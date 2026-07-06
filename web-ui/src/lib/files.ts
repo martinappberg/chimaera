@@ -10,6 +10,7 @@
  */
 
 import { api, ApiError } from "./api";
+import { EXT_GLYPH, GLYPHS, NAME_GLYPH, type Glyph } from "./icons";
 
 export interface FsEntry {
   name: string;
@@ -31,6 +32,13 @@ export interface FileChunk {
   size: number;
   /** True when the response stopped short of EOF (X-Truncated). */
   truncated: boolean;
+  /**
+   * Opaque modification token (X-Mtime; nanoseconds-since-epoch as a string).
+   * Kept as a string — the value exceeds 2^53, so parsing it as a number would
+   * lose precision and break the PUT conflict check. Echoed back as
+   * `expect_mtime`. Null on an older daemon that omits the header.
+   */
+  mtime: string | null;
 }
 
 export interface TablePage {
@@ -79,7 +87,79 @@ export async function fsFile(path: string, offset = 0, limit = FILE_CHUNK): Prom
   const bytes = new Uint8Array(await res.arrayBuffer());
   const size = Number(res.headers.get("X-File-Size") ?? bytes.length);
   const truncated = res.headers.get("X-Truncated") === "true";
-  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated };
+  const mtime = res.headers.get("X-Mtime");
+  return { bytes, size: Number.isFinite(size) ? size : bytes.length, truncated, mtime };
+}
+
+/** A concurrent-modification conflict raised by PUT /fs/file (HTTP 409). */
+export class FileConflictError extends Error {
+  constructor(message = "file changed on disk") {
+    super(message);
+    this.name = "FileConflictError";
+  }
+}
+
+/**
+ * Write `bytes` to `path` via PUT /fs/file. When `expectMtime` is given the
+ * daemon refuses (409 → FileConflictError) if the file changed on disk since
+ * that mtime — the caller offers reload/overwrite. Other failures surface as
+ * ApiError (400 dir/missing-parent, 413 over the 1MB cap). Resolves to the
+ * new mtime (X-Mtime on the 204) so the editor can keep tracking edits.
+ */
+export async function fsWrite(
+  path: string,
+  bytes: Uint8Array,
+  expectMtime: string | null = null,
+): Promise<string | null> {
+  const q = new URLSearchParams({ path });
+  if (expectMtime !== null) q.set("expect_mtime", expectMtime);
+  // Copy into a fresh ArrayBuffer-backed view so the body is a plain
+  // BodyInit (Uint8Array over SharedArrayBuffer is not).
+  const body = bytes.slice();
+  const res = await api(`/fs/file?${q.toString()}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/octet-stream" },
+    body,
+  });
+  if (res.status === 409) throw new FileConflictError();
+  if (!res.ok) {
+    let message = `save failed with status ${res.status}`;
+    try {
+      const errBody = (await res.json()) as { error?: string };
+      if (errBody.error) message = errBody.error;
+    } catch {
+      // non-JSON error body; keep the generic message
+    }
+    throw new ApiError(res.status, message);
+  }
+  return res.headers.get("X-Mtime");
+}
+
+export interface QuickOpenEntry {
+  /** Absolute path on the daemon's filesystem. */
+  path: string;
+  /** Workspace-relative path (what the palette matches and shows). */
+  rel: string;
+  name: string;
+  mtime: number;
+}
+
+/**
+ * Fuzzy file index for the quick-open palette. The daemon walks the workspace
+ * root (ignoring .git/node_modules/target/…), subsequence-matches `q` against
+ * the relative path, and returns up to `limit` ranked entries. An empty `q`
+ * returns the most-recently-modified files.
+ */
+export async function fsQuickOpen(
+  workspaceId: string,
+  q: string,
+  limit = 50,
+): Promise<QuickOpenEntry[]> {
+  const params = new URLSearchParams({ workspace_id: workspaceId, q, limit: String(limit) });
+  const body = await json<{ entries: QuickOpenEntry[] }>(
+    await api(`/fs/quickopen?${params.toString()}`),
+  );
+  return body.entries;
 }
 
 export async function fsMarkdown(path: string): Promise<string> {
@@ -150,7 +230,35 @@ export function extension(path: string): string {
   return i > 0 ? name.slice(i + 1) : "";
 }
 
-export type FileViewKind = "image" | "markdown" | "html" | "table" | "binary" | "text";
+/** Gzip wrappers the server decompresses transparently (fs/table, fs/file). */
+const GZIP_EXTS = new Set(["gz", "bgz"]);
+
+/** True when the path is a server-decompressed gzip member. */
+export function isGzipped(path: string): boolean {
+  return GZIP_EXTS.has(extension(path));
+}
+
+/**
+ * The "effective" extension used for view-kind and icon decisions: for a
+ * gzip wrapper (foo.tsv.gz → tsv) the inner extension is sniffed, matching
+ * the server's own inner-name sniff. A bare `foo.gz` stays "gz".
+ */
+export function innerExtension(path: string): string {
+  const ext = extension(path);
+  if (!GZIP_EXTS.has(ext)) return ext;
+  const stem = basename(path).toLowerCase().slice(0, -(ext.length + 1));
+  const i = stem.lastIndexOf(".");
+  return i > 0 ? stem.slice(i + 1) : ext;
+}
+
+export type FileViewKind =
+  | "image"
+  | "markdown"
+  | "html"
+  | "table"
+  | "pdf"
+  | "binary"
+  | "text";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
@@ -160,10 +268,11 @@ const TABLE_EXTS = new Set(["csv", "tsv"]);
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
  * still sniffs the first bytes and falls back to the card (that catches
- * .gz, .bam, extensionless binaries, and the long tail).
+ * .bam, extensionless binaries, and the long tail). Gzip wrappers are NOT
+ * listed here: their inner extension is sniffed first (foo.tsv.gz → table).
  */
 const BINARY_EXTS = new Set([
-  "pdf", "zip", "tar", "7z", "rar", "xz", "zst", "bz2",
+  "zip", "tar", "7z", "rar", "xz", "zst", "bz2",
   "exe", "dll", "so", "dylib", "o", "a", "class", "jar", "pyc", "wasm",
   "iso", "dmg",
   "mp3", "mp4", "m4a", "wav", "flac", "ogg", "mov", "avi", "mkv", "webm",
@@ -174,15 +283,45 @@ const BINARY_EXTS = new Set([
   "bam", "bai", "cram", "crai", "bcf", "csi", "tbi", "bigwig", "bw", "bigbed", "bb",
 ]);
 
-/** How FileView renders `path`, decided purely from the extension. */
+/**
+ * How FileView renders `path`, decided from the extension. Gzip wrappers
+ * resolve by their inner extension (foo.tsv.gz renders as a table, foo.gz of
+ * an unknown inner type falls through to the text/sniff path) — the server's
+ * fs/table and fs/file decompress transparently.
+ */
 export function viewKindFor(path: string): FileViewKind {
-  const ext = extension(path);
+  const ext = innerExtension(path);
+  // Only fs/table and fs/file decompress gzip; the /raw/ (image/pdf/html) and
+  // fs/markdown paths do not. A gzipped tabular file previews as a table;
+  // every other gzip goes down the text path (fs/file decompresses, then the
+  // NUL sniff falls back to the binary card for gzipped binaries).
+  if (isGzipped(path)) return TABLE_EXTS.has(ext) ? "table" : "text";
   if (IMAGE_EXTS.has(ext)) return "image";
   if (MARKDOWN_EXTS.has(ext)) return "markdown";
   if (HTML_EXTS.has(ext)) return "html";
   if (TABLE_EXTS.has(ext)) return "table";
+  if (ext === "pdf") return "pdf";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
+}
+
+/** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */
+export const EDIT_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The vendored file-type glyph for a path (tree, tabs, pane bars, quick-open),
+ * resolved by exact filename first (Dockerfile, LICENSE, .gitignore, lockfiles)
+ * then by extension. Gzip wrappers resolve by their inner extension, matching
+ * the server's inner-name sniff (foo.tsv.gz → the table glyph). Unknown types
+ * fall back to a quiet generic-file glyph.
+ */
+export function iconFor(path: string): Glyph | null {
+  const name = basename(path).toLowerCase();
+  const byName = NAME_GLYPH[name];
+  if (byName !== undefined) return GLYPHS[byName] ?? null;
+  const ext = innerExtension(path);
+  const byExt = EXT_GLYPH[ext];
+  return byExt !== undefined ? (GLYPHS[byExt] ?? null) : null;
 }
 
 /** True when the first bytes look like binary data (NUL sniff, first 8KB). */

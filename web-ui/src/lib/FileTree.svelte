@@ -7,6 +7,7 @@
    */
   import { untrack } from "svelte";
   import { fsList, type FsEntry } from "./files";
+  import FileIcon from "./FileIcon.svelte";
 
   interface Props {
     /** Workspace root on the daemon's filesystem. */
@@ -32,19 +33,81 @@
     depth: number;
   }
 
+  // Quiet client-side filter over the LOADED tree: narrows visible entries by
+  // a case-insensitive name match, keeping the ancestor dirs of any match so
+  // the structure stays legible. Revealed by the affordance or by typing while
+  // the tree is focused.
+  let filter = $state("");
+  let filterOpen = $state(false);
+  let filterEl = $state<HTMLInputElement | null>(null);
+  const filterQuery = $derived(filter.trim().toLowerCase());
+
   const rows = $derived.by(() => {
+    const q = filterQuery;
     const out: Row[] = [];
-    const walk = (dir: string, depth: number): void => {
+    // Returns true when this subtree contributed at least one visible row.
+    const walk = (dir: string, depth: number): boolean => {
       const entries = listings.get(dir);
-      if (entries === undefined) return;
+      if (entries === undefined) return false;
+      let any = false;
       for (const e of entries) {
-        out.push({ entry: e, depth });
-        if (e.kind === "dir" && expanded.has(e.path)) walk(e.path, depth + 1);
+        const selfMatch = q === "" || e.name.toLowerCase().includes(q);
+        if (e.kind === "dir") {
+          // A filtered dir is shown when it (or a loaded descendant) matches;
+          // expand into it while filtering even if collapsed, so matches surface.
+          const descend = q !== "" || expanded.has(e.path);
+          const marker: Row = { entry: e, depth };
+          const before = out.length;
+          out.push(marker);
+          const childMatched = descend ? walk(e.path, depth + 1) : false;
+          if (q !== "" && !selfMatch && !childMatched) {
+            out.length = before; // prune a dir with no matches under it
+          } else {
+            any = true;
+          }
+        } else if (selfMatch) {
+          out.push({ entry: e, depth });
+          any = true;
+        }
       }
+      return any;
     };
     walk(root, 0);
     return out;
   });
+
+  function openFilter(seed = ""): void {
+    filterOpen = true;
+    if (seed !== "") filter = seed;
+    void Promise.resolve().then(() => filterEl?.focus());
+  }
+
+  function closeFilter(): void {
+    filter = "";
+    filterOpen = false;
+  }
+
+  /** Typing a printable character with the tree focused opens the filter. */
+  function onTreeKeydown(e: KeyboardEvent): void {
+    if (filterOpen || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key.length === 1 && e.key !== " ") {
+      openFilter(e.key);
+      e.preventDefault();
+    }
+  }
+
+  function onFilterKeydown(e: KeyboardEvent): void {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFilter();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      // Enter opens the first matching file (skip dirs), a fast keyboard path.
+      const hit = rows.find((r) => r.entry.kind === "file");
+      if (hit !== undefined) onOpen(hit.entry.path);
+    }
+  }
 
   // Load (or reload) the root whenever the workspace changes. The body
   // writes the state it also reads (via load), so it must not track it —
@@ -104,11 +167,45 @@
   }
 </script>
 
-<div class="tree" role="tree">
+<div class="tree-wrap">
+  <div class="filter-bar" class:open={filterOpen}>
+    {#if filterOpen}
+      <svg class="filter-icon" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+        <circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.4" />
+        <line x1="10" y1="10" x2="13.5" y2="13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+      </svg>
+      <input
+        class="filter-input"
+        bind:this={filterEl}
+        bind:value={filter}
+        placeholder="filter files"
+        spellcheck="false"
+        autocomplete="off"
+        aria-label="filter files"
+        onkeydown={onFilterKeydown}
+      />
+      <button class="filter-clear" aria-label="clear filter" title="clear filter" onclick={closeFilter}>&times;</button>
+    {:else}
+      <button class="filter-toggle" aria-label="filter files" title="filter files" onclick={() => openFilter()}>
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.4" />
+          <line x1="10" y1="10" x2="13.5" y2="13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+        </svg>
+      </button>
+    {/if}
+  </div>
+  <div
+    class="tree"
+    role="tree"
+    tabindex="-1"
+    onkeydown={onTreeKeydown}
+  >
   {#if rootError !== null}
     <div class="tree-error">{rootError}</div>
   {:else if listings.get(root)?.length === 0}
     <div class="tree-empty">empty</div>
+  {:else if filterQuery !== "" && rows.length === 0}
+    <div class="tree-empty">no matches</div>
   {/if}
   {#each rows as { entry, depth } (entry.path)}
     <div
@@ -150,18 +247,97 @@
           />
         </svg>
       {:else}
-        <span class="chev-gap"></span>
+        <span class="file-glyph"><FileIcon path={entry.path} size={14} /></span>
       {/if}
       <span class="node-name" class:dir={entry.kind === "dir"}>{entry.name}</span>
     </div>
   {/each}
+  </div>
 </div>
 
 <style>
+  .tree-wrap {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* Quiet filter affordance: a small magnifier that expands into an input.
+     The collapsed toggle sits flush-right so it never competes with the tree. */
+  .filter-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding: 0 0.55rem 2px;
+    min-height: 20px;
+  }
+
+  .filter-bar.open {
+    justify-content: stretch;
+    gap: 0.3rem;
+  }
+
+  .filter-toggle,
+  .filter-clear {
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2px;
+    border-radius: 4px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0.7;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .filter-toggle:hover,
+  .filter-clear:hover {
+    opacity: 1;
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+
+  .filter-icon {
+    flex: none;
+    color: var(--muted);
+    opacity: 0.7;
+  }
+
+  .filter-clear {
+    font-size: var(--text-md);
+    line-height: 1;
+    padding: 0 0.2rem;
+  }
+
+  .filter-input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    background: none;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    color: var(--fg);
+    padding: 1px 0;
+  }
+
+  .filter-input::placeholder {
+    color: var(--muted);
+    opacity: 0.7;
+  }
+
   .tree {
     display: flex;
     flex-direction: column;
     padding: 2px 0.45rem 0.5rem;
+    outline: none;
   }
 
   .tree-error,
@@ -213,9 +389,13 @@
     opacity: 0.4;
   }
 
-  .chev-gap {
+  /* File glyph sits in the chevron column; a hair inset so its 14px body
+     lines up with the 9px dir chevrons above it. */
+  .file-glyph {
     flex: none;
-    width: 9px;
+    display: flex;
+    align-items: center;
+    margin: 0 -2px 0 -3px;
   }
 
   .node-name {

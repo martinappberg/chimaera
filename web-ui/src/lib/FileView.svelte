@@ -13,6 +13,7 @@
   import HtmlView from "./HtmlView.svelte";
   import TableView from "./TableView.svelte";
   import BinaryView from "./BinaryView.svelte";
+  import PdfView from "./PdfView.svelte";
 
   interface Props {
     path: string;
@@ -71,6 +72,8 @@
       <HtmlView {path} />
     {:else if kind === "table"}
       <TableView {path} />
+    {:else if kind === "pdf"}
+      <PdfView {path} />
     {:else if kind === "binary"}
       <BinaryView {path} />
     {:else if probe.state === "text"}

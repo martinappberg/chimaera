@@ -33,6 +33,7 @@ function chord(macKeys: string, otherKey: string, layer2 = false): string {
 /** Display strings for every app chord, used verbatim in tooltips. */
 export const KEYS = {
   picker: chord("O", "O"),
+  quickOpen: chord("P", "P"),
   openN: chord("1–9", "1–9"),
   newTerminal: chord("E", "E"),
   newAgent: chord("E", "E", true),

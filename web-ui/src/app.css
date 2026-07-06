@@ -40,6 +40,17 @@
   --syn-func: #3e6fc0;
   --syn-def: #1d1d20;
   --syn-prop: #705aa8;
+  /* File-type glyph tints (icons.ts categories), muted so the set reads as
+     one quiet family rather than a rainbow — a hair more saturated in dark. */
+  --ficon-generic: #7c7c85;
+  --ficon-lang: #4a76c4;
+  --ficon-data: #2f8a70;
+  --ficon-doc: #6a6a76;
+  --ficon-media: #b07a2e;
+  --ficon-archive: #9a7440;
+  --ficon-config: #78788a;
+  --ficon-bio: #8a5bb0;
+  --ficon-vcs: #b0603c;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -67,6 +78,15 @@
     --syn-func: #82a7e8;
     --syn-def: #e7e7ea;
     --syn-prop: #a58fd6;
+    --ficon-generic: #8b8b95;
+    --ficon-lang: #6f9ae4;
+    --ficon-data: #58c39c;
+    --ficon-doc: #9a9aa6;
+    --ficon-media: #d8a45c;
+    --ficon-archive: #c39a63;
+    --ficon-config: #9a9ab0;
+    --ficon-bio: #b78fdc;
+    --ficon-vcs: #e0855c;
   }
 }
 

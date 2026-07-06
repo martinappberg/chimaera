@@ -1,23 +1,54 @@
 <script lang="ts">
   /**
-   * Read-only CodeMirror 6 view for code/text files. The parent (FileView)
-   * fetched — and binary-sniffed — the first 256KB chunk; this component
-   * owns the editor and the quiet "load more" tail for truncated files.
-   * The editor instance is plain module state, never $state (same rule as
+   * CodeMirror 6 view for code/text files. Read-only for oversized/truncated
+   * files (the "load more" tail); editable for text files < 1MB. Cmd/Ctrl+S
+   * saves through the daemon with an mtime precondition — a concurrent
+   * on-disk change surfaces a quiet reload/overwrite conflict bar. Dirty state
+   * lives in the editing store (drives the tab dot + the beforeunload guard).
+   *
+   * The editor instance is plain module-ish state, never $state (same rule as
    * xterm instances in termPool).
    */
   import { onMount } from "svelte";
-  import { EditorState, StateEffect } from "@codemirror/state";
-  import { EditorView, lineNumbers, highlightSpecialChars } from "@codemirror/view";
+  import { Compartment, EditorState, StateEffect } from "@codemirror/state";
+  import {
+    EditorView,
+    lineNumbers,
+    highlightSpecialChars,
+    keymap,
+    drawSelection,
+  } from "@codemirror/view";
   import {
     LanguageDescription,
     syntaxHighlighting,
     HighlightStyle,
     bracketMatching,
+    indentOnInput,
   } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
+  import {
+    defaultKeymap,
+    history,
+    historyKeymap,
+    indentWithTab,
+  } from "@codemirror/commands";
   import { tags as t } from "@lezer/highlight";
-  import { basename, fsFile, humanSize, FILE_CHUNK, type FileChunk } from "./files";
+  import {
+    basename,
+    fsFile,
+    fsWrite,
+    humanSize,
+    looksBinary,
+    FileConflictError,
+    EDIT_MAX_BYTES,
+    FILE_CHUNK,
+    type FileChunk,
+  } from "./files";
+  import { ApiError } from "./api";
+  import { setDirty, forgetDirty } from "./editing";
+  import { isMac } from "./keys";
+
+  const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 
   interface Props {
     path: string;
@@ -34,13 +65,22 @@
   let loadingMore = $state(false);
   let loadError = $state<string | null>(null);
 
+  // Editing state.
+  let editable = $state(false);
+  let dirty = $state(false);
+  let savedMtime = $state<string | null>(null);
+  let saving = $state(false);
+  let saveError = $state<string | null>(null);
+  let conflict = $state(false);
+  let savedFlash = $state(false);
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+
   let view: EditorView | null = null;
+  const editCompartment = new Compartment();
   // Streaming decoder: chunk boundaries may split a UTF-8 sequence; the
   // decoder carries the partial bytes across load-more calls.
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
-  // Syntax colors ride on CSS variables (app.css), so one style serves both
-  // light and dark schemes.
   const highlight = HighlightStyle.define([
     { tag: [t.keyword, t.operatorKeyword, t.modifier, t.self], color: "var(--syn-keyword)" },
     { tag: [t.string, t.special(t.string), t.character], color: "var(--syn-string)" },
@@ -74,7 +114,6 @@
     },
     ".cm-content": {
       padding: "10px 0 14px",
-      caretColor: "transparent",
     },
     ".cm-line": {
       padding: "0 14px 0 8px",
@@ -92,7 +131,10 @@
       padding: "0 6px 0 14px",
       minWidth: "3ch",
     },
+    ".cm-activeLine": { backgroundColor: "color-mix(in srgb, var(--fg) 3%, transparent)" },
+    ".cm-activeLineGutter": { backgroundColor: "transparent" },
     "&.cm-focused": { outline: "none" },
+    ".cm-cursor": { borderLeftColor: "var(--accent)" },
     ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
       backgroundColor: "var(--term-selection)",
     },
@@ -102,6 +144,41 @@
     },
   });
 
+  /** The editable/read-only extension set for the compartment. */
+  function editExtensions(canEdit: boolean) {
+    return canEdit
+      ? [
+          history(),
+          keymap.of([
+            { key: "Mod-s", run: () => (triggerSave(), true), preventDefault: true },
+            indentWithTab,
+            ...defaultKeymap,
+            ...historyKeymap,
+          ]),
+          indentOnInput(),
+          EditorView.editable.of(true),
+          EditorView.updateListener.of((u) => {
+            if (u.docChanged) markDirty();
+          }),
+        ]
+      : [EditorState.readOnly.of(true), EditorView.editable.of(false)];
+  }
+
+  function markDirty(): void {
+    if (!editable) return;
+    if (!dirty) {
+      dirty = true;
+      setDirty(path, true);
+    }
+    // A fresh edit invalidates the "saved" flash and any stale conflict/error.
+    savedFlash = false;
+  }
+
+  function clearDirty(): void {
+    dirty = false;
+    setDirty(path, false);
+  }
+
   onMount(() => {
     const el = host;
     if (el === null) return;
@@ -109,21 +186,31 @@
     loadedBytes = first.bytes.length;
     totalBytes = first.size;
     truncated = first.truncated;
+    savedMtime = first.mtime;
+    // Editable when the whole file fits under the 1MB cap and is text. Large
+    // truncated files stay read-only with the load-more tail.
+    editable = totalBytes <= EDIT_MAX_BYTES && !truncated;
 
     const state = EditorState.create({
       doc: text,
       extensions: [
         lineNumbers(),
         highlightSpecialChars(),
+        drawSelection(),
         bracketMatching(),
         syntaxHighlighting(highlight, { fallback: true }),
         theme,
-        EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        editCompartment.of(editExtensions(editable)),
       ],
     });
     const v = new EditorView({ state, parent: el });
     view = v;
+
+    // Under-cap files that came back truncated (256KB < size ≤ 1MB): pull the
+    // rest in the background so the editor holds the full document and can save.
+    if (totalBytes <= EDIT_MAX_BYTES && truncated) {
+      void fillToEnd(v);
+    }
 
     // Language by filename, loaded lazily; appended once ready.
     const desc = LanguageDescription.matchFilename(languages, basename(path));
@@ -140,9 +227,35 @@
 
     return () => {
       view = null;
+      if (flashTimer !== null) clearTimeout(flashTimer);
+      forgetDirty(path);
       v.destroy();
     };
   });
+
+  /** Load remaining chunks (silently) so an under-cap file becomes editable. */
+  async function fillToEnd(v: EditorView): Promise<void> {
+    while (view === v && truncated) {
+      try {
+        const chunk = await fsFile(path, loadedBytes, FILE_CHUNK);
+        if (view !== v) return;
+        const text = decoder.decode(chunk.bytes, { stream: true });
+        v.dispatch({ changes: { from: v.state.doc.length, insert: text } });
+        loadedBytes += chunk.bytes.length;
+        totalBytes = chunk.size;
+        truncated = chunk.truncated;
+        if (chunk.bytes.length === 0) break;
+      } catch {
+        return; // leave it read-only-ish; user can still view
+      }
+    }
+    if (view === v && !truncated && totalBytes <= EDIT_MAX_BYTES && !editable) {
+      editable = true;
+      // The background fill shouldn't leave the doc marked dirty.
+      v.dispatch({ effects: editCompartment.reconfigure(editExtensions(true)) });
+      clearDirty();
+    }
+  }
 
   async function loadMore(): Promise<void> {
     const v = view;
@@ -163,21 +276,105 @@
       loadingMore = false;
     }
   }
+
+  function triggerSave(): void {
+    void save(false);
+  }
+
+  async function save(force: boolean): Promise<void> {
+    const v = view;
+    if (v === null || !editable || saving) return;
+    if (!dirty && !force) return;
+    saving = true;
+    saveError = null;
+    const text = v.state.doc.toString();
+    const bytes = new TextEncoder().encode(text);
+    try {
+      const mtime = await fsWrite(path, bytes, force ? null : savedMtime);
+      if (view !== v) return;
+      savedMtime = mtime;
+      conflict = false;
+      saveError = null;
+      clearDirty();
+      flashSaved();
+    } catch (e) {
+      if (view !== v) return;
+      if (e instanceof FileConflictError) {
+        conflict = true;
+      } else if (e instanceof ApiError) {
+        saveError = e.message;
+      } else {
+        saveError = e instanceof Error ? e.message : "save failed";
+      }
+    } finally {
+      if (view === v) saving = false;
+    }
+  }
+
+  function flashSaved(): void {
+    savedFlash = true;
+    if (flashTimer !== null) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => (savedFlash = false), 1600);
+  }
+
+  /** Conflict → reload: discard local edits, take the on-disk version. */
+  async function reloadFromDisk(): Promise<void> {
+    const v = view;
+    if (v === null) return;
+    try {
+      const chunk = await fsFile(path, 0, EDIT_MAX_BYTES);
+      if (view !== v) return;
+      const fresh = new TextDecoder("utf-8", { fatal: false }).decode(chunk.bytes);
+      if (looksBinary(chunk.bytes)) return;
+      v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: fresh } });
+      loadedBytes = chunk.bytes.length;
+      totalBytes = chunk.size;
+      truncated = chunk.truncated;
+      savedMtime = chunk.mtime;
+      conflict = false;
+      saveError = null;
+      clearDirty();
+    } catch (e) {
+      saveError = e instanceof Error ? e.message : "reload failed";
+    }
+  }
 </script>
 
 <div class="code-view">
-  <div class="editor" bind:this={host}></div>
-  {#if truncated}
-    <footer class="more">
-      <span>showing {humanSize(loadedBytes)} of {humanSize(totalBytes)}</span>
-      {#if loadError !== null}
-        <span class="more-err">{loadError}</span>
-      {/if}
-      <button class="more-btn" disabled={loadingMore} onclick={() => void loadMore()}>
-        {loadingMore ? "loading…" : "load more"}
-      </button>
-    </footer>
+  {#if conflict}
+    <!-- Quiet concurrent-modification bar: the file changed on disk under us. -->
+    <div class="conflict" role="alert">
+      <span class="conflict-msg">changed on disk</span>
+      <button class="conflict-btn" onclick={() => void reloadFromDisk()}>reload</button>
+      <button class="conflict-btn danger" onclick={() => void save(true)}>overwrite</button>
+    </div>
   {/if}
+  <div class="editor" bind:this={host}></div>
+  <footer class="bar">
+    {#if editable}
+      <span class="status">
+        {#if saving}saving…{:else if dirty}unsaved{:else if savedFlash}saved{:else}editable{/if}
+      </span>
+      {#if saveError !== null}
+        <span class="bar-err">{saveError}</span>
+      {/if}
+      <span class="spacer"></span>
+      <span class="hint">{SAVE_HINT}</span>
+    {:else}
+      {#if truncated}
+        <span class="status">showing {humanSize(loadedBytes)} of {humanSize(totalBytes)}</span>
+        {#if loadError !== null}<span class="bar-err">{loadError}</span>{/if}
+        <span class="spacer"></span>
+        <button class="more-btn" disabled={loadingMore} onclick={() => void loadMore()}>
+          {loadingMore ? "loading…" : "load more"}
+        </button>
+      {:else}
+        <span class="status">read-only</span>
+        <span class="spacer"></span>
+        {#if totalBytes > EDIT_MAX_BYTES}<span class="hint">over 1 MB — view only</span>{/if}
+      {/if}
+    {/if}
+  </footer>
 </div>
 
 <style>
@@ -197,12 +394,54 @@
     height: 100%;
   }
 
-  .more {
+  .conflict {
     flex: none;
     display: flex;
     align-items: center;
     gap: 0.6rem;
     height: 28px;
+    padding: 0 0.7rem;
+    background: color-mix(in srgb, var(--warn) 12%, var(--term-bg));
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, var(--edge));
+    font-size: 0.72rem;
+    color: var(--fg);
+  }
+
+  .conflict-msg {
+    color: var(--warn);
+    font-weight: 500;
+  }
+
+  .conflict-btn {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: var(--term-bg);
+    font: inherit;
+    font-size: 0.7rem;
+    color: var(--fg);
+    cursor: pointer;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .conflict-btn:hover {
+    background: var(--row-hover);
+  }
+
+  .conflict-btn.danger:hover {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  }
+
+  .bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    height: 26px;
     padding: 0 0.7rem;
     border-top: 1px solid var(--edge);
     font-size: 0.68rem;
@@ -210,8 +449,21 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .more-err {
+  .status {
+    color: var(--muted);
+  }
+
+  .bar-err {
     color: var(--err);
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .hint {
+    font-family: var(--mono);
+    opacity: 0.7;
   }
 
   .more-btn {
@@ -224,7 +476,6 @@
     cursor: pointer;
     padding: 0.1rem 0.4rem;
     border-radius: 4px;
-    margin-left: auto;
   }
 
   .more-btn:hover:not(:disabled) {

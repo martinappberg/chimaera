@@ -1,7 +1,9 @@
 //! Filesystem endpoints: the folder picker (home + directories-only listing),
 //! and the file service backing file tabs — full directory listings, ranged
-//! raw reads, server-rendered markdown, paged CSV/TSV tables, and short-lived
-//! tickets that let iframes/img tags fetch bytes without a bearer header.
+//! raw reads, atomic single-file writes (lightweight editing), server-rendered
+//! markdown, paged CSV/TSV tables (with a transparent gzip tier for .gz/.bgz),
+//! and short-lived tickets that let iframes/img tags fetch bytes without a
+//! bearer header.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -10,10 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use flate2::read::{GzDecoder, MultiGzDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -23,6 +27,14 @@ use crate::AppState;
 const MAX_FILE_CHUNK: u64 = 2 * 1024 * 1024;
 /// Default `fs/file` read size (256KB).
 const DEFAULT_FILE_CHUNK: u64 = 256 * 1024;
+/// Hard cap on a `fs/file` PUT body — editing is for small text files;
+/// anything bigger belongs in a real editor.
+const MAX_WRITE_BYTES: usize = 1024 * 1024;
+/// Hard cap on decompressed bytes consumed per gzip-backed request. Gzip has
+/// no random access, so every read decodes sequentially from the start; this
+/// bounds that work (and defuses gzip bombs) at the cost of an honest
+/// "truncated" answer for very deep reads.
+const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
 /// Largest markdown source `fs/markdown` will render.
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard cap on `fs/table` rows per page.
@@ -63,6 +75,57 @@ fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
         anyhow::bail!("{} is not a file", path.display());
     }
     Ok(path)
+}
+
+/// True when the path names a gzip stream: `.gz`, or bgzip's `.bgz`. BGZF is
+/// standard multi-member gzip, so sequential multi-member decode covers it
+/// (block-level random access is a later wave).
+fn is_gzip_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("bgz"))
+}
+
+/// The name a gzip file decompresses to, judged from its path:
+/// `foo.tsv.gz` -> `foo.tsv`.
+fn gz_inner_from_path(path: &Path) -> Option<String> {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// The stored FNAME of the first gzip member, if the compressor recorded one
+/// (`gzip file.tsv` does; pipelines often don't).
+fn gz_inner_from_header(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut decoder = GzDecoder::new(file);
+    if decoder.header().is_none() {
+        // Header parsing is lazy in flate2's read decoder; a short read
+        // forces it. Errors just mean "no name to sniff".
+        let mut probe = [0u8; 1];
+        let _ = decoder.read(&mut probe);
+    }
+    let name = decoder.header()?.filename()?;
+    std::str::from_utf8(name).ok().map(str::to_owned)
+}
+
+/// Content type for a gzip file, from the inner (decompressed) name: the path
+/// minus its .gz/.bgz suffix, falling back to the member FNAME, else
+/// octet-stream. `foo.tsv.gz` reads as a TSV, not as a gzip blob.
+fn gz_mime(path: &Path) -> mime_guess::Mime {
+    let guess = |name: String| mime_guess::from_path(Path::new(&name)).first();
+    gz_inner_from_path(path)
+        .and_then(guess)
+        .or_else(|| gz_inner_from_header(path).and_then(guess))
+        .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM)
+}
+
+/// Modification time as an opaque token for the `X-Mtime` header and the PUT
+/// `expect_mtime` conflict check: nanoseconds since the unix epoch, so two
+/// saves within the same second still compare as different on filesystems
+/// with sub-second timestamps.
+fn mtime_token(meta: &std::fs::Metadata) -> String {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or_else(|| "0".to_string(), |d| d.as_nanos().to_string())
 }
 
 /// 400 with a JSON error body.
@@ -232,40 +295,69 @@ pub(crate) struct FileQuery {
 }
 
 /// GET /api/v1/fs/file?path=&offset=0&limit=262144 — raw bytes of a slice of
-/// the file, with `X-File-Size` (total size) and `X-Truncated` (whether bytes
-/// remain past this slice) headers. `limit` is capped at 2MB.
+/// the file, with `X-File-Size` (total size), `X-Truncated` (whether bytes
+/// remain past this slice), and `X-Mtime` (opaque modification token, echoed
+/// back by PUT's `expect_mtime`) headers. `limit` is capped at 2MB.
+///
+/// `.gz`/`.bgz` paths are decompressed transparently: `offset`/`limit` then
+/// address DECOMPRESSED bytes (sequential decode, capped), the Content-Type
+/// comes from the inner name, and `X-File-Size` is only present once the
+/// total decompressed size is known (i.e. this slice reached EOF).
 pub(crate) async fn file(Query(query): Query<FileQuery>) -> Response {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FILE_CHUNK)
         .min(MAX_FILE_CHUNK);
-    match read_file_slice(&query.path, query.offset, limit) {
-        Ok((path, total, bytes)) => {
-            let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            let truncated = query.offset.saturating_add(bytes.len() as u64) < total;
-            (
-                [
-                    (header::CONTENT_TYPE, mime.essence_str().to_string()),
-                    (HeaderName::from_static("x-file-size"), total.to_string()),
-                    (
-                        HeaderName::from_static("x-truncated"),
-                        truncated.to_string(),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
+    match read_file_response(&query.path, query.offset, limit) {
+        Ok(response) => response,
         Err(err) => bad_request(&err),
     }
 }
 
-/// Read up to `limit` bytes of the file at `raw` starting at `offset`.
-/// Returns the canonical path, the total file size, and the bytes.
-fn read_file_slice(raw: &str, offset: u64, limit: u64) -> anyhow::Result<(PathBuf, u64, Vec<u8>)> {
+/// Build the `fs/file` response for a plain or gzip-compressed file.
+fn read_file_response(raw: &str, offset: u64, limit: u64) -> anyhow::Result<Response> {
     let path = canonical_file(raw)?;
-    let mut file = std::fs::File::open(&path)
-        .with_context(|| format!("{}: failed to open", path.display()))?;
+    let meta =
+        std::fs::metadata(&path).with_context(|| format!("{}: failed to stat", path.display()))?;
+    let mtime = mtime_token(&meta);
+
+    let (mime, total, bytes, truncated) = if is_gzip_path(&path) {
+        let (total, bytes, more) = read_gz_slice(&path, offset, limit)?;
+        (gz_mime(&path), total, bytes, more)
+    } else {
+        let (total, bytes) = read_file_slice(&path, offset, limit)?;
+        let truncated = offset.saturating_add(bytes.len() as u64) < total;
+        let mime = mime_guess::from_path(&path).first_or_octet_stream();
+        (mime, Some(total), bytes, truncated)
+    };
+
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, mime.essence_str().to_string()),
+            (
+                HeaderName::from_static("x-truncated"),
+                truncated.to_string(),
+            ),
+            (HeaderName::from_static("x-mtime"), mtime),
+        ],
+        bytes,
+    )
+        .into_response();
+    if let Some(total) = total {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-file-size"),
+            // Always ASCII digits; from_str cannot fail on it.
+            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+    }
+    Ok(response)
+}
+
+/// Read up to `limit` bytes of the (canonical) file at `path` starting at
+/// `offset`. Returns the total file size and the bytes.
+fn read_file_slice(path: &Path, offset: u64, limit: u64) -> anyhow::Result<(u64, Vec<u8>)> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
     let total = file
         .metadata()
         .with_context(|| format!("{}: failed to stat", path.display()))?
@@ -278,7 +370,177 @@ fn read_file_slice(raw: &str, offset: u64, limit: u64) -> anyhow::Result<(PathBu
             .read_to_end(&mut bytes)
             .with_context(|| format!("{}: failed to read", path.display()))?;
     }
-    Ok((path, total, bytes))
+    Ok((total, bytes))
+}
+
+/// Sequentially decode the gzip file at `path`, skipping `offset`
+/// decompressed bytes and returning up to `limit` more. Multi-member streams
+/// (bgzip/BGZF, concatenated gzips) decode transparently. Returns the total
+/// decompressed size when this read hit EOF (`None` while unknown), the
+/// bytes, and whether more decompressed bytes remain.
+fn read_gz_slice(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+) -> anyhow::Result<(Option<u64>, Vec<u8>, bool)> {
+    if offset > MAX_GZ_DECOMPRESS {
+        anyhow::bail!(
+            "{}: offset {offset} is beyond the {MAX_GZ_DECOMPRESS}-byte sequential decode cap for compressed files",
+            path.display()
+        );
+    }
+    let file =
+        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
+    let ctx = || format!("{}: failed to decompress", path.display());
+    // flate2's read decoders buffer their input internally.
+    let mut decoder = MultiGzDecoder::new(file);
+    let skipped =
+        std::io::copy(&mut (&mut decoder).take(offset), &mut std::io::sink()).with_context(ctx)?;
+    if skipped < offset {
+        // Offset past decompressed EOF: empty slice, and now the total is known.
+        return Ok((Some(skipped), Vec::new(), false));
+    }
+    let mut bytes = Vec::new();
+    (&mut decoder)
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .with_context(ctx)?;
+    // A full slice may sit exactly at EOF; probe one byte to find out.
+    let mut probe = [0u8; 1];
+    let more = bytes.len() as u64 == limit && decoder.read(&mut probe).with_context(ctx)? > 0;
+    let total = if more {
+        None
+    } else {
+        Some(offset + bytes.len() as u64)
+    };
+    Ok((total, bytes, more))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PutFileQuery {
+    path: String,
+    #[serde(default)]
+    expect_mtime: Option<String>,
+}
+
+/// Outcome of an attempted atomic write.
+enum WriteOutcome {
+    /// Written; carries the file's new `X-Mtime` token.
+    Written(String),
+    /// The on-disk mtime no longer matches `expect_mtime`.
+    Conflict,
+}
+
+/// PUT /api/v1/fs/file?path=&expect_mtime= — write the raw request body to
+/// the file, atomically (hidden sibling tmp + rename), creating it if its
+/// parent directory exists. 204 on success with the new `X-Mtime` so the
+/// editor can chain saves; 400 for directories/missing parents; 409
+/// `{"error":"file changed on disk"}` when `expect_mtime` (the token from a
+/// previous GET/PUT) no longer matches — the check is skipped when the param
+/// is absent; 413 over 1MB (editing is for small text files).
+pub(crate) async fn put_file(Query(query): Query<PutFileQuery>, body: Bytes) -> Response {
+    if body.len() > MAX_WRITE_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!(
+                    "file too large to save ({} bytes, limit {MAX_WRITE_BYTES})",
+                    body.len()
+                )
+            })),
+        )
+            .into_response();
+    }
+    match write_file_atomic(&query.path, &body, query.expect_mtime.as_deref()) {
+        Ok(WriteOutcome::Written(mtime)) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().insert(
+                HeaderName::from_static("x-mtime"),
+                // The token is ASCII digits; from_str cannot fail on it.
+                HeaderValue::from_str(&mtime).unwrap_or(HeaderValue::from_static("0")),
+            );
+            response
+        }
+        Ok(WriteOutcome::Conflict) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "file changed on disk"})),
+        )
+            .into_response(),
+        Err(err) => bad_request(&err),
+    }
+}
+
+/// Write `bytes` to the file at `raw` atomically: a hidden tmp sibling (never
+/// visible in listings, even transiently) is written, given the original
+/// file's permissions, then renamed over the target. Refuses directories and
+/// paths whose parent directory does not exist.
+fn write_file_atomic(
+    raw: &str,
+    bytes: &[u8],
+    expect_mtime: Option<&str>,
+) -> anyhow::Result<WriteOutcome> {
+    let expanded = expand_tilde(raw)?;
+    let (target, existing) = match std::fs::metadata(&expanded) {
+        Ok(meta) if meta.is_dir() => {
+            anyhow::bail!("{} is a directory", expanded.display());
+        }
+        Ok(meta) => {
+            let path =
+                std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
+            (path, Some(meta))
+        }
+        // New file: the parent directory must already exist.
+        Err(_) => {
+            let name = expanded
+                .file_name()
+                .map(|n| n.to_os_string())
+                .with_context(|| format!("{} has no file name", expanded.display()))?;
+            let parent = match expanded.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => anyhow::bail!("{} has no parent directory", expanded.display()),
+            };
+            let parent =
+                std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+            if !parent.is_dir() {
+                anyhow::bail!("{} is not a directory", parent.display());
+            }
+            (parent.join(name), None)
+        }
+    };
+
+    if let Some(expect) = expect_mtime {
+        // The client edited some version of the file; if the disk moved on
+        // (or the file vanished) since that version, refuse to clobber it.
+        if existing.as_ref().map(mtime_token).as_deref() != Some(expect) {
+            return Ok(WriteOutcome::Conflict);
+        }
+    }
+
+    let tmp = target.with_file_name(format!(
+        ".{}.{}.tmp",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        &chimaera_core::generate_token()[..8]
+    ));
+    std::fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if let Some(meta) = &existing {
+        // Keep the original mode (e.g. an executable script stays executable).
+        // Best-effort: a failure here still leaves a correct write.
+        if let Err(err) = std::fs::set_permissions(&tmp, meta.permissions()) {
+            tracing::warn!(path = %tmp.display(), %err, "failed to carry permissions onto tmp file");
+        }
+    }
+    if let Err(err) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(
+            anyhow::Error::new(err).context(format!("failed to rename into {}", target.display()))
+        );
+    }
+    let meta = std::fs::metadata(&target)
+        .with_context(|| format!("{}: failed to stat after write", target.display()))?;
+    Ok(WriteOutcome::Written(mtime_token(&meta)))
 }
 
 #[derive(Deserialize)]
@@ -337,7 +599,9 @@ pub(crate) struct TableQuery {
 
 /// GET /api/v1/fs/table?path=&offset_rows=0&limit_rows=200&delim=auto — a
 /// page of a CSV/TSV file: header row as `columns`, then `limit_rows` data
-/// rows starting at `offset_rows`. All cells are strings.
+/// rows starting at `offset_rows`. All cells are strings. `.gz`/`.bgz` files
+/// (bioinformatics reality: `.tsv.gz` everywhere) page identically via
+/// sequential decode, capped at [`MAX_GZ_DECOMPRESS`] decompressed bytes.
 pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
     let delim = query.delim.as_deref().unwrap_or("auto");
@@ -347,7 +611,7 @@ pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
     }
 }
 
-/// Parse one page of the delimited file at `raw`.
+/// Parse one page of the delimited (possibly gzip-compressed) file at `raw`.
 fn read_table(
     raw: &str,
     offset_rows: usize,
@@ -355,17 +619,9 @@ fn read_table(
     delim: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let path = canonical_file(raw)?;
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
-    {
-        anyhow::bail!(
-            "{} is gzip-compressed; compressed tables are not supported yet",
-            path.display()
-        );
-    }
+    let gz = is_gzip_path(&path);
     let delimiter = match delim {
-        "auto" => sniff_delimiter(&path)?,
+        "auto" => sniff_delimiter(&path, gz)?,
         "," | "comma" => b',',
         "\t" | "tab" => b'\t',
         other => anyhow::bail!("unsupported delimiter {other:?} (want auto, comma, or tab)"),
@@ -373,11 +629,57 @@ fn read_table(
 
     let file = std::fs::File::open(&path)
         .with_context(|| format!("{}: failed to open", path.display()))?;
+    let (columns, rows, truncated) = if gz {
+        // Take caps the decode work so a gzip bomb cannot spin the daemon;
+        // flate2's read decoders buffer their input internally.
+        let decoder = MultiGzDecoder::new(file).take(MAX_GZ_DECOMPRESS);
+        let (columns, rows, mut truncated, rest) =
+            page_records(decoder, delimiter, offset_rows, limit_rows, &path)?;
+        if rest.limit() == 0 {
+            // Cap reached: rows past it are unreachable by sequential decode,
+            // so the page is honestly "truncated" even though we saw EOF.
+            truncated = true;
+        }
+        (columns, rows, truncated)
+    } else {
+        let (columns, rows, truncated, _) = page_records(
+            std::io::BufReader::new(file),
+            delimiter,
+            offset_rows,
+            limit_rows,
+            &path,
+        )?;
+        (columns, rows, truncated)
+    };
+
+    Ok(json!({
+        "columns": columns,
+        "rows": rows,
+        "offset": offset_rows,
+        "truncated": truncated,
+    }))
+}
+
+/// One paged table read: header row, data rows, more-rows-remain, and the
+/// reader handed back (gz callers inspect its remaining `Take` budget to
+/// detect the decode cap).
+type PagedRecords<R> = (Vec<String>, Vec<Vec<String>>, bool, R);
+
+/// Page `limit_rows` records (after skipping `offset_rows`) out of a
+/// delimited byte stream: header row first, then the page. Returns the
+/// exhausted reader so gz callers can check whether the decode cap was hit.
+fn page_records<R: Read>(
+    input: R,
+    delimiter: u8,
+    offset_rows: usize,
+    limit_rows: usize,
+    path: &Path,
+) -> anyhow::Result<PagedRecords<R>> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(true)
         .flexible(true)
-        .from_reader(std::io::BufReader::new(file));
+        .from_reader(input);
 
     let lossy_cells = |record: &csv::ByteRecord| -> Vec<String> {
         record
@@ -406,29 +708,56 @@ fn read_table(
         rows.push(lossy_cells(&record));
     }
 
-    Ok(json!({
-        "columns": columns,
-        "rows": rows,
-        "offset": offset_rows,
-        "truncated": truncated,
-    }))
+    Ok((columns, rows, truncated, reader.into_inner()))
 }
 
-/// Pick the delimiter from the extension (.tsv -> tab, .csv -> comma), or
-/// sniff the first line: any tab means tab, otherwise comma.
-fn sniff_delimiter(path: &Path) -> anyhow::Result<u8> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("tsv") => return Ok(b'\t'),
-        Some(ext) if ext.eq_ignore_ascii_case("csv") => return Ok(b','),
-        _ => {}
+/// `.tsv` -> tab, `.csv` -> comma, judged from the end of a file name.
+fn delimiter_from_name(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".tsv") {
+        Some(b'\t')
+    } else if lower.ends_with(".csv") {
+        Some(b',')
+    } else {
+        None
+    }
+}
+
+/// Pick the delimiter: the effective file name decides by extension (for gz
+/// that is the path minus its .gz/.bgz suffix — `foo.tsv.gz` -> tsv — then
+/// the gzip member's stored FNAME); with no telling name, sniff the first
+/// (decoded) line: any tab means tab, otherwise comma.
+fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
+    let effective = if gz {
+        gz_inner_from_path(path)
+    } else {
+        path.file_name().map(|n| n.to_string_lossy().into_owned())
+    };
+    if let Some(delim) = effective.as_deref().and_then(delimiter_from_name) {
+        return Ok(delim);
+    }
+    if gz {
+        if let Some(delim) = gz_inner_from_header(path)
+            .as_deref()
+            .and_then(delimiter_from_name)
+        {
+            return Ok(delim);
+        }
     }
     let file =
         std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
     let mut first_line = Vec::new();
-    std::io::BufReader::new(file)
-        .take(64 * 1024)
-        .read_until(b'\n', &mut first_line)
-        .with_context(|| format!("{}: failed to read", path.display()))?;
+    if gz {
+        std::io::BufReader::new(MultiGzDecoder::new(file))
+            .take(64 * 1024)
+            .read_until(b'\n', &mut first_line)
+            .with_context(|| format!("{}: failed to decompress", path.display()))?;
+    } else {
+        std::io::BufReader::new(file)
+            .take(64 * 1024)
+            .read_until(b'\n', &mut first_line)
+            .with_context(|| format!("{}: failed to read", path.display()))?;
+    }
     Ok(if first_line.contains(&b'\t') {
         b'\t'
     } else {
@@ -505,33 +834,117 @@ pub(crate) async fn create_ticket(
     Json(json!({"ticket": ticket})).into_response()
 }
 
+/// Parse a single `Range: bytes=...` header value against a file of `total`
+/// bytes into an inclusive (start, end) pair. `None` means "serve the whole
+/// file" (no/unusable range — RFC 9110 lets a server ignore malformed or
+/// multi-part ranges); `Some(Err(()))` means unsatisfiable (416).
+fn parse_byte_range(value: &str, total: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = value.strip_prefix("bytes=")?.trim();
+    if spec.contains(',') {
+        return None; // multipart ranges: not worth it, serve the whole file
+    }
+    let (start, end) = spec.split_once('-')?;
+    let range = if start.is_empty() {
+        // Suffix form: the last N bytes.
+        let suffix: u64 = end.parse().ok()?;
+        if suffix == 0 || total == 0 {
+            return Some(Err(()));
+        }
+        (total.saturating_sub(suffix), total - 1)
+    } else {
+        let start: u64 = start.parse().ok()?;
+        let end: u64 = if end.is_empty() {
+            total.saturating_sub(1)
+        } else {
+            end.parse().ok()?
+        };
+        if start >= total || start > end {
+            return Some(Err(()));
+        }
+        (start, end.min(total.saturating_sub(1)))
+    };
+    Some(Ok(range))
+}
+
 /// GET /raw/{ticket} — the ticketed file's bytes, no bearer auth (mounted
 /// outside the /api auth layer). Content-Type comes from the extension. HTML
 /// is confined with `Content-Security-Policy: sandbox allow-scripts` and no
 /// referrer; SVG gets a script-less sandbox (scripts never run in <img>, but
-/// direct navigation should not run them either). 404 on unknown or expired
-/// tickets, and on files that vanished since the ticket was minted.
+/// direct navigation should not run them either). Single byte ranges are
+/// honored (206/416; pdf.js fetches pages lazily this way). 404 on unknown
+/// or expired tickets, and on files that vanished since the ticket was minted.
 pub(crate) async fn raw(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(ticket): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
     let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
         return not_found();
     };
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unreadable");
             return not_found();
         }
     };
+    let total = match file.metadata().await {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
+            return not_found();
+        }
+    };
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_byte_range(v, total));
+    let (status, span) = match range {
+        None => (StatusCode::OK, (0, total.saturating_sub(1))),
+        Some(Ok(span)) => (StatusCode::PARTIAL_CONTENT, span),
+        Some(Err(())) => {
+            let mut response = (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                Json(json!({"error": "range not satisfiable"})),
+            )
+                .into_response();
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return response;
+        }
+    };
+
+    let (start, end) = span;
+    let len = if total == 0 { 0 } else { end - start + 1 };
+    let mut bytes = vec![0u8; len as usize];
+    let read = async {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        file.seek(SeekFrom::Start(start)).await?;
+        file.read_exact(&mut bytes).await
+    };
+    if let Err(err) = read.await {
+        tracing::warn!(path = %path.display(), %err, "ticketed file read failed");
+        return not_found();
+    }
+
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
     let mut response = (
-        [(header::CONTENT_TYPE, mime.essence_str().to_string())],
+        status,
+        [
+            (header::CONTENT_TYPE, mime.essence_str().to_string()),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+        ],
         bytes,
     )
         .into_response();
+    if status == StatusCode::PARTIAL_CONTENT {
+        if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+            response.headers_mut().insert(header::CONTENT_RANGE, value);
+        }
+    }
     let sandbox = match mime.essence_str() {
         "text/html" => Some(HeaderValue::from_static("sandbox allow-scripts")),
         "image/svg+xml" => Some(HeaderValue::from_static("sandbox")),

@@ -15,7 +15,9 @@
   import { dotState, dotTitle } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { basename } from "./files";
+  import { dirtyFiles } from "./editing";
   import { KEYS } from "./keys";
+  import FileIcon from "./FileIcon.svelte";
 
   interface Props {
     node: PaneNode;
@@ -104,17 +106,13 @@
               stroke-linejoin="round"
             />
           </svg>
+        {:else if $dirtyFiles.has(tab.path)}
+          <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
+          <span class="dirty-dot" title="unsaved changes"></span>
         {:else}
-          <svg class="glyph" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-            <title>file</title>
-            <path
-              d="M4.5 1.75h5L12.5 4.75V14a.25.25 0 0 1-.25.25h-7.5a.25.25 0 0 1-.25-.25V2a.25.25 0 0 1 .25-.25Z"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linejoin="round"
-            />
-          </svg>
+          <span class="tab-glyph" class:on={i === node.active}>
+            <FileIcon path={tab.path} size={13} plain={i === node.active} />
+          </span>
         {/if}
         <span class="tab-name">{label(tab)}</span>
         <button
@@ -284,6 +282,28 @@
 
   .glyph.starting {
     opacity: 0.9;
+  }
+
+  /* File type glyph slot; quiet by default, lifts to full strength on the
+     active tab (parity with the weight-based active emphasis). */
+  .tab-glyph {
+    flex: none;
+    display: flex;
+    align-items: center;
+    opacity: 0.85;
+  }
+
+  .tab-glyph.on {
+    opacity: 1;
+  }
+
+  /* Unsaved-edits marker: sits in the glyph slot, same footprint as a glyph. */
+  .dirty-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   .tab-name {

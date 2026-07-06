@@ -58,6 +58,7 @@
     type Tab,
   } from "./lib/layout";
   import { basename, fileTabTitles, fsProbe } from "./lib/files";
+  import { dirtyFiles } from "./lib/editing";
   import {
     paneContentEl,
     paneRootEl,
@@ -71,6 +72,7 @@
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
+  import QuickOpen from "./lib/QuickOpen.svelte";
   import FileTree from "./lib/FileTree.svelte";
   import SplitTree from "./lib/SplitNode.svelte";
   import Pane from "./lib/Pane.svelte";
@@ -80,6 +82,9 @@
   let sessions = $state<Session[]>([]);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
   let pickerOpen = $state(false);
+  let quickOpenOpen = $state(false);
+  /** Element focused when the quick-open palette opened; restored on close. */
+  let quickOpenRestoreEl: HTMLElement | null = null;
   let eventsUp = $state(false);
   let createError = $state<string | null>(null);
   /** Rail row currently showing the inline kill confirmation. */
@@ -291,6 +296,16 @@
     if (pickerOpen) return;
     if (activeWsId === null || !layoutReady) return;
 
+    // Quick-open palette (files + sessions). Toggles like the folder picker;
+    // while open it owns the keyboard, so all other chords stand down.
+    if (key === "p" && !l2 && plain) {
+      intercept();
+      if (quickOpenOpen) closeQuickOpen();
+      else openQuickOpen();
+      return;
+    }
+    if (quickOpenOpen) return;
+
     // Navigation layer (Alt on both platforms): arrows move pane focus,
     // brackets cycle the focused pane's tabs.
     if (e.altKey) {
@@ -395,6 +410,55 @@
       if (sid !== null) pool.focusTerminal(sid);
     });
   }
+
+  function openQuickOpen(): void {
+    if (quickOpenOpen || activeWsId === null) return;
+    quickOpenRestoreEl =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    quickOpenOpen = true;
+  }
+
+  /** Close the palette and put focus back where it was (or the focused terminal). */
+  function closeQuickOpen(): void {
+    quickOpenOpen = false;
+    const el = quickOpenRestoreEl;
+    quickOpenRestoreEl = null;
+    void tick().then(() => {
+      if (el !== null && el.isConnected) {
+        el.focus();
+        return;
+      }
+      const sid = focusedSessionOf(layout);
+      if (sid !== null) pool.focusTerminal(sid);
+    });
+  }
+
+  /** Quick-open: open a file in the focused pane, or in a fresh split. The
+   *  palette's own onClose fires right after; drop the restore target so it
+   *  doesn't yank focus back to a now-hidden terminal. */
+  function quickOpenFile(path: string, split: boolean): void {
+    quickOpenRestoreEl = null;
+    if (split) splitAt(layout.focusedPaneId, "row");
+    openFilePath(path);
+  }
+
+  /** Quick-open: focus a session in the focused pane, or in a fresh split. */
+  function quickOpenSession(id: string, split: boolean): void {
+    quickOpenRestoreEl = null;
+    if (split) splitAt(layout.focusedPaneId, "row");
+    openSess(id);
+  }
+
+  // beforeunload guard: warn before losing unsaved edits (any dirty file).
+  $effect(() => {
+    if ($dirtyFiles.size === 0) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  });
 
   /** Scope this window to `w` (open in THIS window). */
   function activateWorkspace(w: Workspace): void {
@@ -996,6 +1060,17 @@
 
 {#if pickerOpen}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+{/if}
+
+{#if quickOpenOpen && activeWsId !== null}
+  <QuickOpen
+    workspaceId={activeWsId}
+    sessions={wsSessions}
+    sessionNames={displayNames}
+    onOpenFile={quickOpenFile}
+    onOpenSession={quickOpenSession}
+    onClose={closeQuickOpen}
+  />
 {/if}
 
 {#if $unauthorized}

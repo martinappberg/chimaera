@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { fsMarkdown } from "./files";
+  /**
+   * Markdown preview (server-rendered comrak GFM, sanitized) with an
+   * Edit/Preview toggle. The edit side is the shared CodeMirror editor in
+   * markdown mode (Cmd/Ctrl+S saves; dirty dot + conflict handling all come
+   * from CodeView). Switching back to Preview re-renders from disk so saved
+   * edits show immediately. Editing is offered only for files under the 1MB
+   * cap; larger markdown stays preview-only.
+   */
+  import { fsMarkdown, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import CodeView from "./CodeView.svelte";
 
   interface Props {
     path: string;
@@ -7,11 +16,27 @@
 
   let { path }: Props = $props();
 
+  let mode = $state<"preview" | "edit">("preview");
   let html = $state<string | null>(null);
   let error = $state<string | null>(null);
+  let chunk = $state<FileChunk | null>(null);
+  let chunkError = $state<string | null>(null);
+  /** Null until the first fetch tells us whether the file fits the edit cap. */
+  let editable = $state<boolean | null>(null);
 
-  // Server-rendered (comrak, GFM) and sanitized (ammonia) — safe to inject.
+  // Reset per path.
   $effect(() => {
+    void path;
+    mode = "preview";
+    chunk = null;
+    chunkError = null;
+    editable = null;
+  });
+
+  // Preview HTML: (re)rendered from disk whenever we enter/return to preview,
+  // so a save on the edit side is reflected without reopening the tab.
+  $effect(() => {
+    if (mode !== "preview") return;
     const p = path;
     html = null;
     error = null;
@@ -27,20 +52,132 @@
       stale = true;
     };
   });
+
+  async function enterEdit(): Promise<void> {
+    // Fetch the raw source once; CodeView handles the rest (incl. background
+    // fill for under-cap truncated files and the save/dirty/conflict flow).
+    if (chunk === null && chunkError === null) {
+      try {
+        const c = await fsFile(path);
+        chunk = c;
+        editable = c.size <= EDIT_MAX_BYTES;
+      } catch (e) {
+        chunkError = e instanceof Error ? e.message : "failed to load source";
+        return;
+      }
+    }
+    if (editable === false) return; // too large; stay in preview
+    mode = "edit";
+  }
 </script>
 
-<div class="md-scroll">
-  {#if error !== null}
-    <div class="file-error">{error}</div>
-  {:else if html !== null}
-    <article class="md-body">
-      <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
-      {@html html}
-    </article>
-  {/if}
+<div class="md-view">
+  <div class="md-bar">
+    <div class="toggle" role="tablist" aria-label="markdown mode">
+      <button
+        class="seg"
+        class:on={mode === "preview"}
+        role="tab"
+        aria-selected={mode === "preview"}
+        onclick={() => (mode = "preview")}>preview</button
+      >
+      <button
+        class="seg"
+        class:on={mode === "edit"}
+        role="tab"
+        aria-selected={mode === "edit"}
+        title={editable === false ? "over 1 MB — preview only" : "edit source"}
+        disabled={editable === false}
+        onclick={() => void enterEdit()}>edit</button
+      >
+    </div>
+    {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
+  </div>
+
+  <div class="md-content">
+    {#if mode === "edit" && chunk !== null}
+      <CodeView {path} first={chunk} />
+    {:else}
+      <div class="md-scroll">
+        {#if error !== null}
+          <div class="file-error">{error}</div>
+        {:else if html !== null}
+          <article class="md-body">
+            <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
+            {@html html}
+          </article>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
+  .md-view {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Quiet mode toggle bar, matching the pane top-bar treatment. */
+  .md-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    height: 26px;
+    padding: 0 0.6rem;
+    border-bottom: 1px solid var(--edge);
+  }
+
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+  }
+
+  .seg {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 4px;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .seg:hover:not(:disabled) {
+    color: var(--fg);
+  }
+
+  .seg.on {
+    color: var(--fg);
+    background: var(--row-active);
+  }
+
+  .seg:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .md-bar-err {
+    font-size: var(--text-xs);
+    color: var(--err);
+  }
+
+  .md-content {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+  }
+
   .md-scroll {
     position: absolute;
     inset: 0;
@@ -55,8 +192,6 @@
     text-align: center;
   }
 
-  /* Readable measure, styled by the app's tokens; content is server HTML,
-     hence the :global rules scoped under .md-body. */
   .md-body {
     max-width: 70ch;
     margin: 0 auto;

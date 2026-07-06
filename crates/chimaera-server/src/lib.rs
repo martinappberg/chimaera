@@ -3,6 +3,7 @@ mod api;
 mod assets;
 mod fs;
 mod naming;
+mod quickopen;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -48,6 +49,8 @@ pub(crate) struct AppState {
     pub(crate) display_names: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
+    /// Quick-open walk cache (short TTL, per workspace).
+    pub(crate) quickopen: Mutex<quickopen::QuickOpenCache>,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
@@ -80,6 +83,7 @@ impl AppState {
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
+            quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
             claude_bin: tokio::sync::OnceCell::new(),
         }
@@ -114,9 +118,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
         .route("/fs/list", get(fs::list))
-        .route("/fs/file", get(fs::file))
+        .route("/fs/file", get(fs::file).put(fs::put_file))
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
+        .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
@@ -1508,6 +1513,7 @@ mod tests {
             "/api/v1/fs/file?path=/etc/hosts",
             "/api/v1/fs/markdown?path=/x.md",
             "/api/v1/fs/table?path=/x.csv",
+            "/api/v1/fs/quickopen?workspace_id=w-x&q=main",
         ] {
             let res = app(test_state())
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1523,6 +1529,18 @@ mod tests {
                     .uri("/api/v1/fs/ticket")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"path":"/etc/hosts"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // So is the file write.
+        let res = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/fs/file?path=/tmp/x.txt")
+                    .body(Body::from("data"))
                     .unwrap(),
             )
             .await
@@ -1872,7 +1890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fs_table_caps_rows_and_rejects_gz_dirs_missing() {
+    async fn fs_table_caps_rows_and_rejects_corrupt_gz_dirs_missing() {
         let state = test_state();
         let root = test_dir("fs-table-bad");
 
@@ -1892,13 +1910,13 @@ mod tests {
         assert_eq!(json["rows"].as_array().unwrap().len(), 1000);
         assert_eq!(json["truncated"], true);
 
-        // .gz is a clear 400 until the gzip tier lands.
+        // A .gz that is not actually gzip is a clean 400, not a hang or 500.
         let gz = root.join("data.csv.gz");
-        std::fs::write(&gz, [0x1f, 0x8b, 0x08]).unwrap();
+        std::fs::write(&gz, b"totally not gzip bytes").unwrap();
         let uri = format!("/api/v1/fs/table?path={}", gz.to_string_lossy());
         let (status, err) = request(&state, Method::GET, &uri, None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("not supported"));
+        assert!(err["error"].is_string());
 
         for path in [
             root.to_string_lossy().into_owned(),
@@ -1908,6 +1926,529 @@ mod tests {
             let (status, err) = request(&state, Method::GET, &uri, None).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
             assert!(err["error"].is_string());
+        }
+    }
+
+    /// Gzip `content`, optionally recording `fname` as the member's FNAME.
+    fn gzip_bytes(content: &[u8], fname: Option<&str>) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = flate2::GzBuilder::new();
+        if let Some(name) = fname {
+            builder = builder.filename(name);
+        }
+        let mut encoder = builder.write(Vec::new(), flate2::Compression::default());
+        encoder.write_all(content).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn fs_table_pages_tsv_gz_including_multimember() {
+        let state = test_state();
+        let root = test_dir("fs-table-gz");
+
+        // Single member: pages exactly like the plain-file test.
+        let mut tsv = String::from("name\tvalue\n");
+        for i in 0..8 {
+            tsv.push_str(&format!("row{i}\t{i}\n"));
+        }
+        let single = root.join("data.tsv.gz");
+        std::fs::write(&single, gzip_bytes(tsv.as_bytes(), None)).unwrap();
+        let path = single.to_string_lossy();
+
+        let uri = format!("/api/v1/fs/table?path={path}");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["name", "value"]));
+        assert_eq!(json["rows"].as_array().unwrap().len(), 8);
+        assert_eq!(json["rows"][0], serde_json::json!(["row0", "0"]));
+        assert_eq!(json["truncated"], false);
+
+        let uri = format!("/api/v1/fs/table?path={path}&limit_rows=3");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(json["truncated"], true);
+
+        let uri = format!("/api/v1/fs/table?path={path}&offset_rows=6&limit_rows=3");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(json["rows"][0][0], "row6");
+        assert_eq!(json["offset"], 6);
+        assert_eq!(json["truncated"], false);
+
+        // Multi-member (bgzip-style concatenated gzip streams), with the
+        // member boundary cutting a row in half: the decode is seamless.
+        let mut multi = gzip_bytes(b"a\tb\nrow0\t0\nro", None);
+        multi.extend(gzip_bytes(b"w1\t1\nrow2\t2\n", None));
+        let multi_path = root.join("multi.tsv.gz");
+        std::fs::write(&multi_path, multi).unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", multi_path.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["a", "b"]));
+        assert_eq!(
+            json["rows"],
+            serde_json::json!([["row0", "0"], ["row1", "1"], ["row2", "2"]])
+        );
+
+        // .bgz reads the same as .gz.
+        let bgz = root.join("data.tsv.bgz");
+        std::fs::write(&bgz, gzip_bytes(b"x\ty\n1\t2\n", None)).unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", bgz.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["x", "y"]));
+    }
+
+    #[tokio::test]
+    async fn fs_table_gz_sniffs_inner_name() {
+        let state = test_state();
+        let root = test_dir("fs-table-gz-sniff");
+
+        // Outer name says nothing ("blob.gz"), but the member FNAME says
+        // .csv — comma wins even though the first line contains a tab
+        // (content-sniffing alone would have picked tab).
+        let blob = root.join("blob.gz");
+        std::fs::write(&blob, gzip_bytes(b"a,b\tc\n1,2\t3\n", Some("data.csv"))).unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", blob.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["a", "b\tc"]));
+
+        // No FNAME, no inner extension: the first decoded line is sniffed.
+        let mystery = root.join("mystery.gz");
+        std::fs::write(&mystery, gzip_bytes(b"x\ty\n3\t4\n", None)).unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", mystery.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["x", "y"]));
+    }
+
+    #[tokio::test]
+    async fn fs_file_gz_serves_decompressed_slices() {
+        let state = test_state();
+        let root = test_dir("fs-file-gz");
+        let path = root.join("notes.txt.gz");
+        std::fs::write(&path, gzip_bytes(b"abcdefghij", None)).unwrap();
+        let path = path.to_string_lossy();
+
+        // Whole file: decompressed bytes, inner-name content type, exact size.
+        let uri = format!("/api/v1/fs/file?path={path}");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"abcdefghij");
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+        assert_eq!(header_str(&headers, "x-file-size"), "10");
+        assert!(header_str(&headers, "x-mtime").parse::<u128>().unwrap() > 0);
+
+        // A head slice: truncated, and the total size is honestly unknown.
+        let uri = format!("/api/v1/fs/file?path={path}&limit=4");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"abcd");
+        assert_eq!(header_str(&headers, "x-truncated"), "true");
+        assert!(headers.get("x-file-size").is_none());
+
+        // Offsets address decompressed bytes (sequential skip).
+        let uri = format!("/api/v1/fs/file?path={path}&offset=4&limit=4");
+        let (_, headers, body) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(&body[..], b"efgh");
+        assert_eq!(header_str(&headers, "x-truncated"), "true");
+
+        // A slice ending exactly at EOF is not truncated, and knows the size.
+        let uri = format!("/api/v1/fs/file?path={path}&offset=6&limit=4");
+        let (_, headers, body) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(&body[..], b"ghij");
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+        assert_eq!(header_str(&headers, "x-file-size"), "10");
+
+        // An offset past decompressed EOF: empty, non-truncated.
+        let uri = format!("/api/v1/fs/file?path={path}&offset=100");
+        let (_, headers, body) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert!(body.is_empty());
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+        assert_eq!(header_str(&headers, "x-file-size"), "10");
+
+        // Multi-member decodes seamlessly here too.
+        let multi_path = root.join("hello.txt.gz");
+        let mut multi = gzip_bytes(b"hello ", None);
+        multi.extend(gzip_bytes(b"world", None));
+        std::fs::write(&multi_path, multi).unwrap();
+        let uri = format!("/api/v1/fs/file?path={}", multi_path.to_string_lossy());
+        let (status, _, body) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"hello world");
+    }
+
+    /// PUT raw bytes with the bearer token; returns status, headers, body.
+    async fn put_raw(
+        state: &Arc<AppState>,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, axum::http::HeaderMap, bytes::Bytes) {
+        let res = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, bytes)
+    }
+
+    #[tokio::test]
+    async fn fs_put_file_round_trip_atomic_with_mtime_chain() {
+        let state = test_state();
+        let root = test_dir("fs-put");
+        let path = root.join("notes.txt");
+        let uri = |extra: &str| format!("/api/v1/fs/file?path={}{extra}", path.to_string_lossy());
+
+        // Create (parent exists, file does not): 204 + the new mtime token.
+        let (status, headers, body) = put_raw(&state, &uri(""), b"hello v1".to_vec()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+        let mtime1 = header_str(&headers, "x-mtime").to_string();
+        assert!(mtime1.parse::<u128>().unwrap() > 0);
+
+        // GET reports the same token, so the editor can start a save chain.
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri(""), Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"hello v1");
+        assert_eq!(header_str(&headers, "x-mtime"), mtime1);
+
+        // Save with a matching expect_mtime: accepted, token advances.
+        let (status, headers, _) = put_raw(
+            &state,
+            &uri(&format!("&expect_mtime={mtime1}")),
+            b"hello v2".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mtime2 = header_str(&headers, "x-mtime").to_string();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello v2");
+
+        // Chained save against the returned token still works.
+        let (status, _, _) = put_raw(
+            &state,
+            &uri(&format!("&expect_mtime={mtime2}")),
+            b"hello v3".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello v3");
+
+        // Atomicity hygiene: no tmp siblings survive the writes.
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["notes.txt"], "leftover files: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn fs_put_file_conflict_is_409_and_leaves_disk_untouched() {
+        let state = test_state();
+        let root = test_dir("fs-put-conflict");
+        let path = root.join("doc.md");
+        std::fs::write(&path, "original").unwrap();
+
+        let uri = format!("/api/v1/fs/file?path={}", path.to_string_lossy());
+        let (_, headers, _) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        let stale = header_str(&headers, "x-mtime").to_string();
+
+        // Another writer touches the file (mtime moves past the token).
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        std::fs::write(&path, "external edit").unwrap();
+
+        let (status, _, body) = put_raw(
+            &state,
+            &format!("{uri}&expect_mtime={stale}"),
+            b"my edit".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err, serde_json::json!({"error": "file changed on disk"}));
+        // The refused write changed nothing on disk.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
+
+        // A file deleted since the editor loaded it is a conflict too.
+        let gone = root.join("gone.txt");
+        let (status, _, _) = put_raw(
+            &state,
+            &format!(
+                "/api/v1/fs/file?path={}&expect_mtime=12345",
+                gone.to_string_lossy()
+            ),
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!gone.exists());
+
+        // Without expect_mtime the check is skipped (explicit overwrite).
+        let (status, _, _) = put_raw(&state, &uri, b"forced".to_vec()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "forced");
+    }
+
+    #[tokio::test]
+    async fn fs_put_file_rejects_dirs_and_missing_parents() {
+        let state = test_state();
+        let root = test_dir("fs-put-bad");
+
+        // Writing over a directory is refused.
+        let uri = format!("/api/v1/fs/file?path={}", root.to_string_lossy());
+        let (status, _, body) = put_raw(&state, &uri, b"x".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("directory"));
+
+        // Creating a file whose parent directory does not exist is refused
+        // (no implicit mkdir -p).
+        let orphan = root.join("no/such/dir/file.txt");
+        let uri = format!("/api/v1/fs/file?path={}", orphan.to_string_lossy());
+        let (status, _, _) = put_raw(&state, &uri, b"x".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn fs_put_file_caps_at_1mb() {
+        let state = test_state();
+        let root = test_dir("fs-put-cap");
+        let path = root.join("big.txt");
+        let uri = format!("/api/v1/fs/file?path={}", path.to_string_lossy());
+
+        // Exactly 1MB is fine.
+        let (status, _, _) = put_raw(&state, &uri, vec![b'a'; 1024 * 1024]).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024);
+
+        // One byte over is a 413, and the file is untouched.
+        let (status, _, body) = put_raw(&state, &uri, vec![b'b'; 1024 * 1024 + 1]).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("too large"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024);
+    }
+
+    /// Age a file's mtime by `secs` so second-resolution ranking tests do not
+    /// have to sleep.
+    fn age_file(path: &std::path::Path, secs: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fs_quickopen_ranks_matches_and_ignores() {
+        let state = test_state();
+        let root = test_dir("quickopen");
+        for dir in [
+            "src",
+            "map",
+            "docs",
+            "node_modules",
+            "target",
+            ".git",
+            "work",
+            "dist",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".snakemake",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // Tier 0 (name-prefix), newer beats older within the tier.
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/main_test.rs"), "#[test]").unwrap();
+        age_file(&root.join("src/main_test.rs"), 3600);
+        // Tier 1 (name-substring): "domain" contains "main".
+        std::fs::write(root.join("src/domain.rs"), "struct D;").unwrap();
+        // Tier 2 (path-subsequence): m-a-i-n spread across "map/init.txt".
+        std::fs::write(root.join("map/init.txt"), "x").unwrap();
+        // Non-match.
+        std::fs::write(root.join("docs/other.txt"), "y").unwrap();
+        // Ignored directories, all with tempting matches inside.
+        for ignored in [
+            "node_modules/main.js",
+            "target/main.rs",
+            ".git/main",
+            "work/main.txt",
+            "dist/main.css",
+            "__pycache__/main.pyc",
+            ".venv/main.py",
+            "venv/main.py",
+            ".snakemake/main.log",
+        ] {
+            std::fs::write(root.join(ignored), "z").unwrap();
+        }
+
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Ranked: prefix (mtime-tiebroken) > substring > subsequence, and
+        // nothing from the ignored directories leaks in.
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=main");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let rels: Vec<&str> = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["rel"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rels,
+            [
+                "src/main.rs",
+                "src/main_test.rs",
+                "src/domain.rs",
+                "map/init.txt"
+            ]
+        );
+        let first = &json["entries"][0];
+        assert_eq!(first["name"], "main.rs");
+        assert_eq!(
+            first["path"].as_str().unwrap(),
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .join("src/main.rs")
+                .to_str()
+                .unwrap()
+        );
+        assert!(first["mtime"].as_u64().unwrap() > 0);
+
+        // Matching is case-insensitive.
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=MAIN");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["entries"][0]["rel"], "src/main.rs");
+
+        // Empty query: every indexed file, most recent first.
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["entries"].as_array().unwrap().len(), 5);
+
+        // limit is honored.
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=main&limit=2");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["entries"].as_array().unwrap().len(), 2);
+
+        // Unknown workspaces are 404s.
+        let (status, err) = request(
+            &state,
+            Method::GET,
+            "/api/v1/fs/quickopen?workspace_id=w-nope&q=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(err["error"].as_str().unwrap().contains("w-nope"));
+    }
+
+    #[tokio::test]
+    async fn raw_serves_byte_ranges() {
+        let state = test_state();
+        let root = test_dir("fs-raw-range");
+        let path = root.join("doc.pdf");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let (_, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/ticket",
+            Some(serde_json::json!({"path": path.to_string_lossy()})),
+        )
+        .await;
+        let ticket = json["ticket"].as_str().unwrap();
+        let uri = format!("/raw/{ticket}");
+
+        let ranged = |range: &'static str| {
+            let state = state.clone();
+            let uri = uri.clone();
+            async move {
+                let res = app(state)
+                    .oneshot(
+                        Request::builder()
+                            .uri(&uri)
+                            .header(header::RANGE, range)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = res.status();
+                let headers = res.headers().clone();
+                let bytes = res.into_body().collect().await.unwrap().to_bytes();
+                (status, headers, bytes)
+            }
+        };
+
+        // Full fetch advertises range support.
+        let (status, headers, body) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"0123456789");
+        assert_eq!(header_str(&headers, "accept-ranges"), "bytes");
+
+        // bounded, open-ended, and suffix forms.
+        let (status, headers, body) = ranged("bytes=2-5").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], b"2345");
+        assert_eq!(header_str(&headers, "content-range"), "bytes 2-5/10");
+        assert_eq!(header_str(&headers, "content-type"), "application/pdf");
+
+        let (status, headers, body) = ranged("bytes=7-").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], b"789");
+        assert_eq!(header_str(&headers, "content-range"), "bytes 7-9/10");
+
+        let (status, _, body) = ranged("bytes=-3").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], b"789");
+
+        // An end past EOF clamps.
+        let (status, headers, body) = ranged("bytes=8-999").await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], b"89");
+        assert_eq!(header_str(&headers, "content-range"), "bytes 8-9/10");
+
+        // A start past EOF is unsatisfiable.
+        let (status, headers, _) = ranged("bytes=100-").await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header_str(&headers, "content-range"), "bytes */10");
+
+        // Malformed and multipart ranges fall back to the whole file.
+        for odd in ["bytes=nope", "bytes=1-2,4-5", "chapters=1-2"] {
+            let res = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::RANGE, odd)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{odd}");
         }
     }
 
