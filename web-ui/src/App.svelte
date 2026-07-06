@@ -23,27 +23,33 @@
   import { reconnectingSockets } from "./lib/ws";
   import {
     activateTab,
-    allSessionIds,
+    allFilePaths,
     cycleTab,
     defaultLayout,
     deserializeLayout,
     detachTab,
-    dropSession,
+    dropTab,
     findPane,
     focusPane,
+    focusedFile as focusedFileOf,
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    openFile,
     openSession,
+    pruneFiles,
     pruneSessions,
     serializeLayout,
     setRatio,
     splitPane,
+    tabCount,
     toggleZoom,
     type FocusDir,
     type Layout,
     type SplitDir,
+    type Tab,
   } from "./lib/layout";
+  import { basename, fileTabTitles, fsProbe } from "./lib/files";
   import {
     paneContentEl,
     startDrag,
@@ -53,6 +59,7 @@
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
+  import FileTree from "./lib/FileTree.svelte";
   import SplitTree from "./lib/SplitNode.svelte";
   import Pane from "./lib/Pane.svelte";
 
@@ -74,12 +81,22 @@
   let autoOpened = false;
   let dropSpot = $state<DropSpot | null>(null);
 
+  // Rail FILES section: collapsible, resizable share of the rail height.
+  let filesOpen = $state(true);
+  let filesFrac = $state(0.4);
+  let filesDividerActive = $state(false);
+  let railEl = $state<HTMLElement | null>(null);
+  let daemonEl = $state<HTMLElement | null>(null);
+
   const winKey = windowKey();
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
+  const focusedFilePath = $derived(focusedFileOf(layout));
+  /** Open file tabs' display titles (basename, disambiguated by parent dir). */
+  const fileTitles = $derived(fileTabTitles(allFilePaths(layout)));
   const zoomedPane = $derived(
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
@@ -171,6 +188,18 @@
     }
     layoutReady = true;
     pruneAndAutoOpen();
+    pruneDeadFiles();
+  }
+
+  /** Drop restored file tabs whose files are definitively gone (400/404);
+   *  an unreachable or not-yet-upgraded daemon never wipes tabs. */
+  function pruneDeadFiles(): void {
+    const paths = allFilePaths(layout);
+    if (paths.length === 0) return;
+    void Promise.all(paths.map(async (p) => [p, await fsProbe(p)] as const)).then((results) => {
+      const dead = new Set(results.filter(([, r]) => r === "dead").map(([p]) => p));
+      if (dead.size > 0) layout = pruneFiles(layout, dead);
+    });
   }
 
   /**
@@ -309,7 +338,7 @@
     layout = pruneSessions(layout, new Set(sessions.map((s) => s.id)));
     if (!autoOpened) {
       autoOpened = true;
-      if (allSessionIds(layout).length === 0 && wsSessions.length > 0) {
+      if (tabCount(layout) === 0 && wsSessions.length > 0) {
         layout = openSession(layout, wsSessions[0].id);
       }
     }
@@ -330,6 +359,14 @@
   function openSess(id: string): void {
     layout = openSession(layout, id);
     pool.focusTerminal(id);
+  }
+
+  /** Open/focus a file preview tab (FILES tree click). */
+  function openFilePath(path: string): void {
+    layout = openFile(layout, path);
+    // The pane now shows a file: pull DOM focus off any terminal so plain
+    // keys stop reaching a PTY that is no longer visible.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
   function focusDirection(dir: FocusDir): void {
@@ -355,9 +392,9 @@
   function spawnSize(): { cols: number; rows: number } | null {
     const pane = findPane(layout.root, layout.focusedPaneId);
     if (pane === null) return null;
-    const sid = pane.tabs[pane.active]?.sessionId;
-    if (sid !== undefined) {
-      const exact = pool.getSize(sid);
+    const active = pane.tabs[pane.active];
+    if (active !== undefined && active.surface === "terminal") {
+      const exact = pool.getSize(active.sessionId);
       if (exact !== null) return exact;
     }
     const el = paneContentEl(pane.id);
@@ -411,29 +448,33 @@
     setRatio(splitId, ratio) {
       layout = setRatio(layout, splitId, ratio);
     },
-    dragTab(e, paneId, index, sessionId) {
-      beginDrag(e, sessionId, () => ctrl.activateTab(paneId, index));
+    dragTab(e, paneId, index, tab) {
+      beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
     },
     dividerDrag(active) {
       pool.setDragging(active);
     },
   };
 
-  /** Shared drag start for rail rows and pane tabs. */
-  function beginDrag(e: PointerEvent, sessionId: string, onClick: () => void): void {
+  /** Shared drag start for rail rows and pane tabs (any surface). */
+  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void): void {
     const label =
-      displayNames.get(sessionId) ?? sessionsById.get(sessionId)?.name ?? sessionId.slice(0, 8);
+      tab.surface === "terminal"
+        ? (displayNames.get(tab.sessionId) ??
+          sessionsById.get(tab.sessionId)?.name ??
+          tab.sessionId.slice(0, 8))
+        : (fileTitles.get(tab.path) ?? basename(tab.path));
     startDrag(
       e,
-      { sessionId, label },
+      { tab, label },
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
           layout =
             spot.kind === "tab"
-              ? moveTabToIndex(layout, sessionId, spot.paneId, spot.index)
-              : dropSession(layout, sessionId, spot.paneId, spot.zone);
-          pool.focusTerminal(sessionId);
+              ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
+              : dropTab(layout, tab, spot.paneId, spot.zone);
+          if (tab.surface === "terminal") pool.focusTerminal(tab.sessionId);
         },
         onClick,
         onEnd: () => (dropSpot = null),
@@ -442,13 +483,83 @@
   }
 
   function onRailRowDown(e: PointerEvent, sessionId: string): void {
-    beginDrag(e, sessionId, () => openSess(sessionId));
+    beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
+  }
+
+  /**
+   * FILES section resize: a quiet divider above the section header; drag
+   * moves the boundary (fraction of the rail, clamped), Escape restores.
+   */
+  function onFilesDividerDown(e: PointerEvent): void {
+    if (e.button !== 0 || railEl === null || daemonEl === null) return;
+    e.preventDefault();
+    const divider = e.currentTarget as HTMLElement;
+    const rail = railEl;
+    const daemon = daemonEl;
+    const pointerId = e.pointerId;
+    const startFrac = filesFrac;
+    let raf = 0;
+    let lastY = e.clientY;
+    let done = false;
+
+    try {
+      divider.setPointerCapture(pointerId);
+    } catch {
+      // capture unavailable; window-level listeners still track the drag
+    }
+    filesDividerActive = true;
+
+    const apply = () => {
+      raf = 0;
+      const railH = rail.getBoundingClientRect().height;
+      const daemonTop = daemon.getBoundingClientRect().top;
+      if (railH <= 0) return;
+      const h = daemonTop - lastY;
+      filesFrac = Math.min(Math.max(h / railH, 0.12), 0.8);
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      lastY = ev.clientY;
+      if (raf === 0) raf = requestAnimationFrame(apply);
+    };
+
+    const finish = (cancel: boolean) => {
+      if (done) return;
+      done = true;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey, true);
+      if (raf !== 0) cancelAnimationFrame(raf);
+      if (cancel) filesFrac = startFrac;
+      filesDividerActive = false;
+    };
+
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId === pointerId) finish(false);
+    };
+    const onCancel = (ev: PointerEvent) => {
+      if (ev.pointerId === pointerId) finish(true);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        finish(true);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey, true);
   }
 </script>
 
 <div class="shell">
   <div class="body">
-    <aside class="rail" class:collapsed={layout.focusMode}>
+    <aside class="rail" class:collapsed={layout.focusMode} bind:this={railEl}>
       <div class="workspace">
         <button
           class="ws-btn"
@@ -522,7 +633,44 @@
         <button class="row new" onclick={() => void newSession("shell")}>+ terminal</button>
       </nav>
 
-      <div class="daemon">
+      {#if workspace !== null}
+        {#if filesOpen}
+          <div
+            class="files-divider"
+            class:active={filesDividerActive}
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="resize files section"
+            onpointerdown={onFilesDividerDown}
+          ></div>
+        {/if}
+        <section class="files" class:open={filesOpen} style:flex-basis={filesOpen ? `${filesFrac * 100}%` : "auto"}>
+          <button
+            class="files-header"
+            aria-expanded={filesOpen}
+            onclick={() => (filesOpen = !filesOpen)}
+          >
+            <svg class="files-chev" class:open={filesOpen} viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+              <path
+                d="M6 4l4 4-4 4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span>files</span>
+          </button>
+          {#if filesOpen}
+            <div class="files-body">
+              <FileTree root={workspace.root} onOpen={openFilePath} activePath={focusedFilePath} />
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      <div class="daemon" bind:this={daemonEl}>
         <span
           class="daemon-dot"
           class:ok={daemonOk}
@@ -548,6 +696,7 @@
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
+            fileNames={fileTitles}
             {ctrl}
           />
         {:else}
@@ -557,6 +706,7 @@
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
+            fileNames={fileTitles}
             {ctrl}
           />
         {/if}
@@ -790,6 +940,86 @@
     font-size: 0.72rem;
     line-height: 1.35;
     color: var(--err);
+  }
+
+  /* --- FILES section --- */
+
+  /* Quiet resize handle between sessions and files; hairline on hover. */
+  .files-divider {
+    flex: none;
+    height: 7px;
+    position: relative;
+    cursor: row-resize;
+    touch-action: none;
+  }
+
+  .files-divider::after {
+    content: "";
+    position: absolute;
+    inset: 3px 12px;
+    border-radius: 1px;
+    background: transparent;
+    transition: background-color 0.12s ease;
+  }
+
+  .files-divider:hover::after {
+    background: var(--edge);
+  }
+
+  .files-divider.active::after {
+    background: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .files {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .files.open {
+    flex-shrink: 0;
+    flex-grow: 0;
+  }
+
+  .files-header {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.9rem;
+    font: inherit;
+    font-size: 0.62rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .files-header:hover {
+    color: var(--fg);
+  }
+
+  .files-chev {
+    flex: none;
+    opacity: 0.7;
+    transition: transform 0.1s ease;
+  }
+
+  .files-chev.open {
+    transform: rotate(90deg);
+  }
+
+  .files-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
   }
 
   .daemon {

@@ -13,6 +13,8 @@ export default defineConfig({
         target: process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
         ws: true,
       },
+      // Ticketed raw file bytes (iframes/images) live outside /api.
+      "/raw": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
     },
   },
 });

@@ -19,6 +19,16 @@
   --scrim: rgba(0, 0, 0, 0.25);
   --overlay-bg: #ffffff;
   --edge: #e3e3e7;
+  /* Syntax accents for the read-only code view (CodeMirror), muted to match
+     the terminal's ANSI palette. */
+  --syn-keyword: #9a4fa8;
+  --syn-string: #2f8a57;
+  --syn-comment: #8a8a93;
+  --syn-number: #a05e2a;
+  --syn-type: #2f7a9b;
+  --syn-func: #3e6fc0;
+  --syn-def: #1d1d20;
+  --syn-prop: #705aa8;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -38,6 +48,14 @@
     --scrim: rgba(0, 0, 0, 0.5);
     --overlay-bg: #1b1b20;
     --edge: #2b2b32;
+    --syn-keyword: #c586d6;
+    --syn-string: #7cc99a;
+    --syn-comment: #7a7a85;
+    --syn-number: #d0a355;
+    --syn-type: #6fb3d2;
+    --syn-func: #82a7e8;
+    --syn-def: #e7e7ea;
+    --syn-prop: #a58fd6;
   }
 }
 

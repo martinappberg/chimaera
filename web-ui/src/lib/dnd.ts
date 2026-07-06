@@ -6,7 +6,7 @@
  * threshold, so plain clicks keep working; Escape cancels an active drag.
  */
 
-import type { Zone } from "./layout";
+import type { Tab, Zone } from "./layout";
 
 /** Modifier-key label for hints ("⌘" on macOS, "Ctrl+" elsewhere). */
 export const MOD_LABEL =
@@ -17,7 +17,8 @@ export type DropSpot =
   | { kind: "tab"; paneId: string; index: number };
 
 export interface DragPayload {
-  sessionId: string;
+  /** The surface being dragged (terminal session or file preview). */
+  tab: Tab;
   label: string;
 }
 
@@ -28,7 +29,7 @@ export interface LayoutCtrl {
   closeTab(paneId: string, index: number): void;
   setRatio(splitId: string, ratio: number): void;
   /** Begin a pointer drag of a tab (click-through handled by the drag). */
-  dragTab(e: PointerEvent, paneId: string, index: number, sessionId: string): void;
+  dragTab(e: PointerEvent, paneId: string, index: number, tab: Tab): void;
   /** Divider drag lifecycle — gates terminal refits. */
   dividerDrag(active: boolean): void;
 }

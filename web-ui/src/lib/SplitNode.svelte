@@ -12,10 +12,11 @@
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
+    fileNames: Map<string, string>;
     ctrl: LayoutCtrl;
   }
 
-  let { node, focusedPaneId, dropSpot, sessions, names, ctrl }: Props = $props();
+  let { node, focusedPaneId, dropSpot, sessions, names, fileNames, ctrl }: Props = $props();
 
   const MIN_PANE_PX = 120;
   const DIVIDER_PX = 8;
@@ -101,11 +102,11 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
     <div
       class="divider"
@@ -115,7 +116,7 @@
       onpointerdowncapture={onDividerDown}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
   </div>
 {/if}

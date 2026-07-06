@@ -42,6 +42,8 @@ pub(crate) struct AppState {
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
+    /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
+    pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
@@ -72,6 +74,7 @@ impl AppState {
             sessions: chimaera_pty::SessionManager::new(),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
+            tickets: Mutex::new(fs::TicketStore::default()),
             changes: tokio::sync::Notify::new(),
             claude_bin: tokio::sync::OnceCell::new(),
         }
@@ -105,6 +108,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
+        .route("/fs/list", get(fs::list))
+        .route("/fs/file", get(fs::file))
+        .route("/fs/markdown", get(fs::markdown))
+        .route("/fs/table", get(fs::table))
+        .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
@@ -114,9 +122,13 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
 
     // The WS routes stay outside the bearer-header middleware: browsers cannot
     // set headers on a WebSocket, so they authenticate via their first frame.
+    // /raw/{ticket} is also unauthenticated: iframes and img tags cannot send
+    // Authorization headers, so a short-lived single-path ticket (minted via
+    // the bearer-authed POST /api/v1/fs/ticket) authorizes each fetch instead.
     let ws = Router::new()
         .route("/ws/sessions/{id}", get(ws::session_ws))
         .route("/ws/events", get(ws::events_ws))
+        .route("/raw/{ticket}", get(fs::raw))
         .with_state(state);
 
     Router::new()
@@ -1316,13 +1328,538 @@ mod tests {
 
     #[tokio::test]
     async fn fs_endpoints_without_token_are_401() {
-        for uri in ["/api/v1/fs/home", "/api/v1/fs/dirs?path=/"] {
+        for uri in [
+            "/api/v1/fs/home",
+            "/api/v1/fs/dirs?path=/",
+            "/api/v1/fs/list?path=/",
+            "/api/v1/fs/file?path=/etc/hosts",
+            "/api/v1/fs/markdown?path=/x.md",
+            "/api/v1/fs/table?path=/x.csv",
+        ] {
             let res = app(test_state())
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+        // The ticket mint is a POST and equally protected.
+        let res = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/fs/ticket")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"/etc/hosts"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Like `request`, but returns the raw response: status, headers, bytes.
+    /// `token: None` sends no Authorization header (for /raw).
+    async fn request_bytes(
+        state: &Arc<AppState>,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, bytes::Bytes) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let res = app(state.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, bytes)
+    }
+
+    fn header_str<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+        headers
+            .get(name)
+            .unwrap_or_else(|| panic!("missing header {name}"))
+            .to_str()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fs_list_dirs_first_sorted_with_metadata() {
+        let state = test_state();
+        let root = test_dir("fs-full-list");
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::create_dir(root.join("Docs")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("README.md"), "hello").unwrap();
+        std::fs::write(root.join("app.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let uri = format!("/api/v1/fs/list?path={}", root.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["path"].as_str().unwrap(), canonical.to_str().unwrap());
+        assert_eq!(
+            json["parent"].as_str().unwrap(),
+            canonical.parent().unwrap().to_str().unwrap()
+        );
+
+        // Dirs first (case-insensitive), then files; dot entries and broken
+        // symlinks excluded.
+        let entries = json["entries"].as_array().unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Docs", "src", "app.rs", "README.md"]);
+        assert_eq!(entries[0]["kind"], "dir");
+        assert_eq!(entries[1]["kind"], "dir");
+        assert_eq!(entries[2]["kind"], "file");
+        assert_eq!(entries[3]["kind"], "file");
+        assert_eq!(entries[3]["size"], 5); // "hello"
+        assert!(entries[3]["mtime"].as_u64().unwrap() > 0);
+        assert_eq!(
+            entries[2]["path"].as_str().unwrap(),
+            canonical.join("app.rs").to_str().unwrap()
+        );
+
+        // hidden=true adds the dot entries in their sorted spots.
+        let uri = format!(
+            "/api/v1/fs/list?path={}&hidden=true",
+            root.to_string_lossy()
+        );
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [".git", "Docs", "src", ".env", "app.rs", "README.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_list_rejects_files_and_missing_paths() {
+        let state = test_state();
+        let root = test_dir("fs-list-bad");
+        let file = root.join("plain.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        for path in [
+            file.to_string_lossy().into_owned(),
+            "/definitely/not/a/dir".into(),
+        ] {
+            let uri = format!("/api/v1/fs/list?path={path}");
+            let (status, err) = request(&state, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(err["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_file_serves_slices_with_size_headers() {
+        let state = test_state();
+        let root = test_dir("fs-file");
+        let path = root.join("notes.txt");
+        std::fs::write(&path, "0123456789").unwrap();
+        let path = path.to_string_lossy();
+
+        // Whole file by default.
+        let uri = format!("/api/v1/fs/file?path={path}");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"0123456789");
+        assert!(header_str(&headers, "content-type").starts_with("text/plain"));
+        assert_eq!(header_str(&headers, "x-file-size"), "10");
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+
+        // A middle slice reports truncation.
+        let uri = format!("/api/v1/fs/file?path={path}&offset=3&limit=4");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"3456");
+        assert_eq!(header_str(&headers, "x-file-size"), "10");
+        assert_eq!(header_str(&headers, "x-truncated"), "true");
+
+        // A slice ending exactly at EOF is not truncated.
+        let uri = format!("/api/v1/fs/file?path={path}&offset=6&limit=4");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"6789");
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+
+        // An offset past EOF yields an empty, non-truncated body.
+        let uri = format!("/api/v1/fs/file?path={path}&offset=100");
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(header_str(&headers, "x-truncated"), "false");
+    }
+
+    #[tokio::test]
+    async fn fs_file_limit_is_capped_at_2mb() {
+        let state = test_state();
+        let root = test_dir("fs-file-cap");
+        let path = root.join("big.bin");
+        std::fs::write(&path, vec![0x42u8; 3 * 1024 * 1024]).unwrap();
+
+        let uri = format!(
+            "/api/v1/fs/file?path={}&limit=99999999",
+            path.to_string_lossy()
+        );
+        let (status, headers, body) =
+            request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.len(), 2 * 1024 * 1024);
+        assert_eq!(
+            header_str(&headers, "x-file-size"),
+            (3 * 1024 * 1024).to_string()
+        );
+        assert_eq!(header_str(&headers, "x-truncated"), "true");
+    }
+
+    #[tokio::test]
+    async fn fs_file_rejects_dirs_and_missing_paths() {
+        let state = test_state();
+        let root = test_dir("fs-file-bad");
+
+        for path in [
+            root.to_string_lossy().into_owned(),
+            "/no/such/file.txt".into(),
+        ] {
+            let uri = format!("/api/v1/fs/file?path={path}");
+            let (status, err) = request(&state, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(err["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_markdown_renders_gfm_and_sanitizes() {
+        let state = test_state();
+        let root = test_dir("fs-md");
+        let path = root.join("doc.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "# Title\n\n",
+                "~~old~~ new, see https://example.com\n\n",
+                "| a | b |\n|---|---|\n| 1 | 2 |\n\n",
+                "<script>alert('xss')</script>\n\n",
+                "<img src=\"x.png\" onerror=\"alert('xss')\">\n",
+            ),
+        )
+        .unwrap();
+
+        let uri = format!("/api/v1/fs/markdown?path={}", path.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = json["html"].as_str().unwrap();
+
+        // GFM features render.
+        assert!(html.contains("<h1>Title</h1>"), "no heading in {html}");
+        assert!(
+            html.contains("<del>old</del>"),
+            "no strikethrough in {html}"
+        );
+        assert!(html.contains("<table>"), "no table in {html}");
+        assert!(
+            html.contains("<a href=\"https://example.com\""),
+            "no autolink in {html}"
+        );
+        // Sanitization strips script tags and event handlers but keeps the img.
+        assert!(!html.contains("<script"), "script survived in {html}");
+        assert!(!html.contains("onerror"), "onerror survived in {html}");
+        assert!(!html.contains("alert("), "alert survived in {html}");
+        assert!(
+            html.contains("<img src=\"x.png\""),
+            "img stripped in {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_markdown_rejects_oversize_dirs_and_missing() {
+        let state = test_state();
+        let root = test_dir("fs-md-bad");
+
+        // One byte over the 4MB limit is a 400.
+        let big = root.join("big.md");
+        std::fs::write(&big, "a".repeat(4 * 1024 * 1024 + 1)).unwrap();
+        let uri = format!("/api/v1/fs/markdown?path={}", big.to_string_lossy());
+        let (status, err) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("too large"));
+
+        for path in [
+            root.to_string_lossy().into_owned(),
+            "/no/such/doc.md".into(),
+        ] {
+            let uri = format!("/api/v1/fs/markdown?path={path}");
+            let (status, err) = request(&state, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(err["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_table_pages_csv_with_header() {
+        let state = test_state();
+        let root = test_dir("fs-table");
+        let path = root.join("data.csv");
+        let mut csv = String::from("name,value,note\n");
+        for i in 0..8 {
+            csv.push_str(&format!("row{i},{i},\"has, comma\"\n"));
+        }
+        std::fs::write(&path, csv).unwrap();
+        let path = path.to_string_lossy();
+
+        // Defaults: all 8 rows fit in one 200-row page.
+        let uri = format!("/api/v1/fs/table?path={path}");
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["columns"],
+            serde_json::json!(["name", "value", "note"])
+        );
+        assert_eq!(json["rows"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            json["rows"][0],
+            serde_json::json!(["row0", "0", "has, comma"])
+        );
+        assert_eq!(json["offset"], 0);
+        assert_eq!(json["truncated"], false);
+
+        // A limited page is truncated.
+        let uri = format!("/api/v1/fs/table?path={path}&limit_rows=3");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(json["rows"][2][0], "row2");
+        assert_eq!(json["truncated"], true);
+
+        // The final short page is not.
+        let uri = format!("/api/v1/fs/table?path={path}&offset_rows=6&limit_rows=3");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(json["rows"][0][0], "row6");
+        assert_eq!(json["offset"], 6);
+        assert_eq!(json["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn fs_table_sniffs_delimiters() {
+        let state = test_state();
+        let root = test_dir("fs-table-sniff");
+
+        // .tsv extension forces tabs.
+        let tsv = root.join("data.tsv");
+        std::fs::write(&tsv, "a\tb\n1\t2\n").unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", tsv.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["rows"][0], serde_json::json!(["1", "2"]));
+
+        // Unknown extension: a tab in the first line wins over commas.
+        let weird = root.join("export.data");
+        std::fs::write(&weird, "x\ty\n3\t4\n").unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", weird.to_string_lossy());
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["x", "y"]));
+
+        // Explicit delim=tab overrides a .csv extension.
+        let mixed = root.join("tabs.csv");
+        std::fs::write(&mixed, "p\tq\n5\t6\n").unwrap();
+        let uri = format!(
+            "/api/v1/fs/table?path={}&delim=tab",
+            mixed.to_string_lossy()
+        );
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["columns"], serde_json::json!(["p", "q"]));
+
+        // An unsupported delim value is a 400.
+        let uri = format!("/api/v1/fs/table?path={}&delim=pipe", tsv.to_string_lossy());
+        let (status, err) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("delimiter"));
+    }
+
+    #[tokio::test]
+    async fn fs_table_caps_rows_and_rejects_gz_dirs_missing() {
+        let state = test_state();
+        let root = test_dir("fs-table-bad");
+
+        // limit_rows above the 1000 cap clamps to 1000.
+        let big = root.join("big.csv");
+        let mut csv = String::from("n\n");
+        for i in 0..1200 {
+            csv.push_str(&format!("{i}\n"));
+        }
+        std::fs::write(&big, csv).unwrap();
+        let uri = format!(
+            "/api/v1/fs/table?path={}&limit_rows=1200",
+            big.to_string_lossy()
+        );
+        let (status, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["rows"].as_array().unwrap().len(), 1000);
+        assert_eq!(json["truncated"], true);
+
+        // .gz is a clear 400 until the gzip tier lands.
+        let gz = root.join("data.csv.gz");
+        std::fs::write(&gz, [0x1f, 0x8b, 0x08]).unwrap();
+        let uri = format!("/api/v1/fs/table?path={}", gz.to_string_lossy());
+        let (status, err) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("not supported"));
+
+        for path in [
+            root.to_string_lossy().into_owned(),
+            "/no/such/data.csv".into(),
+        ] {
+            let uri = format!("/api/v1/fs/table?path={path}");
+            let (status, err) = request(&state, Method::GET, &uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(err["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_ticket_mints_and_raw_serves_without_auth() {
+        let state = test_state();
+        let root = test_dir("fs-ticket");
+        let path = root.join("pic.png");
+        std::fs::write(&path, b"\x89PNG fake image bytes").unwrap();
+
+        // Mint (bearer-authed).
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/ticket",
+            Some(serde_json::json!({"path": path.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ticket = json["ticket"].as_str().unwrap().to_string();
+        assert!(ticket.starts_with("t-"), "bad ticket {ticket}");
+        assert_eq!(ticket.len(), 34, "bad ticket {ticket}");
+        assert!(ticket[2..]
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+
+        // Fetch with NO Authorization header.
+        let uri = format!("/raw/{ticket}");
+        let (status, headers, body) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"\x89PNG fake image bytes");
+        assert_eq!(header_str(&headers, "content-type"), "image/png");
+        assert!(headers.get("content-security-policy").is_none());
+
+        // Tickets are reusable within their TTL (an <img> may refetch).
+        let (status, _, _) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Unknown tickets are 404s.
+        let (status, _, _) = request_bytes(
+            &state,
+            Method::GET,
+            "/raw/t-00000000000000000000000000000000",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A file that vanished after minting is a 404 too.
+        std::fs::remove_file(&path).unwrap();
+        let (status, _, _) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Minting for a directory or a missing file is a 400.
+        for bad in [
+            root.to_string_lossy().into_owned(),
+            "/no/such/pic.png".into(),
+        ] {
+            let (status, err) = request(
+                &state,
+                Method::POST,
+                "/api/v1/fs/ticket",
+                Some(serde_json::json!({"path": bad})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(err["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_ticket_expires() {
+        let state = test_state();
+        let root = test_dir("fs-ticket-expiry");
+        let path = root.join("page.txt");
+        std::fs::write(&path, "still here").unwrap();
+
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/ticket",
+            Some(serde_json::json!({"path": path.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ticket = json["ticket"].as_str().unwrap().to_string();
+
+        let uri = format!("/raw/{ticket}");
+        let (status, _, _) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Once expired the ticket is gone for good, even though the file
+        // still exists.
+        lock(&state.tickets).expire(&ticket);
+        let (status, _, _) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn raw_html_is_sandboxed() {
+        let state = test_state();
+        let root = test_dir("fs-raw-html");
+        let path = root.join("report.html");
+        std::fs::write(&path, "<h1>hi</h1><script>runs_in_sandbox()</script>").unwrap();
+
+        let (_, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/ticket",
+            Some(serde_json::json!({"path": path.to_string_lossy()})),
+        )
+        .await;
+        let ticket = json["ticket"].as_str().unwrap();
+
+        let uri = format!("/raw/{ticket}");
+        let (status, headers, body) = request_bytes(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header_str(&headers, "content-type"), "text/html");
+        assert_eq!(
+            header_str(&headers, "content-security-policy"),
+            "sandbox allow-scripts"
+        );
+        assert_eq!(header_str(&headers, "referrer-policy"), "no-referrer");
+        // Raw bytes pass through unmodified — the sandbox does the confining.
+        assert_eq!(&body[..], b"<h1>hi</h1><script>runs_in_sandbox()</script>");
     }
 
     #[tokio::test]

@@ -278,6 +278,26 @@ rail is the source of truth for lifecycle). Keyboard: Cmd/Ctrl+Alt+Left/Right cy
 the focused pane. Cmd+T/Cmd+W stay unbound in the browser (tab-collision; the Tauri shell
 owns them properly). At M3, files open the same way: a preview tab in the focused pane.
 
+**The parity principle (author, 2026-07-06): every action has BOTH a keyboard chord and a
+discoverable mouse path.** Keyboard for speed, mouse for discovery — neither is a fallback.
+Concretely for panes:
+
+- **Hover controls**: a quiet control cluster fades in (≤120 ms) at the top-right of the
+  hovered pane — split right, split down, zoom, close view — invisible otherwise, so the
+  common case stays chrome-free but every pane operation is one visible click.
+- **Zoom is clickable both ways**: the hover cluster's zoom control enters it; the zoom
+  badge shown while zoomed is a button that exits it. Double-clicking a tab also
+  zoom-toggles its pane.
+- **Double-click a divider** resets the split to 50/50.
+- Every hover control's tooltip teaches its chord ("zoom ⇧⌘↵") — the mouse path is how the
+  keyboard path gets learned.
+
+**Discoverability rules** (from first real use, 2026-07-06): the tab bar shows whenever the
+window has more than one pane — even for single-tab panes — because a hidden tab bar leaves
+the common pane with no drag handle; it hides only in the single-pane single-tab case. And
+every mode needs a mouse exit: clicking the workspace name in the strip leaves focus mode
+(tooltip "show sidebar ⌘B") — a mode you can only exit via a chord is a trap.
+
 **Quality bar ("SOTA usable"):** divider drags and tab drags at 60 fps with translucent
 drop-zone previews showing exactly where things land; transitions fast (≤120 ms) and few;
 fully keyboard-operable; visible focus states; zero layout jank on resize (terminal refit is
@@ -370,6 +390,27 @@ dismissible banner, never a forced landing. Attaching to a session with unseen a
 overlays a **recap card** (final state, last assistant gist, diffstat, elapsed); any key
 dismisses it.
 
+**The agent launcher (author request, 2026-07-06).** "+ new agent" is a split button: the
+main surface spawns your **default config instantly** (default = latest chosen, persisted);
+hover (~150 ms) or the chevron opens the launcher popover:
+
+- **Agent rows** — Claude Code, Codex, Gemini CLI…: the daemon detects what's installed
+  (login-shell `command -v` per known binary, cached; version probed). Installed agents are
+  selectable with a **model** picker (curated per-agent list — e.g. opus/sonnet/haiku via
+  `--model`); selecting spawns and becomes the new default.
+- **Uninstalled agents stay visible but muted, with an install action** — which opens a new
+  terminal session in the workspace with the install command **pre-typed, not executed**
+  (transparent, user presses Enter; our own terminals are the install UI).
+- **Resume section** — recent resumable Claude sessions *for this workspace* (cwd-scoped, from
+  the same `~/.claude/projects` JSONL store the naming pipeline reads): title, age; selecting
+  spawns `claude --resume <id>` in a PTY. Searchable past ~8 entries.
+
+Server surface: `GET /api/v1/agents` (installed/version/models/install-hint per agent),
+`GET /api/v1/agents/claude/sessions?workspace_id=` (resumables), and POST /sessions gains
+`agent`, `model`, `resume`. Non-claude agents start as plain TUI sessions (hook-driven
+attention states are claude-only until their integrations land; the UI shows their state as
+the muted unknown dot, honestly).
+
 **Triage dashboard (Leader-d).** Groups top to bottom: **Needs you** (needs_permission +
 idle_prompt + errored), sorted longest-blocked first, rows "ripen" (border saturates with
 age), never folds; **Rate-limited** pinned with reset countdown + auto-resume toggle;
@@ -446,6 +487,27 @@ so each new format is one server match-arm + one UI component.
   resolved), PDF (pdf.js via range requests), JSON/JSONL tree view, chunked text/code for giant
   files, hex fallback.
 - Directory listings decorated with git status and scratch-vs-home filesystem hints.
+
+**File-navigation niceties (author request 2026-07-06, second pass after M3 wave 1):**
+
+- **File-type icons**: a small curated set of inline 14–16 px SVG glyphs (no icon-font
+  dependency), one per category — code, data/table, document/markdown, image, HTML/report,
+  notebook, archive, config, binary — monochrome line style with a muted per-category tint
+  from the existing palette. Scientific formats get first-class icons (fastq/fasta, bam/cram,
+  vcf, parquet, bed/gtf) — a bioinformatics tree that *reads* at a glance is a differentiator
+  no general editor bothers with.
+- **Session-type icons, same system**: sessions carry a leading type glyph everywhere they
+  appear (rail rows, pane tabs, strip chips, launcher rows, later the dashboard) — plain
+  terminal = prompt glyph, Claude Code = spark-style glyph, Codex / Gemini = their own
+  distinct marks. Type glyph and state dot coexist and mean different things: the glyph says
+  *which tool*, the dot says *what state*. Trademark care: original abstract marks evoking
+  each agent, never embedded vendor logos (this ships in an open-source binary).
+- **Quick-open search (Cmd/Ctrl+P)**: one palette overlay (same visual language as the folder
+  picker) fuzzy-matching **files and sessions** in the active workspace — files open as tabs
+  in the focused pane, sessions focus. Server side: a workspace file-index endpoint (walker
+  with .git/node_modules/target/venv ignores, result cap, mtime-ranked); content search
+  (ripgrep-style) is a later wave. A small filter affordance at the top of the rail's files
+  section covers the browse-narrowing case without opening the palette.
 
 ### Git + Slurm
 

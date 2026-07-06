@@ -1,8 +1,8 @@
 /**
  * The in-window layout tree: internal nodes are row/col splits with a
  * draggable ratio, leaves are panes, and a pane holds a stack of tabs
- * (surfaces). Today every surface is a terminal session; the model stays
- * surface-agnostic so file previews can arrive later as new tab kinds.
+ * (surfaces). Surfaces are terminal sessions or read-only file previews;
+ * the model stays surface-agnostic so further tab kinds can arrive later.
  *
  * Everything here is pure and DOM-free: ops take a Layout and return a new
  * Layout (structural sharing where nothing changed), which keeps Svelte 5
@@ -14,12 +14,22 @@ export type SplitDir = "row" | "col";
 export type FocusDir = "left" | "right" | "up" | "down";
 export type Zone = "left" | "right" | "top" | "bottom" | "center";
 
-/** A surface shown as a tab. Extend this union for file previews at M3. */
+/** A surface shown as a tab. */
 export interface TerminalTab {
   surface: "terminal";
   sessionId: string;
 }
-export type Tab = TerminalTab;
+export interface FileTab {
+  surface: "file";
+  /** Absolute path on the daemon's filesystem. */
+  path: string;
+}
+export type Tab = TerminalTab | FileTab;
+
+/** Identity key for the no-duplicates invariant (one tab per surface). */
+export function tabKey(t: Tab): string {
+  return t.surface === "terminal" ? `s:${t.sessionId}` : `f:${t.path}`;
+}
 
 export interface PaneNode {
   type: "pane";
@@ -83,13 +93,11 @@ export function findPane(node: LayoutNode, id: string): PaneNode | null {
   return findPane(node.a, id) ?? findPane(node.b, id);
 }
 
-/** Where a session is open, if anywhere (the no-duplicates invariant). */
-export function paneForSession(
-  node: LayoutNode,
-  sessionId: string,
-): { paneId: string; index: number } | null {
+/** Where a surface is open, if anywhere (the no-duplicates invariant). */
+export function paneForTab(node: LayoutNode, tab: Tab): { paneId: string; index: number } | null {
+  const key = tabKey(tab);
   for (const p of panes(node)) {
-    const index = p.tabs.findIndex((t) => t.sessionId === sessionId);
+    const index = p.tabs.findIndex((t) => tabKey(t) === key);
     if (index >= 0) return { paneId: p.id, index };
   }
   return null;
@@ -98,14 +106,37 @@ export function paneForSession(
 /** Every session shown anywhere in the tree. */
 export function allSessionIds(l: Layout): string[] {
   const out: string[] = [];
-  for (const p of panes(l.root)) for (const t of p.tabs) out.push(t.sessionId);
+  for (const p of panes(l.root))
+    for (const t of p.tabs) if (t.surface === "terminal") out.push(t.sessionId);
   return out;
 }
 
-/** The focused pane's active session, if it has one. */
+/** Every file path shown anywhere in the tree. */
+export function allFilePaths(l: Layout): string[] {
+  const out: string[] = [];
+  for (const p of panes(l.root)) for (const t of p.tabs) if (t.surface === "file") out.push(t.path);
+  return out;
+}
+
+/** Total number of tabs of any kind. */
+export function tabCount(l: Layout): number {
+  let n = 0;
+  for (const p of panes(l.root)) n += p.tabs.length;
+  return n;
+}
+
+/** The focused pane's active session, if its active tab is a terminal. */
 export function focusedSession(l: Layout): string | null {
   const p = findPane(l.root, l.focusedPaneId);
-  return p?.tabs[p.active]?.sessionId ?? null;
+  const t = p?.tabs[p.active];
+  return t !== undefined && t.surface === "terminal" ? t.sessionId : null;
+}
+
+/** The focused pane's active file path, if its active tab is a file. */
+export function focusedFile(l: Layout): string | null {
+  const p = findPane(l.root, l.focusedPaneId);
+  const t = p?.tabs[p.active];
+  return t !== undefined && t.surface === "file" ? t.path : null;
 }
 
 /**
@@ -232,11 +263,11 @@ export function detachTab(l: Layout, paneId: string, index: number): Layout {
 }
 
 /**
- * Open a session: focus its existing tab if it is open anywhere (VS Code
+ * Open a surface: focus its existing tab if it is open anywhere (VS Code
  * semantics, no duplicates), otherwise append it to the focused pane.
  */
-export function openSession(l: Layout, sessionId: string): Layout {
-  const loc = paneForSession(l.root, sessionId);
+export function openTab(l: Layout, tab: Tab): Layout {
+  const loc = paneForTab(l.root, tab);
   if (loc !== null) {
     return activateTab(l, loc.paneId, loc.index);
   }
@@ -244,10 +275,18 @@ export function openSession(l: Layout, sessionId: string): Layout {
   if (paneId === undefined) return l;
   const root = withPane(l.root, paneId, (p) => ({
     ...p,
-    tabs: [...p.tabs, { surface: "terminal", sessionId }],
+    tabs: [...p.tabs, tab],
     active: p.tabs.length,
   }));
   return normalize({ ...l, root, focusedPaneId: paneId });
+}
+
+export function openSession(l: Layout, sessionId: string): Layout {
+  return openTab(l, { surface: "terminal", sessionId });
+}
+
+export function openFile(l: Layout, path: string): Layout {
+  return openTab(l, { surface: "file", path });
 }
 
 /** Cycle the focused pane's active tab by `delta` (wraps). */
@@ -266,13 +305,13 @@ export function toggleZoom(l: Layout): Layout {
 }
 
 /**
- * Drop a session onto a pane. Edge zones tear off into a new split on that
- * side; center adds (or moves) the tab into the pane. The session's existing
+ * Drop a surface onto a pane. Edge zones tear off into a new split on that
+ * side; center adds (or moves) the tab into the pane. The surface's existing
  * tab, if any, is detached first — the no-duplicates invariant holds.
  */
-export function dropSession(l: Layout, sessionId: string, targetPaneId: string, zone: Zone): Layout {
+export function dropTab(l: Layout, tab: Tab, targetPaneId: string, zone: Zone): Layout {
   if (findPane(l.root, targetPaneId) === null) return l;
-  const src = paneForSession(l.root, sessionId);
+  const src = paneForTab(l.root, tab);
 
   if (zone === "center") {
     if (src !== null && src.paneId === targetPaneId) {
@@ -282,7 +321,7 @@ export function dropSession(l: Layout, sessionId: string, targetPaneId: string, 
     if (findPane(next.root, targetPaneId) === null) return l;
     const root = withPane(next.root, targetPaneId, (p) => ({
       ...p,
-      tabs: [...p.tabs, { surface: "terminal", sessionId }],
+      tabs: [...p.tabs, tab],
       active: p.tabs.length,
     }));
     return normalize({ ...next, root, focusedPaneId: targetPaneId });
@@ -298,7 +337,7 @@ export function dropSession(l: Layout, sessionId: string, targetPaneId: string, 
   const np: PaneNode = {
     type: "pane",
     id: uid(),
-    tabs: [{ surface: "terminal", sessionId }],
+    tabs: [tab],
     active: 0,
   };
   const dir: SplitDir = zone === "left" || zone === "right" ? "row" : "col";
@@ -307,13 +346,13 @@ export function dropSession(l: Layout, sessionId: string, targetPaneId: string, 
 }
 
 /**
- * Move a session's tab to `index` within `paneId`'s tab bar (reorder or
- * cross-pane move); a session not open anywhere is inserted fresh.
+ * Move a surface's tab to `index` within `paneId`'s tab bar (reorder or
+ * cross-pane move); a surface not open anywhere is inserted fresh.
  */
-export function moveTabToIndex(l: Layout, sessionId: string, paneId: string, index: number): Layout {
+export function moveTabToIndex(l: Layout, tab: Tab, paneId: string, index: number): Layout {
   const target = findPane(l.root, paneId);
   if (target === null) return l;
-  const src = paneForSession(l.root, sessionId);
+  const src = paneForTab(l.root, tab);
   if (src !== null && src.paneId === paneId) {
     const insertAt = index > src.index ? index - 1 : index;
     if (insertAt === src.index) return activateTab(l, paneId, src.index);
@@ -327,24 +366,25 @@ export function moveTabToIndex(l: Layout, sessionId: string, paneId: string, ind
   const at = Math.min(Math.max(index, 0), t.tabs.length);
   const root = withPane(next.root, paneId, (x) => ({
     ...x,
-    tabs: x.tabs.toSpliced(at, 0, { surface: "terminal", sessionId }),
+    tabs: x.tabs.toSpliced(at, 0, tab),
     active: at,
   }));
   return normalize({ ...next, root, focusedPaneId: paneId });
 }
 
 /**
- * Drop tabs whose sessions no longer exist; panes emptied by pruning close
- * (the last pane survives, empty).
+ * Drop tabs failing `keep`; panes emptied by pruning close (the last pane
+ * survives, empty). The active tab follows its surface when it survives.
  */
-export function pruneSessions(l: Layout, live: ReadonlySet<string>): Layout {
+function pruneTabs(l: Layout, keep: (t: Tab) => boolean): Layout {
   const walk = (node: LayoutNode): LayoutNode | null => {
     if (node.type === "pane") {
-      const tabs = node.tabs.filter((t) => live.has(t.sessionId));
+      const tabs = node.tabs.filter(keep);
       if (tabs.length === node.tabs.length) return node;
       if (tabs.length === 0) return null;
-      const activeSession = node.tabs[node.active]?.sessionId;
-      const keptActive = tabs.findIndex((t) => t.sessionId === activeSession);
+      const activeTab = node.tabs[node.active];
+      const keptActive =
+        activeTab !== undefined ? tabs.findIndex((t) => tabKey(t) === tabKey(activeTab)) : -1;
       const active = keptActive >= 0 ? keptActive : Math.min(node.active, tabs.length - 1);
       return { ...node, tabs, active };
     }
@@ -358,6 +398,16 @@ export function pruneSessions(l: Layout, live: ReadonlySet<string>): Layout {
   const root = walk(l.root);
   if (root === l.root) return l;
   return normalize({ ...l, root: root ?? emptyPane() });
+}
+
+/** Drop terminal tabs whose sessions no longer exist; file tabs are untouched. */
+export function pruneSessions(l: Layout, live: ReadonlySet<string>): Layout {
+  return pruneTabs(l, (t) => t.surface !== "terminal" || live.has(t.sessionId));
+}
+
+/** Drop file tabs whose paths are known-dead (404 on restore). */
+export function pruneFiles(l: Layout, dead: ReadonlySet<string>): Layout {
+  return pruneTabs(l, (t) => t.surface !== "file" || !dead.has(t.path));
 }
 
 // --- geometric focus navigation -------------------------------------------
@@ -421,10 +471,12 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 
 // --- (de)serialization ------------------------------------------------------
 
+/** Tab wire form: `{s}` terminal, `{f}` file (additive within blob v1). */
+type STab = { s: string } | { f: string };
 interface SPane {
   t: "p";
   id: string;
-  tabs: { s: string }[];
+  tabs: STab[];
   active: number;
 }
 interface SSplit {
@@ -439,7 +491,14 @@ type SNode = SPane | SSplit;
 
 function serNode(node: LayoutNode): SNode {
   if (node.type === "pane") {
-    return { t: "p", id: node.id, tabs: node.tabs.map((t) => ({ s: t.sessionId })), active: node.active };
+    return {
+      t: "p",
+      id: node.id,
+      tabs: node.tabs.map((t): STab =>
+        t.surface === "terminal" ? { s: t.sessionId } : { f: t.path },
+      ),
+      active: node.active,
+    };
   }
   return { t: "s", id: node.id, dir: node.dir, ratio: node.ratio, a: serNode(node.a), b: serNode(node.b) };
 }
@@ -463,7 +522,7 @@ function deserNode(
   raw: unknown,
   depth: number,
   ids: Set<string>,
-  seenSessions: Set<string>,
+  seenTabs: Set<string>,
 ): LayoutNode | null {
   if (!isRecord(raw) || depth > MAX_DEPTH) return null;
   if (typeof raw.id !== "string" || raw.id.length === 0 || raw.id.length > 64 || ids.has(raw.id)) {
@@ -474,10 +533,19 @@ function deserNode(
     if (!Array.isArray(raw.tabs) || typeof raw.active !== "number") return null;
     const tabs: Tab[] = [];
     for (const t of raw.tabs) {
-      if (!isRecord(t) || typeof t.s !== "string" || t.s.length === 0) return null;
-      if (seenSessions.has(t.s)) continue; // enforce no-duplicates on load
-      seenSessions.add(t.s);
-      tabs.push({ surface: "terminal", sessionId: t.s });
+      if (!isRecord(t)) return null;
+      let tab: Tab;
+      if (typeof t.s === "string" && t.s.length > 0) {
+        tab = { surface: "terminal", sessionId: t.s };
+      } else if (typeof t.f === "string" && t.f.length > 0 && t.f.length <= 4096) {
+        tab = { surface: "file", path: t.f };
+      } else {
+        return null;
+      }
+      const key = tabKey(tab);
+      if (seenTabs.has(key)) continue; // enforce no-duplicates on load
+      seenTabs.add(key);
+      tabs.push(tab);
     }
     const active = Number.isInteger(raw.active) ? raw.active : 0;
     return { type: "pane", id: raw.id, tabs, active };
@@ -485,8 +553,8 @@ function deserNode(
   if (raw.t === "s") {
     if (raw.dir !== "row" && raw.dir !== "col") return null;
     if (typeof raw.ratio !== "number") return null;
-    const a = deserNode(raw.a, depth + 1, ids, seenSessions);
-    const b = deserNode(raw.b, depth + 1, ids, seenSessions);
+    const a = deserNode(raw.a, depth + 1, ids, seenTabs);
+    const b = deserNode(raw.b, depth + 1, ids, seenTabs);
     if (a === null || b === null) return null;
     return { type: "split", id: raw.id, dir: raw.dir, ratio: clampRatio(raw.ratio), a, b };
   }
@@ -531,10 +599,22 @@ if (import.meta.env.DEV) {
   ok(allSessionIds(l).length === 1, "openSession never duplicates");
   ok(l.focusedPaneId !== firstPane, "openSession focuses the pane already holding the session");
 
+  // openFile dedupes across panes exactly like sessions
+  l = focusPane(l, firstPane);
+  l = openFile(l, "/tmp/a.txt");
+  ok(l.focusedPaneId === firstPane, "openFile lands in the focused pane");
+  l = focusPane(l, panes(l.root).find((p) => p.id !== firstPane)?.id ?? firstPane);
+  l = openFile(l, "/tmp/a.txt");
+  ok(allFilePaths(l).length === 1, "openFile never duplicates");
+  ok(l.focusedPaneId === firstPane, "openFile focuses the pane already holding the file");
+
   // detaching the last tab collapses the pane back to a single-pane tree
-  const loc = paneForSession(l.root, "sessA");
-  ok(loc !== null, "session is findable");
-  if (loc !== null) l = detachTab(l, loc.paneId, loc.index);
+  const locA = paneForTab(l.root, { surface: "file", path: "/tmp/a.txt" });
+  ok(locA !== null, "file tab is findable");
+  if (locA !== null) l = detachTab(l, locA.paneId, locA.index);
+  const locS = paneForTab(l.root, { surface: "terminal", sessionId: "sessA" });
+  ok(locS !== null, "session is findable");
+  if (locS !== null) l = detachTab(l, locS.paneId, locS.index);
   ok(panes(l.root).length === 1, "empty pane collapses into its sibling");
 
   // geometric focus: A | (B over C) — from A moving right lands in B or C,
@@ -561,18 +641,28 @@ if (import.meta.env.DEV) {
   g = focusPane(g, a);
   ok(g.zoomedPaneId === null, "focus change clears zoom");
 
-  // serialize -> deserialize round-trips the tree shape
+  // serialize -> deserialize round-trips the tree shape, including file tabs
+  g = openFile(g, "/tmp/readme.md");
   const round = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(g))));
   ok(round !== null, "serialized layout deserializes");
   ok(round !== null && panes(round.root).length === panes(g.root).length, "round-trip keeps pane count");
   ok(round !== null && round.focusedPaneId === g.focusedPaneId, "round-trip keeps focus");
+  ok(
+    round !== null && allFilePaths(round).join() === "/tmp/readme.md",
+    "round-trip keeps file tabs",
+  );
   ok(deserializeLayout({ v: 1, root: { t: "x" } }) === null, "malformed blobs are rejected");
 
-  // pruning dead sessions collapses emptied panes
+  // pruning dead sessions collapses emptied panes but never touches files
   let pr = defaultLayout();
   pr = openSession(pr, "s1");
+  pr = openFile(pr, "/tmp/keep.md");
   pr = splitPane(pr, pr.focusedPaneId, "row");
   pr = openSession(pr, "s2");
   pr = pruneSessions(pr, new Set(["s1"]));
   ok(panes(pr.root).length === 1 && allSessionIds(pr).join() === "s1", "prune drops dead tabs and panes");
+  ok(allFilePaths(pr).join() === "/tmp/keep.md", "session prune keeps file tabs");
+  pr = pruneFiles(pr, new Set(["/tmp/keep.md"]));
+  ok(allFilePaths(pr).length === 0, "file prune drops dead file tabs");
+  ok(allSessionIds(pr).join() === "s1", "file prune keeps sessions");
 }

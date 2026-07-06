@@ -5,6 +5,7 @@
   import { MOD_LABEL, registerPane, unregisterPane } from "./dnd";
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
+  import FileView from "./FileView.svelte";
 
   interface Props {
     node: PaneNode;
@@ -14,10 +15,20 @@
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
+    fileNames: Map<string, string>;
     ctrl: LayoutCtrl;
   }
 
-  let { node, focusedPaneId, zoomed = false, dropSpot, sessions, names, ctrl }: Props = $props();
+  let {
+    node,
+    focusedPaneId,
+    zoomed = false,
+    dropSpot,
+    sessions,
+    names,
+    fileNames,
+    ctrl,
+  }: Props = $props();
 
   const focused = $derived(node.id === focusedPaneId);
   const activeTab = $derived(node.tabs[node.active] ?? null);
@@ -47,11 +58,15 @@
   onpointerdowncapture={() => ctrl.focusPane(node.id)}
 >
   {#if node.tabs.length > 1}
-    <PaneTabs {node} {sessions} {names} {dropSpot} {ctrl} bind:el={tabbarEl} />
+    <PaneTabs {node} {sessions} {names} {fileNames} {dropSpot} {ctrl} bind:el={tabbarEl} />
   {/if}
   <div class="content" bind:this={contentEl}>
     {#if activeTab !== null}
-      <TerminalView sessionId={activeTab.sessionId} {focused} />
+      {#if activeTab.surface === "terminal"}
+        <TerminalView sessionId={activeTab.sessionId} {focused} />
+      {:else}
+        <FileView path={activeTab.path} />
+      {/if}
     {:else}
       <div class="hint">
         <span><kbd>{MOD_LABEL}1–9</kbd> opens a session</span>

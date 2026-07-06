@@ -1,34 +1,39 @@
 <script lang="ts">
-  import type { PaneNode } from "./layout";
+  import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "./sessions";
   import { dotState } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
+  import { basename } from "./files";
 
   interface Props {
     node: PaneNode;
     sessions: Map<string, Session>;
     names: Map<string, string>;
+    /** Open-file tab titles (basename, disambiguated), keyed by path. */
+    fileNames: Map<string, string>;
     dropSpot: DropSpot | null;
     ctrl: LayoutCtrl;
     /** Bound by Pane so the dnd hit-tester can target this bar. */
     el?: HTMLElement | null;
   }
 
-  let { node, sessions, names, dropSpot, ctrl, el = $bindable(null) }: Props = $props();
+  let { node, sessions, names, fileNames, dropSpot, ctrl, el = $bindable(null) }: Props = $props();
 
   /** Insertion index while a drag hovers this tab bar, else null. */
   const insertIndex = $derived(
     dropSpot?.kind === "tab" && dropSpot.paneId === node.id ? dropSpot.index : null,
   );
 
-  function label(sessionId: string): string {
-    return names.get(sessionId) ?? sessions.get(sessionId)?.name ?? sessionId.slice(0, 8);
+  function label(tab: Tab): string {
+    if (tab.surface === "terminal") {
+      return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
+    }
+    return fileNames.get(tab.path) ?? basename(tab.path);
   }
 </script>
 
 <div class="tabs" role="tablist" bind:this={el}>
-  {#each node.tabs as tab, i (tab.sessionId)}
-    {@const s = sessions.get(tab.sessionId)}
+  {#each node.tabs as tab, i (tabKey(tab))}
     <div
       class="tab"
       class:active={i === node.active}
@@ -37,12 +42,12 @@
       aria-selected={i === node.active}
       tabindex="-1"
       data-tab-index={i}
-      title={label(tab.sessionId)}
+      title={tab.surface === "file" ? tab.path : label(tab)}
       onpointerdowncapture={(e) => {
         // Capture-phase (directly attached, not delegated); ignore presses
         // on the close button so it stays a plain click.
         if (e.target instanceof Element && e.target.closest(".tab-close")) return;
-        ctrl.dragTab(e, node.id, i, tab.sessionId);
+        ctrl.dragTab(e, node.id, i, tab);
       }}
       onauxclick={(e) => {
         // Middle-click closes the tab (detaches the view, never the session).
@@ -52,8 +57,21 @@
         }
       }}
     >
-      <span class="dot {s ? dotState(s) : ''}"></span>
-      <span class="tab-name">{label(tab.sessionId)}</span>
+      {#if tab.surface === "terminal"}
+        {@const s = sessions.get(tab.sessionId)}
+        <span class="dot {s ? dotState(s) : ''}"></span>
+      {:else}
+        <svg class="file-glyph" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+          <path
+            d="M4.5 1.75h5L12.5 4.75V14a.25.25 0 0 1-.25.25h-7.5a.25.25 0 0 1-.25-.25V2a.25.25 0 0 1 .25-.25Z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linejoin="round"
+          />
+        </svg>
+      {/if}
+      <span class="tab-name">{label(tab)}</span>
       <button
         class="tab-close"
         aria-label="close tab"
@@ -131,6 +149,11 @@
     position: relative;
     flex: 1;
     min-width: 8px;
+  }
+
+  .file-glyph {
+    flex: none;
+    opacity: 0.75;
   }
 
   .tab-name {
