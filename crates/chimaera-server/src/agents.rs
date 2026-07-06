@@ -88,13 +88,32 @@ impl AgentRecord {
         self.custom_title.as_deref().or(self.ai_title.as_deref())
     }
 
-    /// Display name, naming rule zero for agents:
-    /// customTitle > aiTitle > first prompt (truncated) > "claude".
-    pub(crate) fn display_name(&self) -> String {
-        self.title()
-            .map(str::to_string)
+    /// Display name, naming rule zero for agents: customTitle > claude's own
+    /// live terminal title > aiTitle > first prompt (truncated) > "claude".
+    /// The OSC title is how `/rename` (and any in-TUI naming) propagates
+    /// instantly without depending on semi-documented transcript records —
+    /// found in the field when a `/rename git` left the row on its
+    /// first-prompt name while the subtitle already showed "✳ git".
+    pub(crate) fn display_name(&self, osc_title: Option<&str>) -> String {
+        self.custom_title
+            .clone()
+            .or_else(|| osc_title.and_then(cleaned_osc_title))
+            .or_else(|| self.ai_title.clone())
             .or_else(|| self.first_prompt.as_deref().map(truncate_prompt))
             .unwrap_or_else(|| "claude".to_string())
+    }
+}
+
+/// Claude's terminal title, stripped of its spark prefix; `None` for empty
+/// or default titles that carry no session-specific information.
+fn cleaned_osc_title(raw: &str) -> Option<String> {
+    let t = raw
+        .trim_start_matches(['✳', '✻', '*', '⏺'])
+        .trim()
+        .to_string();
+    match t.as_str() {
+        "" | "Claude Code" | "claude" => None,
+        _ => Some(t),
     }
 }
 
@@ -535,13 +554,19 @@ mod tests {
     #[test]
     fn display_name_resolution_chain() {
         let mut record = AgentRecord::new("k".into());
-        assert_eq!(record.display_name(), "claude");
+        assert_eq!(record.display_name(None), "claude");
         record.first_prompt = Some("fix the flaky tests".into());
-        assert_eq!(record.display_name(), "fix the flaky tests");
+        assert_eq!(record.display_name(None), "fix the flaky tests");
         record.ai_title = Some("Fixing tests".into());
-        assert_eq!(record.display_name(), "Fixing tests");
+        assert_eq!(record.display_name(None), "Fixing tests");
+        // Claude's live terminal title (e.g. after /rename) outranks aiTitle
+        // and the first prompt; spark prefixes are stripped and default
+        // titles carry no information.
+        assert_eq!(record.display_name(Some("✳ git")), "git");
+        assert_eq!(record.display_name(Some("✳ Claude Code")), "Fixing tests");
+        assert_eq!(record.display_name(Some("  ")), "Fixing tests");
         record.custom_title = Some("My run".into());
-        assert_eq!(record.display_name(), "My run");
+        assert_eq!(record.display_name(Some("✳ git")), "My run");
     }
 
     #[test]

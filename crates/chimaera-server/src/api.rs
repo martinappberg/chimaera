@@ -126,7 +126,7 @@ pub(crate) fn session_json(
         info.name.clone()
     } else {
         match agent {
-            Some(agent) => agent.display_name(),
+            Some(agent) => agent.display_name(info.title.as_deref()),
             None => crate::naming::shell_display_name(info, polled),
         }
     };
