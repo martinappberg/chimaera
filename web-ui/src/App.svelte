@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
+    ApiError,
     getActiveWorkspaceId,
     getHostLabel,
     pollHealth,
@@ -11,10 +12,13 @@
     createSession,
     deleteSession,
     listWorkspaces,
+    needsAttention,
     pollSessions,
     type Session,
+    type SessionKind,
     type Workspace,
   } from "./lib/sessions";
+  import { EventsSocket } from "./lib/events";
   import { reconnectingSockets } from "./lib/ws";
   import FolderPicker from "./lib/FolderPicker.svelte";
   import TerminalView from "./lib/Terminal.svelte";
@@ -26,23 +30,49 @@
   let activeId = $state<string | null>(null);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
   let pickerOpen = $state(false);
+  let eventsUp = $state(false);
+  let agentError = $state<string | null>(null);
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
   const sessionIds = $derived(wsSessions.map((s) => s.id));
 
-  // Duplicate names within a workspace get a " · n" display suffix (real
-  // naming — shell titles, agent ai-titles — lands with M2).
+  /** Sessions in the active workspace waiting on the user. */
+  const needsYou = $derived(wsSessions.filter(needsAttention).length);
+
+  // Row name is the agent's own title when it has one; duplicate display
+  // names within a workspace get a " · n" suffix.
   const displayNames = $derived.by(() => {
     const counts = new Map<string, number>();
     const names = new Map<string, string>();
     for (const s of wsSessions) {
-      const n = (counts.get(s.name) ?? 0) + 1;
-      counts.set(s.name, n);
-      names.set(s.id, n === 1 ? s.name : `${s.name} · ${n}`);
+      const base = s.agent_title ?? s.name;
+      const n = (counts.get(base) ?? 0) + 1;
+      counts.set(base, n);
+      names.set(s.id, n === 1 ? base : `${base} · ${n}`);
     }
     return names;
   });
+
+  /** Dot modifier class for a session row (see .dot.* styles). */
+  function dotState(s: Session): string {
+    if (s.kind !== "agent") return s.alive ? "alive" : "";
+    switch (s.agent_state) {
+      case "running":
+        return "alive";
+      case "needs_permission":
+      case "idle_prompt":
+        return "attn";
+      case "finished":
+        return "done";
+      case "errored":
+        return "err";
+      case "rate_limited":
+        return "rate";
+      default:
+        return "";
+    }
+  }
 
   $effect(() =>
     pollHealth(
@@ -56,13 +86,20 @@
     ),
   );
 
-  $effect(() =>
-    pollSessions(applySessions, () => {
+  // /ws/events pushes full session snapshots; the 5s poll only runs as a
+  // fallback while the socket is down (including before the first frame).
+  $effect(() => {
+    if (eventsUp) return;
+    return pollSessions(applySessions, () => {
       // transient poll failure; the daemon dot already reflects reachability
-    }),
-  );
+    });
+  });
 
   onMount(() => {
+    const events = new EventsSocket({
+      onSessions: applySessions,
+      onStatus: (up) => (eventsUp = up),
+    });
     refreshWorkspaces();
 
     const onKeydown = (e: KeyboardEvent) => {
@@ -85,11 +122,15 @@
       }
     };
     window.addEventListener("keydown", onKeydown, true);
-    return () => window.removeEventListener("keydown", onKeydown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeydown, true);
+      events.close();
+    };
   });
 
   $effect(() => {
-    document.title = workspace ? `${workspace.name} — chimaera` : "chimaera";
+    const base = workspace ? `${workspace.name} — chimaera` : "chimaera";
+    document.title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
   });
 
   /**
@@ -124,6 +165,7 @@
     activeWsId = w.id;
     setActiveWorkspaceId(w.id);
     pickerOpen = false;
+    agentError = null;
     ensureActive();
   }
 
@@ -151,17 +193,23 @@
     applySessions(sessions.filter((s) => s.id !== id));
   }
 
-  async function newTerminal(): Promise<void> {
+  async function newSession(kind: SessionKind): Promise<void> {
     if (activeWsId === null) {
       openPicker();
       return;
     }
+    agentError = null;
     try {
-      const s = await createSession(activeWsId);
+      const s = await createSession(activeWsId, kind);
       sessions.push(s);
       activeId = s.id;
-    } catch {
-      // creation failed; the next poll keeps the list truthful
+    } catch (e) {
+      // Shell failures stay quiet (the next snapshot keeps the list
+      // truthful); agent failures carry an actionable message (409 when
+      // claude is not installed) worth a line under the button.
+      if (kind === "agent") {
+        agentError = e instanceof ApiError ? e.message : "failed to start agent";
+      }
     }
   }
 
@@ -198,6 +246,11 @@
           />
         </svg>
       </button>
+      {#if needsYou > 0}
+        <span class="needs" title="{needsYou} need{needsYou === 1 ? 's' : ''} you">
+          {needsYou}
+        </span>
+      {/if}
     </div>
 
     <nav class="sessions">
@@ -215,10 +268,10 @@
             }
           }}
         >
-          <span class="dot" class:alive={s.alive}></span>
+          <span class="dot {dotState(s)}"></span>
           <span class="labels">
             <span class="name">{displayNames.get(s.id) ?? s.name}</span>
-            {#if s.title && s.title !== s.name}
+            {#if s.title && s.title !== s.name && s.title !== s.agent_title}
               <span class="title">{s.title}</span>
             {/if}
           </span>
@@ -233,7 +286,11 @@
           >
         </div>
       {/each}
-      <button class="row new" onclick={() => void newTerminal()}>+ new terminal</button>
+      <button class="row new primary" onclick={() => void newSession("agent")}>+ new agent</button>
+      {#if agentError}
+        <div class="agent-error">{agentError}</div>
+      {/if}
+      <button class="row new" onclick={() => void newSession("shell")}>+ terminal</button>
     </nav>
 
     <div class="daemon">
@@ -254,7 +311,7 @@
         <button class="open-cta" onclick={openPicker}>Open a folder</button>
       </div>
     {:else if wsSessions.length === 0}
-      <div class="empty">No sessions — create a terminal</div>
+      <div class="empty">No sessions — start an agent</div>
     {:else}
       <TerminalView {activeId} {sessionIds} {onTitle} {onExited} />
     {/if}
@@ -286,7 +343,17 @@
   }
 
   .workspace {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     padding: 0 0.9rem 0.9rem;
+  }
+
+  .needs {
+    flex: none;
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--warn);
   }
 
   .ws-btn {
@@ -300,7 +367,7 @@
     letter-spacing: 0.01em;
     color: var(--fg);
     cursor: pointer;
-    max-width: 100%;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 0.3rem;
@@ -366,9 +433,29 @@
     opacity: 0.55;
   }
 
+  /* Agent attention states; the base .dot covers gone/unknown. */
   .dot.alive {
     background: var(--accent);
     opacity: 1;
+  }
+
+  .dot.attn {
+    background: var(--warn);
+    opacity: 1;
+  }
+
+  .dot.err {
+    background: var(--err);
+    opacity: 1;
+  }
+
+  .dot.rate {
+    background: var(--rate);
+    opacity: 1;
+  }
+
+  .dot.done {
+    opacity: 0.85;
   }
 
   .labels {
@@ -428,6 +515,18 @@
   .row.new:hover {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  .row.new.primary {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  .agent-error {
+    padding: 0.1rem 0.45rem 0.25rem;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    color: var(--err);
   }
 
   .daemon {

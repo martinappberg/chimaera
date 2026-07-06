@@ -38,6 +38,7 @@ fn opts(command: Option<Vec<String>>) -> SpawnOpts {
         cols: 80,
         rows: 24,
         command,
+        id: None,
     }
 }
 

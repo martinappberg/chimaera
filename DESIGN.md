@@ -247,6 +247,59 @@ Layout: left rail = workspace switcher + session list with attention badges + Sl
 center = active session (structured transcript or terminal); right = file tree + preview pane;
 Cmd-K global switcher across sessions and workspaces.
 
+### In-window layout: panes, focus mode, cohesive type
+
+*Added 2026-07-06 (author request). Builds after M2a.*
+
+**Split panes.** Each workspace window holds a binary layout tree: internal nodes are
+horizontal/vertical splits with a draggable ratio; leaves are panes. A pane hosts a *surface*
+— a terminal session today, a file preview at M3, a dashboard later — so the layout layer is
+deliberately surface-agnostic ("MultiQC report tiled next to the agent that produced it" is
+the product thesis in one screen). Interactions:
+
+- Keyboard: Cmd/Ctrl+D split right, Cmd/Ctrl+Shift+D split down, Cmd/Ctrl+Alt+arrows move
+  focus between panes, Cmd/Ctrl+Shift+Enter zoom-toggle the focused pane (tmux prefix-z
+  semantics: temporary fullscreen within the window, subtle indicator, same key restores).
+  Pane-close via the session's own exit or a quiet hover control — never bound to Cmd+W in
+  the browser (the tab-close collision; the Tauri shell can own Cmd+W properly).
+- Drag and drop: drag a session row from the rail into a pane's edge drop-zones
+  (left/right/top/bottom halves; center replaces); drag dividers to resize; drag a pane
+  header to re-tile.
+- The focused pane is always visually unmistakable (hairline accent on the pane border —
+  the session-hue idea from the interaction model applies here first).
+
+**Tabs within panes** (added same day). A pane holds a *stack* of surfaces with a quiet tab
+bar (hidden when a pane has exactly one tab — no chrome tax for the common case): one active
+tab per pane. Clicking a rail session opens it as a tab in the focused pane — or focuses the
+existing tab if it's already open somewhere (VS Code semantics, no duplicates by default).
+Drag tabs to reorder, drag between panes, drag to a pane edge to tear off into a new split;
+middle-click closes a tab (closing a tab detaches the view, never kills the session — the
+rail is the source of truth for lifecycle). Keyboard: Cmd/Ctrl+Alt+Left/Right cycles tabs in
+the focused pane. Cmd+T/Cmd+W stay unbound in the browser (tab-collision; the Tauri shell
+owns them properly). At M3, files open the same way: a preview tab in the focused pane.
+
+**Quality bar ("SOTA usable"):** divider drags and tab drags at 60 fps with translucent
+drop-zone previews showing exactly where things land; transitions fast (≤120 ms) and few;
+fully keyboard-operable; visible focus states; zero layout jank on resize (terminal refit is
+debounced, never mid-drag).
+
+**Focus mode.** Cmd/Ctrl+B collapses the rail to nothing; what remains is the **session
+strip** (the tmux-style bottom bar already specced in the interaction model — this is its
+first shipped increment): workspace name, one compact chip per session with state dot, the
+focused one inverted, aggregate "N need you", host label. So even fully collapsed, the window
+always says where you are — and the strip is precisely what scales to many windows later.
+Zoom + focus mode together = one terminal, edge to edge, still one glance from total context.
+
+**Layout persistence.** The layout tree is part of daemon-owned per-window view state (the
+return-is-a-state-machine decision), so reload/reconnect restores panes, ratios, zoom, and
+focus-mode exactly.
+
+**Cohesive type.** The terminal ships a bundled open-source mono (JetBrains Mono, OFL — no
+CDN, embedded in the binary like everything else) instead of the system ui-monospace default,
+and the same face is used for the UI's monospace accents (session ordinals, paths,
+breadcrumbs, the strip), so terminal content and chrome share typographic DNA instead of
+feeling like two applications.
+
 ### Interaction model: naming, orientation, navigation
 
 *Added 2026-07-06 from a dedicated research + dual-design pass (tmux/zellij mechanics,
@@ -427,8 +480,11 @@ True non-goals (product boundaries, not deferrals):
 - **No text editor.** Viewing must be great; editing is a single-file save box at most, added
   late. The author rarely hand-edits code — that's the scope unlock that makes this buildable.
   Real editing lives in whatever editor you already have.
-- No tiling window manager, no own mobile app, no E2E relay service (free-ride
-  `--remote-control` / ntfy), no Electron, nothing heavy on the cluster.
+- No own mobile app, no E2E relay service (free-ride `--remote-control` / ntfy), no Electron,
+  nothing heavy on the cluster. (In-window split panes ARE in scope — author decision
+  2026-07-06, superseding the earlier "no tiling WM" line; see In-window layout below. The
+  non-goal was solo-scope caution, not product conviction, and panes are the mechanism that
+  puts an agent and its outputs side by side.)
 - No bespoke GPU-native client (see Client section — a different project, not a deferral of
   this one).
 
@@ -499,6 +555,10 @@ which is the survival property that matters.
 - **2026-07-06 — exited shells vanish (tmux semantics).** The daemon reaps a session when its
   child exits; no gray corpse rows. Persistent lifecycle rows ("finished", awaiting review)
   are *agent*-session semantics and arrive with M2's attention states.
+- **2026-07-06 — in-window split panes, focus mode, bundled mono.** Author request: tiling
+  panes (drag-and-drop + keyboard), pane zoom, a rail-collapsing focus mode that leaves the
+  session strip as the always-on orientation layer, and JetBrains Mono bundled for terminal +
+  UI monospace accents. Supersedes the "no tiling WM" non-goal. Builds after M2a.
 - **2026-07-06 — window host label.** The daemon indicator shows what the user calls the
   machine: "local" for an untunneled daemon, else the ssh alias passed by `chimaera connect`
   via the `#host=` hash param (the VS Code Remote convention); the raw hostname is hover

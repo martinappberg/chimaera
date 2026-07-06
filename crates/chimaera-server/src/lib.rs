@@ -1,3 +1,4 @@
+mod agents;
 mod api;
 mod assets;
 mod fs;
@@ -10,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{middleware, Router};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -27,24 +28,43 @@ pub(crate) struct AppState {
     pub(crate) started: Instant,
     pub(crate) hostname: String,
     pub(crate) pid: u32,
+    /// Port the daemon listens on; embedded in generated agent hook URLs.
+    pub(crate) port: u16,
     /// Registered workspaces, persisted to `workspaces.json` on change.
     pub(crate) workspaces: Mutex<workspaces::WorkspaceStore>,
     /// Owner of all PTY sessions; outlives any client connection.
     pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
+    /// session id -> agent wrapper state (kind "agent" sessions only).
+    pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
+    /// Signalled whenever the session list / agent state / titles change;
+    /// wakes /ws/events subscribers (a 1s tick catches anything missed).
+    pub(crate) changes: tokio::sync::Notify,
+    /// `claude` binary resolved once per daemon via the login shell.
+    pub(crate) claude_bin: tokio::sync::OnceCell<Result<PathBuf, String>>,
 }
 
 impl AppState {
-    pub(crate) fn new(token: String, hostname: String, pid: u32, workspaces_path: PathBuf) -> Self {
+    pub(crate) fn new(
+        token: String,
+        hostname: String,
+        pid: u32,
+        port: u16,
+        workspaces_path: PathBuf,
+    ) -> Self {
         AppState {
             token,
             started: Instant::now(),
             hostname,
             pid,
+            port,
             workspaces: Mutex::new(workspaces::WorkspaceStore::load(workspaces_path)),
             sessions: chimaera_pty::SessionManager::new(),
             session_workspaces: Mutex::new(HashMap::new()),
+            agents: Mutex::new(HashMap::new()),
+            changes: tokio::sync::Notify::new(),
+            claude_bin: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -73,12 +93,17 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
+        // Registered after route_layer, so hook ingestion is NOT behind bearer
+        // auth: claude's hooks cannot know the daemon token, so the random
+        // per-session key embedded in the hook URL authorizes them instead.
+        .route("/agent-events/{id}", post(agents::ingest))
         .with_state(state.clone());
 
-    // The WS route stays outside the bearer-header middleware: browsers cannot
-    // set headers on a WebSocket, so it authenticates via its first frame.
+    // The WS routes stay outside the bearer-header middleware: browsers cannot
+    // set headers on a WebSocket, so they authenticate via their first frame.
     let ws = Router::new()
         .route("/ws/sessions/{id}", get(ws::session_ws))
+        .route("/ws/events", get(ws::events_ws))
         .with_state(state);
 
     Router::new()
@@ -120,6 +145,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         token,
         hostname,
         pid,
+        port,
         chimaera_core::data_dir().join("workspaces.json"),
     ));
 
@@ -190,10 +216,15 @@ mod tests {
     /// (equivalent to pointing data_dir at a temp HOME, without the global
     /// env-var mutation that races across parallel tests).
     fn test_state() -> Arc<AppState> {
+        test_state_with_port(0)
+    }
+
+    fn test_state_with_port(port: u16) -> Arc<AppState> {
         Arc::new(AppState::new(
             "test-token".to_string(),
             "testhost".to_string(),
             4242,
+            port,
             test_dir("data").join("workspaces.json"),
         ))
     }
@@ -224,7 +255,11 @@ mod tests {
         let json = if bytes.is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap()
+            // Non-JSON bodies (e.g. axum's plain-text extractor rejections)
+            // come back as a JSON string so callers can still assert on them.
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            })
         };
         (status, json)
     }
@@ -496,6 +531,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 command: None,
+                id: None,
             })
             .expect("spawn session");
 
@@ -590,6 +626,579 @@ mod tests {
             }
             other => panic!("expected error text frame, got {other:?}"),
         }
+    }
+
+    /// Spawn a real shell session tagged as an agent (synthetic record with a
+    /// known hook key), without needing a claude binary.
+    fn inject_agent(state: &Arc<AppState>, key: &str) -> String {
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir("agent-cwd"),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: None,
+                id: None,
+            })
+            .expect("spawn session");
+        lock(&state.agents).insert(info.id.clone(), agents::AgentRecord::new(key.to_string()));
+        info.id
+    }
+
+    /// The session entry for `id` from GET /api/v1/sessions.
+    async fn session_entry(state: &Arc<AppState>, id: &str) -> serde_json::Value {
+        let (status, list) = request(state, Method::GET, "/api/v1/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("session {id} not listed in {list}"))
+    }
+
+    #[tokio::test]
+    async fn session_kind_defaults_to_shell_and_round_trips() {
+        let state = test_state();
+        let root = test_dir("kind-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+
+        // No kind in the body -> shell.
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": workspace_id, "name": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session["kind"], "shell");
+        assert_eq!(session["agent_state"], serde_json::Value::Null);
+        assert_eq!(session["agent_title"], serde_json::Value::Null);
+
+        // Explicit kind "shell" round-trips through GET.
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": workspace_id, "kind": "shell"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = session_entry(&state, session["id"].as_str().unwrap()).await;
+        assert_eq!(entry["kind"], "shell");
+        assert_eq!(entry["agent_state"], serde_json::Value::Null);
+        assert_eq!(entry["agent_title"], serde_json::Value::Null);
+
+        // An unknown kind is a 400 (serde rejects it).
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": workspace_id, "kind": "bogus"})),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_agent_without_claude_is_409_with_hint() {
+        let state = test_state();
+        state
+            .claude_bin
+            .set(Err("claude not found via login shell (test)".to_string()))
+            .expect("preset claude_bin");
+        let root = test_dir("agent-409");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": ws["id"], "kind": "agent"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().unwrap().contains("claude not found"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_spawns_command_with_generated_settings() {
+        let state = test_state_with_port(45678);
+        // A stand-in "claude": exits immediately, but exercises the whole
+        // spawn path (settings generation, id pre-pick, record registration).
+        state
+            .claude_bin
+            .set(Ok(PathBuf::from("/bin/echo")))
+            .expect("preset claude_bin");
+        let root = test_dir("agent-spawn");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": ws["id"], "kind": "agent"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session["kind"], "agent");
+        assert_eq!(session["agent_state"], "unknown");
+        assert_eq!(session["agent_title"], serde_json::Value::Null);
+        let id = session["id"].as_str().unwrap().to_string();
+
+        // The generated settings file wires every hook to this daemon+session.
+        let settings_path = chimaera_core::runtime_dir()
+            .join("agents")
+            .join(format!("{id}-settings.json"));
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let key = lock(&state.agents)
+            .get(&id)
+            .map(|r| r.key.clone())
+            .expect("agent record registered");
+        let url = settings["hooks"]["SessionStart"][0]["hooks"][0]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:45678/api/v1/agent-events/{id}?key={key}")
+        );
+        std::fs::remove_file(&settings_path).ok();
+    }
+
+    /// POST a synthetic hook payload to the ingest endpoint.
+    async fn post_hook(
+        state: &Arc<AppState>,
+        id: &str,
+        key: &str,
+        payload: serde_json::Value,
+    ) -> StatusCode {
+        let (status, _) = request(
+            state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{id}?key={key}"),
+            Some(payload),
+        )
+        .await;
+        status
+    }
+
+    #[tokio::test]
+    async fn agent_events_rejects_bad_key_and_unknown_session() {
+        let state = test_state();
+        let id = inject_agent(&state, "right-key");
+
+        let payload = serde_json::json!({"hook_event_name": "Stop"});
+        assert_eq!(
+            post_hook(&state, &id, "wrong-key", payload.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_hook(&state, &id, "", payload.clone()).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_hook(&state, "s-00000000", "right-key", payload.clone()).await,
+            StatusCode::NOT_FOUND
+        );
+        // A bad key must not change state.
+        assert_eq!(session_entry(&state, &id).await["agent_state"], "unknown");
+        // The right key works.
+        assert_eq!(
+            post_hook(&state, &id, "right-key", payload).await,
+            StatusCode::OK
+        );
+        assert_eq!(session_entry(&state, &id).await["agent_state"], "finished");
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_events_state_transitions() {
+        let state = test_state();
+        let id = inject_agent(&state, "k");
+
+        let cases = [
+            (
+                serde_json::json!({"hook_event_name": "SessionStart", "source": "startup"}),
+                "running",
+            ),
+            (
+                serde_json::json!({
+                    "hook_event_name": "Notification",
+                    "notification_type": "permission_prompt",
+                    "message": "Claude needs your permission to use Bash",
+                }),
+                "needs_permission",
+            ),
+            (
+                serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"}),
+                "running",
+            ),
+            (
+                serde_json::json!({
+                    "hook_event_name": "Notification",
+                    "notification_type": "idle_prompt",
+                    "message": "Claude is waiting for your input",
+                }),
+                "idle_prompt",
+            ),
+            (
+                serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "go"}),
+                "running",
+            ),
+            (serde_json::json!({"hook_event_name": "Stop"}), "finished"),
+            (
+                serde_json::json!({"hook_event_name": "StopFailure", "error_type": "rate_limit"}),
+                "rate_limited",
+            ),
+            (
+                serde_json::json!({"hook_event_name": "StopFailure", "error_type": "server_error"}),
+                "errored",
+            ),
+            // SessionEnd keeps the last state.
+            (
+                serde_json::json!({"hook_event_name": "SessionEnd", "reason": "other"}),
+                "errored",
+            ),
+        ];
+        for (payload, expected) in cases {
+            let event = payload["hook_event_name"].as_str().unwrap().to_string();
+            assert_eq!(post_hook(&state, &id, "k", payload).await, StatusCode::OK);
+            assert_eq!(
+                session_entry(&state, &id).await["agent_state"],
+                *expected,
+                "after {event}"
+            );
+        }
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_title_tail_polls_transcript() {
+        let state = test_state();
+        let id = inject_agent(&state, "k");
+        agents::spawn_agent_watch(state.clone(), id.clone());
+
+        // Synthetic SessionStart pointing transcript_path at a fixture file.
+        let transcript = test_dir("transcript").join("session.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"message\"}\n").unwrap();
+        let status = post_hook(
+            &state,
+            &id,
+            "k",
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "session_id": "5e0d64b2-abcd-abcd-abcd-000000000000",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let wait_for_title = |expected: &'static str| {
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let title = session_entry(&state, &id).await["agent_title"].clone();
+                    if title == expected {
+                        return;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "agent_title stuck at {title}, want {expected}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+
+        // An appended ai-title record becomes the title...
+        let mut line = serde_json::json!(
+            {"type": "ai-title", "aiTitle": "Fix the flaky tests", "sessionId": "x"}
+        )
+        .to_string();
+        line.push('\n');
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+        wait_for_title("Fix the flaky tests").await;
+
+        // ...and a later customTitle record wins over it.
+        let mut line =
+            serde_json::json!({"type": "custom-title", "customTitle": "My run"}).to_string();
+        line.push('\n');
+        std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+        wait_for_title("My run").await;
+
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn ws_events_auth_snapshot_and_change_push() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let first = inject_agent(&state, "k"); // one agent session pre-existing
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/events");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Initial full snapshot arrives immediately after auth.
+        let snapshot = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected sessions text frame, got {other:?}"),
+        };
+        assert_eq!(snapshot["type"], "sessions");
+        let entry = snapshot["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == first)
+            .expect("existing session in snapshot");
+        assert_eq!(entry["kind"], "agent");
+        assert_eq!(entry["agent_state"], "unknown");
+
+        // A state change pushes a fresh snapshot.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{first}?key=k"),
+            Some(serde_json::json!({"hook_event_name": "Stop"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no snapshot with finished state"
+            );
+            let frame = match next_ws_frame(&mut socket).await {
+                WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                _ => continue,
+            };
+            let done = frame["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == first && s["agent_state"] == "finished");
+            if done {
+                break;
+            }
+        }
+
+        // A disappearing session (killed PTY) is caught by the fallback tick.
+        state.sessions.kill(&first).ok();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "killed session never left the snapshot"
+            );
+            let frame = match next_ws_frame(&mut socket).await {
+                WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                _ => continue,
+            };
+            let gone = !frame["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == first);
+            if gone {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_events_bad_token_is_rejected() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/events");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "wrong"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("ws frame timeout")
+            .expect("ws stream ended")
+            .expect("ws frame error");
+        match frame {
+            WsMessage::Text(text) => {
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["type"], "error");
+                assert_eq!(json["message"], "unauthorized");
+            }
+            other => panic!("expected error text frame, got {other:?}"),
+        }
+    }
+
+    /// End-to-end against the real `claude` binary: spawn kind=agent, watch
+    /// the TUI come up in the PTY, and wait for a real hook POST to flip the
+    /// agent state. Gated behind CHIMAERA_TEST_CLAUDE=1 so CI without claude
+    /// (or without a subscription) stays green.
+    #[tokio::test]
+    async fn real_claude_agent_session() {
+        if std::env::var("CHIMAERA_TEST_CLAUDE").as_deref() != Ok("1") {
+            eprintln!("skipping real_claude_agent_session (set CHIMAERA_TEST_CLAUDE=1)");
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = test_state_with_port(port);
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let root = test_dir("claude-agent");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": ws["id"], "kind": "agent"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "agent spawn failed: {session}");
+        assert_eq!(session["kind"], "agent");
+        let id = session["id"].as_str().unwrap().to_string();
+
+        // 1. The claude TUI comes up in the PTY.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "claude TUI never appeared in the PTY snapshot"
+            );
+            let text = match state.sessions.attach(&id) {
+                Ok(att) => String::from_utf8_lossy(&att.snapshot).to_string(),
+                Err(_) => String::new(),
+            };
+            if text.to_lowercase().contains("claude") {
+                eprintln!("TUI is up (snapshot contains 'claude')");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // 2. A real hook POST flips the state away from "unknown". Nudge the
+        // TUI if needed: Enter dismisses a possible trust dialog, then a tiny
+        // prompt guarantees a UserPromptSubmit hook.
+        let attachment = state.sessions.attach(&id).expect("attach for input");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut nudges = 0u32;
+        loop {
+            let entry = session_entry(&state, &id).await;
+            let agent_state = entry["agent_state"].as_str().unwrap_or("").to_string();
+            if agent_state != "unknown" {
+                eprintln!("hook flipped agent_state to {agent_state}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no hook POST ever flipped the state"
+            );
+            let elapsed = 120 - (deadline - tokio::time::Instant::now()).as_secs();
+            if elapsed > 10 && nudges == 0 {
+                eprintln!("nudge: Enter (possible trust dialog)");
+                attachment.input.send(bytes::Bytes::from("\r")).await.ok();
+                nudges = 1;
+            } else if elapsed > 20 && nudges == 1 {
+                eprintln!("nudge: submitting a tiny prompt");
+                attachment
+                    .input
+                    .send(bytes::Bytes::from("reply with just: ok\r"))
+                    .await
+                    .ok();
+                nudges = 2;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // Bonus observation (not asserted): the title tail-poll may pick up
+        // claude's ai-title record.
+        for _ in 0..30 {
+            let entry = session_entry(&state, &id).await;
+            if let Some(title) = entry["agent_title"].as_str() {
+                eprintln!("observed agent_title from transcript: {title}");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let final_entry = session_entry(&state, &id).await;
+        eprintln!(
+            "final session entry: state={} title={}",
+            final_entry["agent_state"], final_entry["agent_title"]
+        );
+
+        let (status, _) = request(
+            &state,
+            Method::DELETE,
+            &format!("/api/v1/sessions/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

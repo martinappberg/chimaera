@@ -4,6 +4,8 @@
   --muted: #6c6c74;
   --accent: #2e9e6b;
   --err: #cc4444;
+  --warn: #b8862b; /* agent needs_permission / idle_prompt dot */
+  --rate: #8a68c0; /* agent rate_limited dot */
   --rail-bg: #f3f3f5;
   --row-hover: #ececef;
   --row-active: #e4e4e9;
@@ -21,6 +23,8 @@
     --muted: #92929c;
     --accent: #3fbf85;
     --err: #d96b6b;
+    --warn: #d0a355;
+    --rate: #a58fd6;
     --rail-bg: #18181c;
     --row-hover: #1f1f24;
     --row-active: #26262c;

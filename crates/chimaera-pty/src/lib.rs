@@ -46,6 +46,9 @@ pub struct SpawnOpts {
     /// `None` spawns the user's shell (`$SHELL`, else `/bin/bash`) as an
     /// interactive shell.
     pub command: Option<Vec<String>>,
+    /// Caller-chosen session id (must be unused). `None` generates one. This
+    /// lets callers embed the id in the command/environment before spawning.
+    pub id: Option<SessionId>,
 }
 
 /// Out-of-band events emitted by a session.
@@ -91,7 +94,15 @@ impl SessionManager {
     /// Spawn a new session and register it. Returns its initial info. The
     /// session unregisters itself when its child exits.
     pub fn spawn(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
-        let id = self.unused_id();
+        let id = match &opts.id {
+            Some(id) => {
+                if lock_unpoisoned(&self.sessions).contains_key(id) {
+                    return Err(anyhow!("session id {id} already in use"));
+                }
+                id.clone()
+            }
+            None => self.unused_id(),
+        };
         let mgr = Arc::downgrade(self);
         let exit_id = id.clone();
         let on_exit = Box::new(move || {

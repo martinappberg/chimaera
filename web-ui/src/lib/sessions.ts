@@ -6,6 +6,18 @@ export interface Workspace {
   name: string;
 }
 
+export type SessionKind = "shell" | "agent";
+
+/** Machine-readable attention state of an agent session (null for shells). */
+export type AgentState =
+  | "running"
+  | "needs_permission"
+  | "idle_prompt"
+  | "finished"
+  | "errored"
+  | "rate_limited"
+  | "unknown";
+
 export interface Session {
   id: string;
   name: string;
@@ -17,6 +29,19 @@ export interface Session {
   exit_status: number | null;
   title: string | null;
   workspace_id: string;
+  kind: SessionKind;
+  agent_state: AgentState | null;
+  /** Claude's own name for the conversation; overrides `name` for display. */
+  agent_title: string | null;
+}
+
+/** True when the session is waiting on the user (drives the aggregate count). */
+export function needsAttention(s: Session): boolean {
+  return (
+    s.agent_state === "needs_permission" ||
+    s.agent_state === "idle_prompt" ||
+    s.agent_state === "errored"
+  );
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -84,13 +109,14 @@ export async function listSessions(): Promise<Session[]> {
 
 export async function createSession(
   workspaceId: string,
+  kind: SessionKind = "shell",
   name: string | null = null,
 ): Promise<Session> {
   return json(
     await api("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace_id: workspaceId, name }),
+      body: JSON.stringify({ workspace_id: workspaceId, kind, name }),
     }),
   );
 }

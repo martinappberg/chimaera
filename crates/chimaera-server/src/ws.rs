@@ -1,4 +1,5 @@
-//! WebSocket bridge: /ws/sessions/{id} <-> chimaera_pty session.
+//! WebSocket bridges: /ws/sessions/{id} <-> chimaera_pty session, and the
+//! /ws/events full-snapshot session bus.
 //!
 //! Browsers cannot set an Authorization header on a WebSocket, so the first
 //! text frame must be `{"type":"auth","token":"..."}` (within 5 seconds).
@@ -109,14 +110,37 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Err(RecvError::Closed) => output_open = false,
             },
             event = attachment.events.recv(), if events_open => match event {
-                Ok(event) => match serde_json::to_value(&event) {
-                    Ok(value) => {
-                        if send_json(&mut socket, &value).await.is_err() {
-                            return;
+                Ok(event) => {
+                    let resized = matches!(event, chimaera_pty::SessionEvent::Resized { .. });
+                    match serde_json::to_value(&event) {
+                        Ok(value) => {
+                            if send_json(&mut socket, &value).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(err) => tracing::warn!(%id, %err, "failed to serialize session event"),
+                    }
+                    // Resize reflows the server grid; stale pre-resize cells
+                    // on the client turn TUI redraws into garbage. Repaint
+                    // from the authoritative grid (tmux redraw semantics).
+                    if resized {
+                        match state.sessions.attach(&id) {
+                            Ok(mut fresh) => {
+                                if send_json(&mut socket, &json!({"type": "resync"})).await.is_err() {
+                                    return;
+                                }
+                                let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
+                                if socket.send(Message::Binary(snapshot)).await.is_err() {
+                                    return;
+                                }
+                                attachment = fresh;
+                            }
+                            Err(err) => {
+                                tracing::debug!(%id, %err, "post-resize resync attach failed");
+                            }
                         }
                     }
-                    Err(err) => tracing::warn!(%id, %err, "failed to serialize session event"),
-                },
+                }
                 Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => events_open = false,
             },
@@ -149,6 +173,79 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
         }
     }
+}
+
+/// GET /ws/events — the session bus. After first-frame auth the server sends
+/// a full `{"type":"sessions","sessions":[...]}` snapshot immediately and
+/// again (throttled to at most 4/s) whenever any session appears, disappears,
+/// or changes state/title. Dead simple full-snapshot protocol; no diffs.
+pub(crate) async fn events_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_events(socket, state))
+}
+
+/// Minimum gap between snapshot frames (<= 4/s).
+const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
+/// Fallback poll: catches changes that never signal `changes` (e.g. a PTY
+/// child exiting on its own).
+const EVENTS_TICK: Duration = Duration::from_secs(1);
+
+async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
+    if !authenticate(&mut socket, &state).await {
+        let _ = send_json(
+            &mut socket,
+            &json!({"type": "error", "message": "unauthorized"}),
+        )
+        .await;
+        return;
+    }
+
+    let mut last_sent: Option<String> = None;
+    if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            _ = state.changes.notified() => {}
+            _ = tokio::time::sleep(EVENTS_TICK) => {}
+            msg = socket.recv() => match msg {
+                Some(Ok(_)) => continue, // client frames carry nothing here
+                Some(Err(_)) | None => return,
+            },
+        }
+        if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(EVENTS_THROTTLE).await;
+    }
+}
+
+/// Send the current session snapshot if it differs from the last one sent.
+async fn send_sessions_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_sent: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let snapshot = json!({
+        "type": "sessions",
+        "sessions": crate::api::sessions_json(state),
+    })
+    .to_string();
+    if last_sent.as_deref() == Some(snapshot.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(snapshot.clone().into())).await?;
+    *last_sent = Some(snapshot);
+    Ok(())
 }
 
 /// First-frame auth: text `{"type":"auth","token":...}` within 5 seconds.
