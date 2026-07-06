@@ -36,6 +36,7 @@
     deserializeLayout,
     detachTab,
     dropTab,
+    dropTabAtRootEdge,
     findPane,
     focusPane,
     focusedFile as focusedFileOf,
@@ -44,7 +45,6 @@
     moveTabToIndex,
     openFile,
     openSession,
-    panes,
     pruneFiles,
     pruneSessions,
     serializeLayout,
@@ -61,7 +61,9 @@
   import {
     paneContentEl,
     paneRootEl,
+    registerStage,
     startDrag,
+    unregisterStage,
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/dnd";
@@ -103,6 +105,8 @@
   let filesDividerActive = $state(false);
   let railEl = $state<HTMLElement | null>(null);
   let daemonEl = $state<HTMLElement | null>(null);
+  /** The stage element; its edges are the root-split drop targets. */
+  let stageEl = $state<HTMLElement | null>(null);
 
   const winKey = windowKey();
 
@@ -125,8 +129,6 @@
   const zoomedPane = $derived(
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
-  /** With more than one pane, every pane shows its tab bar (orientation). */
-  const multiPane = $derived(panes(layout.root).length > 1);
 
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
@@ -173,6 +175,14 @@
     const blob = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
     if (!layoutReady) return;
     saveViewState(stateKey(activeWsId), blob);
+  });
+
+  // The dnd hit-tester needs the stage rect for window-edge drop targets.
+  $effect(() => {
+    const el = stageEl;
+    if (el === null) return;
+    registerStage(el);
+    return () => unregisterStage(el);
   });
 
   // Dispose pooled terminals for sessions that no longer exist.
@@ -651,8 +661,16 @@
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
-              : dropTab(layout, tab, spot.paneId, spot.zone);
-          if (tab.surface === "terminal") pool.focusTerminal(tab.sessionId);
+              : spot.kind === "edge"
+                ? dropTabAtRootEdge(layout, tab, spot.edge)
+                : dropTab(layout, tab, spot.paneId, spot.zone);
+          if (tab.surface === "terminal") {
+            pool.focusTerminal(tab.sessionId);
+          } else if (document.activeElement instanceof HTMLElement) {
+            // A file surface landed: pull DOM focus off any terminal so
+            // plain keys stop reaching a PTY that is no longer visible.
+            document.activeElement.blur();
+          }
         },
         onClick,
         onEnd: () => (dropSpot = null),
@@ -662,6 +680,11 @@
 
   function onRailRowDown(e: PointerEvent, sessionId: string): void {
     beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
+  }
+
+  /** FILES tree entries drag exactly like rail rows (surface parity). */
+  function onTreeEntryDown(e: PointerEvent, path: string): void {
+    beginDrag(e, { surface: "file", path }, () => openFilePath(path));
   }
 
   /** Svelte action: focus the node as soon as it mounts (confirm buttons). */
@@ -878,7 +901,12 @@
           </button>
           {#if filesOpen}
             <div class="files-body">
-              <FileTree root={workspace.root} onOpen={openFilePath} activePath={focusedFilePath} />
+              <FileTree
+                root={workspace.root}
+                onOpen={openFilePath}
+                onDragStart={onTreeEntryDown}
+                activePath={focusedFilePath}
+              />
             </div>
           {/if}
         </section>
@@ -897,7 +925,7 @@
       </div>
     </aside>
 
-    <main class="stage">
+    <main class="stage" bind:this={stageEl}>
       {#if activeWsId === null}
         <div class="empty">
           <button class="open-cta" onclick={openPicker}>Open a folder</button>
@@ -908,7 +936,6 @@
             node={zoomedPane}
             focusedPaneId={layout.focusedPaneId}
             zoomed
-            forceTabs={multiPane}
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
@@ -919,13 +946,16 @@
           <SplitTree
             node={layout.root}
             focusedPaneId={layout.focusedPaneId}
-            forceTabs={multiPane}
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
             {ctrl}
           />
+        {/if}
+        {#if dropSpot?.kind === "edge"}
+          <!-- Window-edge preview: the root split's new pane, full height/width. -->
+          <div class="edge-drop {dropSpot.edge}"></div>
         {/if}
       {/if}
     </main>
@@ -1373,6 +1403,30 @@
     position: relative;
     background: var(--bg);
     padding: 8px;
+  }
+
+  /* Translucent window-edge drop preview: exactly the half the root split's
+     new pane will take, full height/width along that edge. */
+  .edge-drop {
+    position: absolute;
+    z-index: 30;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+    border-radius: 7px;
+    pointer-events: none;
+  }
+
+  .edge-drop.left {
+    inset: 8px 50% 8px 8px;
+  }
+  .edge-drop.right {
+    inset: 8px 8px 8px 50%;
+  }
+  .edge-drop.top {
+    inset: 8px 8px 50% 8px;
+  }
+  .edge-drop.bottom {
+    inset: 50% 8px 8px 8px;
   }
 
   .empty {

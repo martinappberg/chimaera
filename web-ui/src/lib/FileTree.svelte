@@ -13,11 +13,14 @@
     root: string;
     /** Open a file surface in the layout. */
     onOpen(path: string): void;
+    /** Begin a pointer drag of a file entry (same grammar as rail rows and
+     *  pane tabs; a sub-threshold release becomes a plain open). */
+    onDragStart(e: PointerEvent, path: string): void;
     /** The focused pane's active file, for the subtle current marker. */
     activePath: string | null;
   }
 
-  let { root, onOpen, activePath }: Props = $props();
+  let { root, onOpen, onDragStart, activePath }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
   let listings = $state<Map<string, FsEntry[]>>(new Map());
@@ -117,7 +120,14 @@
       tabindex="0"
       title={entry.path}
       style:padding-left={`${8 + depth * 13}px`}
-      onclick={() => (entry.kind === "dir" ? toggle(entry.path) : onOpen(entry.path))}
+      onclick={() => {
+        // Files open via the drag's sub-threshold click path (below), so a
+        // completed drag never ALSO opens the file in the focused pane.
+        if (entry.kind === "dir") toggle(entry.path);
+      }}
+      onpointerdowncapture={(e) => {
+        if (entry.kind === "file") onDragStart(e, entry.path);
+      }}
       onkeydown={(e) => onRowKey(e, entry)}
     >
       {#if entry.kind === "dir"}

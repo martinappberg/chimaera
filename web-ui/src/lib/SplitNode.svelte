@@ -9,8 +9,6 @@
   interface Props {
     node: LayoutNode;
     focusedPaneId: string;
-    /** Show tab bars on every pane (any multi-pane layout). */
-    forceTabs?: boolean;
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
@@ -21,7 +19,6 @@
   let {
     node,
     focusedPaneId,
-    forceTabs = false,
     dropSpot,
     sessions,
     names,
@@ -113,11 +110,11 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
     <div
       class="divider"
@@ -131,7 +128,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
   </div>
 {/if}

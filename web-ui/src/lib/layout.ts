@@ -13,6 +13,8 @@
 export type SplitDir = "row" | "col";
 export type FocusDir = "left" | "right" | "up" | "down";
 export type Zone = "left" | "right" | "top" | "bottom" | "center";
+/** A window edge (root-split drop target). */
+export type Side = Exclude<Zone, "center">;
 
 /** A surface shown as a tab. */
 export interface TerminalTab {
@@ -357,6 +359,39 @@ export function dropTab(l: Layout, tab: Tab, targetPaneId: string, zone: Zone): 
 }
 
 /**
+ * Drop a surface on a window edge: split the ROOT, the new pane taking the
+ * full window height/width on that side. Re-creating the shape that already
+ * exists (the surface's single-tab pane already spans that edge) is a no-op.
+ */
+export function dropTabAtRootEdge(l: Layout, tab: Tab, side: Side): Layout {
+  const dir: SplitDir = side === "left" || side === "right" ? "row" : "col";
+  const before = side === "left" || side === "top";
+  const src = paneForTab(l.root, tab);
+  if (src !== null) {
+    const sp = findPane(l.root, src.paneId);
+    if (sp !== null && sp.tabs.length === 1) {
+      // Its pane would collapse and re-materialize in the same place.
+      if (panes(l.root).length === 1) return l;
+      if (l.root.type === "split" && l.root.dir === dir) {
+        const edgeChild = before ? l.root.a : l.root.b;
+        if (edgeChild.id === src.paneId) return l;
+      }
+    }
+  }
+  const next = src !== null ? detachTab(l, src.paneId, src.index) : l;
+  const np: PaneNode = { type: "pane", id: uid(), tabs: [tab], active: 0 };
+  const split: SplitNode = {
+    type: "split",
+    id: uid(),
+    dir,
+    ratio: 0.5,
+    a: before ? np : next.root,
+    b: before ? next.root : np,
+  };
+  return normalize({ ...next, root: split, focusedPaneId: np.id, zoomedPaneId: null });
+}
+
+/**
  * Move a surface's tab to `index` within `paneId`'s tab bar (reorder or
  * cross-pane move); a surface not open anywhere is inserted fresh.
  */
@@ -674,6 +709,24 @@ if (import.meta.env.DEV) {
     "round-trip keeps file tabs",
   );
   ok(deserializeLayout({ v: 1, root: { t: "x" } }) === null, "malformed blobs are rejected");
+
+  // window-edge root split: new pane spans the full edge; same-place no-ops
+  let re = defaultLayout();
+  re = openSession(re, "e1");
+  const onlyPane = re.focusedPaneId;
+  re = dropTabAtRootEdge(re, { surface: "terminal", sessionId: "e1" }, "left");
+  ok(
+    panes(re.root).length === 1 && re.focusedPaneId === onlyPane,
+    "root-edge drop of the only pane's only tab is a no-op",
+  );
+  re = splitPane(re, onlyPane, "row");
+  re = openSession(re, "e2");
+  re = dropTabAtRootEdge(re, { surface: "terminal", sessionId: "e2" }, "bottom");
+  ok(re.root.type === "split" && re.root.dir === "col", "root-edge drop splits the root");
+  ok(panes(re.root).length === 2, "moving a pane's last tab away collapses the pane");
+  const reBefore = re;
+  re = dropTabAtRootEdge(re, { surface: "terminal", sessionId: "e2" }, "bottom");
+  ok(re === reBefore, "re-dropping the edge pane's tab on the same edge is a no-op");
 
   // pruning dead sessions collapses emptied panes but never touches files
   let pr = defaultLayout();

@@ -1,16 +1,19 @@
 /**
  * Pointer-event drag & drop for the layout system (no HTML5 DnD — it cannot
- * hit 60fps and its ghosts are unstylable). Sources are rail rows and pane
- * tabs; targets are pane edge zones (left/right/top/bottom/center) and tab
- * bars (insertion index). A drag only becomes active past a small movement
- * threshold, so plain clicks keep working; Escape cancels an active drag.
+ * hit 60fps and its ghosts are unstylable). Sources are pane tabs, the pane
+ * bar's empty area (drags the active tab), rail rows, and file-tree entries;
+ * targets are pane edge bands (split), pane centers (adopt as a tab), tab
+ * bars (insertion index), and window edges (root split). A drag only becomes
+ * active past a small movement threshold, so plain clicks keep working;
+ * Escape cancels an active drag.
  */
 
-import type { SplitDir, Tab, Zone } from "./layout";
+import type { Side, SplitDir, Tab, Zone } from "./layout";
 
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
-  | { kind: "tab"; paneId: string; index: number };
+  | { kind: "tab"; paneId: string; index: number }
+  | { kind: "edge"; edge: Side };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
@@ -44,6 +47,17 @@ interface PaneReg {
 
 const paneRegs = new Map<string, PaneReg>();
 
+/** The stage element (the pane-tree viewport); its edges are drop targets. */
+let stageEl: HTMLElement | null = null;
+
+export function registerStage(el: HTMLElement): void {
+  stageEl = el;
+}
+
+export function unregisterStage(el: HTMLElement): void {
+  if (stageEl === el) stageEl = null;
+}
+
 export function registerPane(paneId: string, reg: PaneReg): void {
   paneRegs.set(paneId, reg);
 }
@@ -76,14 +90,16 @@ const DRAG_THRESHOLD_PX = 4;
 
 function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a === null || b === null) return a === b;
-  if (a.kind !== b.kind || a.paneId !== b.paneId) return false;
-  if (a.kind === "tab" && b.kind === "tab") return a.index === b.index;
-  if (a.kind === "zone" && b.kind === "zone") return a.zone === b.zone;
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "edge" && b.kind === "edge") return a.edge === b.edge;
+  if (a.kind === "tab" && b.kind === "tab") return a.paneId === b.paneId && a.index === b.index;
+  if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
   return false;
 }
 
+/** Edge bands are ~25% of the pane; the middle half-by-half is "center". */
 function zoneAt(nx: number, ny: number): Zone {
-  if (nx > 0.28 && nx < 0.72 && ny > 0.28 && ny < 0.72) return "center";
+  if (nx > 0.25 && nx < 0.75 && ny > 0.25 && ny < 0.75) return "center";
   const edges: [Zone, number][] = [
     ["left", nx],
     ["right", 1 - nx],
@@ -94,7 +110,29 @@ function zoneAt(nx: number, ny: number): Zone {
   return edges[0][0];
 }
 
+/** Pointer within this many px of the stage boundary targets a window edge. */
+const WINDOW_EDGE_PX = 16;
+
+function windowEdgeAt(x: number, y: number): DropSpot | null {
+  if (stageEl === null) return null;
+  const r = stageEl.getBoundingClientRect();
+  if (r.width === 0 || x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+  const d: [Side, number][] = [
+    ["left", x - r.left],
+    ["right", r.right - x],
+    ["top", y - r.top],
+    ["bottom", r.bottom - y],
+  ];
+  d.sort((p, q) => p[1] - q[1]);
+  return d[0][1] <= WINDOW_EDGE_PX ? { kind: "edge", edge: d[0][0] } : null;
+}
+
+/**
+ * Hit-test priority: tab bars (precise insertion beats everything), then
+ * window edges (a thin band along the stage boundary), then pane zones.
+ */
 function spotAt(x: number, y: number): DropSpot | null {
+  let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
     const r = reg.root.getBoundingClientRect();
     if (r.width === 0 || x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
@@ -113,6 +151,13 @@ function spotAt(x: number, y: number): DropSpot | null {
         return { kind: "tab", paneId, index };
       }
     }
+    paneHit = { paneId, r };
+    break;
+  }
+  const edge = windowEdgeAt(x, y);
+  if (edge !== null) return edge;
+  if (paneHit !== null) {
+    const { paneId, r } = paneHit;
     const nx = (x - r.left) / r.width;
     const ny = (y - r.top) / r.height;
     return { kind: "zone", paneId, zone: zoneAt(nx, ny) };

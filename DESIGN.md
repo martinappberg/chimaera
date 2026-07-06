@@ -325,6 +325,25 @@ files from the tree/palette). Any asymmetry is a bug.
 clicking the workspace name in the strip leaves focus mode (tooltip "show sidebar ⌘B") — a
 mode you can only exit via a chord is a trap.
 
+**Polish inventory (author, 2026-07-06 — standing micro-interaction rules for every build):**
+
+- Controls appear on hover of their *owning region* only (pane controls on bar hover, row
+  actions on row hover) — never on a whole-surface hover that lights up chrome everywhere.
+- Tooltips: ~500 ms delay, then instant for siblings while one is warm (macOS behavior);
+  always name the chord.
+- Transitions: opacity/transform only, 80–120 ms ease-out, never layout-shifting; respect
+  `prefers-reduced-motion`.
+- Cursor discipline: grab/grabbing on drags, col/row-resize on dividers, pointer only on
+  actual actions.
+- Every button has hover, active (subtle press), and :focus-visible states from one token set.
+- Drag ghosts: translucent chip, subtle shadow, no rotation gimmicks.
+- Scrollable regions get soft edge fades when content overflows; scrollbars thin and quiet
+  everywhere (terminal treatment is the reference).
+- Loading: nothing for <150 ms, soft pulse to ~400 ms, spinner only beyond; no spinner storms.
+- Numbers and timestamps use tabular-nums; truncation is middle-ellipsis for paths, end for
+  prose.
+- Empty states are quiet, specific, and actionable — never dead ends, never cheerful filler.
+
 **Quality bar ("SOTA usable"):** divider drags and tab drags at 60 fps with translucent
 drop-zone previews showing exactly where things land; transitions fast (≤120 ms) and few;
 fully keyboard-operable; visible focus states; zero layout jank on resize (terminal refit is
@@ -547,12 +566,17 @@ agent sessions living in one window is what makes it possible.
 
 **File-navigation niceties (author request 2026-07-06, second pass after M3 wave 1):**
 
-- **File-type icons**: a small curated set of inline 14–16 px SVG glyphs (no icon-font
-  dependency), one per category — code, data/table, document/markdown, image, HTML/report,
-  notebook, archive, config, binary — monochrome line style with a muted per-category tint
-  from the existing palette. Scientific formats get first-class icons (fastq/fasta, bam/cram,
-  vcf, parquet, bed/gtf) — a bioinformatics tree that *reads* at a glance is a differentiator
-  no general editor bothers with.
+- **File-type icons — one system, applied everywhere a file appears** (tree, tabs, pane top
+  bars, quick-open palette): inline 14–16 px SVGs, no icon font. Coverage goal is BROAD
+  (author: "as many filetypes as possible") — ~40+ mappings: per-language code icons (rust,
+  python, js/ts, svelte, R, shell, …), json/toml/yaml, markdown, html/css, notebooks,
+  csv/tsv/parquet, images, pdf, archives, lockfiles, dockerfiles, makefiles/justfiles,
+  env/config, git files, licenses — plus the first-class bio set (fasta/fastq, bam/cram/sam,
+  vcf/bcf, bed/gtf/gff, h5/h5ad). Implementation guidance: rather than hand-drawing 40 glyphs,
+  curate a subset from an MIT-licensed icon set (e.g. Material Icon Theme's SVG paths,
+  license-verified), normalized to our muted palette tints and stroke weight so they read as
+  one family with the hand-made session glyphs. Unknown types get a quiet generic-file glyph.
+  Icon lookup is by extension with a few filename specials (Dockerfile, justfile, LICENSE).
 - **Session-type icons, same system**: sessions carry a leading type glyph everywhere they
   appear (rail rows, pane tabs, strip chips, launcher rows, later the dashboard) — plain
   terminal = prompt glyph, Claude Code = spark-style glyph, Codex / Gemini = their own
