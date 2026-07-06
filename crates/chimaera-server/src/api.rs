@@ -158,6 +158,13 @@ pub(crate) struct CreateSession {
     name: Option<String>,
     #[serde(default)]
     kind: SessionKind,
+    /// Initial PTY size, clamped to sane bounds. The UI passes the focused
+    /// pane's fitted size so TUIs never boot at a wrong size (claude's boot
+    /// banner rendered at 80x24 then reflowed was a real observed artifact).
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
 }
 
 /// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or the
@@ -178,8 +185,8 @@ pub(crate) async fn create_session(
     let mut opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         name: body.name,
-        cols: 80,
-        rows: 24,
+        cols: body.cols.map_or(80, |c| c.clamp(20, 500)),
+        rows: body.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
         id: None,
     };
