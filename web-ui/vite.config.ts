@@ -9,6 +9,10 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      "/ws": {
+        target: process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+        ws: true,
+      },
     },
   },
 });

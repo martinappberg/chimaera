@@ -15,7 +15,11 @@ rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
 chimaera-core.workspace = true
+chimaera-pty.workspace = true
+futures.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.29"

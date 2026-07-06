@@ -550,6 +550,11 @@ M0 `connect` validated end-to-end against a production HPC cluster. Findings:
 - cluster login nodes run Duo + `gssapi-with-mic,password` only (no pubkeys): riding the
   user's ControlMaster isn't just convenient, it's the *only* non-interactive path — the
   design's shell-out-to-system-ssh decision is load-bearing here.
+- **On containers as a fallback:** Docker never exists on HPC (no root); Apptainer/Singularity
+  does, but adds per-site bind-mount/startup variance. The static binary already solves the
+  problem class containers address (old glibc, missing deps) — and the bugs we actually hit
+  were ssh/shell semantics that would reproduce identically inside a container. Keep an
+  Apptainer recipe as a documented fallback for pathological hosts, not as the plan.
 
 ## Sources
 

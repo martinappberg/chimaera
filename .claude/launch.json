@@ -6,6 +6,12 @@
       "runtimeExecutable": "cargo",
       "runtimeArgs": ["run", "-p", "chimaera", "--", "serve", "--port", "9700"],
       "port": 9700
+    },
+    {
+      "name": "web-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "web-ui", "run", "dev", "--", "--port", "5173", "--strictPort"],
+      "port": 5173
     }
   ]
 }

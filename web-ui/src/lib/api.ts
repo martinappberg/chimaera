@@ -1,22 +1,48 @@
 const TOKEN_KEY = "chimaera:token";
+const WS_KEY = "chimaera.ws";
 
 /**
- * Read the access token from the URL fragment (#token=...) once, persist it
- * to sessionStorage, and strip it from the address bar. Falls back to a
- * previously stored token on reload.
+ * Read the access token and workspace id from the URL fragment
+ * (#token=...&ws=...) once, persist them to sessionStorage, and strip the
+ * fragment from the address bar. Falls back to previously stored values on
+ * reload.
  */
-function initToken(): string | null {
+function initFromHash(): string | null {
   const params = new URLSearchParams(location.hash.slice(1));
-  const fromHash = params.get("token");
-  if (fromHash) {
-    sessionStorage.setItem(TOKEN_KEY, fromHash);
-    history.replaceState(null, "", location.pathname + location.search);
-    return fromHash;
+  const tokenFromHash = params.get("token");
+  const wsFromHash = params.get("ws");
+  if (tokenFromHash !== null) {
+    sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
-  return sessionStorage.getItem(TOKEN_KEY);
+  if (wsFromHash !== null) {
+    sessionStorage.setItem(WS_KEY, wsFromHash);
+  }
+  if (tokenFromHash !== null || wsFromHash !== null) {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
-const token = initToken();
+const token = initFromHash();
+
+/** The bearer token for this session, if one was provided. */
+export function getToken(): string | null {
+  return token;
+}
+
+/** The workspace id this tab is scoped to, if any (window = workspace). */
+export function getActiveWorkspaceId(): string | null {
+  return sessionStorage.getItem(WS_KEY);
+}
+
+/** Persist the tab's active workspace id; null clears it. */
+export function setActiveWorkspaceId(id: string | null): void {
+  if (id === null) {
+    sessionStorage.removeItem(WS_KEY);
+  } else {
+    sessionStorage.setItem(WS_KEY, id);
+  }
+}
 
 export class ApiError extends Error {
   readonly status: number;

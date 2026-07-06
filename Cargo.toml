@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/chimaera",
     "crates/chimaera-core",
+    "crates/chimaera-pty",
     "crates/chimaera-server",
 ]
 
@@ -30,7 +31,13 @@ nix = { version = "0.29", features = ["signal", "process"] }
 open = "5"
 mimalloc = "0.1"
 
+bytes = "1"
+futures = "0.3"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+
 chimaera-core = { path = "crates/chimaera-core" }
+chimaera-pty = { path = "crates/chimaera-pty" }
 chimaera-server = { path = "crates/chimaera-server" }
 
 [profile.release]
