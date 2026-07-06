@@ -278,6 +278,11 @@ rail is the source of truth for lifecycle). Keyboard: Cmd/Ctrl+Alt+Left/Right cy
 the focused pane. Cmd+T/Cmd+W stay unbound in the browser (tab-collision; the Tauri shell
 owns them properly). At M3, files open the same way: a preview tab in the focused pane.
 
+**Modifier policy (post-audit, 2026-07-06): the terminal owns bare Ctrl, everywhere.** App
+chords are Cmd-based on macOS and Ctrl+Shift-based on Linux/Windows (the terminal-emulator
+convention). A workbench that steals Ctrl+D from a shell is broken by definition — the first
+UX audit caught exactly this.
+
 **The parity principle (author, 2026-07-06): every action has BOTH a keyboard chord and a
 discoverable mouse path.** Keyboard for speed, mouse for discovery — neither is a fallback.
 Concretely for panes:
@@ -292,11 +297,33 @@ Concretely for panes:
 - Every hover control's tooltip teaches its chord ("zoom ⇧⌘↵") — the mouse path is how the
   keyboard path gets learned.
 
-**Discoverability rules** (from first real use, 2026-07-06): the tab bar shows whenever the
-window has more than one pane — even for single-tab panes — because a hidden tab bar leaves
-the common pane with no drag handle; it hides only in the single-pane single-tab case. And
-every mode needs a mouse exit: clicking the workspace name in the strip leaves focus mode
-(tooltip "show sidebar ⌘B") — a mode you can only exit via a chord is a trap.
+**Every pane always has a top bar (author, 2026-07-06 — supersedes the earlier
+hide-when-single-tab rule).** A slim (~26 px) always-present bar per pane: type glyph +
+active tab name (dirty dot for edited files), sibling tabs as compact items, and the pane
+controls living at its right edge (fade in on bar hover; the zoom badge stays persistent
+while zoomed). You always know which document/session a pane shows; every pane always has a
+drag handle; zoom/split/close always have a mouse home. Minimalism is preserved by making the
+bar quiet, not absent.
+
+**Surface parity (author, 2026-07-06):** terminal tabs and file tabs are the same kind of
+thing — same anatomy (glyph + name + close), same drag behavior, same chords, same top-bar
+treatment — differing ONLY in how new ones are created (sessions from the rail/launcher,
+files from the tree/palette). Any asymmetry is a bug.
+
+**The full drag grammar** (one mental model, everywhere):
+- *Sources:* tabs, the top bar's empty area (drags the pane's active tab), rail session rows,
+  file-tree entries.
+- *Targets:* pane **edge bands** (~25%) → split that pane on that side; pane **center** → the
+  dragged surface **becomes a tab** there (activated); a **tab bar** → insert at the pointer's
+  position (insertion caret shown); **window edges** → full-height/width root split.
+- *Rules:* moving a pane's last tab away collapses the pane; dropping a surface where it
+  already lives is a no-op; anything droppable shows its translucent preview before release;
+  Escape always cancels. Same-pane center drops don't duplicate — tabs are unique per
+  surface, window-wide.
+
+**Discoverability rules** (from first real use, 2026-07-06): every mode needs a mouse exit:
+clicking the workspace name in the strip leaves focus mode (tooltip "show sidebar ⌘B") — a
+mode you can only exit via a chord is a trap.
 
 **Quality bar ("SOTA usable"):** divider drags and tab drags at 60 fps with translucent
 drop-zone previews showing exactly where things land; transitions fast (≤120 ms) and few;
@@ -346,6 +373,17 @@ persistence + previews + workspace-first.*
 6. **One aggregate number** ("2 need you") in tab title/badge — never per-session counts.
 7. **Never steal terminal keystrokes** (zellij's top complaint): one leader key, double-tap to
    pass it through, everything else raw to the PTY, zero exceptions.
+
+**Naming rule zero (author, 2026-07-06): a session's name is the most specific thing known
+about what it's DOING, never where it merely lives.** The workspace name already appears in
+the window title and rail header; repeating it per-row is zero information (the shipped
+fallback did exactly this — three rows all reading "chimaera" — and was rightly called out).
+Display resolution: shells — foreground command while running (`snakemake`) → workspace-
+relative cwd while idle (`results/qc`) → shell name at root (`zsh`); agents — customTitle →
+aiTitle → first prompt truncated (captured from the UserPromptSubmit hook we already ingest —
+dispatching a task names the row instantly) → agent name. Foreground/cwd via ~2s daemon poll
+of the PTY's foreground process (/proc on Linux, libproc on macOS), OSC titles preferred when
+the shell emits them. Same resolved name everywhere: rail, tabs, strip, resume lists.
 
 **Auto-naming.** Agent sessions free-ride Claude Code's own naming: the CLI appends an
 `{"type":"ai-title"}` record to the session JSONL seconds after turn 1 (verified in real
@@ -488,6 +526,25 @@ so each new format is one server match-arm + one UI component.
   files, hex fallback.
 - Directory listings decorated with git status and scratch-vs-home filesystem hints.
 
+**The context bridge (author request 2026-07-06): selection knows its source.** Select text
+in a file view and a quiet floating affordance appears (plus a chord — parity principle):
+**"reference in agent"**. It types a precise reference into the focused agent session's
+input — Claude Code's native `@path` mention plus the line range and the quoted selection —
+*without submitting*, so you review and press Enter. The workbench knows exactly what you're
+looking at (path, line range), so agents get surgical context instead of pasted mystery text.
+Plain Cmd+C stays untouched (never spooky). Wave 2 of this: selections in *terminal* panes
+reference the session's scrollback.
+
+**Drag-to-reference (same feature, drop-based):** dragging a file (tree entry or file tab)
+over a *session* pane adds one zone to the drag grammar — a labeled band over the input area
+at the pane's bottom: **"@ reference"**. Dropping there types into the session instead of
+opening a tab: Claude agent sessions get the native `@path` mention (workspace-relative);
+plain terminals get the shell-escaped path (relative to the session's current cwd when under
+it — the naming-v2 cwd poll already knows it — else absolute). Never auto-submits. Center
+drop still means "open as tab"; the two intents get two visibly distinct zones, no modifier
+keys to memorize. This is a signature workbench feature — file views and
+agent sessions living in one window is what makes it possible.
+
 **File-navigation niceties (author request 2026-07-06, second pass after M3 wave 1):**
 
 - **File-type icons**: a small curated set of inline 14–16 px SVG glyphs (no icon-font
@@ -539,9 +596,11 @@ parts can be deferred indefinitely.
 
 True non-goals (product boundaries, not deferrals):
 
-- **No text editor.** Viewing must be great; editing is a single-file save box at most, added
-  late. The author rarely hand-edits code — that's the scope unlock that makes this buildable.
-  Real editing lives in whatever editor you already have.
+- **No IDE-grade editor** (amended 2026-07-06: author wants markdown/text *editable*).
+  Lightweight single-file editing IS in scope: the CodeMirror viewer flips editable, Cmd+S
+  saves through the daemon, dirty-dot on the tab, markdown gets an edit/preview toggle. The
+  non-goal that remains: no LSP, no completions, no multi-file refactoring, no debugger —
+  serious editing still lives in real editors; agents write most code anyway.
 - No own mobile app, no E2E relay service (free-ride `--remote-control` / ntfy), no Electron,
   nothing heavy on the cluster. (In-window split panes ARE in scope — author decision
   2026-07-06, superseding the earlier "no tiling WM" line; see In-window layout below. The

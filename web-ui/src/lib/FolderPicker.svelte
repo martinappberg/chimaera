@@ -35,8 +35,14 @@
   let busy = false;
 
   const showRecents = $derived(!navigated && input === "" && recents.length > 0);
+  /** An absolute (or ~) path typed into the filter: the "open this folder"
+   *  row acts on IT, not on the breadcrumb directory. */
+  const typedPath = $derived.by((): string | null => {
+    const t = input.trim();
+    return t.startsWith("/") || t.startsWith("~") ? t : null;
+  });
   const filtered = $derived(
-    listing === null
+    listing === null || typedPath !== null
       ? []
       : listing.dirs.filter((d) => d.name.toLowerCase().includes(input.trim().toLowerCase())),
   );
@@ -45,7 +51,9 @@
     if (showRecents) {
       for (const ws of recents) out.push({ kind: "recent", ws });
     }
-    if (listing !== null) {
+    if (typedPath !== null) {
+      out.push({ kind: "here", path: typedPath });
+    } else if (listing !== null) {
       out.push({ kind: "here", path: listing.path });
       for (const dir of filtered) out.push({ kind: "dir", dir });
     }
@@ -263,7 +271,13 @@
       {#if showRecents}
         <div class="section">recent</div>
         {#each recents as ws, i (ws.id)}
-          <div class="rowwrap" class:hl={highlight === i} data-idx={i}>
+          <div
+            class="rowwrap"
+            role="presentation"
+            class:hl={highlight === i}
+            data-idx={i}
+            onmouseenter={() => (highlight = i)}
+          >
             <button
               class="row"
               tabindex="-1"
@@ -278,22 +292,40 @@
         {/each}
         <div class="section">browse</div>
       {/if}
-      {#if listing !== null}
-        <div class="rowwrap" class:hl={highlight === browseOffset} data-idx={browseOffset}>
-          <button
-            class="row"
-            tabindex="-1"
-            title={listing.path}
-            onmousedown={keepFocus}
-            onclick={() => void openHere(listing?.path ?? null)}
+      {#if typedPath !== null || listing !== null}
+        {@const herePath = typedPath ?? listing?.path ?? null}
+        {#if herePath !== null}
+          <div
+            class="rowwrap"
+            role="presentation"
+            class:hl={highlight === browseOffset}
+            data-idx={browseOffset}
+            onmouseenter={() => (highlight = browseOffset)}
           >
-            <span class="name">open this folder</span>
-          </button>
-          {@render newWindow(listing.path)}
-        </div>
+            <button
+              class="row"
+              tabindex="-1"
+              title={herePath}
+              onmousedown={keepFocus}
+              onclick={() => void openHere(herePath)}
+            >
+              <span class="name here-label">open this folder</span>
+              {#if typedPath !== null}
+                <span class="here-path">{typedPath}</span>
+              {/if}
+            </button>
+            {@render newWindow(herePath)}
+          </div>
+        {/if}
         {#each filtered as dir, j (dir.path)}
           {@const idx = browseOffset + 1 + j}
-          <div class="rowwrap" class:hl={highlight === idx} data-idx={idx}>
+          <div
+            class="rowwrap"
+            role="presentation"
+            class:hl={highlight === idx}
+            data-idx={idx}
+            onmouseenter={() => (highlight = idx)}
+          >
             <button
               class="row"
               tabindex="-1"
@@ -357,8 +389,8 @@
     background: none;
     color: var(--fg);
     font: inherit;
-    font-size: 0.9rem;
-    padding: 0.7rem 0.9rem 0.4rem;
+    font-size: var(--text-md);
+    padding: 12px 16px 8px;
   }
 
   .filter::placeholder {
@@ -373,10 +405,10 @@
     white-space: nowrap;
     overflow-x: auto;
     scrollbar-width: none;
-    padding: 0 0.9rem 0.5rem;
+    padding: 0 16px 8px;
     border-bottom: 1px solid var(--edge);
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     min-height: 1.4em;
   }
@@ -407,18 +439,20 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0.3rem 0.45rem 0.45rem;
+    padding: 4px 8px 8px;
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
   }
 
   .section {
-    padding: 0.45rem 0.45rem 0.15rem;
-    font-size: 0.75rem;
+    padding: 8px 8px 2px;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
   .error {
-    padding: 0.4rem 0.45rem;
-    font-size: 0.75rem;
+    padding: 8px;
+    font-size: var(--text-sm);
     color: var(--err);
   }
 
@@ -426,12 +460,11 @@
     display: flex;
     align-items: center;
     border-radius: 5px;
+    transition: background-color 0.12s ease;
   }
 
-  .rowwrap:hover {
-    background: var(--row-hover);
-  }
-
+  /* One highlight at a time: mouse hover MOVES the keyboard highlight (see
+     onmouseenter) instead of painting a second row. */
   .rowwrap.hl {
     background: var(--row-active);
   }
@@ -441,15 +474,15 @@
     min-width: 0;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 8px;
     appearance: none;
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.85rem;
+    font-size: var(--text-md);
     color: var(--fg);
     text-align: left;
-    padding: 0.32rem 0.45rem;
+    padding: 6px 8px;
     cursor: pointer;
   }
 
@@ -460,7 +493,22 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono);
-    font-size: 0.78rem;
+    font-size: var(--text-sm);
+  }
+
+  .name.here-label {
+    flex: none;
+  }
+
+  .here-path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
   }
 
   .chev {
@@ -476,9 +524,9 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
-    padding: 0.2rem 0.45rem;
+    padding: 0.2rem 8px;
     cursor: pointer;
   }
 
@@ -486,7 +534,6 @@
     color: var(--fg);
   }
 
-  .rowwrap:hover .side,
   .rowwrap.hl .side {
     display: block;
   }

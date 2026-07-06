@@ -263,6 +263,17 @@ export function detachTab(l: Layout, paneId: string, index: number): Layout {
 }
 
 /**
+ * Close a pane outright (its sibling absorbs the split). The last pane
+ * never closes — with tabs it stays, empty it simply stays empty.
+ */
+export function closePane(l: Layout, paneId: string): Layout {
+  if (findPane(l.root, paneId) === null) return l;
+  if (panes(l.root).length === 1) return l;
+  const root = replaceNode(l.root, paneId, null);
+  return normalize({ ...l, root: root ?? emptyPane() });
+}
+
+/**
  * Open a surface: focus its existing tab if it is open anywhere (VS Code
  * semantics, no duplicates), otherwise append it to the focused pane.
  */
@@ -616,6 +627,17 @@ if (import.meta.env.DEV) {
   ok(locS !== null, "session is findable");
   if (locS !== null) l = detachTab(l, locS.paneId, locS.index);
   ok(panes(l.root).length === 1, "empty pane collapses into its sibling");
+
+  // closePane collapses a pane outright but never removes the last one
+  let cl = defaultLayout();
+  cl = splitPane(cl, cl.focusedPaneId, "row");
+  const clNew = cl.focusedPaneId;
+  cl = closePane(cl, clNew);
+  ok(panes(cl.root).length === 1, "closePane collapses the pane");
+  ok(findPane(cl.root, clNew) === null, "closed pane is gone");
+  const clOnly = cl.focusedPaneId;
+  cl = closePane(cl, clOnly);
+  ok(panes(cl.root).length === 1 && cl.focusedPaneId === clOnly, "last pane never closes");
 
   // geometric focus: A | (B over C) — from A moving right lands in B or C,
   // moving right again is a no-op, moving down from B lands in C.

@@ -29,6 +29,12 @@ export const FONT_FAMILY =
 export interface PoolHandlers {
   onTitle(id: string, title: string): void;
   onExited(id: string, status: number | null): void;
+  /**
+   * Fatal socket error for a session (auth rejection, session gone).
+   * Protocol errors never reach the terminal scrollback — the app decides
+   * how to surface them.
+   */
+  onSocketError(id: string, message: string): void;
 }
 
 interface PoolEntry {
@@ -220,7 +226,9 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
       handlers?.onExited(id, status);
     },
     onError: (message) => {
-      term.write(`\r\n\x1b[2m[${message}]\x1b[0m\r\n`);
+      // Never write protocol errors into the PTY scrollback; route them to
+      // the app (which shows the re-auth overlay on "unauthorized").
+      handlers?.onSocketError(id, message);
     },
   });
 
@@ -268,13 +276,16 @@ function attach(id: string, host: HTMLElement): void {
   entry.lastUsed = ++clock;
   evictLru();
   const e = entry;
+  // Hand focus over synchronously — the element is attached and xterm's
+  // textarea exists; waiting for a rAF drops keystrokes typed in the gap
+  // (and throttled rAFs can delay it indefinitely).
+  if (pendingFocusId === id) {
+    pendingFocusId = null;
+    e.term.focus();
+  }
   requestAnimationFrame(() => {
     if (e.el.parentElement !== host) return;
     fitEntry(e);
-    if (pendingFocusId === id) {
-      pendingFocusId = null;
-      e.term.focus();
-    }
   });
 }
 

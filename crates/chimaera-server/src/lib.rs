@@ -2,6 +2,7 @@ mod agents;
 mod api;
 mod assets;
 mod fs;
+mod naming;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -42,6 +43,9 @@ pub(crate) struct AppState {
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
     pub(crate) agents: Mutex<HashMap<String, agents::AgentRecord>>,
+    /// session id -> polled shell display name (naming rule zero); written
+    /// by the per-session watcher in `naming`, read by `session_json`.
+    pub(crate) display_names: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Signalled whenever the session list / agent state / titles change;
@@ -74,6 +78,7 @@ impl AppState {
             sessions: chimaera_pty::SessionManager::new(),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
+            display_names: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
             changes: tokio::sync::Notify::new(),
             claude_bin: tokio::sync::OnceCell::new(),
@@ -487,6 +492,14 @@ mod tests {
         assert_eq!(session["rows"], 24);
         assert_eq!(session["alive"], true);
 
+        // A fresh shell is named after the shell binary itself (naming rule
+        // zero: it sits idle at the workspace root), and nothing is pinned.
+        assert_eq!(
+            session["display_name"].as_str().unwrap(),
+            naming::default_shell_name()
+        );
+        assert_eq!(session["renamed"], false);
+
         // GET lists it, alive.
         let (status, list) = request(&state, Method::GET, "/api/v1/sessions", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -498,6 +511,7 @@ mod tests {
             .expect("session listed");
         assert_eq!(entry["alive"], true);
         assert_eq!(entry["workspace_id"].as_str().unwrap(), workspace_id);
+        assert!(entry["display_name"].is_string());
 
         // DELETE kills it.
         let (status, _) = request(
@@ -983,6 +997,165 @@ mod tests {
         line.push('\n');
         std::io::Write::write_all(&mut file, line.as_bytes()).unwrap();
         wait_for_title("My run").await;
+
+        state.sessions.kill(&id).ok();
+    }
+
+    /// Spawn a real bash (no rc files, so no OSC titles interfere) at `root`,
+    /// map it to `workspace_id`, and start the naming watcher — the shell
+    /// equivalent of `inject_agent`.
+    fn inject_shell(state: &Arc<AppState>, root: &std::path::Path, workspace_id: &str) -> String {
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: root.to_path_buf(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/bash".to_string(),
+                    "--noprofile".to_string(),
+                    "--norc".to_string(),
+                ]),
+                id: None,
+            })
+            .expect("spawn shell");
+        lock(&state.session_workspaces).insert(info.id.clone(), workspace_id.to_string());
+        naming::spawn_shell_watch(state.clone(), info.id.clone());
+        info.id
+    }
+
+    /// Poll GET /api/v1/sessions until the session's display_name matches.
+    async fn wait_display_name(state: &Arc<AppState>, id: &str, expected: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let entry = session_entry(state, id).await;
+            if entry["display_name"] == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "display_name stuck at {}, want {expected:?}",
+                entry["display_name"]
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_display_name_tracks_foreground_command() {
+        let state = test_state();
+        let root = test_dir("naming-fg");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let id = inject_shell(&state, &root, &workspace_id);
+
+        // Idle at the workspace root: named after the shell binary.
+        wait_display_name(&state, &id, "bash").await;
+        assert_eq!(session_entry(&state, &id).await["renamed"], false);
+
+        // A running foreground command takes over the name...
+        let att = state.sessions.attach(&id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("sleep 5\n"))
+            .await
+            .expect("send input");
+        wait_display_name(&state, &id, "sleep").await;
+
+        // ...and the name falls back to the shell once it exits.
+        wait_display_name(&state, &id, "bash").await;
+
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_display_name_uses_workspace_relative_cwd() {
+        let state = test_state();
+        let root = test_dir("naming-cd");
+        std::fs::create_dir(root.join("crates")).unwrap();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let id = inject_shell(&state, &root, &workspace_id);
+
+        wait_display_name(&state, &id, "bash").await;
+
+        // cd into a subdirectory: the idle shell is named by where it sits,
+        // relative to the workspace root.
+        let att = state.sessions.attach(&id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("cd crates\n"))
+            .await
+            .expect("send input");
+        wait_display_name(&state, &id, "crates").await;
+
+        // cd back to the root: the shell name again.
+        att.input
+            .send(bytes::Bytes::from("cd ..\n"))
+            .await
+            .expect("send input");
+        wait_display_name(&state, &id, "bash").await;
+
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_first_prompt_is_provisional_display_name() {
+        let state = test_state();
+        let id = inject_agent(&state, "k");
+
+        // No hook data yet: the generic agent name.
+        assert_eq!(session_entry(&state, &id).await["display_name"], "claude");
+
+        // The first UserPromptSubmit becomes the provisional title,
+        // truncated near 60 chars at a word boundary.
+        let prompt = "please refactor the entire qc pipeline so the reports land in \
+                      results/qc and nothing downstream breaks";
+        let status = post_hook(
+            &state,
+            &id,
+            "k",
+            serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = session_entry(&state, &id).await;
+        let display = entry["display_name"].as_str().unwrap();
+        assert!(
+            display.starts_with("please refactor the entire qc pipeline"),
+            "{display}"
+        );
+        assert!(display.ends_with('…'), "{display}");
+        assert!(display.chars().count() <= 61, "{display}");
+        assert_eq!(entry["agent_state"], "running");
+
+        // A later prompt does not displace the first.
+        let status = post_hook(
+            &state,
+            &id,
+            "k",
+            serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": "and again"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            session_entry(&state, &id).await["display_name"],
+            display,
+            "first prompt must stay the provisional title"
+        );
 
         state.sessions.kill(&id).ok();
     }

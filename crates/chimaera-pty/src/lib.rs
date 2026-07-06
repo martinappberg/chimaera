@@ -34,6 +34,11 @@ pub struct SessionInfo {
     pub alive: bool,
     pub exit_status: Option<i32>,
     pub title: Option<String>,
+    /// OS pid of the direct child (the shell or command), when known.
+    pub pid: Option<u32>,
+    /// True when `name` was pinned explicitly (spawn name / user rename)
+    /// rather than derived from the cwd; pinned names stay authoritative.
+    pub renamed: bool,
 }
 
 /// Options for spawning a new session.
@@ -151,6 +156,14 @@ impl SessionManager {
             .session(id)
             .ok_or_else(|| anyhow!("unknown session: {id}"))?;
         session.resize(cols, rows)
+    }
+
+    /// Pid of the foreground process group on the session's tty
+    /// (`tcgetpgrp` on the PTY master). `None` for unknown sessions or when
+    /// the platform/tty cannot answer. For an idle shell this is the shell's
+    /// own pid; while a command runs it is (the group leader of) that command.
+    pub fn foreground_pid(&self, id: &str) -> Option<i32> {
+        self.session(id).and_then(|s| s.foreground_pid())
     }
 
     /// Signal the session's child to terminate (SIGHUP); the wait thread

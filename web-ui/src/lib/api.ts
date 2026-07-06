@@ -1,3 +1,5 @@
+import { writable } from "svelte/store";
+
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
@@ -28,11 +30,38 @@ function initFromHash(): string | null {
   return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
 }
 
-const token = initFromHash();
+let token = initFromHash();
 
 /** The bearer token for this session, if one was provided. */
 export function getToken(): string | null {
   return token;
+}
+
+/**
+ * True once any REST call or events socket saw a 401/unauthorized; drives
+ * the blocking reconnect overlay. Cleared only by a successful re-auth
+ * (which reloads the window).
+ */
+export const unauthorized = writable(false);
+
+/** Mark this window's auth as dead (401 from REST or a WS auth error). */
+export function notifyUnauthorized(): void {
+  unauthorized.set(true);
+}
+
+/**
+ * Re-read the token from the URL fragment (the user may have pasted a fresh
+ * `chimaera connect` URL into the address bar without reloading). Returns
+ * true when a new token was picked up.
+ */
+export function refreshTokenFromHash(): boolean {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const fresh = params.get("token");
+  if (fresh === null || fresh === token) return false;
+  token = fresh;
+  sessionStorage.setItem(TOKEN_KEY, fresh);
+  history.replaceState(null, "", location.pathname + location.search);
+  return true;
 }
 
 /**
@@ -74,7 +103,9 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  return fetch(`/api/v1${path}`, { ...init, headers });
+  const res = await fetch(`/api/v1${path}`, { ...init, headers });
+  if (res.status === 401) notifyUnauthorized();
+  return res;
 }
 
 export interface Health {

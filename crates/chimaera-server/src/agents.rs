@@ -66,6 +66,9 @@ pub(crate) struct AgentRecord {
     pub(crate) custom_title: Option<String>,
     /// Latest `{"type":"ai-title"}` transcript record.
     pub(crate) ai_title: Option<String>,
+    /// First prompt seen in a `UserPromptSubmit` hook payload; provisional
+    /// display name until a real title exists.
+    pub(crate) first_prompt: Option<String>,
 }
 
 impl AgentRecord {
@@ -76,6 +79,7 @@ impl AgentRecord {
             transcript_path: None,
             custom_title: None,
             ai_title: None,
+            first_prompt: None,
         }
     }
 
@@ -83,6 +87,44 @@ impl AgentRecord {
     pub(crate) fn title(&self) -> Option<&str> {
         self.custom_title.as_deref().or(self.ai_title.as_deref())
     }
+
+    /// Display name, naming rule zero for agents:
+    /// customTitle > aiTitle > first prompt (truncated) > "claude".
+    pub(crate) fn display_name(&self) -> String {
+        self.title()
+            .map(str::to_string)
+            .or_else(|| self.first_prompt.as_deref().map(truncate_prompt))
+            .unwrap_or_else(|| "claude".to_string())
+    }
+}
+
+/// Provisional-title cap (chars); truncation backs off to a word boundary.
+const PROMPT_TITLE_MAX: usize = 60;
+
+/// Collapse whitespace and truncate to ~60 chars at a word boundary,
+/// appending an ellipsis when anything was cut.
+fn truncate_prompt(prompt: &str) -> String {
+    let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= PROMPT_TITLE_MAX {
+        return flat;
+    }
+    let mut out = String::new();
+    for word in flat.split(' ') {
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + sep + word.chars().count() > PROMPT_TITLE_MAX {
+            break;
+        }
+        if sep == 1 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        // A single giant word: hard-cut it.
+        out = flat.chars().take(PROMPT_TITLE_MAX).collect();
+    }
+    out.push('…');
+    out
 }
 
 /// Fresh session id in the same format the PTY engine generates.
@@ -214,6 +256,19 @@ pub(crate) async fn ingest(
         .get("hook_event_name")
         .and_then(|e| e.as_str())
         .unwrap_or("");
+
+    // The first prompt becomes the provisional display name (it loses to any
+    // customTitle/aiTitle transcript record; see AgentRecord::display_name).
+    if event == "UserPromptSubmit" && record.first_prompt.is_none() {
+        if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+            let prompt = prompt.trim();
+            if !prompt.is_empty() {
+                record.first_prompt = Some(prompt.to_string());
+                changed = true;
+            }
+        }
+    }
+
     if let Some(next) = map_event(event, &payload) {
         if record.state != next {
             record.state = next;
@@ -475,6 +530,37 @@ mod tests {
         assert_eq!(record.title(), Some("Second ai"));
         // Garbage lines are ignored.
         assert!(!apply_title_line("not json", &mut record));
+    }
+
+    #[test]
+    fn display_name_resolution_chain() {
+        let mut record = AgentRecord::new("k".into());
+        assert_eq!(record.display_name(), "claude");
+        record.first_prompt = Some("fix the flaky tests".into());
+        assert_eq!(record.display_name(), "fix the flaky tests");
+        record.ai_title = Some("Fixing tests".into());
+        assert_eq!(record.display_name(), "Fixing tests");
+        record.custom_title = Some("My run".into());
+        assert_eq!(record.display_name(), "My run");
+    }
+
+    #[test]
+    fn truncate_prompt_cuts_at_word_boundaries() {
+        // Short prompts pass through (whitespace collapsed).
+        assert_eq!(truncate_prompt("short prompt"), "short prompt");
+        assert_eq!(
+            truncate_prompt("  collapse \n\t whitespace  "),
+            "collapse whitespace"
+        );
+        // Long prompts are cut at a word boundary near 60 chars, with an
+        // ellipsis marking the cut.
+        let out = truncate_prompt(&"word ".repeat(30));
+        assert!(out.chars().count() <= PROMPT_TITLE_MAX + 1, "{out}");
+        assert!(out.ends_with(" word…"), "{out}");
+        // A single giant token is hard-cut rather than dropped.
+        let out = truncate_prompt(&"x".repeat(200));
+        assert_eq!(out.chars().count(), PROMPT_TITLE_MAX + 1);
+        assert!(out.ends_with('…'));
     }
 
     #[test]

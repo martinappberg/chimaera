@@ -6,11 +6,7 @@
  * threshold, so plain clicks keep working; Escape cancels an active drag.
  */
 
-import type { Tab, Zone } from "./layout";
-
-/** Modifier-key label for hints ("⌘" on macOS, "Ctrl+" elsewhere). */
-export const MOD_LABEL =
-  typeof navigator !== "undefined" && /mac/i.test(navigator.platform) ? "⌘" : "Ctrl+";
+import type { SplitDir, Tab, Zone } from "./layout";
 
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
@@ -32,6 +28,12 @@ export interface LayoutCtrl {
   dragTab(e: PointerEvent, paneId: string, index: number, tab: Tab): void;
   /** Divider drag lifecycle — gates terminal refits. */
   dividerDrag(active: boolean): void;
+  /** Split `paneId` (pane hover cluster; same as the mod+D chords). */
+  splitPaneAt(paneId: string, dir: SplitDir): void;
+  /** Toggle zoom on `paneId` (cluster button, zoom badge, tab dblclick). */
+  zoomPane(paneId: string): void;
+  /** Close the pane's active view; an empty pane collapses. */
+  closeView(paneId: string): void;
 }
 
 interface PaneReg {
@@ -53,6 +55,11 @@ export function unregisterPane(paneId: string, root: HTMLElement): void {
 
 export function paneContentEl(paneId: string): HTMLElement | null {
   return paneRegs.get(paneId)?.content ?? null;
+}
+
+/** The pane's root element (focus target for freshly split empty panes). */
+export function paneRootEl(paneId: string): HTMLElement | null {
+  return paneRegs.get(paneId)?.root ?? null;
 }
 
 export interface DragCallbacks {

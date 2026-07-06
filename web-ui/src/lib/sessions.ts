@@ -33,6 +33,17 @@ export interface Session {
   agent_state: AgentState | null;
   /** Claude's own name for the conversation; overrides `name` for display. */
   agent_title: string | null;
+  /**
+   * Server-resolved display name (naming rule zero: the most specific thing
+   * known about what the session is DOING). Optional until the daemon half
+   * lands; the client falls back to agent_title/name.
+   */
+  display_name?: string | null;
+}
+
+/** The one display name for a session, used identically everywhere. */
+export function displayName(s: Session): string {
+  return s.display_name ?? s.agent_title ?? s.name;
 }
 
 /** True when the session is waiting on the user (drives the aggregate count). */
@@ -63,7 +74,30 @@ export function dotState(s: Session): string {
     case "rate_limited":
       return "rate";
     default:
-      return "";
+      // "unknown" on a live process is a visible starting state (hollow
+      // ring), distinct from both finished (filled) and dead (dim).
+      return s.alive ? "starting" : "";
+  }
+}
+
+/** Hover tooltip naming the state behind a session dot. */
+export function dotTitle(s: Session): string {
+  if (s.kind !== "agent") return s.alive ? "shell running" : "exited";
+  switch (s.agent_state) {
+    case "running":
+      return "agent working";
+    case "needs_permission":
+      return "needs permission";
+    case "idle_prompt":
+      return "waiting for your input";
+    case "finished":
+      return "finished";
+    case "errored":
+      return "agent error";
+    case "rate_limited":
+      return "rate limited";
+    default:
+      return s.alive ? "starting…" : "exited";
   }
 }
 

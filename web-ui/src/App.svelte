@@ -1,17 +1,23 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import {
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
+    health as fetchHealth,
+    notifyUnauthorized,
     pollHealth,
+    refreshTokenFromHash,
     setActiveWorkspaceId,
+    unauthorized,
     type Health,
   } from "./lib/api";
   import {
     createSession,
     deleteSession,
+    displayName,
     dotState,
+    dotTitle,
     listWorkspaces,
     needsAttention,
     pollSessions,
@@ -24,6 +30,7 @@
   import {
     activateTab,
     allFilePaths,
+    closePane,
     cycleTab,
     defaultLayout,
     deserializeLayout,
@@ -37,6 +44,7 @@
     moveTabToIndex,
     openFile,
     openSession,
+    panes,
     pruneFiles,
     pruneSessions,
     serializeLayout,
@@ -52,10 +60,12 @@
   import { basename, fileTabTitles, fsProbe } from "./lib/files";
   import {
     paneContentEl,
+    paneRootEl,
     startDrag,
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/dnd";
+  import { chordDigit, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
@@ -64,13 +74,19 @@
   import Pane from "./lib/Pane.svelte";
 
   let health = $state<Health | null>(null);
-  let daemonOk = $state(false);
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
   let pickerOpen = $state(false);
   let eventsUp = $state(false);
-  let agentError = $state<string | null>(null);
+  let createError = $state<string | null>(null);
+  /** Rail row currently showing the inline kill confirmation. */
+  let confirmKillId = $state<string | null>(null);
+  /** Element that held focus when the picker opened; restored on close. */
+  let pickerRestoreEl: HTMLElement | null = null;
+  /** Feedback under the retry button on the re-auth overlay. */
+  let authRetryMsg = $state<string | null>(null);
+  let authRetrying = $state(false);
 
   // In-window layout: the tree is daemon-owned per-window view state; until
   // the GET resolves the stage stays blank (fast, local) so a restored tree
@@ -90,6 +106,15 @@
 
   const winKey = windowKey();
 
+  /**
+   * View-state key: (window id, workspace id) composed client-side, so
+   * switching workspaces away and back restores that workspace's layout.
+   * Server key charset is [A-Za-z0-9_-]{1,64}; uuid + "_" + "w-xxxxxxxx" fits.
+   */
+  function stateKey(wsId: string | null): string {
+    return wsId === null ? winKey : `${winKey}_${wsId}`;
+  }
+
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
@@ -100,17 +125,19 @@
   const zoomedPane = $derived(
     layout.zoomedPaneId !== null ? findPane(layout.root, layout.zoomedPaneId) : null,
   );
+  /** With more than one pane, every pane shows its tab bar (orientation). */
+  const multiPane = $derived(panes(layout.root).length > 1);
 
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
 
-  // Row name is the agent's own title when it has one; duplicate display
-  // names within a workspace get a " · n" suffix.
+  // Row name is the server-resolved display name (naming rule zero), with
+  // the " · n" suffix only as a duplicate tiebreaker within the workspace.
   const displayNames = $derived.by(() => {
     const counts = new Map<string, number>();
     const names = new Map<string, string>();
     for (const s of wsSessions) {
-      const base = s.agent_title ?? s.name;
+      const base = displayName(s);
       const n = (counts.get(base) ?? 0) + 1;
       counts.set(base, n);
       names.set(s.id, n === 1 ? base : `${base} · ${n}`);
@@ -118,14 +145,15 @@
     return names;
   });
 
+  // Health polling keeps the hostname fresh and trips the 401 overlay; the
+  // daemon dot itself tracks the authenticated events socket.
   $effect(() =>
     pollHealth(
       (h) => {
         health = h;
-        daemonOk = true;
       },
       () => {
-        daemonOk = false;
+        // unreachable daemon; the events socket state already reflects this
       },
     ),
   );
@@ -139,11 +167,12 @@
     });
   });
 
-  // Persist the layout (debounced in viewState) whenever it changes.
+  // Persist the layout (debounced in viewState) whenever it changes, keyed
+  // by (window, workspace) so each workspace keeps its own tree.
   $effect(() => {
     const blob = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
     if (!layoutReady) return;
-    saveViewState(winKey, blob);
+    saveViewState(stateKey(activeWsId), blob);
   });
 
   // Dispose pooled terminals for sessions that no longer exist.
@@ -154,10 +183,13 @@
   });
 
   onMount(() => {
-    pool.initPool({ onTitle, onExited });
+    pool.initPool({ onTitle, onExited, onSocketError });
     const events = new EventsSocket({
       onSessions: applySessions,
       onStatus: (up) => (eventsUp = up),
+      onFatal: (message) => {
+        if (message === "unauthorized") notifyUnauthorized();
+      },
     });
     refreshWorkspaces();
     void bootViewState();
@@ -173,16 +205,31 @@
     };
   });
 
-  /** Restore this window's layout from the daemon; anything missing/invalid
-   *  (including a not-yet-upgraded daemon) falls back to the default. */
+  /** Guards overlapping boots (initial load racing a workspace switch). */
+  let bootSeq = 0;
+
+  /** Restore this (window, workspace)'s layout from the daemon; anything
+   *  missing/invalid (including a not-yet-upgraded daemon) falls back to the
+   *  default. Blobs written before per-workspace keys are read from the bare
+   *  window key when they match the active workspace. */
   async function bootViewState(): Promise<void> {
-    const raw = await loadViewState(winKey);
-    if (
+    const seq = ++bootSeq;
+    const wsAtBoot = activeWsId;
+    const matches = (raw: unknown): boolean =>
       typeof raw === "object" &&
       raw !== null &&
       (raw as { v?: unknown }).v === 1 &&
-      (raw as { ws?: unknown }).ws === activeWsId
-    ) {
+      (raw as { ws?: unknown }).ws === wsAtBoot;
+    // A slow/hung daemon must never leave the stage blank forever: after 3s
+    // the default layout renders and a late restore is simply dropped.
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
+    let raw = await Promise.race([loadViewState(stateKey(wsAtBoot)), timeout]);
+    if (!matches(raw) && wsAtBoot !== null) {
+      // pre-composite-key blob migration
+      raw = await Promise.race([loadViewState(winKey), timeout]);
+    }
+    if (seq !== bootSeq) return; // a later switch superseded this boot
+    if (matches(raw)) {
       const restored = deserializeLayout((raw as { layout?: unknown }).layout);
       if (restored !== null) layout = restored;
     }
@@ -203,29 +250,40 @@
   }
 
   /**
-   * The chords intercepted even when a terminal has focus (capture phase;
-   * everything is modifier-gated so plain keys always reach the PTY):
-   *   mod+O picker · mod+1..9 open Nth session · mod+D / mod+Shift+D splits
-   *   mod+Alt+arrows focus · mod+Alt+[ ] tabs · mod+Shift+Enter zoom · mod+B
-   *   focus mode. Cmd+W/Cmd+T stay unbound (browser collision).
+   * The chords intercepted even when a terminal has focus (capture phase).
+   * Modifier policy: Cmd-based on macOS, Ctrl+Shift-based elsewhere — the
+   * terminal owns bare Ctrl on every platform (tmux Ctrl+B, EOF Ctrl+D,
+   * zsh/vim Ctrl+O all reach the PTY untouched). The second layer is Shift
+   * on macOS and Alt elsewhere (see keys.ts):
+   *   mod+O picker toggle · mod+1..9 open Nth session · mod+E terminal /
+   *   mod2+E agent · mod+D / mod2+D splits · mod+Backspace close view ·
+   *   mod+Alt+arrows focus · mod+Alt+[ ] tabs · mod2+Enter zoom · mod+B
+   *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
-    const mod = e.metaKey || e.ctrlKey;
-    if (!mod) return;
+    if (!isAppChord(e)) return;
+    const l2 = isLayer2(e);
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // On macOS, Alt is reserved for the navigation layer, so letter/digit
+    // chords must not fire with Alt held. Elsewhere Alt IS the second layer.
+    const plain = !isMac || !e.altKey;
     const intercept = () => {
       e.preventDefault();
       e.stopPropagation();
     };
-    if (!e.altKey && !e.shiftKey && key === "o") {
+
+    if (key === "o" && !l2 && plain) {
       intercept();
-      openPicker();
+      if (pickerOpen) closePicker();
+      else openPicker();
       return;
     }
     if (pickerOpen) return;
     if (activeWsId === null || !layoutReady) return;
 
-    if (e.altKey && !e.shiftKey) {
+    // Navigation layer (Alt on both platforms): arrows move pane focus,
+    // brackets cycle the focused pane's tabs.
+    if (e.altKey) {
       const dirs: Record<string, FocusDir> = {
         ArrowLeft: "left",
         ArrowRight: "right",
@@ -236,41 +294,49 @@
       if (dir !== undefined) {
         intercept();
         focusDirection(dir);
-      } else if (e.code === "BracketLeft") {
+        return;
+      }
+      if (e.code === "BracketLeft") {
         intercept();
         cycle(-1);
-      } else if (e.code === "BracketRight") {
+        return;
+      }
+      if (e.code === "BracketRight") {
         intercept();
         cycle(1);
-      }
-      return;
-    }
-    if (e.shiftKey && !e.altKey) {
-      if (key === "d") {
-        intercept();
-        split("col");
-      } else if (key === "Enter") {
-        intercept();
-        layout = toggleZoom(layout);
-      }
-      return;
-    }
-    if (!e.shiftKey && !e.altKey) {
-      if (key === "d") {
-        intercept();
-        split("row");
         return;
       }
-      if (key === "b") {
-        intercept();
-        layout = { ...layout, focusMode: !layout.focusMode };
-        return;
-      }
-      const n = Number.parseInt(key, 10);
-      if (n >= 1 && n <= 9 && n <= wsSessions.length) {
-        intercept();
-        openSess(wsSessions[n - 1].id);
-      }
+    }
+
+    if (key === "d" && plain) {
+      intercept();
+      split(l2 ? "col" : "row");
+      return;
+    }
+    if (key === "e" && plain) {
+      intercept();
+      void newSession(l2 ? "agent" : "shell");
+      return;
+    }
+    if (key === "Enter" && l2) {
+      intercept();
+      layout = toggleZoom(layout);
+      return;
+    }
+    if (key === "Backspace" && !l2 && plain) {
+      intercept();
+      closeView(layout.focusedPaneId);
+      return;
+    }
+    if (key === "b" && !l2 && plain) {
+      intercept();
+      layout = { ...layout, focusMode: !layout.focusMode };
+      return;
+    }
+    const n = chordDigit(e);
+    if (n !== null && !l2 && plain && n <= wsSessions.length) {
+      intercept();
+      openSess(wsSessions[n - 1].id);
     }
   }
 
@@ -298,8 +364,26 @@
   }
 
   function openPicker(): void {
+    if (pickerOpen) return;
+    pickerRestoreEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     refreshWorkspaces();
     pickerOpen = true;
+  }
+
+  /** Close the picker and put focus back where it was (or on the focused
+   *  session's terminal), so keystrokes never die on <body>. */
+  function closePicker(): void {
+    pickerOpen = false;
+    const el = pickerRestoreEl;
+    pickerRestoreEl = null;
+    void tick().then(() => {
+      if (el !== null && el.isConnected) {
+        el.focus();
+        return;
+      }
+      const sid = focusedSessionOf(layout);
+      if (sid !== null) pool.focusTerminal(sid);
+    });
   }
 
   /** Scope this window to `w` (open in THIS window). */
@@ -308,17 +392,18 @@
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
     const switched = activeWsId !== w.id;
+    closePicker();
+    createError = null;
+    if (!switched) return;
+    // Flush the outgoing workspace's pending layout write under its own key,
+    // then restore (or default) the incoming workspace's tree.
+    void flushViewState();
     activeWsId = w.id;
     setActiveWorkspaceId(w.id);
-    pickerOpen = false;
-    agentError = null;
-    if (switched) {
-      // The layout tree is per workspace window; a workspace switch starts
-      // clean and auto-opens the new workspace's first session.
-      layout = defaultLayout();
-      autoOpened = false;
-      pruneAndAutoOpen();
-    }
+    layoutReady = false;
+    layout = defaultLayout();
+    autoOpened = false;
+    void bootViewState();
   }
 
   function applySessions(list: Session[]): void {
@@ -329,13 +414,27 @@
   }
 
   /**
+   * Sessions created by this window in the last few seconds. A sessions
+   * snapshot fetched BEFORE the create but arriving AFTER it would otherwise
+   * prune the fresh tab right out of the layout (stale-poll race).
+   */
+  const recentlyCreated = new Map<string, number>();
+  const RECENT_MS = 10_000;
+
+  /**
    * Once both the persisted layout and the first session snapshot are in:
    * drop tabs whose sessions vanished (also on every later snapshot), and —
    * exactly once — populate a pristine layout with the first session.
    */
   function pruneAndAutoOpen(): void {
     if (!layoutReady || !gotSessions) return;
-    layout = pruneSessions(layout, new Set(sessions.map((s) => s.id)));
+    const live = new Set(sessions.map((s) => s.id));
+    const now = Date.now();
+    for (const [id, ts] of recentlyCreated) {
+      if (now - ts > RECENT_MS) recentlyCreated.delete(id);
+      else live.add(id);
+    }
+    layout = pruneSessions(layout, live);
     if (!autoOpened) {
       autoOpened = true;
       if (tabCount(layout) === 0 && wsSessions.length > 0) {
@@ -353,6 +452,17 @@
     // Exited sessions vanish, tmux-style — the daemon has already reaped
     // them; drop the row without waiting for the next poll.
     applySessions(sessions.filter((s) => s.id !== id));
+  }
+
+  function onSocketError(id: string, message: string): void {
+    // Session-socket protocol errors never enter the scrollback. A token
+    // mismatch raises the blocking re-auth overlay; anything else is logged
+    // and the next sessions snapshot reconciles the rail.
+    if (message === "unauthorized") {
+      notifyUnauthorized();
+    } else {
+      console.warn(`session ${id}: ${message}`);
+    }
   }
 
   /** Open/focus a session in the layout (rail click, strip chip, mod+N). */
@@ -382,10 +492,35 @@
   }
 
   function split(dir: SplitDir): void {
-    layout = splitPane(layout, layout.focusedPaneId, dir);
-    // The new pane is empty: pull DOM focus off the old terminal so typing
-    // doesn't land in a pane that no longer looks focused.
+    splitAt(layout.focusedPaneId, dir);
+  }
+
+  /** Split `paneId`; focus lands INSIDE the new pane on a real focusable
+   *  target (the pane root), so chords and Escape keep working. */
+  function splitAt(paneId: string, dir: SplitDir): void {
+    layout = splitPane(layout, paneId, dir);
+    const newPaneId = layout.focusedPaneId;
+    // Pull DOM focus off the old terminal so typing doesn't land in a pane
+    // that no longer looks focused; then land it on the new pane, which is
+    // a real focusable target (tabindex=-1) so chords/Escape keep working.
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    void tick().then(() => paneRootEl(newPaneId)?.focus());
+  }
+
+  /** Close the focused view: detach the pane's active tab, or collapse the
+   *  pane entirely when it is empty (the last pane just stays). */
+  function closeView(paneId: string): void {
+    const p = findPane(layout.root, paneId);
+    if (p === null) return;
+    layout = p.tabs.length > 0 ? detachTab(layout, paneId, p.active) : closePane(layout, paneId);
+    const sid = focusedSessionOf(layout);
+    const focusedId = layout.focusedPaneId;
+    // After the flush: closing a pane restructures the tree, which can
+    // re-parent (and blur) the surviving terminal — focus once it settles.
+    void tick().then(() => {
+      if (sid !== null) pool.focusTerminal(sid);
+      else paneRootEl(focusedId)?.focus();
+    });
   }
 
   /** The focused pane's fitted size, for spawning sessions at the right grid. */
@@ -406,28 +541,58 @@
       openPicker();
       return;
     }
-    agentError = null;
+    createError = null;
     try {
       const s = await createSession(activeWsId, kind, null, spawnSize());
-      sessions.push(s);
+      recentlyCreated.set(s.id, Date.now());
+      // A racing events snapshot may already have delivered the session.
+      if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
+      // The new session opens as the active tab in the focused pane,
+      // focused, immediately — never an invisible rail-only row.
       openSess(s.id);
     } catch (e) {
-      // Shell failures stay quiet (the next snapshot keeps the list
-      // truthful); agent failures carry an actionable message (409 when
-      // claude is not installed) worth a line under the button.
-      if (kind === "agent") {
-        agentError = e instanceof ApiError ? e.message : "failed to start agent";
-      }
+      // Both kinds surface an inline error (409 when claude is missing,
+      // "unauthorized"/network noise otherwise).
+      const what = kind === "agent" ? "agent" : "terminal";
+      createError = e instanceof ApiError ? e.message : `failed to start ${what}`;
     }
   }
 
-  async function closeSession(id: string): Promise<void> {
+  /** Kill the session's process on the daemon and drop it locally. */
+  async function killSession(id: string): Promise<void> {
+    confirmKillId = null;
     try {
       await deleteSession(id);
     } catch {
       // already gone or unreachable; fall through and drop it locally
     }
     applySessions(sessions.filter((s) => s.id !== id));
+  }
+
+  /** The × on a rail row: live sessions get an inline confirm first. */
+  function requestKill(s: Session): void {
+    if (s.alive) {
+      confirmKillId = s.id;
+    } else {
+      void killSession(s.id);
+    }
+  }
+
+  async function retryAuth(): Promise<void> {
+    if (authRetrying) return;
+    authRetrying = true;
+    authRetryMsg = null;
+    refreshTokenFromHash();
+    try {
+      await fetchHealth();
+      // Token works again: a clean reload re-auths every socket and
+      // restores the layout from the daemon.
+      location.reload();
+    } catch {
+      authRetryMsg = "still unauthorized — paste a fresh URL from `chimaera connect`, then retry";
+    } finally {
+      authRetrying = false;
+    }
   }
 
   // --- layout controller (invoked by the pane tree) -------------------------
@@ -453,6 +618,19 @@
     },
     dividerDrag(active) {
       pool.setDragging(active);
+    },
+    splitPaneAt(paneId, dir) {
+      splitAt(paneId, dir);
+    },
+    zoomPane(paneId) {
+      layout = toggleZoom(focusPane(layout, paneId));
+      const sid = focusedSessionOf(layout);
+      // Zoom swaps the pane between tree and fullscreen rendering, which
+      // re-parents the terminal; restore its focus after the flush.
+      if (sid !== null) void tick().then(() => pool.focusTerminal(sid));
+    },
+    closeView(paneId) {
+      closeView(paneId);
     },
   };
 
@@ -484,6 +662,11 @@
 
   function onRailRowDown(e: PointerEvent, sessionId: string): void {
     beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
+  }
+
+  /** Svelte action: focus the node as soon as it mounts (confirm buttons). */
+  function focusOnMount(node: HTMLElement): void {
+    node.focus();
   }
 
   /**
@@ -590,47 +773,78 @@
 
       <nav class="sessions">
         {#each wsSessions as s (s.id)}
-          <div
-            class="row"
-            class:active={s.id === focusedSessionId}
-            role="button"
-            tabindex="0"
-            onpointerdowncapture={(e) => {
-              // Capture-phase (directly attached); the close button stays a
-              // plain click.
-              if (e.target instanceof Element && e.target.closest(".close")) return;
-              onRailRowDown(e, s.id);
-            }}
-            onkeydown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                openSess(s.id);
-              }
-            }}
-          >
-            <span class="dot {dotState(s)}"></span>
-            <span class="labels">
-              <span class="name">{displayNames.get(s.id) ?? s.name}</span>
-              {#if s.title && s.title !== s.name && s.title !== s.agent_title}
-                <span class="title">{s.title}</span>
-              {/if}
-            </span>
-            <button
-              class="close"
-              aria-label="close session"
-              title="close"
-              onclick={(e) => {
-                e.stopPropagation();
-                void closeSession(s.id);
-              }}>&times;</button
+          {#if confirmKillId === s.id}
+            <div
+              class="row confirm"
+              role="alertdialog"
+              tabindex="-1"
+              aria-label="kill session?"
+              onkeydown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  confirmKillId = null;
+                }
+              }}
             >
-          </div>
+              <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
+              <span class="confirm-label">kill session?</span>
+              <button class="confirm-kill" use:focusOnMount onclick={() => void killSession(s.id)}>
+                kill
+              </button>
+              <button class="confirm-cancel" onclick={() => (confirmKillId = null)}>cancel</button>
+            </div>
+          {:else}
+            <div
+              class="row"
+              class:active={s.id === focusedSessionId}
+              role="button"
+              tabindex="0"
+              onpointerdowncapture={(e) => {
+                // Capture-phase (directly attached); the close button stays a
+                // plain click.
+                if (e.target instanceof Element && e.target.closest(".close")) return;
+                onRailRowDown(e, s.id);
+              }}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  openSess(s.id);
+                }
+              }}
+            >
+              <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
+              <span class="labels">
+                <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
+                {#if s.title && s.title !== s.name && s.title !== s.agent_title}
+                  <span class="title">{s.title}</span>
+                {/if}
+              </span>
+              <button
+                class="close"
+                aria-label="kill session"
+                title="kill session"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  requestKill(s);
+                }}>&times;</button
+              >
+            </div>
+          {/if}
         {/each}
-        <button class="row new primary" onclick={() => void newSession("agent")}>+ new agent</button>
-        {#if agentError}
-          <div class="agent-error">{agentError}</div>
+        <button
+          class="row new primary"
+          title="start a Claude agent ({KEYS.newAgent})"
+          onclick={() => void newSession("agent")}>+ new agent</button
+        >
+        <button
+          class="row new"
+          title="open a terminal ({KEYS.newTerminal})"
+          onclick={() => void newSession("shell")}>+ terminal</button
+        >
+        {#if createError}
+          <div class="create-error">{createError}</div>
         {/if}
-        <button class="row new" onclick={() => void newSession("shell")}>+ terminal</button>
       </nav>
 
       {#if workspace !== null}
@@ -673,10 +887,11 @@
       <div class="daemon" bind:this={daemonEl}>
         <span
           class="daemon-dot"
-          class:ok={daemonOk}
+          class:ok={eventsUp}
           class:pulse={$reconnectingSockets > 0}
           role="status"
-          aria-label={daemonOk ? "connected" : "disconnected"}
+          title={eventsUp ? "connected" : "disconnected"}
+          aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
         <span class="daemon-host" title={health?.hostname}>{getHostLabel()}</span>
       </div>
@@ -693,6 +908,7 @@
             node={zoomedPane}
             focusedPaneId={layout.focusedPaneId}
             zoomed
+            forceTabs={multiPane}
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
@@ -703,6 +919,7 @@
           <SplitTree
             node={layout.root}
             focusedPaneId={layout.focusedPaneId}
+            forceTabs={multiPane}
             {dropSpot}
             sessions={sessionsById}
             names={displayNames}
@@ -718,7 +935,12 @@
     <!-- Focus-mode session strip: the rail is gone, but the window always
          says where you are. Hidden whenever the rail is visible. -->
     <footer class="strip">
-      <span class="strip-ws" title={workspace?.root}>{workspace?.name ?? "chimaera"}</span>
+      <button
+        class="strip-ws"
+        title="show sidebar ({KEYS.focusMode})"
+        onclick={() => (layout = { ...layout, focusMode: false })}
+        >{workspace?.name ?? "chimaera"}</button
+      >
       <div class="chips">
         {#each wsSessions as s (s.id)}
           <button
@@ -727,8 +949,10 @@
             title={s.title ?? undefined}
             onclick={() => openSess(s.id)}
           >
-            <span class="dot {dotState(s)}"></span>
-            <span class="chip-name">{s.kind === "shell" ? "$ " : ""}{displayNames.get(s.id) ?? s.name}</span>
+            <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
+            <span class="chip-name"
+              >{s.kind === "shell" ? "$ " : ""}{displayNames.get(s.id) ?? displayName(s)}</span
+            >
           </button>
         {/each}
       </div>
@@ -741,11 +965,27 @@
 </div>
 
 {#if pickerOpen}
-  <FolderPicker
-    recents={workspaces}
-    onOpened={activateWorkspace}
-    onClose={() => (pickerOpen = false)}
-  />
+  <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
+{/if}
+
+{#if $unauthorized}
+  <!-- Blocking re-auth overlay: the daemon rejected this window's token
+       (restart or expiry). Nothing behind it is trustworthy until re-auth. -->
+  <div class="auth-overlay" role="alertdialog" aria-modal="true" aria-label="reconnect">
+    <div class="auth-panel">
+      <div class="auth-title">disconnected — unauthorized</div>
+      <p class="auth-body">
+        The daemon rejected this window's token (it likely restarted). Paste a fresh URL from
+        <code>chimaera connect</code> into the address bar, then retry.
+      </p>
+      <button class="auth-retry" use:focusOnMount disabled={authRetrying} onclick={() => void retryAuth()}>
+        {authRetrying ? "retrying…" : "retry"}
+      </button>
+      {#if authRetryMsg}
+        <div class="auth-msg">{authRetryMsg}</div>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 <style>
@@ -768,7 +1008,7 @@
     display: flex;
     flex-direction: column;
     background: var(--rail-bg);
-    padding: 0.9rem 0 0.65rem;
+    padding: 16px 0 12px;
     overflow: hidden;
     transition:
       width 0.12s ease,
@@ -787,13 +1027,13 @@
   .workspace {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0 0.9rem 0.9rem;
+    gap: 8px;
+    padding: 0 16px 12px;
   }
 
   .needs {
     flex: none;
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: var(--warn);
   }
@@ -802,9 +1042,11 @@
     appearance: none;
     border: none;
     background: none;
-    padding: 0;
+    padding: 2px 6px;
+    margin: -2px -6px;
+    border-radius: 5px;
     font: inherit;
-    font-size: 0.85rem;
+    font-size: var(--text-md);
     font-weight: 600;
     letter-spacing: 0.01em;
     color: var(--fg);
@@ -813,6 +1055,15 @@
     display: flex;
     align-items: center;
     gap: 0.3rem;
+    transition: background-color 0.12s ease;
+  }
+
+  .ws-btn:hover {
+    background: var(--row-hover);
+  }
+
+  .ws-btn:hover .ws-chev {
+    opacity: 1;
   }
 
   .ws-btn.placeholder {
@@ -835,6 +1086,7 @@
     flex: none;
     color: var(--muted);
     opacity: 0.7;
+    transition: opacity 0.12s ease;
   }
 
   .sessions {
@@ -843,22 +1095,67 @@
     display: flex;
     flex-direction: column;
     gap: 1px;
-    padding: 0 0.45rem;
+    padding: 0 8px;
     min-height: 0;
   }
 
   .row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    padding: 0.35rem 0.45rem;
+    gap: 8px;
+    padding: 6px 8px;
     border-radius: 5px;
-    font-size: 0.85rem;
+    font-size: var(--text-md);
     cursor: pointer;
     user-select: none;
+    transition: background-color 0.12s ease;
   }
 
   .row:hover {
+    background: var(--row-hover);
+  }
+
+  /* Inline kill confirmation, swapped in place of the row. */
+  .row.confirm {
+    cursor: default;
+    background: var(--row-active);
+  }
+
+  .confirm-label {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-sm);
+    color: var(--fg);
+  }
+
+  .confirm-kill,
+  .confirm-cancel {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+    color: var(--muted);
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .confirm-kill {
+    color: var(--err);
+    font-weight: 500;
+  }
+
+  .confirm-kill:hover,
+  .confirm-kill:focus-visible {
+    background: color-mix(in srgb, var(--err) 14%, transparent);
+  }
+
+  .confirm-cancel:hover {
+    color: var(--fg);
     background: var(--row-hover);
   }
 
@@ -883,11 +1180,11 @@
 
   .name {
     font-family: var(--mono);
-    font-size: 0.78rem;
+    font-size: var(--text-sm);
   }
 
   .title {
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -897,12 +1194,15 @@
     background: none;
     padding: 0 0.1rem;
     font: inherit;
-    font-size: 0.9rem;
+    font-size: var(--text-md);
     line-height: 1;
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
     flex: none;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
   }
 
   .row:hover .close,
@@ -919,7 +1219,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.82rem;
+    font-size: var(--text-md);
     color: var(--muted);
     justify-content: flex-start;
     margin-top: 0.15rem;
@@ -935,9 +1235,9 @@
     font-weight: 500;
   }
 
-  .agent-error {
-    padding: 0.1rem 0.45rem 0.25rem;
-    font-size: 0.72rem;
+  .create-error {
+    padding: 2px 8px 4px;
+    font-size: var(--text-xs);
     line-height: 1.35;
     color: var(--err);
   }
@@ -991,11 +1291,11 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    padding: 0.3rem 0.9rem;
+    padding: 4px 16px;
     font: inherit;
-    font-size: 0.62rem;
+    font-size: var(--text-xs);
     font-weight: 600;
-    letter-spacing: 0.14em;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--muted);
     cursor: pointer;
@@ -1025,9 +1325,9 @@
   .daemon {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
-    padding: 0.65rem 0.9rem 0;
-    font-size: 0.72rem;
+    gap: 8px;
+    padding: 12px 16px 0;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -1037,7 +1337,7 @@
     border-radius: 50%;
     background: var(--muted);
     opacity: 0.55;
-    transition: background-color 0.3s ease;
+    transition: background-color 0.15s ease;
   }
 
   .daemon-dot.ok {
@@ -1072,7 +1372,7 @@
     min-height: 0;
     position: relative;
     background: var(--bg);
-    padding: 10px;
+    padding: 8px;
   }
 
   .empty {
@@ -1082,7 +1382,7 @@
     align-items: center;
     justify-content: center;
     color: var(--muted);
-    font-size: 0.9rem;
+    font-size: var(--text-md);
   }
 
   .open-cta {
@@ -1091,9 +1391,10 @@
     background: none;
     padding: 0;
     font: inherit;
-    font-size: 0.9rem;
+    font-size: var(--text-md);
     color: var(--muted);
     cursor: pointer;
+    transition: color 0.12s ease;
   }
 
   .open-cta:hover {
@@ -1106,23 +1407,38 @@
     flex: none;
     display: flex;
     align-items: center;
-    gap: 0.7rem;
-    height: 34px;
-    padding: 0 0.9rem;
+    gap: 12px;
+    height: 32px;
+    padding: 0 16px;
     background: var(--rail-bg);
     border-top: 1px solid var(--edge);
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
+  /* The workspace name doubles as the mouse exit from focus mode. */
   .strip-ws {
     flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 2px 6px;
+    margin: 0 -6px;
+    border-radius: 4px;
+    font: inherit;
+    font-size: var(--text-xs);
     font-weight: 600;
     color: var(--fg);
     max-width: 180px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+  }
+
+  .strip-ws:hover {
+    background: var(--row-hover);
   }
 
   .chips {
@@ -1150,10 +1466,13 @@
     padding: 0.15rem 0.55rem;
     border-radius: 4px;
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     max-width: 180px;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
   }
 
   .chip:hover {
@@ -1191,5 +1510,81 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* --- blocking re-auth overlay --- */
+
+  .auth-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    background: var(--scrim);
+    animation: authfade 0.1s ease-out;
+  }
+
+  @keyframes authfade {
+    from {
+      opacity: 0;
+    }
+  }
+
+  .auth-panel {
+    margin-top: 20vh;
+    width: min(420px, calc(100vw - 2rem));
+    padding: 20px;
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22);
+  }
+
+  .auth-title {
+    font-size: var(--text-md);
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .auth-body {
+    margin: 0 0 12px;
+    font-size: var(--text-md);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  .auth-body code {
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+  }
+
+  .auth-retry {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: none;
+    padding: 4px 16px;
+    border-radius: 5px;
+    font: inherit;
+    font-size: var(--text-md);
+    color: var(--fg);
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+  }
+
+  .auth-retry:hover:enabled {
+    background: var(--row-hover);
+  }
+
+  .auth-retry:disabled {
+    color: var(--muted);
+    cursor: default;
+  }
+
+  .auth-msg {
+    margin-top: 8px;
+    font-size: var(--text-xs);
+    color: var(--err);
   }
 </style>

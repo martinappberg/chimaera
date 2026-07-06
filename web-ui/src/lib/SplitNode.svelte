@@ -9,6 +9,8 @@
   interface Props {
     node: LayoutNode;
     focusedPaneId: string;
+    /** Show tab bars on every pane (any multi-pane layout). */
+    forceTabs?: boolean;
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
@@ -16,7 +18,16 @@
     ctrl: LayoutCtrl;
   }
 
-  let { node, focusedPaneId, dropSpot, sessions, names, fileNames, ctrl }: Props = $props();
+  let {
+    node,
+    focusedPaneId,
+    forceTabs = false,
+    dropSpot,
+    sessions,
+    names,
+    fileNames,
+    ctrl,
+  }: Props = $props();
 
   const MIN_PANE_PX = 120;
   const DIVIDER_PX = 8;
@@ -102,21 +113,25 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+  <Pane {node} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
     <div
       class="divider"
       class:active={dividerActive}
       role="separator"
       aria-orientation={node.dir === "row" ? "vertical" : "horizontal"}
+      title="drag to resize · double-click for 50/50"
       onpointerdowncapture={onDividerDown}
+      ondblclick={() => {
+        if (node.type === "split") ctrl.setRatio(node.id, 0.5);
+      }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {forceTabs} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
     </div>
   </div>
 {/if}

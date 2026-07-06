@@ -12,11 +12,18 @@ export interface EventsSocketHandlers {
    * fired only on transitions.
    */
   onStatus(connected: boolean): void;
+  /**
+   * The daemon rejected the socket (bad auth or server failure); the socket
+   * gives up permanently. `message` is the server's error string
+   * ("unauthorized" on a token mismatch).
+   */
+  onFatal?(message: string): void;
 }
 
 interface ServerEventFrame {
   type: string;
   sessions?: Session[];
+  message?: string;
 }
 
 /**
@@ -61,9 +68,10 @@ export class EventsSocket {
         this.setConnected(true);
         this.handlers.onSessions(msg.sessions);
       } else if (msg.type === "error") {
-        // Bad auth or a server-side failure; give up and let the sessions
-        // poll (which surfaces the same failure) remain the fallback.
+        // Bad auth or a server-side failure; give up and surface it (the
+        // app shows the blocking re-auth overlay on "unauthorized").
         this.fatal = true;
+        this.handlers.onFatal?.(msg.message ?? "connection rejected");
         ws.close();
       }
     };

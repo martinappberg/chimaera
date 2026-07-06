@@ -87,8 +87,12 @@ impl EventListener for EventProxy {
 pub(crate) struct Session {
     id: SessionId,
     name: String,
+    /// Whether `name` was pinned explicitly at spawn (vs derived from cwd).
+    renamed: bool,
     cwd: PathBuf,
     created_at: u64,
+    /// OS pid of the direct child, captured at spawn.
+    child_pid: Option<u32>,
     term: Arc<Mutex<Term<EventProxy>>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -106,15 +110,13 @@ impl Session {
         on_exit: Box<dyn FnOnce() + Send + 'static>,
     ) -> anyhow::Result<Arc<Session>> {
         let cwd = opts.cwd.clone();
-        let name = opts
-            .name
-            .clone()
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| {
-                cwd.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| cwd.to_string_lossy().into_owned())
-            });
+        let explicit_name = opts.name.clone().filter(|n| !n.is_empty());
+        let renamed = explicit_name.is_some();
+        let name = explicit_name.unwrap_or_else(|| {
+            cwd.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cwd.to_string_lossy().into_owned())
+        });
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -157,6 +159,7 @@ impl Session {
             .context("failed to clone pty reader")?;
         let mut writer = master.take_writer().context("failed to take pty writer")?;
         let killer = child.clone_killer();
+        let child_pid = child.process_id();
 
         let (output_tx, _) = broadcast::channel::<Bytes>(OUTPUT_CHANNEL_CAPACITY);
         let (events_tx, _) = broadcast::channel::<SessionEvent>(EVENT_CHANNEL_CAPACITY);
@@ -275,11 +278,13 @@ impl Session {
         Ok(Arc::new(Session {
             id,
             name,
+            renamed,
             cwd,
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            child_pid,
             term,
             master: Mutex::new(master),
             killer: Mutex::new(killer),
@@ -306,6 +311,21 @@ impl Session {
             alive,
             exit_status,
             title: lock_unpoisoned(&self.title).clone(),
+            pid: self.child_pid,
+            renamed: self.renamed,
+        }
+    }
+
+    /// Foreground process group on the tty (`tcgetpgrp` on the master fd).
+    /// `None` when the platform or tty cannot answer.
+    pub(crate) fn foreground_pid(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            lock_unpoisoned(&self.master).process_group_leader()
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
 

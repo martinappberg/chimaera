@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "./sessions";
-  import { dotState } from "./sessions";
+  import { dotState, dotTitle } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { basename } from "./files";
 
@@ -56,10 +56,11 @@
           ctrl.closeTab(node.id, i);
         }
       }}
+      ondblclick={() => ctrl.zoomPane(node.id)}
     >
       {#if tab.surface === "terminal"}
         {@const s = sessions.get(tab.sessionId)}
-        <span class="dot {s ? dotState(s) : ''}"></span>
+        <span class="dot {s ? dotState(s) : ''}" title={s ? dotTitle(s) : undefined}></span>
       {:else}
         <svg class="file-glyph" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
           <path
@@ -91,7 +92,7 @@
     flex: none;
     display: flex;
     align-items: stretch;
-    height: 30px;
+    height: 28px;
     overflow: hidden;
     border-bottom: 1px solid var(--edge);
     padding: 0 4px;
@@ -101,15 +102,16 @@
     position: relative;
     display: flex;
     align-items: center;
-    gap: 0.45rem;
+    gap: 8px;
     padding: 0 0.4rem 0 0.6rem;
     max-width: 200px;
     min-width: 0;
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: default;
     user-select: none;
+    transition: color 0.12s ease;
   }
 
   .tab:hover {
@@ -169,12 +171,15 @@
     background: none;
     padding: 0 0.15rem;
     font: inherit;
-    font-size: 0.85rem;
+    font-size: var(--text-md);
     line-height: 1;
     color: var(--muted);
     cursor: pointer;
     opacity: 0;
     flex: none;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
   }
 
   .tab:hover .tab-close,

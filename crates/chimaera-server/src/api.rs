@@ -88,12 +88,14 @@ pub(crate) async fn create_workspace(
 }
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
-/// `agent_state` and `agent_title` fields. `agent` is the wrapper record for
-/// kind "agent" sessions; `None` means a plain shell.
+/// `agent_state`, `agent_title` and `display_name` fields. `agent` is the
+/// wrapper record for kind "agent" sessions; `None` means a plain shell.
+/// `polled` is the shell naming watcher's latest value, if any.
 pub(crate) fn session_json(
     info: &chimaera_pty::SessionInfo,
     workspace_id: Option<String>,
     agent: Option<&crate::agents::AgentRecord>,
+    polled: Option<&str>,
 ) -> serde_json::Value {
     let mut map = match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -117,15 +119,29 @@ pub(crate) fn session_json(
             .and_then(|a| a.title())
             .map_or(serde_json::Value::Null, |t| json!(t)),
     );
+    // Naming rule zero: the most specific thing known about what the session
+    // is DOING. A user-pinned name stays authoritative (`renamed` flags the
+    // pin for the UI); agents and shells resolve their own chains.
+    let display_name = if info.renamed {
+        info.name.clone()
+    } else {
+        match agent {
+            Some(agent) => agent.display_name(),
+            None => crate::naming::shell_display_name(info, polled),
+        }
+    };
+    map.insert("display_name".to_string(), json!(display_name));
     serde_json::Value::Object(map)
 }
 
 /// The full session list as JSON values (shared by GET /sessions and the
-/// /ws/events snapshots). Lock order: session_workspaces -> agents.
+/// /ws/events snapshots). Lock order: session_workspaces -> agents ->
+/// display_names.
 pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let sessions = state.sessions.list();
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
+    let names = crate::lock(&state.display_names);
     sessions
         .iter()
         .map(|info| {
@@ -133,6 +149,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 info,
                 workspaces.get(&info.id).cloned(),
                 agents.get(&info.id),
+                names.get(&info.id).map(String::as_str),
             )
         })
         .collect()
@@ -234,11 +251,25 @@ pub(crate) async fn create_session(
         Ok(info) => {
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
             let agent = agent_key.map(crate::agents::AgentRecord::new);
+            let mut polled = None;
             if agent.is_some() {
                 crate::agents::spawn_agent_watch(state.clone(), info.id.clone());
+            } else {
+                // Prime the display name (a fresh shell sits at the root, so
+                // it is the shell itself) and start the naming watcher.
+                let shell = crate::naming::default_shell_name();
+                crate::lock(&state.display_names).insert(info.id.clone(), shell.clone());
+                polled = Some(shell);
+                crate::naming::spawn_shell_watch(state.clone(), info.id.clone());
             }
             state.changes.notify_waiters();
-            Json(session_json(&info, Some(workspace.id), agent.as_ref())).into_response()
+            Json(session_json(
+                &info,
+                Some(workspace.id),
+                agent.as_ref(),
+                polled.as_deref(),
+            ))
+            .into_response()
         }
         Err(err) => {
             if let Some(id) = &opts.id {
