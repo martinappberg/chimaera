@@ -37,15 +37,56 @@
   const pool = new Map<string, PoolEntry>();
   let clock = 0;
 
+  // Muted ANSI palettes tuned to the app's neutrals; xterm's defaults are
+  // the single loudest "unstyled demo" signal in a terminal app.
+  const LIGHT_ANSI = {
+    black: "#3b3b41",
+    red: "#bf4d56",
+    green: "#2f8a57",
+    yellow: "#9a7b2f",
+    blue: "#3e6fc0",
+    magenta: "#95569f",
+    cyan: "#2f8a9b",
+    white: "#b9b9c0",
+    brightBlack: "#73737d",
+    brightRed: "#d4707a",
+    brightGreen: "#43a56f",
+    brightYellow: "#b5964a",
+    brightBlue: "#5f8cd6",
+    brightMagenta: "#ad74b8",
+    brightCyan: "#4aa5b5",
+    brightWhite: "#d9d9df",
+  };
+  const DARK_ANSI = {
+    black: "#33333a",
+    red: "#e2757e",
+    green: "#5cc48d",
+    yellow: "#d9b96c",
+    blue: "#79a5ea",
+    magenta: "#c795d3",
+    cyan: "#6cc3d4",
+    white: "#c9c9d1",
+    brightBlack: "#5f5f6a",
+    brightRed: "#ef959c",
+    brightGreen: "#7fd6a8",
+    brightYellow: "#e7cd8b",
+    brightBlue: "#9cbbf1",
+    brightMagenta: "#d8afe2",
+    brightCyan: "#8fd6e4",
+    brightWhite: "#ededf3",
+  };
+
   function themeFromTokens() {
     const cs = getComputedStyle(document.documentElement);
     const v = (name: string) => cs.getPropertyValue(name).trim();
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
     return {
-      background: v("--bg"),
+      background: v("--term-bg"),
       foreground: v("--fg"),
       cursor: v("--fg"),
-      cursorAccent: v("--bg"),
+      cursorAccent: v("--term-bg"),
       selectionBackground: v("--term-selection"),
+      ...(dark ? DARK_ANSI : LIGHT_ANSI),
     };
   }
 
@@ -74,6 +115,12 @@
     const term = new Terminal({
       fontFamily: FONT_FAMILY,
       fontSize: 13,
+      lineHeight: 1.25,
+      fontWeight: "400",
+      fontWeightBold: "600",
+      cursorBlink: false,
+      cursorStyle: "block",
+      drawBoldTextInBrightColors: false,
       scrollback: 5000,
       theme: themeFromTokens(),
     });
@@ -196,16 +243,24 @@
 <style>
   .term-host {
     position: absolute;
-    inset: 0;
+    inset: 12px;
   }
 
+  /* The terminal is a composed surface: its own background one step apart
+     from the chrome, hairline border, soft radius. */
   .term-host :global(.term-slot) {
     position: absolute;
-    inset: 10px 4px 10px 14px;
+    inset: 0;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 10px;
+    overflow: hidden;
   }
 
-  /* Let xterm's own viewport fill the slot. */
+  /* Padding lives on .xterm itself: the fit addon subtracts the terminal
+     element's padding, so cols/rows stay exact. */
   .term-host :global(.xterm) {
     height: 100%;
+    padding: 12px 8px 12px 14px;
   }
 </style>
