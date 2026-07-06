@@ -375,6 +375,7 @@
     scrollbar-width: none;
     padding: 0 0.9rem 0.5rem;
     border-bottom: 1px solid var(--edge);
+    font-family: var(--mono);
     font-size: 0.72rem;
     color: var(--muted);
     min-height: 1.4em;
@@ -458,6 +459,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 0.78rem;
   }
 
   .chev {

@@ -44,6 +44,29 @@ export function needsAttention(s: Session): boolean {
   );
 }
 
+/**
+ * Dot modifier class for a session (shared by the rail, pane tabs, and the
+ * session strip; see the global .dot.* styles in app.css).
+ */
+export function dotState(s: Session): string {
+  if (s.kind !== "agent") return s.alive ? "alive" : "";
+  switch (s.agent_state) {
+    case "running":
+      return "alive";
+    case "needs_permission":
+    case "idle_prompt":
+      return "attn";
+    case "finished":
+      return "done";
+    case "errored":
+      return "err";
+    case "rate_limited":
+      return "rate";
+    default:
+      return "";
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
@@ -111,12 +134,22 @@ export async function createSession(
   workspaceId: string,
   kind: SessionKind = "shell",
   name: string | null = null,
+  size: { cols: number; rows: number } | null = null,
 ): Promise<Session> {
+  // Spawn at the destination pane's fitted size so TUIs never boot at a
+  // wrong 80x24 and repaint on the first resize (server clamps identically).
+  const dims =
+    size === null
+      ? {}
+      : {
+          cols: Math.min(Math.max(Math.round(size.cols), 20), 500),
+          rows: Math.min(Math.max(Math.round(size.rows), 5), 200),
+        };
   return json(
     await api("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace_id: workspaceId, kind, name }),
+      body: JSON.stringify({ workspace_id: workspaceId, kind, name, ...dims }),
     }),
   );
 }
