@@ -69,8 +69,9 @@ pub struct Attachment {
     pub input: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }
 
-/// Owner of all PTY sessions. Sessions keep running while unattached and are
-/// retained (with `alive = false`) after their child exits.
+/// Owner of all PTY sessions. Sessions keep running while unattached; when a
+/// session's child exits it is unregistered (tmux semantics: an exited shell
+/// vanishes). Attached clients receive `SessionEvent::Exited` first.
 pub struct SessionManager {
     sessions: Mutex<HashMap<SessionId, Arc<session::Session>>>,
 }
@@ -87,17 +88,25 @@ impl SessionManager {
         })
     }
 
-    /// Spawn a new session and register it. Returns its initial info.
-    pub fn spawn(&self, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
+    /// Spawn a new session and register it. Returns its initial info. The
+    /// session unregisters itself when its child exits.
+    pub fn spawn(self: &Arc<Self>, opts: SpawnOpts) -> anyhow::Result<SessionInfo> {
         let id = self.unused_id();
-        let session = session::Session::spawn(id.clone(), &opts)
+        let mgr = Arc::downgrade(self);
+        let exit_id = id.clone();
+        let on_exit = Box::new(move || {
+            if let Some(m) = mgr.upgrade() {
+                lock_unpoisoned(&m.sessions).remove(&exit_id);
+            }
+        });
+        let session = session::Session::spawn(id.clone(), &opts, on_exit)
             .with_context(|| format!("failed to spawn session in {}", opts.cwd.display()))?;
         let info = session.info();
         lock_unpoisoned(&self.sessions).insert(id, session);
         Ok(info)
     }
 
-    /// List all sessions (alive and exited), sorted by creation time.
+    /// List all live sessions, sorted by creation time.
     pub fn list(&self) -> Vec<SessionInfo> {
         let mut infos: Vec<SessionInfo> = lock_unpoisoned(&self.sessions)
             .values()
@@ -133,14 +142,13 @@ impl SessionManager {
         session.resize(cols, rows)
     }
 
-    /// Signal the session's child to terminate (SIGHUP). The session record
-    /// is kept (`alive = false`, `exit_status` set once reaped). Killing an
-    /// already-dead session is a no-op.
+    /// Signal the session's child to terminate (SIGHUP); the wait thread
+    /// reaps it and the session unregisters itself. Killing an unknown or
+    /// already-exited session is a no-op, so deletes are idempotent.
     pub fn kill(&self, id: &str) -> anyhow::Result<()> {
-        let session = self
-            .session(id)
-            .ok_or_else(|| anyhow!("unknown session: {id}"))?;
-        session.kill();
+        if let Some(session) = self.session(id) {
+            session.kill();
+        }
         Ok(())
     }
 

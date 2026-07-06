@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getActiveWorkspaceId, pollHealth, setActiveWorkspaceId, type Health } from "./lib/api";
+  import {
+    getActiveWorkspaceId,
+    getHostLabel,
+    pollHealth,
+    setActiveWorkspaceId,
+    type Health,
+  } from "./lib/api";
   import {
     createSession,
     deleteSession,
@@ -24,6 +30,19 @@
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
   const sessionIds = $derived(wsSessions.map((s) => s.id));
+
+  // Duplicate names within a workspace get a " · n" display suffix (real
+  // naming — shell titles, agent ai-titles — lands with M2).
+  const displayNames = $derived.by(() => {
+    const counts = new Map<string, number>();
+    const names = new Map<string, string>();
+    for (const s of wsSessions) {
+      const n = (counts.get(s.name) ?? 0) + 1;
+      counts.set(s.name, n);
+      names.set(s.id, n === 1 ? s.name : `${s.name} · ${n}`);
+    }
+    return names;
+  });
 
   $effect(() =>
     pollHealth(
@@ -126,12 +145,10 @@
     if (s) s.title = title;
   }
 
-  function onExited(id: string, status: number | null): void {
-    const s = sessions.find((x) => x.id === id);
-    if (s) {
-      s.alive = false;
-      s.exit_status = status;
-    }
+  function onExited(id: string, _status: number | null): void {
+    // Exited sessions vanish, tmux-style — the daemon has already reaped
+    // them; drop the row without waiting for the next poll.
+    applySessions(sessions.filter((s) => s.id !== id));
   }
 
   async function newTerminal(): Promise<void> {
@@ -200,7 +217,7 @@
         >
           <span class="dot" class:alive={s.alive}></span>
           <span class="labels">
-            <span class="name">{s.name}</span>
+            <span class="name">{displayNames.get(s.id) ?? s.name}</span>
             {#if s.title && s.title !== s.name}
               <span class="title">{s.title}</span>
             {/if}
@@ -227,7 +244,7 @@
         role="status"
         aria-label={daemonOk ? "connected" : "disconnected"}
       ></span>
-      <span class="daemon-host">{health?.hostname ?? "—"}</span>
+      <span class="daemon-host" title={health?.hostname}>{getHostLabel()}</span>
     </div>
   </aside>
 

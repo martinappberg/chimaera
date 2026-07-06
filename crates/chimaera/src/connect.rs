@@ -27,7 +27,12 @@ pub async fn run(
     let mux_delegated = wait_for_port(local, &mut tunnel).await?;
     tracing::info!("tunnel up: 127.0.0.1:{local} -> {host}:{}", manifest.port);
 
-    let url = format!("http://127.0.0.1:{local}/#token={}", manifest.token);
+    // The host alias rides along so the UI can label the window with the
+    // name the user actually calls this machine (their ssh alias).
+    let url = format!(
+        "http://127.0.0.1:{local}/#token={}&host={host}",
+        manifest.token
+    );
     println!("{url}");
     if !no_open {
         if let Err(e) = open::that(&url) {

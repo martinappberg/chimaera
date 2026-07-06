@@ -1,23 +1,28 @@
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
+const HOST_KEY = "chimaera.host";
 
 /**
- * Read the access token and workspace id from the URL fragment
- * (#token=...&ws=...) once, persist them to sessionStorage, and strip the
- * fragment from the address bar. Falls back to previously stored values on
- * reload.
+ * Read the access token, workspace id, and host label from the URL fragment
+ * (#token=...&ws=...&host=...) once, persist them to sessionStorage, and
+ * strip the fragment from the address bar. Falls back to previously stored
+ * values on reload.
  */
 function initFromHash(): string | null {
   const params = new URLSearchParams(location.hash.slice(1));
   const tokenFromHash = params.get("token");
   const wsFromHash = params.get("ws");
+  const hostFromHash = params.get("host");
   if (tokenFromHash !== null) {
     sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
   if (wsFromHash !== null) {
     sessionStorage.setItem(WS_KEY, wsFromHash);
   }
-  if (tokenFromHash !== null || wsFromHash !== null) {
+  if (hostFromHash !== null) {
+    sessionStorage.setItem(HOST_KEY, hostFromHash);
+  }
+  if (tokenFromHash !== null || wsFromHash !== null || hostFromHash !== null) {
     history.replaceState(null, "", location.pathname + location.search);
   }
   return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
@@ -28,6 +33,15 @@ const token = initFromHash();
 /** The bearer token for this session, if one was provided. */
 export function getToken(): string | null {
   return token;
+}
+
+/**
+ * What the user calls the machine this window is connected to: the ssh alias
+ * passed by `chimaera connect` (e.g. "cluster"), or "local" for a daemon
+ * reached without a tunnel. The raw hostname stays available as hover detail.
+ */
+export function getHostLabel(): string {
+  return sessionStorage.getItem(HOST_KEY) ?? "local";
 }
 
 /** The workspace id this tab is scoped to, if any (window = workspace). */

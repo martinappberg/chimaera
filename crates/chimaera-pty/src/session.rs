@@ -100,7 +100,11 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn spawn(id: SessionId, opts: &SpawnOpts) -> anyhow::Result<Arc<Session>> {
+    pub(crate) fn spawn(
+        id: SessionId,
+        opts: &SpawnOpts,
+        on_exit: Box<dyn FnOnce() + Send + 'static>,
+    ) -> anyhow::Result<Arc<Session>> {
         let cwd = opts.cwd.clone();
         let name = opts
             .name
@@ -231,7 +235,9 @@ impl Session {
                 .context("failed to spawn pty writer thread")?;
         }
 
-        // Wait thread: reap the child, record its exit status, publish Exited.
+        // Wait thread: reap the child, record its exit status, publish
+        // Exited, then hand control back to the owner (which unregisters the
+        // session — exited shells vanish, tmux-style).
         {
             let state = Arc::clone(&state);
             let events_tx = events_tx.clone();
@@ -259,6 +265,7 @@ impl Session {
                     }
                     let _ = events_tx.send(SessionEvent::Exited { status });
                     tracing::info!(session = %id, exit_status = ?status, "session exited");
+                    on_exit();
                 })
                 .context("failed to spawn child wait thread")?;
         }

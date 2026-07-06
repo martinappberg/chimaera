@@ -496,6 +496,14 @@ which is the survival property that matters.
   structured chat mode, and ACP multi-agent are all on the v1 path (M6). Plain persistent
   shells are first-class workspace sessions from M1. The only exclusions are true non-goals,
   not compromises.
+- **2026-07-06 — exited shells vanish (tmux semantics).** The daemon reaps a session when its
+  child exits; no gray corpse rows. Persistent lifecycle rows ("finished", awaiting review)
+  are *agent*-session semantics and arrive with M2's attention states.
+- **2026-07-06 — window host label.** The daemon indicator shows what the user calls the
+  machine: "local" for an untunneled daemon, else the ssh alias passed by `chimaera connect`
+  via the `#host=` hash param (the VS Code Remote convention); the raw hostname is hover
+  detail. Raw hostnames like `host.example` confused the author on day one — labels must
+  be human.
 
 Still open:
 

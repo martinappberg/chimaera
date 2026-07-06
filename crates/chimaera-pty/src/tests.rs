@@ -88,17 +88,13 @@ async fn wait_for_event(
     }
 }
 
-/// Poll until the session reports `alive == false`.
-async fn wait_dead(mgr: &SessionManager, id: &str) {
+/// Poll until the session unregisters itself (reap-on-exit semantics:
+/// an exited session vanishes from the registry, tmux-style).
+async fn wait_gone(mgr: &SessionManager, id: &str) {
     let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        match mgr.get(id) {
-            Some(info) if !info.alive => return,
-            Some(_) => {}
-            None => panic!("session {id} disappeared"),
-        }
+    while mgr.get(id).is_some() {
         if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for session {id} to exit");
+            panic!("timed out waiting for session {id} to unregister");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -196,7 +192,7 @@ fn visible_text<T>(term: &Term<T>) -> Vec<String> {
 // --- tests -----------------------------------------------------------------
 
 /// (a) A plain command produces output on the live stream and an Exited event,
-/// and the session record is retained with its exit status.
+/// then the session unregisters itself.
 #[tokio::test]
 async fn spawn_echo_collects_output_and_exited_event() {
     let mgr = SessionManager::new();
@@ -226,10 +222,8 @@ async fn spawn_echo_collects_output_and_exited_event() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    // The Exited event is published after the state flips, so this is stable.
-    let info = mgr.get(&info.id).expect("session record must be retained");
-    assert!(!info.alive);
-    assert_eq!(info.exit_status, Some(0));
+    // After Exited is published the session reaps itself out of the registry.
+    wait_gone(&mgr, &info.id).await;
 }
 
 /// (b) Server-side state survives detach: output produced while attached is
@@ -259,8 +253,8 @@ async fn detached_session_state_survives_in_snapshot() {
     assert!(mgr.get(&info.id).expect("session still listed").alive);
 
     mgr.kill(&info.id).expect("kill failed");
-    wait_dead(&mgr, &info.id).await;
-    // Killing an already-dead session is Ok(()).
+    wait_gone(&mgr, &info.id).await;
+    // Killing an unregistered session is Ok(()) — deletes stay idempotent.
     mgr.kill(&info.id).expect("second kill must be a no-op");
 }
 
@@ -270,7 +264,10 @@ async fn detached_session_state_survives_in_snapshot() {
 #[tokio::test]
 async fn snapshot_replay_matches_live_grid() {
     let mgr = SessionManager::new();
-    let script = "printf 'plain \\033[31mred\\033[0m \\033[1mbold\\033[0m\\nsecond line\\n'";
+    // The trailing sleep keeps the session alive (reap-on-exit would remove
+    // it) while leaving exactly the printf output on the grid.
+    let script =
+        "printf 'plain \\033[31mred\\033[0m \\033[1mbold\\033[0m\\nsecond line\\n'; sleep 30";
     let info = mgr
         .spawn(opts(Some(vec![
             "/bin/bash".to_string(),
@@ -279,7 +276,6 @@ async fn snapshot_replay_matches_live_grid() {
         ])))
         .expect("spawn failed");
 
-    wait_dead(&mgr, &info.id).await;
     let att = attach_when_snapshot_contains(&mgr, &info.id, "second line").await;
 
     let replayed = replay_snapshot(&att.snapshot, info.cols, info.rows);
@@ -312,6 +308,9 @@ async fn snapshot_replay_matches_live_grid() {
         );
     }
     assert_eq!(replayed.grid().cursor.point, live_cursor);
+
+    mgr.kill(&info.id).expect("kill failed");
+    wait_gone(&mgr, &info.id).await;
 }
 
 /// (d) resize() changes the child's winsize (visible via `stty size`) and
@@ -345,7 +344,7 @@ async fn resize_reaches_child_and_broadcasts_event() {
     assert_eq!((info.cols, info.rows), (100, 30));
 
     mgr.kill(&info.id).expect("kill failed");
-    wait_dead(&mgr, &info.id).await;
+    wait_gone(&mgr, &info.id).await;
 }
 
 /// (e) Two concurrent attachments both receive subsequent output.
@@ -368,9 +367,5 @@ async fn multi_attach_fans_out_output() {
     assert!(out2.contains("multi-45"));
 
     mgr.kill(&info.id).expect("kill failed");
-    wait_dead(&mgr, &info.id).await;
-    let info = mgr
-        .get(&info.id)
-        .expect("session record retained after kill");
-    assert!(!info.alive);
+    wait_gone(&mgr, &info.id).await;
 }
