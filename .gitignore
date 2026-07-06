@@ -1,0 +1,6 @@
+/target
+node_modules/
+web-ui/dist/
+*.log
+.DS_Store
+.claude/scheduled_tasks.lock

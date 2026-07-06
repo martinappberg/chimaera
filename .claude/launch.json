@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chimaerad",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "chimaera", "--", "serve", "--port", "9700"],
+      "port": 9700
+    }
+  ]
+}
