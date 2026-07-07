@@ -59,6 +59,8 @@ pub struct SpawnOpts {
     /// Caller-chosen session id (must be unused). `None` generates one. This
     /// lets callers embed the id in the command/environment before spawning.
     pub id: Option<SessionId>,
+    /// Extra environment variables for the child (on top of the daemon's).
+    pub env: Vec<(String, String)>,
 }
 
 /// Out-of-band events emitted by a session.

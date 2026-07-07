@@ -49,6 +49,8 @@ enum Command {
     },
     /// Check the local environment for common problems.
     Doctor,
+    /// Print the shell-integration snippet (for remote hosts' rc files).
+    ShellIntegration,
 }
 
 #[tokio::main]
@@ -73,5 +75,9 @@ async fn main() -> anyhow::Result<()> {
             no_open,
         } => connect::run(&host, local_port, binary.as_deref(), no_open).await,
         Command::Doctor => doctor::run(),
+        Command::ShellIntegration => {
+            print!("{}", chimaera_core::shellint::snippet());
+            Ok(())
+        }
     }
 }

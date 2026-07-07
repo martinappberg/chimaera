@@ -580,6 +580,7 @@ mod tests {
                 rows: 24,
                 command: None,
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn session");
 
@@ -688,6 +689,7 @@ mod tests {
                 rows: 24,
                 command: None,
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn session");
         lock(&state.agents).insert(info.id.clone(), agents::AgentRecord::new(key.to_string()));
@@ -1023,6 +1025,7 @@ mod tests {
                     "--norc".to_string(),
                 ]),
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn shell");
         lock(&state.session_workspaces).insert(info.id.clone(), workspace_id.to_string());
@@ -1115,6 +1118,74 @@ mod tests {
         wait_display_name(&state, &id, "bash").await;
 
         state.sessions.kill(&id).ok();
+    }
+
+    /// End-to-end shell integration: a real bash spawned the way
+    /// create_session spawns it (integration injected, hermetic HOME) must
+    /// reach phase `ready` and populate the command journal with command
+    /// text, output, and exit codes.
+    #[tokio::test]
+    async fn integrated_shell_populates_command_journal() {
+        use chimaera_pty::ShellPhase;
+
+        let state = test_state();
+        let base = test_dir("shellint-base");
+        let home = test_dir("shellint-home");
+        let launch =
+            chimaera_core::shellint::shell_launch_for("/bin/bash", &base).expect("launch");
+        let mut env = launch.env;
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir("shellint-cwd"),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(launch.argv),
+                id: None,
+                env,
+            })
+            .expect("spawn integrated bash");
+        let marks = state.sessions.marks(&info.id).expect("marks");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while marks.phase() != ShellPhase::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "integrated shell never reached ready (phase {:?})",
+                marks.phase()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let att = state.sessions.attach(&info.id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("echo integration-works\n"))
+            .await
+            .expect("send command");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let entry = loop {
+            let done = marks
+                .journal(10)
+                .into_iter()
+                .find(|e| !e.running && e.command.as_deref() == Some("echo integration-works"));
+            if let Some(entry) = done {
+                break entry;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "journal never recorded the command; journal: {:?}",
+                marks.journal(10)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(entry.exit_code, Some(0), "{entry:?}");
+        assert!(entry.output.contains("integration-works"), "{entry:?}");
+        assert_eq!(entry.source, chimaera_pty::CommandSource::User);
+
+        state.sessions.kill(&info.id).ok();
     }
 
     #[tokio::test]

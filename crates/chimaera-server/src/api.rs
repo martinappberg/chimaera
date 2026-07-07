@@ -206,7 +206,22 @@ pub(crate) async fn create_session(
         rows: body.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
         id: None,
+        env: Vec::new(),
     };
+
+    // Plain shells get shell integration injected (OSC 133 journal marks);
+    // a failure to materialize the scripts degrades to a plain spawn.
+    if body.kind == SessionKind::Shell {
+        match chimaera_core::shellint::shell_launch() {
+            Ok(launch) => {
+                opts.command = Some(launch.argv);
+                opts.env = launch.env;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "shell integration unavailable; spawning plain shell");
+            }
+        }
+    }
 
     // Agent sessions: resolve claude (once per daemon, via the login shell),
     // pre-pick the session id so the hook URL can embed it, and generate the
