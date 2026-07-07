@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Docs — chimaera</title>
+    <meta
+      name="description"
+      content="Install and run chimaera: serve locally, connect to a remote host over SSH, use the workbench, and keep everything up to date."
+    />
+    <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/css/styles.css" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Docs — chimaera" />
+    <meta property="og:description" content="Install and run chimaera: serve locally, connect over SSH, use the workbench, keep it up to date." />
+    <meta property="og:url" content="https://martinappberg.github.io/chimaera/docs.html" />
+    <meta property="og:image" content="https://martinappberg.github.io/chimaera/assets/img/og.png" />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("chimaera-theme");
+          if (!t)
+            t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+          document.documentElement.setAttribute("data-theme", t);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="nav" id="nav">
+      <div class="wrap nav__inner">
+        <a class="brand" href="./" aria-label="chimaera home">
+          <svg class="hexmark" width="28" height="28" viewBox="0 0 240 240" aria-hidden="true">
+            <g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z" />
+              <path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1" />
+            </g>
+          </svg>
+          <span class="wordmark">chimaera</span>
+        </a>
+        <nav class="nav__links" aria-label="Primary">
+          <a href="index.html#features">Features</a>
+          <a href="index.html#how">How it works</a>
+          <a href="index.html#download">Download</a>
+          <a href="docs.html" aria-current="page">Docs</a>
+        </nav>
+        <div class="nav__actions">
+          <button class="icon-btn theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle theme">
+            <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+            <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /></svg>
+          </button>
+          <a class="btn btn--ghost btn--sm" href="https://github.com/martinappberg/chimaera" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.55v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.41-1.27.74-1.56-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.08 0 4.41-2.69 5.38-5.25 5.67.42.36.8 1.08.8 2.18v3.23c0 .31.2.66.8.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
+            <span>GitHub</span>
+          </a>
+          <button class="icon-btn nav__burger" id="burger" type="button" aria-label="Open menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div class="sheet" id="sheet" aria-hidden="true">
+      <div class="sheet__scrim" data-close></div>
+      <div class="sheet__panel">
+        <div class="sheet__head">
+          <span class="wordmark" style="font-size: 17px">chimaera</span>
+          <button class="icon-btn" data-close type="button" aria-label="Close menu" style="margin-left: auto">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" /></svg>
+          </button>
+        </div>
+        <a href="index.html#features" data-close>Features</a>
+        <a href="index.html#how" data-close>How it works</a>
+        <a href="index.html#download" data-close>Download</a>
+        <a href="docs.html" data-close>Docs</a>
+        <a class="btn btn--primary" href="index.html#download" data-close>Get chimaera</a>
+      </div>
+    </div>
+
+    <div class="wrap docs">
+      <!-- Sidebar -->
+      <aside class="docs__nav" id="docs-nav">
+        <h4>Getting started</h4>
+        <a href="#what">What it is</a>
+        <a href="#install">Install</a>
+        <a href="#serve">Run locally</a>
+        <a href="#connect">Connect to a remote host</a>
+        <h4>Using it</h4>
+        <a href="#workspaces">Workspaces &amp; windows</a>
+        <a href="#agents">Agents</a>
+        <a href="#previews">File previews</a>
+        <a href="#linked">Linked terminals</a>
+        <h4>Operating</h4>
+        <a href="#updates">Staying current</a>
+        <a href="#platforms">Platforms</a>
+        <a href="#faq">Troubleshooting</a>
+        <a href="#license">License</a>
+      </aside>
+
+      <!-- Content -->
+      <main class="docs__main">
+        <h1>Documentation</h1>
+        <p class="docs__lede">
+          Everything you need to install chimaera, run it locally or on a remote
+          host, and drive your agents from one window.
+        </p>
+
+        <div class="note">
+          <p><strong>Early software.</strong> chimaera is pre-release and moving fast — interfaces, storage formats, and the wire protocol can change without notice. Pin your version if you depend on it.</p>
+        </div>
+
+        <h2 id="what">What it is</h2>
+        <p>
+          chimaera is an <strong>agent workbench</strong>. One static Rust binary
+          (<code>chimaera</code>) is the whole server: it owns your coding-agent
+          sessions as persistent, daemon-owned PTY processes on whatever host owns
+          the work — your laptop, a dev server, or an HPC login node — and serves a
+          workspace-first web UI around them (file previews, terminals, git state).
+        </p>
+        <p>
+          Agents run as the real interactive TUIs (<code>claude</code> and friends)
+          in daemon-owned PTYs, so they look, behave, and bill exactly like they do
+          in any terminal. The daemon owns the sessions; windows are just views.
+          Close the laptop mid-run and nothing dies. A native Tauri app wraps the
+          same UI in real windows.
+        </p>
+
+        <h2 id="install">Install</h2>
+        <h3>Native app (recommended)</h3>
+        <p>
+          Grab the macOS app from the
+          <a href="index.html#download">download section</a> or the
+          <a href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener">latest release</a>.
+          It bundles the daemon, gives you a home screen of workspaces and remote
+          hosts, and auto-updates itself (signature-verified) on launch.
+        </p>
+
+        <h3>Build from source</h3>
+        <p>You need stable Rust and Node (see <code>.nvmrc</code> / <code>rust-toolchain.toml</code> for exact versions).</p>
+        <div class="codecard">
+          <div class="codecard__bar"><div class="mock__dots"><i></i><i></i><i></i></div><span class="name">build</span></div>
+          <pre><code><span class="p">$</span> git clone https://github.com/martinappberg/chimaera
+<span class="p">$</span> cd chimaera
+<span class="p">$</span> npm --prefix web-ui install
+<span class="p">$</span> npm --prefix web-ui run build      <span class="c"># the daemon embeds web-ui/dist</span>
+<span class="p">$</span> cargo build --release -p chimaera</code></pre>
+        </div>
+        <p>
+          If you use <a href="https://github.com/casey/just" target="_blank" rel="noopener">just</a>,
+          <code>just serve</code> does the UI build + daemon run in one step, and
+          <code>just app-build</code> bundles the native app.
+        </p>
+
+        <h2 id="serve">Run locally</h2>
+        <p>Start the daemon; it prints the URL to open.</p>
+        <div class="codecard">
+          <div class="codecard__bar"><div class="mock__dots"><i></i><i></i><i></i></div><span class="name">serve</span></div>
+          <pre><code><span class="p">$</span> chimaera serve
+  <span class="c">→ workbench on http://127.0.0.1:9700/#token=…</span>
+
+<span class="p">$</span> chimaera serve --port 9700   <span class="c"># pick the port</span>
+<span class="p">$</span> chimaera status               <span class="c"># what's running</span>
+<span class="p">$</span> chimaera doctor               <span class="c"># environment sanity check</span></code></pre>
+        </div>
+        <p>
+          The URL carries a bearer token in the fragment, so anyone with the link
+          on the machine can attach. Open it in a browser — or just use the native
+          app, which manages the local daemon for you.
+        </p>
+
+        <h2 id="connect">Connect to a remote host</h2>
+        <p>
+          <code>chimaera connect &lt;host&gt;</code> shells out to your system
+          <code>ssh</code>, so <code>ProxyJump</code>, <code>ControlMaster</code>,
+          and 2FA from your <code>~/.ssh/config</code> all just work. It installs
+          the daemon into <code>~/.chimaera</code> on the host if it's missing,
+          starts or attaches to it, tunnels the port, and opens the UI.
+        </p>
+        <div class="codecard">
+          <div class="codecard__bar"><div class="mock__dots"><i></i><i></i><i></i></div><span class="name">connect</span></div>
+          <pre><code><span class="p">$</span> chimaera connect gpu-node
+  <span class="c">→ detecting target (uname -sm) … linux/x86_64</span>
+  <span class="c">→ installing daemon in ~/.chimaera … ok</span>
+  <span class="c">→ starting daemon … listening on :9700</span>
+  <span class="c">→ tunnelling 127.0.0.1:9700 → gpu-node:9700 … ok</span>
+  <span class="c">→ opening workbench ✓</span></code></pre>
+        </div>
+        <div class="note">
+          <p><strong>Host key:</strong> <code>&lt;host&gt;</code> is any name your ssh knows — an alias from <code>~/.ssh/config</code>, or <code>user@host</code>. chimaera never reimplements the ssh client; whatever <code>ssh &lt;host&gt;</code> does on your machine is what <code>connect</code> does.</p>
+        </div>
+        <p>
+          No root and no containers are needed on the remote — the daemon is a
+          single static binary that installs under your home directory. From the
+          native app, add the host once on the home screen and connect with a
+          click (probe → auto-install → start → tunnel, shown as progress states).
+        </p>
+
+        <h2 id="workspaces">Workspaces &amp; windows</h2>
+        <p>
+          A <strong>window is a workspace</strong> — a folder, local or remote.
+          Opening it gives you the file tree, previews, and git state for that
+          folder, plus as many agent and terminal sessions as you want living
+          inside it. Sessions belong to the workspace and the host-side daemon,
+          not to the window — so windows are detachable views you can close and
+          reopen without losing anything.
+        </p>
+        <ul>
+          <li>Split panes, tabs, and drag-and-drop arrange terminals and previews side by side.</li>
+          <li><strong>Focus mode</strong> collapses the chrome down to the work; a session strip keeps you oriented.</li>
+          <li>Layout is per-window view state, owned by the daemon and restored when you return.</li>
+        </ul>
+
+        <h2 id="agents">Agents</h2>
+        <p>
+          The launcher detects the agent CLIs you have installed and can install or
+          update them from official sources — binaries live under
+          <code>~/.chimaera</code>, and your credentials stay entirely yours (in
+          <code>HOME</code> and your login-shell environment). Supported today:
+        </p>
+        <ul>
+          <li><strong>Claude Code</strong> (<code>claude</code>) — the primary agent.</li>
+          <li><strong>Codex</strong> — the modern Rust CLI with <code>codex login</code>.</li>
+          <li><strong>Gemini CLI</strong> — via API-key auth.</li>
+          <li><strong>Antigravity</strong> (<code>agy</code>) — Google's official CLI.</li>
+          <li><strong>Plain shells</strong> — first-class workspace sessions too.</li>
+        </ul>
+        <p>
+          Agents run as their real TUIs. Injected hooks turn each agent's state
+          into an <strong>attention signal</strong> so a rail badge and the session
+          strip tell you which one is waiting on you — approval always happens in
+          context, never out of band. Sessions auto-name after what they're
+          actually doing, and ended conversations drop into a per-workspace Recents
+          list you can resume from.
+        </p>
+
+        <h2 id="previews">File previews</h2>
+        <p>
+          The previews are the reason you can retire code-server. The server
+          extracts and the client renders — whole files are never loaded into the
+          browser.
+        </p>
+        <ul>
+          <li><strong>Images</strong> — with zoom, pan, and fit.</li>
+          <li><strong>Markdown</strong> — rendered, with an edit/preview toggle.</li>
+          <li><strong>CSV / TSV</strong> — paged tables, gzip and BGZF included.</li>
+          <li><strong>PDF</strong> — bundled viewer, no CDN (air-gapped safe).</li>
+          <li><strong>Notebooks</strong> — <code>.ipynb</code> with outputs.</li>
+          <li><strong>HTML reports</strong> — self-contained, sandboxed: the MultiQC / FastQC class of scientific output.</li>
+        </ul>
+        <p>
+          Lightweight editing is built in (CodeMirror, <kbd>⌘S</kbd> to save, a
+          dirty indicator) — enough to fix a script, not a full IDE.
+        </p>
+
+        <h2 id="linked">Linked terminals</h2>
+        <p>
+          Hand an agent a leash to a live shell — the one that already has your
+          modules loaded and your conda environment active — instead of paying
+          setup cost on every command. Links are <strong>user-granted</strong>,
+          scoped to a specific terminal, and every command the agent runs through
+          the link is audited in that terminal's own scrollback so you can see
+          exactly what happened.
+        </p>
+
+        <h2 id="updates">Staying current</h2>
+        <p>Two things keep themselves current so a running setup keeps pace with releases:</p>
+        <ul>
+          <li>
+            <strong>The daemon</strong> is replaced on connect when it's older than
+            the client — silently if it has no live sessions, otherwise behind an
+            explicit "update" action that spells out what it ends. An idle shell
+            holding a <code>module load</code> or conda environment is never killed
+            without asking. This works the same for local and remote daemons.
+          </li>
+          <li>
+            <strong>The native app</strong> checks GitHub releases on launch and
+            offers a one-click "update &amp; restart"; the download is
+            signature-verified (minisign) before it installs.
+          </li>
+        </ul>
+
+        <h2 id="platforms">Platforms</h2>
+        <p>macOS and Linux.</p>
+        <ul>
+          <li><strong>Daemon:</strong> fully static musl binaries for <code>x86_64</code> and <code>aarch64</code> Linux — they run on old-glibc HPC systems (verified on glibc 2.17, no root) — plus an <code>aarch64</code> macOS build.</li>
+          <li><strong>Native app:</strong> macOS on Apple Silicon.</li>
+          <li><strong>Windows:</strong> untested.</li>
+        </ul>
+        <p>
+          The daemon is built to live on shared login nodes: bounded allocations,
+          hard ceilings on preview extraction, ~150&nbsp;MB RSS and under a core
+          steady-state. Durable state is append-only, size-capped JSONL under
+          <code>~/.chimaera</code> — no SQLite anywhere near NFS/Lustre.
+        </p>
+
+        <h2 id="faq">Troubleshooting</h2>
+        <h3>The remote daemon is a stale version</h3>
+        <p>
+          Reconnect — <code>chimaera connect &lt;host&gt;</code> replaces an
+          outdated daemon (asking first if it has live sessions). Or force it from
+          the CLI with <code>chimaera connect &lt;host&gt; --update-daemon</code>.
+        </p>
+        <h3><code>claude</code> isn't found on the remote</h3>
+        <p>
+          Non-interactive SSH often has a slimmer <code>PATH</code>. chimaera
+          spawns agents through your <strong>login shell</strong> so they get the
+          same environment as an interactive session — but the agent still has to
+          be installed and on that login shell's <code>PATH</code>. Install or
+          update it from the launcher, or check <code>chimaera doctor</code>.
+        </p>
+        <h3>2FA / no public keys on the cluster</h3>
+        <p>
+          If your cluster requires interactive 2FA (e.g. Duo) and forbids
+          pubkeys, keep a live <code>ControlMaster</code> connection open (the way
+          you normally SSH in); chimaera reuses it for non-interactive commands.
+        </p>
+
+        <h2 id="license">License</h2>
+        <p>
+          chimaera is licensed under the
+          <a href="https://github.com/martinappberg/chimaera/blob/main/LICENSE" target="_blank" rel="noopener">GNU AGPL-3.0</a>
+          — free for everyone to use, self-host, and modify. If you want to build a
+          closed-source product or service on chimaera, a commercial license is
+          available: <a href="mailto:mkjberg@gmail.com">contact the author</a>.
+          Contributions require a CLA (see
+          <a href="https://github.com/martinappberg/chimaera/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>).
+        </p>
+
+        <div class="note" style="margin-top: 40px">
+          <p><strong>Found a bug or have a question?</strong> <a href="https://github.com/martinappberg/chimaera/issues" target="_blank" rel="noopener">Open an issue</a> on GitHub.</p>
+        </div>
+      </main>
+    </div>
+
+    <footer class="footer">
+      <div class="wrap">
+        <div class="footer__bottom" style="margin-top: 0; border-top: 0; padding-top: 0">
+          <a class="brand" href="./" aria-label="chimaera home">
+            <svg class="hexmark" width="22" height="22" viewBox="0 0 240 240" aria-hidden="true"><g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"><path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/><path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/></g></svg>
+            <span class="wordmark" style="font-size: 15px">chimaera</span>
+          </a>
+          <span class="mono">© <span id="year">2026</span> · AGPL-3.0 · <a href="https://github.com/martinappberg/chimaera" target="_blank" rel="noopener">GitHub</a></span>
+        </div>
+      </div>
+    </footer>
+
+    <script src="assets/js/site.js" defer></script>
+    <script>
+      // Highlight the docs section currently in view.
+      (function () {
+        var links = Array.prototype.slice.call(
+          document.querySelectorAll(".docs__nav a")
+        );
+        var map = {};
+        links.forEach(function (a) {
+          map[a.getAttribute("href").slice(1)] = a;
+        });
+        var spy = new IntersectionObserver(
+          function (entries) {
+            entries.forEach(function (e) {
+              if (e.isIntersecting) {
+                links.forEach(function (l) { l.classList.remove("active"); });
+                var a = map[e.target.id];
+                if (a) a.classList.add("active");
+              }
+            });
+          },
+          { rootMargin: "-80px 0px -70% 0px", threshold: 0 }
+        );
+        document.querySelectorAll(".docs__main h2[id]").forEach(function (h) {
+          spy.observe(h);
+        });
+      })();
+    </script>
+  </body>
+</html>
