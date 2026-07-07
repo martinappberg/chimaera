@@ -49,6 +49,37 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let mut attachment = match state.sessions.attach(&id) {
         Ok(attachment) => attachment,
         Err(err) => {
+            // A session that died before this client could attach (fast
+            // agent failures — a missing API key kills codex in ~400ms)
+            // still gets an honest pane: replay the final screen once,
+            // then close as exited. Blank panes teach nothing.
+            if let Some(words) = state.sessions.last_words(&id) {
+                let mut ready = match serde_json::to_value(&words.info) {
+                    Ok(serde_json::Value::Object(map)) => map,
+                    _ => serde_json::Map::new(),
+                };
+                ready.insert("type".to_string(), json!("ready"));
+                ready.insert("cwd_current".to_string(), json!(words.info.cwd.clone()));
+                if send_json(&mut socket, &serde_json::Value::Object(ready))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if socket
+                    .send(Message::Binary(Bytes::from(words.snapshot)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = send_json(
+                    &mut socket,
+                    &json!({"type": "exited", "status": words.info.exit_status}),
+                )
+                .await;
+                return;
+            }
             tracing::debug!(%id, %err, "ws attach failed");
             let _ = send_json(
                 &mut socket,

@@ -30,6 +30,12 @@ export interface Session {
   title: string | null;
   workspace_id: string;
   kind: SessionKind;
+  /**
+   * Which agent CLI a kind-"agent" session runs ("claude", "codex",
+   * "gemini"); drives the glyph choice everywhere sessions appear. Null for
+   * shells; optional (treated as "claude") until the daemon half lands.
+   */
+  agent_kind?: string | null;
   agent_state: AgentState | null;
   /** Claude's own name for the conversation; overrides `name` for display. */
   agent_title: string | null;
@@ -67,6 +73,16 @@ export function needsAttention(s: Session): boolean {
   );
 }
 
+/** The agent CLI behind a session ("claude" until the server says otherwise). */
+export function agentKind(s: Session): string {
+  return s.kind === "agent" ? (s.agent_kind ?? "claude") : "shell";
+}
+
+/** True for agents with no hook integration yet (state is honestly unknown). */
+function unintegrated(s: Session): boolean {
+  return s.kind === "agent" && agentKind(s) !== "claude";
+}
+
 /**
  * Dot modifier class for a session (shared by the rail, pane tabs, and the
  * session strip; see the global .dot.* styles in app.css).
@@ -86,9 +102,11 @@ export function dotState(s: Session): string {
     case "rate_limited":
       return "rate";
     default:
-      // "unknown" on a live process is a visible starting state (hollow
-      // ring), distinct from both finished (filled) and dead (dim).
-      return s.alive ? "starting" : "";
+      if (!s.alive) return "";
+      // Hook-less agents (codex, gemini) never learn their state: a muted
+      // filled dot — honestly unknown, not perpetually "starting". Claude's
+      // pre-hook moment stays the hollow provisional ring.
+      return unintegrated(s) ? "unk" : "starting";
   }
 }
 
@@ -109,7 +127,8 @@ export function dotTitle(s: Session): string {
     case "rate_limited":
       return "rate limited";
     default:
-      return s.alive ? "starting…" : "exited";
+      if (!s.alive) return "exited";
+      return unintegrated(s) ? `state unknown (no ${agentKind(s)} integration yet)` : "starting…";
   }
 }
 
@@ -176,11 +195,20 @@ export async function listSessions(): Promise<Session[]> {
   return json(await api("/sessions"));
 }
 
+/** Launcher extras for kind-"agent" spawns (POST /sessions passthrough). */
+export interface AgentSpawn {
+  /** Which agent CLI ("claude" when omitted). */
+  agent?: string;
+  /** Claude session id to resume (`claude --resume <id>`). */
+  resume?: string;
+}
+
 export async function createSession(
   workspaceId: string,
   kind: SessionKind = "shell",
   name: string | null = null,
   size: { cols: number; rows: number } | null = null,
+  spawn: AgentSpawn = {},
 ): Promise<Session> {
   // Spawn at the destination pane's fitted size so TUIs never boot at a
   // wrong 80x24 and repaint on the first resize (server clamps identically).
@@ -191,11 +219,16 @@ export async function createSession(
           cols: Math.min(Math.max(Math.round(size.cols), 20), 500),
           rows: Math.min(Math.max(Math.round(size.rows), 5), 200),
         };
+  const extras: Record<string, string> = {};
+  if (kind === "agent") {
+    if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
+    if (spawn.resume !== undefined) extras.resume = spawn.resume;
+  }
   return json(
     await api("/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspace_id: workspaceId, kind, name, ...dims }),
+      body: JSON.stringify({ workspace_id: workspaceId, kind, name, ...dims, ...extras }),
     }),
   );
 }

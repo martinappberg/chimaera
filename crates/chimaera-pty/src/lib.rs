@@ -14,7 +14,7 @@ mod snapshot;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -77,11 +77,28 @@ pub struct Attachment {
     pub input: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }
 
+/// The final screen of an exited session, kept briefly so late attachers (a
+/// client whose tab opened just as the process died — fast agent failures)
+/// still see what happened instead of a blank pane.
+#[derive(Clone)]
+pub struct LastWords {
+    /// The session's final info (`alive: false`, exit status recorded).
+    pub info: SessionInfo,
+    /// ANSI escape stream of the final screen, same form as an attach
+    /// snapshot.
+    pub snapshot: Vec<u8>,
+}
+
+/// Bound on remembered last-words snapshot bytes (oldest evicted first).
+const LAST_WORDS_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 /// Owner of all PTY sessions. Sessions keep running while unattached; when a
 /// session's child exits it is unregistered (tmux semantics: an exited shell
 /// vanishes). Attached clients receive `SessionEvent::Exited` first.
 pub struct SessionManager {
     sessions: Mutex<HashMap<SessionId, Arc<session::Session>>>,
+    /// Final screens of recently exited sessions, oldest first.
+    last_words: Mutex<VecDeque<LastWords>>,
 }
 
 /// Lock a mutex, recovering the guard if a panicking thread poisoned it.
@@ -93,6 +110,7 @@ impl SessionManager {
     pub fn new() -> Arc<Self> {
         Arc::new(SessionManager {
             sessions: Mutex::new(HashMap::new()),
+            last_words: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -112,6 +130,15 @@ impl SessionManager {
         let exit_id = id.clone();
         let on_exit = Box::new(move || {
             if let Some(m) = mgr.upgrade() {
+                // Snapshot the final screen BEFORE unregistering, so there is
+                // no moment where a session is neither live nor remembered.
+                if let Some(session) = m.session(&exit_id) {
+                    let attachment = session.attach();
+                    m.remember_last_words(LastWords {
+                        info: attachment.info,
+                        snapshot: attachment.snapshot,
+                    });
+                }
                 lock_unpoisoned(&m.sessions).remove(&exit_id);
             }
         });
@@ -174,6 +201,27 @@ impl SessionManager {
             session.kill();
         }
         Ok(())
+    }
+
+    /// The final screen of a recently exited session, if still remembered
+    /// (bounded by [`LAST_WORDS_MAX_BYTES`] of snapshot data).
+    pub fn last_words(&self, id: &str) -> Option<LastWords> {
+        lock_unpoisoned(&self.last_words)
+            .iter()
+            .rev()
+            .find(|w| w.info.id == id)
+            .cloned()
+    }
+
+    fn remember_last_words(&self, words: LastWords) {
+        let mut remembered = lock_unpoisoned(&self.last_words);
+        remembered.push_back(words);
+        let mut total: usize = remembered.iter().map(|w| w.snapshot.len()).sum();
+        while total > LAST_WORDS_MAX_BYTES && remembered.len() > 1 {
+            if let Some(dropped) = remembered.pop_front() {
+                total -= dropped.snapshot.len();
+            }
+        }
     }
 
     pub(crate) fn session(&self, id: &str) -> Option<Arc<session::Session>> {

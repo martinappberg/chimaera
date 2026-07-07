@@ -27,6 +27,43 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::AppState;
 
+/// Which agent CLI a kind-"agent" session runs. The id doubles as the binary
+/// name probed on the login-shell PATH. Hook-driven attention state exists
+/// only for Claude; other agents surface `agent_state: "unknown"` (the muted
+/// dot in the UI) until their integrations land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AgentKind {
+    Claude,
+    Codex,
+    Gemini,
+}
+
+impl AgentKind {
+    pub(crate) const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini];
+
+    /// Stable id — also the binary name (`claude`, `codex`, `gemini`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::Gemini => "gemini",
+        }
+    }
+
+    /// Human product name for launcher rows and error messages.
+    pub(crate) fn product_name(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "Claude Code",
+            AgentKind::Codex => "Codex",
+            AgentKind::Gemini => "Gemini CLI",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<AgentKind> {
+        AgentKind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
 /// Attention state of an agent session, derived from Claude Code hook events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentState {
@@ -62,6 +99,8 @@ const FILES_TOUCHED_CAP: usize = 100;
 pub(crate) struct AgentRecord {
     /// Per-session secret embedded in the hook URL; authorizes ingestion.
     pub(crate) key: String,
+    /// Which agent CLI this session runs (the UI glyphs sessions by it).
+    pub(crate) kind: AgentKind,
     pub(crate) state: AgentState,
     /// Latest transcript path reported by any hook payload.
     pub(crate) transcript_path: Option<PathBuf>,
@@ -72,6 +111,10 @@ pub(crate) struct AgentRecord {
     /// First prompt seen in a `UserPromptSubmit` hook payload; provisional
     /// display name until a real title exists.
     pub(crate) first_prompt: Option<String>,
+    /// The claude session id this session resumed (`--resume <id>`), when it
+    /// did. Claude forks a NEW session id on resume, so recents needs this
+    /// to recognize the live continuation of an old conversation.
+    pub(crate) resumed_from: Option<String>,
     /// Files this session has written (PostToolUse hooks for file-writing
     /// tools): ordered, de-duplicated, most recently touched last, capped at
     /// [`FILES_TOUCHED_CAP`]. Never cleared — the list lives as long as the
@@ -80,14 +123,16 @@ pub(crate) struct AgentRecord {
 }
 
 impl AgentRecord {
-    pub(crate) fn new(key: String) -> Self {
+    pub(crate) fn new(key: String, kind: AgentKind) -> Self {
         AgentRecord {
             key,
+            kind,
             state: AgentState::Unknown,
             transcript_path: None,
             custom_title: None,
             ai_title: None,
             first_prompt: None,
+            resumed_from: None,
             files_touched: Vec::new(),
         }
     }
@@ -114,8 +159,9 @@ impl AgentRecord {
         self.custom_title.as_deref().or(self.ai_title.as_deref())
     }
 
-    /// Display name, naming rule zero for agents: customTitle > claude's own
-    /// live terminal title > aiTitle > first prompt (truncated) > "claude".
+    /// Display name, naming rule zero for agents: customTitle > the agent's
+    /// own live terminal title > aiTitle > first prompt (truncated) > the
+    /// agent binary name ("claude"/"codex"/"gemini").
     /// The OSC title is how `/rename` (and any in-TUI naming) propagates
     /// instantly without depending on semi-documented transcript records —
     /// found in the field when a `/rename git` left the row on its
@@ -126,7 +172,17 @@ impl AgentRecord {
             .or_else(|| osc_title.and_then(cleaned_osc_title))
             .or_else(|| self.ai_title.clone())
             .or_else(|| self.first_prompt.as_deref().map(truncate_prompt))
-            .unwrap_or_else(|| "claude".to_string())
+            .unwrap_or_else(|| self.kind.as_str().to_string())
+    }
+
+    /// The session id `claude --resume` accepts: the transcript filename stem
+    /// (hooks report the transcript as `<store>/<cwd-key>/<session-id>.jsonl`).
+    pub(crate) fn resume_id(&self) -> Option<String> {
+        self.transcript_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
     }
 }
 
@@ -147,8 +203,9 @@ fn cleaned_osc_title(raw: &str) -> Option<String> {
 const PROMPT_TITLE_MAX: usize = 60;
 
 /// Collapse whitespace and truncate to ~60 chars at a word boundary,
-/// appending an ellipsis when anything was cut.
-fn truncate_prompt(prompt: &str) -> String {
+/// appending an ellipsis when anything was cut. Shared with the launcher's
+/// resumable-session titles so both surfaces truncate identically.
+pub(crate) fn truncate_prompt(prompt: &str) -> String {
     let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= PROMPT_TITLE_MAX {
         return flat;
@@ -180,43 +237,6 @@ pub(crate) fn fresh_session_id() -> String {
 /// Fresh per-session hook secret.
 pub(crate) fn fresh_agent_key() -> String {
     chimaera_core::generate_token()[..32].to_string()
-}
-
-/// Resolve the `claude` binary through the user's login shell. Field-tested:
-/// `claude` is not on the non-interactive ssh PATH on HPC login nodes, so a
-/// plain `which` from the daemon's environment is not enough.
-pub(crate) async fn resolve_claude() -> Result<PathBuf, String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let output = tokio::process::Command::new(&shell)
-        .arg("-lc")
-        .arg("command -v claude")
-        .output()
-        .await;
-    let not_found = || {
-        format!(
-            "claude not found via `{shell} -lc 'command -v claude'`; install Claude Code \
-             (https://claude.com/claude-code) or make `claude` resolvable from your login shell"
-        )
-    };
-    match output {
-        Ok(out) if out.status.success() => {
-            // Login shells may print banners; the path is the last non-empty line.
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let path = stdout
-                .lines()
-                .rev()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("");
-            if path.starts_with('/') {
-                Ok(PathBuf::from(path))
-            } else {
-                Err(not_found())
-            }
-        }
-        Ok(_) => Err(not_found()),
-        Err(err) => Err(format!("failed to run login shell {shell}: {err}")),
-    }
 }
 
 /// Hook events wired into the generated settings file. Everything the state
@@ -405,21 +425,32 @@ fn poll_interval() -> Duration {
 }
 
 /// Watch one agent session for its lifetime: tail-poll the transcript for
-/// title records and drop the agent record (broadcasting a change) once the
-/// underlying PTY session is gone.
+/// title records and retire the agent record into the workspace's recents
+/// (broadcasting a change) once the underlying PTY session is gone.
 pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
     tokio::spawn(async move {
         let mut tailed: Option<PathBuf> = None;
         let mut offset: u64 = 0;
         let mut partial = Vec::new();
+        // Last name facts seen live, for the recents entry: SessionInfo is
+        // gone by the time the death tick fires.
+        let mut last_pin: Option<String> = None;
+        let mut last_osc: Option<String> = None;
         loop {
             tokio::time::sleep(poll_interval()).await;
 
-            if state.sessions.get(&session_id).is_none() {
-                if crate::lock(&state.agents).remove(&session_id).is_some() {
-                    state.changes.notify_waiters();
-                }
+            let Some(info) = state.sessions.get(&session_id) else {
+                crate::recents::retire(
+                    &state,
+                    &session_id,
+                    last_pin.as_deref(),
+                    last_osc.as_deref(),
+                );
                 return;
+            };
+            last_pin = info.renamed.then(|| info.name.clone());
+            if info.title.is_some() {
+                last_osc = info.title;
             }
 
             let path = {
@@ -502,8 +533,9 @@ async fn read_appended_lines(
 /// Apply one transcript line to the record's title fields. Returns whether
 /// the effective title changed. Recognizes `{"type":"ai-title","aiTitle":..}`
 /// records and any record carrying a top-level `customTitle` (string sets it,
-/// null clears it).
-fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
+/// null clears it). Shared with the launcher's resumable-session scan so the
+/// live tail and the resume list resolve titles identically.
+pub(crate) fn apply_title_line(line: &str, record: &mut AgentRecord) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
     };
@@ -620,7 +652,7 @@ mod tests {
 
     #[test]
     fn touch_file_dedupes_orders_and_caps() {
-        let mut record = AgentRecord::new("k".into());
+        let mut record = AgentRecord::new("k".into(), AgentKind::Claude);
         assert!(record.touch_file("/w/a"));
         assert!(record.touch_file("/w/b"));
         // Re-touching the newest entry changes nothing.
@@ -640,7 +672,7 @@ mod tests {
 
     #[test]
     fn titles_latest_custom_wins_over_latest_ai() {
-        let mut record = AgentRecord::new("k".into());
+        let mut record = AgentRecord::new("k".into(), AgentKind::Claude);
         assert!(apply_title_line(
             r#"{"type":"ai-title","aiTitle":"First ai","sessionId":"x"}"#,
             &mut record
@@ -666,7 +698,7 @@ mod tests {
 
     #[test]
     fn display_name_resolution_chain() {
-        let mut record = AgentRecord::new("k".into());
+        let mut record = AgentRecord::new("k".into(), AgentKind::Claude);
         assert_eq!(record.display_name(None), "claude");
         record.first_prompt = Some("fix the flaky tests".into());
         assert_eq!(record.display_name(None), "fix the flaky tests");

@@ -21,10 +21,19 @@
     listWorkspaces,
     needsAttention,
     pollSessions,
+    type AgentSpawn,
     type Session,
-    type SessionKind,
     type Workspace,
   } from "./lib/sessions";
+  import {
+    getAgentDefault,
+    listRecents,
+    relativeAge,
+    setAgentDefault,
+    type AgentInfo,
+    type LaunchPick,
+    type RecentConvo,
+  } from "./lib/launcher";
   import { EventsSocket } from "./lib/events";
   import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
   import { get } from "svelte/store";
@@ -89,6 +98,8 @@
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
+  import Launcher from "./lib/Launcher.svelte";
+  import SessionGlyph from "./lib/SessionGlyph.svelte";
   import QuickOpen from "./lib/QuickOpen.svelte";
   import FileTree from "./lib/FileTree.svelte";
   import SplitTree from "./lib/SplitNode.svelte";
@@ -104,6 +115,20 @@
   let quickOpenRestoreEl: HTMLElement | null = null;
   let eventsUp = $state(false);
   let createError = $state<string | null>(null);
+  // --- the agent launcher (split button + popover) ---
+  /** The persisted default agent the split button's main surface spawns. */
+  let agentDefault = $state(getAgentDefault());
+  let launcherOpen = $state(false);
+  /** The split button's rect at open time; the popover hangs below it. */
+  let launcherAnchor = $state<DOMRect | null>(null);
+  let newSplitEl = $state<HTMLElement | null>(null);
+  /** Hover-intent timer (~150ms, chevron only) that opens the launcher. */
+  let launcherHoverTimer: ReturnType<typeof setTimeout> | null = null;
+  // --- the rail's Recents section (ended agent conversations) ---
+  let recents = $state<RecentConvo[]>([]);
+  let recentsExpanded = $state(false);
+  /** Follow-up fetch timer: retirement lands on the daemon's ~2s watch tick. */
+  let recentsTimer: ReturnType<typeof setTimeout> | null = null;
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
   /** Element that held focus when the picker opened; restored on close. */
@@ -565,7 +590,11 @@
     }
     if (key === "e" && plain) {
       intercept();
-      void newSession(l2 ? "agent" : "shell");
+      // mod2+E spawns the persisted default agent config (same as the split
+      // button's main surface); the launcher popover stays mouse-opened —
+      // nothing chord-new.
+      if (l2) spawnDefaultAgent();
+      else newShell();
       return;
     }
     if (key === "Enter" && l2) {
@@ -705,10 +734,20 @@
     void bootViewState();
   }
 
+  /** Agent ids in the previous snapshot. A vanished agent just retired into
+   *  the workspace's recents; an appeared one may be a resumed conversation
+   *  leaving them — either way the rail section refetches. */
+  let prevAgentIds = new Set<string>();
+
   function applySessions(list: Session[]): void {
     list.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
     sessions = list;
     gotSessions = true;
+    const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
+    const changed =
+      agentIds.size !== prevAgentIds.size || [...prevAgentIds].some((id) => !agentIds.has(id));
+    prevAgentIds = agentIds;
+    if (changed) refreshRecents(true);
     pruneAndAutoOpen();
   }
 
@@ -849,26 +888,148 @@
     return el !== null ? pool.estimateSize(el) : null;
   }
 
-  async function newSession(kind: SessionKind): Promise<void> {
+  /** Spawn + surface a session; the shared tail of every create path. */
+  async function spawnSession(
+    kind: "shell" | "agent",
+    spawn: AgentSpawn = {},
+  ): Promise<Session | null> {
     if (activeWsId === null) {
       openPicker();
-      return;
+      return null;
     }
     createError = null;
     try {
-      const s = await createSession(activeWsId, kind, null, spawnSize());
+      const s = await createSession(activeWsId, kind, null, spawnSize(), spawn);
       recentlyCreated.set(s.id, Date.now());
       // A racing events snapshot may already have delivered the session.
       if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
       // The new session opens as the active tab in the focused pane,
       // focused, immediately — never an invisible rail-only row.
       openSess(s.id);
+      return s;
     } catch (e) {
-      // Both kinds surface an inline error (409 when claude is missing,
+      // Inline error (409 when the agent binary is missing,
       // "unauthorized"/network noise otherwise).
-      const what = kind === "agent" ? "agent" : "terminal";
+      const what = kind === "agent" ? (spawn.agent ?? "agent") : "terminal";
       createError = e instanceof ApiError ? e.message : `failed to start ${what}`;
+      return null;
     }
+  }
+
+  function newShell(): void {
+    void spawnSession("shell");
+  }
+
+  /** The split button's main surface / Cmd+Shift+E: the persisted default
+   *  agent, instantly — no popover in the way. */
+  function spawnDefaultAgent(): void {
+    void spawnSession("agent", { agent: agentDefault.agent });
+  }
+
+  // --- the agent launcher popover ---
+
+  /** When the popover opened, so a chevron click landing right after a
+   *  hover-open confirms it instead of flash-closing it. */
+  let launcherOpenedAt = 0;
+
+  function openLauncher(): void {
+    if (launcherOpen || activeWsId === null || newSplitEl === null) return;
+    launcherAnchor = newSplitEl.getBoundingClientRect();
+    launcherOpenedAt = Date.now();
+    launcherOpen = true;
+  }
+
+  function closeLauncher(): void {
+    launcherOpen = false;
+    const sid = focusedSessionOf(layout);
+    if (sid !== null) pool.focusTerminal(sid);
+  }
+
+  /** Hover intent (~150ms) on the CHEVRON opens the launcher — the main
+   *  surface never does; it is a pure instant spawn (field feedback: a
+   *  popover chasing every hover of the button read as intrusive). */
+  function armLauncherHover(): void {
+    if (launcherOpen || activeWsId === null) return;
+    disarmLauncherHover();
+    launcherHoverTimer = setTimeout(() => {
+      launcherHoverTimer = null;
+      openLauncher();
+    }, 150);
+  }
+
+  function disarmLauncherHover(): void {
+    if (launcherHoverTimer !== null) {
+      clearTimeout(launcherHoverTimer);
+      launcherHoverTimer = null;
+    }
+  }
+
+  /** Every launcher selection becomes the new default agent and spawns. */
+  function launcherPick(pick: LaunchPick): void {
+    launcherOpen = false;
+    agentDefault = { agent: pick.agent };
+    setAgentDefault(agentDefault);
+    void spawnSession("agent", pick);
+  }
+
+  /** Install flow: a fresh terminal with the install command PRE-TYPED —
+   *  never executed; the user reviews and presses Enter themselves. The
+   *  short delay lets the shell paint its prompt first, so the command
+   *  appears typed AT the prompt instead of echoing ahead of it. */
+  function launcherInstall(a: AgentInfo): void {
+    launcherOpen = false;
+    void spawnSession("shell").then((s) => {
+      if (s === null || a.install === "") return;
+      setTimeout(() => typeIntoSession(s.id, a.install), 400);
+    });
+  }
+
+  // --- the rail's Recents section ---
+
+  /** Reload the workspace's ended agent conversations. `follow` schedules a
+   *  second fetch: a killed agent retires into recents on the daemon's ~2s
+   *  watch tick, after the session already vanished from the snapshot. */
+  function refreshRecents(follow = false): void {
+    const ws = activeWsId;
+    if (ws === null) {
+      recents = [];
+      return;
+    }
+    listRecents(ws)
+      .then((r) => {
+        if (activeWsId === ws) recents = r;
+      })
+      .catch(() => {
+        // rail stays on its last list; the next snapshot retries
+      });
+    if (follow) {
+      if (recentsTimer !== null) clearTimeout(recentsTimer);
+      recentsTimer = setTimeout(() => {
+        recentsTimer = null;
+        refreshRecents();
+      }, 2600);
+    }
+  }
+
+  $effect(() => {
+    void activeWsId;
+    recentsExpanded = false;
+    refreshRecents();
+  });
+
+  /** A Recents row: resume when the CLI supports it (claude), else an
+   *  honest fresh start of the same agent (the tooltip says which). */
+  function openRecent(r: RecentConvo): void {
+    void spawnSession(
+      "agent",
+      r.resume !== null ? { agent: r.kind, resume: r.resume } : { agent: r.kind },
+    );
+  }
+
+  function recentTooltip(r: RecentConvo): string {
+    return r.resume !== null
+      ? `resume “${r.title}”`
+      : `${r.kind} can't resume a finished conversation yet — starts a fresh one`;
   }
 
   /** Kill the session's process on the daemon and drop it locally. */
@@ -1136,7 +1297,7 @@
                 }
               }}
             >
-              <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
+              <SessionGlyph kind={s.kind} agentKind={s.agent_kind} state={dotState(s)} size={11} />
               <span class="confirm-label">kill session?</span>
               <button class="confirm-kill" use:focusOnMount onclick={() => void killSession(s.id)}>
                 kill
@@ -1162,7 +1323,15 @@
                 }
               }}
             >
-              <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
+              <!-- Session-type glyph carrying the state color — the same
+                   mark as the pane tab (surface parity, rail included). -->
+              <SessionGlyph
+                kind={s.kind}
+                agentKind={s.agent_kind}
+                state={dotState(s)}
+                size={11}
+                title={dotTitle(s)}
+              />
               <span class="labels">
                 <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
                 {#if s.title && s.title !== s.name && s.title !== s.agent_title}
@@ -1181,18 +1350,79 @@
             </div>
           {/if}
         {/each}
-        <button
-          class="row new primary"
-          title="start a Claude agent ({KEYS.newAgent})"
-          onclick={() => void newSession("agent")}>+ new agent</button
-        >
+        <!-- Split button: the main surface spawns the persisted default
+             agent instantly — always. Only the CHEVRON opens the launcher
+             popover (hover ~150ms or click): agents · new or resumed. -->
+        <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
+          <button
+            class="row new primary main"
+            title="start {agentDefault.agent} ({KEYS.newAgent})"
+            onclick={() => {
+              launcherOpen = false;
+              spawnDefaultAgent();
+            }}
+          >
+            <span class="new-label">+ new agent</span>
+            <span class="new-default">{agentDefault.agent}</span>
+          </button>
+          <button
+            class="new-chev"
+            aria-haspopup="menu"
+            aria-expanded={launcherOpen}
+            aria-label="choose agent or resume a conversation"
+            title="agents · resume"
+            onpointerenter={armLauncherHover}
+            onpointerleave={disarmLauncherHover}
+            onclick={() => {
+              if (launcherOpen && Date.now() - launcherOpenedAt > 400) closeLauncher();
+              else openLauncher();
+            }}
+          >
+            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+              <path
+                d="M4 6l4 4 4-4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
         <button
           class="row new"
           title="open a terminal ({KEYS.newTerminal})"
-          onclick={() => void newSession("shell")}>+ terminal</button
+          onclick={newShell}>+ terminal</button
         >
         {#if createError}
           <div class="create-error">{createError}</div>
+        {/if}
+
+        <!-- Recents: ended agent conversations, any agent type, newest
+             first — the daemon remembers them across restarts. Click
+             resumes (claude) or honestly starts fresh (the tooltip says). -->
+        {#if recents.length > 0}
+          <div class="recents">
+            <div class="recents-head">recent</div>
+            <div class="recents-list" class:expanded={recentsExpanded}>
+              {#each recentsExpanded ? recents : recents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
+                <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
+                  <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
+                  <span class="recent-title">{r.title}</span>
+                  <span class="recent-age">{relativeAge(r.lastActive)}</span>
+                </button>
+              {/each}
+            </div>
+            {#if recents.length > 3}
+              <button
+                class="recents-more"
+                onclick={() => (recentsExpanded = !recentsExpanded)}
+              >
+                {recentsExpanded ? "show less" : `all ${recents.length}`}
+              </button>
+            {/if}
+          </div>
         {/if}
       </nav>
 
@@ -1308,10 +1538,16 @@
             title={s.title ?? undefined}
             onclick={() => openSess(s.id)}
           >
-            <span class="dot {dotState(s)}" title={dotTitle(s)}></span>
-            <span class="chip-name"
-              >{s.kind === "shell" ? "$ " : ""}{displayNames.get(s.id) ?? displayName(s)}</span
-            >
+            <!-- The type glyph replaces both the dot and the old "$ "
+                 prefix — same mark as tabs and rail rows (parity). -->
+            <SessionGlyph
+              kind={s.kind}
+              agentKind={s.agent_kind}
+              state={dotState(s)}
+              size={10}
+              title={dotTitle(s)}
+            />
+            <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
           </button>
         {/each}
       </div>
@@ -1322,6 +1558,16 @@
     </footer>
   {/if}
 </div>
+
+{#if launcherOpen && activeWsId !== null && launcherAnchor !== null}
+  <Launcher
+    workspaceId={activeWsId}
+    anchor={launcherAnchor}
+    onPick={launcherPick}
+    onInstall={launcherInstall}
+    onClose={closeLauncher}
+  />
+{/if}
 
 {#if pickerOpen}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
@@ -1605,11 +1851,173 @@
     font-weight: 500;
   }
 
+  /* --- the agent launcher's split button --- */
+
+  .new-split {
+    display: flex;
+    align-items: stretch;
+    gap: 1px;
+    margin-top: 0.15rem;
+  }
+
+  .new-split .row.new.main {
+    flex: 1;
+    min-width: 0;
+    margin-top: 0;
+    gap: 6px;
+  }
+
+  .new-label {
+    flex: none;
+  }
+
+  /* What the main surface will spawn — quiet transparency, not chrome. */
+  .new-default {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
+  .new-chev {
+    appearance: none;
+    border: none;
+    background: none;
+    flex: none;
+    width: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .new-chev:hover,
+  .new-chev[aria-expanded="true"] {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .new-chev:active {
+    background: var(--row-active);
+  }
+
   .create-error {
     padding: 2px 8px 4px;
     font-size: var(--text-xs);
     line-height: 1.35;
     color: var(--err);
+  }
+
+  /* --- Recents: ended agent conversations --- */
+
+  .recents {
+    margin-top: 0.55rem;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .recents-head {
+    flex: none;
+    padding: 4px 8px;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    user-select: none;
+  }
+
+  .recents-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  /* Expanded: a scrollable window, soft edge fade when it overflows. */
+  .recents-list.expanded {
+    max-height: 240px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    mask-image: linear-gradient(to bottom, black calc(100% - 10px), transparent);
+  }
+
+  .recent-row {
+    appearance: none;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.12s ease;
+  }
+
+  .recent-row:hover {
+    background: var(--row-hover);
+  }
+
+  /* History reads quieter than live rows; hover restores full presence. */
+  .recent-row :global(.sglyph) {
+    opacity: 0.7;
+  }
+
+  .recent-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+    transition: color 0.12s ease;
+  }
+
+  .recent-row:hover .recent-title {
+    color: var(--fg);
+  }
+
+  .recent-age {
+    flex: none;
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    opacity: 0.8;
+  }
+
+  .recents-more {
+    appearance: none;
+    border: none;
+    background: none;
+    align-self: flex-start;
+    margin: 1px 0 0;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.12s ease;
+  }
+
+  .recents-more:hover {
+    color: var(--fg);
+    background: var(--row-hover);
   }
 
   /* --- FILES section --- */

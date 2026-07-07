@@ -440,7 +440,11 @@ export function setDragging(v: boolean): void {
 export function syncSessions(liveIds: readonly string[]): void {
   const live = new Set(liveIds);
   for (const entry of [...pool.values()]) {
-    if (!live.has(entry.id)) disposeEntry(entry);
+    // A visible terminal outlives its session: a fast-dying agent's pane
+    // must keep showing the process's last words (the missing-API-key
+    // message IS the product here). Disposal happens once the tab closes
+    // and the instance parks (or on LRU eviction).
+    if (!live.has(entry.id) && !isVisible(entry)) disposeEntry(entry);
   }
 }
 

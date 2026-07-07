@@ -449,12 +449,22 @@ dismisses it.
 
 **The agent launcher (author request, 2026-07-06).** "+ new agent" is a split button: the
 main surface spawns your **default config instantly** (default = latest chosen, persisted);
-hover (~150 ms) or the chevron opens the launcher popover:
+**the popover opens ONLY from the chevron** (hover ~150 ms on the chevron itself, or click
+it) — field feedback 2026-07-06: hover-anywhere-on-the-button opening the menu is intrusive;
+the main surface must stay a pure instant-spawn target. The popover itself is held to the
+full polish inventory (field verdict on the first cut: "looks a bit cheap and unintuitive" —
+it is a first-class surface, not a utility menu: proper section rhythm, glyph alignment,
+hover/highlight states, and the install/resume rows designed, not listed). Non-claude spawn
+paths (codex, gemini) must be verified against the real installed binaries — the first cut's
+codex launch did not work in the field.
 
 - **Agent rows** — Claude Code, Codex, Gemini CLI…: the daemon detects what's installed
   (login-shell `command -v` per known binary, cached; version probed). Installed agents are
-  selectable with a **model** picker (curated per-agent list — e.g. opus/sonnet/haiku via
-  `--model`); selecting spawns and becomes the new default.
+  selectable; selecting spawns a NEW conversation and becomes the new default. **No model
+  picker** (author, 2026-07-06: "less interesting… skip that") — models are chosen inside
+  each agent's own TUI when it matters; the launcher's whole question is *which agent, new
+  or resumed*. (The server may keep model/resume params on POST /sessions — harmless API
+  surface — but the launcher UI shows agents and conversations only.)
 - **Uninstalled agents stay visible but muted, with an install action** — which opens a new
   terminal session in the workspace with the install command **pre-typed, not executed**
   (transparent, user presses Enter; our own terminals are the install UI).
@@ -462,11 +472,52 @@ hover (~150 ms) or the chevron opens the launcher popover:
   the same `~/.claude/projects` JSONL store the naming pipeline reads): title, age; selecting
   spawns `claude --resume <id>` in a PTY. Searchable past ~8 entries.
 
+- **Rail Recents (author, 2026-07-06):** a quiet section under the session list showing the
+  workspace's recently-ended agent conversations — **across agent types** — last 3 visible,
+  expandable to a scrollable list. Backed by daemon-persisted per-workspace agent history
+  (kind, last title, resume handle when one exists, last-active), recorded whenever an agent
+  session ends. Rows: type glyph + title + relative age. Click resumes when the agent
+  supports it (claude `--resume <id>`; codex/gemini native resume verified against the real
+  binaries — if an agent can't resume, the row starts a fresh conversation with an honest
+  tooltip). Live sessions never appear in Recents; resuming one moves it out.
+
 Server surface: `GET /api/v1/agents` (installed/version/models/install-hint per agent),
-`GET /api/v1/agents/claude/sessions?workspace_id=` (resumables), and POST /sessions gains
-`agent`, `model`, `resume`. Non-claude agents start as plain TUI sessions (hook-driven
-attention states are claude-only until their integrations land; the UI shows their state as
-the muted unknown dot, honestly).
+`GET /api/v1/agents/claude/sessions?workspace_id=` (resumables),
+`GET /api/v1/recents?workspace_id=` (ended conversations, live ones filtered out), and
+POST /sessions gains `agent`, `model`, `resume`. Non-claude agents start as plain TUI
+sessions (hook-driven attention states are claude-only until their integrations land; the UI
+shows their state as the muted unknown dot, honestly).
+
+Launcher field notes (2026-07-06, shipped with the build):
+- **"Codex does not work" root cause:** legacy codex-cli (0.1.x, npm-era) requires
+  `OPENAI_API_KEY` in the environment and exits ~1 within ~400ms without it — and the
+  daemon's environment never sourced the user's shell profile, so even an exported key
+  wouldn't reach it. Two structural fixes, both general:
+  1. **Agent sessions spawn through the user's login shell** —
+     `$SHELL -lc 'exec "$0" "$@"' <bin> <args…>` (`exec $argv` for fish). Terminal parity
+     is the product promise (VS Code's integrated terminal model): nvm PATHs, exported
+     keys, profile env all reach the TUI. `exec` keeps the agent as the PTY's direct child.
+  2. **Last words:** when a session's child exits, the manager snapshots the final screen
+     (escape stream + exit status) into a bounded buffer (2MB, oldest evicted) BEFORE
+     unregistering. A client attaching to an already-dead session gets ready →
+     final-screen replay → `exited` instead of a blank pane; the pooled client terminal
+     for a visible tab is likewise not disposed while on screen. A fast agent failure now
+     reads as what it is ("Missing OpenAI API key. Set the environment variable…").
+  The modern Rust codex CLI has `codex login` (OAuth); the legacy one is API-key only —
+  the launcher's pre-typed install command upgrades it.
+- **Recents vs `--resume` identity:** claude forks a NEW session id on every resume. Agent
+  records carry `resumed_from`; the live-exclusion set matches either identity, and when a
+  resumed session ends it *supersedes* its ancestor's recents entry (one conversation, one
+  row, resumable via the newest id). Untitled claude boots never enter recents (nothing
+  recognizable); untitled codex/gemini do (they have no title machinery yet — their rows
+  are the only history there is).
+- No model picker (author: "less interesting, skip") — launcher = which agent, new or
+  resumed. `--model` stays a server capability on POST /sessions.
+- Popover opens from the CHEVRON only (hover ~150ms or click); the main surface is a pure
+  instant spawn of the persisted default agent.
+- Dev-loop nicety: the vite dev server exposes `~/.chimaera/manifest.json` at
+  `/dev/manifest` (dev-only middleware, never in a build) so the dev page can self-auth
+  without hand-copying tokens.
 
 **Triage dashboard (Leader-d).** Groups top to bottom: **Needs you** (needs_permission +
 idle_prompt + errored), sorted longest-blocked first, rows "ripen" (border saturates with

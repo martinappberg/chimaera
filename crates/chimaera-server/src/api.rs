@@ -88,8 +88,8 @@ pub(crate) async fn create_workspace(
 }
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
-/// `agent_state`, `agent_title`, `files_touched`, `display_name` and
-/// `cwd_current` fields.
+/// `agent_kind`, `agent_state`, `agent_title`, `files_touched`,
+/// `display_name` and `cwd_current` fields.
 /// `agent` is the wrapper record for kind "agent" sessions; `None` means a
 /// plain shell. `polled` / `polled_cwd` are the shell naming watcher's
 /// latest values, if any; `cwd_current` falls back to the spawn cwd (agents,
@@ -116,6 +116,12 @@ pub(crate) fn session_json(
     map.insert(
         "kind".to_string(),
         json!(if agent.is_some() { "agent" } else { "shell" }),
+    );
+    // Which agent CLI the session runs ("claude"/"codex"/"gemini") so the
+    // UI can glyph rows per agent; null for shells.
+    map.insert(
+        "agent_kind".to_string(),
+        agent.map_or(serde_json::Value::Null, |a| json!(a.kind.as_str())),
     );
     map.insert(
         "agent_state".to_string(),
@@ -189,6 +195,17 @@ pub(crate) struct CreateSession {
     name: Option<String>,
     #[serde(default)]
     kind: SessionKind,
+    /// Which agent CLI a kind "agent" session runs; "claude" when omitted.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Model id passed as `--model <id>` (curated list per agent from
+    /// GET /api/v1/agents); the agent's own default when omitted.
+    #[serde(default)]
+    model: Option<String>,
+    /// Claude session id to resume (`--resume <id>`, claude-only), from
+    /// GET /api/v1/agents/claude/sessions.
+    #[serde(default)]
+    resume: Option<String>,
     /// Initial PTY size, clamped to sane bounds. The UI passes the focused
     /// pane's fitted size so TUIs never boot at a wrong size (claude's boot
     /// banner rendered at 80x24 then reflowed was a real observed artifact).
@@ -198,9 +215,11 @@ pub(crate) struct CreateSession {
     rows: Option<u16>,
 }
 
-/// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or the
-/// interactive claude TUI with injected hooks (kind "agent") at the
-/// workspace root.
+/// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or an
+/// agent TUI (kind "agent") at the workspace root. Claude agents get the
+/// injected hook settings (and `--model`/`--resume` when given); codex and
+/// gemini spawn their TUIs as plain PTY sessions — hook-driven attention
+/// state stays claude-only until their integrations land.
 pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
@@ -213,6 +232,9 @@ pub(crate) async fn create_session(
             .into_response();
     };
 
+    let bad_request =
+        |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+
     let mut opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         name: body.name,
@@ -222,49 +244,91 @@ pub(crate) async fn create_session(
         id: None,
     };
 
-    // Agent sessions: resolve claude (once per daemon, via the login shell),
-    // pre-pick the session id so the hook URL can embed it, and generate the
-    // per-session settings file that wires claude's hooks to this daemon.
-    let mut agent_key = None;
+    // Agent sessions: resolve the agent binary (cached, via the login
+    // shell), pre-pick the session id so the hook URL can embed it, and —
+    // for claude — generate the per-session settings file that wires its
+    // hooks to this daemon.
+    let mut spawned_agent = None;
     if body.kind == SessionKind::Agent {
-        let claude = state
-            .claude_bin
-            .get_or_init(crate::agents::resolve_claude)
-            .await;
-        let claude = match claude {
-            Ok(path) => path.clone(),
+        let agent_kind = match &body.agent {
+            None => crate::agents::AgentKind::Claude,
+            Some(name) => match crate::agents::AgentKind::parse(name) {
+                Some(kind) => kind,
+                None => {
+                    return bad_request(format!(
+                        "unknown agent {name:?} (expected claude, codex or gemini)"
+                    ));
+                }
+            },
+        };
+        if body.resume.is_some() && agent_kind != crate::agents::AgentKind::Claude {
+            return bad_request("resume is only supported for claude sessions".to_string());
+        }
+        // Argv cannot shell-inject, but flag-shaped or control-byte values
+        // have no business in --model/--resume.
+        for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
+            if let Some(value) = value {
+                if !crate::launcher::safe_arg(value) {
+                    return bad_request(format!("invalid {field} {value:?}"));
+                }
+            }
+        }
+
+        let bin = match crate::launcher::detect(&state, agent_kind, false)
+            .await
+            .path
+        {
+            Ok(path) => path,
             Err(msg) => {
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
         };
         let id = crate::agents::fresh_session_id();
         let key = crate::agents::fresh_agent_key();
-        let settings = match crate::agents::write_settings(&id, &key, state.port) {
-            Ok(path) => path,
-            Err(err) => {
-                tracing::error!(%err, "failed to write agent settings");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": err.to_string()})),
-                )
-                    .into_response();
+        // Hook injection is claude-only: other agents have no hook system
+        // to wire, so their sessions stay honestly "unknown".
+        let settings = if agent_kind == crate::agents::AgentKind::Claude {
+            match crate::agents::write_settings(&id, &key, state.port) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    tracing::error!(%err, "failed to write agent settings");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": err.to_string()})),
+                    )
+                        .into_response();
+                }
             }
+        } else {
+            None
         };
-        opts.command = Some(vec![
-            claude.to_string_lossy().into_owned(),
-            "--settings".to_string(),
-            settings.to_string_lossy().into_owned(),
-        ]);
+        // Login-shell wrap: agents must see the user's terminal environment
+        // (exported API keys, nvm PATHs) — the daemon's own env never
+        // sourced their profile.
+        opts.command = Some(crate::launcher::wrap_login_shell(
+            &crate::launcher::login_shell(),
+            crate::launcher::build_agent_command(
+                agent_kind,
+                &bin,
+                settings.as_deref(),
+                body.model.as_deref(),
+                body.resume.as_deref(),
+            ),
+        ));
         opts.id = Some(id.clone());
         // Register the record before spawning so no hook can beat it in.
-        crate::lock(&state.agents).insert(id, crate::agents::AgentRecord::new(key.clone()));
-        agent_key = Some(key);
+        let mut record = crate::agents::AgentRecord::new(key.clone(), agent_kind);
+        // Claude forks a new session id on --resume; remember the ancestor
+        // so recents can hide (and later supersede) the old conversation.
+        record.resumed_from = body.resume.clone();
+        crate::lock(&state.agents).insert(id, record);
+        spawned_agent = Some((key, agent_kind));
     }
 
     match state.sessions.spawn(opts.clone()) {
         Ok(info) => {
             crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
-            let agent = agent_key.map(crate::agents::AgentRecord::new);
+            let agent = spawned_agent.map(|(key, kind)| crate::agents::AgentRecord::new(key, kind));
             let mut polled = None;
             if agent.is_some() {
                 crate::agents::spawn_agent_watch(state.clone(), info.id.clone());

@@ -13,6 +13,7 @@
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "./sessions";
   import { dotState, dotTitle } from "./sessions";
+  import SessionGlyph from "./SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { basename, midTruncate } from "./files";
   import { dirtyFiles } from "./editing";
@@ -172,17 +173,14 @@
       >
         {#if tab.surface === "terminal"}
           {@const s = sessions.get(tab.sessionId)}
-          <svg class="glyph {s ? dotState(s) : ''}" viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-            <title>{s ? dotTitle(s) : "terminal"}</title>
-            <path
-              d="M3 4.5L6.5 8 3 11.5M8.5 12h4.5"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
+          <!-- Session-type glyph (agent_kind-driven) carrying the state color. -->
+          <SessionGlyph
+            kind={s?.kind ?? "shell"}
+            agentKind={s?.agent_kind}
+            state={s ? dotState(s) : ""}
+            size={10}
+            title={s ? dotTitle(s) : "terminal"}
+          />
         {:else if $dirtyFiles.has(tab.path)}
           <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
           <span class="dirty-dot" title="unsaved changes"></span>
@@ -386,42 +384,8 @@
     min-width: 8px;
   }
 
-  /* Type glyph, shared slot for both surfaces; a terminal's glyph carries
-     its session-state color (same palette as the rail dots). */
-  .glyph {
-    flex: none;
-    color: var(--muted);
-    opacity: 0.8;
-  }
-
-  .glyph.alive {
-    color: var(--accent);
-    opacity: 1;
-  }
-
-  .glyph.attn {
-    color: var(--warn);
-    opacity: 1;
-  }
-
-  .glyph.err {
-    color: var(--err);
-    opacity: 1;
-  }
-
-  .glyph.rate {
-    color: var(--rate);
-    opacity: 1;
-  }
-
-  .glyph.done {
-    color: var(--fg);
-    opacity: 0.6;
-  }
-
-  .glyph.starting {
-    opacity: 0.9;
-  }
+  /* The terminal type glyph moved into SessionGlyph (shared with quick-open
+     and the launcher); its state palette lives there too. */
 
   /* File type glyph slot; quiet by default, lifts to full strength on the
      active tab (parity with the weight-based active emphasis). */

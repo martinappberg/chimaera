@@ -370,3 +370,34 @@ async fn multi_attach_fans_out_output() {
     mgr.kill(&info.id).expect("kill failed");
     wait_gone(&mgr, &info.id).await;
 }
+
+/// (f) A session that dies fast still leaves a readable final screen: the
+/// manager remembers its last words (info + snapshot) after unregistration,
+/// so a client attaching just too late sees what happened, not a blank pane.
+#[tokio::test]
+async fn fast_death_leaves_readable_last_words() {
+    let mgr = SessionManager::new();
+    let info = mgr
+        .spawn(opts(Some(vec![
+            "/bin/bash".to_string(),
+            "--norc".to_string(),
+            "--noprofile".to_string(),
+            "-c".to_string(),
+            "echo doomed; exit 3".to_string(),
+        ])))
+        .expect("spawn failed");
+
+    wait_gone(&mgr, &info.id).await;
+
+    let words = mgr.last_words(&info.id).expect("last words remembered");
+    assert!(!words.info.alive);
+    assert_eq!(words.info.exit_status, Some(3));
+    let term = replay_snapshot(&words.snapshot, words.info.cols, words.info.rows);
+    let text = visible_text(&term).join("\n");
+    assert!(
+        text.contains("doomed"),
+        "final screen missing output: {text:?}"
+    );
+
+    assert!(mgr.last_words("s-never-existed").is_none());
+}

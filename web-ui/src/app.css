@@ -125,50 +125,8 @@ body {
   height: 100vh;
 }
 
-/* Session state dots, shared by the rail, pane tabs, and the session strip
-   (global because the pool and several components render them). */
-.dot {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  opacity: 0.55;
-}
-
-.dot.alive {
-  background: var(--accent);
-  opacity: 1;
-}
-
-.dot.attn {
-  background: var(--warn);
-  opacity: 1;
-}
-
-.dot.err {
-  background: var(--err);
-  opacity: 1;
-}
-
-.dot.rate {
-  background: var(--rate);
-  opacity: 1;
-}
-
-/* finished: filled, full-strength muted — clearly "done", not "dead". */
-.dot.done {
-  background: var(--fg);
-  opacity: 0.6;
-}
-
-/* starting (agent_state unknown on a live process): hollow ring, visibly
-   provisional — distinct from finished (filled) and dead (dim fill). */
-.dot.starting {
-  background: transparent;
-  border: 1.5px solid var(--muted);
-  opacity: 0.9;
-}
+/* Session state is carried by the type glyphs now (SessionGlyph, shared by
+   the rail, pane tabs, and the session strip) — the old state dots are gone. */
 
 /* Pooled terminal slots are created outside any component (termPool.ts) and
    reparented between pane containers, so their chrome lives here. The pane

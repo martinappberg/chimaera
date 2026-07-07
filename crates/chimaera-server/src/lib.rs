@@ -2,8 +2,10 @@ mod agents;
 mod api;
 mod assets;
 mod fs;
+mod launcher;
 mod naming;
 mod quickopen;
+mod recents;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -38,6 +40,9 @@ pub(crate) struct AppState {
     /// Per-window view state (layout trees etc.), persisted to
     /// `view-state.json` on change.
     pub(crate) view_state: Mutex<view_state::ViewStateStore>,
+    /// Ended agent conversations per workspace (the rail's Recents section),
+    /// persisted to `recents.json` on change.
+    pub(crate) recents: Mutex<recents::RecentsStore>,
     /// Owner of all PTY sessions; outlives any client connection.
     pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
     /// session id -> workspace id.
@@ -58,8 +63,13 @@ pub(crate) struct AppState {
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
-    /// `claude` binary resolved once per daemon via the login shell.
-    pub(crate) claude_bin: tokio::sync::OnceCell<Result<PathBuf, String>>,
+    /// Agent binaries resolved via the login shell (with `--version`),
+    /// cached per agent for the daemon's lifetime;
+    /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
+    pub(crate) agent_bins: Mutex<HashMap<agents::AgentKind, launcher::AgentDetection>>,
+    /// Root of Claude Code's per-project transcript store, normally
+    /// `~/.claude/projects`; tests point it at a fixture dir.
+    pub(crate) claude_projects_dir: PathBuf,
 }
 
 impl AppState {
@@ -82,6 +92,7 @@ impl AppState {
             view_state: Mutex::new(view_state::ViewStateStore::load(
                 data_dir.join("view-state.json"),
             )),
+            recents: Mutex::new(recents::RecentsStore::load(data_dir.join("recents.json"))),
             sessions: chimaera_pty::SessionManager::new(),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
@@ -90,7 +101,12 @@ impl AppState {
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
-            claude_bin: tokio::sync::OnceCell::new(),
+            agent_bins: Mutex::new(HashMap::new()),
+            claude_projects_dir: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".claude")
+                .join("projects"),
         }
     }
 }
@@ -116,6 +132,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             get(api::list_sessions).post(api::create_session),
         )
         .route("/sessions/{id}", delete(api::delete_session))
+        .route("/agents", get(launcher::list_agents))
+        .route("/agents/claude/sessions", get(launcher::claude_resumables))
+        .route("/recents", get(recents::list_recents))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),
@@ -272,6 +291,21 @@ mod tests {
             port,
             data_dir,
         ))
+    }
+
+    /// Test state with the Claude transcript store pointed at a fixture dir
+    /// (equivalent to pointing HOME at a temp dir, without the global
+    /// env-var mutation that races across parallel tests).
+    fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
+        let mut state = AppState::new(
+            "test-token".to_string(),
+            "testhost".to_string(),
+            4242,
+            0,
+            test_dir("data"),
+        );
+        state.claude_projects_dir = store;
+        Arc::new(state)
     }
 
     async fn request(
@@ -648,6 +682,80 @@ mod tests {
         state.sessions.kill(&info.id).ok();
     }
 
+    /// Attaching to a session that already died replays its final screen
+    /// (last words) and closes as exited — never a blank pane. This is the
+    /// fast-agent-failure path: codex without OPENAI_API_KEY printed its
+    /// error and exited before the client's tab could connect.
+    #[tokio::test]
+    async fn ws_attach_to_dead_session_replays_last_words() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir("ws-dead-cwd"),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/bash".to_string(),
+                    "--norc".to_string(),
+                    "--noprofile".to_string(),
+                    "-c".to_string(),
+                    "echo Missing API key; exit 1".to_string(),
+                ]),
+                id: None,
+            })
+            .expect("spawn session");
+
+        // Wait for the fast death to unregister the session.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.sessions.get(&info.id).is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "session never died");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/sessions/{}", info.id);
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // ready (alive: false) -> final-screen binary -> exited, then close.
+        let ready = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected ready text frame, got {other:?}"),
+        };
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["alive"], false);
+        let snapshot = match next_ws_frame(&mut socket).await {
+            WsMessage::Binary(bytes) => bytes,
+            other => panic!("expected last-words binary frame, got {other:?}"),
+        };
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("Missing API key"),
+            "final screen missing the process's output"
+        );
+        let exited = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected exited text frame, got {other:?}"),
+        };
+        assert_eq!(exited["type"], "exited");
+        assert_eq!(exited["status"], 1);
+    }
+
     #[tokio::test]
     async fn ws_bad_token_is_rejected() {
         use futures::{SinkExt, StreamExt};
@@ -699,8 +807,29 @@ mod tests {
                 id: None,
             })
             .expect("spawn session");
-        lock(&state.agents).insert(info.id.clone(), agents::AgentRecord::new(key.to_string()));
+        lock(&state.agents).insert(
+            info.id.clone(),
+            agents::AgentRecord::new(key.to_string(), agents::AgentKind::Claude),
+        );
         info.id
+    }
+
+    /// Preset the launcher's detection cache for one agent, so tests never
+    /// hit the real login shell (the same isolation idea as
+    /// `test_state_with_data_dir`: no global env mutation).
+    fn preset_agent(
+        state: &Arc<AppState>,
+        kind: agents::AgentKind,
+        path: Result<PathBuf, String>,
+        version: Option<&str>,
+    ) {
+        lock(&state.agent_bins).insert(
+            kind,
+            launcher::AgentDetection {
+                path,
+                version: version.map(str::to_string),
+            },
+        );
     }
 
     /// The session entry for `id` from GET /api/v1/sessions.
@@ -738,6 +867,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(session["kind"], "shell");
+        assert_eq!(session["agent_kind"], serde_json::Value::Null);
         assert_eq!(session["agent_state"], serde_json::Value::Null);
         assert_eq!(session["agent_title"], serde_json::Value::Null);
         assert_eq!(session["files_touched"], serde_json::Value::Null);
@@ -771,10 +901,12 @@ mod tests {
     #[tokio::test]
     async fn create_agent_without_claude_is_409_with_hint() {
         let state = test_state();
-        state
-            .claude_bin
-            .set(Err("claude not found via login shell (test)".to_string()))
-            .expect("preset claude_bin");
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Err("claude not found via login shell (test)".to_string()),
+            None,
+        );
         let root = test_dir("agent-409");
         let (_, ws) = request(
             &state,
@@ -799,10 +931,12 @@ mod tests {
         let state = test_state_with_port(45678);
         // A stand-in "claude": exits immediately, but exercises the whole
         // spawn path (settings generation, id pre-pick, record registration).
-        state
-            .claude_bin
-            .set(Ok(PathBuf::from("/bin/echo")))
-            .expect("preset claude_bin");
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(PathBuf::from("/bin/echo")),
+            None,
+        );
         let root = test_dir("agent-spawn");
         let (_, ws) = request(
             &state,
@@ -820,6 +954,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(session["kind"], "agent");
+        assert_eq!(session["agent_kind"], "claude");
         assert_eq!(session["agent_state"], "unknown");
         assert_eq!(session["agent_title"], serde_json::Value::Null);
         let id = session["id"].as_str().unwrap().to_string();
@@ -843,6 +978,610 @@ mod tests {
             format!("http://127.0.0.1:45678/api/v1/agent-events/{id}?key={key}")
         );
         std::fs::remove_file(&settings_path).ok();
+    }
+
+    #[tokio::test]
+    async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
+        let state = test_state();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(PathBuf::from("/bin/echo")),
+            Some("2.1.196 (Claude Code)"),
+        );
+        preset_agent(
+            &state,
+            agents::AgentKind::Codex,
+            Err("codex not found (test)".to_string()),
+            None,
+        );
+        preset_agent(
+            &state,
+            agents::AgentKind::Gemini,
+            Err("gemini not found (test)".to_string()),
+            None,
+        );
+
+        let (status, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["claude", "codex", "gemini"]);
+
+        // Installed: path + version present, curated models, install hint.
+        let claude = &list[0];
+        assert_eq!(claude["name"], "Claude Code");
+        assert_eq!(claude["installed"], true);
+        assert_eq!(claude["path"], "/bin/echo");
+        assert_eq!(claude["version"], "2.1.196 (Claude Code)");
+        assert_eq!(
+            claude["models"],
+            serde_json::json!([
+                {"id": "opus", "label": "Opus"},
+                {"id": "sonnet", "label": "Sonnet"},
+                {"id": "haiku", "label": "Haiku"},
+            ])
+        );
+        assert!(claude["install"]["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("curl "));
+        assert!(claude["install"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://"));
+
+        // Not installed: muted row material — no path/version, but the
+        // model list and the install action are still there.
+        for (entry, npm) in [
+            (&list[1], "npm install -g @openai/codex"),
+            (&list[2], "npm install -g @google/gemini-cli"),
+        ] {
+            assert_eq!(entry["installed"], false);
+            let obj = entry.as_object().unwrap();
+            assert!(!obj.contains_key("path"), "{entry}");
+            assert!(!obj.contains_key("version"), "{entry}");
+            assert!(!entry["models"].as_array().unwrap().is_empty());
+            assert_eq!(entry["install"]["command"], npm);
+            assert!(entry["install"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://"));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_launcher_endpoints_without_token_are_401() {
+        for uri in [
+            "/api/v1/agents",
+            "/api/v1/agents?refresh=true",
+            "/api/v1/agents/claude/sessions?workspace_id=w-x",
+            "/api/v1/recents?workspace_id=w-x",
+        ] {
+            let res = app(test_state())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_codex_agent_is_plain_tui_with_agent_kind() {
+        let state = test_state();
+        preset_agent(
+            &state,
+            agents::AgentKind::Codex,
+            Ok(PathBuf::from("/bin/echo")),
+            None,
+        );
+        let root = test_dir("codex-spawn");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": ws["id"], "kind": "agent",
+                "agent": "codex", "model": "o4-mini",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["kind"], "agent");
+        assert_eq!(session["agent_kind"], "codex");
+        // Hook-driven state is claude-only: codex reads as the honest
+        // unknown dot, named after its binary until an OSC title lands.
+        assert_eq!(session["agent_state"], "unknown");
+        assert_eq!(session["display_name"], "codex");
+        // No hook settings file was generated (hooks are claude-only).
+        let id = session["id"].as_str().unwrap();
+        let settings_path = chimaera_core::runtime_dir()
+            .join("agents")
+            .join(format!("{id}-settings.json"));
+        assert!(!settings_path.exists(), "codex must not get hook settings");
+    }
+
+    /// Register a workspace and return its id.
+    async fn make_workspace(state: &Arc<AppState>, label: &str) -> String {
+        let root = test_dir(label);
+        let (status, ws) = request(
+            state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ws}");
+        ws["id"].as_str().unwrap().to_string()
+    }
+
+    /// Plant a dead-session-to-be agent record: the maps hold what the watch
+    /// loop would see at the death tick (no live PTY needed — retire never
+    /// touches the session manager).
+    fn plant_agent_record(
+        state: &Arc<AppState>,
+        session_id: &str,
+        workspace_id: &str,
+        kind: agents::AgentKind,
+        ai_title: Option<&str>,
+        transcript: Option<&str>,
+    ) {
+        let mut record = agents::AgentRecord::new("k".to_string(), kind);
+        record.ai_title = ai_title.map(str::to_string);
+        record.transcript_path = transcript.map(PathBuf::from);
+        lock(&state.agents).insert(session_id.to_string(), record);
+        lock(&state.session_workspaces).insert(session_id.to_string(), workspace_id.to_string());
+    }
+
+    async fn recents_of(state: &Arc<AppState>, workspace_id: &str) -> Vec<serde_json::Value> {
+        let (status, body) = request(
+            state,
+            Method::GET,
+            &format!("/api/v1/recents?workspace_id={workspace_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn recents_retire_round_trips_and_persists() {
+        let data_dir = test_dir("recents");
+        let state = test_state_with_data_dir(0, data_dir.clone());
+        let ws = make_workspace(&state, "recents-root").await;
+        plant_agent_record(
+            &state,
+            "s-1",
+            &ws,
+            agents::AgentKind::Claude,
+            Some("fix the flaky test"),
+            Some("/tmp/store/proj/abc-123.jsonl"),
+        );
+
+        recents::retire(&state, "s-1", None, None);
+
+        let entries = recents_of(&state, &ws).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["kind"], "claude");
+        assert_eq!(entries[0]["title"], "fix the flaky test");
+        assert_eq!(entries[0]["resume"], "abc-123");
+        assert!(entries[0]["last_active"].as_u64().unwrap() > 0);
+        // The record and its workspace mapping are gone (retire IS the
+        // cleanup path).
+        assert!(lock(&state.agents).get("s-1").is_none());
+        assert!(lock(&state.session_workspaces).get("s-1").is_none());
+
+        // Daemon restart: a fresh state over the same data dir still has it.
+        let reloaded = test_state_with_data_dir(0, data_dir);
+        // Same workspace registry file, so the id resolves.
+        let entries = recents_of(&reloaded, &ws).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["resume"], "abc-123");
+    }
+
+    #[tokio::test]
+    async fn recents_skip_untitled_claude_keep_codex_and_pins_win() {
+        let state = test_state();
+        let ws = make_workspace(&state, "recents-mixed").await;
+
+        // Claude empty boot: fallback name, no transcript — not a memory.
+        plant_agent_record(
+            &state,
+            "s-empty",
+            &ws,
+            agents::AgentKind::Claude,
+            None,
+            None,
+        );
+        recents::retire(&state, "s-empty", None, None);
+        assert!(recents_of(&state, &ws).await.is_empty());
+
+        // Codex has no title machinery: its bare-name row still counts.
+        plant_agent_record(&state, "s-cdx", &ws, agents::AgentKind::Codex, None, None);
+        recents::retire(&state, "s-cdx", None, None);
+
+        // A user-renamed claude keeps its pinned name, and an OSC title
+        // beats the ai title (same precedence as live display names).
+        plant_agent_record(&state, "s-pin", &ws, agents::AgentKind::Claude, None, None);
+        recents::retire(&state, "s-pin", Some("bio-evolve run"), None);
+
+        let entries = recents_of(&state, &ws).await;
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["title"], "bio-evolve run"); // newest first
+        assert_eq!(entries[0]["kind"], "claude");
+        assert_eq!(entries[0]["resume"], serde_json::Value::Null);
+        assert_eq!(entries[1]["kind"], "codex");
+        assert_eq!(entries[1]["title"], "codex");
+    }
+
+    #[tokio::test]
+    async fn recents_hide_live_conversations_and_dedupe_resumes() {
+        let state = test_state();
+        let ws = make_workspace(&state, "recents-live").await;
+
+        plant_agent_record(
+            &state,
+            "s-a",
+            &ws,
+            agents::AgentKind::Claude,
+            Some("hooks online"),
+            Some("/tmp/store/proj/conv-9.jsonl"),
+        );
+        recents::retire(&state, "s-a", None, None);
+        assert_eq!(recents_of(&state, &ws).await.len(), 1);
+
+        // The same conversation resumed in a live session: hidden, not lost.
+        plant_agent_record(
+            &state,
+            "s-b",
+            &ws,
+            agents::AgentKind::Claude,
+            Some("hooks online"),
+            Some("/tmp/store/proj/conv-9.jsonl"),
+        );
+        assert!(recents_of(&state, &ws).await.is_empty());
+
+        // It ends again with a newer title: back in the list, still one entry.
+        crate::lock(&state.agents).get_mut("s-b").unwrap().ai_title =
+            Some("hooks online v2".to_string());
+        recents::retire(&state, "s-b", None, None);
+        let entries = recents_of(&state, &ws).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["title"], "hooks online v2");
+
+        // Resumed live again: claude forks a NEW session id on --resume, so
+        // until hooks report the new transcript the live record knows only
+        // what it resumed from — that alone must hide the ancestor entry.
+        plant_agent_record(&state, "s-c", &ws, agents::AgentKind::Claude, None, None);
+        lock(&state.agents).get_mut("s-c").unwrap().resumed_from = Some("conv-9".to_string());
+        assert!(
+            recents_of(&state, &ws).await.is_empty(),
+            "resumed_from must hide the ancestor entry"
+        );
+
+        // It ends under its new id: the ancestor entry is superseded by the
+        // continuation — one entry, newest title, resumable via the NEW id.
+        {
+            let mut agents_map = lock(&state.agents);
+            let record = agents_map.get_mut("s-c").unwrap();
+            record.ai_title = Some("hooks online v3".to_string());
+            record.transcript_path = Some(PathBuf::from("/tmp/store/proj/conv-10.jsonl"));
+        }
+        recents::retire(&state, "s-c", None, None);
+        let entries = recents_of(&state, &ws).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["title"], "hooks online v3");
+        assert_eq!(entries[0]["resume"], "conv-10");
+    }
+
+    #[tokio::test]
+    async fn recents_unknown_workspace_is_404() {
+        let (status, body) = request(
+            &test_state(),
+            Method::GET,
+            "/api/v1/recents?workspace_id=w-nope",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    #[tokio::test]
+    async fn create_agent_validates_agent_model_and_resume() {
+        let state = test_state();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(PathBuf::from("/bin/echo")),
+            None,
+        );
+        preset_agent(
+            &state,
+            agents::AgentKind::Codex,
+            Err("codex not found via login shell (test)".to_string()),
+            None,
+        );
+        let root = test_dir("agent-validate");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let sessions_body = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"workspace_id": ws["id"], "kind": "agent"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+
+        // Unknown agent id: 400.
+        let (status, err) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(sessions_body(serde_json::json!({"agent": "cursor"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("unknown agent"));
+
+        // Resume is claude-only: 400 for codex, before any binary lookup.
+        let (status, err) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(sessions_body(
+                serde_json::json!({"agent": "codex", "resume": "abc"}),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("resume"));
+
+        // Flag-shaped model/resume values: 400, never argv.
+        for field in ["model", "resume"] {
+            let (status, err) = request(
+                &state,
+                Method::POST,
+                "/api/v1/sessions",
+                Some(sessions_body(
+                    serde_json::json!({field: "--dangerously-skip-permissions"}),
+                )),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+            assert!(
+                err["error"].as_str().unwrap().contains("invalid"),
+                "{field}"
+            );
+        }
+
+        // A not-installed agent is a 409 with its own install hint.
+        let (status, err) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(sessions_body(serde_json::json!({"agent": "codex"}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(err["error"].as_str().unwrap().contains("codex not found"));
+
+        // Valid model + resume for claude spawns (argv is unit-tested in
+        // launcher::tests; the API can't observe the child's argv).
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(sessions_body(serde_json::json!({
+                "model": "opus",
+                "resume": "5e0d64b2-abcd-abcd-abcd-000000000000",
+            }))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        assert_eq!(session["agent_kind"], "claude");
+        let settings_path = chimaera_core::runtime_dir()
+            .join("agents")
+            .join(format!("{}-settings.json", session["id"].as_str().unwrap()));
+        assert!(settings_path.exists(), "claude keeps hook injection");
+        std::fs::remove_file(&settings_path).ok();
+    }
+
+    /// Write one transcript fixture and backdate its mtime.
+    fn write_transcript(dir: &std::path::Path, name: &str, body: &str, secs_ago: u64) {
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, body).unwrap();
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_resumables_titles_order_and_noise() {
+        let store = test_dir("claude-store");
+        let state = test_state_with_claude_store(store.clone());
+        let root = test_dir("resume-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+        // The store dir is keyed by the *canonical* workspace root, encoded
+        // with claude's every-non-alphanumeric-to-dash rule.
+        let project_dir = store.join(launcher::encode_cwd(std::path::Path::new(
+            ws["root"].as_str().unwrap(),
+        )));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Oldest: prompt-only -> truncated first prompt is the title.
+        write_transcript(
+            &project_dir,
+            "aaaa",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"please refactor the entire qc pipeline so the reports land in results/qc and nothing downstream breaks"}}"#,
+                "\n",
+            ),
+            300,
+        );
+        // Middle: ai-title outranks the prompt; user+assistant lines count.
+        write_transcript(
+            &project_dir,
+            "bbbb",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"fix the STAR index"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"on it"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+                "\n",
+                r#"{"type":"ai-title","aiTitle":"Fix the STAR index","sessionId":"bbbb"}"#,
+                "\n",
+            ),
+            200,
+        );
+        // Newest: a rename (custom-title) wins over everything.
+        write_transcript(
+            &project_dir,
+            "cccc",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"align the fastqs"}}"#,
+                "\n",
+                r#"{"type":"ai-title","aiTitle":"Align fastqs","sessionId":"cccc"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"Pinned by hand","sessionId":"cccc"}"#,
+                "\n",
+            ),
+            100,
+        );
+        // Noise: a titleless boot transcript (skipped), a non-jsonl file
+        // and a subdirectory (ignored).
+        write_transcript(
+            &project_dir,
+            "dddd",
+            "{\"type\":\"mode\",\"mode\":\"normal\"}\n",
+            50,
+        );
+        std::fs::write(project_dir.join("notes.txt"), "not a transcript").unwrap();
+        std::fs::create_dir_all(project_dir.join("memory")).unwrap();
+
+        let uri = format!("/api/v1/agents/claude/sessions?workspace_id={workspace_id}");
+        let (status, list) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = list.as_array().unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["cccc", "bbbb", "aaaa"], "newest first, noise skipped");
+
+        assert_eq!(list[0]["title"], "Pinned by hand");
+        assert_eq!(list[0]["approx_messages"], 1);
+        assert_eq!(list[1]["title"], "Fix the STAR index");
+        assert_eq!(list[1]["approx_messages"], 3);
+        let truncated = list[2]["title"].as_str().unwrap();
+        assert!(
+            truncated.starts_with("please refactor the entire qc pipeline"),
+            "{truncated}"
+        );
+        assert!(truncated.ends_with('…'), "{truncated}");
+        assert!(truncated.chars().count() <= 61, "{truncated}");
+        assert_eq!(list[2]["approx_messages"], 1);
+
+        // mtimes are unix seconds matching the backdated fixtures.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (entry, secs_ago) in [(&list[0], 100u64), (&list[1], 200), (&list[2], 300)] {
+            let mtime = entry["mtime"].as_u64().unwrap();
+            let expect = now - secs_ago;
+            assert!(
+                mtime.abs_diff(expect) < 30,
+                "mtime {mtime} not within 30s of {expect}"
+            );
+        }
+
+        // A workspace never used with claude: empty list, not an error.
+        let bare_root = test_dir("resume-bare");
+        let (_, bare) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": bare_root.to_string_lossy()})),
+        )
+        .await;
+        let uri = format!(
+            "/api/v1/agents/claude/sessions?workspace_id={}",
+            bare["id"].as_str().unwrap()
+        );
+        let (status, list) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list, serde_json::json!([]));
+
+        // Unknown workspace: 404.
+        let (status, _) = request(
+            &state,
+            Method::GET,
+            "/api/v1/agents/claude/sessions?workspace_id=w-00000000",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn claude_resumables_cap_at_twenty_newest() {
+        let store = test_dir("claude-store-cap");
+        let state = test_state_with_claude_store(store.clone());
+        let root = test_dir("resume-cap-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let project_dir = store.join(launcher::encode_cwd(std::path::Path::new(
+            ws["root"].as_str().unwrap(),
+        )));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        for i in 0..25u64 {
+            write_transcript(
+                &project_dir,
+                &format!("f{i:02}"),
+                &format!(
+                    "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"prompt {i}\"}}}}\n"
+                ),
+                (i + 1) * 60, // f00 newest .. f24 oldest
+            );
+        }
+
+        let uri = format!(
+            "/api/v1/agents/claude/sessions?workspace_id={}",
+            ws["id"].as_str().unwrap()
+        );
+        let (status, list) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 20, "capped at 20");
+        let ids: Vec<&str> = list.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        let expect: Vec<String> = (0..20).map(|i| format!("f{i:02}")).collect();
+        assert_eq!(ids, expect, "the 20 newest, newest first");
     }
 
     /// POST a synthetic hook payload to the ingest endpoint.

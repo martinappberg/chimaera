@@ -268,6 +268,10 @@ impl Session {
                     }
                     let _ = events_tx.send(SessionEvent::Exited { status });
                     tracing::info!(session = %id, exit_status = ?status, "session exited");
+                    // Give the reader thread a beat to drain the PTY's final
+                    // bytes into the grid: the owner snapshots the screen as
+                    // the session's last words before unregistering it.
+                    std::thread::sleep(std::time::Duration::from_millis(60));
                     on_exit();
                 })
                 .context("failed to spawn child wait thread")?;

@@ -11,6 +11,7 @@
   import { fsQuickOpen, type QuickOpenEntry } from "./files";
   import { dotState, dotTitle, type Session } from "./sessions";
   import FileIcon from "./FileIcon.svelte";
+  import SessionGlyph from "./SessionGlyph.svelte";
 
   /** Parent directory of a workspace-relative path ("" for a root file). */
   function dirnameOf(rel: string): string {
@@ -184,30 +185,14 @@
             {#if row.kind === "session"}
               {@const s = row.session}
               <span class="glyph-slot">
-                {#if s.kind === "agent"}
-                  <svg class="sglyph {dotState(s)}" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-                    <title>{dotTitle(s)}</title>
-                    <path
-                      d="M8 2.5l1.4 3.6 3.6 1.4-3.6 1.4L8 12.5 6.6 8.9 3 7.5l3.6-1.4z"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.3"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                {:else}
-                  <svg class="sglyph {dotState(s)}" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
-                    <title>{dotTitle(s)}</title>
-                    <path
-                      d="M3 4.5L6.5 8 3 11.5M8.5 12h4.5"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.5"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                {/if}
+                <!-- Session-type glyph (agent_kind-driven), state-colored. -->
+                <SessionGlyph
+                  kind={s.kind}
+                  agentKind={s.agent_kind}
+                  state={dotState(s)}
+                  size={13}
+                  title={dotTitle(s)}
+                />
               </span>
               <span class="name">{sessionLabel(s)}</span>
               <span class="meta">session</span>
@@ -342,30 +327,7 @@
     justify-content: center;
   }
 
-  .sglyph {
-    color: var(--muted);
-    opacity: 0.85;
-  }
-  .sglyph.alive {
-    color: var(--accent);
-    opacity: 1;
-  }
-  .sglyph.attn {
-    color: var(--warn);
-    opacity: 1;
-  }
-  .sglyph.err {
-    color: var(--err);
-    opacity: 1;
-  }
-  .sglyph.rate {
-    color: var(--rate);
-    opacity: 1;
-  }
-  .sglyph.done {
-    color: var(--fg);
-    opacity: 0.6;
-  }
+  /* Session glyphs (and their state palette) live in SessionGlyph. */
 
   .name {
     flex: none;
