@@ -30,7 +30,12 @@ jobs:
       # tauri's beforeBuildCommand builds web-ui (npm install + vite build);
       # setup-node above guarantees it sees a modern node — the UI build
       # needs >= 18 (styleText), which is why .nvmrc exists.
-      - run: npx tauri build
+      #
+      # createUpdaterArtifacts is forced off here: this check only proves the
+      # app compiles and bundles. The signed `.app.tar.gz` updater artifact
+      # needs TAURI_SIGNING_PRIVATE_KEY, which is a release-only concern
+      # (release.yml on main) — a PR must not require it. The .dmg still builds.
+      - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
         working-directory: crates/chimaera-app
       # The .dmg is the shippable artifact; the raw .app is a directory with
       # symlinks that artifact-zipping would flatten.
