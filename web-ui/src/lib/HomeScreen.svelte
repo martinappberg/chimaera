@@ -243,6 +243,9 @@
 </script>
 
 <div class="home">
+  {#if health !== null}
+    <span class="version-mark" title="running version">v{health.version}</span>
+  {/if}
   <div class="inner">
     <header class="masthead">
       <div class="brand">
@@ -271,7 +274,7 @@
         <div class="update-line">
           <span>Chimaera {appUpdate} available —</span>
           <button class="update-act" disabled={appUpdating} onclick={() => void installApp()}>
-            {appUpdating ? "updating…" : "update &amp; restart"}
+            {appUpdating ? "updating…" : "update & restart"}
           </button>
         </div>
         {#if appUpdateError !== null}
@@ -571,6 +574,24 @@
     display: flex;
     align-items: center;
     gap: 9px;
+  }
+
+  /* Quiet running-version stamp, pinned to the home screen's corner. */
+  .version-mark {
+    position: fixed;
+    bottom: 12px;
+    right: 16px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    letter-spacing: 0.01em;
+    opacity: 0.5;
+    user-select: none;
+    transition: opacity 0.15s ease;
+  }
+
+  .version-mark:hover {
+    opacity: 0.9;
   }
 
   h1 {
