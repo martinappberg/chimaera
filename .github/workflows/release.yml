@@ -1,0 +1,109 @@
+name: release
+
+# Tag v* -> a DRAFT GitHub Release carrying the static daemon binaries
+# (musl, the HPC story) and the macOS app bundle. Draft so a human reads
+# the notes and presses publish — releases are outward-facing.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: npm install
+        working-directory: web-ui
+      - run: npm run build
+        working-directory: web-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+
+  daemon:
+    needs: ui
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-zigbuild
+      - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
+      - run: cp target/${{ matrix.target }}/release/chimaera chimaera-${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimaera-${{ matrix.target }}
+          path: chimaera-${{ matrix.target }}
+
+  daemon-macos:
+    needs: ui
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-ui-dist
+          path: web-ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p chimaera
+      - run: cp target/release/chimaera chimaera-aarch64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimaera-aarch64-apple-darwin
+          path: chimaera-aarch64-apple-darwin
+
+  app-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+      - run: npm install
+        working-directory: crates/chimaera-app
+      - run: npx tauri build
+        working-directory: crates/chimaera-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Chimaera-macos-arm64-dmg
+          path: crates/chimaera-app/target/release/bundle/dmg/*.dmg
+
+  publish:
+    needs: [daemon, daemon-macos, app-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/chimaera-x86_64-unknown-linux-musl
+            artifacts/chimaera-aarch64-unknown-linux-musl
+            artifacts/chimaera-aarch64-apple-darwin
+            artifacts/*.dmg

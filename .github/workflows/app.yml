@@ -1,0 +1,45 @@
+name: app
+
+# Native-shell bundle (Tauri). Separate from ci.yml because the app lives in
+# its own cargo workspace (the daemon workspace stays musl-lean) and macOS
+# runners are expensive — this only runs when the app or the UI it embeds
+# changed, or on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/chimaera-app/**"
+      - "web-ui/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+      - run: npm install
+        working-directory: crates/chimaera-app
+      # tauri's beforeBuildCommand builds web-ui (npm install + vite build);
+      # setup-node above guarantees it sees a modern node — the UI build
+      # needs >= 18 (styleText), which is why .nvmrc exists.
+      - run: npx tauri build
+        working-directory: crates/chimaera-app
+      # The .dmg is the shippable artifact; the raw .app is a directory with
+      # symlinks that artifact-zipping would flatten.
+      #
+      # Unsigned until Apple signing lands: to sign + notarize, add
+      # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+      # / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID as repo secrets and export
+      # them on the build step (tauri picks them up).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Chimaera-macos-arm64.dmg
+          path: crates/chimaera-app/target/release/bundle/dmg/*.dmg
