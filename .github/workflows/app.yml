@@ -1,12 +1,12 @@
 name: app
 
-# Native-shell bundle (Tauri). Separate from ci.yml because the app lives in
-# its own cargo workspace (the daemon workspace stays musl-lean) and macOS
-# runners are expensive — this only runs when the app or the UI it embeds
-# changed, or on demand.
+# PR build-check for the native-shell bundle (Tauri). It lives in its own
+# cargo workspace, so ci.yml's root-workspace clippy never touches it — this
+# catches app breakage before merge. macOS runners are expensive, so it only
+# runs on PRs that change the app or the UI it embeds (release.yml builds and
+# publishes the app on merge, so no main-push trigger here).
 on:
-  push:
-    branches: [main]
+  pull_request:
     paths:
       - "crates/chimaera-app/**"
       - "web-ui/**"

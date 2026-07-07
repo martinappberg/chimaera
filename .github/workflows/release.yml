@@ -1,53 +1,58 @@
 name: release
 
-# Tag v* -> a DRAFT GitHub Release. The macOS app is built AND SIGNED by
-# tauri-action, which also emits the updater manifest (latest.json) the
-# installed app polls to auto-update; the static musl daemon binaries (the
-# HPC story) attach to the same release. Draft so a human reads the notes
-# and presses publish.
+# Every merge to main cuts a release. The version is derived from the last
+# git tag and bumped by the squashed PR's commit message (Conventional
+# Commits): `feat:` -> minor, `BREAKING CHANGE`/`!:` -> major, else patch.
+# A single workflow does version + build + publish: a tag pushed by
+# GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be
+# split across two. Put `[skip release]` in the squash message to skip.
 #
-# Requires two repo secrets for update signing (see CONTRIBUTING.md):
-#   TAURI_SIGNING_PRIVATE_KEY           the minisign private key
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  its password ("" if none)
-# Without them the app still builds but produces no valid update signature.
+# Releases are PUBLISHED (not draft) so the installed app auto-updates; the
+# required-CI branch protection on main is the safety gate that a merge is
+# already green. App update signing needs TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]
+# repo secrets (see CONTRIBUTING.md); auto-update only resolves once the repo
+# (or its releases) is public.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
 
+concurrency: release
+
 jobs:
-  # Build + sign the app and CREATE the draft release (tauri-action owns it).
-  app:
-    runs-on: macos-latest
+  version:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
         with:
-          node-version-file: .nvmrc
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/chimaera-app
-      - run: npm install
-        working-directory: crates/chimaera-app
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: crates/chimaera-app
-          tagName: ${{ github.ref_name }}
-          releaseName: "Chimaera ${{ github.ref_name }}"
-          releaseDraft: true
-          # Emits and uploads latest.json (the updater endpoint) because the
-          # app config sets createUpdaterArtifacts.
-          includeUpdaterJson: true
+          fetch-depth: 0
+      - id: bump
+        run: |
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          msg=$(git log -1 --pretty=%B)
+          if [ -z "$latest" ]; then
+            version="0.1.0"
+          else
+            IFS=. read -r ma mi pa <<< "${latest#v}"
+            if echo "$msg" | grep -qiE 'BREAKING CHANGE|!:'; then
+              ma=$((ma + 1)); mi=0; pa=0
+            elif echo "$msg" | grep -qiE '^feat'; then
+              mi=$((mi + 1)); pa=0
+            else
+              pa=$((pa + 1))
+            fi
+            version="$ma.$mi.$pa"
+          fi
+          echo "releasing v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  # Static musl daemon binaries — the ones you scp to a cluster.
   daemon:
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -65,6 +70,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-zigbuild
+      # Stamp the release version so the daemon reports it (health / manifest).
+      - run: sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - run: cp target/${{ matrix.target }}/release/chimaera chimaera-${{ matrix.target }}
       - uses: actions/upload-artifact@v4
@@ -73,6 +80,7 @@ jobs:
           path: chimaera-${{ matrix.target }}
 
   daemon-macos:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +93,7 @@ jobs:
         working-directory: web-ui
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - run: sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - run: cargo build --release -p chimaera
       - run: cp target/release/chimaera chimaera-aarch64-apple-darwin
       - uses: actions/upload-artifact@v4
@@ -92,9 +101,41 @@ jobs:
           name: chimaera-aarch64-apple-darwin
           path: chimaera-aarch64-apple-darwin
 
-  # Attach the daemon binaries to the release tauri-action created.
+  # Build + sign the app and CREATE + PUBLISH the release (tauri-action owns
+  # it, and emits latest.json because the app config sets createUpdaterArtifacts).
+  app:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+      - run: npm install
+        working-directory: crates/chimaera-app
+      # The app version drives both the bundle and the updater comparison.
+      - run: |
+          sed -i "" "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
+          sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/chimaera-app
+          tagName: v${{ needs.version.outputs.version }}
+          releaseName: "Chimaera v${{ needs.version.outputs.version }}"
+          releaseDraft: false
+          includeUpdaterJson: true
+
+  # Attach the daemon binaries to the release tauri-action published.
   attach-daemons:
-    needs: [app, daemon, daemon-macos]
+    needs: [version, app, daemon, daemon-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -104,7 +145,7 @@ jobs:
       - env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ github.ref_name }}" \
+          gh release upload "v${{ needs.version.outputs.version }}" \
             artifacts/chimaera-x86_64-unknown-linux-musl \
             artifacts/chimaera-aarch64-unknown-linux-musl \
             artifacts/chimaera-aarch64-apple-darwin \
