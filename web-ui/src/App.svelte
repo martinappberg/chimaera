@@ -1945,7 +1945,12 @@
                   ondblclick={() => startRename(s)}
                 >
                   <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
-                  {#if s.title && s.title !== s.name && s.title !== s.agent_title}
+                  <!-- Second line only when it adds something over the name.
+                       Shells never do: the name already resolves to the title
+                       (program-set) or the cwd (the shell's "user@host:dir"
+                       prompt title is dropped server-side). Agents show their
+                       own PTY title as context when it differs from the name. -->
+                  {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
                     <span class="title">{s.title}</span>
                   {/if}
                 </span>
