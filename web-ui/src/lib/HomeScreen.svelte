@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import BrandMark from "./BrandMark.svelte";
   import { KEYS } from "./keys";
   import { needsAttention, type Session, type Workspace } from "./sessions";
   import {
@@ -242,10 +243,13 @@
 </script>
 
 <div class="home">
+  {#if health !== null}
+    <span class="version-mark" title="running version">v{health.version}</span>
+  {/if}
   <div class="inner">
     <header class="masthead">
       <div class="brand">
-        <span class="glyph" aria-hidden="true">&gt;_</span>
+        <BrandMark size={24} draw title="chimaera" />
         <h1>chimaera</h1>
       </div>
       <div class="where" title={health?.hostname}>
@@ -270,7 +274,7 @@
         <div class="update-line">
           <span>Chimaera {appUpdate} available —</span>
           <button class="update-act" disabled={appUpdating} onclick={() => void installApp()}>
-            {appUpdating ? "updating…" : "update &amp; restart"}
+            {appUpdating ? "updating…" : "update & restart"}
           </button>
         </div>
         {#if appUpdateError !== null}
@@ -568,15 +572,26 @@
 
   .brand {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
+    align-items: center;
+    gap: 9px;
   }
 
-  .glyph {
+  /* Quiet running-version stamp, pinned to the home screen's corner. */
+  .version-mark {
+    position: fixed;
+    bottom: 12px;
+    right: 16px;
     font-family: var(--mono);
-    font-size: var(--text-lg);
-    color: var(--accent);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    letter-spacing: 0.01em;
+    opacity: 0.5;
     user-select: none;
+    transition: opacity 0.15s ease;
+  }
+
+  .version-mark:hover {
+    opacity: 0.9;
   }
 
   h1 {
