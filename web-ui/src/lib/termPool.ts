@@ -66,6 +66,12 @@ export interface PoolHandlers {
    * selection, empty when the selection was cleared.
    */
   onSelection(id: string, text: string): void;
+  /**
+   * Text was pasted into this terminal (copy provenance): fired BEFORE
+   * xterm forwards the paste to the PTY, so a handler that wants to type a
+   * source tag after it must defer (the app uses a microtask).
+   */
+  onPaste(id: string, text: string): void;
   /** Resolution context for the session's path link provider. */
   linkContext(id: string): LinkContext;
   /**
@@ -288,6 +294,12 @@ function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEnt
   term.onData((data) => entry.socket.sendInput(data));
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
   term.onSelectionChange(() => handlers?.onSelection(id, term.getSelection()));
+  // Copy provenance: surface pastes so agent composers can be source-tagged.
+  // Listener on xterm's own textarea; xterm still handles the paste itself.
+  term.textarea?.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text");
+    if (text !== undefined && text !== "") handlers?.onPaste(id, text);
+  });
 
   entry.ro = new ResizeObserver(() => scheduleFit(entry));
   entry.ro.observe(el);

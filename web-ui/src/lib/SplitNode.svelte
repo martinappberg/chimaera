@@ -18,6 +18,8 @@
     linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
+    /** Panes whose bottom band is armed for the current drag. */
+    bandPanes: ReadonlySet<string>;
     ctrl: LayoutCtrl;
   }
 
@@ -31,6 +33,7 @@
     links,
     linkCtrl,
     wsRoot,
+    bandPanes,
     ctrl,
   }: Props = $props();
 
@@ -118,11 +121,11 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
     </div>
     <div
       class="divider"
@@ -136,7 +139,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
     </div>
   </div>
 {/if}

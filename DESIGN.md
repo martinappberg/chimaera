@@ -825,6 +825,18 @@ which is the survival property that matters.
   detail. Raw hostnames like `host.example` confused the author on day one — labels must
   be human.
 
+- **2026-07-06 — context bridge refinements (author feedback).** Three fixes after first
+  use: (1) *explicit targeting* — a selection in a LINKED terminal references its linked
+  agent (the leash is the bridge), the target's name is always shown on the reference
+  affordance, and the target agent is revealed (split beside the source) before typing —
+  a reference never lands out of sight. (2) *Copy provenance* — copying from any tracked
+  view snapshots the selection's source; pasting that snippet into an agent composer
+  appends a visible ` [from @path#L3-L9] ` / ` [from <name> output] ` tag (additive only,
+  never for shells, never mutates the pasted bytes, 5-min TTL, min 24 chars — plain
+  Cmd+C/V stays plain). (3) *Partitioned drop previews* — while a bottom band (reference
+  or link) is armed, the adopt-as-tab preview stops above it and both bands share one
+  quiet recipe (10% tint, dashed hairline, pill label; the link band tints in the
+  agent's hue) — no more full-pane flashes mid-gesture.
 - **2026-07-06 — linked terminals wave 1 SHIPPED (M4.5).** Daemon: OSC 133 marks scanner +
   per-session command journal, bash/zsh/fish integration injection (verified on bash 3.2 +
   zsh 5.9), exec engine (queue-with-timeout, sentinel fallback, ssh-allowlist policy),

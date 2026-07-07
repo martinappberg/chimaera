@@ -365,6 +365,10 @@
       >
         <span class="ref-at" aria-hidden="true">@</span>
         reference
+        {#if $referenceTarget !== null}
+          <!-- The destination is always named — never a mystery landing. -->
+          <span class="ref-target">→ {midTruncate($referenceTarget.name, 16)}</span>
+        {/if}
       </button>
     {/if}
     {#if touched !== null}
@@ -923,6 +927,18 @@
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
+  }
+
+  .ref-target {
+    color: var(--muted);
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ref-btn:hover:enabled .ref-target {
+    color: inherit;
   }
 
   .ref-btn:hover:enabled {

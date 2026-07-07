@@ -23,6 +23,8 @@
     linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
+    /** Panes whose bottom band is armed for the current drag. */
+    bandPanes: ReadonlySet<string>;
     ctrl: LayoutCtrl;
   }
 
@@ -37,6 +39,7 @@
     links,
     linkCtrl,
     wsRoot,
+    bandPanes,
     ctrl,
   }: Props = $props();
 
@@ -50,6 +53,15 @@
   const refBand = $derived(dropSpot?.kind === "ref" && dropSpot.paneId === node.id);
   /** The "link to agent" band preview (dragging a terminal over this agent). */
   const linkBand = $derived(dropSpot?.kind === "link" && dropSpot.paneId === node.id);
+  /** This pane's bottom band is reserved for the current drag: the center
+   *  (adopt) preview stops above it instead of flashing the full pane. */
+  const bandArmed = $derived(bandPanes.has(node.id));
+  /** When this pane IS an agent session: its own hue (link band tint). */
+  const ownAgentHue = $derived.by(() => {
+    if (activeTab === null || activeTab.surface !== "terminal") return null;
+    const s = sessions.get(activeTab.sessionId);
+    return s !== undefined && s.kind === "agent" ? agentHue(activeTab.sessionId) : null;
+  });
 
   /** When this pane shows a linked terminal: the leash-holder's hue, and
    *  whether that agent is executing here right now (border pulse). */
@@ -129,13 +141,13 @@
   </div>
 
   {#if zone !== null}
-    <div class="drop drop-{zone}"></div>
+    <div class="drop drop-{zone}" class:banded={bandArmed}></div>
   {:else if linkBand}
     <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
-    <div class="drop drop-link">
-      <span class="drop-link-label">link to this agent</span>
+    <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+      <span class="band-label">link to this agent</span>
     </div>
   {/if}
 
@@ -255,7 +267,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     border: 1px dashed color-mix(in srgb, var(--accent) 60%, transparent);
     border-radius: 7px;
     pointer-events: none;
@@ -289,26 +301,41 @@
     inset: 50% 0 0 0;
   }
 
-  /* The link band: visibly a different intent than the split/adopt fills —
-     dashed hairline, quiet label, sits over the composer's input area. */
+  /* While a bottom band is armed for this drag, the adopt-as-tab preview
+     stops above it — the band region is reserved, never flashed over. */
+  .drop-center.banded {
+    inset: 0 0 22% 0;
+  }
+
+  /* The link band: same quiet recipe as the "@ reference" band (one band
+     grammar), tinted in the receiving agent's hue when it has one. */
   .drop-link {
-    inset: 72% 0 0 0;
+    position: absolute;
+    z-index: 7;
+    inset: 78% 0 0 0;
+    margin: 3px;
     display: flex;
     align-items: center;
     justify-content: center;
     background: color-mix(in srgb, var(--accent) 10%, transparent);
     border: 1px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 7px;
+    pointer-events: none;
   }
 
-  .drop-link-label {
+  .drop-link.hued {
+    background: hsl(var(--band-hue) 55% 55% / 0.1);
+    border-color: hsl(var(--band-hue) 55% 55% / 0.55);
+  }
+
+  .band-label {
     font-family: var(--mono);
     font-size: var(--text-xs);
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
+    letter-spacing: 0.06em;
     color: var(--fg);
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
     border-radius: 4px;
     padding: 2px 8px;
+    user-select: none;
   }
 </style>
