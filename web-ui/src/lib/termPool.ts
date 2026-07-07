@@ -269,7 +269,16 @@ function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEnt
   // snapshot frame lands in a fully initialized terminal.
   entry.socket = new SessionSocket(id, {
     onBinary: (data) => term.write(data),
-    onReset: () => term.reset(),
+    onReset: (cols, rows) => {
+      // The incoming snapshot was rendered at (cols, rows); adopt that grid
+      // before replaying or every soft-wrapped row re-wraps at the wrong
+      // column. The onResize echo this fires is a server-side no-op.
+      if (cols !== undefined && rows !== undefined && (term.cols !== cols || term.rows !== rows)) {
+        term.resize(cols, rows);
+      }
+      term.reset();
+    },
+    dims: () => ({ cols: term.cols, rows: term.rows }),
     onTitle: (title) => handlers?.onTitle(id, title),
     onResized: (cols, rows) => {
       if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
@@ -457,18 +466,25 @@ export function getSize(id: string): { cols: number; rows: number } | null {
 
 let cellCache: { w: number; h: number } | null = null;
 
-/** Measure one JetBrains Mono cell the way xterm will (DOM probe). */
+/**
+ * Measure one JetBrains Mono cell the way xterm will (DOM probe). xterm
+ * derives its cell from the face's NATURAL line box (line-height: normal,
+ * ~1.32 x font size for JetBrains Mono) and multiplies by the lineHeight
+ * option. Probing with line-height:1.25 instead undercounts row height ~30%
+ * and spawns sessions a third too tall — TUIs then boot, get winched smaller,
+ * and visibly reshuffle on their very first frame.
+ */
 function cellDims(): { w: number; h: number } {
   if (cellCache !== null) return cellCache;
   const probe = document.createElement("span");
   probe.textContent = "W";
-  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${BASE_FONT_SIZE}px ${FONT_FAMILY};line-height:${LINE_HEIGHT};`;
+  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${BASE_FONT_SIZE}px ${FONT_FAMILY};line-height:normal;`;
   document.body.appendChild(probe);
   const rect = probe.getBoundingClientRect();
   probe.remove();
   const dims = {
     w: rect.width > 1 ? rect.width : BASE_FONT_SIZE * 0.6,
-    h: rect.height > 1 ? rect.height : Math.round(BASE_FONT_SIZE * LINE_HEIGHT),
+    h: rect.height > 1 ? rect.height * LINE_HEIGHT : Math.round(BASE_FONT_SIZE * 1.32 * LINE_HEIGHT),
   };
   // Only cache once the bundled font has had a chance to load.
   if (document.fonts.check(`400 ${BASE_FONT_SIZE}px "JetBrains Mono"`)) cellCache = dims;

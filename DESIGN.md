@@ -144,6 +144,23 @@ on attach/resize the daemon re-emits an escape-sequence snapshot rendered from t
 window title, cursor style, and tab stops. This is the single most underestimated component in
 every multiplexer project — budget accordingly.
 
+**Resize repaint refinement (terminal robustness pass, 2026-07-07).** "Re-emit on resize" is
+scoped to clients that did NOT initiate the resize: the initiator's xterm reflows natively, and
+a full-reset repaint there is visible as flicker + scroll reset (it was the "terminal resets
+when I change the font size" bug). Mechanics: (1) `Session::resize` no-ops on unchanged dims —
+echoed dims from attached clients must never broadcast; (2) each ws connection tracks the dims
+it last requested and skips the resync for matching `Resized` events; foreign resizes repaint
+after a 120ms coalescing window (divider drags fire in bursts); (3) `resync` frames are
+dimension-tagged and the client resizes its xterm to match BEFORE replaying — a snapshot
+replayed at any other width re-wraps every soft-wrapped row wrong; (4) the auth frame carries
+the client's current grid so the server adopts it before rendering the attach snapshot
+(resizes that happen while the socket is down are otherwise lost forever — ResizeObserver
+never re-fires for an unchanged container); (5) snapshots restore mouse/focus/keypad/auto-wrap
+modes, which TUIs assert once at startup and never again. Known gap, accepted: a resync while
+on the alternate screen cannot restore the primary screen's scrollback
+(`alacritty_terminal` does not expose the inactive grid); with resyncs now rare
+(lag/reconnect/foreign-resize only) the blast radius is small.
+
 ### State storage: HPC filesystem realism
 
 - **No SQLite anywhere near NFS/Lustre** (WAL is unsafe across hosts; advisory locking is buggy

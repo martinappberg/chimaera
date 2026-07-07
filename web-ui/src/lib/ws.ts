@@ -12,9 +12,20 @@ export interface SessionSocketHandlers {
   onBinary(data: Uint8Array): void;
   /**
    * Reset the terminal before the next binary frame (a fresh snapshot
-   * follows). Fired on server resync and on successful reconnect.
+   * follows). Fired on server resync and on successful reconnect. When the
+   * server tags the resync with the grid the snapshot was rendered at,
+   * resize to it BEFORE resetting — a snapshot replayed at any other width
+   * re-wraps every soft-wrapped row at the wrong column.
    */
-  onReset(): void;
+  onReset(cols?: number, rows?: number): void;
+  /**
+   * The client's current grid, sent with the auth frame so the server adopts
+   * it before rendering the snapshot. Without it, a resize that happened
+   * while the socket was down (sendResize is dropped, and ResizeObserver
+   * never re-fires for an unchanged container) leaves the PTY at stale dims
+   * forever.
+   */
+  dims?(): { cols: number; rows: number } | null;
   onTitle(title: string): void;
   onResized(cols: number, rows: number): void;
   onExited(status: number | null): void;
@@ -66,7 +77,10 @@ export class SessionSocket {
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
+      // Carry the client grid so the server resizes BEFORE rendering the
+      // snapshot; the frame then always matches what the terminal displays.
+      const dims = this.handlers.dims?.() ?? null;
+      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "", ...(dims ?? {}) }));
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -104,7 +118,7 @@ export class SessionSocket {
         this.everReady = true;
         break;
       case "resync":
-        this.handlers.onReset();
+        this.handlers.onReset(msg.cols, msg.rows);
         break;
       case "title":
         if (typeof msg.title === "string") this.handlers.onTitle(msg.title);

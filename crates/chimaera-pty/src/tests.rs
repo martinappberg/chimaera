@@ -8,7 +8,7 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
 use bytes::Bytes;
 use tokio::sync::broadcast;
@@ -343,6 +343,76 @@ async fn resize_reaches_child_and_broadcasts_event() {
 
     let info = mgr.get(&info.id).expect("session present");
     assert_eq!((info.cols, info.rows), (100, 30));
+
+    mgr.kill(&info.id).expect("kill failed");
+    wait_gone(&mgr, &info.id).await;
+}
+
+/// (d2) A resize to the current dimensions is a no-op: no Resized event, no
+/// winch. Attached clients mirror resize events back as their own resize
+/// requests; without the short-circuit each real resize echoes into repaint
+/// storms across every client.
+#[tokio::test]
+async fn noop_resize_broadcasts_nothing() {
+    let mgr = SessionManager::new();
+    let info = mgr.spawn(opts(bash())).expect("spawn failed");
+    let mut att = mgr.attach(&info.id).expect("attach failed");
+
+    mgr.resize(&info.id, info.cols, info.rows)
+        .expect("no-op resize failed");
+    mgr.resize(&info.id, 100, 30).expect("resize failed");
+
+    // The first Resized event on the channel must already be the real one.
+    let event = wait_for_event(&mut att.events, |e| {
+        matches!(e, SessionEvent::Resized { .. })
+    })
+    .await;
+    match event {
+        SessionEvent::Resized { cols, rows } => assert_eq!((cols, rows), (100, 30)),
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // The real resize still winched the child after the no-op (and bash is
+    // provably up before the kill below — SIGHUP during init is shrugged off).
+    att.input
+        .send(Bytes::from_static(b"stty size\n"))
+        .await
+        .expect("input send failed");
+    read_until(&mut att.output, "30 100").await;
+
+    mgr.kill(&info.id).expect("kill failed");
+    wait_gone(&mgr, &info.id).await;
+}
+
+/// (d3) A snapshot taken while a TUI has mouse/focus/keypad reporting active
+/// re-arms those modes on replay. TUIs assert them once at startup and never
+/// again, so a snapshot that drops them silently breaks scrolling and clicks
+/// in every reattached client.
+#[tokio::test]
+async fn snapshot_restores_tui_modes() {
+    let mgr = SessionManager::new();
+    let script =
+        "printf '\\033[?1000h\\033[?1006h\\033[?1004h\\033[?2004h\\033=ready\\n'; sleep 30";
+    let info = mgr
+        .spawn(opts(Some(vec![
+            "/bin/bash".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+        ])))
+        .expect("spawn failed");
+
+    let att = attach_when_snapshot_contains(&mgr, &info.id, "ready").await;
+    let replayed = replay_snapshot(&att.snapshot, info.cols, info.rows);
+    let mode = *replayed.mode();
+    for (flag, name) in [
+        (TermMode::MOUSE_REPORT_CLICK, "mouse click reporting"),
+        (TermMode::SGR_MOUSE, "SGR mouse encoding"),
+        (TermMode::FOCUS_IN_OUT, "focus reporting"),
+        (TermMode::BRACKETED_PASTE, "bracketed paste"),
+        (TermMode::APP_KEYPAD, "application keypad"),
+    ] {
+        assert!(mode.contains(flag), "replayed snapshot lost {name}");
+    }
 
     mgr.kill(&info.id).expect("kill failed");
     wait_gone(&mgr, &info.id).await;
