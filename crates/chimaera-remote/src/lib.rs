@@ -5,10 +5,12 @@
 //! (ProxyJump, 2FA) by never reimplementing the ssh client.
 //!
 //! Every ssh/scp invocation here rides one chimaera-owned ControlMaster (see
-//! [`ssh_cmd`]): the user authenticates once — password or 2FA — and every
+//! [`ssh_opts`]): the user authenticates once — password or 2FA — and every
 //! subsequent command, tunnel, and new window multiplexes that single
 //! connection with no further prompts, kept warm by `ControlPersist` so
-//! opening new things on the host stays instant.
+//! opening new things on the host stays instant. The same options set a
+//! trust-on-first-use host-key policy, so a freshly installed app can connect
+//! to a host it has never seen without a tty to confirm the key.
 
 pub mod hosts;
 
@@ -33,12 +35,19 @@ fn control_path() -> String {
     dir.join("%C").to_string_lossy().into_owned()
 }
 
-/// The `-o` options that multiplex every chimaera ssh/scp call to a host over
-/// a single authenticated ControlMaster. `ControlMaster=auto` makes the first
-/// connection the master and later ones reuse it; `ControlPersist` keeps the
-/// master alive after clients disconnect so reconnects and new windows skip
-/// re-authentication.
-fn control_opts() -> [String; 6] {
+/// The `-o` options shared by every chimaera ssh/scp call to a host.
+///
+/// *ControlMaster* — `ControlMaster=auto` makes the first connection the
+/// master and later ones reuse it; `ControlPersist` keeps it warm after
+/// clients disconnect so reconnects and new windows skip re-authentication.
+///
+/// *Host key* — `StrictHostKeyChecking=accept-new` is the trust-on-first-use
+/// policy a windowed app needs: ssh has no tty to answer the "authenticity of
+/// host … (yes/no)?" prompt, so a freshly installed app connecting to a host
+/// it has never seen would otherwise fail outright. `accept-new` records an
+/// unknown key automatically but still *refuses* a changed one — keeping the
+/// MITM protection that a blanket `=no` would throw away.
+fn ssh_opts() -> [String; 8] {
     [
         "-o".into(),
         "ControlMaster=auto".into(),
@@ -46,15 +55,17 @@ fn control_opts() -> [String; 6] {
         format!("ControlPath={}", control_path()),
         "-o".into(),
         "ControlPersist=10m".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
     ]
 }
 
-/// An `ssh` command pre-loaded with the shared ControlMaster options, no host
-/// yet. For flag-heavy invocations where the destination must come last
+/// An `ssh` command pre-loaded with the shared options, no host yet. For
+/// flag-heavy invocations where the destination must come last
 /// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
 fn ssh_base() -> Command {
     let mut c = Command::new("ssh");
-    c.args(control_opts());
+    c.args(ssh_opts());
     c
 }
 
@@ -68,12 +79,12 @@ fn ssh_cmd(host: &str) -> Command {
     c
 }
 
-/// An `scp` command pre-loaded with the shared ControlMaster options, so a
-/// binary copy reuses the connection the probe already authenticated instead
-/// of prompting again.
+/// An `scp` command pre-loaded with the shared options, so a binary copy
+/// reuses the connection the probe already authenticated instead of prompting
+/// again.
 fn scp_cmd() -> Command {
     let mut c = Command::new("scp");
-    c.args(control_opts());
+    c.args(ssh_opts());
     c
 }
 
@@ -793,11 +804,13 @@ async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Every ssh/scp call must carry the ControlMaster trio so one auth
-    /// covers the whole session; the socket path uses ssh's short `%C` token.
+    /// Every ssh/scp call must carry the ControlMaster trio (so one auth
+    /// covers the whole session; socket path uses ssh's short `%C` token) plus
+    /// the trust-on-first-use host-key policy that lets a fresh install reach
+    /// a never-seen host with no tty.
     #[test]
-    fn control_opts_multiplex_over_one_master() {
-        let opts = control_opts();
+    fn ssh_opts_multiplex_and_accept_new_hosts() {
+        let opts = ssh_opts();
         assert_eq!(opts[0], "-o");
         assert_eq!(opts[1], "ControlMaster=auto");
         assert_eq!(opts[2], "-o");
@@ -805,6 +818,8 @@ mod tests {
         assert!(opts[3].ends_with("/cm/%C"), "{}", opts[3]);
         assert_eq!(opts[4], "-o");
         assert_eq!(opts[5], "ControlPersist=10m");
+        assert_eq!(opts[6], "-o");
+        assert_eq!(opts[7], "StrictHostKeyChecking=accept-new");
     }
 
     #[test]
