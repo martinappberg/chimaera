@@ -17,9 +17,11 @@
 
   interface Props {
     path: string;
+    /** Per-pane text-size override (px); markdown preview scales to it. */
+    fontSize?: number;
   }
 
-  let { path }: Props = $props();
+  let { path, fontSize = undefined }: Props = $props();
 
   const kind = $derived(viewKindFor(path));
 
@@ -67,7 +69,7 @@
     {#if kind === "image"}
       <ImageView {path} />
     {:else if kind === "markdown"}
-      <MarkdownView {path} />
+      <MarkdownView {path} {fontSize} />
     {:else if kind === "html"}
       <HtmlView {path} />
     {:else if kind === "table"}
