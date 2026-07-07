@@ -356,6 +356,12 @@ impl Session {
         Arc::clone(&self.exec_lock)
     }
 
+    /// Plain-text rendering of the last `last_n` logical lines on screen.
+    pub(crate) fn screen_text(&self, last_n: usize) -> String {
+        let term = lock_unpoisoned(&self.term);
+        snapshot::screen_text(&term, last_n)
+    }
+
     /// Foreground process group on the tty (`tcgetpgrp` on the master fd).
     /// `None` when the platform or tty cannot answer.
     pub(crate) fn foreground_pid(&self) -> Option<i32> {

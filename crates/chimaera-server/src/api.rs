@@ -258,10 +258,23 @@ pub(crate) async fn create_session(
                     .into_response();
             }
         };
+        let mcp_config = match crate::agents::write_mcp_config(&id, &key, state.port) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!(%err, "failed to write agent mcp config");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": err.to_string()})),
+                )
+                    .into_response();
+            }
+        };
         opts.command = Some(vec![
             claude.to_string_lossy().into_owned(),
             "--settings".to_string(),
             settings.to_string_lossy().into_owned(),
+            "--mcp-config".to_string(),
+            mcp_config.to_string_lossy().into_owned(),
         ]);
         opts.id = Some(id.clone());
         // Register the record before spawning so no hook can beat it in.
@@ -378,20 +391,44 @@ pub(crate) async fn exec_session(
             .into_response();
     }
 
-    // Sentinel-typing over a running command is only safe when the
-    // foreground forwards keystrokes to a remote shell (the ssh case).
+    let outcome = run_exec(&state, &id, body.command, body.timeout_ms, body.queue_timeout_ms).await;
+
+    match outcome {
+        Ok(outcome) => Json(json!(outcome)).into_response(),
+        Err(err) => {
+            let code = match &err {
+                chimaera_pty::ExecError::Busy(_) => StatusCode::CONFLICT,
+                chimaera_pty::ExecError::InvalidCommand(_) => StatusCode::BAD_REQUEST,
+                chimaera_pty::ExecError::SessionGone => StatusCode::NOT_FOUND,
+                chimaera_pty::ExecError::NeverStarted(_) => StatusCode::GATEWAY_TIMEOUT,
+            };
+            (code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+/// Run an exec with the server's policy attached: sentinel over a *running*
+/// phase only when the foreground forwards keystrokes elsewhere (ssh and
+/// friends), and the stage (queued/executing) mirrored into session
+/// snapshots for the UI's linked-terminal chips. Shared by the REST
+/// endpoint and the MCP `run_in_terminal` tool.
+pub(crate) async fn run_exec(
+    state: &Arc<AppState>,
+    id: &str,
+    command: String,
+    timeout_ms: Option<u64>,
+    queue_timeout_ms: Option<u64>,
+) -> Result<chimaera_pty::ExecOutcome, chimaera_pty::ExecError> {
     let allow_sentinel_over_running = state
         .sessions
-        .foreground_pid(&id)
+        .foreground_pid(id)
         .and_then(crate::naming::comm_name)
         .is_some_and(|comm| SENTINEL_FOREGROUNDS.contains(&comm.as_str()));
 
-    // Mirror the exec stage (queued -> executing) into session snapshots so
-    // the UI's linked-terminal chips show what is happening live.
     let (stage_tx, mut stage_rx) = tokio::sync::watch::channel(chimaera_pty::ExecStage::Queued);
     let mirror = {
         let state = state.clone();
-        let id = id.clone();
+        let id = id.to_string();
         tokio::spawn(async move {
             loop {
                 let stage = *stage_rx.borrow_and_update();
@@ -407,14 +444,14 @@ pub(crate) async fn exec_session(
     let outcome = state
         .sessions
         .exec(
-            &id,
+            id,
             chimaera_pty::ExecOptions {
-                command: body.command,
+                command,
                 queue_timeout: std::time::Duration::from_millis(
-                    body.queue_timeout_ms.unwrap_or(15_000).min(600_000),
+                    queue_timeout_ms.unwrap_or(15_000).min(600_000),
                 ),
                 timeout: std::time::Duration::from_millis(
-                    body.timeout_ms.unwrap_or(30_000).min(3_600_000),
+                    timeout_ms.unwrap_or(30_000).min(3_600_000),
                 ),
                 allow_sentinel_over_running,
                 stage: Some(stage_tx),
@@ -423,21 +460,9 @@ pub(crate) async fn exec_session(
         .await;
 
     mirror.abort();
-    crate::lock(&state.exec_status).remove(&id);
+    crate::lock(&state.exec_status).remove(id);
     state.changes.notify_waiters();
-
-    match outcome {
-        Ok(outcome) => Json(json!(outcome)).into_response(),
-        Err(err) => {
-            let code = match &err {
-                chimaera_pty::ExecError::Busy(_) => StatusCode::CONFLICT,
-                chimaera_pty::ExecError::InvalidCommand(_) => StatusCode::BAD_REQUEST,
-                chimaera_pty::ExecError::SessionGone => StatusCode::NOT_FOUND,
-                chimaera_pty::ExecError::NeverStarted(_) => StatusCode::GATEWAY_TIMEOUT,
-            };
-            (code, Json(json!({"error": err.to_string()}))).into_response()
-        }
-    }
+    outcome
 }
 
 #[derive(Deserialize)]

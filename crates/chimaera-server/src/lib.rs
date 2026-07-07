@@ -3,6 +3,7 @@ mod api;
 mod assets;
 mod fs;
 mod links;
+mod mcp;
 mod naming;
 mod quickopen;
 mod view_state;
@@ -141,6 +142,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // auth: claude's hooks cannot know the daemon token, so the random
         // per-session key embedded in the hook URL authorizes them instead.
         .route("/agent-events/{id}", post(agents::ingest))
+        // Same key-in-URL auth story as agent-events: claude's MCP client
+        // cannot know the daemon bearer token.
+        .route("/mcp/{id}", post(mcp::mcp))
         .with_state(state.clone());
 
     // The WS routes stay outside the bearer-header middleware: browsers cannot
@@ -1531,6 +1535,272 @@ mod tests {
 
         state.sessions.kill(&agent_a).ok();
         state.sessions.kill(&agent_b).ok();
+    }
+
+    /// POST one JSON-RPC message to an agent's MCP endpoint.
+    async fn mcp_post(
+        state: &Arc<AppState>,
+        agent_id: &str,
+        key: &str,
+        message: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        request(
+            state,
+            Method::POST,
+            &format!("/api/v1/mcp/{agent_id}?key={key}"),
+            Some(message),
+        )
+        .await
+    }
+
+    /// Call an MCP tool and return (isError, text content).
+    async fn mcp_tool_call(
+        state: &Arc<AppState>,
+        agent_id: &str,
+        key: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (bool, String) {
+        let (status, out) = mcp_post(
+            state,
+            agent_id,
+            key,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": tool, "arguments": args},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let result = &out["result"];
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"].as_str().unwrap_or("").to_string();
+        (is_error, text)
+    }
+
+    #[tokio::test]
+    async fn mcp_handshake_auth_and_tool_listing() {
+        let state = test_state();
+        let id = inject_agent(&state, "mk");
+
+        // Wrong key is a 403; unknown agent a 404.
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        });
+        let (status, _) = mcp_post(&state, &id, "wrong", init.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = mcp_post(&state, "s-00000000", "mk", init.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Initialize echoes the protocol version and carries instructions.
+        let (status, out) = mcp_post(&state, &id, "mk", init).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(out["result"]["serverInfo"]["name"], "chimaera");
+        assert!(out["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("@term:"));
+
+        // Notifications (no id) are 202-acknowledged.
+        let (status, _) = mcp_post(
+            &state,
+            &id,
+            "mk",
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // tools/list names the three linked-terminal tools.
+        let (status, out) = mcp_post(
+            &state,
+            &id,
+            "mk",
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = out["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["list_terminals", "run_in_terminal", "read_terminal"]
+        );
+
+        state.sessions.kill(&id).ok();
+    }
+
+    /// The full agent-side story over MCP: unlinked -> helpful error;
+    /// linked -> list, exec (by display name), and journal read all work
+    /// and stay scoped.
+    #[tokio::test]
+    async fn mcp_tools_scoped_to_links_and_exec_round_trip() {
+        let state = test_state();
+        let agent = inject_agent(&state, "mk");
+        let shell = spawn_integrated_bash(&state, "mcp-shell").await;
+
+        // Unlinked: every tool refuses with linking guidance.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": shell, "command": "echo hi"}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert!(text.contains("no terminals are linked"), "{text}");
+
+        // Link, then exec by session id.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": shell, "command": "echo mcp-ran && false"}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.starts_with("exit 1"), "{text}");
+        assert!(text.contains("integrated mode"), "{text}");
+        assert!(text.contains("mcp-ran"), "{text}");
+
+        // list_terminals shows the linked shell with its last command.
+        let (is_error, text) =
+            mcp_tool_call(&state, &agent, "mk", "list_terminals", serde_json::json!({})).await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains(&shell), "{text}");
+        assert!(text.contains("echo mcp-ran && false"), "{text}");
+
+        // read_terminal returns the journal with agent attribution upstream.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "read_terminal",
+            serde_json::json!({"terminal": shell, "commands": 3}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains("phase: ready"), "{text}");
+        assert!(text.contains("echo mcp-ran && false"), "{text}");
+        assert!(text.contains("exit 1"), "{text}");
+
+        // Screen mode reads the visible grid.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "read_terminal",
+            serde_json::json!({"terminal": shell, "screen": true}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains("mcp-ran"), "{text}");
+
+        // A second, unlinked shell stays out of reach — scope is the links.
+        let other = spawn_integrated_bash(&state, "mcp-other").await;
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": other, "command": "echo nope"}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+
+        state.sessions.kill(&agent).ok();
+        state.sessions.kill(&shell).ok();
+        state.sessions.kill(&other).ok();
+    }
+
+    /// `@term:` mentions in a user prompt auto-link (mention = consent) and
+    /// the hook response tells the agent via additionalContext.
+    #[tokio::test]
+    async fn user_prompt_mention_autolinks_terminal() {
+        let state = test_state();
+        let agent = inject_agent(&state, "mk");
+        let root = test_dir("mention-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let root = std::fs::canonicalize(&root).unwrap();
+        let shell = inject_shell(&state, &root, ws["id"].as_str().unwrap());
+        wait_display_name(&state, &shell, "bash").await;
+
+        // Mention by display name links it and reports back as context.
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "run squeue in @term:bash please",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(context.contains("Linked terminal 'bash'"), "{out}");
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(
+            list,
+            serde_json::json!([{"terminal_id": shell, "agent_id": agent}])
+        );
+
+        // A repeated mention of an already-linked terminal stays silent.
+        let (_, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "again in @term:bash",
+            })),
+        )
+        .await;
+        assert_eq!(out["hookSpecificOutput"], serde_json::Value::Null, "{out}");
+
+        // Unknown mentions surface as context too (the agent should know).
+        let (_, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "and @term:doesnotexist",
+            })),
+        )
+        .await;
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(context.contains("no terminal 'doesnotexist'"), "{out}");
+
+        state.sessions.kill(&agent).ok();
+        state.sessions.kill(&shell).ok();
     }
 
     #[tokio::test]

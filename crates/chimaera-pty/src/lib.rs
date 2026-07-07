@@ -182,6 +182,12 @@ impl SessionManager {
         self.session(id).map(|s| s.marks())
     }
 
+    /// Plain-text rendering of the last `last_n` logical lines a session
+    /// shows (what a human sees; scrollback included, wraps joined).
+    pub fn screen_text(&self, id: &str, last_n: usize) -> Option<String> {
+        self.session(id).map(|s| s.screen_text(last_n))
+    }
+
     /// Type a command into a session's shell and wait for its outcome (see
     /// [`exec`] for the mode/queue semantics). Execs are serialized per
     /// session; a busy integrated shell queues up to `opts.queue_timeout`.

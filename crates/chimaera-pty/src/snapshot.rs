@@ -173,6 +173,64 @@ fn is_trim_blank(cell: &Cell) -> bool {
         )
 }
 
+/// Render the terminal's content as plain text: the last `last_n` logical
+/// lines (soft-wrapped rows joined), scrollback included, trailing blank
+/// lines dropped. What a human reading the screen sees — for agents
+/// inspecting a terminal whose shell emits no journal marks.
+pub(crate) fn screen_text<T>(term: &Term<T>, last_n: usize) -> String {
+    let grid = term.grid();
+    let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+    let cols = grid.columns();
+    let screen_lines = grid.screen_lines() as i32;
+    let history = if alt_screen {
+        0
+    } else {
+        grid.history_size() as i32
+    };
+    // Wrapped rows join into one logical line, so overshoot the scan window
+    // rather than counting exactly; the tail cut below makes it precise.
+    let margin = (last_n as i32).saturating_mul(2).saturating_add(screen_lines);
+    let first_line = (-history).max(screen_lines - 1 - margin);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in first_line..screen_lines {
+        let row = &grid[Line(line)];
+        let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        let mut len = row.len();
+        if !wrapped {
+            while len > 0 && is_trim_blank(&row[Column(len - 1)]) {
+                len -= 1;
+            }
+        }
+        for col in 0..len {
+            let cell = &row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                current.push(' ');
+            } else {
+                current.push(cell.c);
+            }
+            if let Some(zerowidth) = cell.zerowidth() {
+                current.extend(zerowidth.iter());
+            }
+        }
+        if !wrapped {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let skip = lines.len().saturating_sub(last_n);
+    lines[skip..].join("\n")
+}
+
 /// Render the full state of `term` as an escape stream (see module docs).
 ///
 /// `title` is passed separately because `Term` does not expose its window

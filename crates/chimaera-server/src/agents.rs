@@ -230,6 +230,26 @@ pub(crate) fn write_settings(session_id: &str, key: &str, port: u16) -> anyhow::
     Ok(path)
 }
 
+/// Write the per-agent MCP config wiring claude to this daemon's
+/// linked-terminal tools (`--mcp-config`; merges with the user's own MCP
+/// servers). Mode 0600 — the URL embeds the session secret.
+pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = format!("http://127.0.0.1:{port}/api/v1/mcp/{session_id}?key={key}");
+    let config = json!({
+        "mcpServers": { "chimaera": { "type": "http", "url": url } }
+    });
+    let dir = chimaera_core::runtime_dir().join("agents");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(format!("{session_id}-mcp.json"));
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    Ok(path)
+}
+
 #[derive(Deserialize)]
 pub(crate) struct IngestQuery {
     #[serde(default)]
@@ -299,6 +319,26 @@ pub(crate) async fn ingest(
     if changed {
         state.changes.notify_waiters();
     }
+
+    // `@term:` mentions in the user's prompt auto-link those terminals to
+    // this agent (the mention is the consent — this hook only fires for the
+    // human's composer input). The notes flow back as context, so the agent
+    // knows the link exists without a discovery round-trip.
+    if event == "UserPromptSubmit" {
+        if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+            let notes = crate::mcp::autolink_mentions(&state, &id, prompt);
+            if !notes.is_empty() {
+                return Json(json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": notes.join("\n"),
+                    }
+                }))
+                .into_response();
+            }
+        }
+    }
+
     Json(json!({})).into_response()
 }
 
