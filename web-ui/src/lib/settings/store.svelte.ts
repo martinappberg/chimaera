@@ -19,6 +19,7 @@ import {
   type SettingId,
   type SettingsMap,
 } from "./schema";
+import { defaultThemeFor, themeById, type ThemeDef } from "./themes";
 
 const PUT_DEBOUNCE_MS = 400;
 
@@ -172,22 +173,36 @@ systemDark?.addEventListener("change", () => {
   }
 });
 
-/** The theme actually in effect right now ("light" | "dark"). */
+/** The mode actually in effect right now ("light" | "dark"). */
 export function resolvedTheme(): "light" | "dark" {
   const pref = getSetting("appearance.theme");
   if (pref === "system") return (systemDark?.matches ?? false) ? "dark" : "light";
   return pref;
 }
 
+// $state.raw: swapped wholesale on theme change, so Svelte consumers (the
+// accent swatch) track it while plain-TS consumers (termPool) just read it.
+let activeThemeDef = $state.raw<ThemeDef>(defaultThemeFor("light"));
+
+/** The full theme currently applied (termPool reads its ANSI palette). */
+export function activeTheme(): ThemeDef {
+  return activeThemeDef;
+}
+
 function applyAppearance(): void {
   const root = document.documentElement;
-  root.dataset.theme = resolvedTheme();
-  const accent = getSetting("appearance.accentColor");
-  if (accent === "") {
-    root.style.removeProperty("--accent");
-  } else {
-    root.style.setProperty("--accent", accent);
+  const mode = resolvedTheme();
+  const id = getSetting(mode === "dark" ? "appearance.darkTheme" : "appearance.lightTheme");
+  const theme = themeById(id) ?? defaultThemeFor(mode);
+  activeThemeDef = theme;
+  // data-theme keeps carrying the MODE (color-scheme + the app.css fallback
+  // blocks); the palette itself lands inline, every theme treated alike.
+  root.dataset.theme = mode;
+  for (const [name, value] of Object.entries(theme.tokens)) {
+    root.style.setProperty(name, value);
   }
+  const accent = getSetting("appearance.accentColor");
+  if (accent !== "") root.style.setProperty("--accent", accent);
 }
 
 // Apply defaults immediately on module load so the first paint has a theme

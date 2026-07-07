@@ -15,7 +15,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { registerPathLinks, type LinkContext, type PathKind } from "./links";
-import { getSetting, onSettingsChange } from "./settings/store.svelte";
+import { activeTheme, getSetting, onSettingsChange } from "./settings/store.svelte";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
@@ -128,65 +128,22 @@ const fontsReady: Promise<void> =
       ]).then(() => undefined)
     : Promise.resolve();
 
-// Muted ANSI palettes tuned to the app's neutrals; xterm's defaults are
-// the single loudest "unstyled demo" signal in a terminal app.
-//
-// Readability pass 2026-07-06 (measured WCAG ratios against both --term-bg
-// values): every color a TUI uses AS TEXT holds >= 4.5:1 (normal) or >= 3.5:1
-// (bright variants, light scheme); dark brightBlack — claude's secondary text
-// — was the worst offender at 3.03 and now sits at 4.65. `black` (dark) and
-// `white`/`brightWhite` (light) stay near their backgrounds by ANSI semantics;
-// the MIN_CONTRAST floor catches any TUI that types with them.
-const LIGHT_ANSI = {
-  black: "#3b3b41",
-  red: "#bf4d56", // 4.76 on #fff
-  green: "#2d8453", // 4.63 (was #2f8a57, 4.29)
-  yellow: "#8c702b", // 4.70 (was #9a7b2f, 4.00)
-  blue: "#3e6fc0", // 4.95
-  magenta: "#95569f", // 5.11
-  cyan: "#2b7e8d", // 4.70 (was #2f8a9b, 4.02)
-  white: "#b9b9c0",
-  brightBlack: "#73737d", // 4.69
-  brightRed: "#d26873", // 3.52 (was 3.28)
-  brightGreen: "#3e9866", // 3.57 (was 3.07)
-  brightYellow: "#a18542", // 3.53 (was 2.83)
-  brightBlue: "#5b89d5", // 3.51 (was 3.38)
-  brightMagenta: "#ad74b8", // 3.52
-  brightCyan: "#4293a1", // 3.55 (was 2.86)
-  brightWhite: "#d9d9df",
-};
-const DARK_ANSI = {
-  black: "#33333a",
-  red: "#e2757e", // 6.45 on #0f0f13
-  green: "#5cc48d", // 8.87
-  yellow: "#d9b96c", // 10.11
-  blue: "#79a5ea", // 7.63
-  magenta: "#c795d3", // 7.89
-  cyan: "#6cc3d4", // 9.47
-  white: "#c9c9d1", // 11.62
-  brightBlack: "#7c7c8a", // 4.65 (was #5f5f6a, 3.03 — claude's secondary text)
-  brightRed: "#ef959c", // 8.61
-  brightGreen: "#7fd6a8", // 11.01
-  brightYellow: "#e7cd8b", // 12.30
-  brightBlue: "#9cbbf1", // 9.83
-  brightMagenta: "#d8afe2", // 10.15
-  brightCyan: "#8fd6e4", // 11.75
-  brightWhite: "#ededf3", // 16.40
-};
-
 function themeFromTokens() {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string) => cs.getPropertyValue(name).trim();
-  // The settings store pins the resolved theme on <html> before notifying
-  // subscribers, so the attribute (and every CSS var) is already current.
-  const dark = document.documentElement.dataset.theme === "dark";
+  // The settings store applies the theme's tokens (and records the active
+  // ThemeDef) before notifying subscribers, so both are already current.
+  // Each theme carries its own hand-tuned ANSI palette (settings/themes.ts)
+  // — xterm's defaults are the single loudest "unstyled demo" signal in a
+  // terminal app, and a UI theme without its terminal palette is half a
+  // theme.
   return {
     background: v("--term-bg"),
     foreground: v("--fg"),
     cursor: v("--fg"),
     cursorAccent: v("--term-bg"),
     selectionBackground: v("--term-selection"),
-    ...(dark ? DARK_ANSI : LIGHT_ANSI),
+    ...activeTheme().ansi,
   };
 }
 

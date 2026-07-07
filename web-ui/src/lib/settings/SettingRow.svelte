@@ -5,7 +5,7 @@
    * accent bar and a reset affordance — the VS Code gutter language, muted.
    */
   import type { SettingDef, SettingId, SettingValue } from "./schema";
-  import { getSetting, isModified, resetSetting, setSetting } from "./store.svelte";
+  import { activeTheme, getSetting, isModified, resetSetting, setSetting } from "./store.svelte";
 
   interface Props {
     def: SettingDef;
@@ -62,14 +62,12 @@
 
   // --- color -------------------------------------------------------------------
 
-  /** The swatch the native picker shows for "" (theme default): read the
-   *  live --accent so the picker opens on the actual current color. */
-  function effectiveColor(): string {
+  /** The swatch the native picker shows for "" (theme default): the active
+   *  theme's own accent, tracked so it follows theme switches live. */
+  const effectiveColor = $derived.by(() => {
     const v = value as string;
-    if (v !== "") return v;
-    const raw = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
-    return /^#[0-9a-fA-F]{6}$/.test(raw) ? raw : "#2e9e6b";
-  }
+    return v !== "" ? v : activeTheme().tokens["--accent"];
+  });
 </script>
 
 <div class="row" class:modified id={`setting-${def.id}`}>
@@ -133,6 +131,32 @@
           onblur={(e) => commitNumber(e.currentTarget.value)}
         />
       </div>
+    {:else if def.type === "enum" && def.control === "theme-cards"}
+      <!-- Mini window previews: pane sheet + rail strip + text lines + the
+           accent dot — enough of the palette to choose by eye. -->
+      <div class="cards" role="radiogroup" aria-label={def.title}>
+        {#each def.options ?? [] as opt (opt.value)}
+          {@const [pane, rail, text, accent] = opt.swatch ?? []}
+          <button
+            class="card"
+            class:on={value === opt.value}
+            role="radio"
+            aria-checked={value === opt.value}
+            title={opt.label}
+            onclick={() => set(opt.value)}
+          >
+            <span class="card-window" style:background={pane}>
+              <span class="card-rail" style:background={rail}></span>
+              <span class="card-page">
+                <span class="card-line" style:background={text} style:opacity={0.85}></span>
+                <span class="card-line short" style:background={text} style:opacity={0.45}></span>
+                <span class="card-dot" style:background={accent}></span>
+              </span>
+            </span>
+            <span class="card-label">{opt.label}</span>
+          </button>
+        {/each}
+      </div>
     {:else if def.type === "enum"}
       {#if (def.options ?? []).length <= 4}
         <div class="seg" role="radiogroup" aria-label={def.title}>
@@ -165,7 +189,7 @@
         <input
           class="swatch"
           type="color"
-          value={effectiveColor()}
+          value={effectiveColor}
           aria-label={def.title}
           oninput={(e) => set(e.currentTarget.value)}
         />
@@ -404,6 +428,93 @@
     border: 1px solid var(--edge);
     border-radius: 6px;
     padding: 3px 6px;
+  }
+
+  /* --- theme cards --- */
+  .cards {
+    display: flex;
+    gap: 10px;
+  }
+
+  .card {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+    cursor: pointer;
+  }
+
+  .card-window {
+    display: flex;
+    width: 92px;
+    height: 56px;
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    overflow: hidden;
+    transition:
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+
+  .card:hover .card-window {
+    border-color: color-mix(in srgb, var(--fg) 25%, var(--edge));
+  }
+
+  .card.on .card-window {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .card-rail {
+    flex: none;
+    width: 22px;
+  }
+
+  .card-page {
+    flex: 1;
+    position: relative;
+    padding: 9px 9px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .card-line {
+    height: 4px;
+    border-radius: 2px;
+  }
+
+  .card-line.short {
+    width: 62%;
+  }
+
+  .card-dot {
+    position: absolute;
+    left: 9px;
+    bottom: 8px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+
+  .card-label {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    text-align: center;
+    transition: color 0.12s ease;
+  }
+
+  .card:hover .card-label,
+  .card.on .card-label {
+    color: var(--fg);
+  }
+
+  .card.on .card-label {
+    font-weight: 600;
   }
 
   /* --- enum --- */

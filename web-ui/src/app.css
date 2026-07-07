@@ -1,8 +1,10 @@
 :root {
   /* Native controls (scrollbars, form widgets) follow the active theme. The
-     settings store resolves appearance.theme (system|light|dark) and pins
-     data-theme on <html> before first paint; tokens key off that attribute,
-     never off the media query directly. */
+     settings store resolves appearance.theme (system|light|dark) to a MODE
+     (pinned as data-theme on <html> before first paint) and applies the
+     selected theme's full token set inline from settings/themes.ts — the
+     color values in this file are the two built-in defaults, kept as the
+     no-JS fallback. Add or edit themes in themes.ts, not here. */
   color-scheme: light;
   /* The bundled terminal face doubles as the UI's monospace accent, so
      terminal content and chrome share typographic DNA. */
@@ -57,6 +59,7 @@
 }
 
 :root[data-theme="dark"] {
+  /* Fallback only — the live palette comes inline from settings/themes.ts. */
   color-scheme: dark;
   --bg: #131316;
   --fg: #e7e7ea;

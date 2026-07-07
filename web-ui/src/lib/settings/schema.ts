@@ -13,6 +13,8 @@
  * the same file.
  */
 
+import { themesOfKind, type ThemeDef } from "./themes";
+
 /** Value types a setting can carry (mirrors the JSON representation). */
 export type SettingValue = boolean | number | string | string[];
 
@@ -28,6 +30,11 @@ export type SettingType =
 export interface EnumOption {
   value: string;
   label: string;
+  /**
+   * Preview colors for card-style enum rendering (theme pickers):
+   * [pane bg, rail bg, text, accent].
+   */
+  swatch?: readonly string[];
 }
 
 export interface SettingDef {
@@ -53,6 +60,9 @@ export interface SettingDef {
   scope: "client" | "daemon";
   /** Extra caveat rendered small in the UI ("Applies to new sessions."). */
   note?: string;
+  /** Control override: "theme-cards" renders enum options as mini theme
+   *  previews (requires options with `swatch`). */
+  control?: "theme-cards";
 }
 
 /**
@@ -62,6 +72,8 @@ export interface SettingDef {
  */
 export interface SettingsMap {
   "appearance.theme": "system" | "light" | "dark";
+  "appearance.lightTheme": string;
+  "appearance.darkTheme": string;
   "appearance.accentColor": string;
   "terminal.fontSize": number;
   "terminal.fontFamily": string;
@@ -86,13 +98,22 @@ export interface SettingsMap {
 
 export type SettingId = keyof SettingsMap;
 
+/** Theme-picker options with card-preview swatches, from the registry. */
+function themeOptions(kind: "light" | "dark"): EnumOption[] {
+  return themesOfKind(kind).map((t: ThemeDef) => ({
+    value: t.id,
+    label: t.label,
+    swatch: [t.tokens["--term-bg"], t.tokens["--rail-bg"], t.tokens["--fg"], t.tokens["--accent"]],
+  }));
+}
+
 const DEFS = {
   // --- Appearance -----------------------------------------------------------
   "appearance.theme": {
-    title: "Theme",
+    title: "Mode",
     category: "Appearance",
     description:
-      "Color theme for the whole window. System follows the OS light/dark preference live.",
+      "Light or dark for the whole window. System follows the OS preference live; the palette comes from the Light Theme / Dark Theme choices below.",
     type: "enum",
     default: "system",
     options: [
@@ -102,11 +123,31 @@ const DEFS = {
     ],
     scope: "client",
   },
+  "appearance.lightTheme": {
+    title: "Light Theme",
+    category: "Appearance",
+    description: "Palette used while the window is light.",
+    type: "enum",
+    default: "chimaera-light",
+    options: themeOptions("light"),
+    control: "theme-cards",
+    scope: "client",
+  },
+  "appearance.darkTheme": {
+    title: "Dark Theme",
+    category: "Appearance",
+    description: "Palette used while the window is dark.",
+    type: "enum",
+    default: "chimaera-dark",
+    options: themeOptions("dark"),
+    control: "theme-cards",
+    scope: "client",
+  },
   "appearance.accentColor": {
     title: "Accent Color",
     category: "Appearance",
     description:
-      "Accent used for focus, selection, live-session dots, and primary actions. Empty uses the theme's built-in green (tuned per light/dark).",
+      "Accent used for focus, selection, live-session dots, and primary actions. Empty uses the selected theme's own accent.",
     type: "color",
     default: "",
     scope: "client",
