@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The project's repository URL (from `Cargo.toml`), e.g.
+/// `https://github.com/<owner>/<repo>`. Used to locate the GitHub release a
+/// build came from when auto-fetching the matching daemon for a remote host.
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// Build identity of this binary: `<git-short-hash>[-dirty].<build-unix-secs>`
 /// (e.g. `ff52221-dirty.1783438290`), embedded by build.rs. Builds outside a
 /// git checkout embed `unknown.<secs>`.

@@ -198,6 +198,7 @@ async fn connect_host(
         let phase = match phase {
             Phase::Probing => "probing",
             Phase::Updating => "updating",
+            Phase::Downloading { .. } => "downloading",
             Phase::Installing { .. } => "installing",
             Phase::Starting => "starting",
             Phase::Tunneling { .. } => "tunneling",

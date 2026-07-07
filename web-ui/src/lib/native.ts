@@ -64,7 +64,7 @@ export interface HostState {
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "updating" | "installing" | "starting" | "tunneling";
+  phase: "probing" | "updating" | "downloading" | "installing" | "starting" | "tunneling";
 }
 
 /** Build parity of the local daemon, as decided at app startup. */

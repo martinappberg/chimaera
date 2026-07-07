@@ -105,6 +105,7 @@
   const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
     probing: "probing for a running daemon…",
     updating: "updating the daemon…",
+    downloading: "downloading chimaera…",
     installing: "installing chimaera…",
     starting: "starting the daemon…",
     tunneling: "bringing the tunnel up…",

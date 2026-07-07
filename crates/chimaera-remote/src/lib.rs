@@ -6,6 +6,7 @@
 
 pub mod hosts;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,6 +22,9 @@ pub enum Phase {
     Probing,
     /// Replacing an outdated remote daemon (graceful stop, then redeploy).
     Updating,
+    /// Fetching the matching daemon binary from the GitHub release this build
+    /// came from (the end-user path: no repo, no `just dist` stash).
+    Downloading { target: String },
     /// Copying a chimaera binary to the host.
     Installing { binary: PathBuf },
     /// Starting the daemon on the host.
@@ -370,6 +374,178 @@ pub fn dist_name(os: &str, arch: &str) -> String {
     }
 }
 
+/// The Rust target triple for a detected `uname -sm` pair, matching the
+/// daemon asset names the release workflow publishes (`chimaera-<triple>`).
+/// `None` for a target we don't build (no silent guessing — the caller
+/// falls back to the explicit-binary / `just dist` message).
+pub fn release_triple(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64" | "arm64") => Some("aarch64-unknown-linux-musl"),
+        ("darwin", "arm64" | "aarch64") => Some("aarch64-apple-darwin"),
+        _ => None,
+    }
+}
+
+/// The GitHub `releases/download` URL for the daemon asset matching `triple`
+/// in release `vversion` of [`chimaera_core::REPOSITORY`].
+fn release_asset_url(version: &str, triple: &str) -> String {
+    format!(
+        "{}/releases/download/v{version}/chimaera-{triple}",
+        chimaera_core::REPOSITORY.trim_end_matches('/'),
+    )
+}
+
+/// Where auto-fetched daemon binaries are cached: `~/.chimaera/dist/cache/`,
+/// keyed by target triple *and* version so an app upgrade fetches a fresh
+/// daemon instead of redeploying a stale cached one. Kept separate from the
+/// `just dist` stash in [`dist_dir`], which a developer owns and overrides
+/// with.
+fn download_cache_path(triple: &str, version: &str) -> PathBuf {
+    dist_dir()
+        .join("cache")
+        .join(format!("chimaera-{triple}-{version}"))
+}
+
+/// Fetch the daemon binary matching `(os, arch)` from the GitHub release this
+/// build came from (`chimaera_core::VERSION`), caching it under
+/// [`download_cache_path`]. This is the end-user auto-install path — the app
+/// ships no repo and no `just dist` stash, but the release that produced it
+/// carries a musl daemon built from the same commit, so its build id matches
+/// ours and connect won't loop trying to "update" it.
+///
+/// Downloads with the system `curl` (kept dependency-free, like every other
+/// ssh/scp/curl shell-out here) and verifies the bytes against the release's
+/// published sha256 before trusting them — we're about to run this on the
+/// user's login-node account.
+async fn fetch_release_binary(
+    os: &str,
+    arch: &str,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<PathBuf> {
+    let triple = release_triple(os, arch)
+        .ok_or_else(|| anyhow::anyhow!("no prebuilt daemon is published for {os}/{arch}"))?;
+    let version = chimaera_core::VERSION;
+    let cached = download_cache_path(triple, version);
+    if cached.is_file() {
+        tracing::info!("using cached daemon {}", cached.display());
+        return Ok(cached);
+    }
+    progress(Phase::Downloading {
+        target: triple.to_string(),
+    });
+
+    let url = release_asset_url(version, triple);
+    let tmp = cached.with_extension("part");
+    if let Some(parent) = cached.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    tracing::info!("downloading daemon from {url}");
+    let out = Command::new("curl")
+        .args(["-fSL", "--retry", "2", "-o"])
+        .arg(&tmp)
+        .arg(&url)
+        .output()
+        .await
+        .context("failed to run curl (is it installed?)")?;
+    if !out.status.success() {
+        std::fs::remove_file(&tmp).ok();
+        bail!(
+            "could not download {url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+        );
+    }
+
+    if let Err(e) = verify_sha256(&tmp, version, triple).await {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+
+    let mut perms = std::fs::metadata(&tmp)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&tmp, perms)?;
+    std::fs::rename(&tmp, &cached)
+        .with_context(|| format!("failed to finalize {}", cached.display()))?;
+    tracing::info!("cached daemon at {}", cached.display());
+    Ok(cached)
+}
+
+/// Verify `file` against the sha256 the GitHub release publishes for this
+/// asset. The digest comes from the release API (`assets[].digest`); the
+/// local hash is computed with `shasum`/`sha256sum` (no crypto dependency in
+/// this lean crate). A digest we can't fetch is a hard failure, not a skip —
+/// this gate exists precisely for the download we're about to execute
+/// remotely.
+async fn verify_sha256(file: &Path, version: &str, triple: &str) -> anyhow::Result<()> {
+    let want = release_asset_sha256(version, triple)
+        .await
+        .context("could not fetch the release checksum to verify the download against")?;
+    let got = sha256_file(file).await?;
+    if !got.eq_ignore_ascii_case(&want) {
+        bail!("checksum mismatch on the downloaded daemon (expected {want}, got {got})");
+    }
+    tracing::debug!("daemon checksum verified ({want})");
+    Ok(())
+}
+
+/// The published sha256 (hex, no `sha256:` prefix) for `chimaera-<triple>` in
+/// release `vversion`, read from the GitHub releases API via `curl`.
+async fn release_asset_sha256(version: &str, triple: &str) -> anyhow::Result<String> {
+    let repo = repo_slug().context("could not derive the repo from the repository URL")?;
+    let api = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
+    let out = Command::new("curl")
+        .args(["-fsSL", "-H", "Accept: application/vnd.github+json", &api])
+        .output()
+        .await
+        .context("failed to run curl")?;
+    if !out.status.success() {
+        bail!(
+            "release metadata request failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let meta: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
+    let asset_name = format!("chimaera-{triple}");
+    let digest = meta
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|assets| {
+            assets.iter().find(|a| {
+                a.get("name").and_then(serde_json::Value::as_str) == Some(asset_name.as_str())
+            })
+        })
+        .and_then(|a| a.get("digest"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("release v{version} has no checksum for {asset_name}"))?;
+    Ok(digest.trim_start_matches("sha256:").to_string())
+}
+
+/// `owner/repo` from [`chimaera_core::REPOSITORY`] (`https://github.com/owner/repo`).
+fn repo_slug() -> Option<String> {
+    chimaera_core::REPOSITORY
+        .trim_end_matches('/')
+        .strip_prefix("https://github.com/")
+        .map(str::to_string)
+}
+
+/// Hex sha256 of `file`, via `sha256sum` (linux) or `shasum -a 256` (macOS).
+async fn sha256_file(file: &Path) -> anyhow::Result<String> {
+    for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
+        let out = Command::new(bin).args(args).arg(file).output().await;
+        if let Ok(out) = out {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(hex) = text.split_whitespace().next() {
+                    return Ok(hex.to_string());
+                }
+            }
+        }
+    }
+    bail!("could not compute a sha256 (neither sha256sum nor shasum is available)")
+}
+
 /// Verify `$HOME/.chimaera/bin/chimaera` exists on the host, installing it
 /// from the explicit `binary`, else from `~/.chimaera/dist/` by detected
 /// target, erroring with instructions otherwise. `force` re-deploys even
@@ -393,19 +569,27 @@ async fn ensure_remote_binary(
         }
         None => {
             let (os, arch) = remote_target(host).await?;
+            // Prefer a developer's local `just dist` stash if present, so a
+            // repo checkout still overrides with its own build; otherwise
+            // auto-fetch the matching daemon from our release (the end-user
+            // path — no repo, no stash).
             let candidate = dist_dir().join(dist_name(&os, &arch));
-            if !candidate.is_file() {
-                bail!(
-                    "chimaera is not installed on {host} ({os}/{arch}) and no deployable \
-                     build was found at {}.\n\
-                     Provide one with either:\n\
-                     \x20 just dist                 (in the chimaera repo: builds musl binaries \
-                     into ~/.chimaera/dist)\n\
-                     \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}",
-                    candidate.display()
-                );
+            if candidate.is_file() {
+                candidate
+            } else {
+                fetch_release_binary(&os, &arch, progress)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "chimaera is not installed on {host} ({os}/{arch}) and could not be \
+                         fetched automatically: {e}.\n\
+                         Provide one with either:\n\
+                         \x20 just dist                 (in the chimaera repo: builds musl \
+                         binaries into ~/.chimaera/dist)\n\
+                         \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
+                        )
+                    })?
             }
-            candidate
         }
     };
     progress(Phase::Installing {
@@ -554,6 +738,59 @@ mod tests {
         assert_eq!(dist_name("linux", "x86_64"), "chimaera-x86_64-linux-musl");
         assert_eq!(dist_name("linux", "aarch64"), "chimaera-aarch64-linux-musl");
         assert_eq!(dist_name("darwin", "arm64"), "chimaera-arm64-darwin");
+    }
+
+    /// The auto-fetch path must map detected targets to the exact asset names
+    /// the release workflow publishes, and skip targets we don't build.
+    #[test]
+    fn release_triples_match_published_assets() {
+        assert_eq!(
+            release_triple("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            release_triple("linux", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        // Some clusters' uname reports arm64 for 64-bit ARM.
+        assert_eq!(
+            release_triple("linux", "arm64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(
+            release_triple("darwin", "arm64"),
+            Some("aarch64-apple-darwin")
+        );
+        // Not published → no guess.
+        assert_eq!(release_triple("darwin", "x86_64"), None);
+        assert_eq!(release_triple("windows", "x86_64"), None);
+    }
+
+    #[test]
+    fn release_asset_url_is_the_github_download_path() {
+        // Mirrors the assets `attach-daemons` uploads to each release.
+        let url = release_asset_url("0.1.1", "x86_64-unknown-linux-musl");
+        assert!(url.starts_with("https://github.com/"), "{url}");
+        assert!(
+            url.ends_with("/releases/download/v0.1.1/chimaera-x86_64-unknown-linux-musl"),
+            "{url}"
+        );
+        assert_eq!(
+            repo_slug().as_deref(),
+            Some("martinappberg/chimaera"),
+            "repo slug drives the release API url"
+        );
+    }
+
+    /// The download cache is keyed by version so an app upgrade never
+    /// redeploys a stale cached daemon (which would loop the update check).
+    #[test]
+    fn download_cache_is_versioned() {
+        let a = download_cache_path("x86_64-unknown-linux-musl", "0.1.1");
+        let b = download_cache_path("x86_64-unknown-linux-musl", "0.1.2");
+        assert_ne!(a, b);
+        assert!(a.ends_with("chimaera-x86_64-unknown-linux-musl-0.1.1"));
+        assert!(a.starts_with(dist_dir()));
     }
 
     #[test]
