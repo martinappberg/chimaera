@@ -10,6 +10,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+/// Normalize user input into an ssh destination. People reasonably type
+/// what they'd type in a terminal — `ssh cluster` — so a leading `ssh`
+/// token is stripped (field report: the literal string went to ssh as one
+/// hostname and OpenSSH answered "hostname contains invalid characters").
+/// What remains must be a bare alias or `user@host`: whitespace means
+/// flags/commands (those belong in ~/.ssh/config), and a leading `-` would
+/// be an option injected into our own `ssh` argv.
+pub fn normalize_alias(input: &str) -> anyhow::Result<String> {
+    let mut alias = input.trim();
+    while let Some(rest) = alias.strip_prefix("ssh ") {
+        alias = rest.trim_start();
+    }
+    // A residual bare "ssh" means the input was only the command word.
+    if alias.is_empty()
+        || alias == "ssh"
+        || alias.chars().any(char::is_whitespace)
+        || alias.starts_with('-')
+    {
+        anyhow::bail!(
+            "\"{input}\" isn't an ssh destination — use the alias from your \
+             ~/.ssh/config or user@host (e.g. \"cluster\" or \"jane@login.example.edu\"); \
+             ssh options belong in ~/.ssh/config"
+        );
+    }
+    Ok(alias.to_string())
+}
+
 /// A remembered remote host.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostEntry {
@@ -36,9 +63,12 @@ impl HostsStore {
     }
 
     /// Load the store from `path`. A missing or corrupt file yields an empty
-    /// store (with a warning for the corrupt case).
+    /// store (with a warning for the corrupt case). Aliases saved before
+    /// normalization existed (e.g. a literal "ssh cluster") are healed on
+    /// load; ones that stay invalid are kept as-is so the user still sees
+    /// (and can delete) them — connect explains what's wrong.
     pub fn load(path: PathBuf) -> Self {
-        let items = match std::fs::read_to_string(&path) {
+        let mut items: Vec<HostEntry> = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(items) => items,
                 Err(err) => {
@@ -52,6 +82,12 @@ impl HostsStore {
                 Vec::new()
             }
         };
+        for entry in &mut items {
+            if let Ok(normalized) = normalize_alias(&entry.alias) {
+                entry.alias = normalized;
+            }
+        }
+        items.dedup_by(|a, b| a.alias == b.alias);
         HostsStore { path, items }
     }
 
@@ -68,9 +104,12 @@ impl HostsStore {
     }
 
     /// Add `alias` (idempotent; an existing entry is returned unchanged,
-    /// though a newly provided binary path replaces a missing one).
+    /// though a newly provided binary path replaces a missing one). Input is
+    /// normalized — `ssh cluster` stores as `cluster` — and rejected with
+    /// a human message when it can't be an ssh destination.
     pub fn add(&mut self, alias: &str, binary: Option<PathBuf>) -> anyhow::Result<HostEntry> {
-        if let Some(existing) = self.items.iter_mut().find(|h| h.alias == alias) {
+        let alias = &normalize_alias(alias)?;
+        if let Some(existing) = self.items.iter_mut().find(|h| h.alias == *alias) {
             if existing.binary.is_none() && binary.is_some() {
                 existing.binary = binary;
                 let entry = existing.clone();
@@ -181,6 +220,53 @@ mod tests {
         let (mut store, dir) = tmp_store("record");
         store.record_connected("fresh").unwrap();
         assert_eq!(store.get("fresh").unwrap().alias, "fresh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Terminal muscle memory types `ssh <alias>`; the prefix is stripped,
+    /// while flags/whitespace/option-shaped input fail with a human message.
+    #[test]
+    fn normalize_alias_strips_ssh_prefix_and_rejects_junk() {
+        assert_eq!(normalize_alias("cluster").unwrap(), "cluster");
+        assert_eq!(normalize_alias("ssh cluster").unwrap(), "cluster");
+        assert_eq!(
+            normalize_alias("  ssh   jane@login.example.edu ").unwrap(),
+            "jane@login.example.edu"
+        );
+        for bad in [
+            "",
+            "   ",
+            "ssh ",
+            "ssh -p 22 host",
+            "host uname",
+            "-oProxyCommand=x",
+        ] {
+            let err = normalize_alias(bad).unwrap_err().to_string();
+            assert!(err.contains("~/.ssh/config"), "{bad:?}: {err}");
+        }
+    }
+
+    /// Entries saved before validation existed ("ssh cluster" verbatim)
+    /// heal on load; duplicates collapse.
+    #[test]
+    fn load_heals_legacy_ssh_prefixed_aliases() {
+        let (mut store, dir) = tmp_store("heal");
+        store.add("clean", None).unwrap();
+        // Simulate a pre-normalization file by writing entries directly.
+        let raw = serde_json::json!([
+            {"alias": "ssh cluster", "added_at": 1},
+            {"alias": "cluster", "added_at": 2},
+            {"alias": "clean", "added_at": 3},
+        ]);
+        std::fs::write(dir.join("hosts.json"), raw.to_string()).unwrap();
+        let healed = HostsStore::load(dir.join("hosts.json"));
+        let aliases: Vec<String> = healed.list().into_iter().map(|h| h.alias).collect();
+        assert!(aliases.contains(&"cluster".to_string()), "{aliases:?}");
+        assert!(
+            !aliases.iter().any(|a| a.starts_with("ssh ")),
+            "{aliases:?}"
+        );
+        assert_eq!(aliases.iter().filter(|a| *a == "cluster").count(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

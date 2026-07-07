@@ -96,6 +96,10 @@ pub async fn connect(
     opts: ConnectOpts,
     progress: impl Fn(Phase),
 ) -> anyhow::Result<Tunnel> {
+    // Normalize whatever the caller has (saved entries predate validation;
+    // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
+    // so every ssh invocation below sees a real destination.
+    let host = &hosts::normalize_alias(host)?;
     progress(Phase::Probing);
     let manifest = match remote_manifest(host).await? {
         Some(m) if remote_alive(host, m.pid).await? => {
