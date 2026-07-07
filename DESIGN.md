@@ -543,6 +543,17 @@ Launcher field notes (2026-07-06, shipped with the build):
 - Dev-loop nicety: the vite dev server exposes `~/.chimaera/manifest.json` at
   `/dev/manifest` (dev-only middleware, never in a build) so the dev page can self-auth
   without hand-copying tokens.
+- **Detection self-corrects (field: "I updated codex but it still says update"):** the
+  cache is daemon-lifetime, so the popover renders cached rows instantly and re-detects
+  in the background (`?refresh=true`), swapping in the truth — an install/update made
+  since the daemon started surfaces on the next popover open, and the refresh refills
+  the daemon-wide cache POST /sessions spawns from.
+- **Chimaera owns renaming (field: "codex /rename doesn't do anything"):** claude's
+  in-TUI /rename flows through OSC titles by luck of its implementation; no other agent
+  has one. `PATCH /api/v1/sessions/{id} {name}` pins a display name at the PTY layer for
+  ANY session kind — double-click a rail row's name (or F2 on the focused row) for
+  inline rename; the pin outranks every derived name on every surface (rail, tab,
+  strip) and survives into Recents when the session ends.
 
 **Triage dashboard (Leader-d).** Groups top to bottom: **Needs you** (needs_permission +
 idle_prompt + errored), sorted longest-blocked first, rows "ripen" (border saturates with

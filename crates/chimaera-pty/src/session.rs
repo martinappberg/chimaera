@@ -53,6 +53,10 @@ impl Dimensions for TermDimensions {
 
 /// Mutable per-session state guarded by one mutex.
 struct SessionState {
+    /// Display name; renameable for the session's whole life.
+    name: String,
+    /// Whether `name` was pinned explicitly (spawn name or user rename).
+    renamed: bool,
     cols: u16,
     rows: u16,
     alive: bool,
@@ -86,9 +90,6 @@ impl EventListener for EventProxy {
 
 pub(crate) struct Session {
     id: SessionId,
-    name: String,
-    /// Whether `name` was pinned explicitly at spawn (vs derived from cwd).
-    renamed: bool,
     cwd: PathBuf,
     created_at: u64,
     /// OS pid of the direct child, captured at spawn.
@@ -181,6 +182,8 @@ impl Session {
         let term = Arc::new(Mutex::new(Term::new(term_config, &dims, proxy)));
 
         let state = Arc::new(Mutex::new(SessionState {
+            name: name.clone(),
+            renamed,
             cols: opts.cols,
             rows: opts.rows,
             alive: true,
@@ -281,8 +284,6 @@ impl Session {
 
         Ok(Arc::new(Session {
             id,
-            name,
-            renamed,
             cwd,
             created_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -301,13 +302,20 @@ impl Session {
     }
 
     pub(crate) fn info(&self) -> SessionInfo {
-        let (cols, rows, alive, exit_status) = {
+        let (name, renamed, cols, rows, alive, exit_status) = {
             let state = lock_unpoisoned(&self.state);
-            (state.cols, state.rows, state.alive, state.exit_status)
+            (
+                state.name.clone(),
+                state.renamed,
+                state.cols,
+                state.rows,
+                state.alive,
+                state.exit_status,
+            )
         };
         SessionInfo {
             id: self.id.clone(),
-            name: self.name.clone(),
+            name,
             cwd: self.cwd.clone(),
             cols,
             rows,
@@ -316,8 +324,17 @@ impl Session {
             exit_status,
             title: lock_unpoisoned(&self.title).clone(),
             pid: self.child_pid,
-            renamed: self.renamed,
+            renamed,
         }
+    }
+
+    /// Pin a user-chosen display name; it stays authoritative over every
+    /// derived name (OSC titles, agent titles, foreground commands) for the
+    /// session's whole life.
+    pub(crate) fn rename(&self, name: String) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.name = name;
+        state.renamed = true;
     }
 
     /// Foreground process group on the tty (`tcgetpgrp` on the master fd).

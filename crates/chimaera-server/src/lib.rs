@@ -131,7 +131,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/sessions",
             get(api::list_sessions).post(api::create_session),
         )
-        .route("/sessions/{id}", delete(api::delete_session))
+        .route(
+            "/sessions/{id}",
+            delete(api::delete_session).patch(api::rename_session),
+        )
         .route("/agents", get(launcher::list_agents))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
@@ -1421,6 +1424,67 @@ mod tests {
         assert_eq!(lineage.len(), 1, "ancestor resurrected: {entries:?}");
         assert_eq!(lineage[0]["resume"], "both-2b");
         assert_eq!(lineage[0]["title"], "fresh daemon title v2");
+    }
+
+    /// PATCH /sessions/{id} pins a display name for ANY session kind — the
+    /// chimaera-owned rename (claude's /rename flows via OSC; codex, gemini,
+    /// agy, and shells have nothing, so the app must own it).
+    #[tokio::test]
+    async fn rename_session_pins_name_for_any_kind() {
+        let state = test_state();
+        let root = test_dir("rename-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": ws["id"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let id = session["id"].as_str().unwrap().to_string();
+        assert_eq!(session["renamed"], false);
+
+        let (status, _) = request(
+            &state,
+            Method::PATCH,
+            &format!("/api/v1/sessions/{id}"),
+            Some(serde_json::json!({"name": "  qc pipeline  "})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let entry = session_entry(&state, &id).await;
+        assert_eq!(entry["renamed"], true);
+        assert_eq!(entry["name"], "qc pipeline"); // trimmed
+                                                  // The pin outranks every derived name.
+        assert_eq!(entry["display_name"], "qc pipeline");
+
+        // Guardrails: empty and unknown.
+        let (status, _) = request(
+            &state,
+            Method::PATCH,
+            &format!("/api/v1/sessions/{id}"),
+            Some(serde_json::json!({"name": "   "})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = request(
+            &state,
+            Method::PATCH,
+            "/api/v1/sessions/s-nope",
+            Some(serde_json::json!({"name": "x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        state.sessions.kill(&id).ok();
     }
 
     #[tokio::test]

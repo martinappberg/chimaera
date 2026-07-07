@@ -19,6 +19,7 @@
     dotState,
     dotTitle,
     listWorkspaces,
+    renameSession,
     needsAttention,
     pollSessions,
     type AgentSpawn,
@@ -131,6 +132,9 @@
   let recentsTimer: ReturnType<typeof setTimeout> | null = null;
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
+  /** Rail row currently in inline rename (double-click or F2). */
+  let renamingId = $state<string | null>(null);
+  let renameDraft = $state("");
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
   /** Feedback under the retry button on the re-auth overlay. */
@@ -1055,6 +1059,25 @@
     applySessions(sessions.filter((s) => s.id !== id));
   }
 
+  /** Inline rename (double-click / F2 on a rail row): chimaera owns the
+   *  pin — it works for every session kind, not just claude's /rename. */
+  function startRename(s: Session): void {
+    confirmKillId = null;
+    renamingId = s.id;
+    renameDraft = displayNames.get(s.id) ?? displayName(s);
+  }
+
+  function commitRename(): void {
+    const id = renamingId;
+    if (id === null) return;
+    renamingId = null;
+    const name = renameDraft.trim();
+    if (name === "") return; // empty = cancel, never un-pin by accident
+    renameSession(id, name).catch(() => {
+      // next sessions snapshot restores the truth
+    });
+  }
+
   /** The × on a rail row: live sessions get an inline confirm first. */
   function requestKill(s: Session): void {
     if (s.alive) {
@@ -1323,15 +1346,23 @@
               role="button"
               tabindex="0"
               onpointerdowncapture={(e) => {
-                // Capture-phase (directly attached); the close button stays a
-                // plain click.
-                if (e.target instanceof Element && e.target.closest(".close")) return;
+                // Capture-phase (directly attached); the close button and
+                // the rename input stay plain interactive targets.
+                if (
+                  e.target instanceof Element &&
+                  e.target.closest(".close, .rename-input")
+                )
+                  return;
                 onRailRowDown(e, s.id);
               }}
               onkeydown={(e) => {
+                if (renamingId === s.id) return; // the input owns keys
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   openSess(s.id);
+                } else if (e.key === "F2") {
+                  e.preventDefault();
+                  startRename(s);
                 }
               }}
             >
@@ -1344,12 +1375,40 @@
                 size={11}
                 title={dotTitle(s)}
               />
-              <span class="labels">
-                <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
-                {#if s.title && s.title !== s.name && s.title !== s.agent_title}
-                  <span class="title">{s.title}</span>
-                {/if}
-              </span>
+              {#if renamingId === s.id}
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  class="rename-input"
+                  type="text"
+                  autofocus
+                  bind:value={renameDraft}
+                  onkeydown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      commitRename();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      renamingId = null;
+                    }
+                  }}
+                  onblur={commitRename}
+                />
+              {:else}
+                <!-- svelte-ignore a11y_no_static_element_interactions --
+                     dblclick is the mouse path; keyboard rename lives on
+                     the row itself (F2), which carries the button role. -->
+                <span
+                  class="labels"
+                  title="double-click to rename (F2)"
+                  ondblclick={() => startRename(s)}
+                >
+                  <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
+                  {#if s.title && s.title !== s.name && s.title !== s.agent_title}
+                    <span class="title">{s.title}</span>
+                  {/if}
+                </span>
+              {/if}
               <button
                 class="close"
                 aria-label="kill session"
@@ -1808,6 +1867,21 @@
     display: flex;
     flex-direction: column;
     line-height: 1.3;
+  }
+
+  /* Inline rename: sized like .name so the row doesn't jump. */
+  .rename-input {
+    flex: 1;
+    min-width: 0;
+    padding: 1px 4px;
+    margin: 0;
+    border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 4px;
+    background: var(--overlay-bg);
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+    outline: none;
   }
 
   .name,

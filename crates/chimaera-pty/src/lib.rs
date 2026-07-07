@@ -193,6 +193,16 @@ impl SessionManager {
         self.session(id).and_then(|s| s.foreground_pid())
     }
 
+    /// Pin a user-chosen display name on a session (`renamed` becomes true;
+    /// the name outranks every derived name from then on).
+    pub fn rename(&self, id: &str, name: String) -> anyhow::Result<()> {
+        let session = self
+            .session(id)
+            .ok_or_else(|| anyhow!("unknown session: {id}"))?;
+        session.rename(name);
+        Ok(())
+    }
+
     /// Signal the session's child to terminate (SIGHUP); the wait thread
     /// reaps it and the session unregisters itself. Killing an unknown or
     /// already-exited session is a no-op, so deletes are idempotent.

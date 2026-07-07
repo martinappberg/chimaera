@@ -370,6 +370,41 @@ pub(crate) async fn create_session(
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct RenameSession {
+    name: String,
+}
+
+/// PATCH /api/v1/sessions/{id} — pin a user-chosen display name. Works for
+/// EVERY session kind (shells, codex, gemini, agy — not just claude, whose
+/// own /rename happens to flow through OSC titles); the pin outranks every
+/// derived name on every surface.
+pub(crate) async fn rename_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameSession>,
+) -> Response {
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 200 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "name must be 1-200 characters"})),
+        )
+            .into_response();
+    }
+    match state.sessions.rename(&id, name.to_string()) {
+        Ok(()) => {
+            state.changes.notify_waiters();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// DELETE /api/v1/sessions/{id}
 pub(crate) async fn delete_session(
     State(state): State<Arc<AppState>>,

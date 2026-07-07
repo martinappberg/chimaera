@@ -237,6 +237,19 @@ export async function deleteSession(id: string): Promise<void> {
   await json<void>(await api(`/sessions/${id}`, { method: "DELETE" }));
 }
 
+/** Pin a user-chosen display name on a session (any kind — the app owns
+ *  renaming; only claude has an in-TUI /rename, and it shouldn't be the
+ *  only way). The pin outranks every derived name on every surface. */
+export async function renameSession(id: string, name: string): Promise<void> {
+  await json<void>(
+    await api(`/sessions/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+  );
+}
+
 /**
  * Poll GET /api/v1/sessions on an interval to refresh names/titles/alive.
  * Fires immediately, then every `intervalMs`. Returns a stop function.

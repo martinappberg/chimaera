@@ -49,9 +49,19 @@
           0,
           a.findIndex((x) => x.id === def.agent),
         );
+        // The detection cache is daemon-lifetime, so an install/update made
+        // since (field report: codex updated, chip still said "update")
+        // would never surface. Show the cached rows instantly, then
+        // re-detect in the background and swap in the truth.
+        return listAgents(true).then((fresh) => {
+          if (fresh.length > 0) agents = fresh;
+        });
       })
       .catch((e) => {
-        loadError = e instanceof Error ? e.message : "failed to load agents";
+        if (agents === null) {
+          loadError = e instanceof Error ? e.message : "failed to load agents";
+        }
+        // refresh failures keep the cached rows — never blank a shown list
       })
       .finally(() => clearTimeout(loadTimer));
 
@@ -199,7 +209,11 @@
               update
             </button>
           {:else if a.version !== null}
-            <span class="aver" title={a.version}>{a.version.split(" ")[0]}</span>
+            <!-- The number, wherever the CLI put it ("codex-cli 0.52.0",
+                 "2.1.202 (Claude Code)", "0.49.0"). -->
+            <span class="aver" title={a.version}>
+              {a.version.split(" ").find((t) => /^\d/.test(t)) ?? a.version.split(" ")[0]}
+            </span>
           {/if}
         </div>
       {/each}
