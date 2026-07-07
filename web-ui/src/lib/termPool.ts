@@ -15,42 +15,58 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { registerPathLinks, type LinkContext, type PathKind } from "./links";
+import { getSetting, onSettingsChange } from "./settings/store.svelte";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
 /**
- * Default terminal font size. Readability pass 2026-07-06: 13 was measurably
- * small for dense TUI output; 13.5 won the screenshot comparison against 14.
- * At 1x displays both land in the same 8px cell (xterm rounds the advance),
- * but 14's true advance is 8.4px — glyphs get cramped — while 13.5's 8.11px
- * fits cleanly; it also keeps ~4% more columns. JetBrains Mono's tall
- * x-height reads crisply at 13.5 on both 1x and 2x.
+ * Built-in default terminal font size (the terminal.fontSize schema default;
+ * baseFontSize() is the live value). Readability pass 2026-07-06: 13 was
+ * measurably small for dense TUI output; 13.5 won the screenshot comparison
+ * against 14. At 1x displays both land in the same 8px cell (xterm rounds
+ * the advance), but 14's true advance is 8.4px — glyphs get cramped — while
+ * 13.5's 8.11px fits cleanly; it also keeps ~4% more columns. JetBrains
+ * Mono's tall x-height reads crisply at 13.5 on both 1x and 2x.
  */
 export const BASE_FONT_SIZE = 13.5;
-/**
- * Readability pass: xterm multiplies the face's NATURAL line box (~1.32 ×
- * font size for JetBrains Mono), so 1.25 ≈ 1.65 × font size — already
- * generous. 1.35 was screenshot-compared and rejected: it double-spaces
- * dense shell output and costs 2–3 rows per pane while claude's own
- * blank-line rhythm provides the paragraph separation.
- */
-const LINE_HEIGHT = 1.25;
-/**
- * Contrast floor (WCAG ratio) xterm enforces by nudging foreground colors.
- * The 16-color palette below is hand-tuned to >=4.5:1 for text roles, but
- * claude (like most TUIs) also emits 256-color grays and dim text the theme
- * cannot retint — measured at 1.6–3.0:1 on our backgrounds. 3.0 lifts only
- * those illegible cases and leaves intended colors otherwise untouched;
- * 4.5 was evaluated and rejected (it visibly recolors TUI secondary text,
- * flattening claude's visual hierarchy).
- */
-const MIN_CONTRAST = 3.0;
 /** Horizontal/vertical padding on .xterm (see app.css) — fit subtracts it. */
 const PAD_X = 22;
 const PAD_Y = 24;
 
 export const FONT_FAMILY =
   '"JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+
+/** The settings-resolved default font size (per-pane overrides layer on top). */
+export function baseFontSize(): number {
+  return getSetting("terminal.fontSize");
+}
+
+/** The settings-resolved font stack (a custom face falls back to bundled). */
+function fontFamily(): string {
+  const custom = getSetting("terminal.fontFamily").trim();
+  return custom === "" ? FONT_FAMILY : `"${custom.replaceAll('"', "")}", ${FONT_FAMILY}`;
+}
+
+/**
+ * Terminal options derived from settings. Line-height default 1.25: xterm
+ * multiplies the face's NATURAL line box (~1.32 × font size for JetBrains
+ * Mono), so 1.25 ≈ 1.65 × font size — already generous; 1.35 was screenshot-
+ * compared and rejected. Contrast default 3.0: the 16-color palette below is
+ * hand-tuned to >=4.5:1, but TUIs also emit 256-color grays measured at
+ * 1.6–3.0:1 on our backgrounds — 3.0 lifts only those illegible cases while
+ * 4.5 visibly recolors intended secondary text.
+ */
+function settingsOptions() {
+  return {
+    fontFamily: fontFamily(),
+    lineHeight: getSetting("terminal.lineHeight"),
+    cursorStyle: getSetting("terminal.cursorStyle"),
+    cursorBlink: getSetting("terminal.cursorBlink"),
+    scrollback: getSetting("terminal.scrollback"),
+    minimumContrastRatio: getSetting("terminal.minimumContrastRatio"),
+    macOptionIsMeta: getSetting("terminal.macOptionIsMeta"),
+  };
+}
 
 export interface PoolHandlers {
   onTitle(id: string, title: string): void;
@@ -85,6 +101,8 @@ interface PoolEntry {
   lastUsed: number;
   fitTimer: ReturnType<typeof setTimeout> | null;
   pendingFit: boolean;
+  /** Pane font-size override (px); undefined = follow terminal.fontSize. */
+  fontOverride: number | undefined;
   /** Dispose the path link provider + its viewport prefetch. */
   disposeLinks: () => void;
 }
@@ -98,7 +116,6 @@ let handlers: PoolHandlers | null = null;
 let stash: HTMLDivElement | null = null;
 let dragging = false;
 let pendingFocusId: string | null = null;
-let schemeMq: MediaQueryList | null = null;
 
 // Ensure the terminal never opens before the bundled face is available —
 // xterm measures glyph metrics once at open, and a fallback-font measure
@@ -160,7 +177,9 @@ const DARK_ANSI = {
 function themeFromTokens() {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string) => cs.getPropertyValue(name).trim();
-  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  // The settings store pins the resolved theme on <html> before notifying
+  // subscribers, so the attribute (and every CSS var) is already current.
+  const dark = document.documentElement.dataset.theme === "dark";
   return {
     background: v("--term-bg"),
     foreground: v("--fg"),
@@ -210,7 +229,8 @@ function scheduleFit(entry: PoolEntry): void {
   }, REFIT_DEBOUNCE_MS);
 }
 
-function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEntry {
+function createEntry(id: string, parent: HTMLElement, fontOverride: number | undefined): PoolEntry {
+  const fontSize = fontOverride ?? baseFontSize();
   const el = document.createElement("div");
   el.className = "term-slot";
   // The element must be visible and laid out BEFORE term.open(): opening in
@@ -220,16 +240,11 @@ function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEnt
   parent.appendChild(el);
 
   const term = new Terminal({
-    fontFamily: FONT_FAMILY,
+    ...settingsOptions(),
     fontSize,
-    lineHeight: LINE_HEIGHT,
     fontWeight: "400",
     fontWeightBold: "600",
-    cursorBlink: false,
-    cursorStyle: "block",
     drawBoldTextInBrightColors: false,
-    minimumContrastRatio: MIN_CONTRAST,
-    scrollback: 5000,
     theme: themeFromTokens(),
   });
   const fit = new FitAddon();
@@ -257,6 +272,7 @@ function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEnt
     lastUsed: ++clock,
     fitTimer: null,
     pendingFit: false,
+    fontOverride,
     // Clickable paths work in EVERY session — agents and shells alike.
     disposeLinks: registerPathLinks(term, id, {
       context: (sid) => handlers?.linkContext(sid) ?? { cwd: null, root: null },
@@ -287,7 +303,15 @@ function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEnt
 
   term.onData((data) => entry.socket.sendInput(data));
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
-  term.onSelectionChange(() => handlers?.onSelection(id, term.getSelection()));
+  term.onSelectionChange(() => {
+    const text = term.getSelection();
+    handlers?.onSelection(id, text);
+    if (text.length > 0 && getSetting("terminal.copyOnSelect")) {
+      void navigator.clipboard?.writeText(text).catch(() => {
+        // clipboard permission denied; selection still works normally
+      });
+    }
+  });
 
   entry.ro = new ResizeObserver(() => scheduleFit(entry));
   entry.ro.observe(el);
@@ -320,17 +344,19 @@ function evictLru(): void {
   }
 }
 
-function attach(id: string, host: HTMLElement, fontSize: number): void {
+function attach(id: string, host: HTMLElement, fontOverride: number | undefined): void {
   ensureStash();
   let entry = pool.get(id);
   if (entry === undefined) {
-    entry = createEntry(id, host, fontSize);
+    entry = createEntry(id, host, fontOverride);
   } else {
     if (entry.el.parentElement !== host) {
       host.appendChild(entry.el);
     }
-    // The destination pane's font size wins (per-pane override); changing
-    // it re-measures the glyph atlas, so refit to the new grid.
+    // The destination pane's font size wins (override, else the settings
+    // default); changing it re-measures the glyph atlas, so refit.
+    entry.fontOverride = fontOverride;
+    const fontSize = fontOverride ?? baseFontSize();
     if (entry.term.options.fontSize !== fontSize) {
       entry.term.options.fontSize = fontSize;
       fitEntry(entry);
@@ -352,23 +378,36 @@ function attach(id: string, host: HTMLElement, fontSize: number): void {
   });
 }
 
-/** Wire the app-level callbacks and theme tracking. Call once on mount. */
+/** Wire the app-level callbacks and settings tracking. Call once on mount. */
 export function initPool(h: PoolHandlers): void {
   handlers = h;
   ensureStash();
-  schemeMq = matchMedia("(prefers-color-scheme: dark)");
-  schemeMq.addEventListener("change", onSchemeChange);
+  // Settings ground truth: any change (this window, another window, or a
+  // hand-edit of settings.json) re-applies live to every warm terminal.
+  // System theme flips arrive through the same channel — the store resolves
+  // "system" and re-pins data-theme before notifying.
+  unsubscribeSettings = onSettingsChange(applySettingsToPool);
 }
 
-function onSchemeChange(): void {
+function applySettingsToPool(): void {
+  const opts = settingsOptions();
   const theme = themeFromTokens();
-  for (const e of pool.values()) e.term.options.theme = theme;
+  for (const e of pool.values()) {
+    Object.assign(e.term.options, opts, { theme });
+    // Panes without a per-pane override follow the default size live.
+    const size = e.fontOverride ?? baseFontSize();
+    if (e.term.options.fontSize !== size) e.term.options.fontSize = size;
+    // Metrics-affecting options (font, line height) change the cell grid.
+    scheduleFit(e);
+  }
 }
+
+let unsubscribeSettings: (() => void) | null = null;
 
 /** Tear the pool down (app unmount). */
 export function disposePool(): void {
-  schemeMq?.removeEventListener("change", onSchemeChange);
-  schemeMq = null;
+  unsubscribeSettings?.();
+  unsubscribeSettings = null;
   for (const entry of [...pool.values()]) disposeEntry(entry);
   assignments.clear();
   handlers = null;
@@ -386,7 +425,7 @@ export function show(id: string, host: HTMLElement, fontSize?: number): void {
   void fontsReady.then(() => {
     // The pane may have moved on (tab switch, unmount) while fonts loaded.
     if (assignments.get(host) !== id || handlers === null) return;
-    attach(id, host, fontSize ?? BASE_FONT_SIZE);
+    attach(id, host, fontSize);
   });
 }
 
@@ -451,23 +490,29 @@ export function getSize(id: string): { cols: number; rows: number } | null {
   return { cols: entry.term.cols, rows: entry.term.rows };
 }
 
-let cellCache: { w: number; h: number } | null = null;
+let cellCache: { key: string; w: number; h: number } | null = null;
 
-/** Measure one JetBrains Mono cell the way xterm will (DOM probe). */
+/** Measure one terminal cell the way xterm will (DOM probe), at the current
+ *  settings-resolved font metrics. */
 function cellDims(): { w: number; h: number } {
-  if (cellCache !== null) return cellCache;
+  const size = baseFontSize();
+  const family = fontFamily();
+  const lineHeight = getSetting("terminal.lineHeight");
+  const key = `${size}|${lineHeight}|${family}`;
+  if (cellCache !== null && cellCache.key === key) return cellCache;
   const probe = document.createElement("span");
   probe.textContent = "W";
-  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${BASE_FONT_SIZE}px ${FONT_FAMILY};line-height:${LINE_HEIGHT};`;
+  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${size}px ${family};line-height:${lineHeight};`;
   document.body.appendChild(probe);
   const rect = probe.getBoundingClientRect();
   probe.remove();
   const dims = {
-    w: rect.width > 1 ? rect.width : BASE_FONT_SIZE * 0.6,
-    h: rect.height > 1 ? rect.height : Math.round(BASE_FONT_SIZE * LINE_HEIGHT),
+    key,
+    w: rect.width > 1 ? rect.width : size * 0.6,
+    h: rect.height > 1 ? rect.height : Math.round(size * lineHeight),
   };
   // Only cache once the bundled font has had a chance to load.
-  if (document.fonts.check(`400 ${BASE_FONT_SIZE}px "JetBrains Mono"`)) cellCache = dims;
+  if (document.fonts.check(`400 ${size}px "JetBrains Mono"`)) cellCache = dims;
   return dims;
 }
 

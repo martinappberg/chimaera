@@ -75,6 +75,7 @@
     if (tab.surface === "terminal") {
       return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
     }
+    if (tab.surface === "settings") return "Settings";
     return fileNames.get(tab.path) ?? basename(tab.path);
   }
 
@@ -181,6 +182,18 @@
               stroke-width="1.5"
               stroke-linecap="round"
               stroke-linejoin="round"
+            />
+          </svg>
+        {:else if tab.surface === "settings"}
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>settings</title>
+            <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <path
+              d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
             />
           </svg>
         {:else if $dirtyFiles.has(tab.path)}

@@ -7,6 +7,7 @@
    */
   import { tick, untrack } from "svelte";
   import { fsList, type FsEntry } from "./files";
+  import { getSetting } from "./settings/store.svelte";
   import FileIcon from "./FileIcon.svelte";
 
   interface Props {
@@ -127,10 +128,23 @@
     });
   });
 
+  // files.showHidden toggles re-list every visible dir in place (expansion
+  // and scroll survive; a hidden dir that vanishes just prunes its subtree).
+  let lastHidden = getSetting("files.showHidden");
+  $effect(() => {
+    const hidden = getSetting("files.showHidden");
+    untrack(() => {
+      if (hidden === lastHidden) return;
+      lastHidden = hidden;
+      void load(root);
+      for (const dir of expanded) void load(dir);
+    });
+  });
+
   async function load(dir: string): Promise<void> {
     loading = new Set(loading).add(dir);
     try {
-      const listing = await fsList(dir);
+      const listing = await fsList(dir, getSetting("files.showHidden"));
       const next = new Map(listings);
       next.set(dir, listing.entries);
       listings = next;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fsTable, type TablePage } from "./files";
+  import { getSetting } from "./settings/store.svelte";
 
   interface Props {
     path: string;
@@ -7,7 +8,8 @@
 
   let { path }: Props = $props();
 
-  const PAGE_ROWS = 200;
+  /** Rows per fetched page (settings ground truth, read per request). */
+  const pageRows = () => getSetting("files.tableRowsPerPage");
   /** Start fetching the next page when the scroll gets this close to the end. */
   const PREFETCH_PX = 600;
   const MIN_COL_PX = 48;
@@ -75,7 +77,7 @@
   async function loadFirst(p: string): Promise<void> {
     loading = true;
     try {
-      const page = await fsTable(p, 0, PAGE_ROWS);
+      const page = await fsTable(p, 0, pageRows());
       if (p !== path) return;
       apply(page, true);
       scroller?.scrollTo({ top: 0 });
@@ -94,7 +96,7 @@
     const p = path;
     const off = loadedOffset + rows.length;
     try {
-      const page = await fsTable(p, off, PAGE_ROWS);
+      const page = await fsTable(p, off, pageRows());
       if (p !== path) return;
       apply(page, false);
     } catch (e) {

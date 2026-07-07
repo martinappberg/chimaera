@@ -24,6 +24,7 @@
     HighlightStyle,
     bracketMatching,
     indentOnInput,
+    indentUnit,
   } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
   import {
@@ -46,6 +47,7 @@
   } from "./files";
   import { ApiError } from "./api";
   import { setDirty, forgetDirty } from "./editing";
+  import { getSetting } from "./settings/store.svelte";
   import { isMac } from "./keys";
   import { clearSelection, setSelection } from "./reference";
   import ReferenceChip from "./ReferenceChip.svelte";
@@ -79,6 +81,7 @@
 
   let view: EditorView | null = null;
   const editCompartment = new Compartment();
+  const settingsCompartment = new Compartment();
 
   // Context bridge: this view's selection, published for the reference
   // affordance + chord. The chip floats near the selection's end.
@@ -151,33 +154,34 @@
     { tag: t.invalid, color: "var(--err)" },
   ]);
 
-  const theme = EditorView.theme({
-    "&": {
-      backgroundColor: "transparent",
-      color: "var(--fg)",
-      height: "100%",
-      fontSize: "12.5px",
-    },
-    ".cm-scroller": {
-      fontFamily: "var(--mono)",
-      lineHeight: "1.55",
-      overflow: "auto",
-    },
-    ".cm-content": {
-      padding: "10px 0 14px",
-    },
-    ".cm-line": {
-      padding: "0 14px 0 8px",
-    },
-    ".cm-gutters": {
-      backgroundColor: "transparent",
-      color: "var(--muted)",
-      border: "none",
-      fontFamily: "var(--mono)",
-      fontSize: "11px",
-      opacity: "0.65",
-      userSelect: "none",
-    },
+  const makeTheme = (fontSize: number, lineHeight: number) =>
+    EditorView.theme({
+      "&": {
+        backgroundColor: "transparent",
+        color: "var(--fg)",
+        height: "100%",
+        fontSize: `${fontSize}px`,
+      },
+      ".cm-scroller": {
+        fontFamily: "var(--mono)",
+        lineHeight: `${lineHeight}`,
+        overflow: "auto",
+      },
+      ".cm-content": {
+        padding: "10px 0 14px",
+      },
+      ".cm-line": {
+        padding: "0 14px 0 8px",
+      },
+      ".cm-gutters": {
+        backgroundColor: "transparent",
+        color: "var(--muted)",
+        border: "none",
+        fontFamily: "var(--mono)",
+        fontSize: `${Math.max(9, Math.round(fontSize - 1.5))}px`,
+        opacity: "0.65",
+        userSelect: "none",
+      },
     ".cm-lineNumbers .cm-gutterElement": {
       padding: "0 6px 0 14px",
       minWidth: "3ch",
@@ -193,6 +197,26 @@
       backgroundColor: "color-mix(in srgb, var(--accent) 16%, transparent)",
       outline: "none",
     },
+  });
+
+  /** Settings-driven extensions (swapped live via settingsCompartment). */
+  function settingsExtensions() {
+    const tabSize = getSetting("editor.tabSize");
+    return [
+      makeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
+      getSetting("editor.lineNumbers") ? lineNumbers() : [],
+      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      EditorState.tabSize.of(tabSize),
+      indentUnit.of(" ".repeat(tabSize)),
+    ];
+  }
+
+  // Live settings changes (this window or any other) reconfigure in place.
+  $effect(() => {
+    const extensions = settingsExtensions();
+    if (view !== null) {
+      view.dispatch({ effects: settingsCompartment.reconfigure(extensions) });
+    }
   });
 
   /** The editable/read-only extension set for the compartment. */
@@ -245,12 +269,11 @@
     const state = EditorState.create({
       doc: text,
       extensions: [
-        lineNumbers(),
+        settingsCompartment.of(settingsExtensions()),
         highlightSpecialChars(),
         drawSelection(),
         bracketMatching(),
         syntaxHighlighting(highlight, { fallback: true }),
-        theme,
         // Context bridge: track the selection in both read-only and editable
         // modes (this listener lives outside the edit compartment).
         EditorView.updateListener.of((u) => {

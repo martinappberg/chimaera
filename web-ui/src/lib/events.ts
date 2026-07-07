@@ -8,6 +8,12 @@ export interface EventsSocketHandlers {
   /** Full session-list snapshot pushed by the daemon. */
   onSessions(sessions: Session[]): void;
   /**
+   * Full settings map (settings.json ground truth), pushed after auth and
+   * again whenever it changes — a PUT from any window or a hand-edit of the
+   * file on disk.
+   */
+  onSettings?(settings: Record<string, unknown>): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -23,6 +29,7 @@ export interface EventsSocketHandlers {
 interface ServerEventFrame {
   type: string;
   sessions?: Session[];
+  settings?: Record<string, unknown>;
   message?: string;
 }
 
@@ -67,6 +74,13 @@ export class EventsSocket {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.setConnected(true);
         this.handlers.onSessions(msg.sessions);
+      } else if (
+        msg.type === "settings" &&
+        typeof msg.settings === "object" &&
+        msg.settings !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onSettings?.(msg.settings);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

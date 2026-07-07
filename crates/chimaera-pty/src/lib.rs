@@ -54,6 +54,8 @@ pub struct SpawnOpts {
     /// Caller-chosen session id (must be unused). `None` generates one. This
     /// lets callers embed the id in the command/environment before spawning.
     pub id: Option<SessionId>,
+    /// Scrollback lines kept server-side. `None` = the default (10k).
+    pub scrollback: Option<usize>,
 }
 
 /// Out-of-band events emitted by a session.

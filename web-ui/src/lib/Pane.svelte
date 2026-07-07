@@ -7,6 +7,7 @@
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
   import FileView from "./FileView.svelte";
+  import SettingsView from "./SettingsView.svelte";
 
   interface Props {
     node: PaneNode;
@@ -71,8 +72,10 @@
     {#if activeTab !== null}
       {#if activeTab.surface === "terminal"}
         <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
-      {:else}
+      {:else if activeTab.surface === "file"}
         <FileView path={activeTab.path} />
+      {:else}
+        <SettingsView />
       {/if}
     {:else if names.size === 0}
       <!-- No sessions to open or drag yet: point at creating one. -->

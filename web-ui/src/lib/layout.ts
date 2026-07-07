@@ -26,11 +26,18 @@ export interface FileTab {
   /** Absolute path on the daemon's filesystem. */
   path: string;
 }
-export type Tab = TerminalTab | FileTab;
+/** The settings surface — a singleton view (no-duplicates gives "focus the
+ *  existing settings tab" for free, VS Code semantics). */
+export interface SettingsTab {
+  surface: "settings";
+}
+export type Tab = TerminalTab | FileTab | SettingsTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
-  return t.surface === "terminal" ? `s:${t.sessionId}` : `f:${t.path}`;
+  if (t.surface === "terminal") return `s:${t.sessionId}`;
+  if (t.surface === "file") return `f:${t.path}`;
+  return "v:settings";
 }
 
 export interface PaneNode {
@@ -312,6 +319,10 @@ export function openFile(l: Layout, path: string): Layout {
   return openTab(l, { surface: "file", path });
 }
 
+export function openSettings(l: Layout): Layout {
+  return openTab(l, { surface: "settings" });
+}
+
 /** Cycle the focused pane's active tab by `delta` (wraps). */
 export function cycleTab(l: Layout, delta: number): Layout {
   const p = findPane(l.root, l.focusedPaneId);
@@ -557,8 +568,9 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 
 // --- (de)serialization ------------------------------------------------------
 
-/** Tab wire form: `{s}` terminal, `{f}` file (additive within blob v1). */
-type STab = { s: string } | { f: string };
+/** Tab wire form: `{s}` terminal, `{f}` file, `{v}` view (additive within
+ *  blob v1; `v` currently only "settings"). */
+type STab = { s: string } | { f: string } | { v: string };
 interface SPane {
   t: "p";
   id: string;
@@ -582,9 +594,11 @@ function serNode(node: LayoutNode): SNode {
     const pane: SPane = {
       t: "p",
       id: node.id,
-      tabs: node.tabs.map((t): STab =>
-        t.surface === "terminal" ? { s: t.sessionId } : { f: t.path },
-      ),
+      tabs: node.tabs.map((t): STab => {
+        if (t.surface === "terminal") return { s: t.sessionId };
+        if (t.surface === "file") return { f: t.path };
+        return { v: "settings" };
+      }),
       active: node.active,
     };
     if (node.fontSize !== undefined) pane.fs = node.fontSize;
@@ -629,6 +643,8 @@ function deserNode(
         tab = { surface: "terminal", sessionId: t.s };
       } else if (typeof t.f === "string" && t.f.length > 0 && t.f.length <= 4096) {
         tab = { surface: "file", path: t.f };
+      } else if (t.v === "settings") {
+        tab = { surface: "settings" };
       } else {
         return null;
       }
@@ -757,6 +773,18 @@ if (import.meta.env.DEV) {
     "round-trip keeps file tabs",
   );
   ok(deserializeLayout({ v: 1, root: { t: "x" } }) === null, "malformed blobs are rejected");
+
+  // settings surface: singleton (dedupes) and survives serialization
+  let st = defaultLayout();
+  st = openSettings(st);
+  st = openSettings(st);
+  ok(tabCount(st) === 1, "openSettings never duplicates");
+  const stRound = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(st))));
+  ok(
+    stRound !== null &&
+      findPane(stRound.root, stRound.focusedPaneId)?.tabs[0]?.surface === "settings",
+    "settings tab round-trips",
+  );
 
   // window-edge root split: new pane spans the full edge; same-place no-ops
   let re = defaultLayout();

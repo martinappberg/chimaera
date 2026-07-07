@@ -220,6 +220,8 @@ pub(crate) async fn create_session(
         rows: body.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
         id: None,
+        // settings.json ground truth; applies to sessions spawned from now on.
+        scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
 
     // Agent sessions: resolve claude (once per daemon, via the login shell),
