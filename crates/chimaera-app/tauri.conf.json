@@ -20,7 +20,10 @@
     "category": "DeveloperTool",
     "shortDescription": "Agent-native IDE for local and HPC work",
     "icon": ["icons/icon.icns", "icons/icon.png"],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "-"
+    }
   },
   "plugins": {
     "updater": {

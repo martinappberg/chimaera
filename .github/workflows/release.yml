@@ -118,9 +118,13 @@ jobs:
       - run: npm install
         working-directory: crates/chimaera-app
       # The app version drives both the bundle and the updater comparison.
+      # The root workspace version is stamped too so chimaera-core::VERSION —
+      # which the app reads to auto-fetch the matching remote daemon from this
+      # release — reports the release version, not the "0.0.1" dev sentinel.
       - run: |
           sed -i "" "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
           sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
+          sed -i "" "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

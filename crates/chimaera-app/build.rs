@@ -14,6 +14,7 @@ fn main() {
             "open_window",
             "check_app_update",
             "install_app_update",
+            "answer_askpass",
         ]),
     ))
     .expect("failed to run tauri-build");

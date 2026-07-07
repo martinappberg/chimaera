@@ -2,16 +2,91 @@
 //! install, daemon start, and port-forward tunnels. Shared by the CLI
 //! (`chimaera connect`) and the native shell, so both speak the exact same
 //! protocol to a host — including inheriting the user's `~/.ssh/config`
-//! (ProxyJump, ControlMaster, 2FA) by never reimplementing the ssh client.
+//! (ProxyJump, 2FA) by never reimplementing the ssh client.
+//!
+//! Every ssh/scp invocation here rides one chimaera-owned ControlMaster (see
+//! [`ssh_opts`]): the user authenticates once — password or 2FA — and every
+//! subsequent command, tunnel, and new window multiplexes that single
+//! connection with no further prompts, kept warm by `ControlPersist` so
+//! opening new things on the host stays instant. The same options set a
+//! trust-on-first-use host-key policy, so a freshly installed app can connect
+//! to a host it has never seen without a tty to confirm the key.
 
 pub mod hosts;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use chimaera_core::Manifest;
 use tokio::process::{Child, Command};
+
+/// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
+/// is ssh's own hash of (localhost, remotehost, port, user): unique per
+/// destination and short enough to stay under the ~104-char unix-socket path
+/// limit a full hostname would blow past. The parent dir is created on demand
+/// (ssh will not create it for the socket).
+fn control_path() -> String {
+    let dir = chimaera_core::data_dir().join("cm");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
+    }
+    dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// The `-o` options shared by every chimaera ssh/scp call to a host.
+///
+/// *ControlMaster* — `ControlMaster=auto` makes the first connection the
+/// master and later ones reuse it; `ControlPersist` keeps it warm after
+/// clients disconnect so reconnects and new windows skip re-authentication.
+///
+/// *Host key* — `StrictHostKeyChecking=accept-new` is the trust-on-first-use
+/// policy a windowed app needs: ssh has no tty to answer the "authenticity of
+/// host … (yes/no)?" prompt, so a freshly installed app connecting to a host
+/// it has never seen would otherwise fail outright. `accept-new` records an
+/// unknown key automatically but still *refuses* a changed one — keeping the
+/// MITM protection that a blanket `=no` would throw away.
+fn ssh_opts() -> [String; 8] {
+    [
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}", control_path()),
+        "-o".into(),
+        "ControlPersist=10m".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+    ]
+}
+
+/// An `ssh` command pre-loaded with the shared options, no host yet. For
+/// flag-heavy invocations where the destination must come last
+/// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
+fn ssh_base() -> Command {
+    let mut c = Command::new("ssh");
+    c.args(ssh_opts());
+    c
+}
+
+/// An `ssh` command pre-loaded with the shared ControlMaster options and
+/// pointed at `host`, ready for the remote command to be appended. The common
+/// shape (`ssh <opts> host <cmd>`); every plain remote command goes through
+/// here so they all share one authenticated connection.
+fn ssh_cmd(host: &str) -> Command {
+    let mut c = ssh_base();
+    c.arg(host);
+    c
+}
+
+/// An `scp` command pre-loaded with the shared options, so a binary copy
+/// reuses the connection the probe already authenticated instead of prompting
+/// again.
+fn scp_cmd() -> Command {
+    let mut c = Command::new("scp");
+    c.args(ssh_opts());
+    c
+}
 
 /// Where the connect flow currently is; consumers surface these however
 /// fits (tracing lines in the CLI, progress events in the shell).
@@ -21,6 +96,9 @@ pub enum Phase {
     Probing,
     /// Replacing an outdated remote daemon (graceful stop, then redeploy).
     Updating,
+    /// Fetching the matching daemon binary from the GitHub release this build
+    /// came from (the end-user path: no repo, no `just dist` stash).
+    Downloading { target: String },
     /// Copying a chimaera binary to the host.
     Installing { binary: PathBuf },
     /// Starting the daemon on the host.
@@ -121,10 +199,12 @@ impl Tunnel {
     }
 
     /// Kill the tunnel child and cancel any master-held forward so local
-    /// ports don't leak past the session that opened them.
+    /// ports don't leak past the session that opened them. Only the forward
+    /// is cancelled — the ControlMaster stays (ControlPersist), so reconnects
+    /// and other windows on this host keep their authenticated connection.
     pub async fn close(mut self) {
         self.child.kill().await.ok();
-        let _ = Command::new("ssh")
+        let _ = ssh_base()
             .args(["-O", "cancel", "-L"])
             .arg(format!(
                 "{}:127.0.0.1:{}",
@@ -179,8 +259,13 @@ pub async fn connect(
                         sessions.map_or("unknown".to_string(), |n| n.to_string()),
                     );
                     progress(Phase::Updating);
+                    // Secure the replacement binary BEFORE stopping the
+                    // running daemon: a failed download/build must never leave
+                    // the host with nothing running (the bug that stranded a
+                    // stopped daemon when a dev build 404'd on download).
+                    let bin = resolve_local_binary(host, opts.binary.as_deref(), &progress).await?;
                     stop_remote(host, m.pid).await?;
-                    ensure_remote_binary(host, opts.binary.as_deref(), true, &progress).await?;
+                    deploy_binary(host, &bin, &progress).await?;
                     progress(Phase::Starting);
                     start_remote(host).await?
                 }
@@ -199,7 +284,7 @@ pub async fn connect(
             }
         }
         _ => {
-            ensure_remote_binary(host, opts.binary.as_deref(), false, &progress).await?;
+            ensure_remote_binary(host, opts.binary.as_deref(), &progress).await?;
             progress(Phase::Starting);
             start_remote(host).await?
         }
@@ -228,8 +313,7 @@ pub async fn connect(
 
 /// Fetch and parse the remote manifest, if any.
 pub async fn remote_manifest(host: &str) -> anyhow::Result<Option<Manifest>> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg("cat ~/.chimaera/manifest.json 2>/dev/null")
         .output()
         .await
@@ -263,8 +347,7 @@ pub async fn remote_sessions_count(
         "curl -fsS -m 5 --config - http://127.0.0.1:{}/api/v1/sessions",
         manifest.port
     );
-    let mut child = Command::new("ssh")
-        .arg(host)
+    let mut child = ssh_cmd(host)
         .arg(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -333,8 +416,7 @@ pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
 
 /// `uname -sm` on the host, lowercased: e.g. `("linux", "x86_64")`.
 pub async fn remote_target(host: &str) -> anyhow::Result<(String, String)> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg("uname -sm")
         .output()
         .await
@@ -370,54 +452,253 @@ pub fn dist_name(os: &str, arch: &str) -> String {
     }
 }
 
-/// Verify `$HOME/.chimaera/bin/chimaera` exists on the host, installing it
-/// from the explicit `binary`, else from `~/.chimaera/dist/` by detected
-/// target, erroring with instructions otherwise. `force` re-deploys even
-/// over an existing binary (the self-update path — the daemon must be
-/// stopped first).
-async fn ensure_remote_binary(
+/// The Rust target triple for a detected `uname -sm` pair, matching the
+/// daemon asset names the release workflow publishes (`chimaera-<triple>`).
+/// `None` for a target we don't build (no silent guessing — the caller
+/// falls back to the explicit-binary / `just dist` message).
+pub fn release_triple(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64" | "arm64") => Some("aarch64-unknown-linux-musl"),
+        ("darwin", "arm64" | "aarch64") => Some("aarch64-apple-darwin"),
+        _ => None,
+    }
+}
+
+/// A daemon asset resolved from the GitHub releases API: the release version
+/// it belongs to, its download URL, and its published sha256 (hex).
+struct ReleaseAsset {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+/// Resolve the daemon asset to download for `triple`. Prefers the release this
+/// build came from (`v{VERSION}` — so a real release's daemon shares our build
+/// id and connect never loops "updating"); falls back to GitHub's `latest`
+/// release when there is no matching one, so a dev build (version `0.0.1`) — or
+/// any version without a published release — still gets a working daemon
+/// instead of a hard 404.
+async fn resolve_release_asset(triple: &str) -> anyhow::Result<ReleaseAsset> {
+    let asset_name = format!("chimaera-{triple}");
+    let version = chimaera_core::VERSION;
+    if let Some(a) = release_asset(&format!("tags/v{version}"), &asset_name).await? {
+        return Ok(a);
+    }
+    tracing::info!("no v{version} release with {asset_name}; falling back to the latest release");
+    release_asset("latest", &asset_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no published release provides {asset_name}"))
+}
+
+/// Look up `asset_name` in the release identified by `release_ref`
+/// (`tags/vX.Y.Z` or `latest`) via the GitHub API. `Ok(None)` when that release
+/// doesn't exist or lacks the asset — so the caller can fall back — and `Err`
+/// only on a transport/parse failure.
+async fn release_asset(
+    release_ref: &str,
+    asset_name: &str,
+) -> anyhow::Result<Option<ReleaseAsset>> {
+    let repo = repo_slug().context("could not derive the repo from the repository URL")?;
+    let api = format!("https://api.github.com/repos/{repo}/releases/{release_ref}");
+    // No `-f`: a missing release answers 404 with a JSON body we detect below,
+    // which we want to treat as "fall back", not as a curl error.
+    let out = Command::new("curl")
+        .args(["-sSL", "-H", "Accept: application/vnd.github+json", &api])
+        .output()
+        .await
+        .context("failed to run curl (is it installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "release metadata request failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let meta: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
+    // A missing release is `{"message": "Not Found", ...}` — no `tag_name`.
+    let Some(tag) = meta.get("tag_name").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(asset) = meta
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(asset_name))
+        })
+    else {
+        return Ok(None);
+    };
+    let url = asset
+        .get("browser_download_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{asset_name} in {tag} has no download url"))?;
+    let sha256 = asset
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("release {tag} has no checksum for {asset_name}"))?
+        .trim_start_matches("sha256:")
+        .to_string();
+    Ok(Some(ReleaseAsset {
+        version: tag.trim_start_matches('v').to_string(),
+        url: url.to_string(),
+        sha256,
+    }))
+}
+
+/// Where auto-fetched daemon binaries are cached: `~/.chimaera/dist/cache/`,
+/// keyed by target triple *and* version so an app upgrade fetches a fresh
+/// daemon instead of redeploying a stale cached one. Kept separate from the
+/// `just dist` stash in [`dist_dir`], which a developer owns and overrides
+/// with.
+fn download_cache_path(triple: &str, version: &str) -> PathBuf {
+    dist_dir()
+        .join("cache")
+        .join(format!("chimaera-{triple}-{version}"))
+}
+
+/// Fetch the daemon binary matching `(os, arch)` from GitHub releases (see
+/// [`resolve_release_asset`] for version-vs-latest selection), caching it under
+/// [`download_cache_path`] keyed by the resolved version. This is the end-user
+/// auto-install path — the app ships no repo and no `just dist` stash.
+///
+/// Downloads with the system `curl` (kept dependency-free, like every other
+/// ssh/scp/curl shell-out here) and verifies the bytes against the release's
+/// published sha256 before trusting them — we're about to run this on the
+/// user's login-node account.
+async fn fetch_release_binary(
+    os: &str,
+    arch: &str,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<PathBuf> {
+    let triple = release_triple(os, arch)
+        .ok_or_else(|| anyhow::anyhow!("no prebuilt daemon is published for {os}/{arch}"))?;
+    let asset = resolve_release_asset(triple).await?;
+    let cached = download_cache_path(triple, &asset.version);
+    if cached.is_file() {
+        tracing::info!("using cached daemon {}", cached.display());
+        return Ok(cached);
+    }
+    progress(Phase::Downloading {
+        target: triple.to_string(),
+    });
+
+    let tmp = cached.with_extension("part");
+    if let Some(parent) = cached.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    tracing::info!("downloading daemon {} from {}", asset.version, asset.url);
+    let out = Command::new("curl")
+        .args(["-fSL", "--retry", "2", "-o"])
+        .arg(&tmp)
+        .arg(&asset.url)
+        .output()
+        .await
+        .context("failed to run curl (is it installed?)")?;
+    if !out.status.success() {
+        std::fs::remove_file(&tmp).ok();
+        bail!(
+            "could not download {}: {}",
+            asset.url,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        );
+    }
+
+    let got = sha256_file(&tmp).await?;
+    if !got.eq_ignore_ascii_case(&asset.sha256) {
+        std::fs::remove_file(&tmp).ok();
+        bail!(
+            "checksum mismatch on the downloaded daemon (expected {}, got {got})",
+            asset.sha256,
+        );
+    }
+
+    let mut perms = std::fs::metadata(&tmp)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&tmp, perms)?;
+    std::fs::rename(&tmp, &cached)
+        .with_context(|| format!("failed to finalize {}", cached.display()))?;
+    tracing::info!("cached daemon at {}", cached.display());
+    Ok(cached)
+}
+
+/// `owner/repo` from [`chimaera_core::REPOSITORY`] (`https://github.com/owner/repo`).
+fn repo_slug() -> Option<String> {
+    chimaera_core::REPOSITORY
+        .trim_end_matches('/')
+        .strip_prefix("https://github.com/")
+        .map(str::to_string)
+}
+
+/// Hex sha256 of `file`, via `sha256sum` (linux) or `shasum -a 256` (macOS).
+async fn sha256_file(file: &Path) -> anyhow::Result<String> {
+    for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
+        let out = Command::new(bin).args(args).arg(file).output().await;
+        if let Ok(out) = out {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(hex) = text.split_whitespace().next() {
+                    return Ok(hex.to_string());
+                }
+            }
+        }
+    }
+    bail!("could not compute a sha256 (neither sha256sum nor shasum is available)")
+}
+
+/// Resolve the LOCAL binary to deploy to a host of the target inferred from
+/// `host`: an explicit `binary`, else a developer's `just dist` stash, else
+/// auto-fetched from our release. Touches only the local machine (bar a
+/// read-only `uname` over the shared connection) — callers resolve this
+/// *before* stopping a running daemon, so a failed fetch never strands a host
+/// with no daemon.
+async fn resolve_local_binary(
     host: &str,
     binary: Option<&Path>,
-    force: bool,
     progress: &impl Fn(Phase),
-) -> anyhow::Result<()> {
-    if !force && ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
-        return Ok(());
+) -> anyhow::Result<PathBuf> {
+    if let Some(p) = binary {
+        if !p.is_file() {
+            bail!("binary {} does not exist", p.display());
+        }
+        return Ok(p.to_path_buf());
     }
-    let path = match binary {
-        Some(p) => {
-            if !p.is_file() {
-                bail!("binary {} does not exist", p.display());
-            }
-            p.to_path_buf()
-        }
-        None => {
-            let (os, arch) = remote_target(host).await?;
-            let candidate = dist_dir().join(dist_name(&os, &arch));
-            if !candidate.is_file() {
-                bail!(
-                    "chimaera is not installed on {host} ({os}/{arch}) and no deployable \
-                     build was found at {}.\n\
-                     Provide one with either:\n\
-                     \x20 just dist                 (in the chimaera repo: builds musl binaries \
-                     into ~/.chimaera/dist)\n\
-                     \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}",
-                    candidate.display()
-                );
-            }
-            candidate
-        }
-    };
+    let (os, arch) = remote_target(host).await?;
+    // Prefer a developer's local `just dist` stash if present, so a repo
+    // checkout still overrides with its own build; otherwise auto-fetch the
+    // matching daemon from our release (the end-user path — no repo, no stash).
+    let candidate = dist_dir().join(dist_name(&os, &arch));
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    fetch_release_binary(&os, &arch, progress)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "chimaera is not installed on {host} ({os}/{arch}) and could not be \
+                 fetched automatically: {e}.\n\
+                 Provide one with either:\n\
+                 \x20 just dist                 (in the chimaera repo: builds musl \
+                 binaries into ~/.chimaera/dist)\n\
+                 \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
+            )
+        })
+}
+
+/// Copy `path` to `$HOME/.chimaera/bin/chimaera` on the host, staged +
+/// renamed so an interrupted copy never leaves a half-written executable and
+/// the old inode stays intact for anything still running it.
+async fn deploy_binary(host: &str, path: &Path, progress: &impl Fn(Phase)) -> anyhow::Result<()> {
     progress(Phase::Installing {
-        binary: path.clone(),
+        binary: path.to_path_buf(),
     });
     tracing::info!("installing {} on {host}", path.display());
     ssh_run(host, "mkdir -p $HOME/.chimaera/bin").await?;
-    // Stage + rename, never truncate the live path in place: an interrupted
-    // copy must not leave a half-written-but-executable binary behind, and
-    // rename keeps the old inode intact for anything still running it.
-    let output = Command::new("scp")
-        .arg(&path)
+    let output = scp_cmd()
+        .arg(path)
         .arg(format!("{host}:.chimaera/bin/chimaera.new"))
         .output()
         .await
@@ -435,6 +716,22 @@ async fn ensure_remote_binary(
     )
     .await?;
     Ok(())
+}
+
+/// Ensure the host has a chimaera binary, installing one only if absent (the
+/// fresh-host path — an existing binary is left as-is). Replacing an outdated
+/// one is the caller's job: resolve + deploy around a graceful stop, in that
+/// order, so a failed fetch never kills a working daemon.
+async fn ensure_remote_binary(
+    host: &str,
+    binary: Option<&Path>,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<()> {
+    if ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
+        return Ok(());
+    }
+    let path = resolve_local_binary(host, binary, progress).await?;
+    deploy_binary(host, &path, progress).await
 }
 
 /// Start the daemon on the host and poll until its manifest reports alive.
@@ -477,7 +774,7 @@ fn pick_local_port(requested: Option<u16>, remote_port: u16) -> anyhow::Result<u
 }
 
 fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
-    Command::new("ssh")
+    ssh_base()
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote}"))
@@ -519,8 +816,7 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
 
 /// Run a remote command, treating its exit status as a boolean.
 async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg(cmd)
         .output()
         .await
@@ -530,8 +826,7 @@ async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
 
 /// Run a remote command, failing loudly if it does not exit 0.
 async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg(cmd)
         .output()
         .await
@@ -549,11 +844,75 @@ async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// Every ssh/scp call must carry the ControlMaster trio (so one auth
+    /// covers the whole session; socket path uses ssh's short `%C` token) plus
+    /// the trust-on-first-use host-key policy that lets a fresh install reach
+    /// a never-seen host with no tty.
+    #[test]
+    fn ssh_opts_multiplex_and_accept_new_hosts() {
+        let opts = ssh_opts();
+        assert_eq!(opts[0], "-o");
+        assert_eq!(opts[1], "ControlMaster=auto");
+        assert_eq!(opts[2], "-o");
+        assert!(opts[3].starts_with("ControlPath="), "{}", opts[3]);
+        assert!(opts[3].ends_with("/cm/%C"), "{}", opts[3]);
+        assert_eq!(opts[4], "-o");
+        assert_eq!(opts[5], "ControlPersist=10m");
+        assert_eq!(opts[6], "-o");
+        assert_eq!(opts[7], "StrictHostKeyChecking=accept-new");
+    }
+
     #[test]
     fn dist_names_map_targets() {
         assert_eq!(dist_name("linux", "x86_64"), "chimaera-x86_64-linux-musl");
         assert_eq!(dist_name("linux", "aarch64"), "chimaera-aarch64-linux-musl");
         assert_eq!(dist_name("darwin", "arm64"), "chimaera-arm64-darwin");
+    }
+
+    /// The auto-fetch path must map detected targets to the exact asset names
+    /// the release workflow publishes, and skip targets we don't build.
+    #[test]
+    fn release_triples_match_published_assets() {
+        assert_eq!(
+            release_triple("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
+        assert_eq!(
+            release_triple("linux", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        // Some clusters' uname reports arm64 for 64-bit ARM.
+        assert_eq!(
+            release_triple("linux", "arm64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(
+            release_triple("darwin", "arm64"),
+            Some("aarch64-apple-darwin")
+        );
+        // Not published → no guess.
+        assert_eq!(release_triple("darwin", "x86_64"), None);
+        assert_eq!(release_triple("windows", "x86_64"), None);
+    }
+
+    #[test]
+    fn repo_slug_drives_the_release_api() {
+        assert_eq!(
+            repo_slug().as_deref(),
+            Some("martinappberg/chimaera"),
+            "owner/repo feeds the api.github.com releases url"
+        );
+    }
+
+    /// The download cache is keyed by version so an app upgrade never
+    /// redeploys a stale cached daemon (which would loop the update check).
+    #[test]
+    fn download_cache_is_versioned() {
+        let a = download_cache_path("x86_64-unknown-linux-musl", "0.1.1");
+        let b = download_cache_path("x86_64-unknown-linux-musl", "0.1.2");
+        assert_ne!(a, b);
+        assert!(a.ends_with("chimaera-x86_64-unknown-linux-musl-0.1.1"));
+        assert!(a.starts_with(dist_dir()));
     }
 
     #[test]
