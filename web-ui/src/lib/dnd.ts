@@ -34,6 +34,12 @@ export interface LayoutCtrl {
   setRatio(splitId: string, ratio: number): void;
   /** Begin a pointer drag of a tab (click-through handled by the drag). */
   dragTab(e: PointerEvent, paneId: string, index: number, tab: Tab): void;
+  /**
+   * Begin a pointer drag of an arbitrary surface with a custom click action —
+   * the link icon uses this to drag its own terminal onto an agent (drop =
+   * link) while a plain click still opens the link menu.
+   */
+  dragSurface(e: PointerEvent, tab: Tab, onClick: () => void): void;
   /** Divider drag lifecycle — gates terminal refits. */
   dividerDrag(active: boolean): void;
   /** Split `paneId` (pane hover cluster; same as the mod+D chords). */

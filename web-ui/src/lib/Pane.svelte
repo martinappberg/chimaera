@@ -123,7 +123,7 @@
       {#if activeTab.surface === "terminal"}
         <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else if activeTab.surface === "file"}
-        <FileView path={activeTab.path} />
+        <FileView path={activeTab.path} fontSize={node.fontSize} />
       {:else}
         <SettingsView />
       {/if}

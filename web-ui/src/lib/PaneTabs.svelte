@@ -16,7 +16,7 @@
   import SessionGlyph from "./SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "./agentLinks";
-  import { basename, midTruncate } from "./files";
+  import { basename, midTruncate, viewKindFor } from "./files";
   import { dirtyFiles } from "./editing";
   import { KEYS } from "./keys";
   import { activeSelection, referenceTarget, requestReference } from "./reference";
@@ -189,6 +189,15 @@
   const activeTerminal = $derived.by(() => {
     const t = node.tabs[node.active];
     return t !== undefined && t.surface === "terminal" ? t : null;
+  });
+
+  /** Surfaces that carry a per-pane text size: terminals and rendered
+   *  markdown documents both grow the A−/A+ controls (same handler). */
+  const fontTarget = $derived.by(() => {
+    const t = node.tabs[node.active];
+    if (t === undefined) return false;
+    if (t.surface === "terminal") return true;
+    return t.surface === "file" && viewKindFor(t.path) === "markdown";
   });
 
   /**
@@ -412,19 +421,54 @@
       </div>
     {/if}
     {#if zoomed}
-      <button class="zoom-badge" title="exit zoom ({KEYS.zoom})" onclick={() => ctrl.zoomPane(node.id)}
-        >zoom</button
+      <!-- Persistent while zoomed — the always-visible exit. Reads as an
+           action ("restore"), not a state ("zoom"): the pane is already
+           zoomed, so a collapse glyph + label says what the click DOES. -->
+      <button
+        class="zoom-badge"
+        title="restore — exit zoom ({KEYS.zoom})"
+        aria-label="restore pane"
+        onclick={() => ctrl.zoomPane(node.id)}
       >
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M2.5 9.5h4v4M13.5 6.5h-4v-4M9.5 6.5L14 2M2 14L6.5 9.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span>restore</span>
+      </button>
     {/if}
     <div class="controls">
       {#if agentChoices.length > 0}
+        <!-- The link icon is a drag handle: drag it onto an agent pane to
+             link this terminal there (drop on the "link to this agent" band).
+             A plain click (or Enter/Space) opens the picker menu as the
+             parity path. -->
         <button
           class="ctl"
           class:on={linkMenuOpen}
-          title={linkedAgentId !== null ? "linked — move or unlink" : "link to agent…"}
+          title={linkedAgentId !== null
+            ? "linked — drag onto an agent to move · click to choose"
+            : "drag onto an agent to link · click to choose"}
           aria-label="link to agent"
+          aria-haspopup="menu"
           aria-expanded={linkMenuOpen}
-          onclick={() => (linkMenuOpen = !linkMenuOpen)}
+          onpointerdown={(e) => {
+            if (activeTerminal !== null) {
+              ctrl.dragSurface(e, activeTerminal, () => (linkMenuOpen = !linkMenuOpen));
+            }
+          }}
+          onkeydown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              linkMenuOpen = !linkMenuOpen;
+            }
+          }}
         >
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
             <path
@@ -437,8 +481,9 @@
           </svg>
         </button>
       {/if}
-      {#if activeTerminal !== null}
-        <!-- Parity with the Cmd/Ctrl +/−/0 chords: per-pane text size. -->
+      {#if fontTarget}
+        <!-- Parity with the Cmd/Ctrl +/−/0 chords: per-pane text size
+             (terminals and rendered markdown alike). -->
         <button
           class="ctl ctl-font"
           title="smaller text ({KEYS.fontMinus})"
@@ -1047,14 +1092,16 @@
     width: 24px;
   }
 
-  /* Persistent while zoomed — the always-visible mouse exit from zoom. */
+  /* Persistent while zoomed — the always-visible mouse exit from zoom.
+     Collapse glyph + "restore" label: an action, not the "ZOOM" state. */
   .zoom-badge {
     appearance: none;
     border: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font: inherit;
     font-size: var(--text-xs);
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
     color: var(--muted);
     background: color-mix(in srgb, var(--fg) 7%, transparent);
     padding: 0 7px;

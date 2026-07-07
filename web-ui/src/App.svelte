@@ -101,7 +101,7 @@
     type Tab,
   } from "./lib/layout";
   import type { PathKind } from "./lib/links";
-  import { basename, fileTabTitles, fsProbe } from "./lib/files";
+  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
   import {
     paneContentEl,
@@ -647,15 +647,19 @@
    *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
-    // Per-pane terminal font size (Cmd/Ctrl +/−/0, spec-pinned chords):
-    // intercepted ONLY while the focused pane shows a terminal, so browser
-    // zoom keeps working everywhere else.
+    // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
+    // ONLY while the focused pane shows a font-sizable surface (a terminal or
+    // a rendered markdown document), so browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
       if (step !== null) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
-        if (p !== null && active !== undefined && active.surface === "terminal") {
+        const sizable =
+          active !== undefined &&
+          (active.surface === "terminal" ||
+            (active.surface === "file" && viewKindFor(active.path) === "markdown"));
+        if (p !== null && sizable) {
           e.preventDefault();
           e.stopPropagation();
           adjustFont(p.id, step);
@@ -1312,6 +1316,9 @@
     },
     dragTab(e, paneId, index, tab) {
       beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
+    },
+    dragSurface(e, tab, onClick) {
+      beginDrag(e, tab, onClick);
     },
     dividerDrag(active) {
       pool.setDragging(active);
