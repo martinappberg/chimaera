@@ -366,8 +366,11 @@ async fn kill_escalates_to_sigkill_when_sighup_ignored() {
         "trap '' HUP; echo READY; read _".to_string(),
     ];
     let info = mgr.spawn(opts(Some(cmd))).expect("spawn failed");
-    let mut att = mgr.attach(&info.id).expect("attach failed");
-    read_until(&mut att.output, "READY").await; // trap is installed now
+    // Wait for READY via the snapshot, not the live stream: echo can print
+    // before any live subscriber exists, so those bytes only ever land in the
+    // snapshot. READY prints only after `trap '' HUP`, so seeing it proves the
+    // SIGHUP-ignoring trap is armed.
+    attach_when_snapshot_contains(&mgr, &info.id, "READY").await;
 
     mgr.kill(&info.id).expect("kill failed");
     // SIGHUP is ignored; only the escalation (~2s grace) reaps it.
