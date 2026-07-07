@@ -572,7 +572,7 @@ Launcher field notes (2026-07-06, shipped with the build):
   inline rename; the pin outranks every derived name on every surface (rail, tab,
   strip) and survives into Recents when the session ends.
 
-**Daemon self-update on connect (author, 2026-07-07 — field find #2 on cluster).**
+**Daemon self-update on connect (author, 2026-07-07 — field find #2 on a cluster).**
 Connecting to a host reused a 21-hour-old M0 daemon forever: `connect` only checks
 "running?", and every build calls itself 0.0.1, so builds are indistinguishable. Spec:
 - Binaries embed a **build id** (git hash + dirty flag + build time, via build.rs env);
@@ -1011,8 +1011,8 @@ which is the survival property that matters.
 - **2026-07-06 — window host label.** The daemon indicator shows what the user calls the
   machine: "local" for an untunneled daemon, else the ssh alias passed by `chimaera connect`
   via the `#host=` hash param (the VS Code Remote convention); the raw hostname is hover
-  detail. Raw hostnames like `host.example` confused the author on day one — labels must
-  be human.
+  detail. Raw machine hostnames (the opaque `abc12de3.example` kind) confused the author on
+  day one — labels must be human.
 - **2026-07-06 — native shell pulled forward from M6 (windows + home screen + remotes).**
   `crates/chimaera-app` is a Tauri 2 shell in a deliberately standalone cargo workspace (the
   webview stack never touches the musl/HPC builds). Its binary doubles as the daemon
@@ -1092,9 +1092,10 @@ component decisions:
   pays full handshake+2FA cost there. russh only becomes interesting if a no-external-binary
   Windows client is ever required.
 
-## Field notes: first cluster deployment (cluster, 2026-07-06)
+## Field notes: first cluster deployment (2026-07-06)
 
-M0 `connect` validated end-to-end against a production HPC cluster. Findings:
+M0 `connect` validated end-to-end against a production HPC cluster (CentOS 7.9 login
+nodes, Duo 2FA, ControlMaster-only non-interactive ssh). Findings:
 
 - **The static musl binary ran unmodified on CentOS 7.9 (glibc 2.17)** — a full glibc
   generation older than the design's RHEL 8 worst case. Deployment story confirmed.
@@ -1107,13 +1108,14 @@ M0 `connect` validated end-to-end against a production HPC cluster. Findings:
   must treat zero-exit as mux-delegation (hold, then tear down via `ssh -O cancel -L ...`),
   not as failure.
 - **ControlMaster pins the login node:** all multiplexed sessions ride one TCP connection to
-  one node (config pointed at `login-alias`, master landed on `login-node-a`, every subsequent command
-  hit `login-node-a`). Round-robin manifest discovery matters only *across* master restarts —
-  less scary than the design feared, but still needed.
+  one node (the ssh config pointed at a round-robin login alias, the master landed on one
+  specific node, and every subsequent command hit that same node). Round-robin manifest
+  discovery matters only *across* master restarts — less scary than the design feared, but
+  still needed.
 - **`claude` is not in the non-interactive ssh PATH** on the login node even for a user who
   runs it daily — M2's session spawning must resolve the agent binary via a login shell or
   explicit config, never PATH assumptions.
-- cluster login nodes run Duo + `gssapi-with-mic,password` only (no pubkeys): riding the
+- The cluster's login nodes run Duo + `gssapi-with-mic,password` only (no pubkeys): riding the
   user's ControlMaster isn't just convenient, it's the *only* non-interactive path — the
   design's shell-out-to-system-ssh decision is load-bearing here.
 - **On containers as a fallback:** Docker never exists on HPC (no root); Apptainer/Singularity

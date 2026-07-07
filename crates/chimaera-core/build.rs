@@ -2,7 +2,7 @@
 //! `ff52221-dirty.1783438290` — so every binary can say which source it was
 //! built from. The daemon self-update flow compares these across machines;
 //! before build ids, every build called itself 0.0.1 and a 21-hour-old
-//! daemon was indistinguishable from a fresh one (field find on cluster).
+//! daemon was indistinguishable from a fresh one (field find on a cluster).
 
 use std::process::Command;
 

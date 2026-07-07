@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
+    "tauri": "tauri",
     "icon": "node scripts/gen-icon.mjs && tauri icon icons/icon.png -o icons"
   },
   "devDependencies": {
