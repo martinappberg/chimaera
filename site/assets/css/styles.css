@@ -1321,16 +1321,7 @@ kbd {
   .nav__actions {
     margin-left: 0;
   }
-  .mock__body {
-    grid-template-columns: 1fr;
-  }
-  .mock__rail {
-    display: none;
-  }
-  .mock__stage {
-    grid-template-columns: 1fr;
-  }
-  .pane:nth-child(n + 2) {
+  .mock-frame {
     display: none;
   }
   .features {

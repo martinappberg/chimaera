@@ -103,7 +103,9 @@
               chimaera runs your coding agents as persistent, daemon-owned
               sessions on whatever host owns the work — your laptop, a dev
               server, or an HPC login node — with a workspace-first UI around
-              them. Close your laptop mid-run and the sessions keep going.
+              them. The daemon owns the sessions, not your window, so a reload
+              or a dropped connection never kills them — and when the work runs
+              on a server, you can close your laptop and the agents keep going.
             </p>
             <div class="hero__cta">
               <a class="btn btn--primary" href="#download">
