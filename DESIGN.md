@@ -787,6 +787,16 @@ which is the survival property that matters.
   detail. Raw hostnames like `host.example` confused the author on day one — labels must
   be human.
 
+- **2026-07-06 — linked terminals wave 1 SHIPPED (M4.5).** Daemon: OSC 133 marks scanner +
+  per-session command journal, bash/zsh/fish integration injection (verified on bash 3.2 +
+  zsh 5.9), exec engine (queue-with-timeout, sentinel fallback, ssh-allowlist policy),
+  links model, stateless HTTP MCP server (list/run/read scoped to links), `@term:`
+  mention auto-link via UserPromptSubmit with additionalContext confirmation,
+  `chimaera shell-integration` CLI. UI: chips both sides in the agent hue, exec border
+  pulse, drag-to-link band, link menu, auto-reveal split. 33 new tests (98 total) +
+  live browser verification against a sandboxed daemon with a real claude TUI session.
+  Deferred to wave 2: shell cloning (env-duplicate / journal setup-replay), file
+  drag-to-reference band, journal-powered UI surfaces.
 - **2026-07-06 — linked terminals (agent ↔ shell).** One primitive: a user-granted link
   between an agent session and a terminal session. Linked-only access (the agent's tools see
   exactly its links), one agent per terminal (re-link moves the leash), busy shells queue
