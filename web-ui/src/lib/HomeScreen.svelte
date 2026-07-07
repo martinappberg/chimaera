@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import BrandMark from "./BrandMark.svelte";
   import { KEYS } from "./keys";
   import { needsAttention, type Session, type Workspace } from "./sessions";
   import {
@@ -245,7 +246,7 @@
   <div class="inner">
     <header class="masthead">
       <div class="brand">
-        <span class="glyph" aria-hidden="true">&gt;_</span>
+        <BrandMark size={24} draw title="chimaera" />
         <h1>chimaera</h1>
       </div>
       <div class="where" title={health?.hostname}>
@@ -568,15 +569,8 @@
 
   .brand {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-
-  .glyph {
-    font-family: var(--mono);
-    font-size: var(--text-lg);
-    color: var(--accent);
-    user-select: none;
+    align-items: center;
+    gap: 9px;
   }
 
   h1 {
