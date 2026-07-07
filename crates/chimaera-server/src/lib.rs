@@ -2,6 +2,7 @@ mod agents;
 mod api;
 mod assets;
 mod fs;
+mod links;
 mod naming;
 mod quickopen;
 mod view_state;
@@ -50,6 +51,9 @@ pub(crate) struct AppState {
     /// session id -> stage of a currently in-flight agent exec (queued /
     /// executing); drives the linked-terminal chips in the UI.
     pub(crate) exec_status: Mutex<HashMap<String, chimaera_pty::ExecStage>>,
+    /// terminal session id -> agent session id: the linked-terminal edges
+    /// (one agent per terminal; see the `links` module).
+    pub(crate) links: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Quick-open walk cache (short TTL, per workspace).
@@ -86,6 +90,7 @@ impl AppState {
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             exec_status: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
@@ -117,6 +122,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", delete(api::delete_session))
         .route("/sessions/{id}/exec", post(api::exec_session))
         .route("/sessions/{id}/journal", get(api::session_journal))
+        .route("/links", get(links::list_links).put(links::put_link))
+        .route("/links/{terminal_id}", delete(links::delete_link))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),
@@ -1405,6 +1412,125 @@ mod tests {
 
         state.sessions.kill(&agent_id).ok();
         state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn links_lifecycle_validation_and_move() {
+        let state = test_state();
+        let agent_a = inject_agent(&state, "ka");
+        let agent_b = inject_agent(&state, "kb");
+        let shell = {
+            let info = state
+                .sessions
+                .spawn(chimaera_pty::SpawnOpts {
+                    cwd: test_dir("links-shell"),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    command: None,
+                    id: None,
+                    env: Vec::new(),
+                })
+                .expect("spawn shell");
+            info.id
+        };
+
+        // Link shell -> agent A.
+        let (status, out) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["moved_from"], serde_json::Value::Null);
+
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(
+            list,
+            serde_json::json!([{"terminal_id": shell, "agent_id": agent_a}])
+        );
+
+        // Re-linking to agent B MOVES the leash (one agent per terminal).
+        let (status, out) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_b})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["moved_from"], agent_a, "{out}");
+        assert_eq!(links::terminals_of(&state, &agent_b), vec![shell.clone()]);
+        assert!(links::terminals_of(&state, &agent_a).is_empty());
+
+        // A shell can't play agent; an agent can't play terminal.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": shell})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": agent_a, "agent_id": agent_b})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Unknown sessions are 404s.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": "s-00000000", "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Unlink is idempotent.
+        for _ in 0..2 {
+            let (status, _) = request(
+                &state,
+                Method::DELETE,
+                &format!("/api/v1/links/{shell}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(list, serde_json::json!([]));
+
+        // A link dies with its terminal session (pruned on read).
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        state.sessions.kill(&shell).ok();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+            if list == serde_json::json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "link survived its dead terminal: {list}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        state.sessions.kill(&agent_a).ok();
+        state.sessions.kill(&agent_b).ok();
     }
 
     #[tokio::test]

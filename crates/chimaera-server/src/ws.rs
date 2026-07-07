@@ -238,6 +238,7 @@ async fn send_sessions_snapshot(
     let snapshot = json!({
         "type": "sessions",
         "sessions": crate::api::sessions_json(state),
+        "links": crate::links::links_json(state),
     })
     .to_string();
     if last_sent.as_deref() == Some(snapshot.as_str()) {
