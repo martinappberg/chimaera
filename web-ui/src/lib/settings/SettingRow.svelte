@@ -245,7 +245,8 @@
     display: flex;
     align-items: flex-start;
     gap: 24px;
-    padding: 14px 18px 14px 14px;
+    /* Left padding reserves the absolutely-positioned gutter's lane (14 + 3 + 24). */
+    padding: 14px 18px 14px 41px;
     border-radius: 8px;
     transition: background-color 0.12s ease;
   }
@@ -254,11 +255,15 @@
     background: color-mix(in srgb, var(--fg) 3%, transparent);
   }
 
-  /* Modified marker: a quiet accent bar in the gutter (VS Code language). */
+  /* Modified marker: a quiet accent bar down the left edge (VS Code language).
+     Positioned out of flow so the row can switch to a stacked column when the
+     pane is narrow without the bar reflowing across the top. */
   .gutter {
-    flex: none;
+    position: absolute;
+    left: 14px;
+    top: 14px;
+    bottom: 14px;
     width: 3px;
-    align-self: stretch;
     border-radius: 2px;
     background: transparent;
   }
@@ -346,6 +351,8 @@
 
   .id {
     display: inline-block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     margin-top: 5px;
     font-family: var(--mono);
     font-size: 10px;
@@ -433,6 +440,7 @@
   /* --- theme cards --- */
   .cards {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
   }
 
@@ -668,5 +676,78 @@
     border: none;
     outline: none;
     padding: 2px 4px;
+  }
+
+  /* --- responsive: keyed off the `settings` named container declared on the
+     .settings root in SettingsView (a child component can only query an
+     ancestor's container, never its own). --- */
+
+  /* Narrow: stack the control beneath the text, left-aligned under it. The
+     segmented control also breaks into wrap-friendly pills here. */
+  @container settings (max-width: 640px) {
+    .row {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 10px;
+      padding-left: 22px;
+      padding-right: 14px;
+    }
+
+    .gutter {
+      left: 12px;
+    }
+
+    .control {
+      padding-top: 0;
+      min-height: 0;
+    }
+
+    .textbox {
+      width: 100%;
+    }
+
+    .chips {
+      max-width: 100%;
+    }
+
+    .select {
+      max-width: 100%;
+    }
+
+    /* A joined segmented bar can't shrink, so let it wrap as separated pills. */
+    .seg {
+      flex-wrap: wrap;
+      gap: 5px;
+      border: none;
+      border-radius: 0;
+      overflow: visible;
+    }
+
+    .seg-btn {
+      border: 1px solid var(--edge);
+      border-radius: 6px;
+    }
+  }
+
+  /* Very narrow: guarantee nothing overflows. The slider yields to its numbox
+     and the hex field shrinks to fit. */
+  @container settings (max-width: 360px) {
+    .num {
+      gap: 8px;
+    }
+
+    .slider {
+      display: none;
+    }
+
+    .color {
+      width: 100%;
+    }
+
+    .hex {
+      width: auto;
+      flex: 1 1 0;
+      min-width: 0;
+    }
   }
 </style>
