@@ -122,7 +122,7 @@
 
           <!-- Workbench mockup -->
           <div class="mock-frame">
-            <div class="mock" role="img" aria-label="The chimaera workbench: a rail of terminal and agent sessions on the left, a split view with a running Claude Code session next to a report preview, and a session strip showing which agent needs attention.">
+            <div class="mock" role="img" aria-label="The chimaera workbench: a rail of terminal and agent sessions on the left, a split view with a running Claude Code session, a volcano-plot preview, and a differential-expression report, and a session strip showing which agent needs attention.">
               <div class="mock__bar">
                 <div class="mock__dots"><i></i><i></i><i></i></div>
                 <div class="mock__title">
@@ -163,20 +163,27 @@
                       </span>
                     </div>
                     <div class="term" aria-hidden="true">
-<div class="l"><span class="g">&gt;</span> the volcano plot is using the wrong contrast — fix it</div>
+                      <div class="term__log">
+<div class="l"><span class="g">&gt;</span> volcano plot uses the wrong contrast — fix it</div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="box">⏺</span> I'll switch the contrast to <span class="y">treated_vs_control</span> and</div>
-<div class="l">&nbsp;&nbsp;regenerate the figure.</div>
+<div class="l"><span class="g">⏺</span> Switching the DESeq2 contrast to treated vs</div>
+<div class="l">&nbsp;&nbsp;control and regenerating the figure.</div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="m">⎿</span> <span class="box">Edit</span> scripts/deseq2.R</div>
-<div class="l">&nbsp;&nbsp;<span class="g">+</span> res &lt;- results(dds, contrast=c("cond","treated","control"))</div>
-<div class="l">&nbsp;&nbsp;<span class="m">-</span> res &lt;- results(dds)</div>
+<div class="l"><span class="g">⏺</span> Update<span class="m">(scripts/deseq2.R)</span></div>
+<div class="l">&nbsp;&nbsp;<span class="m">⎿ Updated · 1 addition, 1 removal</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="del">- res &lt;- results(dds)</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">+ res &lt;- results(dds, contrast =</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">c("cond","treated","control"))</span></div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="m">⎿</span> <span class="box">Bash</span> Rscript scripts/deseq2.R</div>
-<div class="l">&nbsp;&nbsp;<span class="m">saved figures/volcano.png · 2,214 DE genes</span></div>
+<div class="l"><span class="g">⏺</span> Bash<span class="m">(Rscript scripts/deseq2.R)</span></div>
+<div class="l">&nbsp;&nbsp;<span class="m">⎿ figures/volcano.png · 2,214 DE genes</span></div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="box">⏺</span> Done — the volcano now uses the treated vs</div>
-<div class="l">&nbsp;&nbsp;control contrast. <span class="cursor"></span></div>
+<div class="l"><span class="g">⏺</span> Write<span class="m">(results/deseq2_report.md)</span></div>
+<div class="l">&nbsp;</div>
+<div class="l"><span class="g">⏺</span> Done — using treated vs control now.</div>
+                      </div>
+                      <div class="term__prompt"><span class="g">&gt;</span> <span class="cursor"></span> <span class="ph">run the QC summary next</span></div>
+                      <div class="term__status"><span><span class="acc">⏵⏵</span> accept edits on</span><span>claude-opus-4.8</span></div>
                     </div>
                   </section>
 
@@ -188,25 +195,44 @@
                       </span>
                     </div>
                     <div class="preview" aria-hidden="true">
-                      <div class="preview__title">figures/volcano.png · differential expression</div>
-                      <div class="chart">
-                        <span class="bar" style="height: 38%"></span>
-                        <span class="bar" style="height: 62%"></span>
-                        <span class="bar" style="height: 30%"></span>
-                        <span class="bar" style="height: 78%"></span>
-                        <span class="bar" style="height: 52%"></span>
-                        <span class="bar" style="height: 90%"></span>
-                        <span class="bar" style="height: 44%"></span>
-                        <span class="bar" style="height: 68%"></span>
-                        <span class="bar" style="height: 34%"></span>
-                        <span class="bar" style="height: 58%"></span>
-                        <span class="bar" style="height: 82%"></span>
-                        <span class="bar" style="height: 48%"></span>
-                      </div>
+                      <div class="preview__cap">treated vs control</div>
+                      <svg class="volcano" viewBox="0 0 260 166" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+                        <line class="axis" x1="32" y1="146" x2="252" y2="146"/>
+                        <line class="axis" x1="32" y1="146" x2="32" y2="14"/>
+                        <line class="thr" x1="124" y1="20" x2="124" y2="146"/>
+                        <line class="thr" x1="160" y1="20" x2="160" y2="146"/>
+                        <line class="thr" x1="32" y1="125" x2="252" y2="125"/>
+                        <circle cx="137.9" cy="133.8" r="1.7" class="ns"/><circle cx="160.0" cy="136.2" r="1.7" class="ns"/><circle cx="160.0" cy="140.8" r="1.7" class="ns"/><circle cx="136.4" cy="143.4" r="1.7" class="ns"/><circle cx="115.0" cy="135.1" r="1.7" class="ns"/><circle cx="145.8" cy="121.0" r="1.7" class="ns"/><circle cx="127.6" cy="131.2" r="1.7" class="ns"/><circle cx="172.7" cy="136.7" r="1.7" class="ns"/><circle cx="147.0" cy="138.5" r="1.7" class="ns"/><circle cx="146.1" cy="133.8" r="1.7" class="ns"/><circle cx="132.0" cy="132.2" r="1.7" class="ns"/><circle cx="147.2" cy="142.5" r="1.7" class="ns"/><circle cx="134.8" cy="132.1" r="1.7" class="ns"/><circle cx="126.7" cy="136.7" r="1.7" class="ns"/><circle cx="148.9" cy="126.7" r="1.7" class="ns"/><circle cx="124.4" cy="131.2" r="1.7" class="ns"/><circle cx="140.3" cy="127.1" r="1.7" class="ns"/><circle cx="154.4" cy="130.6" r="1.7" class="ns"/><circle cx="152.8" cy="134.9" r="1.7" class="ns"/><circle cx="128.5" cy="123.6" r="1.7" class="ns"/><circle cx="152.0" cy="132.3" r="1.7" class="ns"/><circle cx="124.3" cy="133.2" r="1.7" class="ns"/><circle cx="162.9" cy="126.5" r="1.7" class="ns"/><circle cx="139.1" cy="135.7" r="1.7" class="ns"/><circle cx="111.2" cy="126.5" r="1.7" class="ns"/><circle cx="138.6" cy="128.5" r="1.7" class="ns"/><circle cx="159.8" cy="142.6" r="1.7" class="ns"/><circle cx="146.2" cy="135.8" r="1.7" class="ns"/><circle cx="150.4" cy="136.0" r="1.7" class="ns"/><circle cx="146.6" cy="138.3" r="1.7" class="ns"/><circle cx="110.0" cy="130.8" r="1.7" class="ns"/><circle cx="150.6" cy="135.0" r="1.7" class="ns"/><circle cx="120.8" cy="126.5" r="1.7" class="ns"/><circle cx="147.9" cy="138.0" r="1.7" class="ns"/><circle cx="144.0" cy="127.2" r="1.7" class="ns"/><circle cx="141.9" cy="140.9" r="1.7" class="ns"/><circle cx="127.7" cy="125.9" r="1.7" class="ns"/><circle cx="134.9" cy="127.2" r="1.7" class="ns"/><circle cx="139.6" cy="133.8" r="1.7" class="ns"/><circle cx="148.2" cy="115.5" r="1.7" class="ns"/><circle cx="129.2" cy="137.8" r="1.7" class="ns"/><circle cx="138.1" cy="142.3" r="1.7" class="ns"/><circle cx="144.5" cy="136.1" r="1.7" class="ns"/><circle cx="142.3" cy="144.4" r="1.7" class="ns"/><circle cx="154.4" cy="139.3" r="1.7" class="ns"/><circle cx="157.7" cy="133.4" r="1.7" class="ns"/><circle cx="141.8" cy="131.9" r="1.7" class="ns"/><circle cx="164.6" cy="126.5" r="1.7" class="ns"/><circle cx="123.8" cy="142.4" r="1.7" class="ns"/><circle cx="153.9" cy="137.2" r="1.7" class="ns"/><circle cx="146.6" cy="139.8" r="1.7" class="ns"/><circle cx="160.9" cy="140.3" r="1.7" class="ns"/><circle cx="138.3" cy="140.1" r="1.7" class="ns"/><circle cx="174.0" cy="136.2" r="1.7" class="ns"/><circle cx="140.9" cy="133.5" r="1.7" class="ns"/><circle cx="144.7" cy="124.5" r="1.7" class="ns"/><circle cx="136.5" cy="131.0" r="1.7" class="ns"/><circle cx="173.6" cy="136.0" r="1.7" class="ns"/><circle cx="153.1" cy="126.8" r="1.7" class="ns"/><circle cx="126.9" cy="144.5" r="1.7" class="ns"/>
+                        <circle cx="204.6" cy="80.3" r="1.7" class="up"/><circle cx="187.0" cy="41.9" r="1.7" class="up"/><circle cx="209.6" cy="92.4" r="1.7" class="up"/><circle cx="243.2" cy="115.9" r="1.7" class="up"/><circle cx="206.9" cy="91.6" r="1.7" class="up"/><circle cx="191.4" cy="64.8" r="1.7" class="up"/><circle cx="193.2" cy="66.6" r="1.7" class="up"/><circle cx="168.6" cy="114.0" r="1.7" class="up"/><circle cx="201.0" cy="110.9" r="1.7" class="up"/><circle cx="168.5" cy="115.1" r="1.7" class="up"/><circle cx="213.9" cy="63.6" r="1.7" class="up"/><circle cx="218.0" cy="110.2" r="1.7" class="up"/><circle cx="188.8" cy="115.8" r="1.7" class="up"/><circle cx="204.0" cy="40.3" r="1.7" class="up"/><circle cx="171.2" cy="41.1" r="1.7" class="up"/><circle cx="208.4" cy="89.2" r="1.7" class="up"/><circle cx="177.4" cy="45.4" r="1.7" class="up"/><circle cx="186.9" cy="100.9" r="1.7" class="up"/><circle cx="196.7" cy="72.9" r="1.7" class="up"/><circle cx="218.5" cy="112.4" r="1.7" class="up"/><circle cx="211.3" cy="43.2" r="1.7" class="up"/><circle cx="217.6" cy="89.2" r="1.7" class="up"/>
+                        <circle cx="110.4" cy="61.0" r="1.7" class="dn"/><circle cx="94.9" cy="84.3" r="1.7" class="dn"/><circle cx="71.4" cy="94.3" r="1.7" class="dn"/><circle cx="102.5" cy="97.6" r="1.7" class="dn"/><circle cx="110.4" cy="66.2" r="1.7" class="dn"/><circle cx="91.3" cy="103.4" r="1.7" class="dn"/><circle cx="97.2" cy="65.9" r="1.7" class="dn"/><circle cx="95.6" cy="53.0" r="1.7" class="dn"/><circle cx="98.1" cy="60.5" r="1.7" class="dn"/><circle cx="70.2" cy="45.6" r="1.7" class="dn"/><circle cx="109.1" cy="64.6" r="1.7" class="dn"/><circle cx="110.0" cy="115.7" r="1.7" class="dn"/><circle cx="108.5" cy="59.7" r="1.7" class="dn"/><circle cx="119.2" cy="87.8" r="1.7" class="dn"/><circle cx="100.5" cy="88.2" r="1.7" class="dn"/><circle cx="107.6" cy="81.4" r="1.7" class="dn"/><circle cx="64.8" cy="86.3" r="1.7" class="dn"/><circle cx="87.4" cy="61.5" r="1.7" class="dn"/>
+                        <text x="142" y="162" text-anchor="middle">log₂ fold change</text>
+                        <text x="12" y="82" text-anchor="middle" transform="rotate(-90 12 82)">−log₁₀ padj</text>
+                      </svg>
                       <div class="preview__legend">
-                        <span><i style="background: var(--accent)"></i> upregulated</span>
-                        <span><i style="background: var(--rate)"></i> downregulated</span>
+                        <span><i style="background: var(--accent)"></i> up</span>
+                        <span><i style="background: var(--rate)"></i> down</span>
+                        <span><i style="background: var(--faint)"></i> n.s.</span>
                       </div>
+                    </div>
+                  </section>
+
+                  <section class="pane">
+                    <div class="pane__tabs">
+                      <span class="tab active">
+                        <svg class="glyph" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h10v10H3z" fill="none"/><path d="M5 6.5h6M5 9h6M5 11h3.5"/></svg>
+                        deseq2_report.md
+                      </span>
+                    </div>
+                    <div class="mdview" aria-hidden="true">
+                      <h4 class="mdview__h1">Differential expression</h4>
+                      <p class="mdview__meta">treated vs control · 2,214 genes at padj &lt; 0.05</p>
+                      <table>
+                        <tr><th>gene</th><th>log₂FC</th><th>padj</th></tr>
+                        <tr><td>IL6</td><td class="up">+3.1</td><td>2e-11</td></tr>
+                        <tr><td>MMP9</td><td class="up">+2.7</td><td>8e-10</td></tr>
+                        <tr><td>CXCL8</td><td class="up">+2.4</td><td>4e-09</td></tr>
+                        <tr><td>SOD2</td><td class="dn">−1.9</td><td>1e-06</td></tr>
+                      </table>
                     </div>
                   </section>
 
