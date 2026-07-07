@@ -6,6 +6,9 @@ name: release
 # A single workflow does version + build + publish: a tag pushed by
 # GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be
 # split across two. Put `[skip release]` in the squash message to skip.
+# NOTE: the skip check matches the ENTIRE squash message, including the PR
+# description that GitHub folds into it, so never write that token in a PR
+# body unless you actually intend to skip the release.
 #
 # Releases are PUBLISHED (not draft) so the installed app auto-updates; the
 # required-CI branch protection on main is the safety gate that a merge is
