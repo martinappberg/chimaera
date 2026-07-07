@@ -4,3 +4,4 @@ web-ui/dist/
 *.log
 .DS_Store
 .claude/scheduled_tasks.lock
+verify-tmp/

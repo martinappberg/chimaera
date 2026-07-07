@@ -472,14 +472,22 @@ codex launch did not work in the field.
   the same `~/.claude/projects` JSONL store the naming pipeline reads): title, age; selecting
   spawns `claude --resume <id>` in a PTY. Searchable past ~8 entries.
 
-- **Rail Recents (author, 2026-07-06):** a quiet section under the session list showing the
-  workspace's recently-ended agent conversations — **across agent types** — last 3 visible,
-  expandable to a scrollable list. Backed by daemon-persisted per-workspace agent history
-  (kind, last title, resume handle when one exists, last-active), recorded whenever an agent
-  session ends. Rows: type glyph + title + relative age. Click resumes when the agent
-  supports it (claude `--resume <id>`; codex/gemini native resume verified against the real
-  binaries — if an agent can't resume, the row starts a fresh conversation with an honest
-  tooltip). Live sessions never appear in Recents; resuming one moves it out.
+- **Rail Recents (author, 2026-07-06; restructure same evening):** the rail groups
+  **terminals first** (there are few), **agents below** (there are many) — each section
+  headed quietly, with its create affordance at the section's foot ("+ terminal" under
+  terminals; the "+ new agent" split button under agents). Under agents sits **RECENT**:
+  the workspace's recently-ended agent conversations — **across agent types** — last 3
+  visible, expandable to a scrollable list. Rows: type glyph + title + relative age.
+  **RECENT is the ONE resume surface** (author: the popover's resume list was redundant
+  once the rail had it): GET /api/v1/recents merges the daemon's own history
+  (recents.json — any agent kind, ended under its watch) with the claude transcript store
+  (conversations from before chimaera or run outside it); daemon entries win identity
+  collisions. Click resumes when the agent supports it (claude `--resume <id>`); if an
+  agent can't resume, the row starts a fresh conversation with an honest tooltip. Live
+  conversations never appear; resuming one moves it out (claude forks a new session id
+  per resume — records track `resumed_from`, and a resumed-then-ended conversation
+  supersedes its ancestor entry). The section order is also the mod+1–9 chord order and
+  the focus-mode strip order — what you see is what the numbers mean.
 
 Server surface: `GET /api/v1/agents` (installed/version/models/install-hint per agent),
 `GET /api/v1/agents/claude/sessions?workspace_id=` (resumables),
@@ -515,6 +523,23 @@ Launcher field notes (2026-07-06, shipped with the build):
   resumed. `--model` stays a server capability on POST /sessions.
 - Popover opens from the CHEVRON only (hover ~150ms or click); the main surface is a pure
   instant spawn of the persisted default agent.
+- **Popover = agent picker only** (2026-07-06 restructure): one row per catalog agent,
+  each with a link to its **official docs** (opens in the browser — author: no prose
+  warnings, "just highlight that they are not installed and link to the official docs").
+  Not installed → muted + "install" chip (pre-typed, never executed). Installed but
+  **outdated** (the npm-era codex 0.1.x predates `codex login` and hard-exits without
+  OPENAI_API_KEY — Martin's field failure) → "update" chip, same pre-typed flow. The
+  catalog must stay CURRENT: Gemini CLI's Google sign-in was retired for individual
+  accounts 2026-06-18 (Martin hit Google's own migration error in the field; API-key
+  auth still works, and the login-shell env wrap delivers `GEMINI_API_KEY`), and Google's
+  successor is the **Antigravity CLI** (`agy`, single static binary via
+  `curl -fsSL https://antigravity.google/cli/install.sh | bash` — no node, HPC-friendly).
+  BOTH stay in the catalog (author: keep gemini usable, no editorials — the docs links
+  carry the story): claude · codex · gemini · agy. Field trap, guarded: the Antigravity
+  IDE ships an `agy` symlink to its own app launcher (VS Code's `code` pattern) that
+  opens the GUI and exits 0 silently — detection canonicalizes the resolved path and
+  refuses anything inside Antigravity.app, so IDE-only hosts see the honest install row
+  for the real CLI instead of a pane that just says "[exited]".
 - Dev-loop nicety: the vite dev server exposes `~/.chimaera/manifest.json` at
   `/dev/manifest` (dev-only middleware, never in a build) so the dev page can self-auth
   without hand-copying tokens.

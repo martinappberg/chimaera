@@ -31,21 +31,34 @@ use crate::AppState;
 /// name probed on the login-shell PATH. Hook-driven attention state exists
 /// only for Claude; other agents surface `agent_state: "unknown"` (the muted
 /// dot in the UI) until their integrations land.
+///
+/// Gemini CLI's Google sign-in was retired for individual accounts on
+/// 2026-06-18 (API-key auth still works); Google's successor is the
+/// Antigravity CLI (binary `agy`). Both stay in the catalog — the rows
+/// carry official docs links, not editorials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AgentKind {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
 }
 
 impl AgentKind {
-    pub(crate) const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini];
+    /// The launcher catalog: what the popover offers and detection probes.
+    pub(crate) const ALL: [AgentKind; 4] = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Gemini,
+        AgentKind::Antigravity,
+    ];
 
-    /// Stable id — also the binary name (`claude`, `codex`, `gemini`).
+    /// Stable id — also the binary name (`claude`, `codex`, `agy`, `gemini`).
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Antigravity => "agy",
             AgentKind::Gemini => "gemini",
         }
     }
@@ -55,6 +68,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "Claude Code",
             AgentKind::Codex => "Codex",
+            AgentKind::Antigravity => "Antigravity CLI",
             AgentKind::Gemini => "Gemini CLI",
         }
     }

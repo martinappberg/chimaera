@@ -171,6 +171,12 @@
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+  // The rail groups terminals (few) above agents (many); this order is also
+  // the mod+1–9 chord order and the focus-mode strip order, so what you see
+  // is what the numbers mean.
+  const shellSessions = $derived(wsSessions.filter((s) => s.kind !== "agent"));
+  const agentSessions = $derived(wsSessions.filter((s) => s.kind === "agent"));
+  const railSessions = $derived([...shellSessions, ...agentSessions]);
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
   const focusedFilePath = $derived(focusedFileOf(layout));
@@ -613,9 +619,9 @@
       return;
     }
     const n = chordDigit(e);
-    if (n !== null && !l2 && plain && n <= wsSessions.length) {
+    if (n !== null && !l2 && plain && n <= railSessions.length) {
       intercept();
-      openSess(wsSessions[n - 1].id);
+      openSess(railSessions[n - 1].id);
     }
   }
 
@@ -775,8 +781,8 @@
     layout = pruneSessions(layout, live);
     if (!autoOpened) {
       autoOpened = true;
-      if (tabCount(layout) === 0 && wsSessions.length > 0) {
-        layout = openSession(layout, wsSessions[0].id);
+      if (tabCount(layout) === 0 && railSessions.length > 0) {
+        layout = openSession(layout, railSessions[0].id);
       }
     }
   }
@@ -986,6 +992,11 @@
 
   // --- the rail's Recents section ---
 
+  /** Monotone fetch counter: a slow early /recents response must not
+   *  clobber a newer one (the follow-up fetch exists precisely to carry
+   *  fresher data than its predecessor). */
+  let recentsSeq = 0;
+
   /** Reload the workspace's ended agent conversations. `follow` schedules a
    *  second fetch: a killed agent retires into recents on the daemon's ~2s
    *  watch tick, after the session already vanished from the snapshot. */
@@ -995,9 +1006,10 @@
       recents = [];
       return;
     }
+    const seq = ++recentsSeq;
     listRecents(ws)
       .then((r) => {
-        if (activeWsId === ws) recents = r;
+        if (activeWsId === ws && seq === recentsSeq) recents = r;
       })
       .catch(() => {
         // rail stays on its last list; the next snapshot retries
@@ -1282,7 +1294,7 @@
       </div>
 
       <nav class="sessions">
-        {#each wsSessions as s (s.id)}
+        {#snippet sessionRow(s: Session)}
           {#if confirmKillId === s.id}
             <div
               class="row confirm"
@@ -1349,10 +1361,27 @@
               >
             </div>
           {/if}
+        {/snippet}
+
+        <!-- Terminals first (there are few), agents below (there are many);
+             this order is also the mod+1–9 order and the strip order. -->
+        <div class="rail-sec">terminals</div>
+        {#each shellSessions as s (s.id)}
+          {@render sessionRow(s)}
+        {/each}
+        <button
+          class="row new"
+          title="open a terminal ({KEYS.newTerminal})"
+          onclick={newShell}>+ terminal</button
+        >
+
+        <div class="rail-sec agents-sec">agents</div>
+        {#each agentSessions as s (s.id)}
+          {@render sessionRow(s)}
         {/each}
         <!-- Split button: the main surface spawns the persisted default
              agent instantly — always. Only the CHEVRON opens the launcher
-             popover (hover ~150ms or click): agents · new or resumed. -->
+             popover (hover ~150ms or click). -->
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
           <button
             class="row new primary main"
@@ -1369,8 +1398,8 @@
             class="new-chev"
             aria-haspopup="menu"
             aria-expanded={launcherOpen}
-            aria-label="choose agent or resume a conversation"
-            title="agents · resume"
+            aria-label="choose an agent"
+            title="choose an agent"
             onpointerenter={armLauncherHover}
             onpointerleave={disarmLauncherHover}
             onclick={() => {
@@ -1390,11 +1419,6 @@
             </svg>
           </button>
         </div>
-        <button
-          class="row new"
-          title="open a terminal ({KEYS.newTerminal})"
-          onclick={newShell}>+ terminal</button
-        >
         {#if createError}
           <div class="create-error">{createError}</div>
         {/if}
@@ -1531,7 +1555,7 @@
         >{workspace?.name ?? "chimaera"}</button
       >
       <div class="chips">
-        {#each wsSessions as s (s.id)}
+        {#each railSessions as s (s.id)}
           <button
             class="chip"
             class:focused={s.id === focusedSessionId}
@@ -1561,7 +1585,6 @@
 
 {#if launcherOpen && activeWsId !== null && launcherAnchor !== null}
   <Launcher
-    workspaceId={activeWsId}
     anchor={launcherAnchor}
     onPick={launcherPick}
     onInstall={launcherInstall}
@@ -1914,6 +1937,22 @@
     font-size: var(--text-xs);
     line-height: 1.35;
     color: var(--err);
+  }
+
+  /* Rail section headers: terminals above, agents below. */
+  .rail-sec {
+    flex: none;
+    padding: 4px 8px 3px;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    user-select: none;
+  }
+
+  .rail-sec.agents-sec {
+    margin-top: 0.55rem;
   }
 
   /* --- Recents: ended agent conversations --- */

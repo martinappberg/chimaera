@@ -989,11 +989,12 @@ mod tests {
             Ok(PathBuf::from("/bin/echo")),
             Some("2.1.196 (Claude Code)"),
         );
+        // Installed but ancient: the npm-era codex predates `codex login`.
         preset_agent(
             &state,
             agents::AgentKind::Codex,
-            Err("codex not found (test)".to_string()),
-            None,
+            Ok(PathBuf::from("/bin/echo")),
+            Some("0.1.2504161551"),
         );
         preset_agent(
             &state,
@@ -1001,28 +1002,27 @@ mod tests {
             Err("gemini not found (test)".to_string()),
             None,
         );
+        preset_agent(
+            &state,
+            agents::AgentKind::Antigravity,
+            Err("agy not found (test)".to_string()),
+            None,
+        );
 
         let (status, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
         assert_eq!(status, StatusCode::OK);
         let list = list.as_array().unwrap();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 4);
         let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["claude", "codex", "gemini"]);
+        assert_eq!(ids, ["claude", "codex", "gemini", "agy"]);
 
-        // Installed: path + version present, curated models, install hint.
+        // Installed and current: path + version present, no outdated flag.
         let claude = &list[0];
         assert_eq!(claude["name"], "Claude Code");
         assert_eq!(claude["installed"], true);
         assert_eq!(claude["path"], "/bin/echo");
         assert_eq!(claude["version"], "2.1.196 (Claude Code)");
-        assert_eq!(
-            claude["models"],
-            serde_json::json!([
-                {"id": "opus", "label": "Opus"},
-                {"id": "sonnet", "label": "Sonnet"},
-                {"id": "haiku", "label": "Haiku"},
-            ])
-        );
+        assert!(!claude.as_object().unwrap().contains_key("outdated"));
         assert!(claude["install"]["command"]
             .as_str()
             .unwrap()
@@ -1032,23 +1032,29 @@ mod tests {
             .unwrap()
             .starts_with("https://"));
 
+        // Installed but legacy (npm-era codex, no `codex login`): flagged so
+        // the UI offers the install command as an update.
+        let codex = &list[1];
+        assert_eq!(codex["installed"], true);
+        assert_eq!(codex["outdated"], true);
+        assert_eq!(codex["install"]["command"], "npm install -g @openai/codex");
+
         // Not installed: muted row material — no path/version, but the
-        // model list and the install action are still there.
-        for (entry, npm) in [
-            (&list[1], "npm install -g @openai/codex"),
-            (&list[2], "npm install -g @google/gemini-cli"),
-        ] {
-            assert_eq!(entry["installed"], false);
-            let obj = entry.as_object().unwrap();
-            assert!(!obj.contains_key("path"), "{entry}");
-            assert!(!obj.contains_key("version"), "{entry}");
-            assert!(!entry["models"].as_array().unwrap().is_empty());
-            assert_eq!(entry["install"]["command"], npm);
-            assert!(entry["install"]["url"]
-                .as_str()
-                .unwrap()
-                .starts_with("https://"));
-        }
+        // install action and docs link are still there.
+        let agy = &list[3];
+        assert_eq!(agy["name"], "Antigravity CLI");
+        assert_eq!(agy["installed"], false);
+        let obj = agy.as_object().unwrap();
+        assert!(!obj.contains_key("path"), "{agy}");
+        assert!(!obj.contains_key("version"), "{agy}");
+        assert!(agy["install"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("antigravity.google"));
+        assert!(agy["install"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://"));
     }
 
     #[tokio::test]
@@ -1281,6 +1287,140 @@ mod tests {
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["title"], "hooks online v3");
         assert_eq!(entries[0]["resume"], "conv-10");
+    }
+
+    /// GET /recents merges the daemon's own history with the claude
+    /// transcript store (the popover has no resume list of its own): daemon
+    /// entries win identity collisions, transcript-only conversations appear
+    /// as claude rows, live conversations are hidden from both sources.
+    #[tokio::test]
+    async fn recents_merge_daemon_history_with_transcript_store() {
+        let store = test_dir("recents-merge-store");
+        let state = test_state_with_claude_store(store.clone());
+        let root = test_dir("recents-merge-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+        let project_dir = store.join(launcher::encode_cwd(std::path::Path::new(
+            ws["root"].as_str().unwrap(),
+        )));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // A conversation only the transcript store knows (ended before the
+        // daemon existed, or claude run outside chimaera).
+        write_transcript(
+            &project_dir,
+            "hist-1",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"annotate the variants"}}"#,
+                "\n",
+            ),
+            500,
+        );
+        // A conversation BOTH know: transcript says one title, the daemon
+        // watched it end with a newer one — the daemon entry must win.
+        let both_path = project_dir.join("both-2.jsonl");
+        write_transcript(
+            &project_dir,
+            "both-2",
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"stale title","sessionId":"both-2"}"#,
+                "\n"
+            ),
+            400,
+        );
+        plant_agent_record(
+            &state,
+            "s-both",
+            &ws_id,
+            agents::AgentKind::Claude,
+            Some("fresh daemon title"),
+            Some(both_path.to_str().unwrap()),
+        );
+        recents::retire(&state, "s-both", None, None);
+        // And one daemon-only codex conversation (no transcript machinery).
+        plant_agent_record(
+            &state,
+            "s-cdx",
+            &ws_id,
+            agents::AgentKind::Codex,
+            None,
+            None,
+        );
+        recents::retire(&state, "s-cdx", None, None);
+
+        let entries = recents_of(&state, &ws_id).await;
+        let titles: Vec<&str> = entries
+            .iter()
+            .map(|e| e["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        // Newest first: the two just-retired daemon entries, then history.
+        assert!(titles.contains(&"fresh daemon title"), "{titles:?}");
+        assert!(titles.contains(&"codex"), "{titles:?}");
+        assert_eq!(*titles.last().unwrap(), "annotate the variants");
+        assert!(!titles.contains(&"stale title"), "daemon entry must win");
+        let hist = entries.last().unwrap();
+        assert_eq!(hist["kind"], "claude");
+        assert_eq!(hist["resume"], "hist-1");
+        assert!(hist["last_active"].as_u64().unwrap() > 0);
+
+        // A live session on the transcript-only conversation hides it too.
+        plant_agent_record(
+            &state,
+            "s-live",
+            &ws_id,
+            agents::AgentKind::Claude,
+            None,
+            Some(project_dir.join("hist-1.jsonl").to_str().unwrap()),
+        );
+        let entries = recents_of(&state, &ws_id).await;
+        assert!(
+            !entries.iter().any(|e| e["resume"] == "hist-1"),
+            "{entries:?}"
+        );
+        crate::lock(&state.agents).remove("s-live");
+
+        // Resume-then-end: claude forks a new session id and the ANCESTOR
+        // transcript stays on disk in the scanned dir. The superseded
+        // ancestor must NOT resurrect from the scan — clicking it would
+        // fork the conversation from its pre-resume state (review blocker).
+        write_transcript(
+            &project_dir,
+            "both-2b",
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"fresh daemon title v2","sessionId":"both-2b"}"#,
+                "\n",
+            ),
+            10,
+        );
+        plant_agent_record(
+            &state,
+            "s-resumed",
+            &ws_id,
+            agents::AgentKind::Claude,
+            Some("fresh daemon title v2"),
+            Some(project_dir.join("both-2b.jsonl").to_str().unwrap()),
+        );
+        crate::lock(&state.agents)
+            .get_mut("s-resumed")
+            .unwrap()
+            .resumed_from = Some("both-2".to_string());
+        recents::retire(&state, "s-resumed", None, None);
+
+        let entries = recents_of(&state, &ws_id).await;
+        let lineage: Vec<&serde_json::Value> = entries
+            .iter()
+            .filter(|e| e["resume"] == "both-2" || e["resume"] == "both-2b")
+            .collect();
+        assert_eq!(lineage.len(), 1, "ancestor resurrected: {entries:?}");
+        assert_eq!(lineage[0]["resume"], "both-2b");
+        assert_eq!(lineage[0]["title"], "fresh daemon title v2");
     }
 
     #[tokio::test]

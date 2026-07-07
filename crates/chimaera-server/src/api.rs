@@ -255,8 +255,14 @@ pub(crate) async fn create_session(
             Some(name) => match crate::agents::AgentKind::parse(name) {
                 Some(kind) => kind,
                 None => {
+                    // Derived, not hand-written: the catalog moves.
+                    let known: Vec<&str> = crate::agents::AgentKind::ALL
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect();
                     return bad_request(format!(
-                        "unknown agent {name:?} (expected claude, codex or gemini)"
+                        "unknown agent {name:?} (expected one of {})",
+                        known.join(", ")
                     ));
                 }
             },

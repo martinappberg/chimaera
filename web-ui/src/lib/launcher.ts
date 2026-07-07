@@ -11,21 +11,17 @@ export interface AgentInfo {
   id: string;
   name: string;
   installed: boolean;
+  /** Installed but too old to run usefully — offer the install command as
+   *  an update instead of spawning blind (npm-era codex, pre-login). */
+  outdated: boolean;
   /** `--version` first line for installed agents, when the probe worked. */
   version: string | null;
   /** Install command the UI pre-types (never executes) into a fresh terminal. */
   install: string;
-  /** Docs URL for the install hint's tooltip. */
+  /** Official docs URL — a clickable link on every launcher row. */
   installUrl: string | null;
 }
 
-/** One resumable Claude session for a workspace (cwd-scoped JSONL store). */
-export interface ResumeEntry {
-  id: string;
-  title: string;
-  /** Last activity, unix seconds (rendered as relative age). */
-  mtime: number;
-}
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -58,24 +54,12 @@ export async function listAgents(refresh = false): Promise<AgentInfo[]> {
         id: a.id,
         name: typeof a.name === "string" ? a.name : a.id,
         installed: a.installed === true,
+        outdated: a.outdated === true,
         version: typeof a.version === "string" ? a.version : null,
         install: typeof install.command === "string" ? install.command : "",
         installUrl: typeof install.url === "string" ? install.url : null,
       },
     ];
-  });
-}
-
-/** GET /api/v1/agents/claude/sessions — resumables for a workspace. */
-export async function listResumables(workspaceId: string): Promise<ResumeEntry[]> {
-  const q = new URLSearchParams({ workspace_id: workspaceId });
-  const body = await json<unknown>(await api(`/agents/claude/sessions?${q.toString()}`));
-  if (!Array.isArray(body)) return [];
-  return body.flatMap((raw): ResumeEntry[] => {
-    if (typeof raw !== "object" || raw === null) return [];
-    const s = raw as Record<string, unknown>;
-    if (typeof s.id !== "string" || typeof s.title !== "string") return [];
-    return [{ id: s.id, title: s.title, mtime: typeof s.mtime === "number" ? s.mtime : 0 }];
   });
 }
 

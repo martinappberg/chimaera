@@ -37,16 +37,38 @@ pub(crate) struct RecentEntry {
     pub(crate) title: String,
     /// Claude session id (`--resume <id>`); None = can only start fresh.
     pub(crate) resume: Option<String>,
+    /// Ancestor session ids this conversation absorbed across resume cycles
+    /// (claude forks a new id per resume; the ancestors' transcripts stay on
+    /// disk). The merge must not resurrect them from the transcript scan —
+    /// resuming an ancestor id would fork the conversation from its
+    /// pre-resume state.
+    pub(crate) supersedes: Vec<String>,
     /// When the session ended, unix seconds.
     pub(crate) last_active: u64,
 }
 
+/// Ancestor-chain bound: transcripts on disk outlive everything, so a
+/// dropped id would resurrect — but a conversation resumed hundreds of
+/// times is not a real shape; this is a runaway guard, not a policy.
+const SUPERSEDES_CAP: usize = 32;
+
 impl RecentEntry {
-    fn to_json(&self) -> serde_json::Value {
+    /// The wire shape (`supersedes` stays internal to the store file).
+    fn to_api_json(&self) -> serde_json::Value {
         json!({
             "kind": self.kind.as_str(),
             "title": self.title,
             "resume": self.resume,
+            "last_active": self.last_active,
+        })
+    }
+
+    fn to_store_json(&self) -> serde_json::Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "title": self.title,
+            "resume": self.resume,
+            "supersedes": self.supersedes,
             "last_active": self.last_active,
         })
     }
@@ -59,6 +81,15 @@ impl RecentEntry {
                 .get("resume")
                 .and_then(|r| r.as_str())
                 .map(str::to_string),
+            supersedes: value
+                .get("supersedes")
+                .and_then(|s| s.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
             last_active: value.get("last_active")?.as_u64()?,
         })
     }
@@ -103,22 +134,40 @@ impl RecentsStore {
     /// The same conversation ending again (a resume that re-ended) updates
     /// its existing entry, and `supersedes` — the session id this one was
     /// resumed FROM (claude forks a new id per resume) — replaces the
-    /// ancestor entry instead of duplicating the conversation. Handle-less
-    /// duplicates collapse by (kind, title) so untitled codex/gemini rows
-    /// never pile up. Persists on change.
+    /// ancestor entry instead of duplicating the conversation, inheriting
+    /// its ancestor chain so the transcript scan can never resurrect any
+    /// generation of it. Handle-less duplicates collapse by (kind, title)
+    /// so untitled codex/gemini rows never pile up. Persists on change.
     pub(crate) fn push(
         &mut self,
         workspace_id: &str,
-        entry: RecentEntry,
+        mut entry: RecentEntry,
         supersedes: Option<&str>,
     ) {
         let list = self.items.entry(workspace_id.to_string()).or_default();
-        list.retain(|e| match (&entry.resume, &e.resume) {
-            (_, Some(old)) if supersedes == Some(old.as_str()) => false,
-            (Some(new), Some(old)) => new != old,
-            (None, None) => !(e.kind == entry.kind && e.title == entry.title),
-            _ => true,
+        if let Some(ancestor) = supersedes {
+            if !entry.supersedes.iter().any(|s| s == ancestor) {
+                entry.supersedes.push(ancestor.to_string());
+            }
+        }
+        list.retain(|e| {
+            let displaced = match (&entry.resume, &e.resume) {
+                (_, Some(old)) if supersedes == Some(old.as_str()) => true,
+                (Some(new), Some(old)) => new == old,
+                (None, None) => e.kind == entry.kind && e.title == entry.title,
+                _ => false,
+            };
+            if displaced {
+                // The displaced entry's own ancestors move onto the new one.
+                for s in &e.supersedes {
+                    if !entry.supersedes.contains(s) {
+                        entry.supersedes.push(s.clone());
+                    }
+                }
+            }
+            !displaced
         });
+        entry.supersedes.truncate(SUPERSEDES_CAP);
         list.insert(0, entry);
         list.truncate(CAP_PER_WORKSPACE);
         if let Err(err) = self.save() {
@@ -142,7 +191,7 @@ impl RecentsStore {
             .map(|(ws, list)| {
                 (
                     ws.clone(),
-                    serde_json::Value::Array(list.iter().map(RecentEntry::to_json).collect()),
+                    serde_json::Value::Array(list.iter().map(RecentEntry::to_store_json).collect()),
                 )
             })
             .collect();
@@ -186,6 +235,7 @@ pub(crate) fn retire(
             // Fall back to the resumed-from id when no hook ever reported a
             // transcript: the old conversation is still the resume target.
             resume: record.resume_id().or_else(|| record.resumed_from.clone()),
+            supersedes: Vec::new(), // push() records the ancestor chain
             last_active: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -203,33 +253,84 @@ pub(crate) struct RecentsQuery {
 
 /// GET /api/v1/recents?workspace_id= — the workspace's ended agent
 /// conversations, newest first, minus any whose conversation is live again.
+///
+/// Two sources merge here: the daemon's own history (any agent kind, ended
+/// under its watch) and the claude transcript store (conversations from
+/// before chimaera, or from claude run outside it). The rail's Recents is
+/// the ONE resume surface — the launcher popover has no list of its own.
 pub(crate) async fn list_recents(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RecentsQuery>,
 ) -> Response {
-    if crate::lock(&state.workspaces)
-        .get(&query.workspace_id)
-        .is_none()
-    {
+    let Some(workspace) = crate::lock(&state.workspaces).get(&query.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown workspace {}", query.workspace_id)})),
         )
             .into_response();
-    }
+    };
     // A conversation is "live" through either identity: the transcript its
     // hooks report, or the ancestor id it was resumed from (claude forks a
     // new session id per resume, and hooks may not have fired yet).
-    let live: std::collections::HashSet<String> = crate::lock(&state.agents)
-        .values()
-        .flat_map(|r| [r.resume_id(), r.resumed_from.clone()])
-        .flatten()
+    let (live, exclude): (std::collections::HashSet<String>, Vec<PathBuf>) = {
+        let agents = crate::lock(&state.agents);
+        (
+            agents
+                .values()
+                .flat_map(|r| [r.resume_id(), r.resumed_from.clone()])
+                .flatten()
+                .collect(),
+            agents
+                .values()
+                .filter_map(|a| a.transcript_path.clone())
+                .collect(),
+        )
+    };
+    let store_entries = crate::lock(&state.recents).list(&query.workspace_id);
+
+    let dir = state
+        .claude_projects_dir
+        .join(crate::launcher::encode_cwd(&workspace.root));
+    // Transcripts can be tens of MB; scan them off the async runtime.
+    let scanned =
+        tokio::task::spawn_blocking(move || crate::launcher::scan_resumables(&dir, &exclude))
+            .await
+            .unwrap_or_default();
+
+    // Daemon entries win on identity collisions: they know the agent kind
+    // and the true end time, and carry non-claude history the store can't.
+    // "Identity" spans a conversation's whole resume lineage — superseded
+    // ancestor ids count as seen, or the scan would resurrect them (their
+    // transcripts stay on disk) and a click would fork the conversation
+    // from its pre-resume state.
+    let mut seen: std::collections::HashSet<String> = store_entries
+        .iter()
+        .flat_map(|e| e.resume.iter().chain(e.supersedes.iter()))
+        .cloned()
         .collect();
-    let entries: Vec<serde_json::Value> = crate::lock(&state.recents)
-        .list(&query.workspace_id)
+    let mut merged: Vec<serde_json::Value> = store_entries
         .iter()
         .filter(|e| e.resume.as_ref().is_none_or(|r| !live.contains(r)))
-        .map(RecentEntry::to_json)
+        .map(RecentEntry::to_api_json)
         .collect();
-    Json(serde_json::Value::Array(entries)).into_response()
+    for row in scanned {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if seen.contains(id) || live.contains(id) {
+            continue;
+        }
+        seen.insert(id.to_string());
+        merged.push(json!({
+            "kind": AgentKind::Claude.as_str(),
+            "title": row.get("title").cloned().unwrap_or_default(),
+            "resume": id,
+            "last_active": row.get("mtime").cloned().unwrap_or(json!(0)),
+        }));
+    }
+    merged.sort_by_key(|e| {
+        std::cmp::Reverse(e.get("last_active").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
+    merged.truncate(CAP_PER_WORKSPACE);
+    Json(serde_json::Value::Array(merged)).into_response()
 }

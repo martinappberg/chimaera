@@ -43,6 +43,8 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
         // documents `-m, --model` with default o4-mini; o3/gpt-4.1 are the
         // alternatives its README suggests for the CLI.
         AgentKind::Codex => &[("o4-mini", "o4-mini"), ("o3", "o3"), ("gpt-4.1", "GPT-4.1")],
+        // agy picks its own model; no curated list until its integration.
+        AgentKind::Antigravity => &[],
         // Static list (gemini is not installed here to probe): the models
         // the gemini-cli README documents for interactive use.
         AgentKind::Gemini => &[
@@ -60,6 +62,9 @@ pub(crate) fn install_command(kind: AgentKind) -> &'static str {
         // it needs no node on the host, which matters on HPC login nodes.
         AgentKind::Claude => "curl -fsSL https://claude.ai/install.sh | bash",
         AgentKind::Codex => "npm install -g @openai/codex",
+        // Single static binary, no node — same shape as claude's installer
+        // (matters on HPC login nodes).
+        AgentKind::Antigravity => "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         AgentKind::Gemini => "npm install -g @google/gemini-cli",
     }
 }
@@ -68,9 +73,18 @@ pub(crate) fn install_command(kind: AgentKind) -> &'static str {
 pub(crate) fn docs_url(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Claude => "https://docs.claude.com/en/docs/claude-code/setup",
-        AgentKind::Codex => "https://github.com/openai/codex",
+        AgentKind::Codex => "https://developers.openai.com/codex/cli",
+        AgentKind::Antigravity => "https://antigravity.google/docs",
         AgentKind::Gemini => "https://github.com/google-gemini/gemini-cli",
     }
+}
+
+/// An installed build the launcher should offer to UPDATE rather than run
+/// blind: the npm-era TypeScript codex (0.1.x) predates `codex login` and
+/// only knows `OPENAI_API_KEY` auth — found in the field when a spawn died
+/// in ~400ms with "Missing OpenAI API key" on a host with no key anywhere.
+pub(crate) fn is_outdated(kind: AgentKind, version: Option<&str>) -> bool {
+    kind == AgentKind::Codex && version.is_some_and(|v| v.starts_with("0.1."))
 }
 
 /// One cached detection result: where the binary lives (or why it could not
@@ -127,15 +141,41 @@ async fn resolve_bin(kind: AgentKind) -> Result<PathBuf, String> {
                 .map(str::trim)
                 .find(|l| !l.is_empty())
                 .unwrap_or("");
-            if path.starts_with('/') {
-                Ok(PathBuf::from(path))
-            } else {
-                Err(not_found())
+            if !path.starts_with('/') {
+                return Err(not_found());
             }
+            let path = PathBuf::from(path);
+            if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
+                // The Antigravity IDE ships an `agy` symlink to its own app
+                // launcher (like VS Code's `code`): it opens the GUI and
+                // exits 0 silently — NOT the CLI. Field-found: spawning it
+                // made a pane that just said "[exited]".
+                return Err(format!(
+                    "the `agy` on your PATH is the Antigravity IDE's app launcher, \
+                     not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
+                    cmd = install_command(kind),
+                    url = docs_url(kind),
+                ));
+            }
+            Ok(path)
         }
         Ok(_) => Err(not_found()),
         Err(err) => Err(format!("failed to run login shell {shell}: {err}")),
     }
+}
+
+/// True when a resolved `agy` is the Antigravity IDE's app launcher rather
+/// than the standalone CLI. Two platform-spanning signals on the
+/// canonicalized target: the macOS bundle (`…/Antigravity.app/…`), and the
+/// launcher binary's own name — the IDE ships `antigravity` (VS Code's
+/// `code` pattern; users symlink it to `agy` by hand on Linux), while the
+/// real CLI binary is `agy` itself.
+fn agy_is_ide_shim(path: &Path) -> bool {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    target
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy() == "Antigravity.app")
+        || target.file_name().is_some_and(|f| f == "antigravity")
 }
 
 /// Version-probe budget: node-backed CLIs take ~1s to boot; anything past
@@ -194,6 +234,11 @@ pub(crate) async fn list_agents(
             }
             if let Some(version) = &detection.version {
                 row.insert("version".into(), json!(version));
+            }
+            if detection.path.is_ok() && is_outdated(kind, detection.version.as_deref()) {
+                // Installed but too old to run usefully: the UI offers the
+                // install command as an UPDATE instead of spawning blind.
+                row.insert("outdated".into(), json!(true));
             }
             let models: Vec<_> = models(kind)
                 .iter()
@@ -335,7 +380,8 @@ pub(crate) async fn claude_resumables(
 /// missing dir (workspace never used with claude) is an empty list, not an
 /// error. Transcripts with nothing user-visible to title them (warmups,
 /// empty boots) are skipped rather than listed as "untitled".
-fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
+/// (Shared with GET /recents, which merges this history into the rail.)
+pub(crate) fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json::Value> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -497,6 +543,37 @@ fn first_prompt_text(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IDE launcher masquerading as `agy` must be refused on every
+    /// platform: via the macOS bundle path AND via the launcher binary's
+    /// own name (Linux hand-symlink shape). The real CLI passes.
+    #[test]
+    fn agy_shim_detection_spans_platforms() {
+        let dir = std::env::temp_dir().join(format!("chimaera-agy-shim-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Antigravity.app/Contents/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("plain")).unwrap();
+
+        // macOS: agy -> …/Antigravity.app/Contents/bin/antigravity
+        let mac_target = dir.join("Antigravity.app/Contents/bin/antigravity");
+        std::fs::write(&mac_target, "").unwrap();
+        let mac_link = dir.join("agy-mac");
+        std::os::unix::fs::symlink(&mac_target, &mac_link).unwrap();
+        assert!(agy_is_ide_shim(&mac_link));
+
+        // Linux hand-symlink: agy -> /usr/bin/antigravity (no .app anywhere)
+        let linux_target = dir.join("plain/antigravity");
+        std::fs::write(&linux_target, "").unwrap();
+        let linux_link = dir.join("agy-linux");
+        std::os::unix::fs::symlink(&linux_target, &linux_link).unwrap();
+        assert!(agy_is_ide_shim(&linux_link));
+
+        // The real CLI: a binary actually named agy.
+        let real = dir.join("plain/agy");
+        std::fs::write(&real, "").unwrap();
+        assert!(!agy_is_ide_shim(&real));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn encode_cwd_matches_the_real_store() {
@@ -744,10 +821,17 @@ mod tests {
     #[test]
     fn curated_lists_cover_every_agent() {
         for kind in AgentKind::ALL {
-            assert!(!models(kind).is_empty(), "{kind:?} has models");
+            // agy has no curated model list (empty is fine); install and
+            // docs must exist for every catalog agent.
             assert!(!install_command(kind).is_empty());
             assert!(docs_url(kind).starts_with("https://"));
         }
+        // Outdated detection: npm-era codex (0.1.x, pre-`codex login`)
+        // gets the update affordance; modern builds and other agents don't.
+        assert!(is_outdated(AgentKind::Codex, Some("0.1.2504161551")));
+        assert!(!is_outdated(AgentKind::Codex, Some("0.52.0")));
+        assert!(!is_outdated(AgentKind::Codex, None));
+        assert!(!is_outdated(AgentKind::Claude, Some("0.1.99")));
         // The spec'd claude aliases and labels, exactly.
         assert_eq!(
             models(AgentKind::Claude),
