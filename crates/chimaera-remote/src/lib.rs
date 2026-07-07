@@ -259,8 +259,13 @@ pub async fn connect(
                         sessions.map_or("unknown".to_string(), |n| n.to_string()),
                     );
                     progress(Phase::Updating);
+                    // Secure the replacement binary BEFORE stopping the
+                    // running daemon: a failed download/build must never leave
+                    // the host with nothing running (the bug that stranded a
+                    // stopped daemon when a dev build 404'd on download).
+                    let bin = resolve_local_binary(host, opts.binary.as_deref(), &progress).await?;
                     stop_remote(host, m.pid).await?;
-                    ensure_remote_binary(host, opts.binary.as_deref(), true, &progress).await?;
+                    deploy_binary(host, &bin, &progress).await?;
                     progress(Phase::Starting);
                     start_remote(host).await?
                 }
@@ -279,7 +284,7 @@ pub async fn connect(
             }
         }
         _ => {
-            ensure_remote_binary(host, opts.binary.as_deref(), false, &progress).await?;
+            ensure_remote_binary(host, opts.binary.as_deref(), &progress).await?;
             progress(Phase::Starting);
             start_remote(host).await?
         }
@@ -619,62 +624,56 @@ async fn sha256_file(file: &Path) -> anyhow::Result<String> {
     bail!("could not compute a sha256 (neither sha256sum nor shasum is available)")
 }
 
-/// Verify `$HOME/.chimaera/bin/chimaera` exists on the host, installing it
-/// from the explicit `binary`, else from `~/.chimaera/dist/` by detected
-/// target, erroring with instructions otherwise. `force` re-deploys even
-/// over an existing binary (the self-update path — the daemon must be
-/// stopped first).
-async fn ensure_remote_binary(
+/// Resolve the LOCAL binary to deploy to a host of the target inferred from
+/// `host`: an explicit `binary`, else a developer's `just dist` stash, else
+/// auto-fetched from our release. Touches only the local machine (bar a
+/// read-only `uname` over the shared connection) — callers resolve this
+/// *before* stopping a running daemon, so a failed fetch never strands a host
+/// with no daemon.
+async fn resolve_local_binary(
     host: &str,
     binary: Option<&Path>,
-    force: bool,
     progress: &impl Fn(Phase),
-) -> anyhow::Result<()> {
-    if !force && ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
-        return Ok(());
+) -> anyhow::Result<PathBuf> {
+    if let Some(p) = binary {
+        if !p.is_file() {
+            bail!("binary {} does not exist", p.display());
+        }
+        return Ok(p.to_path_buf());
     }
-    let path = match binary {
-        Some(p) => {
-            if !p.is_file() {
-                bail!("binary {} does not exist", p.display());
-            }
-            p.to_path_buf()
-        }
-        None => {
-            let (os, arch) = remote_target(host).await?;
-            // Prefer a developer's local `just dist` stash if present, so a
-            // repo checkout still overrides with its own build; otherwise
-            // auto-fetch the matching daemon from our release (the end-user
-            // path — no repo, no stash).
-            let candidate = dist_dir().join(dist_name(&os, &arch));
-            if candidate.is_file() {
-                candidate
-            } else {
-                fetch_release_binary(&os, &arch, progress)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "chimaera is not installed on {host} ({os}/{arch}) and could not be \
-                         fetched automatically: {e}.\n\
-                         Provide one with either:\n\
-                         \x20 just dist                 (in the chimaera repo: builds musl \
-                         binaries into ~/.chimaera/dist)\n\
-                         \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
-                        )
-                    })?
-            }
-        }
-    };
+    let (os, arch) = remote_target(host).await?;
+    // Prefer a developer's local `just dist` stash if present, so a repo
+    // checkout still overrides with its own build; otherwise auto-fetch the
+    // matching daemon from our release (the end-user path — no repo, no stash).
+    let candidate = dist_dir().join(dist_name(&os, &arch));
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    fetch_release_binary(&os, &arch, progress)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "chimaera is not installed on {host} ({os}/{arch}) and could not be \
+                 fetched automatically: {e}.\n\
+                 Provide one with either:\n\
+                 \x20 just dist                 (in the chimaera repo: builds musl \
+                 binaries into ~/.chimaera/dist)\n\
+                 \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
+            )
+        })
+}
+
+/// Copy `path` to `$HOME/.chimaera/bin/chimaera` on the host, staged +
+/// renamed so an interrupted copy never leaves a half-written executable and
+/// the old inode stays intact for anything still running it.
+async fn deploy_binary(host: &str, path: &Path, progress: &impl Fn(Phase)) -> anyhow::Result<()> {
     progress(Phase::Installing {
-        binary: path.clone(),
+        binary: path.to_path_buf(),
     });
     tracing::info!("installing {} on {host}", path.display());
     ssh_run(host, "mkdir -p $HOME/.chimaera/bin").await?;
-    // Stage + rename, never truncate the live path in place: an interrupted
-    // copy must not leave a half-written-but-executable binary behind, and
-    // rename keeps the old inode intact for anything still running it.
     let output = scp_cmd()
-        .arg(&path)
+        .arg(path)
         .arg(format!("{host}:.chimaera/bin/chimaera.new"))
         .output()
         .await
@@ -692,6 +691,22 @@ async fn ensure_remote_binary(
     )
     .await?;
     Ok(())
+}
+
+/// Ensure the host has a chimaera binary, installing one only if absent (the
+/// fresh-host path — an existing binary is left as-is). Replacing an outdated
+/// one is the caller's job: resolve + deploy around a graceful stop, in that
+/// order, so a failed fetch never kills a working daemon.
+async fn ensure_remote_binary(
+    host: &str,
+    binary: Option<&Path>,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<()> {
+    if ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
+        return Ok(());
+    }
+    let path = resolve_local_binary(host, binary, progress).await?;
+    deploy_binary(host, &path, progress).await
 }
 
 /// Start the daemon on the host and poll until its manifest reports alive.

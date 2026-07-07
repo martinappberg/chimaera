@@ -113,10 +113,19 @@ pub fn install(app: &AppHandle) -> Result<()> {
     let std_listener = std::os::unix::net::UnixListener::bind(&sock)
         .with_context(|| format!("bind {}", sock.display()))?;
     std_listener.set_nonblocking(true)?;
-    let listener = UnixListener::from_std(std_listener)?;
 
     let app = app.clone();
+    // `UnixListener::from_std` registers with the Tokio reactor, so it must
+    // run inside the runtime — spawn first, convert there. `install` itself is
+    // called from Tauri's synchronous setup, which has no reactor.
     tauri::async_runtime::spawn(async move {
+        let listener = match UnixListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("askpass listener unavailable: {e}");
+                return;
+            }
+        };
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
