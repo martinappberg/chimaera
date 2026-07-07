@@ -106,7 +106,10 @@ CI and releases are automatic; know which knob you're touching.
   `cargo fmt`/`clippy`/`test`, plus musl cross-builds. Branch protection on `main`
   requires it green.
 - **`app.yml`** — PR-only build-check for the Tauri bundle. Runs *only* when
-  `crates/chimaera-app/**` or `web-ui/**` change (macOS runners are expensive).
+  `crates/chimaera-app/**` or `web-ui/**` change (macOS runners are expensive). It
+  builds without updater artifacts (`createUpdaterArtifacts` off), so it needs **no
+  signing key** — signing is a release-only concern (`release.yml` on `main`). The
+  PR bundle carries the `0.0.1` sentinel version; harmless, it's never published.
 - **`release.yml`** — **every merge to `main` cuts a PUBLISHED GitHub release**
   (daemon musl + macOS binaries + signed app). The installed app auto-updates
   from it. The version is derived from the last git tag and bumped by the

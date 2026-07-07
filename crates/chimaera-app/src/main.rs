@@ -6,14 +6,24 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod askpass;
 mod daemon;
 mod menu;
 mod shell;
 
 fn main() {
-    // Dual role: `chimaera-app --daemon` IS the local daemon (headless,
-    // no Tauri init), so the .app is self-contained — the shell spawns its
-    // own executable detached and the daemon outlives every window.
+    // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
+    // runs to prompt for a password / 2FA: it relays to the running app over
+    // a socket and prints the answer, no Tauri init. Checked first — it must
+    // stay lightweight and never spawn a daemon or a window.
+    if std::env::args().any(|a| a == "--askpass") {
+        askpass::run_helper();
+        return;
+    }
+
+    // `chimaera-app --daemon` IS the local daemon (headless, no Tauri init),
+    // so the .app is self-contained — the shell spawns its own executable
+    // detached and the daemon outlives every window.
     if std::env::args().any(|a| a == "--daemon") {
         daemon::run_headless();
         return;

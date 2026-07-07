@@ -64,7 +64,7 @@ export interface HostState {
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "updating" | "installing" | "starting" | "tunneling";
+  phase: "probing" | "updating" | "downloading" | "installing" | "starting" | "tunneling";
 }
 
 /** Build parity of the local daemon, as decided at app startup. */
@@ -174,6 +174,31 @@ export function onConnectProgress(
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
   return t.event.listen<ConnectProgress>("connect-progress", (e) => handler(e.payload));
+}
+
+/**
+ * An SSH auth prompt ssh raised while connecting (no tty in the app, so it
+ * comes to us via SSH_ASKPASS). `prompt` is ssh's own text — a password ask,
+ * or a keyboard-interactive challenge like a Duo passcode/option menu.
+ */
+export interface AskpassPrompt {
+  id: number;
+  prompt: string;
+}
+
+/** Subscribe to SSH auth prompts. Returns an unsubscribe promise. */
+export function onAskpass(handler: (p: AskpassPrompt) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<AskpassPrompt>("ssh-askpass", (e) => handler(e.payload));
+}
+
+/**
+ * Answer prompt `id`. `secret` null cancels it, letting the waiting ssh fail
+ * cleanly instead of hanging.
+ */
+export async function answerAskpass(id: number, secret: string | null): Promise<void> {
+  await tauri()?.core.invoke<void>("answer_askpass", { id, secret });
 }
 
 /**

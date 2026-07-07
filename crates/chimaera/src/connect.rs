@@ -18,6 +18,9 @@ pub async fn run(
     let mut tunnel = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),
         Phase::Updating => tracing::info!("updating the daemon on {host}"),
+        Phase::Downloading { target } => {
+            tracing::info!("downloading the {target} daemon for {host}");
+        }
         Phase::Installing { binary } => {
             tracing::info!("installing {} on {host}", binary.display());
         }
