@@ -80,11 +80,21 @@ macOS and Linux. The daemon cross-compiles to fully static musl binaries (x86_64
 that run on old-glibc HPC systems — verified on a cluster running glibc 2.17, no root
 required. Windows is untested.
 
+## Staying current
+
+Two things update themselves, so a running setup keeps pace with releases:
+
+- **The daemon** is replaced on connect when it is older than the client — silently if it
+  has no live sessions, otherwise behind an explicit "update" action that spells out what
+  it ends (an idle shell holding a `module load`/conda environment is never killed without
+  asking). Works the same for the local daemon and remote ones over ssh.
+- **The native app** checks GitHub releases on launch and offers a one-click "update &
+  restart"; the download is signature-verified before it installs.
+
 ## Status
 
 Early and pre-release, moving fast. Interfaces, storage formats, and the wire protocol all
-change without notice; there are no versioned releases yet. See [DESIGN.md](DESIGN.md) for
-the full design and roadmap.
+change without notice. See [DESIGN.md](DESIGN.md) for the full design and roadmap.
 
 ## License
 

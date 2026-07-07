@@ -4,8 +4,10 @@
   import { needsAttention, type Session, type Workspace } from "./sessions";
   import {
     addHost,
+    checkAppUpdate,
     connectHost,
     disconnectHost,
+    installAppUpdate,
     isNativeShell,
     listHosts,
     localDaemonState,
@@ -78,6 +80,25 @@
   let localUpdating = $state(false);
   let localError = $state<string | null>(null);
 
+  // --- app self-update (native shell only) -----------------------------------
+
+  /** A newer signed app build is available on GitHub (its version), or null. */
+  let appUpdate = $state<string | null>(null);
+  let appUpdating = $state(false);
+  let appUpdateError = $state<string | null>(null);
+
+  async function installApp(): Promise<void> {
+    appUpdateError = null;
+    appUpdating = true;
+    try {
+      await installAppUpdate();
+      // Never returns on success — the app relaunches into the new build.
+    } catch (e) {
+      appUpdateError = e instanceof Error ? e.message : String(e);
+      appUpdating = false;
+    }
+  }
+
   /** Current live sessions on the daemon serving this window. */
   const liveNow = $derived(sessions.filter((s) => s.alive).length);
 
@@ -95,6 +116,8 @@
     // Only the local window asks about the local daemon's build parity.
     if (hostLabel === "local") {
       void localDaemonState().then((s) => (localState = s));
+      // Quietly ask GitHub whether a newer signed app build exists.
+      void checkAppUpdate().then((v) => (appUpdate = v));
     }
     let unlisten: (() => void) | null = null;
     void onConnectProgress((p) => {
@@ -241,6 +264,17 @@
         </div>
         {#if localError !== null}
           <div class="err-line masthead-err">{localError}</div>
+        {/if}
+      {/if}
+      {#if native && hostLabel === "local" && appUpdate !== null}
+        <div class="update-line">
+          <span>Chimaera {appUpdate} available —</span>
+          <button class="update-act" disabled={appUpdating} onclick={() => void installApp()}>
+            {appUpdating ? "updating…" : "update &amp; restart"}
+          </button>
+        </div>
+        {#if appUpdateError !== null}
+          <div class="err-line masthead-err">{appUpdateError}</div>
         {/if}
       {/if}
     </header>

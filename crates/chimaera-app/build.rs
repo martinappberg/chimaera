@@ -8,8 +8,12 @@ fn main() {
             "remove_host",
             "connect_host",
             "disconnect_host",
+            "local_state",
+            "update_local_daemon",
             "remote_workspaces",
             "open_window",
+            "check_app_update",
+            "install_app_update",
         ]),
     ))
     .expect("failed to run tauri-build");

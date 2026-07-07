@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-local-daemon"
+description = "Enables the update_local_daemon command without any pre-configured scope."
+commands.allow = ["update_local_daemon"]
+
+[[permission]]
+identifier = "deny-update-local-daemon"
+description = "Denies the update_local_daemon command without any pre-configured scope."
+commands.deny = ["update_local_daemon"]

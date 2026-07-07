@@ -315,6 +315,48 @@ async fn open_window(
         .map_err(|e| format!("could not open window: {e}"))
 }
 
+/// Check GitHub releases for a newer signed app build. Returns the new
+/// version string when one is available, `None` when up to date. All
+/// updater work runs in Rust; the web UI can only ask, never drive the
+/// download — and the download is verified against the embedded minisign
+/// pubkey regardless, so only a validly-signed release can ever install.
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(update.version)),
+        Ok(None) => Ok(None),
+        // A missing/unreachable endpoint (no releases yet) is "no update",
+        // not an error the user should see on every launch.
+        Err(e) => {
+            tracing::debug!("update check unavailable: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Download, verify, and install the pending app update, then relaunch into
+/// it. Diverges on success (the process restarts); returns `Err` only when
+/// the download or signature check fails.
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no update available".to_string())?;
+    tracing::info!("installing app update {}", update.version);
+    update
+        .download_and_install(|_downloaded, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    // Bundle swapped and verified; relaunch into the new build (diverges).
+    app.restart();
+}
+
 fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
     HostsStore::load_default()
         .get(alias)
@@ -335,6 +377,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Build and run the Tauri app.
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             list_hosts,
             add_host,
@@ -345,6 +388,8 @@ pub fn run() {
             update_local_daemon,
             remote_workspaces,
             open_window,
+            check_app_update,
+            install_app_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

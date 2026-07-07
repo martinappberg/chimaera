@@ -60,6 +60,27 @@ what you ran and what you observed, alongside the tests.
 Tests still matter: `cargo test --workspace` covers the daemon, and new server behavior
 should come with tests at that level.
 
+## Releases and update signing
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the static musl
+daemon binaries and the signed macOS app, then opens a **draft** GitHub Release you review
+and publish. Published releases carry a `latest.json` the installed app polls to
+auto-update itself; the download is verified against a minisign public key embedded in the
+app, so only a release signed with the matching private key can ever install.
+
+Two repo secrets sign updates:
+
+- `TAURI_SIGNING_PRIVATE_KEY` — the minisign private key (generate once with
+  `npx tauri signer generate`; keep it out of the repo).
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — its password (empty string if you generated
+  without one).
+
+The matching public key lives in `crates/chimaera-app/tauri.conf.json` under
+`plugins.updater.pubkey` and is safe to commit. Rotating the private key means bumping the
+public key there, and clients on the old key will stop auto-updating until they reinstall.
+Until an Apple Developer ID is configured the bundles are unsigned by Apple (Gatekeeper),
+which is independent of update signing; see the note in `.github/workflows/app.yml`.
+
 ## License and CLA
 
 Chimaera is licensed under the AGPL-3.0 and dual-licensed commercially (see

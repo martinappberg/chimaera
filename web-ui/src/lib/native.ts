@@ -134,6 +134,28 @@ export function onLocalDaemonUpdated(
   );
 }
 
+/**
+ * Check GitHub releases for a newer signed app build (native shell only).
+ * Returns the new version string, or null when up to date / not in the app.
+ * The download+verify happens entirely in the Rust shell.
+ */
+export async function checkAppUpdate(): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return t.core.invoke<string | null>("check_app_update");
+}
+
+/**
+ * Download, verify (against the embedded pubkey), and install the pending
+ * app update, then relaunch. The call does not return on success — the
+ * process restarts into the new build.
+ */
+export async function installAppUpdate(): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("install_app_update");
+}
+
 export async function disconnectHost(alias: string): Promise<void> {
   await tauri()?.core.invoke<void>("disconnect_host", { alias });
 }
