@@ -358,6 +358,18 @@ async fn install_app_update(app: AppHandle) -> Result<(), String> {
     app.restart();
 }
 
+/// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
+/// the user cancelled, which lets the waiting ssh fail cleanly.
+#[tauri::command]
+async fn answer_askpass(
+    askpass: State<'_, crate::askpass::Askpass>,
+    id: u64,
+    secret: Option<String>,
+) -> Result<(), String> {
+    askpass.answer(id, secret);
+    Ok(())
+}
+
 fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
     HostsStore::load_default()
         .get(alias)
@@ -391,10 +403,19 @@ pub fn run() {
             open_window,
             check_app_update,
             install_app_update,
+            answer_askpass,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             crate::menu::install(app)?;
+            // Route ssh auth prompts (password / 2FA) to the UI. Managed
+            // before the listener starts so an early prompt finds the state.
+            app.manage(crate::askpass::Askpass::default());
+            if let Err(e) = crate::askpass::install(&handle) {
+                // Non-fatal: hosts with key/agent auth still connect; only
+                // password/2FA hosts lose the in-app prompt.
+                tracing::warn!("ssh askpass unavailable: {e:#}");
+            }
             // The daemon must be up before the first window points at it;
             // block setup on it (fast when a daemon is already running).
             let local = tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon())

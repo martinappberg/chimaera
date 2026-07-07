@@ -177,6 +177,31 @@ export function onConnectProgress(
 }
 
 /**
+ * An SSH auth prompt ssh raised while connecting (no tty in the app, so it
+ * comes to us via SSH_ASKPASS). `prompt` is ssh's own text — a password ask,
+ * or a keyboard-interactive challenge like a Duo passcode/option menu.
+ */
+export interface AskpassPrompt {
+  id: number;
+  prompt: string;
+}
+
+/** Subscribe to SSH auth prompts. Returns an unsubscribe promise. */
+export function onAskpass(handler: (p: AskpassPrompt) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<AskpassPrompt>("ssh-askpass", (e) => handler(e.payload));
+}
+
+/**
+ * Answer prompt `id`. `secret` null cancels it, letting the waiting ssh fail
+ * cleanly instead of hanging.
+ */
+export async function answerAskpass(id: number, secret: string | null): Promise<void> {
+  await tauri()?.core.invoke<void>("answer_askpass", { id, secret });
+}
+
+/**
  * Native menu actions forwarded to THIS window ("close-view",
  * "new-terminal", "new-agent"). Window-scoped on purpose: the shell emits
  * to the focused window's label, and a window-scoped listener is what
