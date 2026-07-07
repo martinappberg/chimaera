@@ -1,57 +1,95 @@
 # Chimaera
 
-**An agent workbench, not an IDE.** A single static Rust binary runs as a tmux-grade session
-daemon on whatever host owns the work — a remote server, an HPC login node, or your laptop —
-and serves a workspace-oriented UI where the primary objects are *agent sessions* living
-inside *folders*, surrounded by the file previews, terminals, and git state that show what
-those agents actually produced.
+**An agent workbench, not an IDE.** Chimaera runs your agent sessions as persistent,
+daemon-owned processes on whatever host owns the work — your laptop, a remote server, or an
+HPC login node — and gives you a workspace-first UI around them: the file previews, terminals,
+and git state that show what those agents actually produced. One static Rust binary is the
+whole server; the client is a web UI it serves itself, plus a native app that wraps the same
+UI in real windows.
 
-Sessions run the real interactive `claude` TUI in daemon-owned PTYs (same integration mode as
-a VS Code integrated terminal), survive disconnects tmux-style, auto-name themselves, and
-surface which ones need you.
+Agents run as the real interactive TUIs (`claude` and friends) in daemon-owned PTYs, so they
+look, behave, and bill exactly like they do in any terminal. The daemon owns the sessions;
+windows are just views. Close the laptop mid-run and nothing happens.
 
-**Status: M0 — walking skeleton.** See [DESIGN.md](DESIGN.md) for the full design.
+## Why
 
-## Quickstart (native app, macOS)
+The usual way to run coding agents on a remote machine is a two-tool split: code-server in a
+browser tab for looking at files, and tmux over SSH for keeping the agents alive — with all
+the misery of nesting one inside the other. Browser terminals die on reload; tmux renders
+nothing. The deliverable of an agent session is usually *files* — reports, plots, tables —
+not the conversation, and no existing tool puts the sessions and their outputs in one window
+that survives disconnection. Chimaera replaces that whole stack.
+
+## Quickstart
+
+Build from source. You need stable Rust and Node.
 
 ```sh
-just app-build        # bundles Chimaera.app + .dmg (crates/chimaera-app/target/release/bundle)
+git clone https://github.com/martinkjellberg/chimaera
+cd chimaera
+npm --prefix web-ui install
+npm --prefix web-ui run build      # the daemon embeds web-ui/dist
+cargo build --release -p chimaera
 ```
 
-The app is self-contained: it starts (or attaches to) the local daemon, opens a **home
-screen** of your workspaces and remote hosts, and gives every workspace a real window.
-Quitting the app never kills the daemon — sessions are tmux-grade and keep running.
-
-Remote hosts live on the home screen: add your cluster's ssh alias and chimaera installs
-its own daemon into `~/.chimaera` on the host over ssh (no root), starts it, tunnels, and
-lists that host's workspaces. Run `just dist` once to stock `~/.chimaera/dist/` with the
-linux-musl binaries the auto-install deploys.
-
-## Quickstart (local, browser)
+Run it locally:
 
 ```sh
-just serve            # builds the web UI, runs the daemon in the foreground
-chimaera status       # show the running daemon
-chimaera kill         # stop it
+chimaera serve                     # starts the daemon, prints the UI URL
 ```
 
-## Quickstart (remote, CLI)
+Run it on a remote host (an HPC login node, a dev server — anything you can ssh to):
 
 ```sh
-just dist                  # one-time: build deployable musl binaries into ~/.chimaera/dist
-chimaera connect myhost    # install-if-missing, start-or-attach, tunnel, open the UI
+just dist                          # one-time: build linux-musl binaries into ~/.chimaera/dist
+chimaera connect <host>            # install-if-missing, start-or-attach, tunnel, open the UI
 ```
 
 `connect` shells out to your system `ssh`, so `ProxyJump`, `ControlMaster`, and 2FA from
-`~/.ssh/config` all just work.
+`~/.ssh/config` all just work. The daemon installs into `~/.chimaera` on the host — no root,
+no containers, nothing else to set up.
 
-## Development
+If you use [just](https://github.com/casey/just), `just serve` does the UI build + daemon run
+in one step, and `just app-build` bundles the native app.
 
-- `just check` — fmt + clippy + tests (daemon workspace)
-- `just dev-ui` — Vite dev server (proxies `/api` to a running daemon)
-- `just app-dev` / `just app-check` / `just app-build` — the native shell (a standalone
-  cargo workspace in `crates/chimaera-app`, so the Tauri stack stays out of the daemon
-  builds)
-- `just release-linux` — static musl builds via cargo-zigbuild
+## Features
 
-License: TBD.
+- **Sessions that survive disconnect.** tmux-grade ownership: the daemon holds every PTY with
+  full server-side terminal state. Reload, reconnect, or reattach from another machine and you
+  get the identical screen back — no lost scrollback, no broken reconnect tokens.
+- **Multi-agent launcher.** Claude Code, Codex, Gemini CLI, and Antigravity CLI in one
+  launcher: detected if installed, resumable per workspace, and installable/updatable from
+  official sources through the UI — binaries live under `~/.chimaera`, credentials stay
+  entirely yours.
+- **Linked terminals.** Hand an agent a leash to a live shell — the one with your environment
+  already loaded — instead of paying setup cost per command. Links are user-granted, scoped,
+  and audited in the terminal's own scrollback.
+- **File previews.** Images, Markdown, CSV/TSV (gzip included), PDF, and sandboxed
+  self-contained HTML reports — the MultiQC/FastQC class of scientific outputs that normally
+  forces a code-server install. Server extracts, client renders, whole files are never loaded.
+- **A real workbench layout.** Split panes, tabs, drag-and-drop, focus mode, a session strip
+  that always says where you are, and attention states that tell you which agent needs you.
+- **Themes.** Curated light and dark schemes, applied to the UI and injected into the agents'
+  own TUIs so everything starts matching.
+- **Native app.** A Tauri shell wraps the same UI: a window per workspace, a home screen of
+  workspaces and remote hosts with one-click connect. Quitting the app kills nothing.
+
+## Platforms
+
+macOS and Linux. The daemon cross-compiles to fully static musl binaries (x86_64 and aarch64)
+that run on old-glibc HPC systems — verified on a cluster running glibc 2.17, no root
+required. Windows is untested.
+
+## Status
+
+Early and pre-release, moving fast. Interfaces, storage formats, and the wire protocol all
+change without notice; there are no versioned releases yet. See [DESIGN.md](DESIGN.md) for
+the full design and roadmap.
+
+## License
+
+Chimaera is licensed under the [GNU AGPL-3.0](LICENSE) — free for everyone to use, self-host,
+and modify. If you want to build a closed-source product or service on Chimaera, a commercial
+license is available: contact mkjberg@gmail.com.
+
+Contributions require a CLA (see [CONTRIBUTING.md](CONTRIBUTING.md)).

@@ -1024,7 +1024,12 @@ which is the survival property that matters.
 
 Still open:
 
-1. **License** — Apache-2.0 (recommended; matches ACP/Zed ecosystem) vs MIT.
+1. **License** — DECIDED (author, 2026-07-07): **AGPL-3.0-only + dual licensing**
+   (commercial license by contacting the author; CLA from the first outside PR so
+   the relicensing right survives contributions). Free for everyone to use,
+   self-host, and modify; closed-source products/services on top pay. A later
+   carve-out of protocol/SDK crates under Apache-2.0 stays possible while the
+   author holds copyright.
 2. **`--remote-control` free-riding** as the blessed mobile story vs. building ntfy
    approve/deny round-trips (doc recommends: both are cheap; ntfy is vendor-neutral).
 

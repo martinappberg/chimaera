@@ -8,4 +8,5 @@ crates/chimaera-app/gen/
 *.log
 .DS_Store
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 verify-tmp/
