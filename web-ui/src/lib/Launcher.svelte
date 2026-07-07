@@ -6,11 +6,16 @@
    *
    * One question: WHICH agent. One row per known CLI, every row carrying a
    * link to its official docs (opens in the browser):
-   * - installed → click spawns;
+   * - installed → click spawns; a version chimaera installed itself shows
+   *   the accent-tinted version tag (managed, under ~/.chimaera/agents);
    * - installed but outdated (npm-era codex, pre-`codex login`) → click
-   *   still spawns, an "update" chip pre-types the install command into a
-   *   fresh terminal (never executes);
-   * - not installed → muted, an "install" chip pre-types the command.
+   *   still spawns, an "update" chip runs the daemon's curated update
+   *   in-app (managed runtimes), streaming into a visible terminal;
+   * - not installed → muted, an "install" chip does the same for a fresh
+   *   install. One explicit click, never silent: the tooltip says exactly
+   *   what is fetched and where it lands. No curated install (gemini,
+   *   phase 2: node runtime) → no chip at all; the docs link is the
+   *   affordance — the POST would only 400.
    *
    * Resuming lives in the rail's RECENT section, not here.
    *
@@ -97,7 +102,9 @@
     const a = agents?.[i];
     if (a === undefined) return;
     if (!a.installed) {
-      onInstall(a);
+      // No curated install: nothing to run — the docs link is the
+      // affordance (the POST would 400).
+      if (a.managedInstall) onInstall(a);
       return;
     }
     onPick({ agent: a.id });
@@ -192,15 +199,23 @@
               onclick={(e) => e.stopPropagation()}>docs&thinsp;↗</a
             >
           {/if}
-          {#if !a.installed}
-            <span class="achip" title="pre-types “{a.install}” in a new terminal — you press Enter">
+          {#if !a.installed && a.managedInstall}
+            <button
+              class="achip"
+              tabindex="-1"
+              title="downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
+              onclick={(e) => {
+                e.stopPropagation();
+                onInstall(a);
+              }}
+            >
               install
-            </span>
+            </button>
           {:else if a.outdated}
             <button
-              class="achip act"
+              class="achip"
               tabindex="-1"
-              title="this build is too old to sign in — pre-types “{a.install}” in a new terminal"
+              title="this build is too old to sign in — downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
               onclick={(e) => {
                 e.stopPropagation();
                 onInstall(a);
@@ -210,9 +225,21 @@
             </button>
           {:else if a.version !== null}
             <!-- The number, wherever the CLI put it ("codex-cli 0.52.0",
-                 "2.1.202 (Claude Code)", "0.49.0"). -->
-            <span class="aver" title={a.version}>
+                 "2.1.202 (Claude Code)", "0.49.0"). Accent tint = chimaera
+                 installed this one itself (managed, ~/.chimaera/agents). -->
+            <span
+              class="aver"
+              class:managed={a.managed}
+              title={a.managed
+                ? `${a.version} — installed by chimaera in ~/.chimaera/agents`
+                : a.version}
+            >
               {a.version.split(" ").find((t) => /^\d/.test(t)) ?? a.version.split(" ")[0]}
+            </span>
+          {:else if a.managed}
+            <!-- Managed but the version probe failed: still say whose it is. -->
+            <span class="aver managed" title="installed by chimaera in ~/.chimaera/agents">
+              managed
             </span>
           {/if}
         </div>
@@ -360,6 +387,12 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* Chimaera installed this build itself (~/.chimaera/agents): the version
+     tag carries the accent tint — a quiet provenance mark, nothing more. */
+  .aver.managed {
+    color: var(--accent);
+  }
+
   /* Uninstalled agents: visible but muted — honest, not hidden. */
   .arow.missing .aname {
     color: var(--muted);
@@ -370,7 +403,8 @@
     opacity: 0.55;
   }
 
-  /* install / update chip (the actionable right edge of a row). */
+  /* install / update chip: the one explicit click that runs the daemon's
+     curated command — visibly, in a terminal pane (managed runtimes). */
   .achip {
     appearance: none;
     background: none;
@@ -381,19 +415,26 @@
     border-radius: 10px;
     font-size: var(--text-xs);
     color: var(--muted);
+    cursor: pointer;
     transition:
       color 0.12s ease,
-      border-color 0.12s ease;
-  }
-
-  .achip.act {
-    cursor: pointer;
+      border-color 0.12s ease,
+      transform 0.08s ease;
   }
 
   .arow.hl .achip,
   .arow:hover .achip {
     color: var(--fg);
     border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  }
+
+  .achip:active {
+    transform: translateY(0.5px);
+  }
+
+  .achip:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
   }
 
   .foot {

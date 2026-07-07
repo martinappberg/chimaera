@@ -11,13 +11,18 @@ export interface AgentInfo {
   id: string;
   name: string;
   installed: boolean;
-  /** Installed but too old to run usefully — offer the install command as
-   *  an update instead of spawning blind (npm-era codex, pre-login). */
+  /** Installed but too old to run usefully — offer an in-app update
+   *  instead of spawning blind (npm-era codex, pre-login). */
   outdated: boolean;
   /** `--version` first line for installed agents, when the probe worked. */
   version: string | null;
-  /** Install command the UI pre-types (never executes) into a fresh terminal. */
-  install: string;
+  /** The resolved binary lives under ~/.chimaera/agents — installed (or
+   *  updated) by chimaera's managed-runtime flow, not the user's own PATH. */
+  managed: boolean;
+  /** Whether POST /agents/{id}/install has a curated managed install.
+   *  False (gemini: node runtime, phase 2) means the POST would 400 —
+   *  no install chip; the docs link is the affordance. */
+  managedInstall: boolean;
   /** Official docs URL — a clickable link on every launcher row. */
   installUrl: string | null;
 }
@@ -56,11 +61,34 @@ export async function listAgents(refresh = false): Promise<AgentInfo[]> {
         installed: a.installed === true,
         outdated: a.outdated === true,
         version: typeof a.version === "string" ? a.version : null,
-        install: typeof install.command === "string" ? install.command : "",
+        managed: a.managed === true,
+        managedInstall: a.managed_install === true,
         installUrl: typeof install.url === "string" ? install.url : null,
       },
     ];
   });
+}
+
+/**
+ * POST /api/v1/agents/{id}/install — managed runtimes: the daemon builds
+ * the CURATED install/update command itself (official artifacts only, into
+ * ~/.chimaera/agents) and spawns it as an ordinary shell session in
+ * `workspaceId`, so the installer output streams into a normal pane.
+ * Returns the spawned session id; 409 when an install for that agent is
+ * already running.
+ */
+export async function installAgent(agentId: string, workspaceId: string): Promise<string> {
+  const body = await json<{ session_id?: unknown }>(
+    await api(`/agents/${encodeURIComponent(agentId)}/install`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    }),
+  );
+  if (typeof body.session_id !== "string") {
+    throw new ApiError(500, "malformed install response");
+  }
+  return body.session_id;
 }
 
 /** A launcher selection: what to spawn (and, for resume rows, from where). */

@@ -18,6 +18,7 @@
     displayName,
     dotState,
     dotTitle,
+    listSessions,
     listWorkspaces,
     renameSession,
     needsAttention,
@@ -28,6 +29,7 @@
   } from "./lib/sessions";
   import {
     getAgentDefault,
+    installAgent,
     listRecents,
     relativeAge,
     setAgentDefault,
@@ -982,16 +984,40 @@
     void spawnSession("agent", pick);
   }
 
-  /** Install flow: a fresh terminal with the install command PRE-TYPED —
-   *  never executed; the user reviews and presses Enter themselves. The
-   *  short delay lets the shell paint its prompt first, so the command
-   *  appears typed AT the prompt instead of echoing ahead of it. */
+  /** Install/update flow (managed runtimes): the daemon builds its own
+   *  curated command — official artifacts only, into ~/.chimaera/agents —
+   *  and runs it as an ordinary shell session here. The chip's tooltip
+   *  said exactly what runs; this one explicit click executes it, and the
+   *  session opens like any other so the output streams in a visible pane. */
   function launcherInstall(a: AgentInfo): void {
     launcherOpen = false;
-    void spawnSession("shell").then((s) => {
-      if (s === null || a.install === "") return;
-      setTimeout(() => typeIntoSession(s.id, a.install), 400);
-    });
+    const ws = activeWsId;
+    if (ws === null) {
+      openPicker();
+      return;
+    }
+    createError = null;
+    void installAgent(a.id, ws)
+      .then(async (sessionId) => {
+        recentlyCreated.set(sessionId, Date.now());
+        // The daemon spawned the session; a racing events snapshot may not
+        // carry it yet, so fetch the roster before surfacing it exactly
+        // like any new session (active tab in the focused pane).
+        if (!sessions.some((s) => s.id === sessionId)) {
+          try {
+            applySessions(await listSessions());
+          } catch {
+            // roster fetch hiccup; the next events snapshot reconciles
+          }
+        }
+        openSess(sessionId);
+      })
+      .catch((e) => {
+        // Inline error, same surface as any create failure (404 unknown
+        // agent, 409 an install for it is already running).
+        createError =
+          e instanceof ApiError ? e.message : `failed to start the ${a.name} install`;
+      });
   }
 
   // --- the rail's Recents section ---

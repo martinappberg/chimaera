@@ -39,6 +39,7 @@ fn opts(command: Option<Vec<String>>) -> SpawnOpts {
         rows: 24,
         command,
         id: None,
+        env: Vec::new(),
     }
 }
 
@@ -366,6 +367,46 @@ async fn multi_attach_fans_out_output() {
     let out2 = read_until(&mut att2.output, "multi-45").await;
     assert!(out1.contains("multi-45"));
     assert!(out2.contains("multi-45"));
+
+    mgr.kill(&info.id).expect("kill failed");
+    wait_gone(&mgr, &info.id).await;
+}
+
+/// SpawnOpts.env pairs reach the child process's real environment, and an
+/// overriding pair (PATH here) replaces the inherited value rather than
+/// duplicating it — asserted through the child's own eyes via /usr/bin/env
+/// on a real PTY.
+#[tokio::test]
+async fn spawn_env_pairs_reach_the_child() {
+    let mgr = SessionManager::new();
+    let mut o = opts(Some(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "/usr/bin/env; sleep 30".to_string(),
+    ]));
+    o.env = vec![
+        ("CHIMAERA_SESSION".to_string(), "s-envtest".to_string()),
+        ("CHIMAERA_THEME".to_string(), "light".to_string()),
+        (
+            "PATH".to_string(),
+            format!(
+                "/chimaera-shims-test:{}",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        ),
+    ];
+    let info = mgr.spawn(o).expect("spawn failed");
+
+    // The trailing sleep keeps the session alive so the env dump is fully in
+    // the terminal (snapshots include scrollback) rather than racing exit.
+    for needle in [
+        "CHIMAERA_SESSION=s-envtest",
+        "CHIMAERA_THEME=light",
+        // The injected PATH replaced the inherited one, prefix first.
+        "PATH=/chimaera-shims-test:",
+    ] {
+        attach_when_snapshot_contains(&mgr, &info.id, needle).await;
+    }
 
     mgr.kill(&info.id).expect("kill failed");
     wait_gone(&mgr, &info.id).await;

@@ -6,6 +6,7 @@ mod launcher;
 mod naming;
 mod quickopen;
 mod recents;
+mod runtimes;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -70,6 +71,25 @@ pub(crate) struct AppState {
     /// Root of Claude Code's per-project transcript store, normally
     /// `~/.claude/projects`; tests point it at a fixture dir.
     pub(crate) claude_projects_dir: PathBuf,
+    /// Managed-runtime prefix (`~/.chimaera/agents`): curated installs land
+    /// in `<agent>/<version>/bin/` here, activated via per-agent symlinks
+    /// in `bin/`. Derived from the data dir, so tests are isolated for free.
+    pub(crate) managed_root: PathBuf,
+    /// Theming-shim dir (`~/.chimaera/shims`), prepended to every session's
+    /// PATH via spawn env only — user dotfiles are never touched.
+    pub(crate) shims_dir: PathBuf,
+    /// Live install sessions, one per agent (POST /agents/{id}/install
+    /// answers 409 while one runs): session id + reservation time. The id
+    /// registers in `SessionManager` only after spawn, so a reservation
+    /// younger than `runtimes::INSTALL_RESERVATION_GRACE` is busy even with
+    /// no visible session. Cleaned up by the install watcher.
+    pub(crate) installs: Mutex<HashMap<agents::AgentKind, (String, Instant)>>,
+    /// The user's own Claude Code settings file (`~/.claude/settings.json`);
+    /// an explicit theme there suppresses chimaera's theme injection. Tests
+    /// point it at a fixture.
+    pub(crate) claude_settings_path: PathBuf,
+    /// The user's codex config (`~/.codex/config.toml`); same respect rule.
+    pub(crate) codex_config_path: PathBuf,
 }
 
 impl AppState {
@@ -80,6 +100,9 @@ impl AppState {
         port: u16,
         data_dir: PathBuf,
     ) -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         AppState {
             token,
             started: Instant::now(),
@@ -102,11 +125,12 @@ impl AppState {
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
             agent_bins: Mutex::new(HashMap::new()),
-            claude_projects_dir: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claude")
-                .join("projects"),
+            claude_projects_dir: home.join(".claude").join("projects"),
+            managed_root: data_dir.join("agents"),
+            shims_dir: data_dir.join("shims"),
+            installs: Mutex::new(HashMap::new()),
+            claude_settings_path: home.join(".claude").join("settings.json"),
+            codex_config_path: home.join(".codex").join("config.toml"),
         }
     }
 }
@@ -136,6 +160,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             delete(api::delete_session).patch(api::rename_session),
         )
         .route("/agents", get(launcher::list_agents))
+        .route("/agents/{id}/install", post(runtimes::install_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route(
@@ -211,6 +236,15 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         port,
         chimaera_core::data_dir(),
     ));
+
+    // Theming shims: regenerated at every daemon start (and after installs)
+    // so they always match this build's resolution and theme logic.
+    if let Err(err) = runtimes::write_shims(
+        &state.shims_dir,
+        &runtimes::managed_bin_dir(&state.managed_root),
+    ) {
+        tracing::warn!(%err, "failed to write theming shims");
+    }
 
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -623,6 +657,7 @@ mod tests {
                 rows: 24,
                 command: None,
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn session");
 
@@ -710,6 +745,7 @@ mod tests {
                     "echo Missing API key; exit 1".to_string(),
                 ]),
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn session");
 
@@ -808,6 +844,7 @@ mod tests {
                 rows: 24,
                 command: None,
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn session");
         lock(&state.agents).insert(
@@ -826,11 +863,15 @@ mod tests {
         path: Result<PathBuf, String>,
         version: Option<&str>,
     ) {
+        let managed = path
+            .as_ref()
+            .is_ok_and(|p| runtimes::is_managed(p, &state.managed_root));
         lock(&state.agent_bins).insert(
             kind,
             launcher::AgentDetection {
                 path,
                 version: version.map(str::to_string),
+                managed,
             },
         );
     }
@@ -1074,6 +1115,440 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+        // POST install too: it spawns processes, so auth is not optional.
+        let res = app(test_state())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/agents/codex/install")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"workspace_id":"w-x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// POST /api/v1/agents/{id}/install: the pinned contract — 404 unknown
+    /// agent id, 404 unknown workspace, 400 for gemini (no phase-1 managed
+    /// install), and the session mechanics (ordinary kind-"shell" session
+    /// with streaming output, one install per agent = 409, watcher cleanup)
+    /// driven with a stub script so the test never hits the network.
+    #[tokio::test]
+    async fn install_endpoint_contract_and_session_mechanics() {
+        let state = test_state();
+        let ws_id = make_workspace(&state, "install-root").await;
+
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/agents/nope/install",
+            Some(serde_json::json!({"workspace_id": ws_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/agents/codex/install",
+            Some(serde_json::json!({"workspace_id": "w-00000000"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/agents/gemini/install",
+            Some(serde_json::json!({"workspace_id": ws_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("node runtime"),
+            "{body}"
+        );
+
+        // Stubbed install session: streams like any pane, shows up as a
+        // pinned-name shell in the workspace, and blocks a second install.
+        let workspace = lock(&state.workspaces).get(&ws_id).unwrap();
+        let sid = runtimes::start_install(
+            &state,
+            agents::AgentKind::Codex,
+            &workspace,
+            "echo stub-install-output; sleep 30".to_string(),
+        )
+        .expect("stub install spawned");
+        let entry = session_entry(&state, &sid).await;
+        assert_eq!(entry["kind"], "shell");
+        assert_eq!(entry["display_name"], "install codex");
+        assert_eq!(entry["renamed"], true);
+        assert_eq!(entry["workspace_id"].as_str().unwrap(), ws_id);
+
+        // Installer output streams into the ordinary pane pipeline.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let att = state.sessions.attach(&sid).expect("attach install pane");
+            if String::from_utf8_lossy(&att.snapshot).contains("stub-install-output") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "install output never reached the pane"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Same agent again while running: 409. Another agent: fine.
+        let err = runtimes::start_install(
+            &state,
+            agents::AgentKind::Codex,
+            &workspace,
+            "echo second".to_string(),
+        )
+        .expect_err("second install must conflict");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        let other = runtimes::start_install(
+            &state,
+            agents::AgentKind::Antigravity,
+            &workspace,
+            "echo other; sleep 30".to_string(),
+        )
+        .expect("other agent installs in parallel");
+
+        // Kill the codex install; the watcher re-detects and clears the
+        // slot, so a fresh install may start.
+        state.sessions.kill(&sid).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while lock(&state.installs).contains_key(&agents::AgentKind::Codex) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "install watcher never cleared the slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let again = runtimes::start_install(
+            &state,
+            agents::AgentKind::Codex,
+            &workspace,
+            "echo again; sleep 30".to_string(),
+        )
+        .expect("slot free after the session ended");
+        state.sessions.kill(&again).ok();
+        state.sessions.kill(&other).ok();
+    }
+
+    /// A same-agent POST racing the spawn window must 409, not overwrite:
+    /// the reservation is inserted before `SessionManager::spawn` registers
+    /// the session, so a fresh reservation with no visible session is still
+    /// busy; only one past the grace window is reclaimable.
+    #[tokio::test]
+    async fn install_reservation_blocks_the_spawn_registration_race() {
+        let state = test_state();
+        let ws_id = make_workspace(&state, "install-race").await;
+        let workspace = lock(&state.workspaces).get(&ws_id).unwrap();
+
+        // A fresh reservation whose session is not yet registered — the
+        // exact in-spawn window.
+        lock(&state.installs).insert(
+            agents::AgentKind::Codex,
+            ("s-notyet00".to_string(), std::time::Instant::now()),
+        );
+        let err = runtimes::start_install(
+            &state,
+            agents::AgentKind::Codex,
+            &workspace,
+            "echo racer".to_string(),
+        )
+        .expect_err("a fresh reservation must read as busy");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+
+        // The same dead reservation past the grace window: stale, reclaimed.
+        lock(&state.installs).insert(
+            agents::AgentKind::Codex,
+            (
+                "s-notyet00".to_string(),
+                std::time::Instant::now()
+                    - (runtimes::INSTALL_RESERVATION_GRACE + std::time::Duration::from_secs(1)),
+            ),
+        );
+        let sid = runtimes::start_install(
+            &state,
+            agents::AgentKind::Codex,
+            &workspace,
+            "echo reclaimed; sleep 30".to_string(),
+        )
+        .expect("a stale reservation is reclaimable");
+        assert_eq!(
+            lock(&state.installs)
+                .get(&agents::AgentKind::Codex)
+                .map(|(s, _)| s.clone()),
+            Some(sid.clone()),
+            "the reclaim installed its own reservation"
+        );
+        state.sessions.kill(&sid).ok();
+    }
+
+    /// Every chimaera session carries CHIMAERA_SESSION / CHIMAERA_THEME /
+    /// CHIMAERA_SHIMS and the shim-dir PATH prefix — asserted through a
+    /// real daemon-spawned session's own environment (`/usr/bin/env` in the
+    /// PTY; the install spawn path shares `session_env` with POST
+    /// /sessions, and a user shell's rc can stall for a minute on this
+    /// machine, so the deterministic command is the honest probe).
+    #[tokio::test]
+    async fn session_env_reaches_spawned_session() {
+        let state = test_state();
+        let ws_id = make_workspace(&state, "env-root").await;
+
+        // The assembled contract itself: shims first on PATH, session id,
+        // scheme, and the wrap's re-prepend handle.
+        let env = api::session_env(&state, "s-envx", "light");
+        let shims = state.shims_dir.display().to_string();
+        assert_eq!(env[0].0, "PATH");
+        assert!(env[0].1.starts_with(&format!("{shims}:")), "{env:?}");
+        assert!(env.contains(&("CHIMAERA_SESSION".to_string(), "s-envx".to_string())));
+        assert!(env.contains(&("CHIMAERA_THEME".to_string(), "light".to_string())));
+        assert!(env.contains(&("CHIMAERA_SHIMS".to_string(), shims.clone())));
+
+        // An empty inherited PATH must not leave a trailing colon (an empty
+        // member = the cwd on the search path); the fixed system default
+        // fills in instead.
+        assert_eq!(
+            api::spawn_path("/s", ""),
+            "/s:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        assert_eq!(api::spawn_path("/s", "/usr/bin:/bin"), "/s:/usr/bin:/bin");
+
+        // Through a real spawn: a stub install session dumps its env into
+        // the pane (kept alive so the snapshot — scrollback included — is
+        // stable). Grid rows wrap at the pane width, so matching happens on
+        // the de-wrapped text.
+        let workspace = lock(&state.workspaces).get(&ws_id).unwrap();
+        let sid = runtimes::start_install(
+            &state,
+            agents::AgentKind::Claude,
+            &workspace,
+            "/usr/bin/env; sleep 30".to_string(),
+        )
+        .expect("stub env session spawned");
+        let needles = [
+            format!("CHIMAERA_SESSION={sid}"),
+            "CHIMAERA_THEME=dark".to_string(),
+            format!("CHIMAERA_SHIMS={shims}"),
+            format!("PATH={shims}:"),
+        ];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let att = state.sessions.attach(&sid).expect("attach env session");
+            let text = String::from_utf8_lossy(&att.snapshot).replace(['\r', '\n'], "");
+            if needles.iter().all(|n| text.contains(n)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "env dump incomplete; missing {:?}",
+                needles
+                    .iter()
+                    .filter(|n| !text.contains(*n))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        state.sessions.kill(&sid).ok();
+
+        // An invalid theme on POST /sessions is a 400, not a silent dark.
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": ws_id, "kind": "shell", "theme": "blue",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// The scheme theme fills the gap in the generated claude settings —
+    /// and steps aside when the user's own settings.json picks a theme.
+    #[tokio::test]
+    async fn claude_theme_fills_gap_in_generated_settings() {
+        let user_settings_dir = test_dir("user-claude");
+        let mut state = AppState::new(
+            "test-token".to_string(),
+            "testhost".to_string(),
+            4242,
+            0,
+            test_dir("data"),
+        );
+        state.claude_settings_path = user_settings_dir.join("settings.json");
+        let state = Arc::new(state);
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(PathBuf::from("/bin/echo")),
+            None,
+        );
+        let ws_id = make_workspace(&state, "theme-root").await;
+
+        let generated_settings = |session: &serde_json::Value| -> serde_json::Value {
+            let id = session["id"].as_str().unwrap();
+            let path = chimaera_core::runtime_dir()
+                .join("agents")
+                .join(format!("{id}-settings.json"));
+            let value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            std::fs::remove_file(&path).ok();
+            value
+        };
+
+        // No user theme anywhere: the client scheme lands in the settings.
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": ws_id, "kind": "agent", "theme": "light",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{session}");
+        let value = generated_settings(&session);
+        assert_eq!(value["theme"], "light");
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["type"], "http",
+            "the theme merges into the SAME file the hooks ride"
+        );
+
+        // No theme in the body: the default scheme is dark.
+        let (_, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": ws_id, "kind": "agent"})),
+        )
+        .await;
+        assert_eq!(generated_settings(&session)["theme"], "dark");
+
+        // The user set a theme in their own settings.json: hands off.
+        std::fs::write(
+            &state.claude_settings_path,
+            r#"{"theme": "dark", "tui": "fullscreen"}"#,
+        )
+        .unwrap();
+        let (_, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": ws_id, "kind": "agent", "theme": "light",
+            })),
+        )
+        .await;
+        assert!(
+            generated_settings(&session).get("theme").is_none(),
+            "an explicit user theme is never overridden"
+        );
+    }
+
+    /// GET /api/v1/agents flags managed installs: `managed: true` when the
+    /// resolved binary lives under ~/.chimaera/agents, and
+    /// `managed_install` says whether POST install has a curated recipe.
+    #[tokio::test]
+    async fn agents_rows_flag_managed_installs() {
+        let state = test_state();
+        preset_agent(
+            &state,
+            agents::AgentKind::Claude,
+            Ok(PathBuf::from("/Users/u/.local/bin/claude")),
+            Some("2.1.202 (Claude Code)"),
+        );
+        // A managed codex: resolved through the ~/.chimaera/agents/bin swap.
+        preset_agent(
+            &state,
+            agents::AgentKind::Codex,
+            Ok(state.managed_root.join("bin/codex")),
+            Some("codex-cli 0.142.5"),
+        );
+        preset_agent(
+            &state,
+            agents::AgentKind::Gemini,
+            Err("gemini not found (test)".to_string()),
+            None,
+        );
+        preset_agent(
+            &state,
+            agents::AgentKind::Antigravity,
+            Err("agy not found (test)".to_string()),
+            None,
+        );
+
+        let (status, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = list.as_array().unwrap();
+        let row = |id: &str| {
+            list.iter()
+                .find(|a| a["id"] == id)
+                .unwrap_or_else(|| panic!("{id} row missing"))
+                .clone()
+        };
+
+        // The user's own claude: installed, not managed.
+        let claude = row("claude");
+        assert_eq!(claude["installed"], true);
+        assert!(!claude.as_object().unwrap().contains_key("managed"));
+        assert_eq!(claude["managed_install"], true);
+        // The managed codex: flagged per the pinned API contract.
+        let codex = row("codex");
+        assert_eq!(codex["installed"], true);
+        assert_eq!(codex["managed"], true);
+        assert_eq!(codex["managed_install"], true);
+        // gemini: no curated managed install (node runtime, phase 2).
+        assert_eq!(row("gemini")["managed_install"], false);
+        assert_eq!(row("agy")["managed_install"], true);
+    }
+
+    /// Detection falls back to ~/.chimaera/agents/bin when the login shell
+    /// misses (managed installs are deliberately not on the user's PATH),
+    /// and such rows read as installed + managed.
+    #[tokio::test]
+    async fn managed_detection_falls_back_when_login_shell_misses() {
+        let state = test_state();
+        // Ground truth first: if this host has a real standalone agy CLI on
+        // the login-shell PATH, the fallback is unreachable — skip. (The
+        // Antigravity IDE's launcher shim is refused by detection, so IDE
+        // hosts still exercise the fallback.)
+        let probe = launcher::detect(&state, agents::AgentKind::Antigravity, true).await;
+        if probe.path.is_ok() {
+            eprintln!("skipping: a real agy CLI resolves via the login shell on this host");
+            return;
+        }
+
+        let managed_bin = runtimes::managed_bin_dir(&state.managed_root);
+        std::fs::create_dir_all(&managed_bin).unwrap();
+        let fake = managed_bin.join("agy");
+        std::fs::write(&fake, "#!/bin/sh\necho agy version 9.9.9\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let detection = launcher::detect(&state, agents::AgentKind::Antigravity, true).await;
+        assert_eq!(detection.path.as_deref().ok(), Some(fake.as_path()));
+        assert!(detection.managed);
+        assert_eq!(detection.version.as_deref(), Some("agy version 9.9.9"));
+
+        // And the catalog row reflects it (served from the refreshed cache).
+        let (_, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
+        let agy = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "agy")
+            .unwrap()
+            .clone();
+        assert_eq!(agy["installed"], true);
+        assert_eq!(agy["managed"], true);
+        assert_eq!(agy["path"].as_str().unwrap(), fake.to_string_lossy());
     }
 
     #[tokio::test]
@@ -1977,6 +2452,7 @@ mod tests {
                     "--norc".to_string(),
                 ]),
                 id: None,
+                env: Vec::new(),
             })
             .expect("spawn shell");
         lock(&state.session_workspaces).insert(info.id.clone(), workspace_id.to_string());

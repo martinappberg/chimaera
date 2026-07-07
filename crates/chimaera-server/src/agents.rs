@@ -269,7 +269,18 @@ const HOOK_EVENTS: [&str; 8] = [
 
 /// Write the per-agent Claude Code settings file (hooks -> daemon ingest URL)
 /// into the chimaera runtime dir, mode 0600 (it embeds the session secret).
-pub(crate) fn write_settings(session_id: &str, key: &str, port: u16) -> anyhow::Result<PathBuf> {
+///
+/// `theme` merges the scheme-matched theme ("light"/"dark") into the SAME
+/// file the hooks ride — verified against claude 2.1.202: a `"theme"` key
+/// in a `--settings` file re-themes the TUI. Callers pass `None` when the
+/// user's own settings file already sets a theme (respect an explicit
+/// choice; only fill the gap).
+pub(crate) fn write_settings(
+    session_id: &str,
+    key: &str,
+    port: u16,
+    theme: Option<&str>,
+) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let url = format!("http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?key={key}");
@@ -278,7 +289,10 @@ pub(crate) fn write_settings(session_id: &str, key: &str, port: u16) -> anyhow::
     for event in HOOK_EVENTS {
         hooks.insert(event.to_string(), json!([{ "hooks": [hook] }]));
     }
-    let settings = json!({ "hooks": hooks });
+    let mut settings = json!({ "hooks": hooks });
+    if let Some(theme) = theme {
+        settings["theme"] = json!(theme);
+    }
 
     let dir = chimaera_core::runtime_dir().join("agents");
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -429,8 +443,9 @@ fn map_event(event: &str, payload: &serde_json::Value) -> Option<AgentState> {
     }
 }
 
-/// Transcript poll interval: 2s in production, fast in tests.
-fn poll_interval() -> Duration {
+/// Transcript poll interval: 2s in production, fast in tests. (Shared with
+/// the install-session watcher in `runtimes`.)
+pub(crate) fn poll_interval() -> Duration {
     if cfg!(test) {
         Duration::from_millis(50)
     } else {
@@ -751,7 +766,7 @@ mod tests {
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999).unwrap();
+        let path = write_settings(&sid, &key, 43999, None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -762,9 +777,31 @@ mod tests {
             );
             assert_eq!(value["hooks"][event][0]["hooks"][0]["url"], json!(url));
         }
+        // No theme requested: the settings stay hooks-only (a user with an
+        // explicit theme choice is never overridden).
+        assert!(value.get("theme").is_none());
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The scheme-matched theme merges into the SAME settings file the hooks
+    /// ride (verified against claude 2.1.202: `"theme"` in a `--settings`
+    /// file re-themes the TUI).
+    #[test]
+    fn settings_file_merges_theme_next_to_hooks() {
+        let sid = fresh_session_id();
+        let key = fresh_agent_key();
+        let path = write_settings(&sid, &key, 43999, Some("light")).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["theme"], "light");
+        // The hooks still ride along untouched.
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["type"],
+            "http"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

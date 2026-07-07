@@ -145,6 +145,9 @@ impl Session {
         };
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
+        for (name, value) in &opts.env {
+            cmd.env(name, value);
+        }
 
         let mut child = pty
             .slave

@@ -54,6 +54,12 @@ pub struct SpawnOpts {
     /// Caller-chosen session id (must be unused). `None` generates one. This
     /// lets callers embed the id in the command/environment before spawning.
     pub id: Option<SessionId>,
+    /// Extra environment variables for the child, applied on top of the
+    /// inherited environment (a pair with an existing name overrides it, so
+    /// callers can e.g. prepend to PATH). The daemon uses this to inject
+    /// `CHIMAERA_SESSION`/`CHIMAERA_THEME` and the shim dir into every
+    /// session it spawns.
+    pub env: Vec<(String, String)>,
 }
 
 /// Out-of-band events emitted by a session.

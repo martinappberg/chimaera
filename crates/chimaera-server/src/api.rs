@@ -213,6 +213,43 @@ pub(crate) struct CreateSession {
     cols: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+    /// The client's current color scheme ("light"|"dark", from
+    /// prefers-color-scheme at spawn). Drives `CHIMAERA_THEME` in the
+    /// session env and the per-CLI theme injection; defaults to dark.
+    #[serde(default)]
+    theme: Option<String>,
+}
+
+/// The environment every chimaera-spawned session gets: the shim dir
+/// prepended to PATH (theming + future adoption for typed agents; spawn env
+/// only — user dotfiles are never touched), the session's own id, and the
+/// client's color scheme. `CHIMAERA_SHIMS` lets the login-shell wrap
+/// re-prepend the shim dir after profile init reorders PATH.
+pub(crate) fn session_env(
+    state: &AppState,
+    session_id: &str,
+    theme: &str,
+) -> Vec<(String, String)> {
+    let shims = state.shims_dir.display().to_string();
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    vec![
+        ("PATH".to_string(), spawn_path(&shims, &inherited)),
+        ("CHIMAERA_SESSION".to_string(), session_id.to_string()),
+        ("CHIMAERA_THEME".to_string(), theme.to_string()),
+        ("CHIMAERA_SHIMS".to_string(), shims),
+    ]
+}
+
+/// The spawned session's PATH: shim dir first, then the daemon's inherited
+/// PATH — or the fixed system default when that is empty. A bare
+/// "{shims}:" tail is an empty final PATH member, which sh searches as
+/// the cwd (measured: a repo-local ./curl ran inside an install session).
+pub(crate) fn spawn_path(shims: &str, inherited: &str) -> String {
+    if inherited.is_empty() {
+        format!("{shims}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    } else {
+        format!("{shims}:{inherited}")
+    }
 }
 
 /// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or an
@@ -235,19 +272,33 @@ pub(crate) async fn create_session(
     let bad_request =
         |msg: String| (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
 
+    // The client's scheme at spawn; dark when it does not say.
+    let theme = match body.theme.as_deref() {
+        None => "dark",
+        Some(t @ ("light" | "dark")) => t,
+        Some(other) => {
+            return bad_request(format!("invalid theme {other:?} (expected light or dark)"));
+        }
+    };
+
+    // Every session gets a pre-picked id: it rides in the spawn env as
+    // CHIMAERA_SESSION (shells too — typed agents need their session
+    // context) and, for claude, in the hook URL.
+    let id = crate::agents::fresh_session_id();
     let mut opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         name: body.name,
         cols: body.cols.map_or(80, |c| c.clamp(20, 500)),
         rows: body.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
-        id: None,
+        id: Some(id.clone()),
+        env: session_env(&state, &id, theme),
     };
 
     // Agent sessions: resolve the agent binary (cached, via the login
-    // shell), pre-pick the session id so the hook URL can embed it, and —
-    // for claude — generate the per-session settings file that wires its
-    // hooks to this daemon.
+    // shell; user install first, managed fallback), and — for claude —
+    // generate the per-session settings file that wires its hooks to this
+    // daemon and carries the scheme theme.
     let mut spawned_agent = None;
     if body.kind == SessionKind::Agent {
         let agent_kind = match &body.agent {
@@ -289,12 +340,16 @@ pub(crate) async fn create_session(
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }
         };
-        let id = crate::agents::fresh_session_id();
         let key = crate::agents::fresh_agent_key();
         // Hook injection is claude-only: other agents have no hook system
-        // to wire, so their sessions stay honestly "unknown".
+        // to wire, so their sessions stay honestly "unknown". The scheme
+        // theme rides in the same settings file — unless the user's own
+        // settings already set one (respect the explicit choice).
         let settings = if agent_kind == crate::agents::AgentKind::Claude {
-            match crate::agents::write_settings(&id, &key, state.port) {
+            let settings_theme =
+                (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
+                    .then_some(theme);
+            match crate::agents::write_settings(&id, &key, state.port, settings_theme) {
                 Ok(path) => Some(path),
                 Err(err) => {
                     tracing::error!(%err, "failed to write agent settings");
@@ -308,6 +363,12 @@ pub(crate) async fn create_session(
         } else {
             None
         };
+        // Codex themes via `-c tui.theme=` (config-file override, verified
+        // against codex 0.142.5); skipped when the user's own config.toml
+        // picks a theme.
+        let codex_theme = (agent_kind == crate::agents::AgentKind::Codex
+            && !crate::runtimes::codex_user_theme_set(&state.codex_config_path))
+        .then(|| crate::runtimes::codex_theme_name(theme));
         // Login-shell wrap: agents must see the user's terminal environment
         // (exported API keys, nvm PATHs) — the daemon's own env never
         // sourced their profile.
@@ -319,15 +380,15 @@ pub(crate) async fn create_session(
                 settings.as_deref(),
                 body.model.as_deref(),
                 body.resume.as_deref(),
+                codex_theme,
             ),
         ));
-        opts.id = Some(id.clone());
         // Register the record before spawning so no hook can beat it in.
         let mut record = crate::agents::AgentRecord::new(key.clone(), agent_kind);
         // Claude forks a new session id on --resume; remember the ancestor
         // so recents can hide (and later supersede) the old conversation.
         record.resumed_from = body.resume.clone();
-        crate::lock(&state.agents).insert(id, record);
+        crate::lock(&state.agents).insert(id.clone(), record);
         spawned_agent = Some((key, agent_kind));
     }
 

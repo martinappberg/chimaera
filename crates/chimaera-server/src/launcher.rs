@@ -88,33 +88,57 @@ pub(crate) fn is_outdated(kind: AgentKind, version: Option<&str>) -> bool {
 }
 
 /// One cached detection result: where the binary lives (or why it could not
-/// be found) and the first line of its `--version` output.
+/// be found), the first line of its `--version` output, and whether the
+/// resolved binary is a chimaera-managed install (lives under
+/// `~/.chimaera/agents`).
 #[derive(Clone, Debug)]
 pub(crate) struct AgentDetection {
     pub(crate) path: Result<PathBuf, String>,
     pub(crate) version: Option<String>,
+    pub(crate) managed: bool,
 }
 
 /// Detect one agent binary, served from the daemon-lifetime cache unless
-/// `refresh` bypasses it (the launcher refreshes after an install).
+/// `refresh` bypasses it (the launcher refreshes after an install). The
+/// user's own PATH install wins; the managed bin dir is the fallback when
+/// the login shell misses — so spawns prefer the user's binary and pick up
+/// a managed install the moment it lands.
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
     if !refresh {
         if let Some(hit) = crate::lock(&state.agent_bins).get(&kind) {
             return hit.clone();
         }
     }
-    let path = resolve_bin(kind).await;
+    let path = resolve_bin(kind, &crate::runtimes::managed_bin_dir(&state.managed_root)).await;
     let version = match &path {
         Ok(bin) => probe_version(bin).await,
         Err(_) => None,
     };
-    let detection = AgentDetection { path, version };
+    let managed = path
+        .as_ref()
+        .is_ok_and(|p| crate::runtimes::is_managed(p, &state.managed_root));
+    let detection = AgentDetection {
+        path,
+        version,
+        managed,
+    };
     crate::lock(&state.agent_bins).insert(kind, detection.clone());
     detection
 }
 
-/// Resolve an agent binary through the user's login shell (`command -v`).
-async fn resolve_bin(kind: AgentKind) -> Result<PathBuf, String> {
+/// The managed install of `bin` under the managed bin dir, if present and
+/// executable — detection's fallback when the login shell misses.
+pub(crate) fn managed_fallback(bin: &str, managed_bin: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = managed_bin.join(bin);
+    let meta = std::fs::metadata(&path).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(path)
+}
+
+/// Resolve an agent binary through the user's login shell (`command -v`),
+/// falling back to the managed bin dir when the shell misses (managed
+/// installs are deliberately NOT on the user's PATH — dotfiles stay theirs).
+async fn resolve_bin(kind: AgentKind, managed_bin: &Path) -> Result<PathBuf, String> {
     let bin = kind.as_str();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let output = tokio::process::Command::new(&shell)
@@ -131,7 +155,7 @@ async fn resolve_bin(kind: AgentKind) -> Result<PathBuf, String> {
             url = docs_url(kind),
         )
     };
-    match output {
+    let user = match output {
         Ok(out) if out.status.success() => {
             // Login shells may print banners; the path is the last non-empty line.
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -142,25 +166,32 @@ async fn resolve_bin(kind: AgentKind) -> Result<PathBuf, String> {
                 .find(|l| !l.is_empty())
                 .unwrap_or("");
             if !path.starts_with('/') {
-                return Err(not_found());
+                Err(not_found())
+            } else {
+                let path = PathBuf::from(path);
+                if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
+                    // The Antigravity IDE ships an `agy` symlink to its own
+                    // app launcher (like VS Code's `code`): it opens the GUI
+                    // and exits 0 silently — NOT the CLI. Field-found:
+                    // spawning it made a pane that just said "[exited]".
+                    Err(format!(
+                        "the `agy` on your PATH is the Antigravity IDE's app launcher, \
+                         not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
+                        cmd = install_command(kind),
+                        url = docs_url(kind),
+                    ))
+                } else {
+                    Ok(path)
+                }
             }
-            let path = PathBuf::from(path);
-            if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
-                // The Antigravity IDE ships an `agy` symlink to its own app
-                // launcher (like VS Code's `code`): it opens the GUI and
-                // exits 0 silently — NOT the CLI. Field-found: spawning it
-                // made a pane that just said "[exited]".
-                return Err(format!(
-                    "the `agy` on your PATH is the Antigravity IDE's app launcher, \
-                     not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
-                    cmd = install_command(kind),
-                    url = docs_url(kind),
-                ));
-            }
-            Ok(path)
         }
         Ok(_) => Err(not_found()),
         Err(err) => Err(format!("failed to run login shell {shell}: {err}")),
+    };
+    // The user's own install wins; a managed install fills the miss.
+    match user {
+        Ok(path) => Ok(path),
+        Err(msg) => managed_fallback(bin, managed_bin).ok_or(msg),
     }
 }
 
@@ -240,6 +271,17 @@ pub(crate) async fn list_agents(
                 // install command as an UPDATE instead of spawning blind.
                 row.insert("outdated".into(), json!(true));
             }
+            if detection.managed {
+                // The resolved binary is a chimaera-managed install under
+                // ~/.chimaera/agents (the user has none of their own).
+                row.insert("managed".into(), json!(true));
+            }
+            // Whether POST /agents/{id}/install has a curated managed
+            // install for this agent (gemini needs a node runtime: phase 2).
+            row.insert(
+                "managed_install".into(),
+                json!(crate::runtimes::install_script(kind, &state.managed_root).is_some()),
+            );
             let models: Vec<_> = models(kind)
                 .iter()
                 .map(|(id, label)| json!({"id": id, "label": label}))
@@ -266,15 +308,18 @@ pub(crate) fn safe_arg(s: &str) -> bool {
 }
 
 /// Argv for an agent session. Claude gets the hook-injecting `--settings`
-/// plus `--model`/`--resume` when given; codex/gemini spawn their TUIs
-/// plain — no hooks, `--model` when given (both CLIs take it), never
-/// `--resume` (claude-only, enforced by the create handler).
+/// (which also carries the scheme theme) plus `--model`/`--resume` when
+/// given; codex gets `-c tui.theme=<name>` when a theme should be injected
+/// (verified against codex 0.142.5 — see `runtimes`); gemini/agy spawn
+/// their TUIs plain — no hooks, `--model` when given, never `--resume`
+/// (claude-only, enforced by the create handler).
 pub(crate) fn build_agent_command(
     kind: AgentKind,
     bin: &Path,
     settings: Option<&Path>,
     model: Option<&str>,
     resume: Option<&str>,
+    codex_theme: Option<&str>,
 ) -> Vec<String> {
     debug_assert!(
         resume.is_none() || kind == AgentKind::Claude,
@@ -284,10 +329,18 @@ pub(crate) fn build_agent_command(
         settings.is_none() || kind == AgentKind::Claude,
         "hook settings are claude-only"
     );
+    debug_assert!(
+        codex_theme.is_none() || kind == AgentKind::Codex,
+        "tui.theme is codex-only"
+    );
     let mut cmd = vec![bin.to_string_lossy().into_owned()];
     if let Some(settings) = settings {
         cmd.push("--settings".to_string());
         cmd.push(settings.to_string_lossy().into_owned());
+    }
+    if let Some(theme) = codex_theme {
+        cmd.push("-c".to_string());
+        cmd.push(format!("tui.theme={theme}"));
     }
     if let Some(model) = model {
         cmd.push("--model".to_string());
@@ -309,12 +362,23 @@ pub(crate) fn build_agent_command(
 /// and foreground polling all see the real process). The `"$0" "$@"` form
 /// passes the argv through untouched — nothing is re-quoted or interpolated
 /// into the script.
+///
+/// The script re-prepends the shim dir (`$CHIMAERA_SHIMS`, set in the spawn
+/// env) before exec'ing: login-shell init reorders the injected PATH —
+/// measured on this machine, macOS path_helper plus the user's profile
+/// demoted the shim dir from front to position 16 — so the front slot is
+/// reclaimed after the profile has run. A duplicate entry further back is
+/// harmless.
 pub(crate) fn wrap_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
     let script = if shell.rsplit('/').next() == Some("fish") {
         // fish has no `$0`/`$@`; -c puts trailing args in $argv instead.
-        "exec $argv".to_string()
+        r#"test -n "$CHIMAERA_SHIMS"; and set -gx PATH $CHIMAERA_SHIMS $PATH
+exec $argv"#
+            .to_string()
     } else {
-        r#"exec "$0" "$@""#.to_string()
+        r#"if [ -n "${CHIMAERA_SHIMS:-}" ]; then PATH="$CHIMAERA_SHIMS:$PATH"; export PATH; fi
+exec "$0" "$@""#
+            .to_string()
     };
     let mut cmd = vec![shell.to_string(), "-lc".to_string(), script];
     cmd.extend(argv);
@@ -613,6 +677,7 @@ mod tests {
             Some(Path::new("/run/agents/s-1-settings.json")),
             Some("opus"),
             Some("5e0d64b2-abcd-abcd-abcd-000000000000"),
+            None,
         );
         assert_eq!(
             cmd,
@@ -636,6 +701,7 @@ mod tests {
             Some(Path::new("/run/s.json")),
             None,
             None,
+            None,
         );
         assert_eq!(cmd, ["/usr/local/bin/claude", "--settings", "/run/s.json"]);
     }
@@ -649,6 +715,7 @@ mod tests {
             None,
             Some("o4-mini"),
             None,
+            None,
         );
         assert_eq!(cmd, ["/opt/bin/codex", "--model", "o4-mini"]);
         let cmd = build_agent_command(
@@ -657,14 +724,43 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(cmd, ["/opt/bin/gemini"]);
+    }
+
+    /// Codex themes through `-c tui.theme=<name>` — the config override
+    /// documented by codex 0.142.5's own config schema; the names are the
+    /// per-scheme defaults codex itself would pick.
+    #[test]
+    fn build_agent_command_codex_injects_scheme_theme() {
+        let cmd = build_agent_command(
+            AgentKind::Codex,
+            Path::new("/opt/bin/codex"),
+            None,
+            Some("o4-mini"),
+            None,
+            Some("catppuccin-mocha"),
+        );
+        assert_eq!(
+            cmd,
+            [
+                "/opt/bin/codex",
+                "-c",
+                "tui.theme=catppuccin-mocha",
+                "--model",
+                "o4-mini",
+            ]
+        );
     }
 
     #[test]
     fn wrap_login_shell_passes_argv_untouched() {
         // sh-family: `$0`/`$@` carry the argv — nothing is interpolated
         // into the script, so paths with spaces or quotes survive as-is.
+        // The script also reclaims the shim dir's front PATH slot after
+        // profile init (macOS path_helper demotes the injected order —
+        // measured on this machine).
         let cmd = wrap_login_shell(
             "/bin/zsh",
             vec![
@@ -673,32 +769,28 @@ mod tests {
                 "o4-mini".to_string(),
             ],
         );
-        assert_eq!(
-            cmd,
-            [
-                "/bin/zsh",
-                "-lc",
-                r#"exec "$0" "$@""#,
-                "/Users/x/My Tools/codex",
-                "--model",
-                "o4-mini",
-            ]
+        assert_eq!(cmd[..2], ["/bin/zsh", "-lc"]);
+        let script = &cmd[2];
+        assert!(
+            script.contains(r#"PATH="$CHIMAERA_SHIMS:$PATH""#),
+            "{script}"
         );
+        assert!(script.ends_with(r#"exec "$0" "$@""#), "{script}");
+        assert_eq!(cmd[3..], ["/Users/x/My Tools/codex", "--model", "o4-mini"]);
 
         // fish has no `$0`/`$@`; trailing -c args land in $argv instead.
         let cmd = wrap_login_shell(
             "/opt/homebrew/bin/fish",
             vec!["/usr/bin/claude".to_string()],
         );
-        assert_eq!(
-            cmd,
-            [
-                "/opt/homebrew/bin/fish",
-                "-lc",
-                "exec $argv",
-                "/usr/bin/claude"
-            ]
+        assert_eq!(cmd[..2], ["/opt/homebrew/bin/fish", "-lc"]);
+        let script = &cmd[2];
+        assert!(
+            script.contains("set -gx PATH $CHIMAERA_SHIMS $PATH"),
+            "{script}"
         );
+        assert!(script.ends_with("exec $argv"), "{script}");
+        assert_eq!(cmd[3..], ["/usr/bin/claude"]);
     }
 
     #[test]
