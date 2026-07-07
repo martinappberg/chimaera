@@ -13,7 +13,10 @@ import type { Side, SplitDir, Tab, Zone } from "./layout";
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
   | { kind: "tab"; paneId: string; index: number }
-  | { kind: "edge"; edge: Side };
+  | { kind: "edge"; edge: Side }
+  /** The "link to agent" band over an agent pane's input area (only while
+   *  dragging a shell terminal; see startDrag's linkTargets). */
+  | { kind: "link"; paneId: string };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
@@ -94,6 +97,7 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "edge" && b.kind === "edge") return a.edge === b.edge;
   if (a.kind === "tab" && b.kind === "tab") return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
+  if (a.kind === "link" && b.kind === "link") return a.paneId === b.paneId;
   return false;
 }
 
@@ -127,11 +131,15 @@ function windowEdgeAt(x: number, y: number): DropSpot | null {
   return d[0][1] <= WINDOW_EDGE_PX ? { kind: "edge", edge: d[0][0] } : null;
 }
 
+/** Bottom share of a link-target pane that reads as its input-area band. */
+const LINK_BAND_FRAC = 0.28;
+
 /**
  * Hit-test priority: tab bars (precise insertion beats everything), then
- * window edges (a thin band along the stage boundary), then pane zones.
+ * window edges (a thin band along the stage boundary), then — on panes in
+ * `linkTargets` — the link band over the input area, then pane zones.
  */
-function spotAt(x: number, y: number): DropSpot | null {
+function spotAt(x: number, y: number, linkTargets?: ReadonlySet<string>): DropSpot | null {
   let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
     const r = reg.root.getBoundingClientRect();
@@ -160,6 +168,11 @@ function spotAt(x: number, y: number): DropSpot | null {
     const { paneId, r } = paneHit;
     const nx = (x - r.left) / r.width;
     const ny = (y - r.top) / r.height;
+    // On an agent pane the input-area band means "link", not "split below" —
+    // the two intents get two visibly distinct zones (drag-to-reference).
+    if (linkTargets?.has(paneId) === true && ny >= 1 - LINK_BAND_FRAC) {
+      return { kind: "link", paneId };
+    }
     return { kind: "zone", paneId, zone: zoneAt(nx, ny) };
   }
   return null;
@@ -173,11 +186,21 @@ function makeGhost(label: string): HTMLDivElement {
   return ghost;
 }
 
+export interface DragOptions {
+  /** Panes whose input band is a "link to agent" target for this payload. */
+  linkTargets?: ReadonlySet<string>;
+}
+
 /**
  * Start a potential drag from `e` (a pointerdown on the source element).
  * Captures the pointer on the source so terminals never see the moves.
  */
-export function startDrag(e: PointerEvent, payload: DragPayload, cb: DragCallbacks): void {
+export function startDrag(
+  e: PointerEvent,
+  payload: DragPayload,
+  cb: DragCallbacks,
+  opts: DragOptions = {},
+): void {
   if (e.button !== 0) return;
   const source = e.currentTarget instanceof Element ? e.currentTarget : null;
   const pointerId = e.pointerId;
@@ -202,7 +225,7 @@ export function startDrag(e: PointerEvent, payload: DragPayload, cb: DragCallbac
     if (ghost !== null) {
       ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
     }
-    const next = spotAt(lastX, lastY);
+    const next = spotAt(lastX, lastY, opts.linkTargets);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);

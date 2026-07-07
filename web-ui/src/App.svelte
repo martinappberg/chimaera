@@ -26,6 +26,14 @@
     type Workspace,
   } from "./lib/sessions";
   import { EventsSocket } from "./lib/events";
+  import {
+    deleteLink,
+    listLinks,
+    putLink,
+    termReference,
+    type Link,
+    type LinkCtrl,
+  } from "./lib/links";
   import { reconnectingSockets } from "./lib/ws";
   import {
     activateTab,
@@ -48,6 +56,7 @@
     pruneFiles,
     pruneSessions,
     serializeLayout,
+    sessionPaneId,
     setRatio,
     splitPane,
     tabCount,
@@ -80,6 +89,8 @@
   let health = $state<Health | null>(null);
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  /** Linked-terminal edges, mirrored from /ws/events snapshots. */
+  let links = $state<Link[]>([]);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
   let pickerOpen = $state(false);
   let quickOpenOpen = $state(false);
@@ -127,6 +138,8 @@
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
+  /** terminal session id -> agent session id (one agent per terminal). */
+  const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
   const focusedFilePath = $derived(focusedFileOf(layout));
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
@@ -167,11 +180,23 @@
 
   // /ws/events pushes full session snapshots; the 5s poll only runs as a
   // fallback while the socket is down (including before the first frame).
+  // Links normally ride the socket frames; the fallback refreshes them too.
   $effect(() => {
     if (eventsUp) return;
-    return pollSessions(applySessions, () => {
-      // transient poll failure; the daemon dot already reflects reachability
-    });
+    return pollSessions(
+      (list) => {
+        applySessions(list);
+        listLinks().then(
+          (l) => (links = l),
+          () => {
+            // stale links until the daemon is reachable again
+          },
+        );
+      },
+      () => {
+        // transient poll failure; the daemon dot already reflects reachability
+      },
+    );
   });
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
@@ -200,7 +225,10 @@
   onMount(() => {
     pool.initPool({ onTitle, onExited, onSocketError });
     const events = new EventsSocket({
-      onSessions: applySessions,
+      onSessions: (list, linkList) => {
+        applySessions(list);
+        if (linkList !== undefined) links = linkList;
+      },
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -708,6 +736,31 @@
     },
   };
 
+  /**
+   * Panes whose input band should read "link to this agent" while dragging
+   * `tab`: panes showing a live agent session, when the payload is a shell
+   * terminal (files and agents themselves never link).
+   */
+  function linkTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+    if (tab.surface !== "terminal") return undefined;
+    if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
+    const targets = new Set<string>();
+    const walk = (n: typeof layout.root): void => {
+      if (n.type === "pane") {
+        const active = n.tabs[n.active];
+        if (active !== undefined && active.surface === "terminal") {
+          const s = sessionsById.get(active.sessionId);
+          if (s !== undefined && s.kind === "agent" && s.alive) targets.add(n.id);
+        }
+        return;
+      }
+      walk(n.a);
+      walk(n.b);
+    };
+    walk(layout.root);
+    return targets.size > 0 ? targets : undefined;
+  }
+
   /** Shared drag start for rail rows and pane tabs (any surface). */
   function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void): void {
     const label =
@@ -722,6 +775,10 @@
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
+          if (spot.kind === "link") {
+            if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
+            return;
+          }
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
@@ -739,8 +796,69 @@
         onClick,
         onEnd: () => (dropSpot = null),
       },
+      { linkTargets: linkTargetsFor(tab) },
     );
   }
+
+  // --- linked terminals ------------------------------------------------------
+
+  /**
+   * Create/move a link with an optimistic local update; the next /ws/events
+   * snapshot is authoritative either way (on failure we resync explicitly).
+   */
+  async function doLink(terminalId: string, agentId: string): Promise<void> {
+    links = [
+      ...links.filter((l) => l.terminal_id !== terminalId),
+      { terminal_id: terminalId, agent_id: agentId },
+    ];
+    try {
+      await putLink(terminalId, agentId);
+    } catch {
+      links = await listLinks().catch(() => links);
+    }
+  }
+
+  /** Reveal a session's view, splitting beside `besidePaneId` if not open. */
+  function revealSession(sessionId: string, besidePaneId: string): void {
+    if (sessionPaneId(layout, sessionId) === null) {
+      layout = splitPane(layout, besidePaneId, "row");
+    }
+    layout = openSession(layout, sessionId);
+  }
+
+  /**
+   * The drop on an agent pane's link band: link the terminal, type its
+   * @term: reference into the composer (never submits), reveal the terminal
+   * beside the agent, and hand focus to the agent so Enter sends the prompt.
+   */
+  function linkByDrop(terminalId: string, agentPaneId: string): void {
+    const pane = findPane(layout.root, agentPaneId);
+    const agentTab = pane?.tabs[pane.active];
+    if (agentTab === undefined || agentTab.surface !== "terminal") return;
+    const agentId = agentTab.sessionId;
+    void doLink(terminalId, agentId);
+    const name = displayNames.get(terminalId) ?? terminalId;
+    pool.sendText(agentId, `${termReference(name)} `);
+    revealSession(terminalId, agentPaneId);
+    pool.focusTerminal(agentId);
+  }
+
+  /** Link mutations + reveal for the pane top bars (chips and the menu). */
+  const linkCtrl: LinkCtrl = {
+    reveal(sessionId, besidePaneId) {
+      revealSession(sessionId, besidePaneId);
+      pool.focusTerminal(sessionId);
+    },
+    link(terminalId, agentId) {
+      void doLink(terminalId, agentId);
+    },
+    unlink(terminalId) {
+      links = links.filter((l) => l.terminal_id !== terminalId);
+      deleteLink(terminalId).catch(async () => {
+        links = await listLinks().catch(() => links);
+      });
+    },
+  };
 
   function onRailRowDown(e: PointerEvent, sessionId: string): void {
     beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
@@ -1004,6 +1122,8 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            links={linksByTerminal}
+            {linkCtrl}
             {ctrl}
           />
         {:else}
@@ -1014,6 +1134,8 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            links={linksByTerminal}
+            {linkCtrl}
             {ctrl}
           />
         {/if}

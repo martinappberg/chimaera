@@ -1,12 +1,16 @@
 import { getToken } from "./api";
+import type { Link } from "./links";
 import type { Session } from "./sessions";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
 
 export interface EventsSocketHandlers {
-  /** Full session-list snapshot pushed by the daemon. */
-  onSessions(sessions: Session[]): void;
+  /**
+   * Full session-list snapshot pushed by the daemon; `links` rides the same
+   * frame (undefined from a daemon predating linked terminals).
+   */
+  onSessions(sessions: Session[], links?: Link[]): void;
   /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
@@ -23,6 +27,7 @@ export interface EventsSocketHandlers {
 interface ServerEventFrame {
   type: string;
   sessions?: Session[];
+  links?: Link[];
   message?: string;
 }
 
@@ -66,7 +71,10 @@ export class EventsSocket {
       if (msg.type === "sessions" && Array.isArray(msg.sessions)) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.setConnected(true);
-        this.handlers.onSessions(msg.sessions);
+        this.handlers.onSessions(
+          msg.sessions,
+          Array.isArray(msg.links) ? msg.links : undefined,
+        );
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

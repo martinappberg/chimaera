@@ -332,6 +332,15 @@ export function release(id: string, host: HTMLElement): void {
   }
 }
 
+/**
+ * Type text into a session's PTY (the drop-to-link gesture writes the
+ * `@term:` reference into the agent's composer — never submits). No-op when
+ * the session has no pooled terminal yet.
+ */
+export function sendText(id: string, text: string): void {
+  pool.get(id)?.socket.sendInput(text);
+}
+
 /** Focus the session's terminal, deferring until it is attached if needed. */
 export function focusTerminal(id: string): void {
   const entry = pool.get(id);

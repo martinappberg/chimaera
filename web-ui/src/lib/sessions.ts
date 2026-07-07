@@ -39,6 +39,13 @@ export interface Session {
    * lands; the client falls back to agent_title/name.
    */
   display_name?: string | null;
+  /**
+   * Shell phase from OSC 133 marks: at the prompt ("ready"), running a
+   * command ("running"), or no integration seen ("unknown"). Shells only.
+   */
+  phase?: "unknown" | "ready" | "running";
+  /** Stage of an in-flight agent exec against this terminal, else null. */
+  exec_stage?: "queued" | "executing" | null;
 }
 
 /** The one display name for a session, used identically everywhere. */
