@@ -12,6 +12,16 @@
 </p>
 
 <p align="center">
+  <a href="https://martinappberg.github.io/chimaera/"><strong>Website</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://martinappberg.github.io/chimaera/docs.html">Docs</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/martinappberg/chimaera/releases/latest">Download</a>
+  &nbsp;·&nbsp;
+  <a href="DESIGN.md">Design</a>
+</p>
+
+<p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey.svg">
   <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-orange.svg">
