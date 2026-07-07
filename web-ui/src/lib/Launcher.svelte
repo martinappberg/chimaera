@@ -6,8 +6,10 @@
    *
    * One question: WHICH agent. One row per known CLI, every row carrying a
    * link to its official docs (opens in the browser):
-   * - installed → click spawns; a version chimaera installed itself shows
-   *   the accent-tinted version tag (managed, under ~/.chimaera/agents);
+   * - installed → click spawns; the row names whose binary runs — "yours"
+   *   (your own on PATH) or "chimaera" (accent, a build chimaera installed
+   *   under ~/.chimaera/agents) — with the version and the resolved path in
+   *   the tooltip;
    * - installed but outdated (npm-era codex, pre-`codex login`) → click
    *   still spawns, an "update" chip runs the daemon's curated update
    *   in-app (managed runtimes), streaming into a visible terminal;
@@ -43,6 +45,23 @@
 
   let hl = $state(0);
   let rootEl = $state<HTMLElement | null>(null);
+
+  /** The bare version number, wherever the CLI buried it ("codex-cli 0.52.0",
+   *  "2.1.202 (Claude Code)"). */
+  function versionNumber(version: string): string {
+    return version.split(" ").find((t) => /^\d/.test(t)) ?? version.split(" ")[0];
+  }
+
+  /** Version-tag tooltip: whose binary this is and where it resolves — the
+   *  answer to "chimaera's install or mine?" the rail alone can't give. */
+  function whereTitle(a: AgentInfo): string {
+    const whose = a.managed
+      ? "installed by chimaera in ~/.chimaera/agents"
+      : a.path
+        ? `your own install — ${a.path}`
+        : "your own install on PATH";
+    return a.version !== null ? `${a.version} — ${whose}` : whose;
+  }
 
   onMount(() => {
     const def = getAgentDefault();
@@ -223,23 +242,15 @@
             >
               update
             </button>
-          {:else if a.version !== null}
-            <!-- The number, wherever the CLI put it ("codex-cli 0.52.0",
-                 "2.1.202 (Claude Code)", "0.49.0"). Accent tint = chimaera
-                 installed this one itself (managed, ~/.chimaera/agents). -->
-            <span
-              class="aver"
-              class:managed={a.managed}
-              title={a.managed
-                ? `${a.version} — installed by chimaera in ~/.chimaera/agents`
-                : a.version}
-            >
-              {a.version.split(" ").find((t) => /^\d/.test(t)) ?? a.version.split(" ")[0]}
-            </span>
-          {:else if a.managed}
-            <!-- Managed but the version probe failed: still say whose it is. -->
-            <span class="aver managed" title="installed by chimaera in ~/.chimaera/agents">
-              managed
+          {:else if a.installed}
+            <!-- Provenance in words, not just a color: "chimaera" = a build
+                 chimaera installed itself (~/.chimaera/agents), "yours" = your
+                 own on PATH — the launcher's answer to "whose claude runs?".
+                 The version number follows when the probe caught it; the
+                 tooltip carries the resolved path. -->
+            <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
+              <span class="prov">{a.managed ? "chimaera" : "yours"}</span>
+              {#if a.version !== null}<span class="num">{versionNumber(a.version)}</span>{/if}
             </span>
           {/if}
         </div>
@@ -377,9 +388,11 @@
 
   .aver {
     flex: none;
-    max-width: 96px;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    max-width: 150px;
     overflow: hidden;
-    text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono);
     font-size: var(--text-xs);
@@ -387,10 +400,28 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* Chimaera installed this build itself (~/.chimaera/agents): the version
-     tag carries the accent tint — a quiet provenance mark, nothing more. */
-  .aver.managed {
+  /* Provenance word ("chimaera" / "yours") — the at-a-glance answer to whose
+     binary a spawn runs. Muted for the user's own; accent tint when chimaera
+     installed the build itself (~/.chimaera/agents). */
+  .prov {
+    flex: none;
+  }
+
+  .aver.managed .prov {
     color: var(--accent);
+  }
+
+  /* Version number, set off from the provenance word by a thin middot. */
+  .num {
+    flex: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .num::before {
+    content: "·";
+    margin-right: 5px;
+    opacity: 0.5;
   }
 
   /* Uninstalled agents: visible but muted — honest, not hidden. */
