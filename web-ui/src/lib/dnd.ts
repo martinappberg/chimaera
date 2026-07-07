@@ -18,7 +18,11 @@ export type DropSpot =
   | { kind: "ref"; paneId: string }
   /** The "link to agent" band over an agent pane's input area (only while
    *  dragging a shell terminal; see startDrag's linkTargets). */
-  | { kind: "link"; paneId: string };
+  | { kind: "link"; paneId: string }
+  /** An agent's rail row, highlighted while a shell terminal is dragged over
+   *  it — the always-present link target (the agent needn't be open in a
+   *  pane). See startDrag's linkSessions. */
+  | { kind: "linkrow"; sessionId: string };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
@@ -89,6 +93,18 @@ export function unregisterPane(paneId: string, root: HTMLElement): void {
   if (paneRegs.get(paneId)?.root === root) paneRegs.delete(paneId);
 }
 
+/** Agent rail rows, registered so a shell-terminal drag can drop on one to
+ *  link (the always-present target — the agent needn't be open in a pane). */
+const linkRowRegs = new Map<string, HTMLElement>();
+
+export function registerLinkRow(sessionId: string, el: HTMLElement): void {
+  linkRowRegs.set(sessionId, el);
+}
+
+export function unregisterLinkRow(sessionId: string, el: HTMLElement): void {
+  if (linkRowRegs.get(sessionId) === el) linkRowRegs.delete(sessionId);
+}
+
 export function paneContentEl(paneId: string): HTMLElement | null {
   return paneRegs.get(paneId)?.content ?? null;
 }
@@ -124,6 +140,7 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
   if (a.kind === "ref" && b.kind === "ref") return a.paneId === b.paneId;
   if (a.kind === "link" && b.kind === "link") return a.paneId === b.paneId;
+  if (a.kind === "linkrow" && b.kind === "linkrow") return a.sessionId === b.sessionId;
   return false;
 }
 
@@ -173,7 +190,20 @@ function spotAt(
   y: number,
   refFor: ((paneId: string) => boolean) | null,
   linkTargets: ReadonlySet<string> | undefined,
+  linkSessions: ReadonlySet<string> | undefined,
 ): DropSpot | null {
+  // Agent rail rows first: an always-present link target for a shell-terminal
+  // drag, so the agent needn't be open in a pane. The rail never overlaps the
+  // stage, so checking it up front costs nothing elsewhere.
+  if (linkSessions !== undefined) {
+    for (const [sid, el] of linkRowRegs) {
+      if (!linkSessions.has(sid)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        return { kind: "linkrow", sessionId: sid };
+      }
+    }
+  }
   let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
     const r = reg.root.getBoundingClientRect();
@@ -234,6 +264,9 @@ function makeGhost(label: string): HTMLDivElement {
 export interface DragOptions {
   /** Panes whose input band is a "link to agent" target for this payload. */
   linkTargets?: ReadonlySet<string>;
+  /** Agent session ids whose rail rows are "link to agent" targets for this
+   *  payload (a shell terminal). Independent of whether the agent is open. */
+  linkSessions?: ReadonlySet<string>;
 }
 
 /**
@@ -274,7 +307,7 @@ export function startDrag(
     if (ghost !== null) {
       ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
     }
-    const next = spotAt(lastX, lastY, refFor, opts.linkTargets);
+    const next = spotAt(lastX, lastY, refFor, opts.linkTargets, opts.linkSessions);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
