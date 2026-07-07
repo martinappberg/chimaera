@@ -18,4 +18,5 @@ nix.workspace = true
 open.workspace = true
 mimalloc.workspace = true
 chimaera-core.workspace = true
+chimaera-remote.workspace = true
 chimaera-server.workspace = true

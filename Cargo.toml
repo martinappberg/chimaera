@@ -4,6 +4,7 @@ members = [
     "crates/chimaera",
     "crates/chimaera-core",
     "crates/chimaera-pty",
+    "crates/chimaera-remote",
     "crates/chimaera-server",
 ]
 
@@ -38,6 +39,7 @@ alacritty_terminal = "0.26"
 
 chimaera-core = { path = "crates/chimaera-core" }
 chimaera-pty = { path = "crates/chimaera-pty" }
+chimaera-remote = { path = "crates/chimaera-remote" }
 chimaera-server = { path = "crates/chimaera-server" }
 
 [profile.release]

@@ -1,4 +1,3 @@
-use anyhow::Context;
 use chimaera_core::Manifest;
 
 pub async fn run(host: Option<&str>) -> anyhow::Result<()> {
@@ -18,34 +17,11 @@ fn local() -> anyhow::Result<()> {
 }
 
 async fn remote(host: &str) -> anyhow::Result<()> {
-    let output = tokio::process::Command::new("ssh")
-        .arg(host)
-        .arg("cat ~/.chimaera/manifest.json")
-        .output()
-        .await
-        .context("failed to run ssh")?;
-    if !output.status.success() {
+    let Some(manifest) = chimaera_remote::remote_manifest(host).await? else {
         println!("not running");
         return Ok(());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let manifest: Manifest = match serde_json::from_str(text.trim()) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!("unparseable remote manifest: {e}");
-            println!("not running");
-            return Ok(());
-        }
     };
-    let alive = tokio::process::Command::new("ssh")
-        .arg(host)
-        .arg(format!("kill -0 {}", manifest.pid))
-        .output()
-        .await
-        .context("failed to run ssh")?
-        .status
-        .success();
-    if alive {
+    if chimaera_remote::remote_alive(host, manifest.pid).await? {
         report_running(&manifest);
     } else {
         report_stale(&manifest);
