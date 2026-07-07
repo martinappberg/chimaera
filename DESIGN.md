@@ -555,6 +555,55 @@ Launcher field notes (2026-07-06, shipped with the build):
   inline rename; the pin outranks every derived name on every surface (rail, tab,
   strip) and survives into Recents when the session ends.
 
+**Managed agent runtimes (author, 2026-07-07 — queued).** Chimaera installs and updates
+the agent CLIs itself, in-app, while credentials stay entirely the user's: every CLI
+keeps auth in the user's HOME (~/.claude + keychain, ~/.codex/auth.json, ~/.gemini),
+and managed binaries run as the user with their HOME + login-shell env, so login flows
+are identical regardless of who installed the binary. Design:
+- Daemon downloads OFFICIAL artifacts only (hardcoded curated sources, HTTPS, never
+  sudo) into `~/.chimaera/agents/<agent>/<version>/` with a `bin/` symlink swap; spawn
+  prefers the user's own PATH install, falls back to managed.
+- Phase 1 needs NO bundled runtime: claude (official installer, self-contained), codex
+  (GitHub release binaries), agy (single Go binary) — only gemini-cli truly needs node.
+  Phase 2 (if wanted): an official node runtime under `~/.chimaera/runtimes/` (the
+  nvm/code-server pattern) to carry node-based CLIs.
+- This AMENDS the pre-typed-never-executed rule with a transparency-preserving middle:
+  the launcher's install/update chip shows exactly what it fetches and where, executes
+  on one explicit click, and streams installer output into a visible terminal pane. No
+  silent execution; silent auto-update only as a later opt-in setting. Update
+  availability rides the existing background re-detection → "update" chip.
+- HPC is the payoff case: no node, no sudo, daemon-side download means one-click
+  install works identically for remote windows; air-gapped clusters pre-stock
+  artifacts via the existing `~/.chimaera/dist/` pattern.
+- Running sessions keep their binary across updates (processes hold the old file);
+  new spawns get the new version. Claude Code self-updates in place — managed claude
+  defers to it rather than fighting it.
+- `~/.chimaera` as the install prefix is confirmed (author): it is the user's own,
+  needs no root, and survives on HPC — the same guarantee as ~/.local/bin. Updates are
+  UI-driven (the update chip) or auto (opt-in) — "control without owning anything."
+
+**Agent theming + shell shims (author, 2026-07-07 — queued with managed runtimes;
+"pretty important").** Agents must START with a theme that fits chimaera's UI, whether
+launched from the rail or typed into a chimaera shell:
+- The general mechanism is a shim dir: chimaera-spawned sessions (shells AND agents)
+  get `~/.chimaera/shims` prepended to PATH via spawn env only — user dotfiles are
+  never touched; a shell that resets PATH simply drops the shims. Each shim execs the
+  real binary (user's own install first, managed fallback) with the right theme
+  injected for the client's current scheme.
+- Per-CLI theme levers: claude — theme merged into the SAME generated `--settings`
+  file the hooks ride (respect an explicit user-set theme; only fill the gap); gemini —
+  its settings.json theme field; codex/agy — mechanisms verified against the real
+  binaries at build time (rule zero of this launcher work). TUIs that just use ANSI-16
+  already fit: the pane palettes are measured for both schemes.
+- The shim's bigger consequence, deliberately in scope: an agent TYPED into a chimaera
+  shell goes through the wrapper too, so it gets hook injection (attention states),
+  auto-naming, and Recents retirement — hand-started agents become first-class, not
+  just launcher-spawned ones. The shim must know its session context (CHIMAERA_SESSION
+  env set at spawn) and must NEVER apply outside chimaera sessions (the dir simply
+  isn't on PATH elsewhere).
+- Scheme is passed by the client at spawn (it knows prefers-color-scheme); mid-session
+  scheme flips restyle the pane immediately (xterm theme) and the TUI on next launch.
+
 **Triage dashboard (Leader-d).** Groups top to bottom: **Needs you** (needs_permission +
 idle_prompt + errored), sorted longest-blocked first, rows "ripen" (border saturates with
 age), never folds; **Rate-limited** pinned with reset countdown + auto-resume toggle;
