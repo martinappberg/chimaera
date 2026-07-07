@@ -33,10 +33,24 @@
     termReference,
     type Link,
     type LinkCtrl,
-  } from "./lib/links";
-  import { reconnectingSockets } from "./lib/ws";
+  } from "./lib/agentLinks";
+  import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
+  import { get } from "svelte/store";
+  import {
+    activeSelection,
+    clearSelection,
+    composeAgentPathReference,
+    composeFileReference,
+    composeShellPathReference,
+    composeTerminalReference,
+    referenceTarget,
+    setReferenceHandler,
+    setSelection,
+    workspaceRelative,
+  } from "./lib/reference";
   import {
     activateTab,
+    adjacentPane,
     allFilePaths,
     closePane,
     cycleTab,
@@ -53,10 +67,12 @@
     moveTabToIndex,
     openFile,
     openSession,
+    paneForTab,
     pruneFiles,
     pruneSessions,
     serializeLayout,
     sessionPaneId,
+    setPaneFont,
     setRatio,
     splitPane,
     tabCount,
@@ -66,6 +82,7 @@
     type SplitDir,
     type Tab,
   } from "./lib/layout";
+  import type { PathKind } from "./lib/links";
   import { basename, fileTabTitles, fsProbe } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
   import {
@@ -77,7 +94,7 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/dnd";
-  import { chordDigit, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
+  import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
@@ -115,6 +132,9 @@
   let autoOpened = false;
   let dropSpot = $state<DropSpot | null>(null);
 
+  /** File-tree reveal request (terminal dir links); nonce distinguishes repeats. */
+  let treeReveal = $state<{ path: string; nonce: number } | null>(null);
+
   // Rail FILES section: collapsible, resizable share of the rail height.
   let filesOpen = $state(true);
   let filesFrac = $state(0.4);
@@ -150,6 +170,55 @@
 
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
+
+  // --- context bridge: reference target resolution ---------------------------
+
+  /** Agent sessions this window focused, most recent first. */
+  let agentMru = $state<string[]>([]);
+  $effect(() => {
+    const sid = focusedSessionId;
+    if (sid === null || sessionsById.get(sid)?.kind !== "agent") return;
+    if (agentMru[0] === sid) return;
+    agentMru = [sid, ...agentMru.filter((x) => x !== sid)].slice(0, 16);
+  });
+
+  /**
+   * Where a reference lands: the focused agent session, else the workspace's
+   * most recently active agent, else its newest live agent. Null (no agent
+   * session at all) renders every reference affordance disabled.
+   */
+  const refTargetSession = $derived.by(() => {
+    const focused = focusedSessionId !== null ? sessionsById.get(focusedSessionId) : undefined;
+    if (
+      focused !== undefined &&
+      focused.kind === "agent" &&
+      focused.alive &&
+      focused.workspace_id === activeWsId
+    ) {
+      return focused;
+    }
+    for (const id of agentMru) {
+      const s = sessionsById.get(id);
+      if (s !== undefined && s.kind === "agent" && s.alive && s.workspace_id === activeWsId) {
+        return s;
+      }
+    }
+    let latest: Session | null = null;
+    for (const s of wsSessions) {
+      if (s.kind === "agent" && s.alive && (latest === null || s.created_at >= latest.created_at)) {
+        latest = s;
+      }
+    }
+    return latest;
+  });
+
+  // Publish the target for the affordances (chips + pane-bar button).
+  $effect(() => {
+    const t = refTargetSession;
+    referenceTarget.set(
+      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t) },
+    );
+  });
 
   // Row name is the server-resolved display name (naming rule zero), with
   // the " · n" suffix only as a duplicate tiebreaker within the workspace.
@@ -223,7 +292,15 @@
   });
 
   onMount(() => {
-    pool.initPool({ onTitle, onExited, onSocketError });
+    pool.initPool({
+      onTitle,
+      onExited,
+      onSocketError,
+      onSelection: onTermSelection,
+      linkContext,
+      onOpenPath,
+    });
+    setReferenceHandler(referenceSelection);
     const events = new EventsSocket({
       onSessions: (list, linkList) => {
         applySessions(list);
@@ -243,10 +320,130 @@
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      setReferenceHandler(null);
       events.close();
       pool.disposePool();
     };
   });
+
+  // --- context bridge: selection -> reference --------------------------------
+
+  /** xterm selection changes (pool callback): publish/clear per session. */
+  function onTermSelection(id: string, text: string): void {
+    if (text.trim().length > 0) {
+      setSelection(`term:${id}`, { kind: "terminal", sessionId: id, text });
+    } else {
+      clearSelection(`term:${id}`);
+    }
+  }
+
+  /**
+   * Type `text` into a session's input: through its pooled socket when the
+   * terminal is warm, else a one-shot socket. The composed text never carries
+   * a newline, so nothing is ever submitted. If the session is open in a
+   * pane, surface it so the typed reference is reviewable at a glance.
+   */
+  function typeIntoSession(id: string, text: string): void {
+    if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    if (loc !== null) {
+      layout = activateTab(layout, loc.paneId, loc.index);
+      pool.focusTerminal(id);
+    }
+  }
+
+  /**
+   * The one reference entry point (chord, floating chips, pane-bar button —
+   * parity principle): compose the active selection and type it into the
+   * target agent's input, never submitting.
+   */
+  function referenceSelection(): void {
+    const sel = get(activeSelection);
+    const target = refTargetSession;
+    if (sel === null || target === null) return;
+    let text: string;
+    if (sel.kind === "file") {
+      const root = workspace?.root;
+      const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
+      text = composeFileReference(rel, sel.startLine, sel.endLine, sel.text);
+    } else {
+      const src = sessionsById.get(sel.sessionId);
+      const name =
+        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
+      text = composeTerminalReference(name, sel.text);
+    }
+    typeIntoSession(target.id, text);
+  }
+
+  /**
+   * Drag-to-reference drop: type the dropped file's path into the pane's
+   * session — claude agents get the native @mention (workspace-relative),
+   * plain terminals get the shell-escaped path relative to their live cwd.
+   */
+  function referenceFileDrop(paneId: string, path: string): void {
+    const p = findPane(layout.root, paneId);
+    if (p === null) return;
+    const active = p.tabs[p.active];
+    if (active === undefined || active.surface !== "terminal") return;
+    const s = sessionsById.get(active.sessionId);
+    if (s === undefined || !s.alive) return;
+    const root = workspace?.root;
+    const text =
+      s.kind === "agent"
+        ? composeAgentPathReference(root !== undefined ? workspaceRelative(path, root) : path)
+        : composeShellPathReference(path, s.cwd_current ?? s.cwd);
+    typeIntoSession(active.sessionId, text);
+  }
+
+  // --- clickable paths: the bridge's return direction ------------------------
+
+  /** Resolution context for a session's terminal link provider. */
+  function linkContext(id: string): { cwd: string | null; root: string | null } {
+    const s = sessionsById.get(id);
+    const root = workspaces.find((w) => w.id === s?.workspace_id)?.root ?? workspace?.root ?? null;
+    return { cwd: s?.cwd_current ?? s?.cwd ?? null, root };
+  }
+
+  /** A confirmed terminal path link was activated. */
+  function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
+    if (kind === "dir") {
+      revealInTree(path);
+      return;
+    }
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    openFileFromPane(loc?.paneId ?? layout.focusedPaneId, path, newSplit);
+  }
+
+  /**
+   * Open a file surfaced FROM a pane (terminal link, touched-files popover):
+   * an already-open tab is focused wherever it lives (no duplicates);
+   * otherwise it lands in the adjacent pane, or a fresh split to the right
+   * when the window has one pane or Cmd/Ctrl forced a new split.
+   */
+  function openFileFromPane(paneId: string, path: string, newSplit: boolean): void {
+    const existing = paneForTab(layout.root, { surface: "file", path });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openFile(focusPane(layout, neighbor), path);
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openFile(layout, path);
+      }
+    }
+    // A file surface took focus: pull DOM focus off the terminal so plain
+    // keys stop reaching a PTY that is no longer the focused view.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Dir links: open the FILES section and reveal the path in the tree. */
+  let revealNonce = 0;
+  function revealInTree(path: string): void {
+    filesOpen = true;
+    treeReveal = { path, nonce: ++revealNonce };
+  }
 
   /** Guards overlapping boots (initial load racing a workspace switch). */
   let bootSeq = 0;
@@ -304,6 +501,22 @@
    *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
+    // Per-pane terminal font size (Cmd/Ctrl +/−/0, spec-pinned chords):
+    // intercepted ONLY while the focused pane shows a terminal, so browser
+    // zoom keeps working everywhere else.
+    if (!pickerOpen && !quickOpenOpen && layoutReady) {
+      const step = fontChord(e);
+      if (step !== null) {
+        const p = findPane(layout.root, layout.focusedPaneId);
+        const active = p?.tabs[p.active];
+        if (p !== null && active !== undefined && active.surface === "terminal") {
+          e.preventDefault();
+          e.stopPropagation();
+          adjustFont(p.id, step);
+          return;
+        }
+      }
+    }
     if (!isAppChord(e)) return;
     const l2 = isLayer2(e);
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -359,6 +572,18 @@
         cycle(1);
         return;
       }
+    }
+
+    // Context bridge: reference the current selection in the target agent.
+    // Spec-pinned chord — ⇧⌘R on macOS, Ctrl+Shift+R elsewhere. Intercepts
+    // only while a selection exists, so the browser's reload chord survives
+    // when there is nothing to reference. Plain Cmd+C is never touched.
+    if (key === "r" && (isMac ? l2 : !l2) && plain) {
+      if (get(activeSelection) !== null) {
+        intercept();
+        referenceSelection();
+      }
+      return;
     }
 
     if (key === "d" && plain) {
@@ -625,6 +850,20 @@
     });
   }
 
+  /**
+   * Step (or reset, delta 0) a pane's terminal font size — the chords and
+   * the pane-bar A−/A+ controls both land here; persisted with the layout.
+   */
+  function adjustFont(paneId: string, delta: 1 | -1 | 0): void {
+    const p = findPane(layout.root, paneId);
+    if (p === null) return;
+    if (delta === 0) {
+      layout = setPaneFont(layout, paneId, undefined);
+      return;
+    }
+    layout = setPaneFont(layout, paneId, (p.fontSize ?? pool.BASE_FONT_SIZE) + delta);
+  }
+
   /** The focused pane's fitted size, for spawning sessions at the right grid. */
   function spawnSize(): { cols: number; rows: number } | null {
     const pane = findPane(layout.root, layout.focusedPaneId);
@@ -734,6 +973,12 @@
     closeView(paneId) {
       closeView(paneId);
     },
+    openFileFrom(paneId, path, newSplit) {
+      openFileFromPane(paneId, path, newSplit);
+    },
+    adjustFont(paneId, delta) {
+      adjustFont(paneId, delta);
+    },
   };
 
   /**
@@ -775,6 +1020,11 @@
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
+          if (spot.kind === "ref") {
+            // Drag-to-reference: type into the session, never open a tab.
+            if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path);
+            return;
+          }
           if (spot.kind === "link") {
             if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
             return;
@@ -795,6 +1045,18 @@
         },
         onClick,
         onEnd: () => (dropSpot = null),
+        // The "@ reference" band exists over panes showing a LIVE session
+        // (dnd only consults this for file drags).
+        acceptsRef: (paneId) => {
+          const p = findPane(layout.root, paneId);
+          if (p === null) return false;
+          const a = p.tabs[p.active];
+          return (
+            a !== undefined &&
+            a.surface === "terminal" &&
+            (sessionsById.get(a.sessionId)?.alive ?? false)
+          );
+        },
       },
       { linkTargets: linkTargetsFor(tab) },
     );
@@ -838,7 +1100,9 @@
     const agentId = agentTab.sessionId;
     void doLink(terminalId, agentId);
     const name = displayNames.get(terminalId) ?? terminalId;
-    pool.sendText(agentId, `${termReference(name)} `);
+    // The context bridge's typing path: pooled socket when warm, one-shot
+    // socket otherwise — the reference lands even in a cold agent pane.
+    typeIntoSession(agentId, `${termReference(name)} `);
     revealSession(terminalId, agentPaneId);
     pool.focusTerminal(agentId);
   }
@@ -1088,6 +1352,7 @@
                 onOpen={openFilePath}
                 onDragStart={onTreeEntryDown}
                 activePath={focusedFilePath}
+                reveal={treeReveal}
               />
             </div>
           {/if}
@@ -1124,6 +1389,7 @@
             fileNames={fileTitles}
             links={linksByTerminal}
             {linkCtrl}
+            wsRoot={workspace?.root ?? null}
             {ctrl}
           />
         {:else}
@@ -1136,6 +1402,7 @@
             fileNames={fileTitles}
             links={linksByTerminal}
             {linkCtrl}
+            wsRoot={workspace?.root ?? null}
             {ctrl}
           />
         {/if}

@@ -14,11 +14,37 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
+import { registerPathLinks, type LinkContext, type PathKind } from "./links";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
-const FONT_SIZE = 13;
+/**
+ * Default terminal font size. Readability pass 2026-07-06: 13 was measurably
+ * small for dense TUI output; 13.5 won the screenshot comparison against 14.
+ * At 1x displays both land in the same 8px cell (xterm rounds the advance),
+ * but 14's true advance is 8.4px — glyphs get cramped — while 13.5's 8.11px
+ * fits cleanly; it also keeps ~4% more columns. JetBrains Mono's tall
+ * x-height reads crisply at 13.5 on both 1x and 2x.
+ */
+export const BASE_FONT_SIZE = 13.5;
+/**
+ * Readability pass: xterm multiplies the face's NATURAL line box (~1.32 ×
+ * font size for JetBrains Mono), so 1.25 ≈ 1.65 × font size — already
+ * generous. 1.35 was screenshot-compared and rejected: it double-spaces
+ * dense shell output and costs 2–3 rows per pane while claude's own
+ * blank-line rhythm provides the paragraph separation.
+ */
 const LINE_HEIGHT = 1.25;
+/**
+ * Contrast floor (WCAG ratio) xterm enforces by nudging foreground colors.
+ * The 16-color palette below is hand-tuned to >=4.5:1 for text roles, but
+ * claude (like most TUIs) also emits 256-color grays and dim text the theme
+ * cannot retint — measured at 1.6–3.0:1 on our backgrounds. 3.0 lifts only
+ * those illegible cases and leaves intended colors otherwise untouched;
+ * 4.5 was evaluated and rejected (it visibly recolors TUI secondary text,
+ * flattening claude's visual hierarchy).
+ */
+const MIN_CONTRAST = 3.0;
 /** Horizontal/vertical padding on .xterm (see app.css) — fit subtracts it. */
 const PAD_X = 22;
 const PAD_Y = 24;
@@ -35,6 +61,18 @@ export interface PoolHandlers {
    * how to surface them.
    */
   onSocketError(id: string, message: string): void;
+  /**
+   * The terminal's selection changed (context bridge). `text` is the raw
+   * selection, empty when the selection was cleared.
+   */
+  onSelection(id: string, text: string): void;
+  /** Resolution context for the session's path link provider. */
+  linkContext(id: string): LinkContext;
+  /**
+   * A confirmed path link was clicked: open the file in an adjacent pane
+   * (`newSplit` = Cmd/Ctrl held), or reveal a dir in the file tree.
+   */
+  onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void;
 }
 
 interface PoolEntry {
@@ -47,6 +85,8 @@ interface PoolEntry {
   lastUsed: number;
   fitTimer: ReturnType<typeof setTimeout> | null;
   pendingFit: boolean;
+  /** Dispose the path link provider + its viewport prefetch. */
+  disposeLinks: () => void;
 }
 
 // Plain non-reactive module state: xterm instances must never be $state.
@@ -66,48 +106,55 @@ let schemeMq: MediaQueryList | null = null;
 const fontsReady: Promise<void> =
   typeof document !== "undefined" && "fonts" in document
     ? Promise.allSettled([
-        document.fonts.load(`400 ${FONT_SIZE}px "JetBrains Mono"`),
-        document.fonts.load(`600 ${FONT_SIZE}px "JetBrains Mono"`),
+        document.fonts.load(`400 ${BASE_FONT_SIZE}px "JetBrains Mono"`),
+        document.fonts.load(`600 ${BASE_FONT_SIZE}px "JetBrains Mono"`),
       ]).then(() => undefined)
     : Promise.resolve();
 
 // Muted ANSI palettes tuned to the app's neutrals; xterm's defaults are
 // the single loudest "unstyled demo" signal in a terminal app.
+//
+// Readability pass 2026-07-06 (measured WCAG ratios against both --term-bg
+// values): every color a TUI uses AS TEXT holds >= 4.5:1 (normal) or >= 3.5:1
+// (bright variants, light scheme); dark brightBlack — claude's secondary text
+// — was the worst offender at 3.03 and now sits at 4.65. `black` (dark) and
+// `white`/`brightWhite` (light) stay near their backgrounds by ANSI semantics;
+// the MIN_CONTRAST floor catches any TUI that types with them.
 const LIGHT_ANSI = {
   black: "#3b3b41",
-  red: "#bf4d56",
-  green: "#2f8a57",
-  yellow: "#9a7b2f",
-  blue: "#3e6fc0",
-  magenta: "#95569f",
-  cyan: "#2f8a9b",
+  red: "#bf4d56", // 4.76 on #fff
+  green: "#2d8453", // 4.63 (was #2f8a57, 4.29)
+  yellow: "#8c702b", // 4.70 (was #9a7b2f, 4.00)
+  blue: "#3e6fc0", // 4.95
+  magenta: "#95569f", // 5.11
+  cyan: "#2b7e8d", // 4.70 (was #2f8a9b, 4.02)
   white: "#b9b9c0",
-  brightBlack: "#73737d",
-  brightRed: "#d4707a",
-  brightGreen: "#43a56f",
-  brightYellow: "#b5964a",
-  brightBlue: "#5f8cd6",
-  brightMagenta: "#ad74b8",
-  brightCyan: "#4aa5b5",
+  brightBlack: "#73737d", // 4.69
+  brightRed: "#d26873", // 3.52 (was 3.28)
+  brightGreen: "#3e9866", // 3.57 (was 3.07)
+  brightYellow: "#a18542", // 3.53 (was 2.83)
+  brightBlue: "#5b89d5", // 3.51 (was 3.38)
+  brightMagenta: "#ad74b8", // 3.52
+  brightCyan: "#4293a1", // 3.55 (was 2.86)
   brightWhite: "#d9d9df",
 };
 const DARK_ANSI = {
   black: "#33333a",
-  red: "#e2757e",
-  green: "#5cc48d",
-  yellow: "#d9b96c",
-  blue: "#79a5ea",
-  magenta: "#c795d3",
-  cyan: "#6cc3d4",
-  white: "#c9c9d1",
-  brightBlack: "#5f5f6a",
-  brightRed: "#ef959c",
-  brightGreen: "#7fd6a8",
-  brightYellow: "#e7cd8b",
-  brightBlue: "#9cbbf1",
-  brightMagenta: "#d8afe2",
-  brightCyan: "#8fd6e4",
-  brightWhite: "#ededf3",
+  red: "#e2757e", // 6.45 on #0f0f13
+  green: "#5cc48d", // 8.87
+  yellow: "#d9b96c", // 10.11
+  blue: "#79a5ea", // 7.63
+  magenta: "#c795d3", // 7.89
+  cyan: "#6cc3d4", // 9.47
+  white: "#c9c9d1", // 11.62
+  brightBlack: "#7c7c8a", // 4.65 (was #5f5f6a, 3.03 — claude's secondary text)
+  brightRed: "#ef959c", // 8.61
+  brightGreen: "#7fd6a8", // 11.01
+  brightYellow: "#e7cd8b", // 12.30
+  brightBlue: "#9cbbf1", // 9.83
+  brightMagenta: "#d8afe2", // 10.15
+  brightCyan: "#8fd6e4", // 11.75
+  brightWhite: "#ededf3", // 16.40
 };
 
 function themeFromTokens() {
@@ -163,7 +210,7 @@ function scheduleFit(entry: PoolEntry): void {
   }, REFIT_DEBOUNCE_MS);
 }
 
-function createEntry(id: string, parent: HTMLElement): PoolEntry {
+function createEntry(id: string, parent: HTMLElement, fontSize: number): PoolEntry {
   const el = document.createElement("div");
   el.className = "term-slot";
   // The element must be visible and laid out BEFORE term.open(): opening in
@@ -174,13 +221,14 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
 
   const term = new Terminal({
     fontFamily: FONT_FAMILY,
-    fontSize: FONT_SIZE,
+    fontSize,
     lineHeight: LINE_HEIGHT,
     fontWeight: "400",
     fontWeightBold: "600",
     cursorBlink: false,
     cursorStyle: "block",
     drawBoldTextInBrightColors: false,
+    minimumContrastRatio: MIN_CONTRAST,
     scrollback: 5000,
     theme: themeFromTokens(),
   });
@@ -209,6 +257,11 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
     lastUsed: ++clock,
     fitTimer: null,
     pendingFit: false,
+    // Clickable paths work in EVERY session — agents and shells alike.
+    disposeLinks: registerPathLinks(term, id, {
+      context: (sid) => handlers?.linkContext(sid) ?? { cwd: null, root: null },
+      open: (sid, path, kind, newSplit) => handlers?.onOpenPath(sid, path, kind, newSplit),
+    }),
   };
   fitEntry(entry);
 
@@ -234,6 +287,7 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
 
   term.onData((data) => entry.socket.sendInput(data));
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
+  term.onSelectionChange(() => handlers?.onSelection(id, term.getSelection()));
 
   entry.ro = new ResizeObserver(() => scheduleFit(entry));
   entry.ro.observe(el);
@@ -245,6 +299,7 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
 function disposeEntry(entry: PoolEntry): void {
   pool.delete(entry.id);
   if (entry.fitTimer !== null) clearTimeout(entry.fitTimer);
+  entry.disposeLinks();
   entry.socket.close();
   entry.ro.disconnect();
   entry.term.dispose();
@@ -265,13 +320,21 @@ function evictLru(): void {
   }
 }
 
-function attach(id: string, host: HTMLElement): void {
+function attach(id: string, host: HTMLElement, fontSize: number): void {
   ensureStash();
   let entry = pool.get(id);
   if (entry === undefined) {
-    entry = createEntry(id, host);
-  } else if (entry.el.parentElement !== host) {
-    host.appendChild(entry.el);
+    entry = createEntry(id, host, fontSize);
+  } else {
+    if (entry.el.parentElement !== host) {
+      host.appendChild(entry.el);
+    }
+    // The destination pane's font size wins (per-pane override); changing
+    // it re-measures the glyph atlas, so refit to the new grid.
+    if (entry.term.options.fontSize !== fontSize) {
+      entry.term.options.fontSize = fontSize;
+      fitEntry(entry);
+    }
   }
   entry.lastUsed = ++clock;
   evictLru();
@@ -313,13 +376,17 @@ export function disposePool(): void {
   stash = null;
 }
 
-/** Show `id`'s terminal inside `host` (a pane's content container). */
-export function show(id: string, host: HTMLElement): void {
+/**
+ * Show `id`'s terminal inside `host` (a pane's content container) at the
+ * pane's font size (undefined = the default). Also the path for live font
+ * changes: re-invoked with a new size while attached, it just re-measures.
+ */
+export function show(id: string, host: HTMLElement, fontSize?: number): void {
   assignments.set(host, id);
   void fontsReady.then(() => {
     // The pane may have moved on (tab switch, unmount) while fonts loaded.
     if (assignments.get(host) !== id || handlers === null) return;
-    attach(id, host);
+    attach(id, host, fontSize ?? BASE_FONT_SIZE);
   });
 }
 
@@ -332,15 +399,6 @@ export function release(id: string, host: HTMLElement): void {
   }
 }
 
-/**
- * Type text into a session's PTY (the drop-to-link gesture writes the
- * `@term:` reference into the agent's composer — never submits). No-op when
- * the session has no pooled terminal yet.
- */
-export function sendText(id: string, text: string): void {
-  pool.get(id)?.socket.sendInput(text);
-}
-
 /** Focus the session's terminal, deferring until it is attached if needed. */
 export function focusTerminal(id: string): void {
   const entry = pool.get(id);
@@ -349,6 +407,19 @@ export function focusTerminal(id: string): void {
   } else {
     pendingFocusId = id;
   }
+}
+
+/**
+ * Type `text` into the session's live socket (context bridge references).
+ * Returns false when the session has no pooled entry or its socket is down —
+ * the caller falls back to a one-shot socket. Callers guarantee `text`
+ * carries no newline (never submits).
+ */
+export function sendText(id: string, text: string): boolean {
+  const entry = pool.get(id);
+  if (entry === undefined || !entry.socket.isOpen) return false;
+  entry.socket.sendInput(text);
+  return true;
 }
 
 /** Divider-drag coordination: suppress refits mid-drag, flush at drag end. */
@@ -387,16 +458,16 @@ function cellDims(): { w: number; h: number } {
   if (cellCache !== null) return cellCache;
   const probe = document.createElement("span");
   probe.textContent = "W";
-  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${FONT_SIZE}px ${FONT_FAMILY};line-height:${LINE_HEIGHT};`;
+  probe.style.cssText = `position:absolute;visibility:hidden;white-space:pre;font:400 ${BASE_FONT_SIZE}px ${FONT_FAMILY};line-height:${LINE_HEIGHT};`;
   document.body.appendChild(probe);
   const rect = probe.getBoundingClientRect();
   probe.remove();
   const dims = {
-    w: rect.width > 1 ? rect.width : FONT_SIZE * 0.6,
-    h: rect.height > 1 ? rect.height : Math.round(FONT_SIZE * LINE_HEIGHT),
+    w: rect.width > 1 ? rect.width : BASE_FONT_SIZE * 0.6,
+    h: rect.height > 1 ? rect.height : Math.round(BASE_FONT_SIZE * LINE_HEIGHT),
   };
   // Only cache once the bundled font has had a chance to load.
-  if (document.fonts.check(`400 ${FONT_SIZE}px "JetBrains Mono"`)) cellCache = dims;
+  if (document.fonts.check(`400 ${BASE_FONT_SIZE}px "JetBrains Mono"`)) cellCache = dims;
   return dims;
 }
 

@@ -14,10 +14,12 @@
   import type { Session } from "./sessions";
   import { dotState, dotTitle } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
-  import { agentHue, type LinkCtrl } from "./links";
-  import { basename } from "./files";
+  import { agentHue, type LinkCtrl } from "./agentLinks";
+  import { basename, midTruncate } from "./files";
   import { dirtyFiles } from "./editing";
   import { KEYS } from "./keys";
+  import { activeSelection, referenceTarget, requestReference } from "./reference";
+  import { workspaceRelative } from "./reference";
   import FileIcon from "./FileIcon.svelte";
 
   interface Props {
@@ -31,6 +33,8 @@
     /** terminal session id -> agent session id (the linked-terminal edges). */
     links: Map<string, string>;
     linkCtrl: LinkCtrl;
+    /** Active workspace root (touched-files paths relativize against it). */
+    wsRoot: string | null;
     dropSpot: DropSpot | null;
     ctrl: LayoutCtrl;
     /** Bound by Pane so the dnd hit-tester can target this bar. */
@@ -45,6 +49,7 @@
     fileNames,
     links,
     linkCtrl,
+    wsRoot,
     dropSpot,
     ctrl,
     el = $bindable(null),
@@ -154,11 +159,83 @@
     dropSpot?.kind === "tab" && dropSpot.paneId === node.id ? dropSpot.index : null,
   );
 
+  /**
+   * Context bridge: true when this pane's ACTIVE tab is the terminal that
+   * owns the current selection — the bar grows a quiet "reference" action
+   * (the terminal itself has no floating overlay; the bar is its affordance).
+   */
+  const hasTermSelection = $derived.by(() => {
+    const sel = $activeSelection;
+    const active = node.tabs[node.active];
+    return (
+      sel !== null &&
+      sel.kind === "terminal" &&
+      active !== undefined &&
+      active.surface === "terminal" &&
+      active.sessionId === sel.sessionId
+    );
+  });
+
   function label(tab: Tab): string {
     if (tab.surface === "terminal") {
       return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
     }
     return fileNames.get(tab.path) ?? basename(tab.path);
+  }
+
+  /** The pane's active tab, when it is a terminal (font controls target). */
+  const activeTerminal = $derived.by(() => {
+    const t = node.tabs[node.active];
+    return t !== undefined && t.surface === "terminal" ? t : null;
+  });
+
+  /**
+   * Touched-files chip: agent panes get a quiet "N files" chip once the
+   * session's hook-derived files_touched list is non-empty; newest last on
+   * the wire, newest FIRST in the popover.
+   */
+  const touched = $derived.by(() => {
+    if (activeTerminal === null) return null;
+    const s = sessions.get(activeTerminal.sessionId);
+    if (s === undefined || s.kind !== "agent") return null;
+    const files = s.files_touched;
+    return files != null && files.length > 0 ? files : null;
+  });
+
+  let touchedOpen = $state(false);
+  let touchedEl = $state<HTMLElement | null>(null);
+
+  // The popover closes on any outside press or Escape (overlay language).
+  $effect(() => {
+    if (!touchedOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (touchedEl !== null && e.target instanceof Node && !touchedEl.contains(e.target)) {
+        touchedOpen = false;
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        touchedOpen = false;
+      }
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  });
+
+  /** Popover label: workspace-relative, middle-ellipsized (paths rule). */
+  function touchedLabel(path: string): string {
+    return midTruncate(wsRoot !== null ? workspaceRelative(path, wsRoot) : path, 44);
+  }
+
+  function openTouched(e: MouseEvent, path: string): void {
+    touchedOpen = false;
+    ctrl.openFileFrom(node.id, path, e.metaKey || e.ctrlKey);
   }
 
   /** Empty bar area drags the pane's ACTIVE tab (capture runs before the
@@ -272,6 +349,53 @@
        chord (tooltips teach the chords). Faded in on bar hover; the zoom
        badge stays persistent while zoomed. -->
   <div class="bar-right" bind:this={barRightEl}>
+    {#if hasTermSelection}
+      <!-- Selection-driven, not hover-driven: visible exactly while the
+           terminal holds a selection. Same handler as the chord. -->
+      <button
+        class="ref-btn"
+        disabled={$referenceTarget === null}
+        title={$referenceTarget === null
+          ? "no agent session in this workspace — start one to reference"
+          : `reference selection in ${$referenceTarget.name} (${KEYS.reference})`}
+        onclick={(e) => {
+          e.stopPropagation();
+          requestReference();
+        }}
+      >
+        <span class="ref-at" aria-hidden="true">@</span>
+        reference
+      </button>
+    {/if}
+    {#if touched !== null}
+      <!-- Hook-derived "files touched": quiet chip, popover on click. Not
+           hover-gated — it is information, not chrome. -->
+      <div class="touched" bind:this={touchedEl}>
+        <button
+          class="touched-chip"
+          class:open={touchedOpen}
+          title="files this agent touched"
+          aria-haspopup="menu"
+          aria-expanded={touchedOpen}
+          onclick={(e) => {
+            e.stopPropagation();
+            touchedOpen = !touchedOpen;
+          }}
+        >
+          {touched.length} file{touched.length === 1 ? "" : "s"}
+        </button>
+        {#if touchedOpen}
+          <div class="touched-pop" role="menu" aria-label="files touched">
+            {#each [...touched].reverse() as p (p)}
+              <button class="touched-row" role="menuitem" title={p} onclick={(e) => openTouched(e, p)}>
+                <span class="touched-glyph"><FileIcon path={p} size={13} /></span>
+                <span class="touched-name">{touchedLabel(p)}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
     {#if zoomed}
       <button class="zoom-badge" title="exit zoom ({KEYS.zoom})" onclick={() => ctrl.zoomPane(node.id)}
         >zoom</button
@@ -297,6 +421,21 @@
             />
           </svg>
         </button>
+      {/if}
+      {#if activeTerminal !== null}
+        <!-- Parity with the Cmd/Ctrl +/−/0 chords: per-pane text size. -->
+        <button
+          class="ctl ctl-font"
+          title="smaller text ({KEYS.fontMinus})"
+          aria-label="smaller text"
+          onclick={() => ctrl.adjustFont(node.id, -1)}>A−</button
+        >
+        <button
+          class="ctl ctl-font"
+          title="larger text ({KEYS.fontPlus}) · reset {KEYS.fontReset}"
+          aria-label="larger text"
+          onclick={() => ctrl.adjustFont(node.id, 1)}>A+</button
+        >
       {/if}
       <button
         class="ctl"
@@ -761,6 +900,158 @@
   .ctl.on {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  /* Context bridge: quiet selection-driven action in the bar (no hover
+     gating — it appears exactly while the terminal holds a selection). */
+  .ref-btn {
+    appearance: none;
+    border: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    background: color-mix(in srgb, var(--fg) 7%, transparent);
+    padding: 0 7px;
+    height: 18px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .ref-btn:hover:enabled {
+    background: color-mix(in srgb, var(--fg) 12%, transparent);
+    color: var(--fg);
+  }
+
+  .ref-btn:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  .ref-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  .ref-at {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .ref-btn:disabled .ref-at {
+    color: var(--muted);
+  }
+
+  /* --- touched-files chip + popover (overlay visual language) --- */
+
+  .touched {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .touched-chip {
+    appearance: none;
+    border: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    background: color-mix(in srgb, var(--fg) 7%, transparent);
+    padding: 0 7px;
+    height: 18px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .touched-chip:hover,
+  .touched-chip.open {
+    background: color-mix(in srgb, var(--fg) 12%, transparent);
+    color: var(--fg);
+  }
+
+  .touched-pop {
+    position: absolute;
+    top: 22px;
+    right: 0;
+    z-index: 40;
+    min-width: 180px;
+    max-width: 340px;
+    max-height: 280px;
+    overflow-y: auto;
+    padding: 4px;
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.2);
+    animation: touchedfade 0.1s ease-out;
+  }
+
+  @keyframes touchedfade {
+    from {
+      opacity: 0;
+      transform: translateY(-2px);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .touched-pop {
+      animation: none;
+    }
+  }
+
+  .touched-row {
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 4px 7px;
+    border-radius: 5px;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--fg);
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+  }
+
+  .touched-row:hover {
+    background: var(--row-hover);
+  }
+
+  .touched-glyph {
+    flex: none;
+    display: flex;
+    align-items: center;
+  }
+
+  .touched-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  /* Per-pane text size (parity with the chords); text glyphs, same cluster. */
+  .ctl-font {
+    font-size: 10px;
+    font-family: var(--mono);
+    letter-spacing: -0.02em;
+    width: 24px;
   }
 
   /* Persistent while zoomed — the always-visible mouse exit from zoom. */

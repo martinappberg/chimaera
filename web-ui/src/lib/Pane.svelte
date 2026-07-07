@@ -3,7 +3,7 @@
   import type { Session } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane } from "./dnd";
-  import { agentHue, type LinkCtrl } from "./links";
+  import { agentHue, type LinkCtrl } from "./agentLinks";
   import { KEYS, MOD_LABEL } from "./keys";
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
@@ -21,6 +21,8 @@
     /** terminal session id -> agent session id (linked-terminal edges). */
     links: Map<string, string>;
     linkCtrl: LinkCtrl;
+    /** Active workspace root (touched-files paths relativize against it). */
+    wsRoot: string | null;
     ctrl: LayoutCtrl;
   }
 
@@ -34,6 +36,7 @@
     fileNames,
     links,
     linkCtrl,
+    wsRoot,
     ctrl,
   }: Props = $props();
 
@@ -43,6 +46,8 @@
   const zone = $derived(
     dropSpot?.kind === "zone" && dropSpot.paneId === node.id ? dropSpot.zone : null,
   );
+  /** Context bridge: the "@ reference" band hovers over this pane's bottom. */
+  const refBand = $derived(dropSpot?.kind === "ref" && dropSpot.paneId === node.id);
   /** The "link to agent" band preview (dragging a terminal over this agent). */
   const linkBand = $derived(dropSpot?.kind === "link" && dropSpot.paneId === node.id);
 
@@ -95,6 +100,7 @@
     {fileNames}
     {links}
     {linkCtrl}
+    {wsRoot}
     {dropSpot}
     {ctrl}
     bind:el={tabbarEl}
@@ -102,7 +108,7 @@
   <div class="content" bind:this={contentEl}>
     {#if activeTab !== null}
       {#if activeTab.surface === "terminal"}
-        <TerminalView sessionId={activeTab.sessionId} {focused} />
+        <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else}
         <FileView path={activeTab.path} />
       {/if}
@@ -130,6 +136,14 @@
          @term: reference into the composer (never submits). -->
     <div class="drop drop-link">
       <span class="drop-link-label">link to this agent</span>
+    </div>
+  {/if}
+
+  {#if refBand}
+    <!-- Drag-to-reference: types the path into this session's input, never
+         opens a tab, never submits. Visibly distinct from the adopt zone. -->
+    <div class="drop-ref">
+      <span class="drop-ref-label"><span class="drop-ref-at">@</span> reference</span>
     </div>
   {/if}
 </section>
@@ -229,6 +243,38 @@
 
   .drop-center {
     inset: 0;
+  }
+
+  /* Drag-to-reference band over the input area (~22%, matching the dnd
+     hit-test): dashed + labeled so it can't be mistaken for adopt-as-tab. */
+  .drop-ref {
+    position: absolute;
+    z-index: 7;
+    inset: 78% 0 0 0;
+    margin: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border: 1px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 7px;
+    pointer-events: none;
+  }
+
+  .drop-ref-label {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    color: var(--fg);
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border-radius: 4px;
+    padding: 2px 8px;
+    user-select: none;
+  }
+
+  .drop-ref-at {
+    color: var(--accent);
+    font-weight: 600;
   }
   .drop-left {
     inset: 0 50% 0 0;

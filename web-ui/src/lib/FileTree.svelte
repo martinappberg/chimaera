@@ -5,7 +5,7 @@
    * the dir is re-expanded. The tree renders flat rows (indent by depth) —
    * no recursive components, trivial scrolling.
    */
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { fsList, type FsEntry } from "./files";
   import FileIcon from "./FileIcon.svelte";
 
@@ -19,9 +19,14 @@
     onDragStart(e: PointerEvent, path: string): void;
     /** The focused pane's active file, for the subtle current marker. */
     activePath: string | null;
+    /**
+     * Reveal request (terminal dir links): expand the ancestor chain of
+     * `path` and scroll it into view. The nonce distinguishes repeats.
+     */
+    reveal?: { path: string; nonce: number } | null;
   }
 
-  let { root, onOpen, onDragStart, activePath }: Props = $props();
+  let { root, onOpen, onDragStart, activePath, reveal = null }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
   let listings = $state<Map<string, FsEntry[]>>(new Map());
@@ -146,6 +151,62 @@
     }
   }
 
+  /** Row briefly highlighted after a reveal (fades on its own). */
+  let flashPath = $state<string | null>(null);
+  let treeEl = $state<HTMLElement | null>(null);
+
+  // Reveal requests (terminal dir links, touched files): expand the ancestor
+  // chain, refresh its listings (the target may be brand new), scroll the
+  // row into view, and flash it.
+  $effect(() => {
+    const req = reveal;
+    if (req == null) return;
+    untrack(() => void doReveal(req.path));
+  });
+
+  async function doReveal(path: string): Promise<void> {
+    const r = root.endsWith("/") && root.length > 1 ? root.slice(0, -1) : root;
+    if (path !== r && !path.startsWith(`${r}/`)) return;
+    closeFilter();
+    const rel = path === r ? "" : path.slice(r.length + 1);
+    const parts = rel === "" ? [] : rel.split("/");
+    // Expand every ancestor; the target itself expands too when it is a dir
+    // (its row exists either way — the parent listing decides its kind).
+    const chain: string[] = [];
+    let cur = r;
+    for (const part of parts) {
+      cur = `${cur}/${part}`;
+      chain.push(cur);
+    }
+    for (const d of [r, ...chain.slice(0, -1)]) {
+      await load(d); // fresh listings — the path may have just been created
+    }
+    const target = chain.at(-1) ?? r;
+    const isDir = listings.get(parentOf(target))?.some((e) => e.path === target && e.kind === "dir");
+    const next = new Set(expanded);
+    for (const d of chain.slice(0, -1)) next.add(d);
+    if (isDir === true) {
+      next.add(target);
+      expanded = next;
+      await load(target);
+    } else {
+      expanded = next;
+    }
+    flashPath = path;
+    await tick();
+    treeEl
+      ?.querySelector(`[data-path="${CSS.escape(path)}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+    setTimeout(() => {
+      if (flashPath === path) flashPath = null;
+    }, 1200);
+  }
+
+  function parentOf(path: string): string {
+    const i = path.lastIndexOf("/");
+    return i > 0 ? path.slice(0, i) : "/";
+  }
+
   function toggle(dir: string): void {
     const next = new Set(expanded);
     if (next.has(dir)) {
@@ -198,6 +259,7 @@
     class="tree"
     role="tree"
     tabindex="-1"
+    bind:this={treeEl}
     onkeydown={onTreeKeydown}
   >
   {#if rootError !== null}
@@ -211,11 +273,13 @@
     <div
       class="node"
       class:active={entry.path === activePath}
+      class:flash={entry.path === flashPath}
       role="treeitem"
       aria-expanded={entry.kind === "dir" ? expanded.has(entry.path) : undefined}
       aria-selected={entry.path === activePath}
       tabindex="0"
       title={entry.path}
+      data-path={entry.path}
       style:padding-left={`${8 + depth * 13}px`}
       onclick={() => {
         // Files open via the drag's sub-threshold click path (below), so a
@@ -372,6 +436,12 @@
 
   .node.active {
     background: var(--row-active);
+  }
+
+  /* Reveal flash (terminal dir links): a brief accent wash that fades. */
+  .node.flash {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    transition: background-color 0.9s ease;
   }
 
   .chev {

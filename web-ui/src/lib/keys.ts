@@ -44,7 +44,37 @@ export const KEYS = {
   focusMode: chord("B", "B"),
   focusArrows: isMac ? "⌥⌘←↑↓→" : "Ctrl+Shift+Alt+←↑↓→",
   cycleTabs: isMac ? "⌥⌘[ ]" : "Ctrl+Shift+Alt+[ ]",
+  /** Context bridge: Cmd+Shift+R / Ctrl+Shift+R (spec-pinned, not layered). */
+  reference: isMac ? "⇧⌘R" : "Ctrl+Shift+R",
+  /** Per-pane terminal font size (spec-pinned: Cmd/Ctrl +/−/0). */
+  fontPlus: isMac ? "⌘+" : "Ctrl++",
+  fontMinus: isMac ? "⌘−" : "Ctrl+-",
+  fontReset: isMac ? "⌘0" : "Ctrl+0",
 } as const;
+
+/**
+ * Font-size chord action for `e`, when it is one: Cmd on macOS / Ctrl
+ * elsewhere with +/−/0 (spec-pinned — these shadow browser zoom, so callers
+ * must intercept them ONLY while a terminal pane is focused; everywhere else
+ * browser zoom keeps working). "+1"/-"1" = step, 0 = reset.
+ */
+export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
+  const mod = isMac ? e.metaKey && !e.ctrlKey && !e.altKey : e.ctrlKey && !e.metaKey && !e.altKey;
+  if (!mod) return null;
+  switch (e.code) {
+    case "Equal": // + is Shift+Equal on most layouts; both step up
+    case "NumpadAdd":
+      return 1;
+    case "Minus":
+    case "NumpadSubtract":
+      return -1;
+    case "Digit0":
+    case "Numpad0":
+      return 0;
+    default:
+      return null;
+  }
+}
 
 /**
  * True when `e` carries the app's base modifier for this platform. Bare

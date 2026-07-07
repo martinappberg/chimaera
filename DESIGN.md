@@ -554,6 +554,44 @@ looking at (path, line range), so agents get surgical context instead of pasted 
 Plain Cmd+C stays untouched (never spooky). Wave 2 of this: selections in *terminal* panes
 reference the session's scrollback.
 
+**Clickable paths — the bridge's return direction (author, 2026-07-06):** agents produce
+files; opening them should be one click, both ways of detecting them:
+
+- **Terminal link detection**: an xterm.js link provider scans rendered lines for path-like
+  strings (workspace-relative and absolute), validates candidates against the file service
+  (only real files underline), and click opens the file as a tab in an adjacent pane
+  (Cmd+click = new split). Works in every terminal — agent output, `ls`, pipeline logs —
+  exactly the iTerm/VS Code affordance, but wired to our preview surfaces.
+- **Hook-derived "files touched"**: the daemon already receives PostToolUse hook payloads
+  from claude sessions — Write/Edit tool events carry the file path. Track a per-agent-session
+  touched-files list server-side and surface it as a quiet chip row ("3 files") in the
+  session's pane bar → click a file, it opens. Structured, reliable, and zero parsing of
+  terminal text — no injectable skill needed, the hooks we already inject ARE the mechanism.
+
+(The raw-terminal vs own-UI toggle the author floated as a fallback is already the plan for
+Tier B — the structured chat mode from the roadmap — with the toggle living in the pane bar;
+references and clickable paths must work in both views.)
+
+**Viewer UX pass (author, 2026-07-06 — queued):** a focused audit-and-polish of the
+inspection surfaces against real scientific files, since viewer *feel* is the moat's finish:
+
+- **Images/figures**: wheel-zoom anchored at the cursor, drag-to-pan, fit / 100% / percentage
+  indicator, double-click toggles fit↔100%, crisp SVG at any zoom, pixel-grid rendering past
+  ~800% (plot inspection), subtle checkerboard under transparency.
+- **Tables (CSV/TSV/Parquet-to-come)**: column resize + auto-fit, sticky header behavior at
+  horizontal scroll, cell/row selection with plain-text copy, monospace numeric alignment,
+  page-boundary feel (no jumps), row-count/position always visible.
+- **PDF**: zoom smoothness, page-position memory per tab, text selection.
+- Verified against real artifacts (MultiQC HTML, matplotlib/ggplot PNGs+SVGs, wide VCF-like
+  tables), screenshots both schemes.
+
+**Terminal readability pass (author, 2026-07-06 — queued):** current agent/terminal sessions
+are "quite hard to read." Audit and tune: ANSI palette contrast against both scheme
+backgrounds (claude's dim text especially), default font size (evaluate 13.5–14px),
+line-height, per-pane font-size chords (Cmd+plus/minus with persistence), and how claude's
+heavy box-drawing UI renders in JetBrains Mono. Treat as a focused mini-audit with
+screenshots against real claude sessions, not a blind retheme.
+
 **Drag-to-reference (same feature, drop-based):** dragging a file (tree entry or file tab)
 over a *session* pane adds one zone to the drag grammar — a labeled band over the input area
 at the pane's bottom: **"@ reference"**. Dropping there types into the session instead of

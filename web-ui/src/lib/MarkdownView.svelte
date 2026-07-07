@@ -8,7 +8,9 @@
    * cap; larger markdown stays preview-only.
    */
   import { fsMarkdown, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { clearSelection, setSelection } from "./reference";
   import CodeView from "./CodeView.svelte";
+  import ReferenceChip from "./ReferenceChip.svelte";
 
   interface Props {
     path: string;
@@ -53,6 +55,60 @@
     };
   });
 
+  // --- context bridge: selection in the RENDERED preview ---------------------
+  // No line mapping exists for rendered markdown, so the reference carries
+  // the path + quoted excerpt only (the edit side goes through CodeView,
+  // which has real line numbers).
+  const selOwner = {};
+  let contentEl = $state<HTMLDivElement | null>(null);
+  let chipPos = $state<{ x: number; y: number } | null>(null);
+
+  function syncPreviewSelection(): void {
+    const content = contentEl;
+    const s = document.getSelection();
+    if (content === null || s === null || s.rangeCount === 0 || s.isCollapsed) {
+      chipPos = null;
+      clearSelection(selOwner);
+      return;
+    }
+    const range = s.getRangeAt(0);
+    if (!content.contains(range.commonAncestorContainer)) {
+      // A selection elsewhere in the app: drop only what this view owns.
+      chipPos = null;
+      clearSelection(selOwner);
+      return;
+    }
+    const text = s.toString();
+    if (text.trim().length === 0) {
+      chipPos = null;
+      clearSelection(selOwner);
+      return;
+    }
+    setSelection(selOwner, { kind: "file", path, startLine: null, endLine: null, text });
+    const rects = range.getClientRects();
+    const last = rects.length > 0 ? rects[rects.length - 1] : range.getBoundingClientRect();
+    const rect = content.getBoundingClientRect();
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    chipPos = {
+      x: clamp(last.right - rect.left + 4, 4, rect.width - 170),
+      y: clamp(last.bottom - rect.top + 6, 4, rect.height - 58),
+    };
+  }
+
+  $effect(() => {
+    if (mode !== "preview") {
+      chipPos = null;
+      clearSelection(selOwner);
+      return;
+    }
+    document.addEventListener("selectionchange", syncPreviewSelection);
+    return () => {
+      document.removeEventListener("selectionchange", syncPreviewSelection);
+      chipPos = null;
+      clearSelection(selOwner);
+    };
+  });
+
   async function enterEdit(): Promise<void> {
     // Fetch the raw source once; CodeView handles the rest (incl. background
     // fill for under-cap truncated files and the save/dirty/conflict flow).
@@ -94,11 +150,14 @@
     {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
   </div>
 
-  <div class="md-content">
+  <div class="md-content" bind:this={contentEl}>
+    {#if mode !== "edit" && chipPos !== null}
+      <ReferenceChip x={chipPos.x} y={chipPos.y} />
+    {/if}
     {#if mode === "edit" && chunk !== null}
       <CodeView {path} first={chunk} />
     {:else}
-      <div class="md-scroll">
+      <div class="md-scroll" onscroll={syncPreviewSelection}>
         {#if error !== null}
           <div class="file-error">{error}</div>
         {:else if html !== null}

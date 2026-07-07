@@ -88,20 +88,28 @@ pub(crate) async fn create_workspace(
 }
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
-/// `agent_state`, `agent_title` and `display_name` fields. `agent` is the
-/// wrapper record for kind "agent" sessions; `None` means a plain shell.
-/// `polled` is the shell naming watcher's latest value, if any.
+/// `agent_state`, `agent_title`, `files_touched`, `display_name` and
+/// `cwd_current` fields.
+/// `agent` is the wrapper record for kind "agent" sessions; `None` means a
+/// plain shell. `polled` / `polled_cwd` are the shell naming watcher's
+/// latest values, if any; `cwd_current` falls back to the spawn cwd (agents,
+/// never-polled shells).
 pub(crate) fn session_json(
     info: &chimaera_pty::SessionInfo,
     workspace_id: Option<String>,
     agent: Option<&crate::agents::AgentRecord>,
     polled: Option<&str>,
+    polled_cwd: Option<&std::path::Path>,
     exec_stage: Option<chimaera_pty::ExecStage>,
 ) -> serde_json::Value {
     let mut map = match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    map.insert(
+        "cwd_current".to_string(),
+        json!(polled_cwd.unwrap_or(&info.cwd)),
+    );
     map.insert(
         "exec_stage".to_string(),
         exec_stage.map_or(serde_json::Value::Null, |s| json!(s)),
@@ -124,6 +132,10 @@ pub(crate) fn session_json(
             .and_then(|a| a.title())
             .map_or(serde_json::Value::Null, |t| json!(t)),
     );
+    map.insert(
+        "files_touched".to_string(),
+        agent.map_or(serde_json::Value::Null, |a| json!(a.files_touched)),
+    );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the
     // pin for the UI); agents and shells resolve their own chains.
@@ -141,12 +153,13 @@ pub(crate) fn session_json(
 
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots). Lock order: session_workspaces -> agents ->
-/// display_names.
+/// display_names -> current_cwds -> exec_status.
 pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let sessions = state.sessions.list();
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
     let names = crate::lock(&state.display_names);
+    let cwds = crate::lock(&state.current_cwds);
     let execs = crate::lock(&state.exec_status);
     sessions
         .iter()
@@ -156,6 +169,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 workspaces.get(&info.id).cloned(),
                 agents.get(&info.id),
                 names.get(&info.id).map(String::as_str),
+                cwds.get(&info.id).map(PathBuf::as_path),
                 execs.get(&info.id).copied(),
             )
         })
@@ -303,7 +317,8 @@ pub(crate) async fn create_session(
                 Some(workspace.id),
                 agent.as_ref(),
                 polled.as_deref(),
-                None,
+                None, // fresh session: cwd_current is the spawn cwd
+                None, // no exec in flight
             ))
             .into_response()
         }

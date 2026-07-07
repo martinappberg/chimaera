@@ -1,5 +1,5 @@
 import { getToken } from "./api";
-import type { Link } from "./links";
+import type { Link } from "./agentLinks";
 import type { Session } from "./sessions";
 
 const INITIAL_BACKOFF_MS = 500;

@@ -40,6 +40,18 @@ export interface Session {
    */
   display_name?: string | null;
   /**
+   * The session's LIVE working directory (naming-v2 cwd poll), used by
+   * drag-to-reference to relativize dropped paths. Optional until the daemon
+   * half lands; the client falls back to the spawn cwd.
+   */
+  cwd_current?: string | null;
+  /**
+   * Files this agent wrote/edited (PostToolUse hooks, Write/Edit-class
+   * tools): absolute paths, oldest first, deduped, capped server-side.
+   * Null for shells; optional until the daemon half lands.
+   */
+  files_touched?: string[] | null;
+  /**
    * Shell phase from OSC 133 marks: at the prompt ("ready"), running a
    * command ("running"), or no integration seen ("unknown"). Shells only.
    */
