@@ -1,5 +1,5 @@
 /* ============================================================================
-   chimaera — public site
+   chimaera public site
    Tuned to match the app's own restraint (web-ui HomeScreen / app.css):
    quiet muted palette, bordered ghost buttons (accent only on hover/borders),
    small lowercase mono labels, thin line marks, small radii, minimal shadow.
@@ -46,7 +46,7 @@
   --rate: #8a68c0;
   --term-bg: #ffffff;
 
-  /* Brand-mark ramp (BrandMark.svelte light) — flipped in the dark block. */
+  /* Brand-mark ramp (BrandMark.svelte light), flipped in the dark block. */
   --bm-1: #5c5c62;
 
   --scrim: rgba(17, 17, 22, 0.4);
@@ -169,7 +169,7 @@ pre {
   padding-inline: 24px;
 }
 
-/* Small, quiet section label — the app's lowercase muted mono register. */
+/* Small, quiet section label, the app's lowercase muted mono register. */
 .eyebrow {
   font-family: var(--mono);
   font-size: 12px;
@@ -252,7 +252,7 @@ pre {
 }
 
 /* Primary = the one accented action: accent border + accent text, soft-fill
-   on hover. No loud green fill — matches the app's reserved use of accent. */
+   on hover. No loud green fill, matches the app's reserved use of accent. */
 .btn--primary {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   color: var(--accent);
@@ -413,7 +413,7 @@ pre {
   opacity: 0.8;
 }
 
-/* --- Workbench mockup (flat, subtle — no glow/tilt) ------------------------- */
+/* --- Workbench mockup (flat, subtle, no glow/tilt) ------------------------- */
 .mock-frame {
   margin-top: clamp(36px, 5vw, 56px);
 }
