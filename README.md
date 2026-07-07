@@ -25,7 +25,7 @@ that survives disconnection. Chimaera replaces that whole stack.
 Build from source. You need stable Rust and Node.
 
 ```sh
-git clone https://github.com/martinkjellberg/chimaera
+git clone https://github.com/martinappberg/chimaera
 cd chimaera
 npm --prefix web-ui install
 npm --prefix web-ui run build      # the daemon embeds web-ui/dist

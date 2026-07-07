@@ -3,7 +3,7 @@ name = "chimaera-app"
 version = "0.0.1"
 edition = "2021"
 license = "AGPL-3.0-only"
-repository = "https://github.com/martinkjellberg/chimaera"
+repository = "https://github.com/martinappberg/chimaera"
 
 # Deliberately a standalone workspace: the Tauri/webview stack must never
 # enter the daemon workspace (musl CI, HPC login-node builds stay lean).
