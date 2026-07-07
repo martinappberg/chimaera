@@ -1484,7 +1484,7 @@
           );
         },
       },
-      { linkTargets, linkSessions },
+      { linkTargets, linkSessions, leash: linkIntent },
     );
   }
 

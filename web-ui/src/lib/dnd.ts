@@ -261,12 +261,90 @@ function makeGhost(label: string): HTMLDivElement {
   return ghost;
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+interface Leash {
+  svg: SVGSVGElement;
+  line: SVGPathElement;
+  start: SVGCircleElement;
+  end: SVGCircleElement;
+}
+
+/** A body-level SVG overlay: the leash chain (line + a node at each end). */
+function makeLeash(): Leash {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "leash-overlay");
+  const line = document.createElementNS(SVG_NS, "path");
+  line.setAttribute("class", "leash-line");
+  const start = document.createElementNS(SVG_NS, "circle");
+  start.setAttribute("class", "leash-node start");
+  start.setAttribute("r", "3.5");
+  const end = document.createElementNS(SVG_NS, "circle");
+  end.setAttribute("class", "leash-node end");
+  end.setAttribute("r", "5");
+  svg.append(line, start, end);
+  document.body.appendChild(svg);
+  return { svg, line, start, end };
+}
+
+/** The point a leash should snap to for a spot (a link target's center), or
+ *  null when the spot isn't a link target (the leash then trails the pointer). */
+function leashAnchor(spot: DropSpot | null): { x: number; y: number } | null {
+  if (spot === null) return null;
+  if (spot.kind === "linkrow") {
+    const el = linkRowRegs.get(spot.sessionId);
+    if (el !== undefined) {
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+  }
+  if (spot.kind === "link") {
+    const reg = paneRegs.get(spot.paneId);
+    if (reg !== undefined) {
+      const r = reg.content.getBoundingClientRect();
+      // The band lives on the pane's lower ~22%; aim the leash into it.
+      return { x: r.left + r.width / 2, y: r.bottom - r.height * 0.11 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Draw the leash from the grab origin to the pointer, snapping its far end to
+ * the hovered link target's center. A gentle downward sag makes it read as a
+ * hanging chain; over a target it goes taut (the `snapped` class solidifies it).
+ */
+function drawLeash(
+  l: Leash,
+  sx: number,
+  sy: number,
+  px: number,
+  py: number,
+  spot: DropSpot | null,
+): void {
+  const anchor = leashAnchor(spot);
+  const ex = anchor?.x ?? px;
+  const ey = anchor?.y ?? py;
+  const sag = Math.min(Math.max(Math.hypot(ex - sx, ey - sy) * 0.16, 6), 46);
+  const cx = (sx + ex) / 2;
+  const cy = (sy + ey) / 2 + sag;
+  l.line.setAttribute("d", `M ${sx} ${sy} Q ${cx} ${cy} ${ex} ${ey}`);
+  l.start.setAttribute("cx", `${sx}`);
+  l.start.setAttribute("cy", `${sy}`);
+  l.end.setAttribute("cx", `${ex}`);
+  l.end.setAttribute("cy", `${ey}`);
+  l.svg.classList.toggle("snapped", anchor !== null);
+}
+
 export interface DragOptions {
   /** Panes whose input band is a "link to agent" target for this payload. */
   linkTargets?: ReadonlySet<string>;
   /** Agent session ids whose rail rows are "link to agent" targets for this
    *  payload (a shell terminal). Independent of whether the agent is open. */
   linkSessions?: ReadonlySet<string>;
+  /** Draw a "leash" chain from the drag origin to the pointer (link drags):
+   *  it snaps taut onto the hovered link target. */
+  leash?: boolean;
 }
 
 /**
@@ -286,6 +364,7 @@ export function startDrag(
   const sy = e.clientY;
   let active = false;
   let ghost: HTMLDivElement | null = null;
+  let leash: Leash | null = null;
   let raf = 0;
   let lastX = sx;
   let lastY = sy;
@@ -312,6 +391,7 @@ export function startDrag(
       spot = next;
       cb.onSpot(spot);
     }
+    if (leash !== null) drawLeash(leash, sx, sy, lastX, lastY, spot);
   };
 
   const onMove = (ev: PointerEvent) => {
@@ -322,6 +402,7 @@ export function startDrag(
       if (Math.hypot(lastX - sx, lastY - sy) < DRAG_THRESHOLD_PX) return;
       active = true;
       ghost = makeGhost(payload.label);
+      if (opts.leash === true) leash = makeLeash();
       document.body.classList.add("dragging");
     }
     if (raf === 0) raf = requestAnimationFrame(update);
@@ -336,6 +417,7 @@ export function startDrag(
     window.removeEventListener("keydown", onKey, true);
     if (raf !== 0) cancelAnimationFrame(raf);
     ghost?.remove();
+    leash?.svg.remove();
     document.body.classList.remove("dragging");
     try {
       source?.releasePointerCapture(pointerId);
