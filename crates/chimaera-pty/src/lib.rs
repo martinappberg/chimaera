@@ -8,8 +8,11 @@
 //! returns a snapshot escape stream that reconstructs the terminal in a fresh
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
+pub mod marks;
 mod session;
 mod snapshot;
+
+pub use marks::{CommandSource, CommandView, Marks, ShellPhase};
 
 #[cfg(test)]
 mod tests;
@@ -39,6 +42,8 @@ pub struct SessionInfo {
     /// True when `name` was pinned explicitly (spawn name / user rename)
     /// rather than derived from the cwd; pinned names stay authoritative.
     pub renamed: bool,
+    /// Shell phase from OSC 133 marks (`unknown` without shell integration).
+    pub phase: ShellPhase,
 }
 
 /// Options for spawning a new session.
@@ -63,6 +68,8 @@ pub enum SessionEvent {
     Title { title: String },
     Resized { cols: u16, rows: u16 },
     Exited { status: Option<i32> },
+    /// Shell phase change from OSC 133 marks (prompt <-> running).
+    Shell { phase: ShellPhase },
 }
 
 /// A live view onto a session, handed out by [`SessionManager::attach`].
@@ -164,6 +171,16 @@ impl SessionManager {
     /// own pid; while a command runs it is (the group leader of) that command.
     pub fn foreground_pid(&self, id: &str) -> Option<i32> {
         self.session(id).and_then(|s| s.foreground_pid())
+    }
+
+    /// Shell-integration marks (phase + command journal) for a session.
+    pub fn marks(&self, id: &str) -> Option<Arc<Marks>> {
+        self.session(id).map(|s| s.marks())
+    }
+
+    /// Input sender for a session (exec engine path; no snapshot render).
+    pub fn input(&self, id: &str) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+        self.session(id).map(|s| s.input())
     }
 
     /// Signal the session's child to terminate (SIGHUP); the wait thread

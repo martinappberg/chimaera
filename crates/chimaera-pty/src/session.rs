@@ -19,7 +19,8 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    lock_unpoisoned, snapshot, Attachment, SessionEvent, SessionId, SessionInfo, SpawnOpts,
+    lock_unpoisoned, marks::Marks, marks::ShellPhase, snapshot, Attachment, SessionEvent,
+    SessionId, SessionInfo, SpawnOpts,
 };
 
 /// Scrollback history kept per session.
@@ -101,6 +102,8 @@ pub(crate) struct Session {
     input_tx: mpsc::Sender<Bytes>,
     output_tx: broadcast::Sender<Bytes>,
     events_tx: broadcast::Sender<SessionEvent>,
+    /// Shell-integration marks: OSC 133 phase + command journal.
+    marks: Arc<Marks>,
 }
 
 impl Session {
@@ -187,27 +190,41 @@ impl Session {
             exit_status: None,
         }));
 
+        let marks = Arc::new(Marks::new());
+
         // Reader thread: pump PTY output into the headless Term and the live
         // broadcast channel. Advancing the parser and broadcasting happen
         // under the term lock so attach() (which subscribes and renders the
         // snapshot under the same lock) sees each chunk exactly once: either
         // in the snapshot or on the live stream, never both or neither.
+        // The marks scanner is fed outside the term lock (it has its own).
         {
             let term = Arc::clone(&term);
             let output_tx = output_tx.clone();
+            let events_tx = events_tx.clone();
+            let marks = Arc::clone(&marks);
             let id = id.clone();
             std::thread::Builder::new()
                 .name(format!("pty-read-{id}"))
                 .spawn(move || {
                     let mut parser: Processor<StdSyncHandler> = Processor::new();
                     let mut buf = [0u8; 8192];
+                    let mut phase = ShellPhase::Unknown;
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                let mut term = lock_unpoisoned(&term);
-                                parser.advance(&mut *term, &buf[..n]);
-                                let _ = output_tx.send(Bytes::copy_from_slice(&buf[..n]));
+                                marks.feed(&buf[..n]);
+                                {
+                                    let mut term = lock_unpoisoned(&term);
+                                    parser.advance(&mut *term, &buf[..n]);
+                                    let _ = output_tx.send(Bytes::copy_from_slice(&buf[..n]));
+                                }
+                                let now = marks.phase();
+                                if now != phase {
+                                    phase = now;
+                                    let _ = events_tx.send(SessionEvent::Shell { phase });
+                                }
                             }
                             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                             Err(e) => {
@@ -293,6 +310,7 @@ impl Session {
             input_tx,
             output_tx,
             events_tx,
+            marks,
         }))
     }
 
@@ -313,7 +331,18 @@ impl Session {
             title: lock_unpoisoned(&self.title).clone(),
             pid: self.child_pid,
             renamed: self.renamed,
+            phase: self.marks.phase(),
         }
+    }
+
+    /// Shell-integration marks (phase + command journal) for this session.
+    pub(crate) fn marks(&self) -> Arc<Marks> {
+        Arc::clone(&self.marks)
+    }
+
+    /// Queue bytes to the PTY without an attachment (exec engine path).
+    pub(crate) fn input(&self) -> mpsc::Sender<Bytes> {
+        self.input_tx.clone()
     }
 
     /// Foreground process group on the tty (`tcgetpgrp` on the master fd).
