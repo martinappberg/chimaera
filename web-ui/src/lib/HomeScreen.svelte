@@ -1,0 +1,810 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { KEYS } from "./keys";
+  import { needsAttention, type Session, type Workspace } from "./sessions";
+  import {
+    addHost,
+    connectHost,
+    disconnectHost,
+    isNativeShell,
+    listHosts,
+    onConnectProgress,
+    openWindow,
+    remoteWorkspaces,
+    removeHost,
+    type ConnectProgress,
+    type HostState,
+  } from "./native";
+  import type { Health } from "./api";
+
+  interface Props {
+    workspaces: Workspace[];
+    sessions: Session[];
+    hostLabel: string;
+    health: Health | null;
+    /** The authenticated events socket is up (daemon reachable). */
+    connected: boolean;
+    /** Open `w` in THIS window. */
+    onOpen: (w: Workspace) => void;
+    /** Remove `w` from the daemon's registry (files untouched). */
+    onRemove: (w: Workspace) => void;
+    /** Open the folder picker (browse/register a new folder). */
+    onOpenFolder: () => void;
+  }
+
+  let { workspaces, sessions, hostLabel, health, connected, onOpen, onRemove, onOpenFolder }: Props =
+    $props();
+
+  const native = isNativeShell();
+
+  const sorted = $derived(
+    [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
+  );
+
+  /** Live rollup per workspace: total live sessions + how many need you. */
+  const liveByWs = $derived.by(() => {
+    const map = new Map<string, { live: number; attn: number }>();
+    for (const s of sessions) {
+      const entry = map.get(s.workspace_id) ?? { live: 0, attn: 0 };
+      if (s.alive) entry.live += 1;
+      if (needsAttention(s)) entry.attn += 1;
+      map.set(s.workspace_id, entry);
+    }
+    return map;
+  });
+
+  /** Confirm target for workspace removal (one at a time, Escape cancels). */
+  let confirmRemoveId = $state<string | null>(null);
+
+  // --- remote hosts (native shell only) --------------------------------------
+
+  let hosts = $state<HostState[]>([]);
+  /** Remote workspace lists per connected alias. */
+  let remoteWs = $state<Map<string, Workspace[]>>(new Map());
+  /** Human line under a host while its connect flow runs. */
+  let phases = $state<Map<string, string>>(new Map());
+  let hostErrors = $state<Map<string, string>>(new Map());
+  let addOpen = $state(false);
+  let addAlias = $state("");
+  let addError = $state<string | null>(null);
+  let confirmForget = $state<string | null>(null);
+
+  const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
+    probing: "probing for a running daemon…",
+    installing: "installing chimaera…",
+    starting: "starting the daemon…",
+    tunneling: "bringing the tunnel up…",
+  };
+
+  onMount(() => {
+    if (!native) return;
+    void refreshHosts();
+    let unlisten: (() => void) | null = null;
+    void onConnectProgress((p) => {
+      phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
+    }).then((u) => (unlisten = u));
+    return () => unlisten?.();
+  });
+
+  async function refreshHosts(): Promise<void> {
+    try {
+      hosts = await listHosts();
+    } catch {
+      // shell unavailable mid-teardown; leave the list as-is
+    }
+  }
+
+  async function connect(alias: string): Promise<void> {
+    hostErrors = mapWithout(hostErrors, alias);
+    hosts = hosts.map((h) => (h.alias === alias ? { ...h, status: "connecting" } : h));
+    try {
+      const state = await connectHost(alias);
+      hosts = hosts.map((h) => (h.alias === alias ? state : h));
+      const list = await remoteWorkspaces(alias);
+      remoteWs = new Map(remoteWs).set(
+        alias,
+        [...list].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
+      );
+    } catch (e) {
+      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+      void refreshHosts();
+    } finally {
+      phases = mapWithout(phases, alias);
+    }
+  }
+
+  async function disconnect(alias: string): Promise<void> {
+    await disconnectHost(alias);
+    remoteWs = mapWithout(remoteWs, alias);
+    void refreshHosts();
+  }
+
+  async function forget(alias: string): Promise<void> {
+    confirmForget = null;
+    await removeHost(alias);
+    remoteWs = mapWithout(remoteWs, alias);
+    void refreshHosts();
+  }
+
+  async function submitAdd(): Promise<void> {
+    const alias = addAlias.trim();
+    if (alias === "") return;
+    addError = null;
+    try {
+      await addHost(alias);
+      addAlias = "";
+      addOpen = false;
+      await refreshHosts();
+      void connect(alias);
+    } catch (e) {
+      addError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  function mapWithout<K, V>(map: Map<K, V>, key: K): Map<K, V> {
+    const next = new Map(map);
+    next.delete(key);
+    return next;
+  }
+
+  /** "just now" · "5m ago" · "3h ago" · "4d ago" · "2026-05-12". */
+  function ago(unixSecs: number | null | undefined): string {
+    if (!unixSecs) return "";
+    const secs = Math.max(0, Math.floor(Date.now() / 1000) - unixSecs);
+    if (secs < 60) return "just now";
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+    if (secs < 14 * 86400) return `${Math.floor(secs / 86400)}d ago`;
+    return new Date(unixSecs * 1000).toISOString().slice(0, 10);
+  }
+
+  /** Shorten an absolute path with ~ for scanability. */
+  function tildify(path: string): string {
+    const m = path.match(/^\/(?:home|Users)\/[^/]+(\/.*)?$/);
+    return m ? `~${m[1] ?? ""}` : path;
+  }
+
+  function openRow(e: MouseEvent, w: Workspace): void {
+    if (e.metaKey || e.ctrlKey) {
+      void openWindow(null, w.id);
+    } else {
+      onOpen(w);
+    }
+  }
+</script>
+
+<div class="home">
+  <div class="inner">
+    <header class="masthead">
+      <div class="brand">
+        <span class="glyph" aria-hidden="true">&gt;_</span>
+        <h1>chimaera</h1>
+      </div>
+      <div class="where" title={health?.hostname}>
+        <span class="daemon-dot" class:ok={connected} aria-hidden="true"></span>
+        <span class="host-label">{hostLabel}</span>
+        {#if health !== null && health.hostname !== hostLabel}
+          <span class="hostname">{health.hostname}</span>
+        {/if}
+      </div>
+    </header>
+
+    <section>
+      <div class="sec-head">
+        <span class="sec-title">workspaces</span>
+        <button class="ghost" onclick={onOpenFolder}
+          >open a folder… <kbd>{KEYS.picker}</kbd></button
+        >
+      </div>
+      {#if sorted.length === 0}
+        <div class="blank">
+          <p>Nothing here yet — open a folder to start terminals and agents in it.</p>
+          <button class="cta" onclick={onOpenFolder}>Open a folder</button>
+        </div>
+      {:else}
+        <div class="rows">
+          {#each sorted as w (w.id)}
+            {@const live = liveByWs.get(w.id)}
+            {#if confirmRemoveId === w.id}
+              <div class="row confirm" role="alertdialog" aria-label="remove workspace?">
+                <span class="name">{w.name}</span>
+                <span class="confirm-label">remove from this list?</span>
+                <button
+                  class="confirm-yes"
+                  onclick={() => {
+                    confirmRemoveId = null;
+                    onRemove(w);
+                  }}>remove</button
+                >
+                <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>cancel</button>
+              </div>
+            {:else}
+              <div class="rowwrap" role="presentation">
+                <button class="row" title={w.root} onclick={(e) => openRow(e, w)}>
+                  <span class="name">{w.name}</span>
+                  <span class="path">{tildify(w.root)}</span>
+                  {#if live !== undefined && live.attn > 0}
+                    <span class="badge attn" title="{live.attn} need{live.attn === 1 ? 's' : ''} you">
+                      <span class="dot attn"></span>{live.attn}
+                    </span>
+                  {/if}
+                  {#if live !== undefined && live.live > 0}
+                    <span
+                      class="badge"
+                      title="{live.live} live session{live.live === 1 ? '' : 's'}"
+                    >
+                      <span class="dot alive"></span>{live.live}
+                    </span>
+                  {/if}
+                  <span class="when">{ago(w.last_opened_at)}</span>
+                </button>
+                <button class="side" title="open in a new window" onclick={() => void openWindow(null, w.id)}
+                  >new window</button
+                >
+                <button
+                  class="side x"
+                  title="remove from this list (folder untouched)"
+                  onclick={() => (confirmRemoveId = w.id)}>&times;</button
+                >
+              </div>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    <section>
+      <div class="sec-head">
+        <span class="sec-title">remote hosts</span>
+        {#if native}
+          <button
+            class="ghost"
+            onclick={() => {
+              addOpen = !addOpen;
+              addError = null;
+            }}>add a host…</button
+          >
+        {/if}
+      </div>
+
+      {#if !native}
+        <p class="hint">
+          Remote hosts connect from the chimaera app — or run
+          <code>chimaera connect &lt;host&gt;</code> in a terminal and open the printed URL.
+        </p>
+      {:else}
+        {#if addOpen}
+          <form
+            class="add"
+            onsubmit={(e) => {
+              e.preventDefault();
+              void submitAdd();
+            }}
+          >
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="add-input"
+              bind:value={addAlias}
+              placeholder="ssh alias or user@host (from your ~/.ssh/config)"
+              spellcheck="false"
+              autocomplete="off"
+              autofocus
+              onkeydown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  addOpen = false;
+                }
+              }}
+            />
+            <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
+              >connect</button
+            >
+          </form>
+          {#if addError !== null}
+            <div class="err-line">{addError}</div>
+          {/if}
+        {/if}
+
+        {#if hosts.length === 0 && !addOpen}
+          <p class="hint">
+            No remotes yet. Add your cluster's ssh alias — chimaera installs its own daemon in
+            <code>~/.chimaera</code> over ssh, no root needed.
+          </p>
+        {:else}
+          <div class="rows">
+            {#each hosts as h (h.alias)}
+              {@const phase = phases.get(h.alias)}
+              {@const err = hostErrors.get(h.alias)}
+              {@const ws = remoteWs.get(h.alias)}
+              {#if confirmForget === h.alias}
+                <div class="row confirm" role="alertdialog" aria-label="forget host?">
+                  <span class="name">{h.alias}</span>
+                  <span class="confirm-label">forget this host?</span>
+                  <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
+                  <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
+                </div>
+              {:else}
+                <div class="rowwrap" role="presentation">
+                  <button
+                    class="row"
+                    title={h.status === "connected"
+                      ? "browse this host in a new window"
+                      : `connect to ${h.alias}`}
+                    disabled={h.status === "connecting"}
+                    onclick={() =>
+                      h.status === "connected"
+                        ? void openWindow(h.alias, null)
+                        : void connect(h.alias)}
+                  >
+                    <span
+                      class="dot {h.status === 'connected'
+                        ? 'alive'
+                        : h.status === 'connecting'
+                          ? 'starting'
+                          : ''}"
+                    ></span>
+                    <span class="name">{h.alias}</span>
+                    {#if phase !== undefined}
+                      <span class="phase">{phase}</span>
+                    {:else if h.status === "connected"}
+                      <span class="phase quiet">connected · 127.0.0.1:{h.local_port}</span>
+                    {:else}
+                      <span class="when">{ago(h.last_connected_at)}</span>
+                    {/if}
+                  </button>
+                  {#if h.status === "connected"}
+                    <button class="side" onclick={() => void disconnect(h.alias)}>disconnect</button>
+                  {/if}
+                  <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
+                    >&times;</button
+                  >
+                </div>
+                {#if err !== undefined}
+                  <div class="err-line">{err}</div>
+                {/if}
+                {#if h.status === "connected" && ws !== undefined}
+                  <div class="remote-ws">
+                    {#each ws as rw (rw.id)}
+                      <div class="rowwrap" role="presentation">
+                        <button
+                          class="row sub"
+                          title={rw.root}
+                          onclick={() => void openWindow(h.alias, rw.id)}
+                        >
+                          <span class="name">{rw.name}</span>
+                          <span class="path">{tildify(rw.root)}</span>
+                          <span class="when">{ago(rw.last_opened_at)}</span>
+                        </button>
+                      </div>
+                    {/each}
+                    <div class="rowwrap" role="presentation">
+                      <button class="row sub browse" onclick={() => void openWindow(h.alias, null)}>
+                        <span class="name">browse {h.alias}…</span>
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              {/if}
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </section>
+  </div>
+</div>
+
+<style>
+  .home {
+    position: absolute;
+    inset: 0;
+    overflow-y: auto;
+    background: var(--bg);
+  }
+
+  .inner {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: clamp(24px, 10vh, 96px) 24px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 36px;
+  }
+
+  .masthead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .glyph {
+    font-family: var(--mono);
+    font-size: var(--text-lg);
+    color: var(--accent);
+    user-select: none;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .where {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+    min-width: 0;
+  }
+
+  .daemon-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    opacity: 0.5;
+    flex: none;
+  }
+
+  .daemon-dot.ok {
+    background: var(--accent);
+    opacity: 1;
+  }
+
+  .host-label {
+    color: var(--fg);
+  }
+
+  .hostname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.7;
+  }
+
+  section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .sec-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px 4px;
+  }
+
+  .sec-title {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+  }
+
+  .ghost {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .ghost:hover {
+    color: var(--fg);
+  }
+
+  kbd {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    border: 1px solid var(--edge);
+    border-radius: 3px;
+    padding: 0 3px;
+    margin-left: 2px;
+  }
+
+  .blank {
+    border: 1px dashed var(--edge);
+    border-radius: 8px;
+    padding: 28px 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: var(--text-md);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .blank p {
+    margin: 0;
+    max-width: 40ch;
+  }
+
+  .cta {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: var(--overlay-bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-md);
+    padding: 7px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+
+  .cta:hover {
+    border-color: var(--accent);
+  }
+
+  .cta:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .cta.small {
+    padding: 5px 12px;
+    font-size: var(--text-sm);
+  }
+
+  .rows {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .rowwrap {
+    display: flex;
+    align-items: center;
+    border-radius: 6px;
+    transition: background-color 0.12s ease;
+  }
+
+  .rowwrap:hover {
+    background: var(--row-hover);
+  }
+
+  .row {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--fg);
+    text-align: left;
+    padding: 9px 10px;
+    cursor: pointer;
+    border-radius: 6px;
+  }
+
+  .row:disabled {
+    cursor: progress;
+  }
+
+  .row.sub {
+    padding: 6px 10px;
+  }
+
+  .row.browse .name {
+    color: var(--muted);
+  }
+
+  .row.browse:hover .name {
+    color: var(--fg);
+  }
+
+  .name {
+    flex: none;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-md);
+  }
+
+  .path {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .phase {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--text-sm);
+    color: var(--fg);
+  }
+
+  .phase.quiet {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+  }
+
+  .badge {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    padding: 1px 8px 1px 6px;
+  }
+
+  .badge.attn {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  }
+
+  .when {
+    flex: none;
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    opacity: 0.8;
+  }
+
+  .side {
+    flex: none;
+    visibility: hidden;
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    padding: 0.2rem 8px;
+    cursor: pointer;
+  }
+
+  .side:hover {
+    color: var(--fg);
+  }
+
+  .side.x:hover {
+    color: var(--err);
+  }
+
+  .rowwrap:hover .side {
+    visibility: visible;
+  }
+
+  .remote-ws {
+    margin: 0 0 6px 22px;
+    padding-left: 8px;
+    border-left: 1px solid var(--edge);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .row.confirm {
+    cursor: default;
+  }
+
+  .confirm {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 6px;
+    background: var(--row-active);
+  }
+
+  .confirm-label {
+    flex: 1;
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  .confirm-yes,
+  .confirm-no {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  .confirm-yes {
+    color: var(--err);
+  }
+
+  .confirm-yes:hover {
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+  }
+
+  .confirm-no {
+    color: var(--muted);
+  }
+
+  .confirm-no:hover {
+    color: var(--fg);
+  }
+
+  .hint {
+    margin: 0;
+    padding: 4px 10px;
+    font-size: var(--text-sm);
+    color: var(--muted);
+    line-height: 1.55;
+  }
+
+  .hint code {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+
+  .add {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 10px 8px;
+  }
+
+  .add-input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--overlay-bg);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    padding: 6px 10px;
+    outline: none;
+  }
+
+  .add-input:focus {
+    border-color: var(--focus-ring);
+  }
+
+  .add-input::placeholder {
+    color: var(--muted);
+    opacity: 0.7;
+  }
+
+  .err-line {
+    padding: 2px 10px 6px;
+    font-size: var(--text-sm);
+    color: var(--err);
+    white-space: pre-wrap;
+  }
+</style>

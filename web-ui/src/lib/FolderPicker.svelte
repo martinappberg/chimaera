@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ApiError, getToken } from "./api";
+  import { ApiError } from "./api";
+  import { openWindow } from "./native";
   import {
     createWorkspace,
     fsDirs,
@@ -131,12 +132,8 @@
     busy = true;
     try {
       const w = await createWorkspace(path);
-      const token = getToken();
-      const hash =
-        token !== null
-          ? `#token=${encodeURIComponent(token)}&ws=${encodeURIComponent(w.id)}`
-          : `#ws=${encodeURIComponent(w.id)}`;
-      window.open(`${location.origin}/${hash}`);
+      // A real native window in the shell, a new tab in the browser.
+      await openWindow(null, w.id);
       onClose();
     } catch (e) {
       error = e instanceof ApiError ? e.message : "could not open folder";
