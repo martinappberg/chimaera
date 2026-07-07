@@ -146,6 +146,11 @@ export class SessionSocket {
     }
   }
 
+  /** True while the socket is connected and can accept input frames. */
+  get isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   /** Send raw keyboard input (from term.onData) as a binary frame. */
   sendInput(data: string): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -171,4 +176,33 @@ export class SessionSocket {
     this.ws?.close();
     this.ws = null;
   }
+}
+
+/**
+ * Type `text` into a session that has no pooled terminal attached (context
+ * bridge fallback): open a one-shot socket, send the input once the server
+ * is provably ready (the snapshot binary frame has arrived), and close.
+ * The text is raw input — callers guarantee it carries no newline, so this
+ * can never submit anything.
+ */
+export function typeIntoDetachedSession(sessionId: string, text: string): void {
+  let sent = false;
+  const socket = new SessionSocket(sessionId, {
+    onBinary: () => {
+      if (sent) return;
+      sent = true;
+      socket.sendInput(text);
+      // close() lets the buffered frame flush before the close handshake.
+      setTimeout(() => socket.close(), 250);
+    },
+    onReset: () => {},
+    onTitle: () => {},
+    onResized: () => {},
+    onExited: () => socket.close(),
+    onError: () => socket.close(),
+  });
+  // Give up quietly if the session never produces a snapshot.
+  setTimeout(() => {
+    if (!sent) socket.close();
+  }, 5000);
 }

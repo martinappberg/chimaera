@@ -35,6 +35,11 @@ export interface PoolHandlers {
    * how to surface them.
    */
   onSocketError(id: string, message: string): void;
+  /**
+   * The terminal's selection changed (context bridge). `text` is the raw
+   * selection, empty when the selection was cleared.
+   */
+  onSelection(id: string, text: string): void;
 }
 
 interface PoolEntry {
@@ -234,6 +239,7 @@ function createEntry(id: string, parent: HTMLElement): PoolEntry {
 
   term.onData((data) => entry.socket.sendInput(data));
   term.onResize(({ cols, rows }) => entry.socket.sendResize(cols, rows));
+  term.onSelectionChange(() => handlers?.onSelection(id, term.getSelection()));
 
   entry.ro = new ResizeObserver(() => scheduleFit(entry));
   entry.ro.observe(el);
@@ -340,6 +346,19 @@ export function focusTerminal(id: string): void {
   } else {
     pendingFocusId = id;
   }
+}
+
+/**
+ * Type `text` into the session's live socket (context bridge references).
+ * Returns false when the session has no pooled entry or its socket is down —
+ * the caller falls back to a one-shot socket. Callers guarantee `text`
+ * carries no newline (never submits).
+ */
+export function sendText(id: string, text: string): boolean {
+  const entry = pool.get(id);
+  if (entry === undefined || !entry.socket.isOpen) return false;
+  entry.socket.sendInput(text);
+  return true;
 }
 
 /** Divider-drag coordination: suppress refits mid-drag, flush at drag end. */

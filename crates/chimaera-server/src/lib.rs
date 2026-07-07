@@ -47,6 +47,10 @@ pub(crate) struct AppState {
     /// session id -> polled shell display name (naming rule zero); written
     /// by the per-session watcher in `naming`, read by `session_json`.
     pub(crate) display_names: Mutex<HashMap<String, String>>,
+    /// session id -> polled current working directory (shell sessions only);
+    /// written by the same watcher, surfaced as `cwd_current` on session JSON
+    /// (agents and never-polled shells fall back to the spawn cwd).
+    pub(crate) current_cwds: Mutex<HashMap<String, PathBuf>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Quick-open walk cache (short TTL, per workspace).
@@ -82,6 +86,7 @@ impl AppState {
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
+            current_cwds: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
@@ -608,6 +613,9 @@ mod tests {
         };
         assert_eq!(ready["type"], "ready");
         assert_eq!(ready["id"].as_str().unwrap(), info.id);
+        // No naming watcher runs for this session, so the ready frame's
+        // cwd_current falls back to the spawn cwd.
+        assert_eq!(ready["cwd_current"], ready["cwd"]);
 
         // 3. Snapshot as one binary frame.
         match next_ws_frame(&mut socket).await {
@@ -1047,6 +1055,24 @@ mod tests {
         }
     }
 
+    /// Poll GET /api/v1/sessions until the session's cwd_current matches.
+    async fn wait_cwd_current(state: &Arc<AppState>, id: &str, expected: &std::path::Path) {
+        let expected = serde_json::json!(expected);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let entry = session_entry(state, id).await;
+            if entry["cwd_current"] == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cwd_current stuck at {}, want {expected}",
+                entry["cwd_current"]
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn shell_display_name_tracks_foreground_command() {
         let state = test_state();
@@ -1115,6 +1141,50 @@ mod tests {
         wait_display_name(&state, &id, "bash").await;
 
         state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn cwd_current_tracks_shell_cd_and_falls_back_to_spawn_cwd() {
+        let state = test_state();
+        let root = test_dir("cwd-current");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let id = inject_shell(&state, &root, &workspace_id);
+
+        // The watcher's first poll reports the spawn cwd.
+        wait_cwd_current(&state, &id, &root).await;
+
+        // cd into a subdirectory: cwd_current follows...
+        let att = state.sessions.attach(&id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("cd sub\n"))
+            .await
+            .expect("send input");
+        wait_cwd_current(&state, &id, &root.join("sub")).await;
+
+        // ...and back.
+        att.input
+            .send(bytes::Bytes::from("cd ..\n"))
+            .await
+            .expect("send input");
+        wait_cwd_current(&state, &id, &root).await;
+
+        state.sessions.kill(&id).ok();
+
+        // No polled value (agents run no cwd watcher; they keep their spawn
+        // cwd): the field falls back to the spawn cwd.
+        let agent = inject_agent(&state, "k");
+        let entry = session_entry(&state, &agent).await;
+        assert_eq!(entry["cwd_current"], entry["cwd"]);
+        state.sessions.kill(&agent).ok();
     }
 
     #[tokio::test]

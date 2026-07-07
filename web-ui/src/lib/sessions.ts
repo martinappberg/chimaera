@@ -39,6 +39,12 @@ export interface Session {
    * lands; the client falls back to agent_title/name.
    */
   display_name?: string | null;
+  /**
+   * The session's LIVE working directory (naming-v2 cwd poll), used by
+   * drag-to-reference to relativize dropped paths. Optional until the daemon
+   * half lands; the client falls back to the spawn cwd.
+   */
+  cwd_current?: string | null;
 }
 
 /** The one display name for a session, used identically everywhere. */

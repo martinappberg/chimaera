@@ -59,12 +59,19 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         }
     };
 
-    // Ready frame: {"type":"ready", ...SessionInfo fields...}
+    // Ready frame: {"type":"ready", ...SessionInfo fields..., "cwd_current"}
     let mut ready = match serde_json::to_value(&attachment.info) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
     ready.insert("type".to_string(), json!("ready"));
+    // Same field as REST/events session JSON: the polled cwd (shell naming
+    // watcher), falling back to the spawn cwd.
+    let cwd_current = crate::lock(&state.current_cwds)
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| attachment.info.cwd.clone());
+    ready.insert("cwd_current".to_string(), json!(cwd_current));
     if send_json(&mut socket, &serde_json::Value::Object(ready))
         .await
         .is_err()

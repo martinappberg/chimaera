@@ -44,6 +44,8 @@ export const KEYS = {
   focusMode: chord("B", "B"),
   focusArrows: isMac ? "⌥⌘←↑↓→" : "Ctrl+Shift+Alt+←↑↓→",
   cycleTabs: isMac ? "⌥⌘[ ]" : "Ctrl+Shift+Alt+[ ]",
+  /** Context bridge: Cmd+Shift+R / Ctrl+Shift+R (spec-pinned, not layered). */
+  reference: isMac ? "⇧⌘R" : "Ctrl+Shift+R",
 } as const;
 
 /**

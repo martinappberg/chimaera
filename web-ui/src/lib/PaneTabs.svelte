@@ -17,6 +17,7 @@
   import { basename } from "./files";
   import { dirtyFiles } from "./editing";
   import { KEYS } from "./keys";
+  import { activeSelection, referenceTarget, requestReference } from "./reference";
   import FileIcon from "./FileIcon.svelte";
 
   interface Props {
@@ -48,6 +49,23 @@
   const insertIndex = $derived(
     dropSpot?.kind === "tab" && dropSpot.paneId === node.id ? dropSpot.index : null,
   );
+
+  /**
+   * Context bridge: true when this pane's ACTIVE tab is the terminal that
+   * owns the current selection — the bar grows a quiet "reference" action
+   * (the terminal itself has no floating overlay; the bar is its affordance).
+   */
+  const hasTermSelection = $derived.by(() => {
+    const sel = $activeSelection;
+    const active = node.tabs[node.active];
+    return (
+      sel !== null &&
+      sel.kind === "terminal" &&
+      active !== undefined &&
+      active.surface === "terminal" &&
+      active.sessionId === sel.sessionId
+    );
+  });
 
   function label(tab: Tab): string {
     if (tab.surface === "terminal") {
@@ -133,6 +151,24 @@
        chord (tooltips teach the chords). Faded in on bar hover; the zoom
        badge stays persistent while zoomed. -->
   <div class="bar-right">
+    {#if hasTermSelection}
+      <!-- Selection-driven, not hover-driven: visible exactly while the
+           terminal holds a selection. Same handler as the chord. -->
+      <button
+        class="ref-btn"
+        disabled={$referenceTarget === null}
+        title={$referenceTarget === null
+          ? "no agent session in this workspace — start one to reference"
+          : `reference selection in ${$referenceTarget.name} (${KEYS.reference})`}
+        onclick={(e) => {
+          e.stopPropagation();
+          requestReference();
+        }}
+      >
+        <span class="ref-at" aria-hidden="true">@</span>
+        reference
+      </button>
+    {/if}
     {#if zoomed}
       <button class="zoom-badge" title="exit zoom ({KEYS.zoom})" onclick={() => ctrl.zoomPane(node.id)}
         >zoom</button
@@ -387,6 +423,53 @@
   .ctl:hover {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  /* Context bridge: quiet selection-driven action in the bar (no hover
+     gating — it appears exactly while the terminal holds a selection). */
+  .ref-btn {
+    appearance: none;
+    border: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    background: color-mix(in srgb, var(--fg) 7%, transparent);
+    padding: 0 7px;
+    height: 18px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .ref-btn:hover:enabled {
+    background: color-mix(in srgb, var(--fg) 12%, transparent);
+    color: var(--fg);
+  }
+
+  .ref-btn:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  .ref-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+
+  .ref-at {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .ref-btn:disabled .ref-at {
+    color: var(--muted);
   }
 
   /* Persistent while zoomed — the always-visible mouse exit from zoom. */

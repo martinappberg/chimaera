@@ -47,6 +47,8 @@
   import { ApiError } from "./api";
   import { setDirty, forgetDirty } from "./editing";
   import { isMac } from "./keys";
+  import { clearSelection, setSelection } from "./reference";
+  import ReferenceChip from "./ReferenceChip.svelte";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 
@@ -77,6 +79,55 @@
 
   let view: EditorView | null = null;
   const editCompartment = new Compartment();
+
+  // Context bridge: this view's selection, published for the reference
+  // affordance + chord. The chip floats near the selection's end.
+  const selOwner = {};
+  let wrapEl = $state<HTMLDivElement | null>(null);
+  let chipPos = $state<{ x: number; y: number } | null>(null);
+
+  /** Publish/clear the selection and (re)place the chip near its end. */
+  function syncSelection(v: EditorView): void {
+    const sel = v.state.selection.main;
+    if (sel.empty) {
+      chipPos = null;
+      clearSelection(selOwner);
+      return;
+    }
+    const startLine = v.state.doc.lineAt(sel.from).number;
+    const endAt = v.state.doc.lineAt(sel.to);
+    // A selection ending exactly at a line start doesn't include that line.
+    const endLine = endAt.number > startLine && endAt.from === sel.to ? endAt.number - 1 : endAt.number;
+    setSelection(selOwner, {
+      kind: "file",
+      path,
+      startLine,
+      endLine,
+      text: v.state.sliceDoc(sel.from, sel.to),
+    });
+    placeChip(v);
+  }
+
+  /** Chip position: just under the selection head, clamped into the view. */
+  function placeChip(v: EditorView): void {
+    const wrap = wrapEl;
+    if (wrap === null) return;
+    const sel = v.state.selection.main;
+    if (sel.empty) return;
+    const coords = v.coordsAtPos(sel.head);
+    if (coords === null) {
+      // Selection end scrolled out of the viewport: hide the chip, keep the
+      // selection registered (the chord still works).
+      chipPos = null;
+      return;
+    }
+    const rect = wrap.getBoundingClientRect();
+    const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+    chipPos = {
+      x: clamp(coords.left - rect.left + 4, 4, rect.width - 170),
+      y: clamp(coords.bottom - rect.top + 6, 4, rect.height - 58),
+    };
+  }
   // Streaming decoder: chunk boundaries may split a UTF-8 sequence; the
   // decoder carries the partial bytes across load-more calls.
   const decoder = new TextDecoder("utf-8", { fatal: false });
@@ -200,11 +251,21 @@
         bracketMatching(),
         syntaxHighlighting(highlight, { fallback: true }),
         theme,
+        // Context bridge: track the selection in both read-only and editable
+        // modes (this listener lives outside the edit compartment).
+        EditorView.updateListener.of((u) => {
+          if (u.selectionSet || u.docChanged) syncSelection(u.view);
+          else if (u.geometryChanged) placeChip(u.view);
+        }),
         editCompartment.of(editExtensions(editable)),
       ],
     });
     const v = new EditorView({ state, parent: el });
     view = v;
+
+    // Keep the chip pinned to the selection end while the code scrolls.
+    const onScroll = () => placeChip(v);
+    v.scrollDOM.addEventListener("scroll", onScroll, { passive: true });
 
     // Under-cap files that came back truncated (256KB < size ≤ 1MB): pull the
     // rest in the background so the editor holds the full document and can save.
@@ -229,6 +290,8 @@
       view = null;
       if (flashTimer !== null) clearTimeout(flashTimer);
       forgetDirty(path);
+      clearSelection(selOwner);
+      v.scrollDOM.removeEventListener("scroll", onScroll);
       v.destroy();
     };
   });
@@ -340,7 +403,10 @@
   }
 </script>
 
-<div class="code-view">
+<div class="code-view" bind:this={wrapEl}>
+  {#if chipPos !== null}
+    <ReferenceChip x={chipPos.x} y={chipPos.y} />
+  {/if}
   {#if conflict}
     <!-- Quiet concurrent-modification bar: the file changed on disk under us. -->
     <div class="conflict" role="alert">

@@ -26,7 +26,20 @@
     type Workspace,
   } from "./lib/sessions";
   import { EventsSocket } from "./lib/events";
-  import { reconnectingSockets } from "./lib/ws";
+  import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
+  import { get } from "svelte/store";
+  import {
+    activeSelection,
+    clearSelection,
+    composeAgentPathReference,
+    composeFileReference,
+    composeShellPathReference,
+    composeTerminalReference,
+    referenceTarget,
+    setReferenceHandler,
+    setSelection,
+    workspaceRelative,
+  } from "./lib/reference";
   import {
     activateTab,
     allFilePaths,
@@ -45,6 +58,7 @@
     moveTabToIndex,
     openFile,
     openSession,
+    paneForTab,
     pruneFiles,
     pruneSessions,
     serializeLayout,
@@ -138,6 +152,55 @@
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
 
+  // --- context bridge: reference target resolution ---------------------------
+
+  /** Agent sessions this window focused, most recent first. */
+  let agentMru = $state<string[]>([]);
+  $effect(() => {
+    const sid = focusedSessionId;
+    if (sid === null || sessionsById.get(sid)?.kind !== "agent") return;
+    if (agentMru[0] === sid) return;
+    agentMru = [sid, ...agentMru.filter((x) => x !== sid)].slice(0, 16);
+  });
+
+  /**
+   * Where a reference lands: the focused agent session, else the workspace's
+   * most recently active agent, else its newest live agent. Null (no agent
+   * session at all) renders every reference affordance disabled.
+   */
+  const refTargetSession = $derived.by(() => {
+    const focused = focusedSessionId !== null ? sessionsById.get(focusedSessionId) : undefined;
+    if (
+      focused !== undefined &&
+      focused.kind === "agent" &&
+      focused.alive &&
+      focused.workspace_id === activeWsId
+    ) {
+      return focused;
+    }
+    for (const id of agentMru) {
+      const s = sessionsById.get(id);
+      if (s !== undefined && s.kind === "agent" && s.alive && s.workspace_id === activeWsId) {
+        return s;
+      }
+    }
+    let latest: Session | null = null;
+    for (const s of wsSessions) {
+      if (s.kind === "agent" && s.alive && (latest === null || s.created_at >= latest.created_at)) {
+        latest = s;
+      }
+    }
+    return latest;
+  });
+
+  // Publish the target for the affordances (chips + pane-bar button).
+  $effect(() => {
+    const t = refTargetSession;
+    referenceTarget.set(
+      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t) },
+    );
+  });
+
   // Row name is the server-resolved display name (naming rule zero), with
   // the " · n" suffix only as a duplicate tiebreaker within the workspace.
   const displayNames = $derived.by(() => {
@@ -198,7 +261,8 @@
   });
 
   onMount(() => {
-    pool.initPool({ onTitle, onExited, onSocketError });
+    pool.initPool({ onTitle, onExited, onSocketError, onSelection: onTermSelection });
+    setReferenceHandler(referenceSelection);
     const events = new EventsSocket({
       onSessions: applySessions,
       onStatus: (up) => (eventsUp = up),
@@ -215,10 +279,80 @@
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      setReferenceHandler(null);
       events.close();
       pool.disposePool();
     };
   });
+
+  // --- context bridge: selection -> reference --------------------------------
+
+  /** xterm selection changes (pool callback): publish/clear per session. */
+  function onTermSelection(id: string, text: string): void {
+    if (text.trim().length > 0) {
+      setSelection(`term:${id}`, { kind: "terminal", sessionId: id, text });
+    } else {
+      clearSelection(`term:${id}`);
+    }
+  }
+
+  /**
+   * Type `text` into a session's input: through its pooled socket when the
+   * terminal is warm, else a one-shot socket. The composed text never carries
+   * a newline, so nothing is ever submitted. If the session is open in a
+   * pane, surface it so the typed reference is reviewable at a glance.
+   */
+  function typeIntoSession(id: string, text: string): void {
+    if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    if (loc !== null) {
+      layout = activateTab(layout, loc.paneId, loc.index);
+      pool.focusTerminal(id);
+    }
+  }
+
+  /**
+   * The one reference entry point (chord, floating chips, pane-bar button —
+   * parity principle): compose the active selection and type it into the
+   * target agent's input, never submitting.
+   */
+  function referenceSelection(): void {
+    const sel = get(activeSelection);
+    const target = refTargetSession;
+    if (sel === null || target === null) return;
+    let text: string;
+    if (sel.kind === "file") {
+      const root = workspace?.root;
+      const rel = root !== undefined ? workspaceRelative(sel.path, root) : sel.path;
+      text = composeFileReference(rel, sel.startLine, sel.endLine, sel.text);
+    } else {
+      const src = sessionsById.get(sel.sessionId);
+      const name =
+        displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
+      text = composeTerminalReference(name, sel.text);
+    }
+    typeIntoSession(target.id, text);
+  }
+
+  /**
+   * Drag-to-reference drop: type the dropped file's path into the pane's
+   * session — claude agents get the native @mention (workspace-relative),
+   * plain terminals get the shell-escaped path relative to their live cwd.
+   */
+  function referenceFileDrop(paneId: string, path: string): void {
+    const p = findPane(layout.root, paneId);
+    if (p === null) return;
+    const active = p.tabs[p.active];
+    if (active === undefined || active.surface !== "terminal") return;
+    const s = sessionsById.get(active.sessionId);
+    if (s === undefined || !s.alive) return;
+    const root = workspace?.root;
+    const text =
+      s.kind === "agent"
+        ? composeAgentPathReference(root !== undefined ? workspaceRelative(path, root) : path)
+        : composeShellPathReference(path, s.cwd_current ?? s.cwd);
+    typeIntoSession(active.sessionId, text);
+  }
 
   /** Guards overlapping boots (initial load racing a workspace switch). */
   let bootSeq = 0;
@@ -331,6 +465,18 @@
         cycle(1);
         return;
       }
+    }
+
+    // Context bridge: reference the current selection in the target agent.
+    // Spec-pinned chord — ⇧⌘R on macOS, Ctrl+Shift+R elsewhere. Intercepts
+    // only while a selection exists, so the browser's reload chord survives
+    // when there is nothing to reference. Plain Cmd+C is never touched.
+    if (key === "r" && (isMac ? l2 : !l2) && plain) {
+      if (get(activeSelection) !== null) {
+        intercept();
+        referenceSelection();
+      }
+      return;
     }
 
     if (key === "d" && plain) {
@@ -722,6 +868,11 @@
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
+          if (spot.kind === "ref") {
+            // Drag-to-reference: type into the session, never open a tab.
+            if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path);
+            return;
+          }
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
@@ -738,6 +889,18 @@
         },
         onClick,
         onEnd: () => (dropSpot = null),
+        // The "@ reference" band exists over panes showing a LIVE session
+        // (dnd only consults this for file drags).
+        acceptsRef: (paneId) => {
+          const p = findPane(layout.root, paneId);
+          if (p === null) return false;
+          const a = p.tabs[p.active];
+          return (
+            a !== undefined &&
+            a.surface === "terminal" &&
+            (sessionsById.get(a.sessionId)?.alive ?? false)
+          );
+        },
       },
     );
   }

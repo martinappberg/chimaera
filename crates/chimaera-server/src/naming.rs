@@ -13,8 +13,10 @@
 //! the fg pid comes from `tcgetpgrp` on the PTY master (via portable-pty,
 //! portable across unixes); its name and cwd come from `/proc` on Linux and
 //! from libproc (`proc_name` / `PROC_PIDVNODEPATHINFO`) on macOS. Resolved
-//! values land in `AppState::display_names` and nudge the events bus, which
-//! already throttles snapshot pushes.
+//! names land in `AppState::display_names`, the polled cwd in
+//! `AppState::current_cwds` (the `cwd_current` session field, for the context
+//! bridge); both nudge the events bus, which already throttles snapshot
+//! pushes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,28 +35,51 @@ fn poll_interval() -> Duration {
 }
 
 /// Watch one shell session for its lifetime: poll the foreground process,
-/// publish the resolved display name on change, and clean up (broadcasting
-/// a change) once the underlying PTY session is gone.
+/// publish the resolved display name and current working directory on
+/// change, and clean up (broadcasting a change) once the underlying PTY
+/// session is gone.
 pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
     tokio::spawn(async move {
         loop {
             let Some(info) = state.sessions.get(&session_id) else {
-                if crate::lock(&state.display_names)
+                let named = crate::lock(&state.display_names)
                     .remove(&session_id)
-                    .is_some()
-                {
+                    .is_some();
+                let tracked = crate::lock(&state.current_cwds)
+                    .remove(&session_id)
+                    .is_some();
+                if named || tracked {
                     state.changes.notify_waiters();
                 }
                 return;
             };
 
-            if let Some(name) = resolve_shell_name(&state, &info) {
+            let mut changed = false;
+
+            // The shell's cwd, polled once per tick: feeds both the idle name
+            // and the `cwd_current` field on session JSON (context bridge).
+            let cwd = info
+                .pid
+                .and_then(|pid| i32::try_from(pid).ok())
+                .and_then(proc_info::cwd);
+            if let Some(cwd) = &cwd {
+                let mut cwds = crate::lock(&state.current_cwds);
+                if cwds.get(&session_id) != Some(cwd) {
+                    cwds.insert(session_id.clone(), cwd.clone());
+                    changed = true;
+                }
+            }
+
+            if let Some(name) = resolve_shell_name(&state, &info, cwd) {
                 let mut names = crate::lock(&state.display_names);
                 if names.get(&session_id).map(String::as_str) != Some(name.as_str()) {
                     names.insert(session_id.clone(), name);
-                    drop(names);
-                    state.changes.notify_waiters();
+                    changed = true;
                 }
+            }
+
+            if changed {
+                state.changes.notify_waiters();
             }
 
             tokio::time::sleep(poll_interval()).await;
@@ -80,7 +105,12 @@ pub(crate) fn shell_display_name(info: &chimaera_pty::SessionInfo, polled: Optio
 }
 
 /// One poll: resolve what the shell is doing right now, per naming rule zero.
-fn resolve_shell_name(state: &AppState, info: &chimaera_pty::SessionInfo) -> Option<String> {
+/// `polled_cwd` is the watcher's fresh cwd reading for this tick, if any.
+fn resolve_shell_name(
+    state: &AppState,
+    info: &chimaera_pty::SessionInfo,
+    polled_cwd: Option<PathBuf>,
+) -> Option<String> {
     let child = i32::try_from(info.pid?).ok()?;
     let fg = state.sessions.foreground_pid(&info.id).unwrap_or(child);
 
@@ -93,7 +123,7 @@ fn resolve_shell_name(state: &AppState, info: &chimaera_pty::SessionInfo) -> Opt
     }
 
     // Idle shell: name it by where it sits relative to the workspace root.
-    let cwd = proc_info::cwd(child).unwrap_or_else(|| info.cwd.clone());
+    let cwd = polled_cwd.unwrap_or_else(|| info.cwd.clone());
     let shell = proc_info::comm(child).unwrap_or_else(default_shell_name);
     match workspace_root(state, &info.id) {
         Some(root) => match cwd.strip_prefix(&root) {

@@ -13,7 +13,9 @@ import type { Side, SplitDir, Tab, Zone } from "./layout";
 export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
   | { kind: "tab"; paneId: string; index: number }
-  | { kind: "edge"; edge: Side };
+  | { kind: "edge"; edge: Side }
+  /** The "@ reference" band over a session pane's bottom (file drags only). */
+  | { kind: "ref"; paneId: string };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
@@ -84,6 +86,12 @@ export interface DragCallbacks {
   onClick(): void;
   /** Always fired last (drop, click, or cancel). */
   onEnd(): void;
+  /**
+   * Context bridge: true when `paneId` currently shows a live session, so a
+   * FILE drag over it grows the "@ reference" band along its bottom. Omitted
+   * (or false) for non-file drags — the band never appears for tab moves.
+   */
+  acceptsRef?(paneId: string): boolean;
 }
 
 const DRAG_THRESHOLD_PX = 4;
@@ -94,6 +102,7 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "edge" && b.kind === "edge") return a.edge === b.edge;
   if (a.kind === "tab" && b.kind === "tab") return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
+  if (a.kind === "ref" && b.kind === "ref") return a.paneId === b.paneId;
   return false;
 }
 
@@ -127,11 +136,20 @@ function windowEdgeAt(x: number, y: number): DropSpot | null {
   return d[0][1] <= WINDOW_EDGE_PX ? { kind: "edge", edge: d[0][0] } : null;
 }
 
+/** The "@ reference" band covers the bottom ~22% of a session pane. */
+export const REF_BAND_FRAC = 0.22;
+
 /**
- * Hit-test priority: tab bars (precise insertion beats everything), then
- * window edges (a thin band along the stage boundary), then pane zones.
+ * Hit-test priority: tab bars (precise insertion beats everything), then the
+ * "@ reference" band (file drags over session panes — it owns the pane's
+ * bottom, including the stage's bottom-edge strip there), then window edges,
+ * then pane zones.
  */
-function spotAt(x: number, y: number): DropSpot | null {
+function spotAt(
+  x: number,
+  y: number,
+  refFor: ((paneId: string) => boolean) | null,
+): DropSpot | null {
   let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
     const r = reg.root.getBoundingClientRect();
@@ -154,13 +172,22 @@ function spotAt(x: number, y: number): DropSpot | null {
     paneHit = { paneId, r };
     break;
   }
+  const refActive = paneHit !== null && refFor !== null && refFor(paneHit.paneId);
+  if (refActive && paneHit !== null) {
+    const ny = (y - paneHit.r.top) / paneHit.r.height;
+    if (ny >= 1 - REF_BAND_FRAC) return { kind: "ref", paneId: paneHit.paneId };
+  }
   const edge = windowEdgeAt(x, y);
   if (edge !== null) return edge;
   if (paneHit !== null) {
     const { paneId, r } = paneHit;
     const nx = (x - r.left) / r.width;
     const ny = (y - r.top) / r.height;
-    return { kind: "zone", paneId, zone: zoneAt(nx, ny) };
+    let zone = zoneAt(nx, ny);
+    // With the reference band active, the pane's bottom belongs to it — the
+    // sliver between center and the band reads as center, never bottom-split.
+    if (refActive && zone === "bottom") zone = "center";
+    return { kind: "zone", paneId, zone };
   }
   return null;
 }
@@ -197,12 +224,16 @@ export function startDrag(e: PointerEvent, payload: DragPayload, cb: DragCallbac
     // capture can fail if the pointer is already gone; drag still works
   }
 
+  // The reference band only exists for FILE drags (the payload is the gate;
+  // the callback decides per-pane whether a live session sits there).
+  const refFor = payload.tab.surface === "file" ? (cb.acceptsRef?.bind(cb) ?? null) : null;
+
   const update = () => {
     raf = 0;
     if (ghost !== null) {
       ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
     }
-    const next = spotAt(lastX, lastY);
+    const next = spotAt(lastX, lastY, refFor);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
