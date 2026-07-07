@@ -465,13 +465,87 @@ pub fn release_triple(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
-/// The GitHub `releases/download` URL for the daemon asset matching `triple`
-/// in release `vversion` of [`chimaera_core::REPOSITORY`].
-fn release_asset_url(version: &str, triple: &str) -> String {
-    format!(
-        "{}/releases/download/v{version}/chimaera-{triple}",
-        chimaera_core::REPOSITORY.trim_end_matches('/'),
-    )
+/// A daemon asset resolved from the GitHub releases API: the release version
+/// it belongs to, its download URL, and its published sha256 (hex).
+struct ReleaseAsset {
+    version: String,
+    url: String,
+    sha256: String,
+}
+
+/// Resolve the daemon asset to download for `triple`. Prefers the release this
+/// build came from (`v{VERSION}` — so a real release's daemon shares our build
+/// id and connect never loops "updating"); falls back to GitHub's `latest`
+/// release when there is no matching one, so a dev build (version `0.0.1`) — or
+/// any version without a published release — still gets a working daemon
+/// instead of a hard 404.
+async fn resolve_release_asset(triple: &str) -> anyhow::Result<ReleaseAsset> {
+    let asset_name = format!("chimaera-{triple}");
+    let version = chimaera_core::VERSION;
+    if let Some(a) = release_asset(&format!("tags/v{version}"), &asset_name).await? {
+        return Ok(a);
+    }
+    tracing::info!("no v{version} release with {asset_name}; falling back to the latest release");
+    release_asset("latest", &asset_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no published release provides {asset_name}"))
+}
+
+/// Look up `asset_name` in the release identified by `release_ref`
+/// (`tags/vX.Y.Z` or `latest`) via the GitHub API. `Ok(None)` when that release
+/// doesn't exist or lacks the asset — so the caller can fall back — and `Err`
+/// only on a transport/parse failure.
+async fn release_asset(
+    release_ref: &str,
+    asset_name: &str,
+) -> anyhow::Result<Option<ReleaseAsset>> {
+    let repo = repo_slug().context("could not derive the repo from the repository URL")?;
+    let api = format!("https://api.github.com/repos/{repo}/releases/{release_ref}");
+    // No `-f`: a missing release answers 404 with a JSON body we detect below,
+    // which we want to treat as "fall back", not as a curl error.
+    let out = Command::new("curl")
+        .args(["-sSL", "-H", "Accept: application/vnd.github+json", &api])
+        .output()
+        .await
+        .context("failed to run curl (is it installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "release metadata request failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let meta: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
+    // A missing release is `{"message": "Not Found", ...}` — no `tag_name`.
+    let Some(tag) = meta.get("tag_name").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(asset) = meta
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(serde_json::Value::as_str) == Some(asset_name))
+        })
+    else {
+        return Ok(None);
+    };
+    let url = asset
+        .get("browser_download_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{asset_name} in {tag} has no download url"))?;
+    let sha256 = asset
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("release {tag} has no checksum for {asset_name}"))?
+        .trim_start_matches("sha256:")
+        .to_string();
+    Ok(Some(ReleaseAsset {
+        version: tag.trim_start_matches('v').to_string(),
+        url: url.to_string(),
+        sha256,
+    }))
 }
 
 /// Where auto-fetched daemon binaries are cached: `~/.chimaera/dist/cache/`,
@@ -485,12 +559,10 @@ fn download_cache_path(triple: &str, version: &str) -> PathBuf {
         .join(format!("chimaera-{triple}-{version}"))
 }
 
-/// Fetch the daemon binary matching `(os, arch)` from the GitHub release this
-/// build came from (`chimaera_core::VERSION`), caching it under
-/// [`download_cache_path`]. This is the end-user auto-install path — the app
-/// ships no repo and no `just dist` stash, but the release that produced it
-/// carries a musl daemon built from the same commit, so its build id matches
-/// ours and connect won't loop trying to "update" it.
+/// Fetch the daemon binary matching `(os, arch)` from GitHub releases (see
+/// [`resolve_release_asset`] for version-vs-latest selection), caching it under
+/// [`download_cache_path`] keyed by the resolved version. This is the end-user
+/// auto-install path — the app ships no repo and no `just dist` stash.
 ///
 /// Downloads with the system `curl` (kept dependency-free, like every other
 /// ssh/scp/curl shell-out here) and verifies the bytes against the release's
@@ -503,8 +575,8 @@ async fn fetch_release_binary(
 ) -> anyhow::Result<PathBuf> {
     let triple = release_triple(os, arch)
         .ok_or_else(|| anyhow::anyhow!("no prebuilt daemon is published for {os}/{arch}"))?;
-    let version = chimaera_core::VERSION;
-    let cached = download_cache_path(triple, version);
+    let asset = resolve_release_asset(triple).await?;
+    let cached = download_cache_path(triple, &asset.version);
     if cached.is_file() {
         tracing::info!("using cached daemon {}", cached.display());
         return Ok(cached);
@@ -513,31 +585,35 @@ async fn fetch_release_binary(
         target: triple.to_string(),
     });
 
-    let url = release_asset_url(version, triple);
     let tmp = cached.with_extension("part");
     if let Some(parent) = cached.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    tracing::info!("downloading daemon from {url}");
+    tracing::info!("downloading daemon {} from {}", asset.version, asset.url);
     let out = Command::new("curl")
         .args(["-fSL", "--retry", "2", "-o"])
         .arg(&tmp)
-        .arg(&url)
+        .arg(&asset.url)
         .output()
         .await
         .context("failed to run curl (is it installed?)")?;
     if !out.status.success() {
         std::fs::remove_file(&tmp).ok();
         bail!(
-            "could not download {url}: {}",
+            "could not download {}: {}",
+            asset.url,
             String::from_utf8_lossy(&out.stderr).trim(),
         );
     }
 
-    if let Err(e) = verify_sha256(&tmp, version, triple).await {
+    let got = sha256_file(&tmp).await?;
+    if !got.eq_ignore_ascii_case(&asset.sha256) {
         std::fs::remove_file(&tmp).ok();
-        return Err(e);
+        bail!(
+            "checksum mismatch on the downloaded daemon (expected {}, got {got})",
+            asset.sha256,
+        );
     }
 
     let mut perms = std::fs::metadata(&tmp)?.permissions();
@@ -547,57 +623,6 @@ async fn fetch_release_binary(
         .with_context(|| format!("failed to finalize {}", cached.display()))?;
     tracing::info!("cached daemon at {}", cached.display());
     Ok(cached)
-}
-
-/// Verify `file` against the sha256 the GitHub release publishes for this
-/// asset. The digest comes from the release API (`assets[].digest`); the
-/// local hash is computed with `shasum`/`sha256sum` (no crypto dependency in
-/// this lean crate). A digest we can't fetch is a hard failure, not a skip —
-/// this gate exists precisely for the download we're about to execute
-/// remotely.
-async fn verify_sha256(file: &Path, version: &str, triple: &str) -> anyhow::Result<()> {
-    let want = release_asset_sha256(version, triple)
-        .await
-        .context("could not fetch the release checksum to verify the download against")?;
-    let got = sha256_file(file).await?;
-    if !got.eq_ignore_ascii_case(&want) {
-        bail!("checksum mismatch on the downloaded daemon (expected {want}, got {got})");
-    }
-    tracing::debug!("daemon checksum verified ({want})");
-    Ok(())
-}
-
-/// The published sha256 (hex, no `sha256:` prefix) for `chimaera-<triple>` in
-/// release `vversion`, read from the GitHub releases API via `curl`.
-async fn release_asset_sha256(version: &str, triple: &str) -> anyhow::Result<String> {
-    let repo = repo_slug().context("could not derive the repo from the repository URL")?;
-    let api = format!("https://api.github.com/repos/{repo}/releases/tags/v{version}");
-    let out = Command::new("curl")
-        .args(["-fsSL", "-H", "Accept: application/vnd.github+json", &api])
-        .output()
-        .await
-        .context("failed to run curl")?;
-    if !out.status.success() {
-        bail!(
-            "release metadata request failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let meta: serde_json::Value =
-        serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
-    let asset_name = format!("chimaera-{triple}");
-    let digest = meta
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .and_then(|assets| {
-            assets.iter().find(|a| {
-                a.get("name").and_then(serde_json::Value::as_str) == Some(asset_name.as_str())
-            })
-        })
-        .and_then(|a| a.get("digest"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("release v{version} has no checksum for {asset_name}"))?;
-    Ok(digest.trim_start_matches("sha256:").to_string())
 }
 
 /// `owner/repo` from [`chimaera_core::REPOSITORY`] (`https://github.com/owner/repo`).
@@ -871,18 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn release_asset_url_is_the_github_download_path() {
-        // Mirrors the assets `attach-daemons` uploads to each release.
-        let url = release_asset_url("0.1.1", "x86_64-unknown-linux-musl");
-        assert!(url.starts_with("https://github.com/"), "{url}");
-        assert!(
-            url.ends_with("/releases/download/v0.1.1/chimaera-x86_64-unknown-linux-musl"),
-            "{url}"
-        );
+    fn repo_slug_drives_the_release_api() {
         assert_eq!(
             repo_slug().as_deref(),
             Some("martinappberg/chimaera"),
-            "repo slug drives the release API url"
+            "owner/repo feeds the api.github.com releases url"
         );
     }
 
