@@ -87,6 +87,45 @@ pub(crate) async fn create_workspace(
     }
 }
 
+/// POST /api/v1/workspaces/{id}/open — stamp a workspace as freshly opened
+/// (home-screen recency), returning it.
+pub(crate) async fn open_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::lock(&state.workspaces).touch(&id) {
+        Some(workspace) => Json(workspace).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/v1/workspaces/{id} — unregister a workspace (files untouched).
+pub(crate) async fn delete_workspace(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::lock(&state.workspaces).remove(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to persist workspace removal");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
 /// `agent_state`, `agent_title`, `files_touched`, `display_name` and
 /// `cwd_current` fields.
@@ -205,7 +244,9 @@ pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
 ) -> Response {
-    let Some(workspace) = crate::lock(&state.workspaces).get(&body.workspace_id) else {
+    // Touch doubles as the lookup: activity in a workspace is what "recently
+    // used" means on the home screen.
+    let Some(workspace) = crate::lock(&state.workspaces).touch(&body.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown workspace {}", body.workspace_id)})),

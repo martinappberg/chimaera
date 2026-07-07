@@ -111,6 +111,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
         )
+        .route("/workspaces/{id}", delete(api::delete_workspace))
+        .route("/workspaces/{id}/open", post(api::open_workspace))
         .route(
             "/sessions",
             get(api::list_sessions).post(api::create_session),
@@ -460,6 +462,68 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(err["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn workspaces_open_and_delete() {
+        let state = test_state();
+        let root = test_dir("ws-open-del");
+
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = ws["id"].as_str().unwrap().to_string();
+        let stamped = ws["last_opened_at"].as_u64().unwrap();
+        assert!(stamped > 0, "registration stamps last_opened_at");
+
+        // Touch returns the workspace with a fresh (>=) stamp.
+        let (status, touched) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/workspaces/{id}/open"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(touched["id"], ws["id"]);
+        assert!(touched["last_opened_at"].as_u64().unwrap() >= stamped);
+
+        // Unknown ids 404 on both endpoints.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces/w-00000000/open",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = request(
+            &state,
+            Method::DELETE,
+            "/api/v1/workspaces/w-00000000",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // DELETE unregisters (files untouched) and the list empties.
+        let (status, _) = request(
+            &state,
+            Method::DELETE,
+            &format!("/api/v1/workspaces/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(root.is_dir(), "delete never touches the directory");
+        let (status, list) = request(&state, Method::GET, "/api/v1/workspaces", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list.as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
