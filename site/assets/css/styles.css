@@ -1,5 +1,5 @@
 /* ============================================================================
-   chimaera — public site
+   chimaera public site
    Tuned to match the app's own restraint (web-ui HomeScreen / app.css):
    quiet muted palette, bordered ghost buttons (accent only on hover/borders),
    small lowercase mono labels, thin line marks, small radii, minimal shadow.
@@ -46,7 +46,7 @@
   --rate: #8a68c0;
   --term-bg: #ffffff;
 
-  /* Brand-mark ramp (BrandMark.svelte light) — flipped in the dark block. */
+  /* Brand-mark ramp (BrandMark.svelte light), flipped in the dark block. */
   --bm-1: #5c5c62;
 
   --scrim: rgba(17, 17, 22, 0.4);
@@ -169,7 +169,7 @@ pre {
   padding-inline: 24px;
 }
 
-/* Small, quiet section label — the app's lowercase muted mono register. */
+/* Small, quiet section label, the app's lowercase muted mono register. */
 .eyebrow {
   font-family: var(--mono);
   font-size: 12px;
@@ -252,7 +252,7 @@ pre {
 }
 
 /* Primary = the one accented action: accent border + accent text, soft-fill
-   on hover. No loud green fill — matches the app's reserved use of accent. */
+   on hover. No loud green fill, matches the app's reserved use of accent. */
 .btn--primary {
   border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
   color: var(--accent);
@@ -413,7 +413,7 @@ pre {
   opacity: 0.8;
 }
 
-/* --- Workbench mockup (flat, subtle — no glow/tilt) ------------------------- */
+/* --- Workbench mockup (flat, subtle, no glow/tilt) ------------------------- */
 .mock-frame {
   margin-top: clamp(36px, 5vw, 56px);
 }
@@ -513,7 +513,7 @@ pre {
 
 .mock__stage {
   display: grid;
-  grid-template-columns: 1.15fr 1fr;
+  grid-template-columns: 1.5fr 0.95fr 0.95fr;
   background: var(--bg);
 }
 .pane {
@@ -555,6 +555,8 @@ pre {
 
 .term {
   flex: 1;
+  display: flex;
+  flex-direction: column;
   background: var(--term-bg);
   padding: 12px 14px;
   font-family: var(--mono);
@@ -562,6 +564,10 @@ pre {
   line-height: 1.6;
   color: var(--fg);
   overflow: hidden;
+}
+.term__log {
+  flex: 1;
+  min-height: 0;
 }
 .term .l {
   white-space: pre;
@@ -577,6 +583,39 @@ pre {
 }
 .term .box {
   color: var(--muted);
+}
+.term .add {
+  color: var(--accent);
+}
+.term .del {
+  color: #cf6a5f;
+}
+.term__prompt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 7px;
+  color: var(--fg);
+}
+.term__prompt .g {
+  color: var(--accent);
+}
+.term__prompt .ph {
+  color: var(--faint);
+}
+.term__status {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 7px;
+  padding: 0 3px;
+  font-size: 10.5px;
+  color: var(--faint);
+}
+.term__status .acc {
+  color: var(--accent);
 }
 .term .cursor {
   display: inline-block;
@@ -601,27 +640,42 @@ pre {
   gap: 10px;
   overflow: hidden;
 }
-.preview__title {
+.preview__cap {
   font-family: var(--mono);
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 10.5px;
+  color: var(--faint);
 }
-.chart {
+.volcano {
   flex: 1;
-  display: flex;
-  align-items: flex-end;
-  gap: 7px;
-  padding: 8px 4px 4px;
-  border-bottom: 1px solid var(--edge);
+  width: 100%;
+  min-height: 0;
 }
-.chart .bar {
-  flex: 1;
-  border-radius: 3px 3px 0 0;
-  background: var(--accent);
-  opacity: 0.85;
+.volcano .axis {
+  stroke: var(--edge);
+  stroke-width: 1;
 }
-.chart .bar:nth-child(3n) {
-  background: var(--rate);
+.volcano .thr {
+  stroke: var(--faint);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.45;
+}
+.volcano .ns {
+  fill: var(--faint);
+  opacity: 0.38;
+}
+.volcano .up {
+  fill: var(--accent);
+  opacity: 0.9;
+}
+.volcano .dn {
+  fill: var(--rate);
+  opacity: 0.9;
+}
+.volcano text {
+  fill: var(--faint);
+  font-family: var(--mono);
+  font-size: 8px;
 }
 .preview__legend {
   display: flex;
@@ -639,6 +693,54 @@ pre {
   width: 8px;
   height: 8px;
   border-radius: 2px;
+}
+
+.mdview {
+  flex: 1;
+  background: var(--bg);
+  padding: 14px 15px;
+  overflow: hidden;
+  color: var(--muted);
+}
+.mdview__h1 {
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--fg);
+  margin-bottom: 6px;
+}
+.mdview__meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  margin-bottom: 13px;
+}
+.mdview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.mdview th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--faint);
+  border-bottom: 1px solid var(--edge);
+  padding: 5px 6px;
+}
+.mdview td {
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--edge);
+  color: var(--muted);
+}
+.mdview tr:last-child td {
+  border-bottom: none;
+}
+.mdview td.up {
+  color: var(--accent);
+}
+.mdview td.dn {
+  color: var(--rate);
 }
 
 .mock__strip {
@@ -730,6 +832,10 @@ pre {
 }
 .showcase--flip .showcase__media {
   order: -1;
+}
+.showcase__body,
+.showcase__media {
+  min-width: 0;
 }
 .showcase__body h2 {
   font-size: clamp(22px, 2.6vw, 28px);
@@ -1219,16 +1325,7 @@ kbd {
   .nav__actions {
     margin-left: 0;
   }
-  .mock__body {
-    grid-template-columns: 1fr;
-  }
-  .mock__rail {
-    display: none;
-  }
-  .mock__stage {
-    grid-template-columns: 1fr;
-  }
-  .pane:nth-child(2) {
+  .mock-frame {
     display: none;
   }
   .features {

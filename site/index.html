@@ -3,24 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>chimaera — an agent workbench, not an IDE</title>
+    <title>chimaera: an agent workbench, not an IDE</title>
     <meta
       name="description"
-      content="chimaera runs your coding-agent sessions as persistent, daemon-owned processes on whatever host owns the work — laptop, dev server, or HPC login node — with a workspace-first UI around them. One static Rust binary. Sessions survive disconnect."
+      content="chimaera runs Claude Code, Codex, and other coding agents as persistent sessions on the machine your code lives on, from a laptop to an HPC login node. Sessions survive disconnect, and their plots and reports render right beside them. One static Rust binary, no root, no containers."
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/css/styles.css" />
 
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="chimaera — an agent workbench, not an IDE" />
+    <meta property="og:title" content="chimaera: an agent workbench, not an IDE" />
     <meta
       property="og:description"
-      content="Persistent, daemon-owned agent sessions on whatever host owns the work — laptop, dev server, or HPC login node. One static Rust binary. Sessions survive disconnect."
+      content="Persistent coding-agent sessions on the machine your code lives on, from a laptop to an HPC login node. Sessions survive disconnect, and their plots and reports render right beside them. One static Rust binary, no root."
     />
     <meta property="og:image" content="https://martinappberg.github.io/chimaera/assets/img/og.png" />
     <meta property="og:url" content="https://martinappberg.github.io/chimaera/" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="chimaera — an agent workbench, not an IDE" />
+    <meta name="twitter:title" content="chimaera: an agent workbench, not an IDE" />
     <meta
       name="twitter:description"
       content="Persistent, daemon-owned agent sessions on whatever host owns the work. One static Rust binary. Sessions survive disconnect."
@@ -100,10 +100,14 @@
           <div class="hero__head">
             <h1>An agent workbench, not an IDE.</h1>
             <p class="hero__sub">
-              chimaera runs your coding agents as persistent, daemon-owned
-              sessions on whatever host owns the work — your laptop, a dev
-              server, or an HPC login node — with a workspace-first UI around
-              them. Close your laptop mid-run and the sessions keep going.
+              chimaera runs Claude Code, Codex, and other coding agents as
+              persistent sessions on the machine your code already lives on,
+              from your laptop to an HPC login node. A closed window or a
+              dropped SSH connection never interrupts a run; reconnect and every
+              session is exactly where you left it. Plots, reports, and
+              notebooks render right beside the agent that made them, so one
+              window does the job of your editor, your terminal multiplexer, and
+              your file browser.
             </p>
             <div class="hero__cta">
               <a class="btn btn--primary" href="#download">
@@ -122,12 +126,12 @@
 
           <!-- Workbench mockup -->
           <div class="mock-frame">
-            <div class="mock" role="img" aria-label="The chimaera workbench: a rail of terminal and agent sessions on the left, a split view with a running Claude Code session next to a report preview, and a session strip showing which agent needs attention.">
+            <div class="mock" role="img" aria-label="The chimaera workbench: a rail of terminal and agent sessions on the left, a split view with a running Claude Code session, a volcano-plot preview, and a differential-expression report, and a session strip showing which agent needs attention.">
               <div class="mock__bar">
                 <div class="mock__dots"><i></i><i></i><i></i></div>
                 <div class="mock__title">
                   <svg class="hexmark" width="13" height="13" viewBox="0 0 240 240" aria-hidden="true"><g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"><path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/><path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/></g></svg>
-                  rnaseq-pipeline — ssh://gpu-node
+                  rnaseq-pipeline · ssh://gpu-node
                 </div>
               </div>
               <div class="mock__body">
@@ -163,20 +167,27 @@
                       </span>
                     </div>
                     <div class="term" aria-hidden="true">
-<div class="l"><span class="g">&gt;</span> the volcano plot is using the wrong contrast — fix it</div>
+                      <div class="term__log">
+<div class="l"><span class="g">&gt;</span> volcano plot uses the wrong contrast, fix it</div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="box">⏺</span> I'll switch the contrast to <span class="y">treated_vs_control</span> and</div>
-<div class="l">&nbsp;&nbsp;regenerate the figure.</div>
+<div class="l"><span class="g">⏺</span> Switching the DESeq2 contrast to treated vs</div>
+<div class="l">&nbsp;&nbsp;control and regenerating the figure.</div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="m">⎿</span> <span class="box">Edit</span> scripts/deseq2.R</div>
-<div class="l">&nbsp;&nbsp;<span class="g">+</span> res &lt;- results(dds, contrast=c("cond","treated","control"))</div>
-<div class="l">&nbsp;&nbsp;<span class="m">-</span> res &lt;- results(dds)</div>
+<div class="l"><span class="g">⏺</span> Update<span class="m">(scripts/deseq2.R)</span></div>
+<div class="l">&nbsp;&nbsp;<span class="m">⎿ Updated · 1 addition, 1 removal</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="del">- res &lt;- results(dds)</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">+ res &lt;- results(dds, contrast =</span></div>
+<div class="l">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="add">c("cond","treated","control"))</span></div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="m">⎿</span> <span class="box">Bash</span> Rscript scripts/deseq2.R</div>
-<div class="l">&nbsp;&nbsp;<span class="m">saved figures/volcano.png · 2,214 DE genes</span></div>
+<div class="l"><span class="g">⏺</span> Bash<span class="m">(Rscript scripts/deseq2.R)</span></div>
+<div class="l">&nbsp;&nbsp;<span class="m">⎿ figures/volcano.png · 2,214 DE genes</span></div>
 <div class="l">&nbsp;</div>
-<div class="l"><span class="box">⏺</span> Done — the volcano now uses the treated vs</div>
-<div class="l">&nbsp;&nbsp;control contrast. <span class="cursor"></span></div>
+<div class="l"><span class="g">⏺</span> Write<span class="m">(results/deseq2_report.md)</span></div>
+<div class="l">&nbsp;</div>
+<div class="l"><span class="g">⏺</span> Done. Using treated vs control now.</div>
+                      </div>
+                      <div class="term__prompt"><span class="g">&gt;</span> <span class="cursor"></span> <span class="ph">run the QC summary next</span></div>
+                      <div class="term__status"><span><span class="acc">⏵⏵</span> accept edits on</span><span>claude-opus-4.8</span></div>
                     </div>
                   </section>
 
@@ -188,25 +199,44 @@
                       </span>
                     </div>
                     <div class="preview" aria-hidden="true">
-                      <div class="preview__title">figures/volcano.png · differential expression</div>
-                      <div class="chart">
-                        <span class="bar" style="height: 38%"></span>
-                        <span class="bar" style="height: 62%"></span>
-                        <span class="bar" style="height: 30%"></span>
-                        <span class="bar" style="height: 78%"></span>
-                        <span class="bar" style="height: 52%"></span>
-                        <span class="bar" style="height: 90%"></span>
-                        <span class="bar" style="height: 44%"></span>
-                        <span class="bar" style="height: 68%"></span>
-                        <span class="bar" style="height: 34%"></span>
-                        <span class="bar" style="height: 58%"></span>
-                        <span class="bar" style="height: 82%"></span>
-                        <span class="bar" style="height: 48%"></span>
-                      </div>
+                      <div class="preview__cap">treated vs control</div>
+                      <svg class="volcano" viewBox="0 0 260 166" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+                        <line class="axis" x1="32" y1="146" x2="252" y2="146"/>
+                        <line class="axis" x1="32" y1="146" x2="32" y2="14"/>
+                        <line class="thr" x1="124" y1="20" x2="124" y2="146"/>
+                        <line class="thr" x1="160" y1="20" x2="160" y2="146"/>
+                        <line class="thr" x1="32" y1="125" x2="252" y2="125"/>
+                        <circle cx="137.9" cy="133.8" r="1.7" class="ns"/><circle cx="160.0" cy="136.2" r="1.7" class="ns"/><circle cx="160.0" cy="140.8" r="1.7" class="ns"/><circle cx="136.4" cy="143.4" r="1.7" class="ns"/><circle cx="115.0" cy="135.1" r="1.7" class="ns"/><circle cx="145.8" cy="121.0" r="1.7" class="ns"/><circle cx="127.6" cy="131.2" r="1.7" class="ns"/><circle cx="172.7" cy="136.7" r="1.7" class="ns"/><circle cx="147.0" cy="138.5" r="1.7" class="ns"/><circle cx="146.1" cy="133.8" r="1.7" class="ns"/><circle cx="132.0" cy="132.2" r="1.7" class="ns"/><circle cx="147.2" cy="142.5" r="1.7" class="ns"/><circle cx="134.8" cy="132.1" r="1.7" class="ns"/><circle cx="126.7" cy="136.7" r="1.7" class="ns"/><circle cx="148.9" cy="126.7" r="1.7" class="ns"/><circle cx="124.4" cy="131.2" r="1.7" class="ns"/><circle cx="140.3" cy="127.1" r="1.7" class="ns"/><circle cx="154.4" cy="130.6" r="1.7" class="ns"/><circle cx="152.8" cy="134.9" r="1.7" class="ns"/><circle cx="128.5" cy="123.6" r="1.7" class="ns"/><circle cx="152.0" cy="132.3" r="1.7" class="ns"/><circle cx="124.3" cy="133.2" r="1.7" class="ns"/><circle cx="162.9" cy="126.5" r="1.7" class="ns"/><circle cx="139.1" cy="135.7" r="1.7" class="ns"/><circle cx="111.2" cy="126.5" r="1.7" class="ns"/><circle cx="138.6" cy="128.5" r="1.7" class="ns"/><circle cx="159.8" cy="142.6" r="1.7" class="ns"/><circle cx="146.2" cy="135.8" r="1.7" class="ns"/><circle cx="150.4" cy="136.0" r="1.7" class="ns"/><circle cx="146.6" cy="138.3" r="1.7" class="ns"/><circle cx="110.0" cy="130.8" r="1.7" class="ns"/><circle cx="150.6" cy="135.0" r="1.7" class="ns"/><circle cx="120.8" cy="126.5" r="1.7" class="ns"/><circle cx="147.9" cy="138.0" r="1.7" class="ns"/><circle cx="144.0" cy="127.2" r="1.7" class="ns"/><circle cx="141.9" cy="140.9" r="1.7" class="ns"/><circle cx="127.7" cy="125.9" r="1.7" class="ns"/><circle cx="134.9" cy="127.2" r="1.7" class="ns"/><circle cx="139.6" cy="133.8" r="1.7" class="ns"/><circle cx="148.2" cy="115.5" r="1.7" class="ns"/><circle cx="129.2" cy="137.8" r="1.7" class="ns"/><circle cx="138.1" cy="142.3" r="1.7" class="ns"/><circle cx="144.5" cy="136.1" r="1.7" class="ns"/><circle cx="142.3" cy="144.4" r="1.7" class="ns"/><circle cx="154.4" cy="139.3" r="1.7" class="ns"/><circle cx="157.7" cy="133.4" r="1.7" class="ns"/><circle cx="141.8" cy="131.9" r="1.7" class="ns"/><circle cx="164.6" cy="126.5" r="1.7" class="ns"/><circle cx="123.8" cy="142.4" r="1.7" class="ns"/><circle cx="153.9" cy="137.2" r="1.7" class="ns"/><circle cx="146.6" cy="139.8" r="1.7" class="ns"/><circle cx="160.9" cy="140.3" r="1.7" class="ns"/><circle cx="138.3" cy="140.1" r="1.7" class="ns"/><circle cx="174.0" cy="136.2" r="1.7" class="ns"/><circle cx="140.9" cy="133.5" r="1.7" class="ns"/><circle cx="144.7" cy="124.5" r="1.7" class="ns"/><circle cx="136.5" cy="131.0" r="1.7" class="ns"/><circle cx="173.6" cy="136.0" r="1.7" class="ns"/><circle cx="153.1" cy="126.8" r="1.7" class="ns"/><circle cx="126.9" cy="144.5" r="1.7" class="ns"/>
+                        <circle cx="204.6" cy="80.3" r="1.7" class="up"/><circle cx="187.0" cy="41.9" r="1.7" class="up"/><circle cx="209.6" cy="92.4" r="1.7" class="up"/><circle cx="243.2" cy="115.9" r="1.7" class="up"/><circle cx="206.9" cy="91.6" r="1.7" class="up"/><circle cx="191.4" cy="64.8" r="1.7" class="up"/><circle cx="193.2" cy="66.6" r="1.7" class="up"/><circle cx="168.6" cy="114.0" r="1.7" class="up"/><circle cx="201.0" cy="110.9" r="1.7" class="up"/><circle cx="168.5" cy="115.1" r="1.7" class="up"/><circle cx="213.9" cy="63.6" r="1.7" class="up"/><circle cx="218.0" cy="110.2" r="1.7" class="up"/><circle cx="188.8" cy="115.8" r="1.7" class="up"/><circle cx="204.0" cy="40.3" r="1.7" class="up"/><circle cx="171.2" cy="41.1" r="1.7" class="up"/><circle cx="208.4" cy="89.2" r="1.7" class="up"/><circle cx="177.4" cy="45.4" r="1.7" class="up"/><circle cx="186.9" cy="100.9" r="1.7" class="up"/><circle cx="196.7" cy="72.9" r="1.7" class="up"/><circle cx="218.5" cy="112.4" r="1.7" class="up"/><circle cx="211.3" cy="43.2" r="1.7" class="up"/><circle cx="217.6" cy="89.2" r="1.7" class="up"/>
+                        <circle cx="110.4" cy="61.0" r="1.7" class="dn"/><circle cx="94.9" cy="84.3" r="1.7" class="dn"/><circle cx="71.4" cy="94.3" r="1.7" class="dn"/><circle cx="102.5" cy="97.6" r="1.7" class="dn"/><circle cx="110.4" cy="66.2" r="1.7" class="dn"/><circle cx="91.3" cy="103.4" r="1.7" class="dn"/><circle cx="97.2" cy="65.9" r="1.7" class="dn"/><circle cx="95.6" cy="53.0" r="1.7" class="dn"/><circle cx="98.1" cy="60.5" r="1.7" class="dn"/><circle cx="70.2" cy="45.6" r="1.7" class="dn"/><circle cx="109.1" cy="64.6" r="1.7" class="dn"/><circle cx="110.0" cy="115.7" r="1.7" class="dn"/><circle cx="108.5" cy="59.7" r="1.7" class="dn"/><circle cx="119.2" cy="87.8" r="1.7" class="dn"/><circle cx="100.5" cy="88.2" r="1.7" class="dn"/><circle cx="107.6" cy="81.4" r="1.7" class="dn"/><circle cx="64.8" cy="86.3" r="1.7" class="dn"/><circle cx="87.4" cy="61.5" r="1.7" class="dn"/>
+                        <text x="142" y="162" text-anchor="middle">log₂ fold change</text>
+                        <text x="12" y="82" text-anchor="middle" transform="rotate(-90 12 82)">−log₁₀ padj</text>
+                      </svg>
                       <div class="preview__legend">
-                        <span><i style="background: var(--accent)"></i> upregulated</span>
-                        <span><i style="background: var(--rate)"></i> downregulated</span>
+                        <span><i style="background: var(--accent)"></i> up</span>
+                        <span><i style="background: var(--rate)"></i> down</span>
+                        <span><i style="background: var(--faint)"></i> n.s.</span>
                       </div>
+                    </div>
+                  </section>
+
+                  <section class="pane">
+                    <div class="pane__tabs">
+                      <span class="tab active">
+                        <svg class="glyph" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h10v10H3z" fill="none"/><path d="M5 6.5h6M5 9h6M5 11h3.5"/></svg>
+                        deseq2_report.md
+                      </span>
+                    </div>
+                    <div class="mdview" aria-hidden="true">
+                      <h4 class="mdview__h1">Differential expression</h4>
+                      <p class="mdview__meta">treated vs control · 2,214 genes at padj &lt; 0.05</p>
+                      <table>
+                        <tr><th>gene</th><th>log₂FC</th><th>padj</th></tr>
+                        <tr><td>IL6</td><td class="up">+3.1</td><td>2e-11</td></tr>
+                        <tr><td>MMP9</td><td class="up">+2.7</td><td>8e-10</td></tr>
+                        <tr><td>CXCL8</td><td class="up">+2.4</td><td>4e-09</td></tr>
+                        <tr><td>SOD2</td><td class="dn">−1.9</td><td>1e-06</td></tr>
+                      </table>
                     </div>
                   </section>
 
@@ -227,15 +257,15 @@
         <div class="wrap">
           <div class="section-head" style="max-width: 720px">
             <span class="eyebrow">why it exists</span>
-            <h2>One program instead of two half-fits</h2>
+            <h2>One tool instead of two half-fits</h2>
             <p>
-              Running agents on a remote machine usually means two tools:
+              Running agents on a remote machine usually takes two tools:
               code-server in a browser tab to look at files, and tmux over SSH
-              to keep the agents alive. Browser terminals die on reload; tmux
-              shows no file output. And the result of an agent run is usually
-              files — reports, plots, tables — that neither tool puts next to
-              the session that produced them. chimaera does both jobs, in one
-              window, on the host that owns the work.
+              to keep the agents alive. Browser terminals die on reload, tmux
+              shows no file output, and the files an agent produces (reports,
+              plots, tables) end up nowhere near the session that produced them.
+              chimaera does both jobs in one window, on the machine that owns
+              the work.
             </p>
           </div>
         </div>
@@ -256,7 +286,8 @@
               <div class="feature__body"><p>
                 The daemon holds every PTY with full server-side terminal state.
                 Reload, reconnect, or reattach from another machine and you get
-                the same screen back — no lost scrollback, no broken reconnect.
+                the same screen back, with no lost scrollback and no broken
+                reconnect.
               </p></div>
             </article>
 
@@ -264,10 +295,10 @@
               <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h9"/><circle cx="18.5" cy="18" r="2.5"/></svg></div>
               <h3>One launcher for your agents</h3>
               <div class="feature__body"><p>
-                Claude Code, Codex, Gemini CLI and Antigravity — detected if
-                installed, resumable per workspace, installable from official
-                sources. Binaries live under <code>~/.chimaera</code>;
-                credentials stay yours.
+                Claude Code, Codex, Gemini CLI, and Antigravity, each detected
+                if installed, resumable per workspace, and installable from
+                official sources. Binaries live under <code>~/.chimaera</code>,
+                and your credentials stay yours.
               </p></div>
             </article>
 
@@ -286,8 +317,9 @@
               <h3>Previews that replace code-server</h3>
               <div class="feature__body"><p>
                 Images, Markdown, CSV/TSV (gzip included), PDF, notebooks, and
-                sandboxed HTML reports — the MultiQC/FastQC class of output. The
-                server extracts, the client renders; whole files never load.
+                sandboxed HTML reports, the MultiQC and FastQC class of output.
+                The server extracts and the client renders, so whole files never
+                load.
               </p></div>
             </article>
 
@@ -297,7 +329,8 @@
               <div class="feature__body"><p>
                 Split panes, tabs, drag-and-drop, focus mode, and a session
                 strip that says where you are. Terminals and file previews are
-                the same kind of surface — arrange them however the work wants.
+                the same kind of surface, so you arrange them however the work
+                wants.
               </p></div>
             </article>
 
@@ -305,10 +338,10 @@
               <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 17l-4-5 4-5"/><path d="M16 7l4 5-4 5"/><path d="M13 5l-2 14" opacity="0.55"/></svg></div>
               <h3>Linked terminals</h3>
               <div class="feature__body"><p>
-                Hand an agent a leash to a live shell — the one with your
-                modules and conda environment already loaded — instead of paying
-                setup cost per command. Scoped, user-granted, and audited in the
-                shell's own scrollback.
+                Hand an agent a leash to a live shell, the one with your modules
+                and conda environment already loaded, instead of paying setup
+                cost on every command. It stays scoped, user-granted, and
+                audited in the shell's own scrollback.
               </p></div>
             </article>
           </div>
@@ -331,26 +364,26 @@
                 <code>chimaera connect &lt;host&gt;</code> shells out to your
                 system <code>ssh</code>, so ProxyJump, ControlMaster, and 2FA
                 from <code>~/.ssh/config</code> all work as-is. The daemon
-                installs into <code>~/.chimaera</code> on the host — no root, no
-                containers.
+                installs into <code>~/.chimaera</code> on the host, with no root
+                and no containers.
               </p>
               <ul class="checklist">
                 <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Install-if-missing.</b> Detects the target with <code>uname</code> and drops in the right static binary.</span></li>
                 <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Start-or-attach.</b> Reuses a running daemon, tunnels the port, opens the UI.</span></li>
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Self-updating.</b> An outdated remote daemon is replaced on connect — an idle shell holding an environment is never killed without asking.</span></li>
+                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Self-updating.</b> An outdated remote daemon is replaced on connect. An idle shell holding an environment is never killed without asking.</span></li>
               </ul>
             </div>
             <div class="showcase__media">
               <div class="codecard">
                 <div class="codecard__bar">
                   <div class="mock__dots"><i></i><i></i><i></i></div>
-                  <span class="name">zsh — your laptop</span>
+                  <span class="name">zsh · your laptop</span>
                 </div>
                 <pre><code><span class="c"># run it locally</span>
 <span class="p">$</span> chimaera serve
   <span class="c">→ workbench on http://127.0.0.1:9700</span>
 
-<span class="c"># or drive a remote host — HPC login node, dev box, anything</span>
+<span class="c"># or drive a remote host: HPC login node, dev box, anything</span>
 <span class="p">$</span> chimaera connect <span class="s">gpu-node</span>
   <span class="c">→ installing daemon in ~/.chimaera … ok</span>
   <span class="c">→ tunnelling :9700 … ok</span>
@@ -365,13 +398,13 @@
               <h2>One static binary. Old glibc. No root.</h2>
               <p>
                 The daemon cross-compiles to fully static musl binaries (x86_64
-                and aarch64) that run on old HPC systems — verified on a cluster
-                running glibc 2.17, no root. It's built to live on a shared
+                and aarch64) that run on old HPC systems, verified on a cluster
+                running glibc 2.17 with no root. It is built to live on a shared
                 login node: bounded allocations, hard ceilings on preview
-                extraction, ~150&nbsp;MB RSS steady-state.
+                extraction, and about 150&nbsp;MB RSS at steady state.
               </p>
               <ul class="checklist">
-                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>NFS-safe state.</b> Append-only, size-capped JSONL under <code>~/.chimaera</code> — no SQLite near Lustre.</span></li>
+                <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>NFS-safe state.</b> Append-only, size-capped JSONL under <code>~/.chimaera</code>, so there is no SQLite near Lustre.</span></li>
                 <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Good citizen.</b> No busy loops, no unbounded buffers.</span></li>
                 <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span><b>Native app included.</b> A Tauri shell wraps the same UI with a home screen of workspaces and one-click connect. It auto-updates; quitting kills nothing.</span></li>
               </ul>
@@ -380,7 +413,7 @@
               <div class="codecard">
                 <div class="codecard__bar">
                   <div class="mock__dots"><i></i><i></i><i></i></div>
-                  <span class="name">login-node — CentOS 7.9</span>
+                  <span class="name">login-node · CentOS 7.9</span>
                 </div>
                 <pre><code><span class="p">$</span> ldd ./chimaera
   <span class="c">not a dynamic executable</span>
@@ -403,7 +436,7 @@
             <h2>Get chimaera</h2>
             <p>
               The native app bundles the daemon and auto-updates itself. The
-              standalone daemon binaries are for remote hosts —
+              standalone daemon binaries are for remote hosts, and
               <code>chimaera connect</code> installs them for you.
             </p>
           </div>
@@ -471,7 +504,7 @@
             <div class="codecard">
               <div class="codecard__bar">
                 <div class="mock__dots"><i></i><i></i><i></i></div>
-                <span class="name">build from source — needs Rust + Node</span>
+                <span class="name">build from source · needs Rust + Node</span>
               </div>
               <pre><code><span class="p">$</span> git clone https://github.com/martinappberg/chimaera
 <span class="p">$</span> cd chimaera
@@ -493,15 +526,15 @@
           <div class="faq">
             <details class="qa">
               <summary>Does it change how my agents run or bill?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No. Agents run as their real TUIs in a normal PTY, spawned through your login shell with your environment and credentials. <code>claude</code> behaves and bills exactly as it does in any terminal — chimaera just owns the process and gives you a window onto it.</div>
+              <div class="qa__body">No. Agents run as their real TUIs in a normal PTY, spawned through your login shell with your environment and credentials. <code>claude</code> behaves and bills exactly as it does in any terminal. chimaera just owns the process and gives you a window onto it.</div>
             </details>
             <details class="qa">
               <summary>Do my credentials go through chimaera?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No. Credentials stay yours — they live in your <code>HOME</code> and login-shell environment, independent of who installed the agent binary. chimaera can install and update agent CLIs from official sources, but never touches your auth.</div>
+              <div class="qa__body">No. Credentials stay yours. They live in your <code>HOME</code> and login-shell environment, independent of who installed the agent binary. chimaera can install and update agent CLIs from official sources, but never touches your auth.</div>
             </details>
             <details class="qa">
               <summary>Is it only for HPC?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No — it's a general tool for running agents wherever the work lives. HPC login nodes are the founding stress test (old glibc, no root, shared machines), which is why it also behaves well on a laptop or a plain dev server.</div>
+              <div class="qa__body">No. It is a general tool for running agents wherever the work lives. HPC login nodes are the founding stress test (old glibc, no root, shared machines), which is why it also behaves well on a laptop or a plain dev server.</div>
             </details>
             <details class="qa">
               <summary>What platforms are supported?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
@@ -509,7 +542,7 @@
             </details>
             <details class="qa">
               <summary>What's the license?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">GNU AGPL-3.0 — free to use, self-host, and modify. For a closed-source product or service built on chimaera, a commercial license is available: <a href="mailto:mkjberg@gmail.com">get in touch</a>. Contributions require a CLA.</div>
+              <div class="qa__body">GNU AGPL-3.0, free to use, self-host, and modify. For a closed-source product or service built on chimaera, a commercial license is available: <a href="mailto:mkjberg@gmail.com">get in touch</a>. Contributions require a CLA.</div>
             </details>
           </div>
         </div>

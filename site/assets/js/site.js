@@ -1,4 +1,4 @@
-/* chimaera site — theme toggle, mobile nav, and live download links.
+/* chimaera site: theme toggle, mobile nav, and live download links.
    No dependencies; degrades gracefully if the GitHub API is unreachable
    (every button ships with a working /releases/latest fallback href). */
 (function () {
