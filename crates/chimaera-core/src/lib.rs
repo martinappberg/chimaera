@@ -22,6 +22,23 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
+/// Per-user config directory (`$XDG_CONFIG_HOME/chimaera`, else
+/// `~/.config/chimaera`), created on demand. Holds user-editable files
+/// (settings.json) as opposed to daemon-owned state in [`data_dir`].
+pub fn config_dir() -> PathBuf {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(base) if !base.is_empty() => PathBuf::from(base),
+        _ => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config"),
+    };
+    let dir = base.join("chimaera");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("failed to create config dir {}: {e}", dir.display());
+    }
+    dir
+}
+
 /// Per-user runtime directory: `$XDG_RUNTIME_DIR/chimaera` if set, else
 /// `/tmp/chimaera-$UID`. Created with mode 0700 on demand.
 pub fn runtime_dir() -> PathBuf {

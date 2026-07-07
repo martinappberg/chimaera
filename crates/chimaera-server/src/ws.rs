@@ -241,6 +241,13 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     let mut last_sent: Option<String> = None;
+    let mut last_settings_gen: Option<u64> = None;
+    if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
+        .await
+        .is_err()
+    {
+        return;
+    }
     if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
         .await
         .is_err()
@@ -257,6 +264,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                 Some(Err(_)) | None => return,
             },
         }
+        if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
+            .await
+            .is_err()
+        {
+            return;
+        }
         if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
             .await
             .is_err()
@@ -265,6 +278,27 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         }
         tokio::time::sleep(EVENTS_THROTTLE).await;
     }
+}
+
+/// Send a `{"type":"settings","settings":{...}}` frame when the settings
+/// content generation moved (PUT or hand-edit; the store re-stats the file).
+async fn send_settings_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_gen: &mut Option<u64>,
+) -> Result<(), axum::Error> {
+    let (generation, map) = {
+        let mut store = crate::lock(&state.settings);
+        let generation = store.generation();
+        if *last_gen == Some(generation) {
+            return Ok(());
+        }
+        (generation, store.current().clone())
+    };
+    let frame = json!({"type": "settings", "settings": map}).to_string();
+    socket.send(Message::Text(frame.into())).await?;
+    *last_gen = Some(generation);
+    Ok(())
 }
 
 /// Send the current session snapshot if it differs from the last one sent.

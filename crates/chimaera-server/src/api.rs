@@ -341,6 +341,8 @@ pub(crate) async fn create_session(
         command: None,
         id: Some(id.clone()),
         env: session_env(&state, &id, theme),
+        // settings.json ground truth; applies to sessions spawned from now on.
+        scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
 
     // Plain shells get shell integration injected (OSC 133 journal marks);

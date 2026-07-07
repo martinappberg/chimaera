@@ -12,6 +12,12 @@ export interface EventsSocketHandlers {
    */
   onSessions(sessions: Session[], links?: Link[]): void;
   /**
+   * Full settings map (settings.json ground truth), pushed after auth and
+   * again whenever it changes — a PUT from any window or a hand-edit of the
+   * file on disk.
+   */
+  onSettings?(settings: Record<string, unknown>): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -28,6 +34,7 @@ interface ServerEventFrame {
   type: string;
   sessions?: Session[];
   links?: Link[];
+  settings?: Record<string, unknown>;
   message?: string;
 }
 
@@ -75,6 +82,13 @@ export class EventsSocket {
           msg.sessions,
           Array.isArray(msg.links) ? msg.links : undefined,
         );
+      } else if (
+        msg.type === "settings" &&
+        typeof msg.settings === "object" &&
+        msg.settings !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onSettings?.(msg.settings);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

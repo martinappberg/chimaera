@@ -1,4 +1,5 @@
 import { api, ApiError } from "./api";
+import { resolvedTheme } from "./settings/store.svelte";
 
 export interface Workspace {
   id: string;
@@ -243,10 +244,12 @@ export async function createSession(
     if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
   }
-  // Every spawn (shell AND agent) carries the client's current scheme: the
-  // daemon's shims inject it so TUIs boot themed to match the UI. Read at
-  // call time, not module load — the OS scheme may have flipped since.
-  extras.theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  // Every spawn (shell AND agent) carries the UI's current scheme: the
+  // daemon's shims inject it so TUIs boot themed to match. The SETTINGS
+  // store resolves it (appearance.theme system|light|dark → mode), so an
+  // explicit user choice beats the OS scheme; read at call time — either
+  // may have flipped since module load.
+  extras.theme = resolvedTheme();
   return json(
     await api("/sessions", {
       method: "POST",

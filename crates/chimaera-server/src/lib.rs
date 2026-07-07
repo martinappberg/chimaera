@@ -9,6 +9,7 @@ mod naming;
 mod quickopen;
 mod recents;
 mod runtimes;
+mod settings;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -46,6 +47,9 @@ pub(crate) struct AppState {
     /// Ended agent conversations per workspace (the rail's Recents section),
     /// persisted to `recents.json` on change.
     pub(crate) recents: Mutex<recents::RecentsStore>,
+    /// User settings (the settings.json ground truth), stored in the config
+    /// dir; mtime-checked on read so hand-edits surface without a restart.
+    pub(crate) settings: Mutex<settings::SettingsStore>,
     /// Owner of all PTY sessions; outlives any client connection.
     pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
     /// session id -> workspace id.
@@ -107,6 +111,7 @@ impl AppState {
         pid: u32,
         port: u16,
         data_dir: PathBuf,
+        config_dir: PathBuf,
     ) -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -124,6 +129,9 @@ impl AppState {
                 data_dir.join("view-state.json"),
             )),
             recents: Mutex::new(recents::RecentsStore::load(data_dir.join("recents.json"))),
+            settings: Mutex::new(settings::SettingsStore::load(
+                config_dir.join("settings.json"),
+            )),
             sessions: chimaera_pty::SessionManager::new(),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
@@ -182,6 +190,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),
+        )
+        .route(
+            "/settings",
+            get(settings::get_settings).put(settings::put_settings),
         )
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
@@ -254,6 +266,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         pid,
         port,
         chimaera_core::data_dir(),
+        chimaera_core::config_dir(),
     ));
 
     // Theming shims: regenerated at every daemon start (and after installs)
@@ -340,12 +353,14 @@ mod tests {
     }
 
     fn test_state_with_data_dir(port: u16, data_dir: PathBuf) -> Arc<AppState> {
+        let config_dir = data_dir.join("config");
         Arc::new(AppState::new(
             "test-token".to_string(),
             "testhost".to_string(),
             4242,
             port,
             data_dir,
+            config_dir,
         ))
     }
 
@@ -353,12 +368,15 @@ mod tests {
     /// (equivalent to pointing HOME at a temp dir, without the global
     /// env-var mutation that races across parallel tests).
     fn test_state_with_claude_store(store: PathBuf) -> Arc<AppState> {
+        let data = test_dir("data");
+        let config = data.join("config");
         let mut state = AppState::new(
             "test-token".to_string(),
             "testhost".to_string(),
             4242,
             0,
-            test_dir("data"),
+            data,
+            config,
         );
         state.claude_projects_dir = store;
         Arc::new(state)
@@ -739,6 +757,7 @@ mod tests {
                 command: None,
                 id: None,
                 env: Vec::new(),
+                scrollback: None,
             })
             .expect("spawn session");
 
@@ -827,6 +846,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                scrollback: None,
             })
             .expect("spawn session");
 
@@ -926,6 +946,7 @@ mod tests {
                 command: None,
                 id: None,
                 env: Vec::new(),
+                scrollback: None,
             })
             .expect("spawn session");
         lock(&state.agents).insert(
@@ -1457,12 +1478,15 @@ mod tests {
     #[tokio::test]
     async fn claude_theme_fills_gap_in_generated_settings() {
         let user_settings_dir = test_dir("user-claude");
+        let data = test_dir("data");
+        let config = data.join("config");
         let mut state = AppState::new(
             "test-token".to_string(),
             "testhost".to_string(),
             4242,
             0,
-            test_dir("data"),
+            data,
+            config,
         );
         state.claude_settings_path = user_settings_dir.join("settings.json");
         let state = Arc::new(state);
@@ -2534,6 +2558,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                scrollback: None,
             })
             .expect("spawn shell");
         lock(&state.session_workspaces).insert(info.id.clone(), workspace_id.to_string());
@@ -2670,6 +2695,7 @@ mod tests {
                 command: Some(launch.argv),
                 id: None,
                 env,
+                scrollback: None,
             })
             .expect("spawn integrated bash");
         let marks = state.sessions.marks(&info.id).expect("marks");
@@ -2730,6 +2756,7 @@ mod tests {
                 command: Some(launch.argv),
                 id: None,
                 env,
+                scrollback: None,
             })
             .expect("spawn integrated bash");
         let marks = state.sessions.marks(&info.id).expect("marks");
@@ -2764,6 +2791,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                scrollback: None,
             })
             .expect("spawn plain bash");
         let id = info.id;
@@ -2950,6 +2978,7 @@ mod tests {
                     command: None,
                     id: None,
                     env: Vec::new(),
+                    scrollback: None,
                 })
                 .expect("spawn shell");
             info.id
@@ -3533,7 +3562,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Initial snapshot: the agent session with an empty touched list.
+        // Settings frame first (contract), then the initial snapshot: the
+        // agent session with an empty touched list.
+        let settings = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected settings text frame, got {other:?}"),
+        };
+        assert_eq!(settings["type"], "settings");
         let snapshot = match next_ws_frame(&mut socket).await {
             WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
             other => panic!("expected sessions text frame, got {other:?}"),
@@ -3600,7 +3635,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Initial full snapshot arrives immediately after auth.
+        // Settings frame first, then the initial full sessions snapshot.
+        let settings = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected settings text frame, got {other:?}"),
+        };
+        assert_eq!(settings["type"], "settings");
+        assert!(settings["settings"].is_object());
         let snapshot = match next_ws_frame(&mut socket).await {
             WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
             other => panic!("expected sessions text frame, got {other:?}"),
@@ -3662,6 +3703,138 @@ mod tests {
                 .iter()
                 .any(|s| s["id"] == first);
             if gone {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_and_validation() {
+        let state = test_state();
+
+        // Fresh daemon: empty settings object.
+        let (status, body) = request(&state, Method::GET, "/api/v1/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"settings": {}}));
+
+        // PUT stores the sparse map verbatim (unknown keys preserved).
+        let map = serde_json::json!({
+            "terminal.fontSize": 15,
+            "appearance.theme": "dark",
+            "future.unknownKey": [1, 2, 3],
+        });
+        let (status, _) = request(&state, Method::PUT, "/api/v1/settings", Some(map.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = request(&state, Method::GET, "/api/v1/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["settings"], map);
+
+        // Non-object bodies are rejected.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!([1, 2])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Daemon-consumed keys parse with clamping; garbage yields None.
+        let (_, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({
+                "daemon.scrollbackLines": 50,
+                "quickOpen.ignoreDirs": ["node_modules", "", "a/b", ".git"],
+            })),
+        )
+        .await;
+        assert_eq!(lock(&state.settings).scrollback_lines(), Some(200));
+        assert_eq!(
+            lock(&state.settings).quickopen_ignore_dirs(),
+            Some(vec!["node_modules".to_string(), ".git".to_string()]),
+        );
+        let (_, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"daemon.scrollbackLines": "lots"})),
+        )
+        .await;
+        assert_eq!(lock(&state.settings).scrollback_lines(), None);
+    }
+
+    #[tokio::test]
+    async fn settings_hand_edit_on_disk_is_picked_up() {
+        let data_dir = test_dir("settings-disk");
+        let state = test_state_with_data_dir(0, data_dir.clone());
+
+        // Simulate `vim ~/.config/chimaera/settings.json`.
+        let path = data_dir.join("config").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"terminal.fontSize": 16}"#).unwrap();
+        // Filesystem mtime granularity can swallow same-instant rewrites in
+        // this synthetic test; force the stat cache stale. Real hand-edits
+        // happen seconds apart and are caught by the mtime check alone.
+        lock(&state.settings).force_stale_for_tests();
+
+        let (status, body) = request(&state, Method::GET, "/api/v1/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["settings"]["terminal.fontSize"], 16);
+    }
+
+    #[tokio::test]
+    async fn ws_events_pushes_settings_changes() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/events");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Initial settings frame (empty map on a fresh daemon).
+        let settings = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected settings text frame, got {other:?}"),
+        };
+        assert_eq!(settings["type"], "settings");
+        assert_eq!(settings["settings"], serde_json::json!({}));
+
+        // A PUT wakes the bus with the fresh map.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"appearance.theme": "dark"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no settings frame after PUT"
+            );
+            let frame = match next_ws_frame(&mut socket).await {
+                WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                _ => continue,
+            };
+            if frame["type"] == "settings" {
+                assert_eq!(frame["settings"]["appearance.theme"], "dark");
                 break;
             }
         }

@@ -1,6 +1,11 @@
 :root {
-  /* Native controls (scrollbars, form widgets) follow the active theme. */
-  color-scheme: light dark;
+  /* Native controls (scrollbars, form widgets) follow the active theme. The
+     settings store resolves appearance.theme (system|light|dark) to a MODE
+     (pinned as data-theme on <html> before first paint) and applies the
+     selected theme's full token set inline from settings/themes.ts — the
+     color values in this file are the two built-in defaults, kept as the
+     no-JS fallback. Add or edit themes in themes.ts, not here. */
+  color-scheme: light;
   /* The bundled terminal face doubles as the UI's monospace accent, so
      terminal content and chrome share typographic DNA. */
   --mono:
@@ -53,41 +58,41 @@
   --ficon-vcs: #b0603c;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #131316;
-    --fg: #e7e7ea;
-    --muted: #92929c;
-    --accent: #3fbf85;
-    --err: #d96b6b;
-    --warn: #d0a355;
-    --rate: #a58fd6;
-    --rail-bg: #18181c;
-    --row-hover: #1f1f24;
-    --row-active: #26262c;
-    --term-selection: #e7e7ea33;
-    --term-bg: #0f0f13;
-    --scrim: rgba(0, 0, 0, 0.5);
-    --overlay-bg: #1b1b20;
-    --edge: #2b2b32;
-    --syn-keyword: #c586d6;
-    --syn-string: #7cc99a;
-    --syn-comment: #7a7a85;
-    --syn-number: #d0a355;
-    --syn-type: #6fb3d2;
-    --syn-func: #82a7e8;
-    --syn-def: #e7e7ea;
-    --syn-prop: #a58fd6;
-    --ficon-generic: #8b8b95;
-    --ficon-lang: #6f9ae4;
-    --ficon-data: #58c39c;
-    --ficon-doc: #9a9aa6;
-    --ficon-media: #d8a45c;
-    --ficon-archive: #c39a63;
-    --ficon-config: #9a9ab0;
-    --ficon-bio: #b78fdc;
-    --ficon-vcs: #e0855c;
-  }
+:root[data-theme="dark"] {
+  /* Fallback only — the live palette comes inline from settings/themes.ts. */
+  color-scheme: dark;
+  --bg: #131316;
+  --fg: #e7e7ea;
+  --muted: #92929c;
+  --accent: #3fbf85;
+  --err: #d96b6b;
+  --warn: #d0a355;
+  --rate: #a58fd6;
+  --rail-bg: #18181c;
+  --row-hover: #1f1f24;
+  --row-active: #26262c;
+  --term-selection: #e7e7ea33;
+  --term-bg: #0f0f13;
+  --scrim: rgba(0, 0, 0, 0.5);
+  --overlay-bg: #1b1b20;
+  --edge: #2b2b32;
+  --syn-keyword: #c586d6;
+  --syn-string: #7cc99a;
+  --syn-comment: #7a7a85;
+  --syn-number: #d0a355;
+  --syn-type: #6fb3d2;
+  --syn-func: #82a7e8;
+  --syn-def: #e7e7ea;
+  --syn-prop: #a58fd6;
+  --ficon-generic: #8b8b95;
+  --ficon-lang: #6f9ae4;
+  --ficon-data: #58c39c;
+  --ficon-doc: #9a9aa6;
+  --ficon-media: #d8a45c;
+  --ficon-archive: #c39a63;
+  --ficon-config: #9a9ab0;
+  --ficon-bio: #b78fdc;
+  --ficon-vcs: #e0855c;
 }
 
 * {

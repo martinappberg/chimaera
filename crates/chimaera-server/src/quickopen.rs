@@ -102,7 +102,10 @@ pub(crate) async fn quickopen(
     let files = match cached {
         Some(files) => files,
         None => {
-            let files = Arc::new(walk(&workspace.root));
+            // settings.json ground truth: user-tuned ignore list, else the
+            // built-in default (the short cache TTL picks up changes fast).
+            let ignore = crate::lock(&state.settings).quickopen_ignore_dirs();
+            let files = Arc::new(walk(&workspace.root, ignore.as_deref()));
             crate::lock(&state.quickopen).insert(workspace.id.clone(), files.clone());
             files
         }
@@ -112,10 +115,15 @@ pub(crate) async fn quickopen(
     Json(json!({"entries": search(&files, &query.q, limit)})).into_response()
 }
 
-/// Walk `root` collecting regular files, skipping [`IGNORED_DIRS`] and all
+/// Walk `root` collecting regular files, skipping the ignored dirs
+/// (`ignore` override from settings, else [`IGNORED_DIRS`]) and all
 /// symlinks (never followed: loop safety), stopping at [`MAX_INDEX_FILES`].
 /// Unreadable entries are skipped silently, matching `fs/list`.
-fn walk(root: &Path) -> Vec<IndexedFile> {
+fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
+    let ignored = |name: &str| match ignore {
+        Some(list) => list.iter().any(|d| d == name),
+        None => IGNORED_DIRS.contains(&name),
+    };
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -129,7 +137,7 @@ fn walk(root: &Path) -> Vec<IndexedFile> {
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             if file_type.is_dir() {
-                if !IGNORED_DIRS.contains(&name.as_str()) {
+                if !ignored(&name) {
                     stack.push(entry.path());
                 }
                 continue;

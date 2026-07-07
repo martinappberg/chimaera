@@ -10,6 +10,7 @@
   import { onMount } from "svelte";
   import { fsQuickOpen, type QuickOpenEntry } from "./files";
   import { dotState, dotTitle, type Session } from "./sessions";
+  import { getSetting } from "./settings/store.svelte";
   import FileIcon from "./FileIcon.svelte";
   import SessionGlyph from "./SessionGlyph.svelte";
 
@@ -86,7 +87,7 @@
     if (debounce !== null) clearTimeout(debounce);
     debounce = setTimeout(() => {
       const mine = ++seq;
-      void fsQuickOpen(ws, q.trim(), 50)
+      void fsQuickOpen(ws, q.trim(), getSetting("quickOpen.maxResults"))
         .then((res) => {
           if (mine !== seq) return;
           entries = res;
@@ -105,7 +106,7 @@
   onMount(() => {
     // Prime results immediately (no debounce) so the palette opens populated.
     const mine = ++seq;
-    void fsQuickOpen(workspaceId, "", 50)
+    void fsQuickOpen(workspaceId, "", getSetting("quickOpen.maxResults"))
       .then((res) => {
         if (mine === seq) entries = res;
       })

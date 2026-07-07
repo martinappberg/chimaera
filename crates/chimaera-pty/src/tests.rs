@@ -40,6 +40,7 @@ fn opts(command: Option<Vec<String>>) -> SpawnOpts {
         command,
         id: None,
         env: Vec::new(),
+        scrollback: None,
     }
 }
 

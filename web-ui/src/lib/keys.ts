@@ -50,6 +50,8 @@ export const KEYS = {
   fontPlus: isMac ? "⌘+" : "Ctrl++",
   fontMinus: isMac ? "⌘−" : "Ctrl+-",
   fontReset: isMac ? "⌘0" : "Ctrl+0",
+  /** Settings surface (the platform-universal comma convention). */
+  settings: isMac ? "⌘," : "Ctrl+Shift+,",
 } as const;
 
 /**

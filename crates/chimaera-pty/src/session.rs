@@ -180,7 +180,7 @@ impl Session {
             title: Arc::clone(&title),
         };
         let term_config = TermConfig {
-            scrolling_history: SCROLLBACK_LINES,
+            scrolling_history: opts.scrollback.unwrap_or(SCROLLBACK_LINES),
             ..TermConfig::default()
         };
         let dims = TermDimensions {

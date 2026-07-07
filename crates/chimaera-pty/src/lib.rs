@@ -67,6 +67,8 @@ pub struct SpawnOpts {
     /// `CHIMAERA_SESSION`/`CHIMAERA_THEME`, the shim dir, and the shell
     /// integration bootstrap into every session it spawns.
     pub env: Vec<(String, String)>,
+    /// Scrollback lines kept server-side. `None` = the default (10k).
+    pub scrollback: Option<usize>,
 }
 
 /// Out-of-band events emitted by a session.

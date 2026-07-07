@@ -83,6 +83,7 @@
     moveTabToIndex,
     openFile,
     openSession,
+    openSettings,
     paneForTab,
     panes as panesOf,
     pruneFiles,
@@ -114,6 +115,11 @@
   import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
   import { closeThisWindow, isNativeShell, onMenu } from "./lib/native";
   import * as pool from "./lib/termPool";
+  import {
+    applyRemoteSettings,
+    flushSettings,
+    loadSettings,
+  } from "./lib/settings/store.svelte";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
   import HomeScreen from "./lib/HomeScreen.svelte";
@@ -369,6 +375,7 @@
         applySessions(list);
         if (linkList !== undefined) links = linkList;
       },
+      onSettings: applyRemoteSettings,
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -376,6 +383,7 @@
     });
     refreshWorkspaces();
     void bootViewState();
+    void loadSettings();
 
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
@@ -398,7 +406,10 @@
       }).then((u) => (unlistenMenu = u));
     }
 
-    const onPagehide = () => void flushViewState();
+    const onPagehide = () => {
+      void flushViewState();
+      void flushSettings();
+    };
     const onCopy = () => rememberCopy();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
@@ -738,6 +749,11 @@
       layout = { ...layout, focusMode: !layout.focusMode };
       return;
     }
+    if (key === "," && !l2 && plain) {
+      intercept();
+      openSettingsSurface();
+      return;
+    }
     const n = chordDigit(e);
     if (n !== null && !l2 && plain && n <= railSessions.length) {
       intercept();
@@ -955,6 +971,14 @@
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
+  /** Open/focus the settings surface (gear button, ⌘,). Needs a workspace —
+   *  the settings tab lives in the layout like any other surface. */
+  function openSettingsSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openSettings(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
   function focusDirection(dir: FocusDir): void {
     layout = moveFocus(layout, dir);
     const sid = focusedSessionOf(layout);
@@ -1010,7 +1034,7 @@
       layout = setPaneFont(layout, paneId, undefined);
       return;
     }
-    layout = setPaneFont(layout, paneId, (p.fontSize ?? pool.BASE_FONT_SIZE) + delta);
+    layout = setPaneFont(layout, paneId, (p.fontSize ?? pool.baseFontSize()) + delta);
   }
 
   /** The focused pane's fitted size, for spawning sessions at the right grid. */
@@ -1333,7 +1357,9 @@
         ? (displayNames.get(tab.sessionId) ??
           sessionsById.get(tab.sessionId)?.name ??
           tab.sessionId.slice(0, 8))
-        : (fileTitles.get(tab.path) ?? basename(tab.path));
+        : tab.surface === "file"
+          ? (fileTitles.get(tab.path) ?? basename(tab.path))
+          : "Settings";
     // Arm the bottom bands for this drag: reference targets for file drags,
     // link targets for shell-terminal drags. Drives the partitioned zone
     // previews (the band region is reserved, never flashed over).
@@ -1842,6 +1868,25 @@
           aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
         <span class="daemon-host" title={health?.hostname}>{getHostLabel()}</span>
+        {#if activeWsId !== null}
+          <button
+            class="daemon-settings"
+            title="settings ({KEYS.settings})"
+            aria-label="settings"
+            onclick={openSettingsSurface}
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <path
+                d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6L11 5M5 11l-1.4 1.4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        {/if}
       </div>
     </aside>
 
@@ -2537,6 +2582,31 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */
+  .daemon-settings {
+    appearance: none;
+    border: none;
+    background: none;
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 20px;
+    padding: 0;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .daemon-settings:hover {
+    background: var(--row-hover);
+    color: var(--fg);
   }
 
   .stage {

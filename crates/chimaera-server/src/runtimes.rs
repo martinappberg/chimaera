@@ -382,6 +382,7 @@ pub(crate) fn start_install(
         command: Some(vec!["/bin/bash".to_string(), "-c".to_string(), script]),
         id: Some(session_id.clone()),
         env: crate::api::session_env(state, &session_id, "dark"),
+        scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
     match state.sessions.spawn(opts) {
         Ok(info) => {
