@@ -1,5 +1,7 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
+pub mod shellint;
+
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;

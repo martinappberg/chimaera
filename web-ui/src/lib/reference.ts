@@ -161,6 +161,28 @@ export function composeAgentPathReference(relPath: string): string {
 }
 
 /**
+ * The provenance suffix typed after a matching paste into an agent composer:
+ * ` [from @<rel-path>#L3-L9] ` for file snippets, ` [from <name> output] `
+ * for terminal snippets. Additive and visible — the pasted text itself is
+ * never touched (plain paste stays plain), and there is never a newline.
+ */
+export function composeProvenanceSuffix(
+  source: SelectionSource,
+  relPath: string | null,
+  terminalName: string | null,
+): string {
+  if (source.kind === "file") {
+    const path = relPath ?? source.path;
+    const lines =
+      source.startLine !== null && source.endLine !== null
+        ? `#L${source.startLine}-L${source.endLine}`
+        : "";
+    return ` [from @${path}${lines}] `;
+  }
+  return ` [from ${terminalName ?? "terminal"} output] `;
+}
+
+/**
  * A shell-ready path for a plain terminal (drag-to-reference): escaped,
  * relative to the session's current cwd when under it, else absolute.
  */
@@ -217,6 +239,28 @@ if (import.meta.env.DEV) {
     "terminal reference format",
   );
   ok(composeAgentPathReference("src/a.ts") === "@src/a.ts ", "agent path mention");
+  ok(
+    composeProvenanceSuffix(
+      { kind: "file", path: "/w/src/a.ts", startLine: 3, endLine: 9, text: "" },
+      "src/a.ts",
+      null,
+    ) === " [from @src/a.ts#L3-L9] ",
+    "file provenance suffix",
+  );
+  ok(
+    composeProvenanceSuffix(
+      { kind: "terminal", sessionId: "s-1", text: "" },
+      null,
+      "snakemake",
+    ) === " [from snakemake output] ",
+    "terminal provenance suffix",
+  );
+  ok(
+    !/[\r\n]/.test(
+      composeProvenanceSuffix({ kind: "terminal", sessionId: "s", text: "x\n" }, null, "n"),
+    ),
+    "provenance suffix never contains newlines",
+  );
   ok(
     composeShellPathReference("/w/my file.tsv", "/w") === "'my file.tsv' ",
     "shell drop: relative + escaped",

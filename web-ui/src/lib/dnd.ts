@@ -15,7 +15,10 @@ export type DropSpot =
   | { kind: "tab"; paneId: string; index: number }
   | { kind: "edge"; edge: Side }
   /** The "@ reference" band over a session pane's bottom (file drags only). */
-  | { kind: "ref"; paneId: string };
+  | { kind: "ref"; paneId: string }
+  /** The "link to agent" band over an agent pane's input area (only while
+   *  dragging a shell terminal; see startDrag's linkTargets). */
+  | { kind: "link"; paneId: string };
 
 export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
@@ -114,6 +117,7 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "tab" && b.kind === "tab") return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
   if (a.kind === "ref" && b.kind === "ref") return a.paneId === b.paneId;
+  if (a.kind === "link" && b.kind === "link") return a.paneId === b.paneId;
   return false;
 }
 
@@ -147,19 +151,22 @@ function windowEdgeAt(x: number, y: number): DropSpot | null {
   return d[0][1] <= WINDOW_EDGE_PX ? { kind: "edge", edge: d[0][0] } : null;
 }
 
-/** The "@ reference" band covers the bottom ~22% of a session pane. */
+/** The "@ reference" / "link to agent" bands cover the bottom ~22% of a
+ *  pane (one geometry, two payloads: files reference, terminals link). */
 export const REF_BAND_FRAC = 0.22;
 
 /**
  * Hit-test priority: tab bars (precise insertion beats everything), then the
- * "@ reference" band (file drags over session panes — it owns the pane's
- * bottom, including the stage's bottom-edge strip there), then window edges,
- * then pane zones.
+ * bottom band when armed — "@ reference" for file drags over session panes,
+ * "link to agent" for shell-terminal drags over agent panes; either owns the
+ * pane's bottom, including the stage's bottom-edge strip there — then window
+ * edges, then pane zones.
  */
 function spotAt(
   x: number,
   y: number,
   refFor: ((paneId: string) => boolean) | null,
+  linkTargets: ReadonlySet<string> | undefined,
 ): DropSpot | null {
   let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
@@ -184,9 +191,16 @@ function spotAt(
     break;
   }
   const refActive = paneHit !== null && refFor !== null && refFor(paneHit.paneId);
-  if (refActive && paneHit !== null) {
+  const linkActive = paneHit !== null && linkTargets?.has(paneHit.paneId) === true;
+  if (paneHit !== null && (refActive || linkActive)) {
     const ny = (y - paneHit.r.top) / paneHit.r.height;
-    if (ny >= 1 - REF_BAND_FRAC) return { kind: "ref", paneId: paneHit.paneId };
+    if (ny >= 1 - REF_BAND_FRAC) {
+      // Mutually exclusive by payload: ref only arms for file drags, link
+      // only for shell-terminal drags (see startDrag / DragOptions).
+      return refActive
+        ? { kind: "ref", paneId: paneHit.paneId }
+        : { kind: "link", paneId: paneHit.paneId };
+    }
   }
   const edge = windowEdgeAt(x, y);
   if (edge !== null) return edge;
@@ -195,9 +209,9 @@ function spotAt(
     const nx = (x - r.left) / r.width;
     const ny = (y - r.top) / r.height;
     let zone = zoneAt(nx, ny);
-    // With the reference band active, the pane's bottom belongs to it — the
+    // With a bottom band active, the pane's bottom belongs to it — the
     // sliver between center and the band reads as center, never bottom-split.
-    if (refActive && zone === "bottom") zone = "center";
+    if ((refActive || linkActive) && zone === "bottom") zone = "center";
     return { kind: "zone", paneId, zone };
   }
   return null;
@@ -211,11 +225,21 @@ function makeGhost(label: string): HTMLDivElement {
   return ghost;
 }
 
+export interface DragOptions {
+  /** Panes whose input band is a "link to agent" target for this payload. */
+  linkTargets?: ReadonlySet<string>;
+}
+
 /**
  * Start a potential drag from `e` (a pointerdown on the source element).
  * Captures the pointer on the source so terminals never see the moves.
  */
-export function startDrag(e: PointerEvent, payload: DragPayload, cb: DragCallbacks): void {
+export function startDrag(
+  e: PointerEvent,
+  payload: DragPayload,
+  cb: DragCallbacks,
+  opts: DragOptions = {},
+): void {
   if (e.button !== 0) return;
   const source = e.currentTarget instanceof Element ? e.currentTarget : null;
   const pointerId = e.pointerId;
@@ -244,7 +268,7 @@ export function startDrag(e: PointerEvent, payload: DragPayload, cb: DragCallbac
     if (ghost !== null) {
       ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
     }
-    const next = spotAt(lastX, lastY, refFor);
+    const next = spotAt(lastX, lastY, refFor, opts.linkTargets);
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);

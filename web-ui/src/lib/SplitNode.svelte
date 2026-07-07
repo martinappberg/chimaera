@@ -3,6 +3,7 @@
   import { MIN_RATIO } from "./layout";
   import type { Session } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
+  import type { LinkCtrl } from "./agentLinks";
   import Pane from "./Pane.svelte";
   import Self from "./SplitNode.svelte";
 
@@ -13,8 +14,12 @@
     sessions: Map<string, Session>;
     names: Map<string, string>;
     fileNames: Map<string, string>;
+    links: Map<string, string>;
+    linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
+    /** Panes whose bottom band is armed for the current drag. */
+    bandPanes: ReadonlySet<string>;
     ctrl: LayoutCtrl;
   }
 
@@ -25,7 +30,10 @@
     sessions,
     names,
     fileNames,
+    links,
+    linkCtrl,
     wsRoot,
+    bandPanes,
     ctrl,
   }: Props = $props();
 
@@ -113,11 +121,11 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
     </div>
     <div
       class="divider"
@@ -131,7 +139,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {bandPanes} {ctrl} />
     </div>
   </div>
 {/if}

@@ -308,6 +308,13 @@ export function openSession(l: Layout, sessionId: string): Layout {
   return openTab(l, { surface: "terminal", sessionId });
 }
 
+/** The pane currently holding a terminal tab for `sessionId`, if any. */
+export function sessionPaneId(l: Layout, sessionId: string): string | null {
+  return (
+    paneForTab(l.root, { surface: "terminal", sessionId })?.paneId ?? null
+  );
+}
+
 export function openFile(l: Layout, path: string): Layout {
   return openTab(l, { surface: "file", path });
 }

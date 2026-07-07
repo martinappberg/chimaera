@@ -15,6 +15,7 @@
   import { dotState, dotTitle } from "./sessions";
   import SessionGlyph from "./SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
+  import { agentHue, type LinkCtrl } from "./agentLinks";
   import { basename, midTruncate } from "./files";
   import { dirtyFiles } from "./editing";
   import { KEYS } from "./keys";
@@ -30,6 +31,9 @@
     names: Map<string, string>;
     /** Open-file tab titles (basename, disambiguated), keyed by path. */
     fileNames: Map<string, string>;
+    /** terminal session id -> agent session id (the linked-terminal edges). */
+    links: Map<string, string>;
+    linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
     dropSpot: DropSpot | null;
@@ -44,11 +48,112 @@
     sessions,
     names,
     fileNames,
+    links,
+    linkCtrl,
     wsRoot,
     dropSpot,
     ctrl,
     el = $bindable(null),
   }: Props = $props();
+
+  const activeSession = $derived.by(() => {
+    const tab = node.tabs[node.active];
+    return tab !== undefined && tab.surface === "terminal"
+      ? (sessions.get(tab.sessionId) ?? null)
+      : null;
+  });
+
+  /** Chips on an AGENT pane: the terminals this agent holds a leash to. */
+  const linkedTerminals = $derived.by(() => {
+    if (activeSession === null || activeSession.kind !== "agent") return [];
+    const out: string[] = [];
+    for (const [terminal, agent] of links) {
+      if (agent === activeSession.id) out.push(terminal);
+    }
+    return out;
+  });
+
+  /** Back-reference on a TERMINAL pane: the agent holding its leash. */
+  const linkedAgentId = $derived(
+    activeSession !== null && activeSession.kind === "shell"
+      ? (links.get(activeSession.id) ?? null)
+      : null,
+  );
+
+  function sessionLabel(id: string): string {
+    return names.get(id) ?? sessions.get(id)?.name ?? id.slice(0, 8);
+  }
+
+  /** Chip dot modifier for a linked terminal: what is that shell doing? */
+  function chipState(id: string): string {
+    const s = sessions.get(id);
+    if (s === undefined || !s.alive) return "quiet";
+    if (s.exec_stage === "executing") return "exec";
+    if (s.exec_stage === "queued") return "queued";
+    if (s.phase === "running") return "busy";
+    return "ready";
+  }
+
+  function chipTitle(id: string): string {
+    const s = sessions.get(id);
+    const doing =
+      s === undefined || !s.alive
+        ? "exited"
+        : s.exec_stage === "executing"
+          ? "agent is running a command here"
+          : s.exec_stage === "queued"
+            ? "agent exec queued for the prompt"
+            : s.phase === "running"
+              ? "a command is running"
+              : "at the prompt";
+    return `linked terminal · ${doing} — click to focus`;
+  }
+
+  // --- "link to agent…" menu (parity path for the drag gesture) ------------
+
+  let linkMenuOpen = $state(false);
+  let barRightEl = $state<HTMLElement | null>(null);
+
+  /** Live agents in this terminal's workspace, offered by the link menu. */
+  const agentChoices = $derived.by(() => {
+    if (activeSession === null || activeSession.kind !== "shell") return [];
+    return [...sessions.values()].filter(
+      (s) =>
+        s.kind === "agent" && s.alive && s.workspace_id === activeSession.workspace_id,
+    );
+  });
+
+  // Close the menu on any press outside the bar's right cluster or Escape.
+  $effect(() => {
+    if (!linkMenuOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!(e.target instanceof Node) || barRightEl?.contains(e.target) !== true) {
+        linkMenuOpen = false;
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        linkMenuOpen = false;
+      }
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  });
+
+  function chooseAgent(agentId: string): void {
+    if (activeSession === null) return;
+    if (linkedAgentId === agentId) {
+      linkCtrl.unlink(activeSession.id);
+    } else {
+      linkCtrl.link(activeSession.id, agentId);
+    }
+    linkMenuOpen = false;
+  }
 
   /** Insertion index while a drag hovers this tab bar, else null. */
   const insertIndex = $derived(
@@ -204,10 +309,44 @@
     <div class="tab-tail" class:insert={insertIndex === node.tabs.length}></div>
   </div>
 
+  <!-- Linked-terminal chips: on an agent pane, the complete map of the
+       terminals it holds; on a linked terminal, the way back to its agent.
+       Always visible (the bond is state, not chrome), hue = the agent's. -->
+  {#if linkedTerminals.length > 0 && activeSession !== null}
+    {@const hue = agentHue(activeSession.id)}
+    <div class="links" role="group" aria-label="linked terminals">
+      {#each linkedTerminals as tid (tid)}
+        <span class="chip" style:--hue={hue}>
+          <button class="chip-main" title={chipTitle(tid)} onclick={() => linkCtrl.reveal(tid, node.id)}>
+            <span class="chip-dot {chipState(tid)}"></span>
+            <span class="chip-name">{sessionLabel(tid)}</span>
+          </button>
+          <button class="chip-x" title="unlink" aria-label="unlink {sessionLabel(tid)}" onclick={() => linkCtrl.unlink(tid)}>&times;</button>
+        </span>
+      {/each}
+    </div>
+  {:else if linkedAgentId !== null && activeSession !== null}
+    <div class="links" role="group" aria-label="linked agent">
+      <span class="chip" style:--hue={agentHue(linkedAgentId)}>
+        <button
+          class="chip-main"
+          title="linked to this agent — click to jump"
+          onclick={() => linkCtrl.reveal(linkedAgentId, node.id)}
+        >
+          <svg class="chip-spark" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+            <path d="M8 1.5v13M1.5 8h13M3.9 3.9l8.2 8.2M12.1 3.9l-8.2 8.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+          </svg>
+          <span class="chip-name">{sessionLabel(linkedAgentId)}</span>
+        </button>
+        <button class="chip-x" title="unlink" aria-label="unlink from agent" onclick={() => linkCtrl.unlink(activeSession.id)}>&times;</button>
+      </span>
+    </div>
+  {/if}
+
   <!-- Pane controls at the bar's right edge: the mouse path to every pane
        chord (tooltips teach the chords). Faded in on bar hover; the zoom
        badge stays persistent while zoomed. -->
-  <div class="bar-right">
+  <div class="bar-right" bind:this={barRightEl}>
     {#if hasTermSelection}
       <!-- Selection-driven, not hover-driven: visible exactly while the
            terminal holds a selection. Same handler as the chord. -->
@@ -224,6 +363,10 @@
       >
         <span class="ref-at" aria-hidden="true">@</span>
         reference
+        {#if $referenceTarget !== null}
+          <!-- The destination is always named — never a mystery landing. -->
+          <span class="ref-target">→ {midTruncate($referenceTarget.name, 16)}</span>
+        {/if}
       </button>
     {/if}
     {#if touched !== null}
@@ -261,6 +404,26 @@
       >
     {/if}
     <div class="controls">
+      {#if agentChoices.length > 0}
+        <button
+          class="ctl"
+          class:on={linkMenuOpen}
+          title={linkedAgentId !== null ? "linked — move or unlink" : "link to agent…"}
+          aria-label="link to agent"
+          aria-expanded={linkMenuOpen}
+          onclick={() => (linkMenuOpen = !linkMenuOpen)}
+        >
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              d="M6.5 9.5l3-3M5 7l-1.8 1.8a2.3 2.3 0 003.2 3.2L8.2 10.2M11 9l1.8-1.8a2.3 2.3 0 00-3.2-3.2L7.8 5.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      {/if}
       {#if activeTerminal !== null}
         <!-- Parity with the Cmd/Ctrl +/−/0 chords: per-pane text size. -->
         <button
@@ -316,6 +479,21 @@
         </svg>
       </button>
     </div>
+
+    {#if linkMenuOpen}
+      <div class="link-menu" role="menu" aria-label="link to agent">
+        <div class="link-menu-title">link to agent</div>
+        {#each agentChoices as a (a.id)}
+          <button class="link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
+            <span class="chip-dot menu-dot" style:--hue={agentHue(a.id)}></span>
+            <span class="link-menu-name">{sessionLabel(a.id)}</span>
+            {#if linkedAgentId === a.id}
+              <span class="link-menu-state">linked · click to unlink</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -444,9 +622,203 @@
     color: var(--fg);
   }
 
+  /* --- linked-terminal chips ------------------------------------------- */
+
+  .links {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 4px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  /* One chip = the visible bond: agent hue, quiet until something happens. */
+  .chip {
+    display: flex;
+    align-items: center;
+    height: 18px;
+    border: 1px solid hsl(var(--hue) 45% 55% / 0.45);
+    border-radius: 9px;
+    background: hsl(var(--hue) 50% 55% / 0.08);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    max-width: 150px;
+    min-width: 0;
+  }
+
+  .chip-main {
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    height: 100%;
+    padding: 0 2px 0 7px;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+    min-width: 0;
+  }
+
+  .chip-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chip-spark {
+    flex: none;
+    color: hsl(var(--hue) 55% 55%);
+  }
+
+  .chip-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+
+  /* Chip dot states: what the linked shell is doing right now. */
+  .chip-dot.ready {
+    background: hsl(var(--hue) 40% 55% / 0.55);
+  }
+
+  .chip-dot.busy {
+    background: var(--accent);
+  }
+
+  .chip-dot.quiet {
+    background: none;
+    border: 1px solid var(--muted);
+    opacity: 0.6;
+  }
+
+  /* Agent exec queued: hollow agent-hue ring, waiting its turn. */
+  .chip-dot.queued {
+    background: none;
+    border: 1.5px solid hsl(var(--hue) 60% 55%);
+  }
+
+  /* Agent exec running: the leash is being pulled — a gentle hue pulse. */
+  .chip-dot.exec {
+    background: hsl(var(--hue) 65% 55%);
+    animation: chip-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes chip-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 hsl(var(--hue) 65% 55% / 0.55);
+    }
+    50% {
+      box-shadow: 0 0 0 3.5px hsl(var(--hue) 65% 55% / 0);
+    }
+  }
+
+  .chip-x {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0 6px 0 2px;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    flex: none;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .chip:hover .chip-x {
+    opacity: 0.7;
+  }
+
+  .chip-x:hover {
+    opacity: 1;
+    color: var(--fg);
+  }
+
+  /* --- link-to-agent menu ------------------------------------------------ */
+
+  .link-menu {
+    position: absolute;
+    top: 25px;
+    right: 4px;
+    z-index: 20;
+    min-width: 180px;
+    padding: 4px;
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 7px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  }
+
+  .link-menu-title {
+    padding: 3px 8px 5px;
+    font-size: var(--text-xs);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .link-menu-item {
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    cursor: pointer;
+    text-align: left;
+    transition: background-color 0.12s ease;
+  }
+
+  .link-menu-item:hover {
+    background: var(--row-hover);
+  }
+
+  .menu-dot {
+    background: hsl(var(--hue) 55% 55%);
+  }
+
+  .link-menu-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .link-menu-state {
+    margin-left: auto;
+    padding-left: 10px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chip-dot.exec {
+      animation: none;
+    }
+  }
+
   /* --- controls at the bar's right edge --- */
 
   .bar-right {
+    position: relative;
     flex: none;
     display: flex;
     align-items: center;
@@ -492,6 +864,12 @@
     color: var(--fg);
   }
 
+  /* The link control stays lit while its menu is open (its mouse home). */
+  .ctl.on {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
   /* Context bridge: quiet selection-driven action in the bar (no hover
      gating — it appears exactly while the terminal holds a selection). */
   .ref-btn {
@@ -513,6 +891,18 @@
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
+  }
+
+  .ref-target {
+    color: var(--muted);
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ref-btn:hover:enabled .ref-target {
+    color: inherit;
   }
 
   .ref-btn:hover:enabled {

@@ -3,6 +3,7 @@
   import type { Session } from "./sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane } from "./dnd";
+  import { agentHue, type LinkCtrl } from "./agentLinks";
   import { KEYS, MOD_LABEL } from "./keys";
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
@@ -17,8 +18,13 @@
     sessions: Map<string, Session>;
     names: Map<string, string>;
     fileNames: Map<string, string>;
+    /** terminal session id -> agent session id (linked-terminal edges). */
+    links: Map<string, string>;
+    linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
+    /** Panes whose bottom band is armed for the current drag. */
+    bandPanes: ReadonlySet<string>;
     ctrl: LayoutCtrl;
   }
 
@@ -30,7 +36,10 @@
     sessions,
     names,
     fileNames,
+    links,
+    linkCtrl,
     wsRoot,
+    bandPanes,
     ctrl,
   }: Props = $props();
 
@@ -42,6 +51,32 @@
   );
   /** Context bridge: the "@ reference" band hovers over this pane's bottom. */
   const refBand = $derived(dropSpot?.kind === "ref" && dropSpot.paneId === node.id);
+  /** The "link to agent" band preview (dragging a terminal over this agent). */
+  const linkBand = $derived(dropSpot?.kind === "link" && dropSpot.paneId === node.id);
+  /** This pane's bottom band is reserved for the current drag: the center
+   *  (adopt) preview stops above it instead of flashing the full pane. */
+  const bandArmed = $derived(bandPanes.has(node.id));
+  /** When this pane IS an agent session: its own hue (link band tint). */
+  const ownAgentHue = $derived.by(() => {
+    if (activeTab === null || activeTab.surface !== "terminal") return null;
+    const s = sessions.get(activeTab.sessionId);
+    return s !== undefined && s.kind === "agent" ? agentHue(activeTab.sessionId) : null;
+  });
+
+  /** When this pane shows a linked terminal: the leash-holder's hue, and
+   *  whether that agent is executing here right now (border pulse). */
+  const linkedAgentId = $derived(
+    activeTab !== null && activeTab.surface === "terminal"
+      ? (links.get(activeTab.sessionId) ?? null)
+      : null,
+  );
+  const linkHue = $derived(linkedAgentId !== null ? agentHue(linkedAgentId) : null);
+  const agentExec = $derived(
+    linkedAgentId !== null &&
+      activeTab !== null &&
+      activeTab.surface === "terminal" &&
+      sessions.get(activeTab.sessionId)?.exec_stage === "executing",
+  );
 
   let rootEl = $state<HTMLElement | null>(null);
   let contentEl = $state<HTMLDivElement | null>(null);
@@ -60,13 +95,28 @@
 <section
   class="pane"
   class:focused
+  class:linked={linkHue !== null}
+  class:agent-exec={agentExec}
+  style:--hue={linkHue}
   tabindex="-1"
   bind:this={rootEl}
   onpointerdowncapture={() => ctrl.focusPane(node.id)}
 >
   <!-- Every pane always has its top bar — orientation, drag handle, and the
        mouse home for zoom/split/close, even single-pane single-tab. -->
-  <PaneTabs {node} {zoomed} {sessions} {names} {fileNames} {wsRoot} {dropSpot} {ctrl} bind:el={tabbarEl} />
+  <PaneTabs
+    {node}
+    {zoomed}
+    {sessions}
+    {names}
+    {fileNames}
+    {links}
+    {linkCtrl}
+    {wsRoot}
+    {dropSpot}
+    {ctrl}
+    bind:el={tabbarEl}
+  />
   <div class="content" bind:this={contentEl}>
     {#if activeTab !== null}
       {#if activeTab.surface === "terminal"}
@@ -91,7 +141,14 @@
   </div>
 
   {#if zone !== null}
-    <div class="drop drop-{zone}"></div>
+    <div class="drop drop-{zone}" class:banded={bandArmed}></div>
+  {:else if linkBand}
+    <!-- Distinct from the split/adopt zones: a labeled, dashed band over the
+         agent's input area. Dropping links the terminal and types its
+         @term: reference into the composer (never submits). -->
+    <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+      <span class="band-label">link to this agent</span>
+    </div>
   {/if}
 
   {#if refBand}
@@ -122,6 +179,35 @@
   /* The focused pane is unmistakable: hairline accent instead of the edge. */
   .pane.focused {
     border-color: color-mix(in srgb, var(--accent) 62%, var(--edge));
+  }
+
+  /* A linked terminal carries its agent's hue as a quiet border tint
+     (focus still wins — the accent hairline stays unambiguous). */
+  .pane.linked:not(.focused) {
+    border-color: color-mix(in srgb, hsl(var(--hue) 50% 55%) 38%, var(--edge));
+  }
+
+  /* The agent is executing here: the border breathes in the agent's hue —
+     peripheral-vision signal that the leash is being pulled. */
+  .pane.agent-exec {
+    animation: agent-exec-pulse 1.4s ease-in-out infinite;
+  }
+
+  @keyframes agent-exec-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 hsl(var(--hue) 60% 55% / 0);
+    }
+    50% {
+      box-shadow: 0 0 0 2px hsl(var(--hue) 60% 55% / 0.35);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pane.agent-exec {
+      animation: none;
+      box-shadow: 0 0 0 2px hsl(var(--hue) 60% 55% / 0.3);
+    }
   }
 
   .content {
@@ -181,7 +267,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
     border: 1px dashed color-mix(in srgb, var(--accent) 60%, transparent);
     border-radius: 7px;
     pointer-events: none;
@@ -213,5 +299,43 @@
   }
   .drop-bottom {
     inset: 50% 0 0 0;
+  }
+
+  /* While a bottom band is armed for this drag, the adopt-as-tab preview
+     stops above it — the band region is reserved, never flashed over. */
+  .drop-center.banded {
+    inset: 0 0 22% 0;
+  }
+
+  /* The link band: same quiet recipe as the "@ reference" band (one band
+     grammar), tinted in the receiving agent's hue when it has one. */
+  .drop-link {
+    position: absolute;
+    z-index: 7;
+    inset: 78% 0 0 0;
+    margin: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border: 1px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 7px;
+    pointer-events: none;
+  }
+
+  .drop-link.hued {
+    background: hsl(var(--band-hue) 55% 55% / 0.1);
+    border-color: hsl(var(--band-hue) 55% 55% / 0.55);
+  }
+
+  .band-label {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    color: var(--fg);
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border-radius: 4px;
+    padding: 2px 8px;
+    user-select: none;
   }
 </style>

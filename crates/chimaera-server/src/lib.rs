@@ -3,6 +3,8 @@ mod api;
 mod assets;
 mod fs;
 mod launcher;
+mod links;
+mod mcp;
 mod naming;
 mod quickopen;
 mod recents;
@@ -57,6 +59,12 @@ pub(crate) struct AppState {
     /// written by the same watcher, surfaced as `cwd_current` on session JSON
     /// (agents and never-polled shells fall back to the spawn cwd).
     pub(crate) current_cwds: Mutex<HashMap<String, PathBuf>>,
+    /// session id -> stage of a currently in-flight agent exec (queued /
+    /// executing); drives the linked-terminal chips in the UI.
+    pub(crate) exec_status: Mutex<HashMap<String, chimaera_pty::ExecStage>>,
+    /// terminal session id -> agent session id: the linked-terminal edges
+    /// (one agent per terminal; see the `links` module).
+    pub(crate) links: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Quick-open walk cache (short TTL, per workspace).
@@ -121,6 +129,8 @@ impl AppState {
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
             current_cwds: Mutex::new(HashMap::new()),
+            exec_status: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             changes: tokio::sync::Notify::new(),
@@ -161,6 +171,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/sessions/{id}",
             delete(api::delete_session).patch(api::rename_session),
         )
+        .route("/sessions/{id}/exec", post(api::exec_session))
+        .route("/sessions/{id}/journal", get(api::session_journal))
+        .route("/links", get(links::list_links).put(links::put_link))
+        .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
         .route("/agents/{id}/install", post(runtimes::install_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
@@ -183,6 +197,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // auth: claude's hooks cannot know the daemon token, so the random
         // per-session key embedded in the hook URL authorizes them instead.
         .route("/agent-events/{id}", post(agents::ingest))
+        // Same key-in-URL auth story as agent-events: claude's MCP client
+        // cannot know the daemon bearer token.
+        .route("/mcp/{id}", post(mcp::mcp))
         .with_state(state.clone());
 
     // The WS routes stay outside the bearer-header middleware: browsers cannot
@@ -2627,6 +2644,688 @@ mod tests {
         wait_display_name(&state, &id, "bash").await;
 
         state.sessions.kill(&id).ok();
+    }
+
+    /// End-to-end shell integration: a real bash spawned the way
+    /// create_session spawns it (integration injected, hermetic HOME) must
+    /// reach phase `ready` and populate the command journal with command
+    /// text, output, and exit codes.
+    #[tokio::test]
+    async fn integrated_shell_populates_command_journal() {
+        use chimaera_pty::ShellPhase;
+
+        let state = test_state();
+        let base = test_dir("shellint-base");
+        let home = test_dir("shellint-home");
+        let launch = chimaera_core::shellint::shell_launch_for("/bin/bash", &base).expect("launch");
+        let mut env = launch.env;
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir("shellint-cwd"),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(launch.argv),
+                id: None,
+                env,
+            })
+            .expect("spawn integrated bash");
+        let marks = state.sessions.marks(&info.id).expect("marks");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while marks.phase() != ShellPhase::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "integrated shell never reached ready (phase {:?})",
+                marks.phase()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let att = state.sessions.attach(&info.id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("echo integration-works\n"))
+            .await
+            .expect("send command");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let entry = loop {
+            let done = marks
+                .journal(10)
+                .into_iter()
+                .find(|e| !e.running && e.command.as_deref() == Some("echo integration-works"));
+            if let Some(entry) = done {
+                break entry;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "journal never recorded the command; journal: {:?}",
+                marks.journal(10)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(entry.exit_code, Some(0), "{entry:?}");
+        assert!(entry.output.contains("integration-works"), "{entry:?}");
+        assert_eq!(entry.source, chimaera_pty::CommandSource::User);
+
+        state.sessions.kill(&info.id).ok();
+    }
+
+    /// Spawn an integrated bash with a hermetic HOME and wait for `ready`.
+    async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) -> String {
+        let base = test_dir(&format!("{label}-base"));
+        let home = test_dir(&format!("{label}-home"));
+        let launch = chimaera_core::shellint::shell_launch_for("/bin/bash", &base).expect("launch");
+        let mut env = launch.env;
+        env.push(("HOME".to_string(), home.to_string_lossy().into_owned()));
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir(&format!("{label}-cwd")),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(launch.argv),
+                id: None,
+                env,
+            })
+            .expect("spawn integrated bash");
+        let marks = state.sessions.marks(&info.id).expect("marks");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while marks.phase() != chimaera_pty::ShellPhase::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shell never reached ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        info.id
+    }
+
+    /// Exec into a shell with NO integration: the engine must fall back to
+    /// sentinel mode and still deliver output + exit code through the
+    /// printf-emitted marks.
+    #[tokio::test]
+    async fn exec_sentinel_round_trip_on_plain_shell() {
+        let state = test_state();
+        let info = state
+            .sessions
+            .spawn(chimaera_pty::SpawnOpts {
+                cwd: test_dir("exec-sentinel"),
+                name: None,
+                cols: 80,
+                rows: 24,
+                command: Some(vec![
+                    "/bin/bash".to_string(),
+                    "--noprofile".to_string(),
+                    "--norc".to_string(),
+                ]),
+                id: None,
+                env: Vec::new(),
+            })
+            .expect("spawn plain bash");
+        let id = info.id;
+
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/exec"),
+            Some(serde_json::json!({"command": "echo sentinel-ran && false"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["mode"], "sentinel", "{out}");
+        assert_eq!(out["timed_out"], false, "{out}");
+        assert_eq!(out["record"]["exit_code"], 1, "{out}");
+        assert_eq!(out["record"]["source"], "agent", "{out}");
+        assert!(
+            out["record"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("sentinel-ran"),
+            "{out}"
+        );
+
+        state.sessions.kill(&id).ok();
+    }
+
+    /// The author decision in action: an exec against a busy integrated
+    /// shell QUEUES until the prompt returns, then runs in integrated mode.
+    #[tokio::test]
+    async fn exec_queues_behind_running_command() {
+        let state = test_state();
+        let id = spawn_integrated_bash(&state, "exec-queue").await;
+
+        let att = state.sessions.attach(&id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("sleep 2\n"))
+            .await
+            .expect("start user command");
+        // Give the sleep a moment to actually start (phase -> running).
+        let marks = state.sessions.marks(&id).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while marks.phase() != chimaera_pty::ShellPhase::Running {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sleep never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/exec"),
+            Some(serde_json::json!({
+                "command": "echo queued-ran",
+                "queue_timeout_ms": 15000,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["mode"], "integrated", "{out}");
+        assert!(
+            out["record"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("queued-ran"),
+            "{out}"
+        );
+        // It genuinely waited for the sleep instead of typing over it.
+        assert!(
+            out["waited_ms"].as_u64().unwrap() >= 1000,
+            "expected a queue wait, got {out}"
+        );
+
+        state.sessions.kill(&id).ok();
+    }
+
+    /// With a short queue timeout and no remote-forwarding foreground, a
+    /// busy shell is a 409 — never typed into.
+    #[tokio::test]
+    async fn exec_busy_is_409_without_sentinel_permission() {
+        let state = test_state();
+        let id = spawn_integrated_bash(&state, "exec-busy").await;
+
+        let att = state.sessions.attach(&id).expect("attach");
+        att.input
+            .send(bytes::Bytes::from("sleep 5\n"))
+            .await
+            .expect("start user command");
+        let marks = state.sessions.marks(&id).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while marks.phase() != chimaera_pty::ShellPhase::Running {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "sleep never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/exec"),
+            Some(serde_json::json!({
+                "command": "echo should-not-run",
+                "queue_timeout_ms": 300,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn exec_into_agent_session_is_409_and_journal_endpoint_reads() {
+        let state = test_state();
+        let agent_id = inject_agent(&state, "k");
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/sessions/{agent_id}/exec"),
+            Some(serde_json::json!({"command": "echo nope"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{out}");
+
+        // Journal endpoint: exec into a shell, then read it back over HTTP.
+        let id = spawn_integrated_bash(&state, "journal-ep").await;
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/exec"),
+            Some(serde_json::json!({"command": "echo journaled"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+
+        let (status, journal) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/sessions/{id}/journal?limit=5"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{journal}");
+        assert_eq!(journal["phase"], "ready", "{journal}");
+        let entries = journal["entries"].as_array().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e["command"] == "echo journaled")
+            .expect("journaled entry");
+        assert_eq!(entry["source"], "agent", "{journal}");
+        assert_eq!(entry["exit_code"], 0, "{journal}");
+
+        // Unknown session is a 404.
+        let (status, _) = request(
+            &state,
+            Method::GET,
+            "/api/v1/sessions/s-00000000/journal",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        state.sessions.kill(&agent_id).ok();
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn links_lifecycle_validation_and_move() {
+        let state = test_state();
+        let agent_a = inject_agent(&state, "ka");
+        let agent_b = inject_agent(&state, "kb");
+        let shell = {
+            let info = state
+                .sessions
+                .spawn(chimaera_pty::SpawnOpts {
+                    cwd: test_dir("links-shell"),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    command: None,
+                    id: None,
+                    env: Vec::new(),
+                })
+                .expect("spawn shell");
+            info.id
+        };
+
+        // Link shell -> agent A.
+        let (status, out) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["moved_from"], serde_json::Value::Null);
+
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(
+            list,
+            serde_json::json!([{"terminal_id": shell, "agent_id": agent_a}])
+        );
+
+        // Re-linking to agent B MOVES the leash (one agent per terminal).
+        let (status, out) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_b})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["moved_from"], agent_a, "{out}");
+        assert_eq!(links::terminals_of(&state, &agent_b), vec![shell.clone()]);
+        assert!(links::terminals_of(&state, &agent_a).is_empty());
+
+        // A shell can't play agent; an agent can't play terminal.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": shell})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": agent_a, "agent_id": agent_b})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Unknown sessions are 404s.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": "s-00000000", "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Unlink is idempotent.
+        for _ in 0..2 {
+            let (status, _) = request(
+                &state,
+                Method::DELETE,
+                &format!("/api/v1/links/{shell}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(list, serde_json::json!([]));
+
+        // A link dies with its terminal session (pruned on read).
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent_a})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        state.sessions.kill(&shell).ok();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+            if list == serde_json::json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "link survived its dead terminal: {list}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        state.sessions.kill(&agent_a).ok();
+        state.sessions.kill(&agent_b).ok();
+    }
+
+    /// POST one JSON-RPC message to an agent's MCP endpoint.
+    async fn mcp_post(
+        state: &Arc<AppState>,
+        agent_id: &str,
+        key: &str,
+        message: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        request(
+            state,
+            Method::POST,
+            &format!("/api/v1/mcp/{agent_id}?key={key}"),
+            Some(message),
+        )
+        .await
+    }
+
+    /// Call an MCP tool and return (isError, text content).
+    async fn mcp_tool_call(
+        state: &Arc<AppState>,
+        agent_id: &str,
+        key: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (bool, String) {
+        let (status, out) = mcp_post(
+            state,
+            agent_id,
+            key,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": tool, "arguments": args},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let result = &out["result"];
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        (is_error, text)
+    }
+
+    #[tokio::test]
+    async fn mcp_handshake_auth_and_tool_listing() {
+        let state = test_state();
+        let id = inject_agent(&state, "mk");
+
+        // Wrong key is a 403; unknown agent a 404.
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"},
+        });
+        let (status, _) = mcp_post(&state, &id, "wrong", init.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = mcp_post(&state, "s-00000000", "mk", init.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Initialize echoes the protocol version and carries instructions.
+        let (status, out) = mcp_post(&state, &id, "mk", init).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(out["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(out["result"]["serverInfo"]["name"], "chimaera");
+        assert!(out["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("@term:"));
+
+        // Notifications (no id) are 202-acknowledged.
+        let (status, _) = mcp_post(
+            &state,
+            &id,
+            "mk",
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // tools/list names the three linked-terminal tools.
+        let (status, out) = mcp_post(
+            &state,
+            &id,
+            "mk",
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = out["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["list_terminals", "run_in_terminal", "read_terminal"]
+        );
+
+        state.sessions.kill(&id).ok();
+    }
+
+    /// The full agent-side story over MCP: unlinked -> helpful error;
+    /// linked -> list, exec (by display name), and journal read all work
+    /// and stay scoped.
+    #[tokio::test]
+    async fn mcp_tools_scoped_to_links_and_exec_round_trip() {
+        let state = test_state();
+        let agent = inject_agent(&state, "mk");
+        let shell = spawn_integrated_bash(&state, "mcp-shell").await;
+
+        // Unlinked: every tool refuses with linking guidance.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": shell, "command": "echo hi"}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+        assert!(text.contains("no terminals are linked"), "{text}");
+
+        // Link, then exec by session id.
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/links",
+            Some(serde_json::json!({"terminal_id": shell, "agent_id": agent})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": shell, "command": "echo mcp-ran && false"}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.starts_with("exit 1"), "{text}");
+        assert!(text.contains("integrated mode"), "{text}");
+        assert!(text.contains("mcp-ran"), "{text}");
+
+        // list_terminals shows the linked shell with its last command.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "list_terminals",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains(&shell), "{text}");
+        assert!(text.contains("echo mcp-ran && false"), "{text}");
+
+        // read_terminal returns the journal with agent attribution upstream.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "read_terminal",
+            serde_json::json!({"terminal": shell, "commands": 3}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains("phase: ready"), "{text}");
+        assert!(text.contains("echo mcp-ran && false"), "{text}");
+        assert!(text.contains("exit 1"), "{text}");
+
+        // Screen mode reads the visible grid.
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "read_terminal",
+            serde_json::json!({"terminal": shell, "screen": true}),
+        )
+        .await;
+        assert!(!is_error, "{text}");
+        assert!(text.contains("mcp-ran"), "{text}");
+
+        // A second, unlinked shell stays out of reach — scope is the links.
+        let other = spawn_integrated_bash(&state, "mcp-other").await;
+        let (is_error, text) = mcp_tool_call(
+            &state,
+            &agent,
+            "mk",
+            "run_in_terminal",
+            serde_json::json!({"terminal": other, "command": "echo nope"}),
+        )
+        .await;
+        assert!(is_error, "{text}");
+
+        state.sessions.kill(&agent).ok();
+        state.sessions.kill(&shell).ok();
+        state.sessions.kill(&other).ok();
+    }
+
+    /// `@term:` mentions in a user prompt auto-link (mention = consent) and
+    /// the hook response tells the agent via additionalContext.
+    #[tokio::test]
+    async fn user_prompt_mention_autolinks_terminal() {
+        let state = test_state();
+        let agent = inject_agent(&state, "mk");
+        let root = test_dir("mention-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let root = std::fs::canonicalize(&root).unwrap();
+        let shell = inject_shell(&state, &root, ws["id"].as_str().unwrap());
+        wait_display_name(&state, &shell, "bash").await;
+
+        // Mention by display name links it and reports back as context.
+        let (status, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "run squeue in @term:bash please",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(context.contains("Linked terminal 'bash'"), "{out}");
+        let (_, list) = request(&state, Method::GET, "/api/v1/links", None).await;
+        assert_eq!(
+            list,
+            serde_json::json!([{"terminal_id": shell, "agent_id": agent}])
+        );
+
+        // A repeated mention of an already-linked terminal stays silent.
+        let (_, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "again in @term:bash",
+            })),
+        )
+        .await;
+        assert_eq!(out["hookSpecificOutput"], serde_json::Value::Null, "{out}");
+
+        // Unknown mentions surface as context too (the agent should know).
+        let (_, out) = request(
+            &state,
+            Method::POST,
+            &format!("/api/v1/agent-events/{agent}?key=mk"),
+            Some(serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "and @term:doesnotexist",
+            })),
+        )
+        .await;
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(context.contains("no terminal 'doesnotexist'"), "{out}");
+
+        state.sessions.kill(&agent).ok();
+        state.sessions.kill(&shell).ok();
     }
 
     #[tokio::test]

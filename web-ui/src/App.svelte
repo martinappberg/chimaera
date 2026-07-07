@@ -40,6 +40,14 @@
     type RecentConvo,
   } from "./lib/launcher";
   import { EventsSocket } from "./lib/events";
+  import {
+    deleteLink,
+    listLinks,
+    putLink,
+    termReference,
+    type Link,
+    type LinkCtrl,
+  } from "./lib/agentLinks";
   import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
   import { get } from "svelte/store";
   import {
@@ -50,10 +58,12 @@
     composeShellPathReference,
     composeTerminalReference,
     referenceTarget,
+    composeProvenanceSuffix,
     setReferenceHandler,
     setSelection,
     workspaceRelative,
   } from "./lib/reference";
+  import { provenanceFor, rememberCopy } from "./lib/provenance";
   import {
     activateTab,
     adjacentPane,
@@ -74,9 +84,11 @@
     openFile,
     openSession,
     paneForTab,
+    panes as panesOf,
     pruneFiles,
     pruneSessions,
     serializeLayout,
+    sessionPaneId,
     setPaneFont,
     setRatio,
     splitPane,
@@ -115,6 +127,8 @@
   let health = $state<Health | null>(null);
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
+  /** Linked-terminal edges, mirrored from /ws/events snapshots. */
+  let links = $state<Link[]>([]);
   let activeWsId = $state<string | null>(getActiveWorkspaceId());
   let pickerOpen = $state(false);
   let quickOpenOpen = $state(false);
@@ -155,6 +169,9 @@
   let gotSessions = $state(false);
   let autoOpened = false;
   let dropSpot = $state<DropSpot | null>(null);
+  /** Panes whose bottom band is armed for the CURRENT drag (reference or
+   *  link targets) — zone previews stop above the band on these. */
+  let bandPanes = $state<ReadonlySet<string>>(new Set());
 
   /** File-tree reveal request (terminal dir links); nonce distinguishes repeats. */
   let treeReveal = $state<{ path: string; nonce: number } | null>(null);
@@ -188,6 +205,8 @@
   const agentSessions = $derived(wsSessions.filter((s) => s.kind === "agent"));
   const railSessions = $derived([...shellSessions, ...agentSessions]);
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
+  /** terminal session id -> agent session id (one agent per terminal). */
+  const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
   const focusedSessionId = $derived(focusedSessionOf(layout));
   const focusedFilePath = $derived(focusedFileOf(layout));
   /** Open file tabs' display titles (basename, disambiguated by parent dir). */
@@ -211,11 +230,26 @@
   });
 
   /**
-   * Where a reference lands: the focused agent session, else the workspace's
-   * most recently active agent, else its newest live agent. Null (no agent
-   * session at all) renders every reference affordance disabled.
+   * Where a reference lands, most-explicit first: the agent LINKED to the
+   * selection's source terminal (the leash is the bridge the user built),
+   * else the focused agent session, else the workspace's most recently
+   * active agent, else its newest live agent. Null (no agent session at
+   * all) renders every reference affordance disabled.
    */
   const refTargetSession = $derived.by(() => {
+    const sel = $activeSelection;
+    if (sel !== null && sel.kind === "terminal") {
+      const leash = linksByTerminal.get(sel.sessionId);
+      const linked = leash !== undefined ? sessionsById.get(leash) : undefined;
+      if (
+        linked !== undefined &&
+        linked.kind === "agent" &&
+        linked.alive &&
+        linked.workspace_id === activeWsId
+      ) {
+        return linked;
+      }
+    }
     const focused = focusedSessionId !== null ? sessionsById.get(focusedSessionId) : undefined;
     if (
       focused !== undefined &&
@@ -277,11 +311,23 @@
 
   // /ws/events pushes full session snapshots; the 5s poll only runs as a
   // fallback while the socket is down (including before the first frame).
+  // Links normally ride the socket frames; the fallback refreshes them too.
   $effect(() => {
     if (eventsUp) return;
-    return pollSessions(applySessions, () => {
-      // transient poll failure; the daemon dot already reflects reachability
-    });
+    return pollSessions(
+      (list) => {
+        applySessions(list);
+        listLinks().then(
+          (l) => (links = l),
+          () => {
+            // stale links until the daemon is reachable again
+          },
+        );
+      },
+      () => {
+        // transient poll failure; the daemon dot already reflects reachability
+      },
+    );
   });
 
   // Persist the layout (debounced in viewState) whenever it changes, keyed
@@ -313,12 +359,16 @@
       onExited,
       onSocketError,
       onSelection: onTermSelection,
+      onPaste: onTermPaste,
       linkContext,
       onOpenPath,
     });
     setReferenceHandler(referenceSelection);
     const events = new EventsSocket({
-      onSessions: applySessions,
+      onSessions: (list, linkList) => {
+        applySessions(list);
+        if (linkList !== undefined) links = linkList;
+      },
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -349,12 +399,15 @@
     }
 
     const onPagehide = () => void flushViewState();
+    const onCopy = () => rememberCopy();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
+    document.addEventListener("copy", onCopy);
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
       unlistenMenu?.();
+      document.removeEventListener("copy", onCopy);
       setReferenceHandler(null);
       events.close();
       pool.disposePool();
@@ -370,6 +423,32 @@
     } else {
       clearSelection(`term:${id}`);
     }
+  }
+
+  /**
+   * Copy provenance, the paste half: a snippet copied from a tracked view
+   * and pasted into an AGENT composer grows a visible ` [from …] ` tag
+   * right after it. The pasted bytes are untouched, shells are never
+   * touched, and the tag types AFTER xterm forwards the paste (microtask).
+   */
+  function onTermPaste(id: string, text: string): void {
+    const target = sessionsById.get(id);
+    if (target === undefined || target.kind !== "agent" || !target.alive) return;
+    const source = provenanceFor(text);
+    if (source === null) return;
+    // Pasting a snippet back into where it came from needs no tag.
+    if (source.kind === "terminal" && source.sessionId === id) return;
+    const root = workspace?.root;
+    const suffix = composeProvenanceSuffix(
+      source,
+      source.kind === "file" && root !== undefined
+        ? workspaceRelative(source.path, root)
+        : null,
+      source.kind === "terminal"
+        ? (displayNames.get(source.sessionId) ?? "terminal")
+        : null,
+    );
+    queueMicrotask(() => pool.sendText(id, suffix));
   }
 
   /**
@@ -406,6 +485,15 @@
       const name =
         displayNames.get(sel.sessionId) ?? (src !== undefined ? displayName(src) : "terminal");
       text = composeTerminalReference(name, sel.text);
+    }
+    // A reference never lands out of sight: surface the target agent first,
+    // splitting beside the selection's own pane when it is not open anywhere.
+    if (sessionPaneId(layout, target.id) === null) {
+      const beside =
+        (sel.kind === "terminal" ? sessionPaneId(layout, sel.sessionId) : null) ??
+        layout.focusedPaneId;
+      layout = splitPane(layout, beside, "row");
+      layout = openSession(layout, target.id);
     }
     typeIntoSession(target.id, text);
   }
@@ -1213,6 +1301,31 @@
     },
   };
 
+  /**
+   * Panes whose input band should read "link to this agent" while dragging
+   * `tab`: panes showing a live agent session, when the payload is a shell
+   * terminal (files and agents themselves never link).
+   */
+  function linkTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+    if (tab.surface !== "terminal") return undefined;
+    if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
+    const targets = new Set<string>();
+    const walk = (n: typeof layout.root): void => {
+      if (n.type === "pane") {
+        const active = n.tabs[n.active];
+        if (active !== undefined && active.surface === "terminal") {
+          const s = sessionsById.get(active.sessionId);
+          if (s !== undefined && s.kind === "agent" && s.alive) targets.add(n.id);
+        }
+        return;
+      }
+      walk(n.a);
+      walk(n.b);
+    };
+    walk(layout.root);
+    return targets.size > 0 ? targets : undefined;
+  }
+
   /** Shared drag start for rail rows and pane tabs (any surface). */
   function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void): void {
     const label =
@@ -1221,6 +1334,25 @@
           sessionsById.get(tab.sessionId)?.name ??
           tab.sessionId.slice(0, 8))
         : (fileTitles.get(tab.path) ?? basename(tab.path));
+    // Arm the bottom bands for this drag: reference targets for file drags,
+    // link targets for shell-terminal drags. Drives the partitioned zone
+    // previews (the band region is reserved, never flashed over).
+    const armed = new Set<string>();
+    const linkTargets = linkTargetsFor(tab);
+    if (linkTargets !== undefined) for (const id of linkTargets) armed.add(id);
+    if (tab.surface === "file") {
+      for (const p of panesOf(layout.root)) {
+        const a = p.tabs[p.active];
+        if (
+          a !== undefined &&
+          a.surface === "terminal" &&
+          (sessionsById.get(a.sessionId)?.alive ?? false)
+        ) {
+          armed.add(p.id);
+        }
+      }
+    }
+    bandPanes = armed;
     startDrag(
       e,
       { tab, label },
@@ -1230,6 +1362,10 @@
           if (spot.kind === "ref") {
             // Drag-to-reference: type into the session, never open a tab.
             if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path);
+            return;
+          }
+          if (spot.kind === "link") {
+            if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
             return;
           }
           layout =
@@ -1247,7 +1383,10 @@
           }
         },
         onClick,
-        onEnd: () => (dropSpot = null),
+        onEnd: () => {
+          dropSpot = null;
+          bandPanes = new Set();
+        },
         // The "@ reference" band exists over panes showing a LIVE session
         // (dnd only consults this for file drags).
         acceptsRef: (paneId) => {
@@ -1261,8 +1400,71 @@
           );
         },
       },
+      { linkTargets },
     );
   }
+
+  // --- linked terminals ------------------------------------------------------
+
+  /**
+   * Create/move a link with an optimistic local update; the next /ws/events
+   * snapshot is authoritative either way (on failure we resync explicitly).
+   */
+  async function doLink(terminalId: string, agentId: string): Promise<void> {
+    links = [
+      ...links.filter((l) => l.terminal_id !== terminalId),
+      { terminal_id: terminalId, agent_id: agentId },
+    ];
+    try {
+      await putLink(terminalId, agentId);
+    } catch {
+      links = await listLinks().catch(() => links);
+    }
+  }
+
+  /** Reveal a session's view, splitting beside `besidePaneId` if not open. */
+  function revealSession(sessionId: string, besidePaneId: string): void {
+    if (sessionPaneId(layout, sessionId) === null) {
+      layout = splitPane(layout, besidePaneId, "row");
+    }
+    layout = openSession(layout, sessionId);
+  }
+
+  /**
+   * The drop on an agent pane's link band: link the terminal, type its
+   * @term: reference into the composer (never submits), reveal the terminal
+   * beside the agent, and hand focus to the agent so Enter sends the prompt.
+   */
+  function linkByDrop(terminalId: string, agentPaneId: string): void {
+    const pane = findPane(layout.root, agentPaneId);
+    const agentTab = pane?.tabs[pane.active];
+    if (agentTab === undefined || agentTab.surface !== "terminal") return;
+    const agentId = agentTab.sessionId;
+    void doLink(terminalId, agentId);
+    const name = displayNames.get(terminalId) ?? terminalId;
+    // The context bridge's typing path: pooled socket when warm, one-shot
+    // socket otherwise — the reference lands even in a cold agent pane.
+    typeIntoSession(agentId, `${termReference(name)} `);
+    revealSession(terminalId, agentPaneId);
+    pool.focusTerminal(agentId);
+  }
+
+  /** Link mutations + reveal for the pane top bars (chips and the menu). */
+  const linkCtrl: LinkCtrl = {
+    reveal(sessionId, besidePaneId) {
+      revealSession(sessionId, besidePaneId);
+      pool.focusTerminal(sessionId);
+    },
+    link(terminalId, agentId) {
+      void doLink(terminalId, agentId);
+    },
+    unlink(terminalId) {
+      links = links.filter((l) => l.terminal_id !== terminalId);
+      deleteLink(terminalId).catch(async () => {
+        links = await listLinks().catch(() => links);
+      });
+    },
+  };
 
   function onRailRowDown(e: PointerEvent, sessionId: string): void {
     beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
@@ -1654,7 +1856,10 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            links={linksByTerminal}
+            {linkCtrl}
             wsRoot={workspace?.root ?? null}
+            {bandPanes}
             {ctrl}
           />
         {:else}
@@ -1665,7 +1870,10 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            links={linksByTerminal}
+            {linkCtrl}
             wsRoot={workspace?.root ?? null}
+            {bandPanes}
             {ctrl}
           />
         {/if}

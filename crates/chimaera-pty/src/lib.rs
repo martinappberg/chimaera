@@ -8,8 +8,13 @@
 //! returns a snapshot escape stream that reconstructs the terminal in a fresh
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
+pub mod exec;
+pub mod marks;
 mod session;
 mod snapshot;
+
+pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
+pub use marks::{CommandSource, CommandView, Marks, ShellPhase};
 
 #[cfg(test)]
 mod tests;
@@ -39,6 +44,8 @@ pub struct SessionInfo {
     /// True when `name` was pinned explicitly (spawn name / user rename)
     /// rather than derived from the cwd; pinned names stay authoritative.
     pub renamed: bool,
+    /// Shell phase from OSC 133 marks (`unknown` without shell integration).
+    pub phase: ShellPhase,
 }
 
 /// Options for spawning a new session.
@@ -57,8 +64,8 @@ pub struct SpawnOpts {
     /// Extra environment variables for the child, applied on top of the
     /// inherited environment (a pair with an existing name overrides it, so
     /// callers can e.g. prepend to PATH). The daemon uses this to inject
-    /// `CHIMAERA_SESSION`/`CHIMAERA_THEME` and the shim dir into every
-    /// session it spawns.
+    /// `CHIMAERA_SESSION`/`CHIMAERA_THEME`, the shim dir, and the shell
+    /// integration bootstrap into every session it spawns.
     pub env: Vec<(String, String)>,
 }
 
@@ -66,9 +73,20 @@ pub struct SpawnOpts {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    Title { title: String },
-    Resized { cols: u16, rows: u16 },
-    Exited { status: Option<i32> },
+    Title {
+        title: String,
+    },
+    Resized {
+        cols: u16,
+        rows: u16,
+    },
+    Exited {
+        status: Option<i32>,
+    },
+    /// Shell phase change from OSC 133 marks (prompt <-> running).
+    Shell {
+        phase: ShellPhase,
+    },
 }
 
 /// A live view onto a session, handed out by [`SessionManager::attach`].
@@ -207,6 +225,30 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("unknown session: {id}"))?;
         session.rename(name);
         Ok(())
+    }
+
+    /// Shell-integration marks (phase + command journal) for a session.
+    pub fn marks(&self, id: &str) -> Option<Arc<Marks>> {
+        self.session(id).map(|s| s.marks())
+    }
+
+    /// Plain-text rendering of the last `last_n` logical lines a session
+    /// shows (what a human sees; scrollback included, wraps joined).
+    pub fn screen_text(&self, id: &str, last_n: usize) -> Option<String> {
+        self.session(id).map(|s| s.screen_text(last_n))
+    }
+
+    /// Type a command into a session's shell and wait for its outcome (see
+    /// [`exec`] for the mode/queue semantics). Execs are serialized per
+    /// session; a busy integrated shell queues up to `opts.queue_timeout`.
+    pub async fn exec(&self, id: &str, opts: ExecOptions) -> Result<ExecOutcome, ExecError> {
+        let session = self.session(id).ok_or(ExecError::SessionGone)?;
+        exec::exec(session.marks(), session.input(), session.exec_lock(), opts).await
+    }
+
+    /// Input sender for a session (exec engine path; no snapshot render).
+    pub fn input(&self, id: &str) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+        self.session(id).map(|s| s.input())
     }
 
     /// Signal the session's child to terminate (SIGHUP); the wait thread

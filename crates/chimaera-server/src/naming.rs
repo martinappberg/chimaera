@@ -105,6 +105,11 @@ pub(crate) fn shell_display_name(info: &chimaera_pty::SessionInfo, polled: Optio
 }
 
 /// One poll: resolve what the shell is doing right now, per naming rule zero.
+/// Executable name of a pid (exec-policy checks reuse the naming lookup).
+pub(crate) fn comm_name(pid: i32) -> Option<String> {
+    proc_info::comm(pid)
+}
+
 /// `polled_cwd` is the watcher's fresh cwd reading for this tick, if any.
 fn resolve_shell_name(
     state: &AppState,
