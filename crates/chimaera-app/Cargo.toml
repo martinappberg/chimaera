@@ -1,0 +1,31 @@
+[package]
+name = "chimaera-app"
+version = "0.0.1"
+edition = "2021"
+
+# Deliberately a standalone workspace: the Tauri/webview stack must never
+# enter the daemon workspace (musl CI, HPC login-node builds stay lean).
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tauri = { version = "2", features = [] }
+ureq = "2"
+urlencoding = "2"
+
+chimaera-core = { path = "../chimaera-core" }
+chimaera-remote = { path = "../chimaera-remote" }
+chimaera-server = { path = "../chimaera-server" }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

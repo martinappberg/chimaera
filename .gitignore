@@ -1,6 +1,10 @@
 /target
 node_modules/
 web-ui/dist/
+# The native shell is a standalone cargo workspace (Tauri stays out of the
+# daemon workspace), so it has its own target dir.
+crates/chimaera-app/target/
+crates/chimaera-app/gen/
 *.log
 .DS_Store
 .claude/scheduled_tasks.lock

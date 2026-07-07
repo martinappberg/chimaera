@@ -19,6 +19,15 @@ interface TauriGlobal {
       handler: (e: { payload: T }) => void,
     ) => Promise<() => void>;
   };
+  window: { getCurrentWindow: () => { close: () => Promise<void> } };
+  webviewWindow: {
+    getCurrentWebviewWindow: () => {
+      listen: <T>(
+        event: string,
+        handler: (e: { payload: T }) => void,
+      ) => Promise<() => void>;
+    };
+  };
 }
 
 function tauri(): TauriGlobal | null {
@@ -94,6 +103,25 @@ export function onConnectProgress(
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
   return t.event.listen<ConnectProgress>("connect-progress", (e) => handler(e.payload));
+}
+
+/**
+ * Native menu actions forwarded to THIS window ("close-view",
+ * "new-terminal", "new-agent"). Window-scoped on purpose: the shell emits
+ * to the focused window's label, and a window-scoped listener is what
+ * receives targeted events. No-op unsubscriber in the browser.
+ */
+export function onMenu(handler: (action: string) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<string>("menu", (e) => handler(e.payload));
+}
+
+/** Close this native window (menu Cmd+W on a home window). */
+export function closeThisWindow(): void {
+  void tauri()?.window.getCurrentWindow().close();
 }
 
 /**

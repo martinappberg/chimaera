@@ -23,6 +23,17 @@ serve: ui
 dev-ui:
     cd web-ui && npm run dev
 
+# Native shell (standalone cargo workspace; Tauri stays out of the daemon
+# workspace). Debug run + fmt/clippy, and the bundled .app/.dmg.
+app-dev: ui
+    cd crates/chimaera-app && cargo run
+
+app-check:
+    cd crates/chimaera-app && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+
+app-build:
+    cd crates/chimaera-app && npm install && npx tauri build
+
 # Static musl builds (requires cargo-zigbuild + zig)
 release-linux: ui
     cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera

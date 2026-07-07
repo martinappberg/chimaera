@@ -88,6 +88,7 @@
     type LayoutCtrl,
   } from "./lib/dnd";
   import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
+  import { closeThisWindow, isNativeShell, onMenu } from "./lib/native";
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
@@ -289,12 +290,34 @@
     refreshWorkspaces();
     void bootViewState();
 
+    // Native menu items the shell forwards to the focused window. Cmd+W
+    // closes the focused VIEW (a home window just closes), reclaiming the
+    // chords a browser reserves for tabs.
+    let unlistenMenu: (() => void) | null = null;
+    if (isNativeShell()) {
+      void onMenu((action) => {
+        switch (action) {
+          case "close-view":
+            if (activeWsId === null) closeThisWindow();
+            else if (layoutReady) closeView(layout.focusedPaneId);
+            break;
+          case "new-terminal":
+            void newSession("shell");
+            break;
+          case "new-agent":
+            void newSession("agent");
+            break;
+        }
+      }).then((u) => (unlistenMenu = u));
+    }
+
     const onPagehide = () => void flushViewState();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      unlistenMenu?.();
       setReferenceHandler(null);
       events.close();
       pool.disposePool();

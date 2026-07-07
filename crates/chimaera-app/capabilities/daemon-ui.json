@@ -1,0 +1,20 @@
+{
+  "identifier": "daemon-ui",
+  "description": "Every window is the daemon-served UI — the local daemon or an ssh tunnel, always on loopback — and gets the shell bridge (hosts, tunnels, windows).",
+  "windows": ["*"],
+  "local": true,
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "allow-list-hosts",
+    "allow-add-host",
+    "allow-remove-host",
+    "allow-connect-host",
+    "allow-disconnect-host",
+    "allow-remote-workspaces",
+    "allow-open-window"
+  ]
+}
