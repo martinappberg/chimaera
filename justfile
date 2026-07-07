@@ -17,13 +17,31 @@ fmt:
 
 # Run the daemon locally (foreground)
 serve: ui
-    cargo run -p chimaera -- serve --foreground
+    cargo run -p chimaera -- serve
 
 # Vite dev server with proxy to a running daemon
 dev-ui:
     cd web-ui && npm run dev
 
+# Native shell (standalone cargo workspace; Tauri stays out of the daemon
+# workspace). Debug run + fmt/clippy, and the bundled .app/.dmg.
+app-dev: ui
+    cd crates/chimaera-app && cargo run
+
+app-check:
+    cd crates/chimaera-app && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+
+app-build:
+    cd crates/chimaera-app && npm install && npx tauri build
+
 # Static musl builds (requires cargo-zigbuild + zig)
 release-linux: ui
-    cargo zigbuild --release --target x86_64-unknown-linux-musl
-    cargo zigbuild --release --target aarch64-unknown-linux-musl
+    cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
+    cargo zigbuild --release --target aarch64-unknown-linux-musl -p chimaera
+
+# Build deployable linux binaries into ~/.chimaera/dist, where `connect`
+# (CLI and native shell) looks when auto-installing on a remote host.
+dist: release-linux
+    mkdir -p ~/.chimaera/dist
+    cp target/x86_64-unknown-linux-musl/release/chimaera ~/.chimaera/dist/chimaera-x86_64-linux-musl
+    cp target/aarch64-unknown-linux-musl/release/chimaera ~/.chimaera/dist/chimaera-aarch64-linux-musl

@@ -2,6 +2,7 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,9 @@ pub(crate) struct Workspace {
     pub(crate) id: String,
     pub(crate) root: PathBuf,
     pub(crate) name: String,
+    /// Unix seconds of the last open/activity; 0 for pre-upgrade records.
+    #[serde(default)]
+    pub(crate) last_opened_at: u64,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -50,17 +54,49 @@ impl WorkspaceStore {
     }
 
     /// Register `root` (must already be canonical). Idempotent per canonical
-    /// root: an existing entry is returned unchanged.
+    /// root; re-registering stamps the existing entry as freshly opened.
     pub(crate) fn add(&mut self, root: PathBuf) -> anyhow::Result<Workspace> {
-        if let Some(existing) = self.items.iter().find(|w| w.root == root) {
-            return Ok(existing.clone());
+        if let Some(existing) = self.items.iter_mut().find(|w| w.root == root) {
+            existing.last_opened_at = unix_now();
+            let workspace = existing.clone();
+            self.save()?;
+            return Ok(workspace);
         }
         let name = workspace_name(&root);
         let id = format!("w-{}", &chimaera_core::generate_token()[..8]);
-        let workspace = Workspace { id, root, name };
+        let workspace = Workspace {
+            id,
+            root,
+            name,
+            last_opened_at: unix_now(),
+        };
         self.items.push(workspace.clone());
         self.save()?;
         Ok(workspace)
+    }
+
+    /// Stamp `id` as freshly opened. Returns the workspace, or None if
+    /// unknown.
+    pub(crate) fn touch(&mut self, id: &str) -> Option<Workspace> {
+        let entry = self.items.iter_mut().find(|w| w.id == id)?;
+        entry.last_opened_at = unix_now();
+        let workspace = entry.clone();
+        if let Err(err) = self.save() {
+            tracing::warn!(%err, "failed to persist workspace touch");
+        }
+        Some(workspace)
+    }
+
+    /// Unregister `id` (never touches the directory). Returns whether it
+    /// existed.
+    pub(crate) fn remove(&mut self, id: &str) -> anyhow::Result<bool> {
+        let before = self.items.len();
+        self.items.retain(|w| w.id != id);
+        let removed = self.items.len() != before;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
     }
 
     /// Atomically persist the list (tmp file + rename).
@@ -84,4 +120,11 @@ fn workspace_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

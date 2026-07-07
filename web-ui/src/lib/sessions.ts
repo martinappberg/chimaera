@@ -4,6 +4,8 @@ export interface Workspace {
   id: string;
   root: string;
   name: string;
+  /** Unix seconds of the last open/activity; 0/absent on old daemons. */
+  last_opened_at?: number;
 }
 
 export type SessionKind = "shell" | "agent";
@@ -189,6 +191,16 @@ export async function createWorkspace(root: string): Promise<Workspace> {
       body: JSON.stringify({ root }),
     }),
   );
+}
+
+/** Stamp a workspace as freshly opened (home-screen recency). */
+export async function touchWorkspace(id: string): Promise<Workspace> {
+  return json(await api(`/workspaces/${id}/open`, { method: "POST" }));
+}
+
+/** Unregister a workspace from the daemon (the folder itself is untouched). */
+export async function deleteWorkspace(id: string): Promise<void> {
+  await json<void>(await api(`/workspaces/${id}`, { method: "DELETE" }));
 }
 
 export async function listSessions(): Promise<Session[]> {

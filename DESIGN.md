@@ -883,6 +883,20 @@ which is the survival property that matters.
   via the `#host=` hash param (the VS Code Remote convention); the raw hostname is hover
   detail. Raw hostnames like `host.example` confused the author on day one — labels must
   be human.
+- **2026-07-06 — native shell pulled forward from M6 (windows + home screen + remotes).**
+  `crates/chimaera-app` is a Tauri 2 shell in a deliberately standalone cargo workspace (the
+  webview stack never touches the musl/HPC builds). Its binary doubles as the daemon
+  (`--daemon`), spawned detached so quitting the app kills nothing. Windows load the
+  daemon-served UI over `127.0.0.1` with the token in the URL fragment — the exact browser
+  mechanism, one UI codebase; a Tauri capability grants those origins the IPC bridge. A
+  workspace-less window is a **home screen**: workspaces by recency with live session/
+  needs-you badges, plus saved remote hosts (`~/.chimaera/hosts.json`) with one-click
+  connect — probe, auto-install from `~/.chimaera/dist` (built by `just dist`, target
+  detected via `uname -sm`), start, tunnel — surfaced as progress states. The connect flow
+  lives in the shared `chimaera-remote` crate; the CLI drives the same code. Menu bar owns
+  the browser-reserved chords: Cmd+W = close view (emitted to the focused window only),
+  Cmd+T/Cmd+Shift+T = new terminal/agent, Cmd+Shift+N = new home window. M6's remaining
+  scope (Tier B structured chat, ACP, notifications/menubar badge) is unchanged.
 
 Still open:
 

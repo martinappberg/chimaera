@@ -1,0 +1,13 @@
+{
+  "name": "chimaera-app",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "node scripts/gen-icon.mjs && tauri icon icons/icon.png -o icons"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -15,6 +15,7 @@
   import {
     createSession,
     deleteSession,
+    deleteWorkspace,
     displayName,
     dotState,
     dotTitle,
@@ -23,6 +24,7 @@
     renameSession,
     needsAttention,
     pollSessions,
+    touchWorkspace,
     type AgentSpawn,
     type Session,
     type Workspace,
@@ -98,9 +100,11 @@
     type LayoutCtrl,
   } from "./lib/dnd";
   import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
+  import { closeThisWindow, isNativeShell, onMenu } from "./lib/native";
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
+  import HomeScreen from "./lib/HomeScreen.svelte";
   import Launcher from "./lib/Launcher.svelte";
   import SessionGlyph from "./lib/SessionGlyph.svelte";
   import QuickOpen from "./lib/QuickOpen.svelte";
@@ -323,12 +327,34 @@
     refreshWorkspaces();
     void bootViewState();
 
+    // Native menu items the shell forwards to the focused window. Cmd+W
+    // closes the focused VIEW (a home window just closes), reclaiming the
+    // chords a browser reserves for tabs.
+    let unlistenMenu: (() => void) | null = null;
+    if (isNativeShell()) {
+      void onMenu((action) => {
+        switch (action) {
+          case "close-view":
+            if (activeWsId === null) closeThisWindow();
+            else if (layoutReady) closeView(layout.focusedPaneId);
+            break;
+          case "new-terminal":
+            newShell();
+            break;
+          case "new-agent":
+            spawnDefaultAgent();
+            break;
+        }
+      }).then((u) => (unlistenMenu = u));
+    }
+
     const onPagehide = () => void flushViewState();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      unlistenMenu?.();
       setReferenceHandler(null);
       events.close();
       pool.disposePool();
@@ -734,6 +760,8 @@
     const switched = activeWsId !== w.id;
     closePicker();
     createError = null;
+    // Stamp recency for the home screen (fire-and-forget; old daemons 404).
+    void touchWorkspace(w.id).catch(() => {});
     if (!switched) return;
     // Flush the outgoing workspace's pending layout write under its own key,
     // then restore (or default) the incoming workspace's tree.
@@ -744,6 +772,16 @@
     layout = defaultLayout();
     autoOpened = false;
     void bootViewState();
+  }
+
+  /** Home screen: unregister a workspace (the folder itself is untouched). */
+  function removeWorkspace(w: Workspace): void {
+    workspaces = workspaces.filter((x) => x.id !== w.id);
+    void deleteWorkspace(w.id)
+      .catch(() => {
+        // already gone or unreachable; the refresh below reconciles
+      })
+      .finally(refreshWorkspaces);
   }
 
   /** Agent ids in the previous snapshot. A vanished agent just retired into
@@ -1312,6 +1350,20 @@
 </script>
 
 <div class="shell">
+  {#if activeWsId === null}
+    <!-- Home: a real launcher, not an empty IDE. The rail and stage only
+         exist once a workspace scopes this window. -->
+    <HomeScreen
+      {workspaces}
+      {sessions}
+      hostLabel={getHostLabel()}
+      {health}
+      connected={eventsUp}
+      onOpen={activateWorkspace}
+      onRemove={removeWorkspace}
+      onOpenFolder={openPicker}
+    />
+  {:else}
   <div class="body">
     <aside class="rail" class:collapsed={layout.focusMode} bind:this={railEl}>
       <div class="workspace">
@@ -1592,11 +1644,7 @@
     </aside>
 
     <main class="stage" bind:this={stageEl}>
-      {#if activeWsId === null}
-        <div class="empty">
-          <button class="open-cta" onclick={openPicker}>Open a folder</button>
-        </div>
-      {:else if layoutReady}
+      {#if layoutReady}
         {#if zoomedPane !== null}
           <Pane
             node={zoomedPane}
@@ -1665,6 +1713,7 @@
       {/if}
       <span class="strip-host" title={health?.hostname}>{getHostLabel()}</span>
     </footer>
+  {/if}
   {/if}
 </div>
 
@@ -2314,32 +2363,6 @@
   }
   .edge-drop.bottom {
     inset: 50% 8px 8px 8px;
-  }
-
-  .empty {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--muted);
-    font-size: var(--text-md);
-  }
-
-  .open-cta {
-    appearance: none;
-    border: none;
-    background: none;
-    padding: 0;
-    font: inherit;
-    font-size: var(--text-md);
-    color: var(--muted);
-    cursor: pointer;
-    transition: color 0.12s ease;
-  }
-
-  .open-cta:hover {
-    color: var(--fg);
   }
 
   /* --- session strip (focus mode) --- */

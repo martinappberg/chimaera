@@ -283,6 +283,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chimaera-core",
+ "chimaera-remote",
  "chimaera-server",
  "clap",
  "mimalloc",
@@ -318,6 +319,18 @@ dependencies = [
  "portable-pty",
  "rand 0.8.6",
  "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "chimaera-remote"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chimaera-core",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

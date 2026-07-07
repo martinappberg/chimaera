@@ -12,6 +12,23 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "web-ui", "run", "dev", "--", "--port", "5173", "--strictPort"],
       "port": 5173
+    },
+    {
+      "name": "web-ui-sandbox",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "CHIMAERA_DEV_TARGET=http://127.0.0.1:9741",
+        "npm",
+        "--prefix",
+        "web-ui",
+        "run",
+        "dev",
+        "--",
+        "--port",
+        "5174",
+        "--strictPort"
+      ],
+      "port": 5174
     }
   ]
 }

@@ -12,7 +12,22 @@ surface which ones need you.
 
 **Status: M0 — walking skeleton.** See [DESIGN.md](DESIGN.md) for the full design.
 
-## Quickstart (local)
+## Quickstart (native app, macOS)
+
+```sh
+just app-build        # bundles Chimaera.app + .dmg (crates/chimaera-app/target/release/bundle)
+```
+
+The app is self-contained: it starts (or attaches to) the local daemon, opens a **home
+screen** of your workspaces and remote hosts, and gives every workspace a real window.
+Quitting the app never kills the daemon — sessions are tmux-grade and keep running.
+
+Remote hosts live on the home screen: add your cluster's ssh alias and chimaera installs
+its own daemon into `~/.chimaera` on the host over ssh (no root), starts it, tunnels, and
+lists that host's workspaces. Run `just dist` once to stock `~/.chimaera/dist/` with the
+linux-musl binaries the auto-install deploys.
+
+## Quickstart (local, browser)
 
 ```sh
 just serve            # builds the web UI, runs the daemon in the foreground
@@ -20,11 +35,11 @@ chimaera status       # show the running daemon
 chimaera kill         # stop it
 ```
 
-## Quickstart (remote)
+## Quickstart (remote, CLI)
 
 ```sh
-# on the remote host (one-time): put the linux-musl binary at ~/.chimaera/bin/chimaera
-chimaera connect myhost    # start-or-attach the remote daemon, tunnel, open the UI
+just dist                  # one-time: build deployable musl binaries into ~/.chimaera/dist
+chimaera connect myhost    # install-if-missing, start-or-attach, tunnel, open the UI
 ```
 
 `connect` shells out to your system `ssh`, so `ProxyJump`, `ControlMaster`, and 2FA from
@@ -32,8 +47,11 @@ chimaera connect myhost    # start-or-attach the remote daemon, tunnel, open the
 
 ## Development
 
-- `just check` — fmt + clippy + tests
+- `just check` — fmt + clippy + tests (daemon workspace)
 - `just dev-ui` — Vite dev server (proxies `/api` to a running daemon)
+- `just app-dev` / `just app-check` / `just app-build` — the native shell (a standalone
+  cargo workspace in `crates/chimaera-app`, so the Tauri stack stays out of the daemon
+  builds)
 - `just release-linux` — static musl builds via cargo-zigbuild
 
 License: TBD.

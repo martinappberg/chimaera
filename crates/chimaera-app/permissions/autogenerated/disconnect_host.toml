@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-disconnect-host"
+description = "Enables the disconnect_host command without any pre-configured scope."
+commands.allow = ["disconnect_host"]
+
+[[permission]]
+identifier = "deny-disconnect-host"
+description = "Denies the disconnect_host command without any pre-configured scope."
+commands.deny = ["disconnect_host"]
