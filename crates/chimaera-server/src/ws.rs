@@ -18,13 +18,30 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::AppState;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Coalesce window for repaints triggered by *other* clients' resizes: an
+/// interactive divider drag fires resizes in bursts, and every repaint is a
+/// full-screen rewrite.
+const RESYNC_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Client -> server text frames.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
-    Auth { token: String },
-    Resize { cols: u16, rows: u16 },
+    Auth {
+        token: String,
+        /// The client's current grid, adopted before the snapshot is
+        /// rendered. Without it a reconnect after a dropped resize replays
+        /// a snapshot at stale dims into a differently-sized xterm — every
+        /// soft-wrapped row then re-wraps at the wrong column.
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// GET /ws/sessions/{id}
@@ -37,13 +54,24 @@ pub(crate) async fn session_ws(
 }
 
 async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
-    if !authenticate(&mut socket, &state).await {
-        let _ = send_json(
-            &mut socket,
-            &json!({"type": "error", "message": "unauthorized"}),
-        )
-        .await;
-        return;
+    let auth_dims = match authenticate(&mut socket, &state).await {
+        Some(dims) => dims,
+        None => {
+            let _ = send_json(
+                &mut socket,
+                &json!({"type": "error", "message": "unauthorized"}),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Adopt the client's grid BEFORE attaching so the snapshot below is
+    // rendered at the size the client will actually display it.
+    if let Some((cols, rows)) = auth_dims {
+        if let Err(err) = state.sessions.resize(&id, cols, rows) {
+            tracing::debug!(%id, %err, "pre-attach resize failed");
+        }
     }
 
     let mut attachment = match state.sessions.attach(&id) {
@@ -118,8 +146,28 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
 
     let mut output_open = true;
     let mut events_open = true;
+    // Dims this connection itself asked for. Its xterm reflowed natively when
+    // it resized, so a Resized event echoing these back needs no repaint —
+    // resyncing the initiator is exactly the "terminal resets when I change
+    // the font size" bug. Seeded from auth so the pre-attach adopt above
+    // doesn't count as foreign.
+    let mut client_dims: Option<(u16, u16)> = auth_dims;
+    // Pending repaint for a *foreign* resize (another window attached to the
+    // same session), debounced so drag bursts coalesce into one repaint.
+    let mut resync_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
+            _ = async move {
+                match resync_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                resync_at = None;
+                if !resync(&mut socket, &id, &state, &mut attachment).await {
+                    return;
+                }
+            },
             out = attachment.output.recv(), if output_open => match out {
                 Ok(bytes) => {
                     if socket.send(Message::Binary(bytes)).await.is_err() {
@@ -128,28 +176,19 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 }
                 Err(RecvError::Lagged(skipped)) => {
                     tracing::debug!(%id, skipped, "ws output lagged; resyncing");
-                    match state.sessions.attach(&id) {
-                        Ok(mut fresh) => {
-                            if send_json(&mut socket, &json!({"type": "resync"})).await.is_err() {
-                                return;
-                            }
-                            let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
-                            if socket.send(Message::Binary(snapshot)).await.is_err() {
-                                return;
-                            }
-                            attachment = fresh;
-                        }
-                        Err(err) => {
-                            tracing::debug!(%id, %err, "ws resync attach failed");
-                            output_open = false;
-                        }
+                    resync_at = None;
+                    if !resync(&mut socket, &id, &state, &mut attachment).await {
+                        return;
                     }
                 }
                 Err(RecvError::Closed) => output_open = false,
             },
             event = attachment.events.recv(), if events_open => match event {
                 Ok(event) => {
-                    let resized = matches!(event, chimaera_pty::SessionEvent::Resized { .. });
+                    let resized_to = match &event {
+                        chimaera_pty::SessionEvent::Resized { cols, rows } => Some((*cols, *rows)),
+                        _ => None,
+                    };
                     match serde_json::to_value(&event) {
                         Ok(value) => {
                             if send_json(&mut socket, &value).await.is_err() {
@@ -158,24 +197,13 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                         }
                         Err(err) => tracing::warn!(%id, %err, "failed to serialize session event"),
                     }
-                    // Resize reflows the server grid; stale pre-resize cells
-                    // on the client turn TUI redraws into garbage. Repaint
+                    // A resize this connection did NOT request reflowed the
+                    // server grid out from under the client's xterm; repaint
                     // from the authoritative grid (tmux redraw semantics).
-                    if resized {
-                        match state.sessions.attach(&id) {
-                            Ok(mut fresh) => {
-                                if send_json(&mut socket, &json!({"type": "resync"})).await.is_err() {
-                                    return;
-                                }
-                                let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
-                                if socket.send(Message::Binary(snapshot)).await.is_err() {
-                                    return;
-                                }
-                                attachment = fresh;
-                            }
-                            Err(err) => {
-                                tracing::debug!(%id, %err, "post-resize resync attach failed");
-                            }
+                    // The initiator is skipped: its xterm already reflowed.
+                    if let Some(dims) = resized_to {
+                        if client_dims != Some(dims) {
+                            resync_at = Some(tokio::time::Instant::now() + RESYNC_DEBOUNCE);
                         }
                     }
                 }
@@ -197,6 +225,7 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Resize { cols, rows }) => {
+                            client_dims = Some((cols, rows));
                             if let Err(err) = state.sessions.resize(&id, cols, rows) {
                                 tracing::debug!(%id, %err, "ws resize failed");
                             }
@@ -209,6 +238,46 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                 Some(Ok(_)) => {} // ping/pong are handled by axum
             },
+        }
+    }
+}
+
+/// Repaint the client from the authoritative grid: fresh attach, a
+/// dims-tagged resync frame (the client resizes BEFORE replaying — a snapshot
+/// replayed at any other width re-wraps into garbage), then the snapshot.
+/// The events subscription is deliberately kept: swapping it could drop an
+/// Exited/Title event broadcast during the swap. Returns false when the
+/// socket is gone.
+async fn resync(
+    socket: &mut WebSocket,
+    id: &str,
+    state: &AppState,
+    attachment: &mut chimaera_pty::Attachment,
+) -> bool {
+    match state.sessions.attach(id) {
+        Ok(mut fresh) => {
+            let frame = json!({
+                "type": "resync",
+                "cols": fresh.info.cols,
+                "rows": fresh.info.rows,
+            });
+            if send_json(socket, &frame).await.is_err() {
+                return false;
+            }
+            let snapshot = Bytes::from(std::mem::take(&mut fresh.snapshot));
+            if socket.send(Message::Binary(snapshot)).await.is_err() {
+                return false;
+            }
+            attachment.info = fresh.info;
+            attachment.output = fresh.output;
+            attachment.input = fresh.input;
+            true
+        }
+        Err(err) => {
+            // Session gone mid-resync; the kept events channel delivers the
+            // Exited that explains it.
+            tracing::debug!(%id, %err, "resync attach failed");
+            true
         }
     }
 }
@@ -231,7 +300,7 @@ const EVENTS_THROTTLE: Duration = Duration::from_millis(250);
 const EVENTS_TICK: Duration = Duration::from_secs(1);
 
 async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
-    if !authenticate(&mut socket, &state).await {
+    if authenticate(&mut socket, &state).await.is_none() {
         let _ = send_json(
             &mut socket,
             &json!({"type": "error", "message": "unauthorized"}),
@@ -322,15 +391,17 @@ async fn send_sessions_snapshot(
 }
 
 /// First-frame auth: text `{"type":"auth","token":...}` within 5 seconds.
-async fn authenticate(socket: &mut WebSocket, state: &AppState) -> bool {
+/// `None` = rejected; `Some(dims)` = accepted, with the client grid when the
+/// auth frame carried one.
+async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<Option<(u16, u16)>> {
     match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            matches!(
-                serde_json::from_str::<ClientMessage>(&text),
-                Ok(ClientMessage::Auth { token }) if token == state.token
-            )
-        }
-        _ => false,
+        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
+            Ok(ClientMessage::Auth { token, cols, rows }) if token == state.token => {
+                Some(cols.zip(rows))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 

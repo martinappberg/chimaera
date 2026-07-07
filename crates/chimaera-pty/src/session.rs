@@ -415,6 +415,15 @@ impl Session {
     }
 
     pub(crate) fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // Echoed dims are routine (every attached client mirrors resize
+        // events back); a no-op must not winch the child or broadcast —
+        // each Resized event costs every client a full repaint.
+        {
+            let state = lock_unpoisoned(&self.state);
+            if state.cols == cols && state.rows == rows {
+                return Ok(());
+            }
+        }
         {
             let mut term = lock_unpoisoned(&self.term);
             term.resize(TermDimensions { cols, rows });

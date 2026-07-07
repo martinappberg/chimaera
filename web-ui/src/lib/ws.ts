@@ -12,9 +12,20 @@ export interface SessionSocketHandlers {
   onBinary(data: Uint8Array): void;
   /**
    * Reset the terminal before the next binary frame (a fresh snapshot
-   * follows). Fired on server resync and on successful reconnect.
+   * follows). Fired on server resync and on successful reconnect. When the
+   * server tags the resync with the grid the snapshot was rendered at,
+   * resize to it BEFORE resetting — a snapshot replayed at any other width
+   * re-wraps every soft-wrapped row at the wrong column.
    */
-  onReset(): void;
+  onReset(cols?: number, rows?: number): void;
+  /**
+   * The client's current grid, sent with the auth frame so the server adopts
+   * it before rendering the snapshot. Without it, a resize that happened
+   * while the socket was down (sendResize is dropped, and ResizeObserver
+   * never re-fires for an unchanged container) leaves the PTY at stale dims
+   * forever.
+   */
+  dims?(): { cols: number; rows: number } | null;
   onTitle(title: string): void;
   onResized(cols: number, rows: number): void;
   onExited(status: number | null): void;
@@ -66,7 +77,10 @@ export class SessionSocket {
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
+      // Carry the client grid so the server resizes BEFORE rendering the
+      // snapshot; the frame then always matches what the terminal displays.
+      const dims = this.handlers.dims?.() ?? null;
+      ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "", ...(dims ?? {}) }));
     };
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -95,16 +109,31 @@ export class SessionSocket {
       return;
     }
     switch (msg.type) {
-      case "ready":
+      case "ready": {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.clearReconnecting();
         // On a reconnect the server re-sends a full snapshot; wipe the stale
         // screen so the snapshot reconstructs state exactly.
         if (this.everReady) this.handlers.onReset();
         this.everReady = true;
+        // Reconcile grids: resizes are silently dropped while the socket is
+        // down or mid-handshake (the first fit often lands during CONNECTING),
+        // and ResizeObserver never re-fires for an unchanged container. The
+        // ready frame carries the server's dims — correct any drift exactly
+        // once, here.
+        const d = this.handlers.dims?.() ?? null;
+        if (
+          d !== null &&
+          typeof msg.cols === "number" &&
+          typeof msg.rows === "number" &&
+          (msg.cols !== d.cols || msg.rows !== d.rows)
+        ) {
+          this.sendResize(d.cols, d.rows);
+        }
         break;
+      }
       case "resync":
-        this.handlers.onReset();
+        this.handlers.onReset(msg.cols, msg.rows);
         break;
       case "title":
         if (typeof msg.title === "string") this.handlers.onTitle(msg.title);

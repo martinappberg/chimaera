@@ -9,9 +9,10 @@
 //!      transitions; hard line breaks are `CR LF`, soft-wrapped lines are
 //!      emitted at full width so the receiving terminal re-wraps naturally
 //!      (no `CR LF` after the last visible row)
-//!   4. `SGR 0`, window title (OSC 2), re-enabled private modes
-//!      (DECCKM / bracketed paste), cursor position (CUP), the pending SGR
-//!      state at the cursor, and cursor visibility (DECTCEM)
+//!   4. `SGR 0`, window title (OSC 2), re-enabled private modes (DECCKM,
+//!      keypad, bracketed paste, mouse/focus reporting, auto-wrap, origin,
+//!      insert, LNM), cursor position (CUP), the pending SGR state at the
+//!      cursor, and cursor visibility (DECTCEM)
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -329,8 +330,50 @@ pub(crate) fn render_snapshot<T>(term: &Term<T>, title: Option<&str>) -> Vec<u8>
     if mode.contains(TermMode::APP_CURSOR) {
         out.extend_from_slice(b"\x1b[?1h");
     }
+    if mode.contains(TermMode::APP_KEYPAD) {
+        out.extend_from_slice(b"\x1b=");
+    }
     if mode.contains(TermMode::BRACKETED_PASTE) {
         out.extend_from_slice(b"\x1b[?2004h");
+    }
+    // Mouse + focus reporting: TUIs arm these once at startup and never
+    // re-assert them mid-run, so a snapshot that drops them silently breaks
+    // scrolling and clicks in every reattached client.
+    if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if mode.contains(TermMode::MOUSE_DRAG) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    }
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        out.extend_from_slice(b"\x1b[?1003h");
+    }
+    if mode.contains(TermMode::UTF8_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1005h");
+    }
+    if mode.contains(TermMode::SGR_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+    if mode.contains(TermMode::ALTERNATE_SCROLL) {
+        out.extend_from_slice(b"\x1b[?1007h");
+    }
+    if mode.contains(TermMode::FOCUS_IN_OUT) {
+        out.extend_from_slice(b"\x1b[?1004h");
+    }
+    // RIS re-enabled auto-wrap; restore the application's choice when off.
+    if !mode.contains(TermMode::LINE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
+    // ORIGIN is emitted before CUP below; RIS reset the scroll region to the
+    // full screen, so origin-relative and absolute addressing coincide here.
+    if mode.contains(TermMode::ORIGIN) {
+        out.extend_from_slice(b"\x1b[?6h");
+    }
+    if mode.contains(TermMode::INSERT) {
+        out.extend_from_slice(b"\x1b[4h");
+    }
+    if mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+        out.extend_from_slice(b"\x1b[20h");
     }
 
     // Cursor position (1-based CUP) ...
