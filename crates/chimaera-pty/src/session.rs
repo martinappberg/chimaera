@@ -7,7 +7,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -22,6 +22,11 @@ use crate::{
     lock_unpoisoned, marks::Marks, marks::ShellPhase, snapshot, Attachment, SessionEvent,
     SessionId, SessionInfo, SpawnOpts,
 };
+
+/// How long `kill()` waits after SIGHUP before force-killing a still-living
+/// child with SIGKILL. A shell normally exits on SIGHUP at once, so this only
+/// elapses for a child that ignores or misses it.
+const KILL_ESCALATION_GRACE: Duration = Duration::from_secs(2);
 
 /// Scrollback history kept per session.
 const SCROLLBACK_LINES: usize = 10_000;
@@ -445,9 +450,14 @@ impl Session {
         Ok(())
     }
 
-    /// Best-effort child termination (SIGHUP via portable-pty). Reaping and
-    /// state bookkeeping happen on the wait thread. Killing a session whose
-    /// child already exited is a no-op.
+    /// Terminate the child: SIGHUP first (via portable-pty, so a shell can run
+    /// its exit traps and vanish tmux-style), escalating to SIGKILL if it is
+    /// still alive after a short grace period. The escalation matters — a child
+    /// that ignores or misses SIGHUP would otherwise never die, its wait thread
+    /// (blocked on `child.wait()`) would never wake, and the session would leak
+    /// in the registry forever. Non-blocking: the escalation runs on a detached
+    /// thread. Killing a session whose child already exited is a no-op. Reaping
+    /// and state bookkeeping still happen on the wait thread.
     pub(crate) fn kill(&self) {
         if !lock_unpoisoned(&self.state).alive {
             return;
@@ -457,6 +467,25 @@ impl Session {
             // authoritative outcome either way.
             tracing::debug!(session = %self.id, error = %e, "kill failed (child likely already exited)");
         }
+        let Some(pid) = self.child_pid else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let id = self.id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(KILL_ESCALATION_GRACE);
+            // Still alive after the grace period => it ignored SIGHUP; force it.
+            // The wait thread flips `alive` only after `child.wait()` reaps, so
+            // the tiny window where we could signal a reused pid is the same one
+            // the daemon's SIGTERM-then-poll stop paths already accept.
+            if lock_unpoisoned(&state).alive {
+                tracing::warn!(session = %id, pid, "child ignored SIGHUP; sending SIGKILL");
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        });
     }
 
     /// Test-only access to the live headless terminal.
