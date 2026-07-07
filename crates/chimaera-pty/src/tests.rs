@@ -350,6 +350,33 @@ async fn resize_reaches_child_and_broadcasts_event() {
     wait_gone(&mgr, &info.id).await;
 }
 
+/// (d1) kill() escalates to SIGKILL for a child that ignores SIGHUP, so a
+/// wedged child still dies and the session unregisters instead of leaking. The
+/// child arms `trap '' HUP` and only prints READY afterward, so by the time we
+/// kill it the SIGHUP is provably ignored — only the SIGKILL escalation can
+/// reap it, and `wait_gone` would hang (and fail) without it.
+#[tokio::test]
+async fn kill_escalates_to_sigkill_when_sighup_ignored() {
+    let mgr = SessionManager::new();
+    let cmd = vec![
+        "/bin/bash".to_string(),
+        "--norc".to_string(),
+        "--noprofile".to_string(),
+        "-c".to_string(),
+        "trap '' HUP; echo READY; read _".to_string(),
+    ];
+    let info = mgr.spawn(opts(Some(cmd))).expect("spawn failed");
+    // Wait for READY via the snapshot, not the live stream: echo can print
+    // before any live subscriber exists, so those bytes only ever land in the
+    // snapshot. READY prints only after `trap '' HUP`, so seeing it proves the
+    // SIGHUP-ignoring trap is armed.
+    attach_when_snapshot_contains(&mgr, &info.id, "READY").await;
+
+    mgr.kill(&info.id).expect("kill failed");
+    // SIGHUP is ignored; only the escalation (~2s grace) reaps it.
+    wait_gone(&mgr, &info.id).await;
+}
+
 /// (d2) A resize to the current dimensions is a no-op: no Resized event, no
 /// winch. Attached clients mirror resize events back as their own resize
 /// requests; without the short-circuit each real resize echoes into repaint
