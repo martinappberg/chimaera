@@ -590,6 +590,82 @@ agent sessions living in one window is what makes it possible.
   (ripgrep-style) is a later wave. A small filter affordance at the top of the rail's files
   section covers the browse-narrowing case without opening the palette.
 
+### Linked terminals: agents at your shell
+
+*Added 2026-07-06 (author idea). Builds after M3; the OSC 133 groundwork touches the M1 PTY
+layer and pays for itself beyond this feature.*
+
+**The problem.** HPC state lives in long-lived interactive shells: ssh to a login node, `module
+load`, `conda activate`, `salloc`. Recreating that per-command is the tax every agent pays
+today. The daemon already owns every terminal (input channel, headless grid, scrollback) — so
+hand the agent a *leash* to a live shell instead.
+
+**One primitive: the link** — a daemon-owned edge between an agent session and a terminal
+session. Every creation mode converges on it:
+
+- **Sidecar**: "new linked terminal" in the agent pane's hover cluster (and palette) spawns a
+  normal session, links it, and opens it as a split beside the agent.
+- **Attach existing**: dragging a terminal (tab or rail row) over an *agent* pane reuses the
+  drag-to-reference grammar — center still means "become a tab" (surface parity, untouched);
+  the labeled band over the input area reads **"link to agent"** and dropping there creates
+  the link *and* types `@term:name` into the composer without submitting — one gesture
+  teaches both the link and the tagging syntax. Parity path: "Link to agent…" in the terminal
+  pane's top-bar menu.
+- **Mention**: typing `@term:name` (or `@term:3` by stable ordinal) in the composer. A
+  `UserPromptSubmit` hook (same injection mechanism as the attention hooks) detects a mention
+  of an unlinked terminal and auto-links it — the *user* typing the mention is the consent.
+  Agents cannot self-link; links are user-granted only.
+
+**Link ≠ layout.** A linked terminal stays a completely normal session — normal rail row,
+normal tab, drag it anywhere. The sidecar is just default placement, not a container; there is
+no new pane type and no docking machinery.
+
+**Making the bond visible** (resolves the author's "subtab" instinct without occlusion —
+tabs hide each other, and a sidecar you can't watch defeats the purpose): the agent pane's top
+bar grows a **chip row of its linked terminals** — type glyph + name + state dot
+(at-prompt / running / agent-executing / queued) — click a chip to focus that pane (reopening
+it if closed). Reciprocally, the linked terminal's top bar carries the agent's glyph in the
+agent's hue, click to jump back; the pane border pulses that hue while the agent executes
+there. The terminal itself is the audit log — agent keystrokes land in the PTY and its
+scrollback like anyone else's.
+
+**Scope and cardinality (author decisions, 2026-07-06):**
+
+- **Linked-only access.** The agent's tools see exactly its linked terminals — the chip row
+  is the complete truth, and a rogue prompt can't touch an unlinked salloc shell.
+- **One agent per terminal** (re-linking moves the leash; the hue follows). An agent may hold
+  many terminals.
+- **Approvals stay in Claude Code.** `run_in_terminal` prompts like any MCP tool; Chimaera
+  adds zero permission UI.
+
+**Execution semantics — where OSC 133 earns its keep.** Chimaerad injects shell integration
+into the shells it spawns (bash `PROMPT_COMMAND`, zsh hooks, fish — the VS Code trick) and
+taps the escape stream server-side (it already parses every byte for the headless grid),
+yielding exact prompt/command/output/exit boundaries and a **structured command journal** per
+session: command, output span, exit code, duration. The daemon exposes an HTTP MCP server
+(config generated next to the per-agent settings file, per-session key auth) with three tools:
+
+- `list_terminals` — linked sessions with name, cwd, shell state, last command + exit.
+- `run_in_terminal` — types only when the shell is **at prompt**; if busy, **queues with a
+  timeout** (author decision; the chip shows "queued" so waiting is never invisible), waits
+  for the done-marker, returns output + exit code.
+- `read_terminal` — the last N journal entries (commands + outputs), not a raw scrollback
+  blob; raw tail available as a fallback.
+
+**SSH degradation is first-class** (HPC is the point): a remote shell reached *from* a linked
+terminal won't emit OSC 133. `run_in_terminal` falls back to sentinel-wrapping
+(`cmd; printf` marker — works on any remote, zero install) and `chimaera shell-integration`
+prints a one-liner to source remotely for full journal fidelity; the journal marks
+lower-fidelity spans honestly rather than guessing.
+
+**Subshells and cloning (author question, 2026-07-06).** The agent's own Bash tool is
+untouched — it keeps spawning its own subprocesses. Background jobs in the linked shell
+(`sbatch`, `nohup … &`) work naturally, serialized at prompt boundaries. True "fork this
+shell" is wave 2: locally, snapshot env + cwd into a fresh session ("duplicate with
+environment"); for remote shells the journal enables **setup replay** — it knows the `ssh`,
+`module load`, `conda activate`, `cd` sequence, so cloning becomes replaying the reviewed
+setup into a new session. Distinctive, deferred.
+
 ### Git + Slurm
 
 - **Git**: shell out to system git and parse porcelain output (adversarial reviews flagged
@@ -678,6 +754,7 @@ dev working with AI agents, part-time.
 | **M2 — Agent sessions + attention** | Tier A: workspace-scoped `claude` TUI sessions in PTYs, hook injection, JSONL transcript viewer, attention state machine, naming pipeline, session strip + triage dashboard + digest (see Interaction model), ntfy/webhook. | scattered agent chats | 5–6 wks |
 | **M3 — Previews wave 1** | file tree, images+thumbnails, Markdown, sandboxed HTML reports (MultiQC), CSV/TSV with gzip tier. | most code-server use | 3–4 wks |
 | **M4 — Previews wave 2 + git** | Parquet paging, ipynb, PDF, JSON tree, large-file guards; git status/log/diff panel. | code-server, entirely | 3–4 wks |
+| **M4.5 — Linked terminals** | OSC 133 shell integration + per-session command journal, daemon HTTP MCP server (`run_in_terminal`/`read_terminal`/`list_terminals`), link UX (agent top-bar chips, reference-band drag, auto-link on `@term:` mention), sentinel fallback for remote shells. | agent↔shell copy-paste | 3–4 wks |
 | **M5 — HPC layer** | Slurm strip + job↔session links, `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. | — | 2–3 wks |
 | **M6 — Optimal-build completion → v1.0** | Tauri native shell (window per workspace, native notifications, menubar badge), Tier B structured chat mode, Tier C ACP agents (Gemini native, Codex via codex-acp). | Claude desktop app | 6–8 wks |
 | After 1.0 | Hub federation, sbatch-offloaded sessions, protocol publication, single-file editing. | | ongoing |
@@ -709,6 +786,14 @@ which is the survival property that matters.
   via the `#host=` hash param (the VS Code Remote convention); the raw hostname is hover
   detail. Raw hostnames like `host.example` confused the author on day one — labels must
   be human.
+
+- **2026-07-06 — linked terminals (agent ↔ shell).** One primitive: a user-granted link
+  between an agent session and a terminal session. Linked-only access (the agent's tools see
+  exactly its links), one agent per terminal (re-link moves the leash), busy shells queue
+  execs with a timeout. OSC 133 shell integration + server-side command journal; sentinel
+  fallback for SSH'd remotes with a `chimaera shell-integration` one-liner for full fidelity.
+  `@term:` mention by the *user* auto-links; agents cannot self-link. Link ≠ layout — the
+  sidecar split is default placement, not a container. Approvals remain Claude Code's own.
 
 Still open:
 
