@@ -17,8 +17,6 @@
   <a href="https://martinappberg.github.io/chimaera/docs.html">Docs</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/martinappberg/chimaera/releases/latest">Download</a>
-  &nbsp;·&nbsp;
-  <a href="DESIGN.md">Design</a>
 </p>
 
 <p align="center">
