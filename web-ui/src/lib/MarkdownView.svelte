@@ -9,14 +9,22 @@
    */
   import { fsMarkdown, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
   import { clearSelection, setSelection } from "./reference";
+  import { getSetting } from "./settings/store.svelte";
   import CodeView from "./CodeView.svelte";
   import ReferenceChip from "./ReferenceChip.svelte";
 
   interface Props {
     path: string;
+    /** Per-pane text-size override (px); the preview body scales to it. The
+     *  A−/A+ pane controls and the Cmd/Ctrl +/− chords both drive this. */
+    fontSize?: number;
   }
 
-  let { path }: Props = $props();
+  let { path, fontSize = undefined }: Props = $props();
+
+  // Preview base size: the pane override, else the app's base text size (the
+  // same value the A−/A+ steps start from, so the first step never jumps).
+  const bodyFont = $derived(fontSize ?? getSetting("terminal.fontSize"));
 
   let mode = $state<"preview" | "edit">("preview");
   let html = $state<string | null>(null);
@@ -161,7 +169,7 @@
         {#if error !== null}
           <div class="file-error">{error}</div>
         {:else if html !== null}
-          <article class="md-body">
+          <article class="md-body" style:font-size="{bodyFont}px">
             <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
             {@html html}
           </article>
@@ -251,6 +259,8 @@
     text-align: center;
   }
 
+  /* Base font-size is set inline (per-pane text size); every size below is in
+     `em` so A−/A+ scales the whole document uniformly, like the terminal. */
   .md-body {
     max-width: 70ch;
     margin: 0 auto;
@@ -274,26 +284,26 @@
   }
 
   .md-body :global(h1) {
-    font-size: 1.45rem;
+    font-size: 1.576em;
     margin-top: 0.2em;
     padding-bottom: 0.35em;
     border-bottom: 1px solid var(--edge);
   }
 
   .md-body :global(h2) {
-    font-size: 1.15rem;
+    font-size: 1.25em;
     padding-bottom: 0.25em;
     border-bottom: 1px solid var(--edge);
   }
 
   .md-body :global(h3) {
-    font-size: 1rem;
+    font-size: 1.087em;
   }
 
   .md-body :global(h4),
   .md-body :global(h5),
   .md-body :global(h6) {
-    font-size: 0.92rem;
+    font-size: 1em;
   }
 
   .md-body :global(p) {
@@ -329,7 +339,7 @@
   .md-body :global(pre code) {
     background: none;
     padding: 0;
-    font-size: 0.78rem;
+    font-size: 0.848em;
   }
 
   .md-body :global(blockquote) {
@@ -364,7 +374,7 @@
     margin: 1em 0;
     display: block;
     overflow-x: auto;
-    font-size: 0.85rem;
+    font-size: 0.924em;
   }
 
   .md-body :global(th),

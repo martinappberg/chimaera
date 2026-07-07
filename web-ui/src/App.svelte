@@ -41,6 +41,7 @@
   } from "./lib/launcher";
   import { EventsSocket } from "./lib/events";
   import {
+    agentHue,
     deleteLink,
     listLinks,
     putLink,
@@ -101,13 +102,15 @@
     type Tab,
   } from "./lib/layout";
   import type { PathKind } from "./lib/links";
-  import { basename, fileTabTitles, fsProbe } from "./lib/files";
+  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
   import {
     paneContentEl,
     paneRootEl,
+    registerLinkRow,
     registerStage,
     startDrag,
+    unregisterLinkRow,
     unregisterStage,
     type DropSpot,
     type LayoutCtrl,
@@ -679,15 +682,19 @@
    *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
-    // Per-pane terminal font size (Cmd/Ctrl +/−/0, spec-pinned chords):
-    // intercepted ONLY while the focused pane shows a terminal, so browser
-    // zoom keeps working everywhere else.
+    // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
+    // ONLY while the focused pane shows a font-sizable surface (a terminal or
+    // a rendered markdown document), so browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
       if (step !== null) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
-        if (p !== null && active !== undefined && active.surface === "terminal") {
+        const sizable =
+          active !== undefined &&
+          (active.surface === "terminal" ||
+            (active.surface === "file" && viewKindFor(active.path) === "markdown"));
+        if (p !== null && sizable) {
           e.preventDefault();
           e.stopPropagation();
           adjustFont(p.id, step);
@@ -1345,6 +1352,11 @@
     dragTab(e, paneId, index, tab) {
       beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
     },
+    dragSurface(e, tab, onClick) {
+      // The link icon: a link-intent drag — dropping anywhere but an agent
+      // (rail row or pane band) is a no-op, never a tab move.
+      beginDrag(e, tab, onClick, true);
+    },
     dividerDrag(active) {
       pool.setDragging(active);
     },
@@ -1374,16 +1386,16 @@
    * `tab`: panes showing a live agent session, when the payload is a shell
    * terminal (files and agents themselves never link).
    */
-  function linkTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+  function linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined {
     if (tab.surface !== "terminal") return undefined;
     if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
-    const targets = new Set<string>();
+    const targets = new Map<string, string>();
     const walk = (n: typeof layout.root): void => {
       if (n.type === "pane") {
         const active = n.tabs[n.active];
         if (active !== undefined && active.surface === "terminal") {
           const s = sessionsById.get(active.sessionId);
-          if (s !== undefined && s.kind === "agent" && s.alive) targets.add(n.id);
+          if (s !== undefined && s.kind === "agent" && s.alive) targets.set(n.id, s.id);
         }
         return;
       }
@@ -1394,8 +1406,29 @@
     return targets.size > 0 ? targets : undefined;
   }
 
-  /** Shared drag start for rail rows and pane tabs (any surface). */
-  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void): void {
+  /**
+   * The live agent sessions in `tab`'s workspace whose RAIL ROWS are link
+   * targets while dragging that shell terminal (the always-present target —
+   * the agent needn't be open in a pane). Undefined for non-shell payloads.
+   */
+  function linkSessionsFor(tab: Tab): ReadonlySet<string> | undefined {
+    if (tab.surface !== "terminal") return undefined;
+    const term = sessionsById.get(tab.sessionId);
+    if (term === undefined || term.kind !== "shell") return undefined;
+    const out = new Set<string>();
+    for (const s of sessions) {
+      if (s.kind === "agent" && s.alive && s.workspace_id === term.workspace_id) out.add(s.id);
+    }
+    return out.size > 0 ? out : undefined;
+  }
+
+  /**
+   * Shared drag start for rail rows and pane tabs (any surface). `linkIntent`
+   * (set when the drag starts from a pane's link icon) restricts a shell
+   * terminal to link-only drops — anywhere but an agent is a no-op, never a
+   * tab move.
+   */
+  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void, linkIntent = false): void {
     const label =
       tab.surface === "terminal"
         ? (displayNames.get(tab.sessionId) ??
@@ -1409,7 +1442,8 @@
     // previews (the band region is reserved, never flashed over).
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
-    if (linkTargets !== undefined) for (const id of linkTargets) armed.add(id);
+    const linkSessions = linkSessionsFor(tab);
+    if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
     if (tab.surface === "file") {
       for (const p of panesOf(layout.root)) {
         const a = p.tabs[p.active];
@@ -1435,9 +1469,19 @@
             return;
           }
           if (spot.kind === "link") {
+            // Plain tab drag onto an agent pane's band.
             if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
             return;
           }
+          if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
+            // Link-intent drop on an agent (its view, tab, or rail row): link,
+            // then surface the agent.
+            if (tab.surface === "terminal") linkBySession(tab.sessionId, spot.sessionId);
+            return;
+          }
+          // A link-intent drag (from the link icon) only ever links — a drop
+          // anywhere but an agent is a no-op, never a surprise tab move.
+          if (linkIntent) return;
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
@@ -1470,7 +1514,7 @@
           );
         },
       },
-      { linkTargets },
+      { linkTargets, linkSessions, linkIntent },
     );
   }
 
@@ -1519,6 +1563,26 @@
     pool.focusTerminal(agentId);
   }
 
+  /**
+   * The drop on an agent's RAIL ROW: link the terminal, surface the agent
+   * (splitting beside the terminal when the agent isn't open anywhere), type
+   * its @term: reference into the composer, and focus the agent. Works even
+   * when the agent has no pane — the rail row is the always-present target.
+   */
+  function linkBySession(terminalId: string, agentId: string): void {
+    const agent = sessionsById.get(agentId);
+    if (agent === undefined || agent.kind !== "agent" || !agent.alive) return;
+    void doLink(terminalId, agentId);
+    if (sessionPaneId(layout, agentId) === null) {
+      const beside = sessionPaneId(layout, terminalId) ?? layout.focusedPaneId;
+      layout = splitPane(layout, beside, "row");
+      layout = openSession(layout, agentId);
+    }
+    const name = displayNames.get(terminalId) ?? terminalId;
+    typeIntoSession(agentId, `${termReference(name)} `);
+    pool.focusTerminal(agentId);
+  }
+
   /** Link mutations + reveal for the pane top bars (chips and the menu). */
   const linkCtrl: LinkCtrl = {
     reveal(sessionId, besidePaneId) {
@@ -1548,6 +1612,19 @@
   /** Svelte action: focus the node as soon as it mounts (confirm buttons). */
   function focusOnMount(node: HTMLElement): void {
     node.focus();
+  }
+
+  /** Svelte action: register an agent rail row as a link-drop target, so a
+   *  shell-terminal drag (from the link icon or a tab) can drop on it to link.
+   *  No-op for non-agent rows. */
+  function linkRow(node: HTMLElement, s: Session): { destroy(): void } | void {
+    if (s.kind !== "agent") return;
+    registerLinkRow(s.id, node);
+    return {
+      destroy() {
+        unregisterLinkRow(s.id, node);
+      },
+    };
   }
 
   /**
@@ -1804,6 +1881,9 @@
             <div
               class="row"
               class:active={s.id === focusedSessionId}
+              class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
+              style:--hue={s.kind === "agent" ? agentHue(s.id) : null}
+              use:linkRow={s}
               role="button"
               tabindex="0"
               onpointerdowncapture={(e) => {
@@ -2459,6 +2539,13 @@
 
   .row.active {
     background: var(--row-active);
+  }
+
+  /* A shell-terminal link drag hovers this agent row: the always-present
+     "drop to link" target, lit in the agent's own hue. */
+  .row.link-target {
+    background: hsl(var(--hue) 55% 55% / 0.16);
+    box-shadow: inset 0 0 0 1px hsl(var(--hue) 55% 55% / 0.6);
   }
 
   .labels {

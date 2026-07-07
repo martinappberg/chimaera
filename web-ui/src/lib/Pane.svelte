@@ -54,6 +54,9 @@
   const refBand = $derived(dropSpot?.kind === "ref" && dropSpot.paneId === node.id);
   /** The "link to agent" band preview (dragging a terminal over this agent). */
   const linkBand = $derived(dropSpot?.kind === "link" && dropSpot.paneId === node.id);
+  /** A link-intent drag (from the link icon) hovering anywhere in this agent
+   *  pane: the whole view lights up as one target. */
+  const linkPane = $derived(dropSpot?.kind === "linkpane" && dropSpot.paneId === node.id);
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -123,7 +126,7 @@
       {#if activeTab.surface === "terminal"}
         <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else if activeTab.surface === "file"}
-        <FileView path={activeTab.path} />
+        <FileView path={activeTab.path} fontSize={node.fontSize} />
       {:else}
         <SettingsView />
       {/if}
@@ -150,6 +153,12 @@
          agent's input area. Dropping links the terminal and types its
          @term: reference into the composer (never submits). -->
     <div class="drop-link" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
+      <span class="band-label">link to this agent</span>
+    </div>
+  {:else if linkPane}
+    <!-- Link-intent drag: the whole agent view is one target (no aiming for a
+         band). Full-pane wash in the agent's hue, centered label. -->
+    <div class="drop-linkpane" class:hued={ownAgentHue !== null} style:--band-hue={ownAgentHue}>
       <span class="band-label">link to this agent</span>
     </div>
   {/if}
@@ -329,6 +338,27 @@
   .drop-link.hued {
     background: hsl(var(--band-hue) 55% 55% / 0.1);
     border-color: hsl(var(--band-hue) 55% 55% / 0.55);
+  }
+
+  /* Link-intent whole-pane target: the same grammar as the band, but the wash
+     covers the entire view — the agent is one big drop zone. */
+  .drop-linkpane {
+    position: absolute;
+    z-index: 7;
+    inset: 0;
+    margin: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1.5px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 8px;
+    pointer-events: none;
+  }
+
+  .drop-linkpane.hued {
+    background: hsl(var(--band-hue) 55% 55% / 0.14);
+    border-color: hsl(var(--band-hue) 55% 55% / 0.6);
   }
 
   .band-label {
