@@ -254,6 +254,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         pid,
         version: chimaera_core::VERSION.to_string(),
         started_at,
+        build: Some(chimaera_core::BUILD_ID.to_string()),
     };
     manifest.write().context("failed to write manifest")?;
 

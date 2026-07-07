@@ -113,7 +113,7 @@
     type LayoutCtrl,
   } from "./lib/dnd";
   import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
-  import { closeThisWindow, isNativeShell, onMenu } from "./lib/native";
+  import { closeThisWindow, isNativeShell, onLocalDaemonUpdated, onMenu } from "./lib/native";
   import * as pool from "./lib/termPool";
   import {
     applyRemoteSettings,
@@ -389,6 +389,7 @@
     // closes the focused VIEW (a home window just closes), reclaiming the
     // chords a browser reserves for tabs.
     let unlistenMenu: (() => void) | null = null;
+    let unlistenDaemonMoved: (() => void) | null = null;
     if (isNativeShell()) {
       void onMenu((action) => {
         switch (action) {
@@ -404,6 +405,16 @@
             break;
         }
       }).then((u) => (unlistenMenu = u));
+      // The local daemon was replaced (self-update): its old origin is
+      // gone. Windows on the local daemon re-home themselves to the new
+      // port + token, keeping their workspace; tunnel windows are unmoved.
+      void onLocalDaemonUpdated(({ port, token }) => {
+        if (getHostLabel() !== "local") return;
+        const params = new URLSearchParams();
+        params.set("token", token);
+        if (activeWsId !== null) params.set("ws", activeWsId);
+        location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
+      }).then((u) => (unlistenDaemonMoved = u));
     }
 
     const onPagehide = () => {
@@ -418,6 +429,7 @@
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
       unlistenMenu?.();
+      unlistenDaemonMoved?.();
       document.removeEventListener("copy", onCopy);
       setReferenceHandler(null);
       events.close();

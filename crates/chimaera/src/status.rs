@@ -31,8 +31,11 @@ async fn remote(host: &str) -> anyhow::Result<()> {
 
 fn report_running(m: &Manifest) {
     println!(
-        "running: 127.0.0.1:{} (pid {}, v{})",
-        m.port, m.pid, m.version
+        "running: 127.0.0.1:{} (pid {}, v{}, build {})",
+        m.port,
+        m.pid,
+        m.version,
+        m.build.as_deref().unwrap_or("pre-build-id")
     );
 }
 

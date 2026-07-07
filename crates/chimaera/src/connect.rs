@@ -8,13 +8,16 @@ pub async fn run(
     local_port: Option<u16>,
     binary: Option<&Path>,
     no_open: bool,
+    update_daemon: bool,
 ) -> anyhow::Result<()> {
     let opts = ConnectOpts {
         local_port,
         binary: binary.map(Path::to_path_buf),
+        update_daemon,
     };
     let mut tunnel = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),
+        Phase::Updating => tracing::info!("updating the daemon on {host}"),
         Phase::Installing { binary } => {
             tracing::info!("installing {} on {host}", binary.display());
         }
@@ -24,6 +27,19 @@ pub async fn run(
         }
     })
     .await?;
+
+    if tunnel.outdated {
+        let sessions = match tunnel.live_sessions {
+            Some(n) => format!("{n} session{} running", if n == 1 { "" } else { "s" }),
+            None => "session count unknown".to_string(),
+        };
+        tracing::warn!(
+            "remote daemon build {} is older than yours ({}); {sessions} — \
+             rerun with --update-daemon to replace it",
+            tunnel.remote_build.as_deref().unwrap_or("pre-build-id"),
+            chimaera_core::BUILD_ID,
+        );
+    }
 
     // Remember the host so the native shell's home screen can offer it.
     if let Err(e) = HostsStore::load_default().record_connected(host) {

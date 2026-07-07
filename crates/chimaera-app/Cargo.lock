@@ -463,6 +463,7 @@ dependencies = [
  "chimaera-core",
  "chimaera-remote",
  "chimaera-server",
+ "nix 0.29.0",
  "serde",
  "serde_json",
  "tauri",

@@ -19,6 +19,8 @@ use tokio::process::{Child, Command};
 pub enum Phase {
     /// Probing the host for a running daemon.
     Probing,
+    /// Replacing an outdated remote daemon (graceful stop, then redeploy).
+    Updating,
     /// Copying a chimaera binary to the host.
     Installing { binary: PathBuf },
     /// Starting the daemon on the host.
@@ -35,6 +37,42 @@ pub struct ConnectOpts {
     /// Explicit binary to install on the host if chimaera is missing;
     /// otherwise `~/.chimaera/dist/` is searched for a matching build.
     pub binary: Option<PathBuf>,
+    /// Replace an outdated remote daemon even when it has live sessions
+    /// (they end with it). The stop is always graceful — SIGTERM, never -9.
+    pub update_daemon: bool,
+}
+
+/// What [`connect`] should do about a daemon already running on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Same build (and no force): attach to it as-is.
+    Reuse,
+    /// Replace it: graceful stop, redeploy, restart. Chosen when the builds
+    /// differ and it is provably safe (zero live sessions), or when forced.
+    Update,
+    /// Builds differ but sessions could die (live count > 0 or unknown):
+    /// attach to the old daemon and surface the mismatch to the caller.
+    ConnectOutdated,
+}
+
+/// Pure policy for daemon reuse vs replacement, shared by the remote
+/// connect flow and the app's local-daemon startup. `sessions` `None`
+/// means the count could not be determined — treated as busy, never as
+/// empty. `force` replaces the daemon regardless of build or session count
+/// (the explicit `--update-daemon` / host-row affordance).
+pub fn update_decision(
+    local_build: &str,
+    remote_build: Option<&str>,
+    sessions: Option<usize>,
+    force: bool,
+) -> Decision {
+    if chimaera_core::builds_match(local_build, remote_build) && !force {
+        return Decision::Reuse;
+    }
+    if force || sessions == Some(0) {
+        return Decision::Update;
+    }
+    Decision::ConnectOutdated
 }
 
 /// A live port-forward to a remote daemon. Dropping it kills the ssh child
@@ -47,6 +85,15 @@ pub struct Tunnel {
     /// The forward was registered with an ssh ControlMaster and our child
     /// exited 0; the master holds the port, not `child`.
     pub mux_delegated: bool,
+    /// The daemon at the far end is an older build than ours, left running
+    /// because live sessions (or an unknown count) made replacing it unsafe.
+    /// Callers surface this with their explicit update affordance.
+    pub outdated: bool,
+    /// The connected daemon's build id (`None` = predates build ids).
+    pub remote_build: Option<String>,
+    /// Live sessions counted on the remote daemon when the update decision
+    /// was made; `None` when unneeded (builds matched) or undeterminable.
+    pub live_sessions: Option<usize>,
     child: Child,
 }
 
@@ -101,13 +148,58 @@ pub async fn connect(
     // so every ssh invocation below sees a real destination.
     let host = &hosts::normalize_alias(host)?;
     progress(Phase::Probing);
+    let local_build = chimaera_core::BUILD_ID;
+    let mut outdated = false;
+    let mut live_sessions = None;
     let manifest = match remote_manifest(host).await? {
         Some(m) if remote_alive(host, m.pid).await? => {
-            tracing::info!("daemon already running on {host} (pid {})", m.pid);
-            m
+            // Only pay for the session-count round trip when it can change
+            // the decision (build mismatch, or an explicit update request).
+            let sessions = if opts.update_daemon
+                || !chimaera_core::builds_match(local_build, m.build.as_deref())
+            {
+                remote_sessions_count(host, &m).await?
+            } else {
+                None
+            };
+            match update_decision(
+                local_build,
+                m.build.as_deref(),
+                sessions,
+                opts.update_daemon,
+            ) {
+                Decision::Reuse => {
+                    tracing::info!("daemon already running on {host} (pid {})", m.pid);
+                    m
+                }
+                Decision::Update => {
+                    tracing::info!(
+                        "replacing daemon on {host} (build {}, ours {local_build}, {} live sessions)",
+                        m.build.as_deref().unwrap_or("pre-build-id"),
+                        sessions.map_or("unknown".to_string(), |n| n.to_string()),
+                    );
+                    progress(Phase::Updating);
+                    stop_remote(host, m.pid).await?;
+                    ensure_remote_binary(host, opts.binary.as_deref(), true, &progress).await?;
+                    progress(Phase::Starting);
+                    start_remote(host).await?
+                }
+                Decision::ConnectOutdated => {
+                    tracing::info!(
+                        "daemon on {host} is an older build ({} vs ours {local_build}) but {} — connecting to it as-is",
+                        m.build.as_deref().unwrap_or("pre-build-id"),
+                        sessions.map_or("its session count is unknown".to_string(), |n| {
+                            format!("has {n} live session{}", if n == 1 { "" } else { "s" })
+                        }),
+                    );
+                    outdated = true;
+                    live_sessions = sessions;
+                    m
+                }
+            }
         }
         _ => {
-            ensure_remote_binary(host, opts.binary.as_deref(), &progress).await?;
+            ensure_remote_binary(host, opts.binary.as_deref(), false, &progress).await?;
             progress(Phase::Starting);
             start_remote(host).await?
         }
@@ -125,8 +217,11 @@ pub async fn connect(
     Ok(Tunnel {
         host: host.to_string(),
         local_port,
+        remote_build: manifest.build.clone(),
         manifest,
         mux_delegated,
+        outdated,
+        live_sessions,
         child,
     })
 }
@@ -149,6 +244,91 @@ pub async fn remote_manifest(host: &str) -> anyhow::Result<Option<Manifest>> {
 /// Whether `pid` is alive on the host (signal 0 probe over ssh).
 pub async fn remote_alive(host: &str, pid: u32) -> anyhow::Result<bool> {
     ssh_check(host, &format!("kill -0 {pid} 2>/dev/null")).await
+}
+
+/// Count live sessions on the daemon `manifest` describes by asking the
+/// daemon itself: `curl` over ssh against its loopback port, authenticated
+/// with the manifest's own token. `Ok(None)` = could not determine (no
+/// curl, daemon unreachable, bad payload) — callers must treat unknown as
+/// busy, never as zero. `Err` only when ssh itself cannot run.
+pub async fn remote_sessions_count(
+    host: &str,
+    manifest: &Manifest,
+) -> anyhow::Result<Option<usize>> {
+    // The token rides stdin as a curl config line (`--config -`), never in
+    // argv: `ps` on a shared login node must not show other users the
+    // daemon token. (`-H @-` would be neater but needs curl >= 7.55;
+    // `--config -` works on cluster-vintage curls too.)
+    let cmd = format!(
+        "curl -fsS -m 5 --config - http://127.0.0.1:{}/api/v1/sessions",
+        manifest.port
+    );
+    let mut child = Command::new("ssh")
+        .arg(host)
+        .arg(cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to run ssh")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("header = \"Authorization: Bearer {}\"\n", manifest.token);
+        stdin.write_all(line.as_bytes()).await.ok();
+        // Dropping stdin sends EOF, which ends the config for curl.
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to run ssh")?;
+    if !output.status.success() {
+        tracing::debug!(
+            "session count on {host} unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(None);
+    }
+    Ok(count_alive_sessions(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Parse a `GET /api/v1/sessions` payload and count `alive: true` entries
+/// (the list also carries finished sessions for recents/last-words).
+/// `None` for anything that is not the expected JSON array.
+pub fn count_alive_sessions(payload: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    Some(
+        value
+            .as_array()?
+            .iter()
+            .filter(|s| {
+                s.get("alive")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count(),
+    )
+}
+
+/// Gracefully stop the daemon on `host`: SIGTERM, then poll for exit for up
+/// to ~10s. Never escalates to SIGKILL — a daemon that will not die may be
+/// holding sessions that must not be torn out from under their owner, so
+/// this errors honestly instead.
+pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
+    tracing::info!("stopping daemon on {host} (pid {pid})");
+    ssh_run(host, &format!("kill -TERM {pid}")).await?;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !remote_alive(host, pid).await? {
+            return Ok(());
+        }
+    }
+    bail!(
+        "daemon on {host} (pid {pid}) is still running 10s after SIGTERM — \
+         refusing to kill -9 it; something is keeping it busy (open UI tabs \
+         hold its sockets). Close them and retry, or stop it by hand."
+    )
 }
 
 /// `uname -sm` on the host, lowercased: e.g. `("linux", "x86_64")`.
@@ -192,13 +372,16 @@ pub fn dist_name(os: &str, arch: &str) -> String {
 
 /// Verify `$HOME/.chimaera/bin/chimaera` exists on the host, installing it
 /// from the explicit `binary`, else from `~/.chimaera/dist/` by detected
-/// target, erroring with instructions otherwise.
+/// target, erroring with instructions otherwise. `force` re-deploys even
+/// over an existing binary (the self-update path — the daemon must be
+/// stopped first).
 async fn ensure_remote_binary(
     host: &str,
     binary: Option<&Path>,
+    force: bool,
     progress: &impl Fn(Phase),
 ) -> anyhow::Result<()> {
-    if ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
+    if !force && ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
         return Ok(());
     }
     let path = match binary {
@@ -230,9 +413,12 @@ async fn ensure_remote_binary(
     });
     tracing::info!("installing {} on {host}", path.display());
     ssh_run(host, "mkdir -p $HOME/.chimaera/bin").await?;
+    // Stage + rename, never truncate the live path in place: an interrupted
+    // copy must not leave a half-written-but-executable binary behind, and
+    // rename keeps the old inode intact for anything still running it.
     let output = Command::new("scp")
         .arg(&path)
-        .arg(format!("{host}:.chimaera/bin/chimaera"))
+        .arg(format!("{host}:.chimaera/bin/chimaera.new"))
         .output()
         .await
         .context("failed to run scp")?;
@@ -242,7 +428,12 @@ async fn ensure_remote_binary(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    ssh_run(host, "chmod +x $HOME/.chimaera/bin/chimaera").await?;
+    ssh_run(
+        host,
+        "chmod +x $HOME/.chimaera/bin/chimaera.new && \
+         mv -f $HOME/.chimaera/bin/chimaera.new $HOME/.chimaera/bin/chimaera",
+    )
+    .await?;
     Ok(())
 }
 
@@ -373,5 +564,76 @@ mod tests {
         let picked = pick_local_port(None, held).unwrap();
         assert_ne!(picked, held, "held port must not be picked");
         assert_eq!(pick_local_port(Some(4321), held).unwrap(), 4321);
+    }
+
+    /// The full reuse/update/attach-outdated policy, with session counts a
+    /// caller would have fetched (or failed to fetch — `None` = busy).
+    #[test]
+    fn update_decision_matrix() {
+        const OURS: &str = "ff52221.100";
+        // Same source (timestamps differ across targets): reuse.
+        assert_eq!(
+            update_decision(OURS, Some("ff52221.999"), None, false),
+            Decision::Reuse
+        );
+        assert_eq!(
+            update_decision(OURS, Some(OURS), Some(3), false),
+            Decision::Reuse
+        );
+        // Different build + provably idle: safe to replace.
+        assert_eq!(
+            update_decision(OURS, Some("d4e587f.50"), Some(0), false),
+            Decision::Update
+        );
+        // Missing build id = ancient: same rules as a mismatch.
+        assert_eq!(
+            update_decision(OURS, None, Some(0), false),
+            Decision::Update
+        );
+        // Live sessions, or a count we couldn't get: never silently kill.
+        assert_eq!(
+            update_decision(OURS, Some("d4e587f.50"), Some(2), false),
+            Decision::ConnectOutdated
+        );
+        assert_eq!(
+            update_decision(OURS, Some("d4e587f.50"), None, false),
+            Decision::ConnectOutdated
+        );
+        assert_eq!(
+            update_decision(OURS, None, None, false),
+            Decision::ConnectOutdated
+        );
+        // Force (--update-daemon) replaces regardless of sessions or build.
+        assert_eq!(
+            update_decision(OURS, Some("d4e587f.50"), Some(7), true),
+            Decision::Update
+        );
+        assert_eq!(update_decision(OURS, None, None, true), Decision::Update);
+        assert_eq!(
+            update_decision(OURS, Some(OURS), Some(0), true),
+            Decision::Update
+        );
+    }
+
+    /// Session counting only trusts the expected shape and only counts
+    /// `alive: true` (the list also carries finished sessions).
+    #[test]
+    fn count_alive_sessions_parses_payloads() {
+        assert_eq!(count_alive_sessions("[]"), Some(0));
+        assert_eq!(
+            count_alive_sessions(
+                r#"[
+                    {"id": "a", "alive": true},
+                    {"id": "b", "alive": false},
+                    {"id": "c", "alive": true},
+                    {"id": "d"}
+                ]"#
+            ),
+            Some(2)
+        );
+        // Not the sessions payload => unknown, never zero.
+        assert_eq!(count_alive_sessions(""), None);
+        assert_eq!(count_alive_sessions("unauthorized"), None);
+        assert_eq!(count_alive_sessions(r#"{"error": "no"}"#), None);
     }
 }

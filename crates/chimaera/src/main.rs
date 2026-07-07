@@ -46,6 +46,11 @@ enum Command {
         /// Do not open the UI in a browser.
         #[arg(long)]
         no_open: bool,
+        /// Replace an outdated remote daemon even if it has live sessions
+        /// (they end with it). At zero sessions outdated daemons are
+        /// replaced automatically; the stop is always graceful.
+        #[arg(long)]
+        update_daemon: bool,
     },
     /// Check the local environment for common problems.
     Doctor,
@@ -73,11 +78,49 @@ async fn main() -> anyhow::Result<()> {
             local_port,
             binary,
             no_open,
-        } => connect::run(&host, local_port, binary.as_deref(), no_open).await,
+            update_daemon,
+        } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
         Command::Doctor => doctor::run(),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn connect_parses_update_daemon_flag() {
+        let cli =
+            Cli::try_parse_from(["chimaera", "connect", "cluster", "--update-daemon"]).unwrap();
+        match cli.command {
+            Command::Connect {
+                host,
+                update_daemon,
+                ..
+            } => {
+                assert_eq!(host, "cluster");
+                assert!(update_daemon);
+            }
+            _ => panic!("expected connect"),
+        }
+    }
+
+    #[test]
+    fn connect_update_daemon_defaults_off() {
+        let cli = Cli::try_parse_from(["chimaera", "connect", "cluster"]).unwrap();
+        match cli.command {
+            Command::Connect { update_daemon, .. } => assert!(!update_daemon),
+            _ => panic!("expected connect"),
         }
     }
 }

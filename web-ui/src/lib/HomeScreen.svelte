@@ -8,12 +8,15 @@
     disconnectHost,
     isNativeShell,
     listHosts,
+    localDaemonState,
     onConnectProgress,
     openWindow,
     remoteWorkspaces,
     removeHost,
+    updateLocalDaemon,
     type ConnectProgress,
     type HostState,
+    type LocalDaemonState,
   } from "./native";
   import type { Health } from "./api";
 
@@ -69,8 +72,18 @@
   let addError = $state<string | null>(null);
   let confirmForget = $state<string | null>(null);
 
+  // --- local daemon build parity (native shell, local window only) ------------
+
+  let localState = $state<LocalDaemonState | null>(null);
+  let localUpdating = $state(false);
+  let localError = $state<string | null>(null);
+
+  /** Current live sessions on the daemon serving this window. */
+  const liveNow = $derived(sessions.filter((s) => s.alive).length);
+
   const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
     probing: "probing for a running daemon…",
+    updating: "updating the daemon…",
     installing: "installing chimaera…",
     starting: "starting the daemon…",
     tunneling: "bringing the tunnel up…",
@@ -79,6 +92,10 @@
   onMount(() => {
     if (!native) return;
     void refreshHosts();
+    // Only the local window asks about the local daemon's build parity.
+    if (hostLabel === "local") {
+      void localDaemonState().then((s) => (localState = s));
+    }
     let unlisten: (() => void) | null = null;
     void onConnectProgress((p) => {
       phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
@@ -94,11 +111,12 @@
     }
   }
 
-  async function connect(alias: string): Promise<void> {
+  async function connect(alias: string, updateDaemon = false): Promise<void> {
     hostErrors = mapWithout(hostErrors, alias);
     hosts = hosts.map((h) => (h.alias === alias ? { ...h, status: "connecting" } : h));
+    if (updateDaemon) phases = new Map(phases).set(alias, PHASE_LABEL.updating);
     try {
-      const state = await connectHost(alias);
+      const state = await connectHost(alias, updateDaemon);
       hosts = hosts.map((h) => (h.alias === alias ? state : h));
       const list = await remoteWorkspaces(alias);
       remoteWs = new Map(remoteWs).set(
@@ -139,6 +157,33 @@
     } catch (e) {
       addError = e instanceof Error ? e.message : String(e);
     }
+  }
+
+  async function updateLocal(): Promise<void> {
+    localError = null;
+    localUpdating = true;
+    try {
+      await updateLocalDaemon();
+      // Success: the shell broadcasts local-daemon-updated and this window
+      // re-homes itself to the fresh daemon (App-level listener).
+    } catch (e) {
+      localError = e instanceof Error ? e.message : String(e);
+      localUpdating = false;
+    }
+  }
+
+  /** The source part of a build id ("ff52221-dirty.1783438290" → "ff52221-dirty"). */
+  function shortBuild(build: string | null): string {
+    if (build === null) return "an old build";
+    const dot = build.lastIndexOf(".");
+    return dot === -1 ? build : build.slice(0, dot);
+  }
+
+  /** What clicking "update" ends, spelled out next to the action. */
+  function endsLabel(n: number | null): string {
+    if (n === null) return " (session count unknown)";
+    if (n === 0) return "";
+    return ` (ends ${n} session${n === 1 ? "" : "s"})`;
   }
 
   function mapWithout<K, V>(map: Map<K, V>, key: K): Map<K, V> {
@@ -187,6 +232,17 @@
           <span class="hostname">{health.hostname}</span>
         {/if}
       </div>
+      {#if native && hostLabel === "local" && localState?.outdated}
+        <div class="update-line">
+          <span>daemon from {shortBuild(localState.build)} —</span>
+          <button class="update-act" disabled={localUpdating} onclick={() => void updateLocal()}>
+            {localUpdating ? "updating…" : `update${endsLabel(liveNow)}`}
+          </button>
+        </div>
+        {#if localError !== null}
+          <div class="err-line masthead-err">{localError}</div>
+        {/if}
+      {/if}
     </header>
 
     <section>
@@ -362,6 +418,14 @@
                 {#if err !== undefined}
                   <div class="err-line">{err}</div>
                 {/if}
+                {#if h.status === "connected" && h.outdated && phase === undefined}
+                  <div class="note-line">
+                    daemon from {shortBuild(h.remote_build)} —
+                    <button class="update-act" onclick={() => void connect(h.alias, true)}>
+                      update{endsLabel(h.live_sessions)}
+                    </button>
+                  </div>
+                {/if}
                 {#if h.status === "connected" && ws !== undefined}
                   <div class="remote-ws">
                     {#each ws as rw (rw.id)}
@@ -415,6 +479,57 @@
     align-items: baseline;
     justify-content: space-between;
     gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  /* Quiet build-parity note: a second masthead row, right-aligned under
+     the host label, mono + muted like the rest of the meta text. */
+  .update-line {
+    flex-basis: 100%;
+    display: flex;
+    justify-content: flex-end;
+    align-items: baseline;
+    gap: 5px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
+  .update-act {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--warn);
+    cursor: pointer;
+    padding: 0 2px;
+    border-radius: 3px;
+  }
+
+  .update-act:hover {
+    text-decoration: underline;
+  }
+
+  .update-act:disabled {
+    opacity: 0.6;
+    cursor: default;
+    text-decoration: none;
+  }
+
+  .masthead-err {
+    flex-basis: 100%;
+    text-align: right;
+    padding: 0;
+  }
+
+  /* Same quiet register for the outdated-daemon note under a host row. */
+  .note-line {
+    padding: 0 10px 6px 27px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   .brand {

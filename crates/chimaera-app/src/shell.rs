@@ -16,7 +16,8 @@ use crate::daemon::LocalDaemon;
 
 /// App-global shell state.
 pub struct Shell {
-    pub local: LocalDaemon,
+    /// The local daemon (mutable: the update affordance replaces it).
+    pub local: Mutex<LocalDaemon>,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
     /// Aliases with a connect in flight (guards double-clicks).
@@ -31,12 +32,33 @@ pub struct HostState {
     local_port: Option<u16>,
     last_connected_at: Option<u64>,
     error: Option<String>,
+    /// The connected daemon is an older build; live sessions kept connect
+    /// from replacing it (the row offers the explicit update).
+    outdated: bool,
+    remote_build: Option<String>,
+    live_sessions: Option<usize>,
 }
 
 #[derive(Clone, Serialize)]
 struct ConnectProgress {
     alias: String,
     phase: &'static str,
+}
+
+/// The local daemon's build parity, as the home screen sees it.
+#[derive(Clone, Serialize)]
+pub struct LocalState {
+    outdated: bool,
+    build: Option<String>,
+    live_sessions: Option<usize>,
+}
+
+/// Payload of the `local-daemon-updated` broadcast: every window on the
+/// local daemon re-homes itself to the new port + token.
+#[derive(Clone, Serialize)]
+struct LocalDaemonMoved {
+    port: u16,
+    token: String,
 }
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -77,14 +99,17 @@ pub fn open_ui_window(
 fn state_for(
     entry: &chimaera_remote::hosts::HostEntry,
     status: &'static str,
-    port: Option<u16>,
+    tunnel: Option<&Tunnel>,
 ) -> HostState {
     HostState {
         alias: entry.alias.clone(),
         status,
-        local_port: port,
+        local_port: tunnel.map(|t| t.local_port),
         last_connected_at: entry.last_connected_at,
         error: None,
+        outdated: tunnel.is_some_and(|t| t.outdated),
+        remote_build: tunnel.and_then(|t| t.remote_build.clone()),
+        live_sessions: tunnel.and_then(|t| t.live_sessions),
     }
 }
 
@@ -99,7 +124,7 @@ async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
         .iter()
         .map(|h| {
             if let Some(t) = tunnels.get(&h.alias) {
-                state_for(h, "connected", Some(t.local_port))
+                state_for(h, "connected", Some(t))
             } else if connecting.contains(&h.alias) {
                 state_for(h, "connecting", None)
             } else {
@@ -136,18 +161,22 @@ async fn connect_host(
     app: AppHandle,
     state: State<'_, Shell>,
     alias: String,
+    update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
-    tracing::info!("ipc: connect_host {alias}");
-    // Reuse a live tunnel; a dead one is torn down and rebuilt.
+    let update_daemon = update_daemon.unwrap_or(false);
+    tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
+    // Reuse a live tunnel; a dead one is torn down and rebuilt. An update
+    // request never reuses: the old tunnel points at the daemon being
+    // replaced, so it comes down before the connect flow runs.
     {
         let mut tunnels = state.tunnels.lock().await;
         if let Some(t) = tunnels.get(&alias) {
-            if t.is_up().await {
+            if !update_daemon && t.is_up().await {
                 let entry = host_entry(&alias);
-                return Ok(state_for(&entry, "connected", Some(t.local_port)));
+                return Ok(state_for(&entry, "connected", Some(t)));
             }
-            if let Some(dead) = tunnels.remove(&alias) {
-                dead.close().await;
+            if let Some(old) = tunnels.remove(&alias) {
+                old.close().await;
             }
         }
     }
@@ -161,12 +190,14 @@ async fn connect_host(
     let opts = ConnectOpts {
         local_port: None,
         binary: entry.binary.clone(),
+        update_daemon,
     };
     let progress_app = app.clone();
     let progress_alias = alias.clone();
     let result = chimaera_remote::connect(&alias, opts, move |phase| {
         let phase = match phase {
             Phase::Probing => "probing",
+            Phase::Updating => "updating",
             Phase::Installing { .. } => "installing",
             Phase::Starting => "starting",
             Phase::Tunneling { .. } => "tunneling",
@@ -183,13 +214,13 @@ async fn connect_host(
     lock(&state.connecting).remove(&alias);
 
     let tunnel = result.map_err(|e| format!("{e:#}"))?;
-    let local_port = tunnel.local_port;
     if let Err(e) = HostsStore::load_default().record_connected(&alias) {
         tracing::debug!("could not record host {alias}: {e}");
     }
-    state.tunnels.lock().await.insert(alias.clone(), tunnel);
     let entry = host_entry(&alias);
-    Ok(state_for(&entry, "connected", Some(local_port)))
+    let host_state = state_for(&entry, "connected", Some(&tunnel));
+    state.tunnels.lock().await.insert(alias.clone(), tunnel);
+    Ok(host_state)
 }
 
 #[tauri::command]
@@ -197,6 +228,35 @@ async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), S
     if let Some(tunnel) = state.tunnels.lock().await.remove(&alias) {
         tunnel.close().await;
     }
+    Ok(())
+}
+
+/// The local daemon's build parity (home screen: quiet update note).
+#[tauri::command]
+async fn local_state(state: State<'_, Shell>) -> Result<LocalState, String> {
+    let d = lock(&state.local).clone();
+    Ok(LocalState {
+        outdated: d.outdated,
+        build: d.build,
+        live_sessions: d.live_sessions,
+    })
+}
+
+/// Explicit local-daemon update: graceful stop, respawn our build, then
+/// broadcast the new port + token so every window on the local daemon can
+/// re-home itself (the old origin is gone).
+#[tauri::command]
+async fn update_local_daemon(app: AppHandle, state: State<'_, Shell>) -> Result<(), String> {
+    tracing::info!("ipc: update_local_daemon");
+    let fresh = crate::daemon::update_local_daemon()
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let moved = LocalDaemonMoved {
+        port: fresh.port,
+        token: fresh.token.clone(),
+    };
+    *lock(&state.local) = fresh;
+    let _ = app.emit("local-daemon-updated", moved);
     Ok(())
 }
 
@@ -239,7 +299,10 @@ async fn open_window(
 ) -> Result<(), String> {
     tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?}");
     let (port, token, host) = match alias {
-        None => (state.local.port, state.local.token.clone(), None),
+        None => {
+            let local = lock(&state.local);
+            (local.port, local.token.clone(), None)
+        }
         Some(alias) => {
             let tunnels = state.tunnels.lock().await;
             let t = tunnels
@@ -278,6 +341,8 @@ pub fn run() {
             remove_host,
             connect_host,
             disconnect_host,
+            local_state,
+            update_local_daemon,
             remote_workspaces,
             open_window,
         ])
@@ -294,7 +359,7 @@ pub fn run() {
             open_ui_window(&handle, local.port, &local.token, None, None)?;
             tracing::info!("home window open on 127.0.0.1:{}", local.port);
             app.manage(Shell {
-                local,
+                local: Mutex::new(local),
                 tunnels: tokio::sync::Mutex::new(HashMap::new()),
                 connecting: Mutex::new(HashSet::new()),
             });

@@ -80,13 +80,11 @@ pub fn install(app: &App) -> tauri::Result<()> {
         match id {
             "new-window" => {
                 if let Some(shell) = app.try_state::<crate::shell::Shell>() {
-                    let _ = crate::shell::open_ui_window(
-                        app,
-                        shell.local.port,
-                        &shell.local.token,
-                        None,
-                        None,
-                    );
+                    let (port, token) = {
+                        let local = crate::shell::lock(&shell.local);
+                        (local.port, local.token.clone())
+                    };
+                    let _ = crate::shell::open_ui_window(app, port, &token, None, None);
                 }
             }
             "close-view" | "new-terminal" | "new-agent" => {

@@ -11,6 +11,33 @@ use serde::{Deserialize, Serialize};
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Build identity of this binary: `<git-short-hash>[-dirty].<build-unix-secs>`
+/// (e.g. `ff52221-dirty.1783438290`), embedded by build.rs. Builds outside a
+/// git checkout embed `unknown.<secs>`.
+pub const BUILD_ID: &str = env!("CHIMAERA_BUILD_ID");
+
+/// The source-identity part of a build id — everything before the build
+/// timestamp (`ff52221-dirty.1783438290` → `ff52221-dirty`).
+pub fn build_ref(id: &str) -> &str {
+    id.rsplit_once('.').map_or(id, |(r, _)| r)
+}
+
+/// Whether two build ids denote the same source. Timestamps are deliberately
+/// ignored: the same commit is cross-compiled for clusters (`just dist`) and
+/// built natively (the connecting CLI/app) at different moments, and those
+/// must compare equal or every connect would "update" the daemon forever.
+/// `None` (a manifest that predates build ids) never matches — missing means
+/// ancient by definition — and `unknown` hashes only match bytewise-identical
+/// ids, never on hash alone.
+pub fn builds_match(local: &str, remote: Option<&str>) -> bool {
+    let Some(remote) = remote else { return false };
+    if local == remote {
+        return true;
+    }
+    let (l, r) = (build_ref(local), build_ref(remote));
+    l == r && !l.is_empty() && !l.starts_with("unknown")
+}
+
 /// Per-user data directory (`~/.chimaera`), created on demand.
 pub fn data_dir() -> PathBuf {
     let dir = dirs::home_dir()
@@ -74,6 +101,11 @@ pub struct Manifest {
     pub pid: u32,
     pub version: String,
     pub started_at: u64,
+    /// Build id of the daemon binary ([`BUILD_ID`] at `serve` time). `None`
+    /// on manifests written by builds that predate build ids — which is
+    /// itself the signal: missing = ancient = outdated.
+    #[serde(default)]
+    pub build: Option<String>,
 }
 
 impl Manifest {
@@ -145,6 +177,7 @@ mod tests {
             pid: std::process::id(),
             version: VERSION.to_string(),
             started_at: 1_750_000_000,
+            build: Some(BUILD_ID.to_string()),
         };
         manifest.write().unwrap();
 
@@ -161,6 +194,7 @@ mod tests {
         assert_eq!(loaded.pid, manifest.pid);
         assert_eq!(loaded.version, manifest.version);
         assert_eq!(loaded.started_at, manifest.started_at);
+        assert_eq!(loaded.build, manifest.build, "build id round-trips");
         assert!(loaded.is_alive(), "our own pid is alive");
 
         Manifest::remove().unwrap();
@@ -168,5 +202,49 @@ mod tests {
         Manifest::remove().unwrap(); // idempotent
 
         std::fs::remove_dir_all(&tmp_home).ok();
+    }
+
+    /// Manifests written before build ids existed (no `build` field) must
+    /// keep parsing — a missing build is data ("ancient"), not an error.
+    #[test]
+    fn manifest_without_build_field_parses() {
+        let old = r#"{
+            "hostname": "cluster",
+            "port": 9700,
+            "token": "abc",
+            "pid": 1234,
+            "version": "0.0.1",
+            "started_at": 1750000000
+        }"#;
+        let m: Manifest = serde_json::from_str(old).unwrap();
+        assert_eq!(m.build, None, "missing field reads as None");
+        assert_eq!(m.port, 9700);
+    }
+
+    #[test]
+    fn build_id_has_source_ref_and_timestamp() {
+        let (source, secs) = BUILD_ID.rsplit_once('.').expect("hash.time shape");
+        assert!(!source.is_empty());
+        assert!(
+            secs.parse::<u64>().is_ok(),
+            "timestamp is unix secs: {secs}"
+        );
+        assert_eq!(build_ref(BUILD_ID), source);
+    }
+
+    #[test]
+    fn builds_match_ignores_timestamp_but_not_source() {
+        // Same commit, different build moments (native app vs musl dist).
+        assert!(builds_match("ff52221.100", Some("ff52221.999")));
+        assert!(builds_match("ff52221-dirty.100", Some("ff52221-dirty.999")));
+        assert!(builds_match("ff52221.100", Some("ff52221.100")));
+        // Different source never matches.
+        assert!(!builds_match("ff52221.100", Some("d4e587f.100")));
+        assert!(!builds_match("ff52221.100", Some("ff52221-dirty.100")));
+        // Missing = pre-build-id = ancient.
+        assert!(!builds_match("ff52221.100", None));
+        // Non-git builds only match bytewise-identical ids.
+        assert!(!builds_match("unknown.100", Some("unknown.999")));
+        assert!(builds_match("unknown.100", Some("unknown.100")));
     }
 }

@@ -572,7 +572,43 @@ Launcher field notes (2026-07-06, shipped with the build):
   inline rename; the pin outranks every derived name on every surface (rail, tab,
   strip) and survives into Recents when the session ends.
 
-**Managed agent runtimes (author, 2026-07-07 — queued).** Chimaera installs and updates
+**Daemon self-update on connect (author, 2026-07-07 — field find #2 on cluster).**
+Connecting to a host reused a 21-hour-old M0 daemon forever: `connect` only checks
+"running?", and every build calls itself 0.0.1, so builds are indistinguishable. Spec:
+- Binaries embed a **build id** (git hash + dirty flag + build time, via build.rs env);
+  the manifest carries it. A missing field = ancient = outdated by definition.
+- `connect` compares the remote build id to the binary it would deploy. Same → reuse
+  (today's behavior). Different →
+  - **zero live sessions on the remote daemon** (asked over ssh with the manifest's
+    own token) → auto-update: graceful stop, redeploy via the existing
+    ensure_remote_binary/dist path, start, new `Phase::Updating` progress state.
+  - **live sessions** → NEVER silently kill. Connect succeeds against the old daemon
+    but surfaces "daemon is from <build>, yours is newer, N sessions would end" with
+    an explicit update affordance: `chimaera connect --update-daemon` (CLI) and an
+    "update daemon" action on the host row (app). Count unavailable → treat as busy.
+- Local parity: the app/CLI starting a LOCAL daemon applies the same comparison to a
+  running localhost daemon (the manifest is on disk; same rules, no ssh).
+
+**Session lifecycle: activity-honest states + dormancy reaping (author, 2026-07-07 —
+queued, after daemon self-update lands).** "Alive green forever just for existing" is
+dishonest. The daemon sees every byte both ways, and shell integration knows the
+phase (prompt vs running), so:
+- States become activity-based for EVERY session kind: **active** (output flowing /
+  command running / agent working), **idle** (at prompt, quiet minutes — glyph dims),
+  **dormant** (quiet hours — dimmer; may sort below active rows). Track last input +
+  last output per session in the daemon; surface `last_activity` on session JSON.
+- **Reaping** splits by what's lost: agents auto-retire after long dormancy
+  (default ~24h, a setting) — cheap, they land in Recents and resume in one click.
+  Terminals are NEVER auto-killed by default (an idle shell may hold module/conda
+  state — the exact thing linked terminals exist to reuse); `terminal.idleReap`
+  exists as an opt-in setting, and the shell-integration journal allows a smarter
+  future condition ("no command ran in N hours") than byte-silence.
+- **Update as a standing affordance** (extends daemon self-update): the status bar
+  (by the daemon dot) and the home screen show "update available" whenever the
+  running daemon's build id differs from the client binary's — local or remote,
+  one click, the same never-silently-kill-sessions rules.
+
+**Managed agent runtimes (author, 2026-07-07 — SHIPPED).** Chimaera installs and updates
 the agent CLIs itself, in-app, while credentials stay entirely the user's: every CLI
 keeps auth in the user's HOME (~/.claude + keychain, ~/.codex/auth.json, ~/.gemini),
 and managed binaries run as the user with their HOME + login-shell env, so login flows

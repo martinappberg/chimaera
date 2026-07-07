@@ -50,12 +50,28 @@ export interface HostState {
   last_connected_at: number | null;
   /** Last connect error, while status is "error". */
   error: string | null;
+  /**
+   * The connected daemon is an older build than this machine's; live
+   * sessions kept connect from replacing it (the row offers the update).
+   */
+  outdated: boolean;
+  /** The connected daemon's build id (null = predates build ids). */
+  remote_build: string | null;
+  /** Live sessions counted when the update decision was made. */
+  live_sessions: number | null;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
 export interface ConnectProgress {
   alias: string;
-  phase: "probing" | "installing" | "starting" | "tunneling";
+  phase: "probing" | "updating" | "installing" | "starting" | "tunneling";
+}
+
+/** Build parity of the local daemon, as decided at app startup. */
+export interface LocalDaemonState {
+  outdated: boolean;
+  build: string | null;
+  live_sessions: number | null;
 }
 
 export async function listHosts(): Promise<HostState[]> {
@@ -77,12 +93,45 @@ export async function removeHost(alias: string): Promise<void> {
 /**
  * Connect to a saved host (probe, auto-install, start, tunnel). Resolves to
  * the connected state; rejects with the shell's error message on failure.
- * Progress arrives via `onConnectProgress`.
+ * Progress arrives via `onConnectProgress`. `updateDaemon` replaces an
+ * outdated remote daemon even when it has live sessions (graceful stop).
  */
-export async function connectHost(alias: string): Promise<HostState> {
+export async function connectHost(alias: string, updateDaemon = false): Promise<HostState> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
-  return t.core.invoke<HostState>("connect_host", { alias });
+  return t.core.invoke<HostState>("connect_host", { alias, updateDaemon });
+}
+
+/** The local daemon's build parity (native shell only; null in a browser). */
+export async function localDaemonState(): Promise<LocalDaemonState | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return t.core.invoke<LocalDaemonState>("local_state");
+}
+
+/**
+ * Replace the local daemon with this app's build (graceful stop, respawn).
+ * On success the shell broadcasts `local-daemon-updated` and every window
+ * on the local daemon re-homes itself — see `onLocalDaemonUpdated`.
+ */
+export async function updateLocalDaemon(): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("update_local_daemon");
+}
+
+/**
+ * The local daemon was replaced: new port + token, old origin gone. Windows
+ * on the local daemon navigate themselves to the new one.
+ */
+export function onLocalDaemonUpdated(
+  handler: (p: { port: number; token: string }) => void,
+): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<{ port: number; token: string }>("local-daemon-updated", (e) =>
+    handler(e.payload),
+  );
 }
 
 export async function disconnectHost(alias: string): Promise<void> {
