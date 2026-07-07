@@ -41,6 +41,7 @@
   } from "./lib/launcher";
   import { EventsSocket } from "./lib/events";
   import {
+    agentHue,
     deleteLink,
     listLinks,
     putLink,
@@ -101,13 +102,15 @@
     type Tab,
   } from "./lib/layout";
   import type { PathKind } from "./lib/links";
-  import { basename, fileTabTitles, fsProbe } from "./lib/files";
+  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
   import {
     paneContentEl,
     paneRootEl,
+    registerLinkRow,
     registerStage,
     startDrag,
+    unregisterLinkRow,
     unregisterStage,
     type DropSpot,
     type LayoutCtrl,
@@ -121,6 +124,16 @@
     loadSettings,
   } from "./lib/settings/store.svelte";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
+  import {
+    FILES_FRAC_MAX,
+    FILES_FRAC_MIN,
+    RAIL_DEFAULT,
+    RAIL_MAX,
+    RAIL_MIN,
+    loadRailChrome,
+    saveRailChrome,
+  } from "./lib/railState";
+  import { hintsActive, initChordHints } from "./lib/chordHints.svelte";
   import FolderPicker from "./lib/FolderPicker.svelte";
   import HomeScreen from "./lib/HomeScreen.svelte";
   import Launcher from "./lib/Launcher.svelte";
@@ -182,9 +195,17 @@
   /** File-tree reveal request (terminal dir links); nonce distinguishes repeats. */
   let treeReveal = $state<{ path: string; nonce: number } | null>(null);
 
+  // Rail chrome (width + FILES section) is a window preference, persisted
+  // locally so it survives reload and holds across workspace switches. Collapse
+  // is not stored here — it maps onto the layout's focus mode (which persists
+  // and carries the strip). Loaded once, clamped, before the first paint.
+  const railChrome = loadRailChrome();
+  /** Draggable sidebar width; the inline width wins unless focus mode collapses it. */
+  let railWidth = $state(railChrome.width);
+  let railDividerActive = $state(false);
   // Rail FILES section: collapsible, resizable share of the rail height.
-  let filesOpen = $state(true);
-  let filesFrac = $state(0.4);
+  let filesOpen = $state(railChrome.filesOpen);
+  let filesFrac = $state(railChrome.filesFrac);
   let filesDividerActive = $state(false);
   let railEl = $state<HTMLElement | null>(null);
   let daemonEl = $state<HTMLElement | null>(null);
@@ -210,6 +231,11 @@
   const shellSessions = $derived(wsSessions.filter((s) => s.kind !== "agent"));
   const agentSessions = $derived(wsSessions.filter((s) => s.kind === "agent"));
   const railSessions = $derived([...shellSessions, ...agentSessions]);
+  // The first nine rail rows carry the ⌘1–9 chord; this map is what the
+  // which-key hints (rail badges + strip chips) read to label them.
+  const chordDigits = $derived(
+    new Map(railSessions.slice(0, 9).map((s, i) => [s.id, i + 1] as const)),
+  );
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
@@ -344,6 +370,12 @@
     saveViewState(stateKey(activeWsId), blob);
   });
 
+  // Persist rail chrome (width + FILES section) locally on any change. Drags
+  // are rAF-throttled upstream, so the localStorage write rate stays bounded.
+  $effect(() => {
+    saveRailChrome({ width: railWidth, filesOpen, filesFrac });
+  });
+
   // The dnd hit-tester needs the stage rect for window-edge drop targets.
   $effect(() => {
     const el = stageEl;
@@ -422,6 +454,8 @@
       void flushSettings();
     };
     const onCopy = () => rememberCopy();
+    // Which-key discovery: holding the app modifier fades in the ⌘1–9 badges.
+    const stopChordHints = initChordHints();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
     document.addEventListener("copy", onCopy);
@@ -431,6 +465,7 @@
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       document.removeEventListener("copy", onCopy);
+      stopChordHints();
       setReferenceHandler(null);
       events.close();
       pool.disposePool();
@@ -647,15 +682,19 @@
    *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
-    // Per-pane terminal font size (Cmd/Ctrl +/−/0, spec-pinned chords):
-    // intercepted ONLY while the focused pane shows a terminal, so browser
-    // zoom keeps working everywhere else.
+    // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
+    // ONLY while the focused pane shows a font-sizable surface (a terminal or
+    // a rendered markdown document), so browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
       if (step !== null) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
-        if (p !== null && active !== undefined && active.surface === "terminal") {
+        const sizable =
+          active !== undefined &&
+          (active.surface === "terminal" ||
+            (active.surface === "file" && viewKindFor(active.path) === "markdown"));
+        if (p !== null && sizable) {
           e.preventDefault();
           e.stopPropagation();
           adjustFont(p.id, step);
@@ -1313,6 +1352,11 @@
     dragTab(e, paneId, index, tab) {
       beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
     },
+    dragSurface(e, tab, onClick) {
+      // The link icon: a link-intent drag — dropping anywhere but an agent
+      // (rail row or pane band) is a no-op, never a tab move.
+      beginDrag(e, tab, onClick, true);
+    },
     dividerDrag(active) {
       pool.setDragging(active);
     },
@@ -1342,16 +1386,16 @@
    * `tab`: panes showing a live agent session, when the payload is a shell
    * terminal (files and agents themselves never link).
    */
-  function linkTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+  function linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined {
     if (tab.surface !== "terminal") return undefined;
     if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
-    const targets = new Set<string>();
+    const targets = new Map<string, string>();
     const walk = (n: typeof layout.root): void => {
       if (n.type === "pane") {
         const active = n.tabs[n.active];
         if (active !== undefined && active.surface === "terminal") {
           const s = sessionsById.get(active.sessionId);
-          if (s !== undefined && s.kind === "agent" && s.alive) targets.add(n.id);
+          if (s !== undefined && s.kind === "agent" && s.alive) targets.set(n.id, s.id);
         }
         return;
       }
@@ -1362,8 +1406,29 @@
     return targets.size > 0 ? targets : undefined;
   }
 
-  /** Shared drag start for rail rows and pane tabs (any surface). */
-  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void): void {
+  /**
+   * The live agent sessions in `tab`'s workspace whose RAIL ROWS are link
+   * targets while dragging that shell terminal (the always-present target —
+   * the agent needn't be open in a pane). Undefined for non-shell payloads.
+   */
+  function linkSessionsFor(tab: Tab): ReadonlySet<string> | undefined {
+    if (tab.surface !== "terminal") return undefined;
+    const term = sessionsById.get(tab.sessionId);
+    if (term === undefined || term.kind !== "shell") return undefined;
+    const out = new Set<string>();
+    for (const s of sessions) {
+      if (s.kind === "agent" && s.alive && s.workspace_id === term.workspace_id) out.add(s.id);
+    }
+    return out.size > 0 ? out : undefined;
+  }
+
+  /**
+   * Shared drag start for rail rows and pane tabs (any surface). `linkIntent`
+   * (set when the drag starts from a pane's link icon) restricts a shell
+   * terminal to link-only drops — anywhere but an agent is a no-op, never a
+   * tab move.
+   */
+  function beginDrag(e: PointerEvent, tab: Tab, onClick: () => void, linkIntent = false): void {
     const label =
       tab.surface === "terminal"
         ? (displayNames.get(tab.sessionId) ??
@@ -1377,7 +1442,8 @@
     // previews (the band region is reserved, never flashed over).
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
-    if (linkTargets !== undefined) for (const id of linkTargets) armed.add(id);
+    const linkSessions = linkSessionsFor(tab);
+    if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
     if (tab.surface === "file") {
       for (const p of panesOf(layout.root)) {
         const a = p.tabs[p.active];
@@ -1403,9 +1469,19 @@
             return;
           }
           if (spot.kind === "link") {
+            // Plain tab drag onto an agent pane's band.
             if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
             return;
           }
+          if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
+            // Link-intent drop on an agent (its view, tab, or rail row): link,
+            // then surface the agent.
+            if (tab.surface === "terminal") linkBySession(tab.sessionId, spot.sessionId);
+            return;
+          }
+          // A link-intent drag (from the link icon) only ever links — a drop
+          // anywhere but an agent is a no-op, never a surprise tab move.
+          if (linkIntent) return;
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
@@ -1438,7 +1514,7 @@
           );
         },
       },
-      { linkTargets },
+      { linkTargets, linkSessions, linkIntent },
     );
   }
 
@@ -1487,6 +1563,26 @@
     pool.focusTerminal(agentId);
   }
 
+  /**
+   * The drop on an agent's RAIL ROW: link the terminal, surface the agent
+   * (splitting beside the terminal when the agent isn't open anywhere), type
+   * its @term: reference into the composer, and focus the agent. Works even
+   * when the agent has no pane — the rail row is the always-present target.
+   */
+  function linkBySession(terminalId: string, agentId: string): void {
+    const agent = sessionsById.get(agentId);
+    if (agent === undefined || agent.kind !== "agent" || !agent.alive) return;
+    void doLink(terminalId, agentId);
+    if (sessionPaneId(layout, agentId) === null) {
+      const beside = sessionPaneId(layout, terminalId) ?? layout.focusedPaneId;
+      layout = splitPane(layout, beside, "row");
+      layout = openSession(layout, agentId);
+    }
+    const name = displayNames.get(terminalId) ?? terminalId;
+    typeIntoSession(agentId, `${termReference(name)} `);
+    pool.focusTerminal(agentId);
+  }
+
   /** Link mutations + reveal for the pane top bars (chips and the menu). */
   const linkCtrl: LinkCtrl = {
     reveal(sessionId, besidePaneId) {
@@ -1518,6 +1614,19 @@
     node.focus();
   }
 
+  /** Svelte action: register an agent rail row as a link-drop target, so a
+   *  shell-terminal drag (from the link icon or a tab) can drop on it to link.
+   *  No-op for non-agent rows. */
+  function linkRow(node: HTMLElement, s: Session): { destroy(): void } | void {
+    if (s.kind !== "agent") return;
+    registerLinkRow(s.id, node);
+    return {
+      destroy() {
+        unregisterLinkRow(s.id, node);
+      },
+    };
+  }
+
   /**
    * FILES section resize: a quiet divider above the section header; drag
    * moves the boundary (fraction of the rail, clamped), Escape restores.
@@ -1547,7 +1656,7 @@
       const daemonTop = daemon.getBoundingClientRect().top;
       if (railH <= 0) return;
       const h = daemonTop - lastY;
-      filesFrac = Math.min(Math.max(h / railH, 0.12), 0.8);
+      filesFrac = Math.min(Math.max(h / railH, FILES_FRAC_MIN), FILES_FRAC_MAX);
     };
 
     const onMove = (ev: PointerEvent) => {
@@ -1587,6 +1696,83 @@
     window.addEventListener("pointercancel", onCancel);
     window.addEventListener("keydown", onKey, true);
   }
+
+  /**
+   * Sidebar width resize: a quiet vertical handle on the rail's right edge.
+   * Drag moves the boundary (clamped to [RAIL_MIN, RAIL_MAX]); Escape restores.
+   * The stage grows/shrinks with the rail, so terminals are told to hold their
+   * fits until the drag ends (setDragging) to avoid per-frame reflow jank.
+   */
+  function onRailResizeDown(e: PointerEvent): void {
+    if (e.button !== 0 || railEl === null) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    const rail = railEl;
+    const pointerId = e.pointerId;
+    const startX = e.clientX;
+    const startWidth = rail.getBoundingClientRect().width;
+    const startRail = railWidth;
+    let raf = 0;
+    let lastX = e.clientX;
+    let done = false;
+
+    try {
+      handle.setPointerCapture(pointerId);
+    } catch {
+      // capture unavailable; window-level listeners still track the drag
+    }
+    railDividerActive = true;
+    pool.setDragging(true);
+
+    const apply = () => {
+      raf = 0;
+      railWidth = Math.min(Math.max(startWidth + (lastX - startX), RAIL_MIN), RAIL_MAX);
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      lastX = ev.clientX;
+      if (raf === 0) raf = requestAnimationFrame(apply);
+    };
+
+    const finish = (cancel: boolean) => {
+      if (done) return;
+      done = true;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey, true);
+      if (raf !== 0) cancelAnimationFrame(raf);
+      if (cancel) railWidth = startRail;
+      railDividerActive = false;
+      // Flush the fits deferred during the drag now that the width is settled.
+      pool.setDragging(false);
+    };
+
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId === pointerId) finish(false);
+    };
+    const onCancel = (ev: PointerEvent) => {
+      if (ev.pointerId === pointerId) finish(true);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        finish(true);
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey, true);
+  }
+
+  /** Double-click the width handle to snap back to the default sidebar width. */
+  function resetRailWidth(): void {
+    railWidth = RAIL_DEFAULT;
+  }
 </script>
 
 <div class="shell">
@@ -1605,7 +1791,13 @@
     />
   {:else}
   <div class="body">
-    <aside class="rail" class:collapsed={layout.focusMode} bind:this={railEl}>
+    <aside
+      class="rail"
+      class:collapsed={layout.focusMode}
+      class:resizing={railDividerActive}
+      style:width={layout.focusMode ? undefined : `${railWidth}px`}
+      bind:this={railEl}
+    >
       <div class="workspace">
         <button
           class="ws-btn"
@@ -1632,6 +1824,34 @@
             {needsYou}
           </span>
         {/if}
+        <button
+          class="rail-collapse"
+          title="hide sidebar ({KEYS.focusMode})"
+          aria-label="hide sidebar"
+          onclick={() => (layout = { ...layout, focusMode: true })}
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <rect
+              x="1.75"
+              y="2.75"
+              width="12.5"
+              height="10.5"
+              rx="2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
+            <line x1="6.5" y1="2.75" x2="6.5" y2="13.25" stroke="currentColor" stroke-width="1.3" />
+            <path
+              d="M11.4 6.2 9.4 8l2 1.8"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
       </div>
 
       <nav class="sessions">
@@ -1661,6 +1881,9 @@
             <div
               class="row"
               class:active={s.id === focusedSessionId}
+              class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
+              style:--hue={s.kind === "agent" ? agentHue(s.id) : null}
+              use:linkRow={s}
               role="button"
               tabindex="0"
               onpointerdowncapture={(e) => {
@@ -1726,6 +1949,11 @@
                     <span class="title">{s.title}</span>
                   {/if}
                 </span>
+              {/if}
+              {#if hintsActive() && renamingId !== s.id && chordDigits.has(s.id)}
+                <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
+                     while the modifier is held. Pure teaching chrome. -->
+                <span class="kbd-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
               {/if}
               <button
                 class="close"
@@ -1902,6 +2130,20 @@
       </div>
     </aside>
 
+    {#if !layout.focusMode}
+      <!-- Sidebar width handle: a quiet vertical splitter on the rail's edge. -->
+      <div
+        class="rail-resize"
+        class:active={railDividerActive}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="resize sidebar"
+        title="drag to resize · double-click to reset"
+        onpointerdown={onRailResizeDown}
+        ondblclick={resetRailWidth}
+      ></div>
+    {/if}
+
     <main class="stage" bind:this={stageEl}>
       {#if layoutReady}
         {#if zoomedPane !== null}
@@ -1947,6 +2189,34 @@
          says where you are. Hidden whenever the rail is visible. -->
     <footer class="strip">
       <button
+        class="strip-show"
+        title="show sidebar ({KEYS.focusMode})"
+        aria-label="show sidebar"
+        onclick={() => (layout = { ...layout, focusMode: false })}
+      >
+        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+          <rect
+            x="1.75"
+            y="2.75"
+            width="12.5"
+            height="10.5"
+            rx="2"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+          />
+          <line x1="6.5" y1="2.75" x2="6.5" y2="13.25" stroke="currentColor" stroke-width="1.3" />
+          <path
+            d="M9.4 6.2 11.4 8l-2 1.8"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      <button
         class="strip-ws"
         title="show sidebar ({KEYS.focusMode})"
         onclick={() => (layout = { ...layout, focusMode: false })}
@@ -1970,6 +2240,9 @@
               title={dotTitle(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
+            {#if hintsActive() && chordDigits.has(s.id)}
+              <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
+            {/if}
           </button>
         {/each}
       </div>
@@ -2041,7 +2314,10 @@
   }
 
   .rail {
+    /* Width is inline (draggable, persisted); this is only the pre-hydration
+       fallback. min-width guards against a stale/hand-set value wedging it. */
     width: 230px;
+    min-width: 0;
     flex: none;
     display: flex;
     flex-direction: column;
@@ -2053,6 +2329,11 @@
       opacity 0.1s ease;
   }
 
+  /* Mid-drag the width changes every frame; the ease would smear the handle. */
+  .rail.resizing {
+    transition: none;
+  }
+
   /* Focus mode: the rail collapses to nothing; the strip carries context. */
   .rail.collapsed {
     width: 0;
@@ -2060,6 +2341,37 @@
     padding-right: 0;
     opacity: 0;
     visibility: hidden;
+  }
+
+  /* Sidebar width handle: a thin invisible hit-strip sitting on the seam, with
+     a hairline that warms on hover/drag — the vertical sibling of the FILES
+     divider. Negative right margin overlaps the stage so the target straddles
+     the edge without stealing layout width. */
+  .rail-resize {
+    flex: none;
+    width: 7px;
+    margin: 0 -4px 0 0;
+    z-index: 5;
+    position: relative;
+    cursor: col-resize;
+    touch-action: none;
+  }
+
+  .rail-resize::after {
+    content: "";
+    position: absolute;
+    inset: 0 3px;
+    border-radius: 1px;
+    background: transparent;
+    transition: background-color 0.12s ease;
+  }
+
+  .rail-resize:hover::after {
+    background: var(--edge);
+  }
+
+  .rail-resize.active::after {
+    background: color-mix(in srgb, var(--accent) 55%, var(--edge));
   }
 
   .workspace {
@@ -2074,6 +2386,33 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: var(--warn);
+  }
+
+  /* Collapse control: the visible mouse path to focus mode (⌘B), pinned to the
+     header's right edge — quiet muted icon, brightens on hover. */
+  .rail-collapse {
+    flex: none;
+    margin-left: auto;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    padding: 0;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .rail-collapse:hover {
+    background: var(--row-hover);
+    color: var(--fg);
   }
 
   .ws-btn {
@@ -2138,6 +2477,7 @@
   }
 
   .row {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2199,6 +2539,13 @@
 
   .row.active {
     background: var(--row-active);
+  }
+
+  /* A shell-terminal link drag hovers this agent row: the always-present
+     "drop to link" target, lit in the agent's own hue. */
+  .row.link-target {
+    background: hsl(var(--hue) 55% 55% / 0.16);
+    box-shadow: inset 0 0 0 1px hsl(var(--hue) 55% 55% / 0.6);
   }
 
   .labels {
@@ -2265,6 +2612,41 @@
 
   .close:hover {
     color: var(--fg);
+  }
+
+  /* Which-key digit badge: anchored at the row's right so it never nudges the
+     label; yields to the close button on hover. Faded in by chordHints only
+     while the modifier is held — teaching chrome, never interactive. */
+  .kbd-badge {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 3px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1;
+    color: var(--fg);
+    animation: hintfade 0.14s ease-out;
+  }
+
+  .row:hover .kbd-badge {
+    opacity: 0;
+  }
+
+  @keyframes hintfade {
+    from {
+      opacity: 0;
+    }
   }
 
   .row.new {
@@ -2670,6 +3052,33 @@
     color: var(--muted);
   }
 
+  /* Explicit "show sidebar" icon — the discoverable mouse path back, beside
+     the workspace name which does the same. */
+  .strip-show {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 22px;
+    padding: 0;
+    margin-left: -4px;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .strip-show:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
   /* The workspace name doubles as the mouse exit from focus mode. */
   .strip-ws {
     flex: none;
@@ -2710,6 +3119,7 @@
   }
 
   .chip {
+    position: relative;
     flex: none;
     display: flex;
     align-items: center;
@@ -2727,6 +3137,29 @@
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
+  }
+
+  /* Which-key digit on the strip chip — the ⌘1–9 target in focus mode. Corner
+     badge so it overlays rather than widening the chip. */
+  .chip-badge {
+    position: absolute;
+    top: -3px;
+    right: -3px;
+    min-width: 13px;
+    height: 13px;
+    padding: 0 2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 24%, var(--rail-bg));
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+    font-family: var(--mono);
+    font-size: 9px;
+    line-height: 1;
+    color: var(--fg);
+    pointer-events: none;
+    animation: hintfade 0.14s ease-out;
   }
 
   .chip:hover {

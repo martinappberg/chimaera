@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="Chimaera">
+  <title>Chimaera</title>
+  <defs>
+    <linearGradient id="bm" gradientUnits="userSpaceOnUse" x1="54" y1="84" x2="186" y2="156">
+      <stop offset="0" stop-color="#2c2c30"/>
+      <stop offset="0.5" stop-color="#6f6f74"/>
+      <stop offset="1" stop-color="#eaeaed"/>
+    </linearGradient>
+  </defs>
+  <rect width="240" height="240" rx="52" fill="#f5f5f6"/>
+  <g fill="none" stroke="url(#bm)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/>
+    <path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/>
+  </g>
+</svg>

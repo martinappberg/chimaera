@@ -177,6 +177,63 @@ body.dragging {
   -webkit-user-select: none;
 }
 
+/* The "leash": a beaded chain drawn from a pane's link icon to the pointer
+   while dragging that terminal onto an agent. It goes taut (solid + brighter)
+   the moment it snaps to a valid target. Body-level SVG, never a pointer
+   target, and one layer under the label chip. */
+.leash-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.leash-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 0.1 8;
+  opacity: 0.85;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+  transition:
+    stroke-width 0.1s ease,
+    opacity 0.1s ease;
+}
+
+.leash-overlay.snapped .leash-line {
+  stroke-dasharray: none;
+  stroke-width: 3.5;
+  opacity: 1;
+}
+
+.leash-node {
+  fill: var(--accent);
+  transition: opacity 0.1s ease;
+}
+
+.leash-node.start {
+  opacity: 0.9;
+}
+
+.leash-node.end {
+  opacity: 0;
+}
+
+.leash-overlay.snapped .leash-node.end {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .leash-line,
+  .leash-node {
+    transition: none;
+  }
+}
+
 /* xterm chrome: transparent viewport (the slot owns the background) and a
    thin, quiet scrollbar instead of the default heavy one. */
 .xterm .xterm-viewport {

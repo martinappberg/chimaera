@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// Generates icons/icon.png (1024x1024): the chimaera mark — a dark rounded
-// square with the accent-green `>_` prompt, matching the home screen's brand
-// glyph. Pure node (zlib + hand-rolled PNG chunks), no image deps; feed the
-// output to `tauri icon` for the platform sets.
+// Generates icons/icon.png (1024x1024): the chimaera hexagon mark on a light
+// tile, matching the home-screen brand mark (web-ui/src/lib/BrandMark.svelte)
+// and the favicon (web-ui/public/favicon.svg) — a charcoal→silver metallic
+// stroke drawing a hexagon shell around a "C" monogram. Pure node (zlib +
+// hand-rolled PNG chunks), no image deps; feed the output to `tauri icon`
+// for the platform sets.
 
 import { deflateSync } from "node:zlib";
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -10,24 +12,65 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SIZE = 1024;
-const SS = 2; // supersampling factor
+const SS = 3; // supersampling factor (thin metallic strokes want the extra AA)
 
-// Palette (dark theme tokens from web-ui/src/app.css).
-const BG = [0x17, 0x17, 0x1b];
-const EDGE = [0x2b, 0x2b, 0x32];
-const ACCENT = [0x3f, 0xbf, 0x85];
+// Light tile + the metallic gradient stops (charcoal → mid → silver).
+const TILE = [0xf5, 0xf5, 0xf6];
+const DARK = [0x2c, 0x2c, 0x30];
+const MID = [0x6f, 0x6f, 0x74];
+const LIGHT = [0xee, 0xee, 0xf1];
 
 // macOS icon grid: 1024 canvas, ~100px transparent margin, big radius.
 const BODY = { cx: 512, cy: 512, hw: 412, hh: 412, r: 186 };
 
-// The `>` chevron: two capsule strokes meeting at the point.
-const STROKE = 46;
-const CHEV = [
-  { ax: 330, ay: 372, bx: 476, by: 502 },
-  { ax: 476, ay: 522, bx: 330, by: 652 },
+// Mark geometry, mapped from the 240-unit BrandMark grid: icon = 100 + p·3.433.
+const STROKE = 52;
+const HEXV = [
+  [512, 258],
+  [739, 388],
+  [739, 636],
+  [512, 766],
+  [285, 636],
+  [285, 388],
 ];
-// The `_` cursor block.
-const UNDER = { x0: 540, y0: 610, x1: 712, y1: 668, r: 20 };
+
+// The inner "C": a 264° arc (open on the right) sampled into short segments,
+// so the capsule union renders it as one smooth round stroke.
+const C_CX = 512;
+const C_CY = 512;
+const C_R = 161; // 47 · 3.433
+function arcSegments(cx, cy, r, degFrom, degTo, n) {
+  const pt = (deg) => {
+    const a = (deg * Math.PI) / 180;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  };
+  const segs = [];
+  for (let i = 0; i < n; i++) {
+    const [ax, ay] = pt(degFrom + ((degTo - degFrom) * i) / n);
+    const [bx, by] = pt(degFrom + ((degTo - degFrom) * (i + 1)) / n);
+    segs.push({ ax, ay, bx, by });
+  }
+  return segs;
+}
+
+// Every stroke as a segment; round caps/joins fall out of the capsule union.
+const SEGMENTS = [
+  ...HEXV.map((a, i) => ({ ax: a[0], ay: a[1], bx: HEXV[(i + 1) % 6][0], by: HEXV[(i + 1) % 6][1] })),
+  ...arcSegments(C_CX, C_CY, C_R, 48, 312, 40),
+];
+// The gradient runs left→right across the hexagon's horizontal span.
+const GRAD_X0 = 285;
+const GRAD_X1 = 739;
+
+function lerp(a, b, t) {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+/** Metallic colour at horizontal position x (charcoal → mid → silver). */
+function gradAt(x) {
+  const t = Math.max(0, Math.min(1, (x - GRAD_X0) / (GRAD_X1 - GRAD_X0)));
+  return t < 0.5 ? lerp(DARK, MID, t * 2) : lerp(MID, LIGHT, (t - 0.5) * 2);
+}
 
 function sdRoundedRect(px, py, { cx, cy, hw, hh, r }) {
   const qx = Math.abs(px - cx) - (hw - r);
@@ -61,23 +104,13 @@ function sample(x, y) {
   };
 
   const body = sdRoundedRect(x, y, BODY);
-  put(BG, cov(body));
-  // Hairline inner edge, one token lighter, for definition on dark docks.
-  put(EDGE, cov(Math.abs(body + 3) - 3) * 0.55);
+  put(TILE, cov(body));
 
-  const chev = Math.min(
-    sdSegment(x, y, CHEV[0]) - STROKE / 2,
-    sdSegment(x, y, CHEV[1]) - STROKE / 2,
-  );
-  const under = sdRoundedRect(x, y, {
-    cx: (UNDER.x0 + UNDER.x1) / 2,
-    cy: (UNDER.y0 + UNDER.y1) / 2,
-    hw: (UNDER.x1 - UNDER.x0) / 2,
-    hh: (UNDER.y1 - UNDER.y0) / 2,
-    r: UNDER.r,
-  });
-  // Clip the glyph to the body so anti-aliased edges never bleed outside.
-  put(ACCENT, Math.min(cov(Math.min(chev, under)), cov(body)));
+  // Union of every stroke (capsule = segment distance − half width).
+  let mark = Infinity;
+  for (const s of SEGMENTS) mark = Math.min(mark, sdSegment(x, y, s) - STROKE / 2);
+  // Clip the mark to the tile so anti-aliased edges never bleed outside.
+  put(gradAt(x), Math.min(cov(mark), cov(body)));
   return [r, g, b, a];
 }
 

@@ -133,7 +133,7 @@ jobs:
         with:
           projectPath: crates/chimaera-app
           tagName: v${{ needs.version.outputs.version }}
-          releaseName: "Chimaera v${{ needs.version.outputs.version }}"
+          releaseName: "chimaera v${{ needs.version.outputs.version }}"
           releaseDraft: false
           includeUpdaterJson: true
 
