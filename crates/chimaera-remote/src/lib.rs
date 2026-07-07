@@ -2,7 +2,13 @@
 //! install, daemon start, and port-forward tunnels. Shared by the CLI
 //! (`chimaera connect`) and the native shell, so both speak the exact same
 //! protocol to a host — including inheriting the user's `~/.ssh/config`
-//! (ProxyJump, ControlMaster, 2FA) by never reimplementing the ssh client.
+//! (ProxyJump, 2FA) by never reimplementing the ssh client.
+//!
+//! Every ssh/scp invocation here rides one chimaera-owned ControlMaster (see
+//! [`ssh_cmd`]): the user authenticates once — password or 2FA — and every
+//! subsequent command, tunnel, and new window multiplexes that single
+//! connection with no further prompts, kept warm by `ControlPersist` so
+//! opening new things on the host stays instant.
 
 pub mod hosts;
 
@@ -13,6 +19,63 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use chimaera_core::Manifest;
 use tokio::process::{Child, Command};
+
+/// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
+/// is ssh's own hash of (localhost, remotehost, port, user): unique per
+/// destination and short enough to stay under the ~104-char unix-socket path
+/// limit a full hostname would blow past. The parent dir is created on demand
+/// (ssh will not create it for the socket).
+fn control_path() -> String {
+    let dir = chimaera_core::data_dir().join("cm");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
+    }
+    dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// The `-o` options that multiplex every chimaera ssh/scp call to a host over
+/// a single authenticated ControlMaster. `ControlMaster=auto` makes the first
+/// connection the master and later ones reuse it; `ControlPersist` keeps the
+/// master alive after clients disconnect so reconnects and new windows skip
+/// re-authentication.
+fn control_opts() -> [String; 6] {
+    [
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={}", control_path()),
+        "-o".into(),
+        "ControlPersist=10m".into(),
+    ]
+}
+
+/// An `ssh` command pre-loaded with the shared ControlMaster options, no host
+/// yet. For flag-heavy invocations where the destination must come last
+/// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
+fn ssh_base() -> Command {
+    let mut c = Command::new("ssh");
+    c.args(control_opts());
+    c
+}
+
+/// An `ssh` command pre-loaded with the shared ControlMaster options and
+/// pointed at `host`, ready for the remote command to be appended. The common
+/// shape (`ssh <opts> host <cmd>`); every plain remote command goes through
+/// here so they all share one authenticated connection.
+fn ssh_cmd(host: &str) -> Command {
+    let mut c = ssh_base();
+    c.arg(host);
+    c
+}
+
+/// An `scp` command pre-loaded with the shared ControlMaster options, so a
+/// binary copy reuses the connection the probe already authenticated instead
+/// of prompting again.
+fn scp_cmd() -> Command {
+    let mut c = Command::new("scp");
+    c.args(control_opts());
+    c
+}
 
 /// Where the connect flow currently is; consumers surface these however
 /// fits (tracing lines in the CLI, progress events in the shell).
@@ -125,10 +188,12 @@ impl Tunnel {
     }
 
     /// Kill the tunnel child and cancel any master-held forward so local
-    /// ports don't leak past the session that opened them.
+    /// ports don't leak past the session that opened them. Only the forward
+    /// is cancelled — the ControlMaster stays (ControlPersist), so reconnects
+    /// and other windows on this host keep their authenticated connection.
     pub async fn close(mut self) {
         self.child.kill().await.ok();
-        let _ = Command::new("ssh")
+        let _ = ssh_base()
             .args(["-O", "cancel", "-L"])
             .arg(format!(
                 "{}:127.0.0.1:{}",
@@ -232,8 +297,7 @@ pub async fn connect(
 
 /// Fetch and parse the remote manifest, if any.
 pub async fn remote_manifest(host: &str) -> anyhow::Result<Option<Manifest>> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg("cat ~/.chimaera/manifest.json 2>/dev/null")
         .output()
         .await
@@ -267,8 +331,7 @@ pub async fn remote_sessions_count(
         "curl -fsS -m 5 --config - http://127.0.0.1:{}/api/v1/sessions",
         manifest.port
     );
-    let mut child = Command::new("ssh")
-        .arg(host)
+    let mut child = ssh_cmd(host)
         .arg(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -337,8 +400,7 @@ pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
 
 /// `uname -sm` on the host, lowercased: e.g. `("linux", "x86_64")`.
 pub async fn remote_target(host: &str) -> anyhow::Result<(String, String)> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg("uname -sm")
         .output()
         .await
@@ -600,7 +662,7 @@ async fn ensure_remote_binary(
     // Stage + rename, never truncate the live path in place: an interrupted
     // copy must not leave a half-written-but-executable binary behind, and
     // rename keeps the old inode intact for anything still running it.
-    let output = Command::new("scp")
+    let output = scp_cmd()
         .arg(&path)
         .arg(format!("{host}:.chimaera/bin/chimaera.new"))
         .output()
@@ -661,7 +723,7 @@ fn pick_local_port(requested: Option<u16>, remote_port: u16) -> anyhow::Result<u
 }
 
 fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
-    Command::new("ssh")
+    ssh_base()
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote}"))
@@ -703,8 +765,7 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
 
 /// Run a remote command, treating its exit status as a boolean.
 async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg(cmd)
         .output()
         .await
@@ -714,8 +775,7 @@ async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
 
 /// Run a remote command, failing loudly if it does not exit 0.
 async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
-    let output = Command::new("ssh")
-        .arg(host)
+    let output = ssh_cmd(host)
         .arg(cmd)
         .output()
         .await
@@ -732,6 +792,20 @@ async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ssh/scp call must carry the ControlMaster trio so one auth
+    /// covers the whole session; the socket path uses ssh's short `%C` token.
+    #[test]
+    fn control_opts_multiplex_over_one_master() {
+        let opts = control_opts();
+        assert_eq!(opts[0], "-o");
+        assert_eq!(opts[1], "ControlMaster=auto");
+        assert_eq!(opts[2], "-o");
+        assert!(opts[3].starts_with("ControlPath="), "{}", opts[3]);
+        assert!(opts[3].ends_with("/cm/%C"), "{}", opts[3]);
+        assert_eq!(opts[4], "-o");
+        assert_eq!(opts[5], "ControlPersist=10m");
+    }
 
     #[test]
     fn dist_names_map_targets() {
