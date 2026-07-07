@@ -109,14 +109,29 @@ export class SessionSocket {
       return;
     }
     switch (msg.type) {
-      case "ready":
+      case "ready": {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.clearReconnecting();
         // On a reconnect the server re-sends a full snapshot; wipe the stale
         // screen so the snapshot reconstructs state exactly.
         if (this.everReady) this.handlers.onReset();
         this.everReady = true;
+        // Reconcile grids: resizes are silently dropped while the socket is
+        // down or mid-handshake (the first fit often lands during CONNECTING),
+        // and ResizeObserver never re-fires for an unchanged container. The
+        // ready frame carries the server's dims — correct any drift exactly
+        // once, here.
+        const d = this.handlers.dims?.() ?? null;
+        if (
+          d !== null &&
+          typeof msg.cols === "number" &&
+          typeof msg.rows === "number" &&
+          (msg.cols !== d.cols || msg.rows !== d.rows)
+        ) {
+          this.sendResize(d.cols, d.rows);
+        }
         break;
+      }
       case "resync":
         this.handlers.onReset(msg.cols, msg.rows);
         break;
