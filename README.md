@@ -1,11 +1,37 @@
-# Chimaera
+<p align="center">
+  <img src="docs/logo.svg" alt="Chimaera" width="112" height="112">
+</p>
 
-**An agent workbench, not an IDE.** Chimaera runs your agent sessions as persistent,
-daemon-owned processes on whatever host owns the work — your laptop, a remote server, or an
-HPC login node — and gives you a workspace-first UI around them: the file previews, terminals,
-and git state that show what those agents actually produced. One static Rust binary is the
-whole server; the client is a web UI it serves itself, plus a native app that wraps the same
-UI in real windows.
+<h1 align="center">Chimaera</h1>
+
+<p align="center"><strong>An agent workbench, not an IDE.</strong></p>
+
+<p align="center">
+  Persistent, daemon-owned agent sessions on whatever host owns the work —<br>
+  your laptop, a remote server, or an HPC login node — with a workspace-first UI around them.
+</p>
+
+<p align="center">
+  <a href="https://martinappberg.github.io/chimaera/"><strong>Website</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://martinappberg.github.io/chimaera/docs.html">Docs</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/martinappberg/chimaera/releases/latest">Download</a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
+  <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey.svg">
+  <img alt="Status: pre-release" src="https://img.shields.io/badge/status-pre--release-orange.svg">
+</p>
+
+---
+
+Chimaera runs your agent sessions as persistent, daemon-owned processes on whatever host owns
+the work and gives you a workspace-first UI around them: the file previews, terminals, and git
+state that show what those agents actually produced. One static Rust binary is the whole
+server; the client is a web UI it serves itself, plus a native app that wraps the same UI in
+real windows.
 
 Agents run as the real interactive TUIs (`claude` and friends) in daemon-owned PTYs, so they
 look, behave, and bill exactly like they do in any terminal. The daemon owns the sessions;
@@ -95,6 +121,26 @@ Two things update themselves, so a running setup keeps pace with releases:
 
 Early and pre-release, moving fast. Interfaces, storage formats, and the wire protocol all
 change without notice. See [DESIGN.md](DESIGN.md) for the full design and roadmap.
+
+## Development
+
+The workspace is a Rust daemon (`crates/`) plus a Svelte web UI (`web-ui/`) it embeds, and a
+standalone Tauri app (`crates/chimaera-app`). Start here:
+
+- **[CLAUDE.md](CLAUDE.md)** — the fast orientation map: repo layout, the dev loop, working
+  rules, and how releases work. Read it first, whether you're a person or an agent.
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — dev setup, code style, verification culture, the CLA.
+- **[DESIGN.md](DESIGN.md)** — the full architecture and rationale (the source of truth).
+
+```sh
+just check      # fmt + clippy + test — the same gate CI runs
+just serve      # build the UI and run the daemon locally
+just dev-ui     # Vite dev server against a running daemon (develop on :5173)
+```
+
+Every merge to `main` cuts a published release; the version is bumped from the squash-merge
+commit message (Conventional Commits). Put **`[skip release]`** in a PR title to land docs or
+chores without shipping a version.
 
 ## License
 

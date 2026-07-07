@@ -9,6 +9,12 @@ repository = "https://github.com/martinappberg/chimaera"
 # enter the daemon workspace (musl CI, HPC login-node builds stay lean).
 [workspace]
 
+# The shipped binary is just "chimaera" (matches productName) so the dock,
+# menu bar, and `ps` read the brand — not "chimaera-app".
+[[bin]]
+name = "chimaera"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

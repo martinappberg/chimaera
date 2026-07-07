@@ -1,0 +1,45 @@
+name: pages
+
+# Publishes the marketing + docs site in `site/` to GitHub Pages. Static
+# files only (no build step) — the site is hand-written HTML/CSS/JS with the
+# fonts vendored in, so this just uploads the directory as a Pages artifact.
+#
+# ONE-TIME SETUP: repo Settings → Pages → Build and deployment → Source:
+# "GitHub Actions". After that every push to main that touches `site/`
+# (re)deploys to https://martinappberg.github.io/chimaera/.
+#
+# `[skip release]` note doesn't apply here — this workflow never cuts a
+# release; it's independent of release.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel an in-flight deploy; let the newest queue behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
