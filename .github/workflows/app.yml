@@ -41,5 +41,5 @@ jobs:
       # them on the build step (tauri picks them up).
       - uses: actions/upload-artifact@v4
         with:
-          name: Chimaera-macos-arm64.dmg
+          name: chimaera-macos-arm64.dmg
           path: crates/chimaera-app/target/release/bundle/dmg/*.dmg
