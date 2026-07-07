@@ -8,10 +8,12 @@
 //! returns a snapshot escape stream that reconstructs the terminal in a fresh
 //! xterm.js instance, plus live output/event receivers and an input sender.
 
+pub mod exec;
 pub mod marks;
 mod session;
 mod snapshot;
 
+pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
 pub use marks::{CommandSource, CommandView, Marks, ShellPhase};
 
 #[cfg(test)]
@@ -178,6 +180,24 @@ impl SessionManager {
     /// Shell-integration marks (phase + command journal) for a session.
     pub fn marks(&self, id: &str) -> Option<Arc<Marks>> {
         self.session(id).map(|s| s.marks())
+    }
+
+    /// Type a command into a session's shell and wait for its outcome (see
+    /// [`exec`] for the mode/queue semantics). Execs are serialized per
+    /// session; a busy integrated shell queues up to `opts.queue_timeout`.
+    pub async fn exec(
+        &self,
+        id: &str,
+        opts: ExecOptions,
+    ) -> Result<ExecOutcome, ExecError> {
+        let session = self.session(id).ok_or(ExecError::SessionGone)?;
+        exec::exec(
+            session.marks(),
+            session.input(),
+            session.exec_lock(),
+            opts,
+        )
+        .await
     }
 
     /// Input sender for a session (exec engine path; no snapshot render).

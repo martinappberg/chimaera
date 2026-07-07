@@ -80,6 +80,11 @@ pub(crate) fn shell_display_name(info: &chimaera_pty::SessionInfo, polled: Optio
 }
 
 /// One poll: resolve what the shell is doing right now, per naming rule zero.
+/// Executable name of a pid (exec-policy checks reuse the naming lookup).
+pub(crate) fn comm_name(pid: i32) -> Option<String> {
+    proc_info::comm(pid)
+}
+
 fn resolve_shell_name(state: &AppState, info: &chimaera_pty::SessionInfo) -> Option<String> {
     let child = i32::try_from(info.pid?).ok()?;
     let fg = state.sessions.foreground_pid(&info.id).unwrap_or(child);

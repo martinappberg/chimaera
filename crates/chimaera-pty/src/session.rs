@@ -104,6 +104,8 @@ pub(crate) struct Session {
     events_tx: broadcast::Sender<SessionEvent>,
     /// Shell-integration marks: OSC 133 phase + command journal.
     marks: Arc<Marks>,
+    /// Serializes agent execs against this session's shell.
+    exec_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Session {
@@ -314,6 +316,7 @@ impl Session {
             output_tx,
             events_tx,
             marks,
+            exec_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 
@@ -346,6 +349,11 @@ impl Session {
     /// Queue bytes to the PTY without an attachment (exec engine path).
     pub(crate) fn input(&self) -> mpsc::Sender<Bytes> {
         self.input_tx.clone()
+    }
+
+    /// Per-session exec serialization lock.
+    pub(crate) fn exec_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.exec_lock)
     }
 
     /// Foreground process group on the tty (`tcgetpgrp` on the master fd).

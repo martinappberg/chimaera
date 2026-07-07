@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -96,11 +96,16 @@ pub(crate) fn session_json(
     workspace_id: Option<String>,
     agent: Option<&crate::agents::AgentRecord>,
     polled: Option<&str>,
+    exec_stage: Option<chimaera_pty::ExecStage>,
 ) -> serde_json::Value {
     let mut map = match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     };
+    map.insert(
+        "exec_stage".to_string(),
+        exec_stage.map_or(serde_json::Value::Null, |s| json!(s)),
+    );
     map.insert(
         "workspace_id".to_string(),
         workspace_id.map_or(serde_json::Value::Null, serde_json::Value::String),
@@ -142,6 +147,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
     let names = crate::lock(&state.display_names);
+    let execs = crate::lock(&state.exec_status);
     sessions
         .iter()
         .map(|info| {
@@ -150,6 +156,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 workspaces.get(&info.id).cloned(),
                 agents.get(&info.id),
                 names.get(&info.id).map(String::as_str),
+                execs.get(&info.id).copied(),
             )
         })
         .collect()
@@ -283,6 +290,7 @@ pub(crate) async fn create_session(
                 Some(workspace.id),
                 agent.as_ref(),
                 polled.as_deref(),
+                None,
             ))
             .into_response()
         }
@@ -316,4 +324,146 @@ pub(crate) async fn delete_session(
         )
             .into_response(),
     }
+}
+
+/// Foreground commands that forward keystrokes to a shell somewhere else
+/// (remote or containerized), making sentinel-typing over a `running` phase
+/// safe. Anything else running in the foreground (sleep, vim, tail) refuses.
+const SENTINEL_FOREGROUNDS: &[&str] = &[
+    "ssh",
+    "mosh",
+    "mosh-client",
+    "et",
+    "docker",
+    "podman",
+    "kubectl",
+    "oc",
+    "singularity",
+    "apptainer",
+];
+
+#[derive(Deserialize)]
+pub(crate) struct ExecBody {
+    command: String,
+    /// Max runtime once typed (default 30s, capped at 1h).
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// Max wait for the shell's prompt before typing (default 15s, capped at
+    /// 10m). `0` means "only if free right now".
+    #[serde(default)]
+    queue_timeout_ms: Option<u64>,
+}
+
+/// POST /api/v1/sessions/{id}/exec — type a command into a live shell
+/// session and wait for its outcome (the `run_in_terminal` mechanics).
+pub(crate) async fn exec_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ExecBody>,
+) -> Response {
+    // Agent sessions host a TUI, not a shell; typing commands into claude
+    // would be chaos. Links (and this endpoint) are for terminals only.
+    if crate::lock(&state.agents).contains_key(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "cannot exec into an agent session"})),
+        )
+            .into_response();
+    }
+    if state.sessions.get(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown session {id}")})),
+        )
+            .into_response();
+    }
+
+    // Sentinel-typing over a running command is only safe when the
+    // foreground forwards keystrokes to a remote shell (the ssh case).
+    let allow_sentinel_over_running = state
+        .sessions
+        .foreground_pid(&id)
+        .and_then(crate::naming::comm_name)
+        .is_some_and(|comm| SENTINEL_FOREGROUNDS.contains(&comm.as_str()));
+
+    // Mirror the exec stage (queued -> executing) into session snapshots so
+    // the UI's linked-terminal chips show what is happening live.
+    let (stage_tx, mut stage_rx) = tokio::sync::watch::channel(chimaera_pty::ExecStage::Queued);
+    let mirror = {
+        let state = state.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            loop {
+                let stage = *stage_rx.borrow_and_update();
+                crate::lock(&state.exec_status).insert(id.clone(), stage);
+                state.changes.notify_waiters();
+                if stage_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+
+    let outcome = state
+        .sessions
+        .exec(
+            &id,
+            chimaera_pty::ExecOptions {
+                command: body.command,
+                queue_timeout: std::time::Duration::from_millis(
+                    body.queue_timeout_ms.unwrap_or(15_000).min(600_000),
+                ),
+                timeout: std::time::Duration::from_millis(
+                    body.timeout_ms.unwrap_or(30_000).min(3_600_000),
+                ),
+                allow_sentinel_over_running,
+                stage: Some(stage_tx),
+            },
+        )
+        .await;
+
+    mirror.abort();
+    crate::lock(&state.exec_status).remove(&id);
+    state.changes.notify_waiters();
+
+    match outcome {
+        Ok(outcome) => Json(json!(outcome)).into_response(),
+        Err(err) => {
+            let code = match &err {
+                chimaera_pty::ExecError::Busy(_) => StatusCode::CONFLICT,
+                chimaera_pty::ExecError::InvalidCommand(_) => StatusCode::BAD_REQUEST,
+                chimaera_pty::ExecError::SessionGone => StatusCode::NOT_FOUND,
+                chimaera_pty::ExecError::NeverStarted(_) => StatusCode::GATEWAY_TIMEOUT,
+            };
+            (code, Json(json!({"error": err.to_string()}))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JournalQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// GET /api/v1/sessions/{id}/journal — the session's command journal (what
+/// `read_terminal` returns): recent commands with output, exit codes, cwd.
+pub(crate) async fn session_journal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<JournalQuery>,
+) -> Response {
+    let Some(marks) = state.sessions.marks(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown session {id}")})),
+        )
+            .into_response();
+    };
+    let limit = query.limit.unwrap_or(20).min(200);
+    Json(json!({
+        "phase": marks.phase(),
+        "entries": marks.journal(limit),
+    }))
+    .into_response()
 }
