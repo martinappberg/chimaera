@@ -162,6 +162,36 @@ export async function fsQuickOpen(
   return body.entries;
 }
 
+/** One confirmed path from POST /fs/validate. */
+export interface ValidatedPath {
+  /** Canonical absolute path on the daemon. */
+  path: string;
+  kind: "file" | "dir";
+}
+
+/** Server cap on candidates per /fs/validate request. */
+export const VALIDATE_MAX = 50;
+
+/**
+ * Batch existence check behind the terminal link provider, per the
+ * /fs/validate contract: candidates resolve absolutely or against the
+ * absolute `base`, `~` expands, and only hits come back (keyed by the
+ * candidate as sent). Misses are simply absent — never errors.
+ */
+export async function fsValidate(
+  candidates: string[],
+  base: string,
+): Promise<Record<string, ValidatedPath>> {
+  const body = await json<{ valid: Record<string, ValidatedPath> }>(
+    await api("/fs/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidates: candidates.slice(0, VALIDATE_MAX), base }),
+    }),
+  );
+  return body.valid;
+}
+
 export async function fsMarkdown(path: string): Promise<string> {
   const q = new URLSearchParams({ path });
   const body = await json<{ html: string }>(await api(`/fs/markdown?${q.toString()}`));
@@ -215,6 +245,17 @@ export function basename(path: string): string {
   const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
   const i = trimmed.lastIndexOf("/");
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
+}
+
+/**
+ * Middle-ellipsis truncation (polish inventory: paths truncate in the
+ * middle — the basename is the informative end).
+ */
+export function midTruncate(s: string, max: number): string {
+  if (s.length <= max || max < 5) return s;
+  const tail = Math.floor((max - 1) / 2);
+  const head = max - 1 - tail;
+  return `${s.slice(0, head)}…${s.slice(s.length - tail)}`;
 }
 
 /** Name of the containing directory ("/" for root-level paths). */

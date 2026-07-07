@@ -39,6 +39,17 @@ export interface LayoutCtrl {
   zoomPane(paneId: string): void;
   /** Close the pane's active view; an empty pane collapses. */
   closeView(paneId: string): void;
+  /**
+   * Open a file surfaced FROM `paneId` (terminal path link, touched-files
+   * popover): lands in the adjacent pane, or a fresh split when the window
+   * has one pane / `newSplit` (Cmd/Ctrl) is set.
+   */
+  openFileFrom(paneId: string, path: string, newSplit: boolean): void;
+  /**
+   * Step the pane's terminal font size (`delta` +1/-1), or reset to the
+   * default (`delta` 0). Same action as the Cmd/Ctrl +/−/0 chords.
+   */
+  adjustFont(paneId: string, delta: 1 | -1 | 0): void;
 }
 
 interface PaneReg {

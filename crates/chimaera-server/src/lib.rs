@@ -127,6 +127,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
         .route("/fs/quickopen", get(quickopen::quickopen))
+        .route("/fs/validate", post(fs::validate))
         .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
@@ -739,6 +740,7 @@ mod tests {
         assert_eq!(session["kind"], "shell");
         assert_eq!(session["agent_state"], serde_json::Value::Null);
         assert_eq!(session["agent_title"], serde_json::Value::Null);
+        assert_eq!(session["files_touched"], serde_json::Value::Null);
 
         // Explicit kind "shell" round-trips through GET.
         let (status, session) = request(
@@ -753,6 +755,7 @@ mod tests {
         assert_eq!(entry["kind"], "shell");
         assert_eq!(entry["agent_state"], serde_json::Value::Null);
         assert_eq!(entry["agent_title"], serde_json::Value::Null);
+        assert_eq!(entry["files_touched"], serde_json::Value::Null);
 
         // An unknown kind is a 400 (serde rejects it).
         let (status, _) = request(
@@ -1235,6 +1238,162 @@ mod tests {
         state.sessions.kill(&id).ok();
     }
 
+    /// Synthetic PostToolUse payload for a file-writing tool, shaped like
+    /// the real hook payloads (top-level tool_name + tool_input).
+    fn touch_payload(tool: &str, field: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "tool_input": { field: path },
+        })
+    }
+
+    #[tokio::test]
+    async fn agent_files_touched_builds_from_post_tool_use_hooks() {
+        let state = test_state();
+        let id = inject_agent(&state, "k");
+
+        // A fresh agent has an empty list (never null — the UI renders a
+        // quiet zero-files chip row, not a missing field).
+        assert_eq!(
+            session_entry(&state, &id).await["files_touched"],
+            serde_json::json!([])
+        );
+
+        // Every file-writing tool contributes; non-writing tools do not.
+        for (tool, field, path) in [
+            ("Write", "file_path", "/w/a.rs"),
+            ("Edit", "file_path", "/w/b.rs"),
+            ("MultiEdit", "file_path", "/w/c.rs"),
+            ("NotebookEdit", "notebook_path", "/w/d.ipynb"),
+            ("Bash", "command", "cargo test"),
+            ("Read", "file_path", "/w/read-only.rs"),
+        ] {
+            assert_eq!(
+                post_hook(&state, &id, "k", touch_payload(tool, field, path)).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            session_entry(&state, &id).await["files_touched"],
+            serde_json::json!(["/w/a.rs", "/w/b.rs", "/w/c.rs", "/w/d.ipynb"])
+        );
+
+        // Re-touching an older path moves it to the end: dedupe, newest last.
+        post_hook(
+            &state,
+            &id,
+            "k",
+            touch_payload("Edit", "file_path", "/w/a.rs"),
+        )
+        .await;
+        assert_eq!(
+            session_entry(&state, &id).await["files_touched"],
+            serde_json::json!(["/w/b.rs", "/w/c.rs", "/w/d.ipynb", "/w/a.rs"])
+        );
+
+        // State changes clear nothing; the list lives as long as the session.
+        post_hook(
+            &state,
+            &id,
+            "k",
+            serde_json::json!({"hook_event_name": "Stop"}),
+        )
+        .await;
+        let entry = session_entry(&state, &id).await;
+        assert_eq!(entry["agent_state"], "finished");
+        assert_eq!(
+            entry["files_touched"],
+            serde_json::json!(["/w/b.rs", "/w/c.rs", "/w/d.ipynb", "/w/a.rs"])
+        );
+
+        // The cap keeps the newest 100, oldest dropped first.
+        for i in 0..105 {
+            post_hook(
+                &state,
+                &id,
+                "k",
+                touch_payload("Write", "file_path", &format!("/w/f{i}.rs")),
+            )
+            .await;
+        }
+        let entry = session_entry(&state, &id).await;
+        let touched = entry["files_touched"].as_array().unwrap();
+        assert_eq!(touched.len(), 100);
+        // 4 pre-existing + 105 new = 109; the 9 oldest fell off.
+        assert_eq!(touched.first().unwrap(), "/w/f5.rs");
+        assert_eq!(touched.last().unwrap(), "/w/f104.rs");
+
+        state.sessions.kill(&id).ok();
+    }
+
+    #[tokio::test]
+    async fn ws_events_pushes_files_touched_changes() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let state = test_state();
+        let id = inject_agent(&state, "k");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let url = format!("ws://{addr}/ws/events");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        socket
+            .send(WsMessage::text(
+                serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Initial snapshot: the agent session with an empty touched list.
+        let snapshot = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            other => panic!("expected sessions text frame, got {other:?}"),
+        };
+        let entry = snapshot["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .expect("agent session in snapshot");
+        assert_eq!(entry["files_touched"], serde_json::json!([]));
+
+        // A file touch nudges the bus: a fresh snapshot carries the path.
+        let status = post_hook(
+            &state,
+            &id,
+            "k",
+            touch_payload("Write", "file_path", "/w/touched.rs"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no snapshot with the touched file"
+            );
+            let frame = match next_ws_frame(&mut socket).await {
+                WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                _ => continue,
+            };
+            let done = frame["sessions"].as_array().unwrap().iter().any(|s| {
+                s["id"] == id && s["files_touched"] == serde_json::json!(["/w/touched.rs"])
+            });
+            if done {
+                break;
+            }
+        }
+
+        state.sessions.kill(&id).ok();
+    }
+
     #[tokio::test]
     async fn ws_events_auth_snapshot_and_change_push() {
         use futures::SinkExt;
@@ -1591,19 +1750,28 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
-        // The ticket mint is a POST and equally protected.
-        let res = app(test_state())
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/v1/fs/ticket")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"path":"/etc/hosts"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // The ticket mint and the link-provider validation are POSTs and
+        // equally protected.
+        for (uri, body) in [
+            ("/api/v1/fs/ticket", r#"{"path":"/etc/hosts"}"#),
+            (
+                "/api/v1/fs/validate",
+                r#"{"candidates":["hosts"],"base":"/etc"}"#,
+            ),
+        ] {
+            let res = app(test_state())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
         // So is the file write.
         let res = app(test_state())
             .oneshot(
@@ -1616,6 +1784,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn fs_validate_resolves_relative_absolute_missing_and_dirs() {
+        let state = test_state();
+        let base = test_dir("validate-base");
+        std::fs::create_dir(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub").join("real.txt"), "x").unwrap();
+        std::fs::write(base.join("top.rs"), "x").unwrap();
+        // The base may itself be uncanonical (macOS /var -> /private/var);
+        // resolved paths in the answer are always canonical.
+        let canon = std::fs::canonicalize(&base).unwrap();
+        let abs = canon.join("top.rs").to_string_lossy().into_owned();
+
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/validate",
+            Some(serde_json::json!({
+                "candidates": [
+                    "sub/real.txt",     // relative file
+                    "sub",              // relative dir
+                    abs,                // absolute file
+                    "missing.txt",      // nonexistent -> absent
+                    "./sub/../top.rs",  // dot segments resolve away
+                    "",                 // empty -> absent
+                ],
+                "base": base.to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let valid = body["valid"].as_object().unwrap();
+        assert_eq!(valid.len(), 4, "{body}");
+        assert_eq!(
+            valid["sub/real.txt"]["path"],
+            serde_json::json!(canon.join("sub").join("real.txt").to_string_lossy())
+        );
+        assert_eq!(valid["sub/real.txt"]["kind"], "file");
+        assert_eq!(
+            valid["sub"]["path"],
+            serde_json::json!(canon.join("sub").to_string_lossy())
+        );
+        assert_eq!(valid["sub"]["kind"], "dir");
+        assert_eq!(valid[&abs]["path"], serde_json::json!(abs));
+        assert_eq!(valid[&abs]["kind"], "file");
+        assert_eq!(valid["./sub/../top.rs"]["path"], serde_json::json!(abs));
+        assert!(!valid.contains_key("missing.txt"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn fs_validate_caps_candidates_and_rejects_relative_base() {
+        let state = test_state();
+        let base = test_dir("validate-cap");
+        std::fs::write(base.join("real.txt"), "x").unwrap();
+
+        // Candidates past the 50 cap are ignored, even valid ones.
+        let mut candidates: Vec<String> = (0..50).map(|i| format!("nope-{i}")).collect();
+        candidates.push("real.txt".to_string());
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/validate",
+            Some(serde_json::json!({
+                "candidates": candidates,
+                "base": base.to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["valid"].as_object().unwrap().is_empty(), "{body}");
+
+        // A non-absolute base is a 400 (candidates would resolve nowhere).
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/validate",
+            Some(serde_json::json!({
+                "candidates": ["real.txt"],
+                "base": "relative/base",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].is_string(), "{body}");
     }
 
     /// Like `request`, but returns the raw response: status, headers, bytes.

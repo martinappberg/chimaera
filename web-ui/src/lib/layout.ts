@@ -39,7 +39,17 @@ export interface PaneNode {
   tabs: Tab[];
   /** Index into `tabs`; meaningless (0) when `tabs` is empty. */
   active: number;
+  /**
+   * Per-pane terminal font size override (px); undefined = the default.
+   * Applies to whichever terminal tab the pane shows; persisted with the
+   * layout so a reload keeps every pane's text size.
+   */
+  fontSize?: number;
 }
+
+/** Clamp bounds for the per-pane terminal font size (px). */
+export const FONT_MIN = 9;
+export const FONT_MAX = 28;
 
 export interface SplitNode {
   type: "split";
@@ -312,6 +322,36 @@ export function cycleTab(l: Layout, delta: number): Layout {
   return normalize({ ...l, root });
 }
 
+/** Set (or clear, with undefined) a pane's terminal font-size override. */
+export function setPaneFont(l: Layout, paneId: string, size: number | undefined): Layout {
+  const p = findPane(l.root, paneId);
+  if (p === null || p.fontSize === size) return l;
+  const clamped =
+    size === undefined ? undefined : Math.min(Math.max(Math.round(size * 2) / 2, FONT_MIN), FONT_MAX);
+  const root = withPane(l.root, paneId, (x) => {
+    const next = { ...x };
+    if (clamped === undefined) delete next.fontSize;
+    else next.fontSize = clamped;
+    return next;
+  });
+  return root === l.root ? l : { ...l, root };
+}
+
+/**
+ * The pane a surface opened from `paneId` should land in: the geometrically
+ * nearest neighbor (right, else left, below, above). Null when `paneId` is
+ * the only pane — the caller splits instead.
+ */
+export function adjacentPane(l: Layout, paneId: string): string | null {
+  if (findPane(l.root, paneId) === null) return null;
+  const probe: Layout = { ...l, focusedPaneId: paneId, zoomedPaneId: null };
+  for (const dir of ["right", "left", "down", "up"] as const) {
+    const moved = moveFocus(probe, dir);
+    if (moved.focusedPaneId !== paneId) return moved.focusedPaneId;
+  }
+  return null;
+}
+
 export function toggleZoom(l: Layout): Layout {
   if (l.zoomedPaneId !== null) return { ...l, zoomedPaneId: null };
   return normalize({ ...l, zoomedPaneId: l.focusedPaneId });
@@ -524,6 +564,8 @@ interface SPane {
   id: string;
   tabs: STab[];
   active: number;
+  /** Per-pane terminal font size (px), when overridden. */
+  fs?: number;
 }
 interface SSplit {
   t: "s";
@@ -537,7 +579,7 @@ type SNode = SPane | SSplit;
 
 function serNode(node: LayoutNode): SNode {
   if (node.type === "pane") {
-    return {
+    const pane: SPane = {
       t: "p",
       id: node.id,
       tabs: node.tabs.map((t): STab =>
@@ -545,6 +587,8 @@ function serNode(node: LayoutNode): SNode {
       ),
       active: node.active,
     };
+    if (node.fontSize !== undefined) pane.fs = node.fontSize;
+    return pane;
   }
   return { t: "s", id: node.id, dir: node.dir, ratio: node.ratio, a: serNode(node.a), b: serNode(node.b) };
 }
@@ -594,7 +638,11 @@ function deserNode(
       tabs.push(tab);
     }
     const active = Number.isInteger(raw.active) ? raw.active : 0;
-    return { type: "pane", id: raw.id, tabs, active };
+    const pane: PaneNode = { type: "pane", id: raw.id, tabs, active };
+    if (typeof raw.fs === "number" && raw.fs >= FONT_MIN && raw.fs <= FONT_MAX) {
+      pane.fontSize = raw.fs;
+    }
+    return pane;
   }
   if (raw.t === "s") {
     if (raw.dir !== "row" && raw.dir !== "col") return null;
@@ -727,6 +775,28 @@ if (import.meta.env.DEV) {
   const reBefore = re;
   re = dropTabAtRootEdge(re, { surface: "terminal", sessionId: "e2" }, "bottom");
   ok(re === reBefore, "re-dropping the edge pane's tab on the same edge is a no-op");
+
+  // per-pane font size: set/clamp/reset, survives serialization
+  let fz = defaultLayout();
+  fz = setPaneFont(fz, fz.focusedPaneId, 15);
+  ok(findPane(fz.root, fz.focusedPaneId)?.fontSize === 15, "font override sets");
+  const fzRound = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(fz))));
+  ok(
+    fzRound !== null && findPane(fzRound.root, fzRound.focusedPaneId)?.fontSize === 15,
+    "font override round-trips",
+  );
+  fz = setPaneFont(fz, fz.focusedPaneId, 100);
+  ok(findPane(fz.root, fz.focusedPaneId)?.fontSize === FONT_MAX, "font clamps to bounds");
+  fz = setPaneFont(fz, fz.focusedPaneId, undefined);
+  ok(findPane(fz.root, fz.focusedPaneId)?.fontSize === undefined, "font resets to default");
+
+  // adjacentPane: right neighbor first, null for a single pane
+  let ap = defaultLayout();
+  ok(adjacentPane(ap, ap.focusedPaneId) === null, "single pane has no neighbor");
+  const apLeft = ap.focusedPaneId;
+  ap = splitPane(ap, apLeft, "row");
+  ok(adjacentPane(ap, apLeft) === ap.focusedPaneId, "right neighbor wins");
+  ok(adjacentPane(ap, ap.focusedPaneId) === apLeft, "left neighbor is the fallback");
 
   // pruning dead sessions collapses emptied panes but never touches files
   let pr = defaultLayout();

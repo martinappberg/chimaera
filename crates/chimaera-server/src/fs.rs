@@ -39,6 +39,9 @@ const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard cap on `fs/table` rows per page.
 const MAX_TABLE_ROWS: usize = 1000;
+/// Hard cap on candidates per `fs/validate` request (the UI batches one
+/// request per visible-viewport scan).
+const MAX_VALIDATE_CANDIDATES: usize = 50;
 /// How long a raw-access ticket stays valid.
 const TICKET_TTL: Duration = Duration::from_secs(600);
 
@@ -763,6 +766,54 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
     } else {
         b','
     })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ValidateRequest {
+    candidates: Vec<String>,
+    base: String,
+}
+
+/// POST /api/v1/fs/validate {candidates, base} — batched existence check
+/// behind the terminal link provider: only path-like strings that resolve to
+/// something real get underlined. Each candidate is resolved (absolute, or
+/// relative against the absolute `base`, `~` expanded) and answered under
+/// `valid` as `{path, kind}` — the canonical absolute path and whether it is
+/// a `file` or a `dir`. Misses are simply absent. Candidates past
+/// [`MAX_VALIDATE_CANDIDATES`] are ignored: cheap and batched by design.
+pub(crate) async fn validate(Json(body): Json<ValidateRequest>) -> Response {
+    let base = Path::new(&body.base);
+    if !base.is_absolute() {
+        return bad_request(&anyhow::anyhow!(
+            "base {:?} is not an absolute path",
+            body.base
+        ));
+    }
+    let mut valid = serde_json::Map::new();
+    for candidate in body.candidates.iter().take(MAX_VALIDATE_CANDIDATES) {
+        if candidate.is_empty() || valid.contains_key(candidate) {
+            continue;
+        }
+        let Ok(expanded) = expand_tilde(candidate) else {
+            continue;
+        };
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else {
+            base.join(expanded)
+        };
+        // canonicalize both resolves (symlinks, `..`) and checks existence;
+        // anything unresolvable is a miss, never an error.
+        let Ok(resolved) = std::fs::canonicalize(&joined) else {
+            continue;
+        };
+        let kind = if resolved.is_dir() { "dir" } else { "file" };
+        valid.insert(
+            candidate.clone(),
+            json!({"path": resolved.to_string_lossy(), "kind": kind}),
+        );
+    }
+    Json(json!({"valid": valid})).into_response()
 }
 
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to

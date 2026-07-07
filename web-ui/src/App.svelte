@@ -42,6 +42,7 @@
   } from "./lib/reference";
   import {
     activateTab,
+    adjacentPane,
     allFilePaths,
     closePane,
     cycleTab,
@@ -62,6 +63,7 @@
     pruneFiles,
     pruneSessions,
     serializeLayout,
+    setPaneFont,
     setRatio,
     splitPane,
     tabCount,
@@ -71,6 +73,7 @@
     type SplitDir,
     type Tab,
   } from "./lib/layout";
+  import type { PathKind } from "./lib/links";
   import { basename, fileTabTitles, fsProbe } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
   import {
@@ -82,7 +85,7 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/dnd";
-  import { chordDigit, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
+  import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
   import * as pool from "./lib/termPool";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
   import FolderPicker from "./lib/FolderPicker.svelte";
@@ -117,6 +120,9 @@
   let gotSessions = $state(false);
   let autoOpened = false;
   let dropSpot = $state<DropSpot | null>(null);
+
+  /** File-tree reveal request (terminal dir links); nonce distinguishes repeats. */
+  let treeReveal = $state<{ path: string; nonce: number } | null>(null);
 
   // Rail FILES section: collapsible, resizable share of the rail height.
   let filesOpen = $state(true);
@@ -261,7 +267,14 @@
   });
 
   onMount(() => {
-    pool.initPool({ onTitle, onExited, onSocketError, onSelection: onTermSelection });
+    pool.initPool({
+      onTitle,
+      onExited,
+      onSocketError,
+      onSelection: onTermSelection,
+      linkContext,
+      onOpenPath,
+    });
     setReferenceHandler(referenceSelection);
     const events = new EventsSocket({
       onSessions: applySessions,
@@ -354,6 +367,56 @@
     typeIntoSession(active.sessionId, text);
   }
 
+  // --- clickable paths: the bridge's return direction ------------------------
+
+  /** Resolution context for a session's terminal link provider. */
+  function linkContext(id: string): { cwd: string | null; root: string | null } {
+    const s = sessionsById.get(id);
+    const root = workspaces.find((w) => w.id === s?.workspace_id)?.root ?? workspace?.root ?? null;
+    return { cwd: s?.cwd_current ?? s?.cwd ?? null, root };
+  }
+
+  /** A confirmed terminal path link was activated. */
+  function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
+    if (kind === "dir") {
+      revealInTree(path);
+      return;
+    }
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    openFileFromPane(loc?.paneId ?? layout.focusedPaneId, path, newSplit);
+  }
+
+  /**
+   * Open a file surfaced FROM a pane (terminal link, touched-files popover):
+   * an already-open tab is focused wherever it lives (no duplicates);
+   * otherwise it lands in the adjacent pane, or a fresh split to the right
+   * when the window has one pane or Cmd/Ctrl forced a new split.
+   */
+  function openFileFromPane(paneId: string, path: string, newSplit: boolean): void {
+    const existing = paneForTab(layout.root, { surface: "file", path });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openFile(focusPane(layout, neighbor), path);
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openFile(layout, path);
+      }
+    }
+    // A file surface took focus: pull DOM focus off the terminal so plain
+    // keys stop reaching a PTY that is no longer the focused view.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Dir links: open the FILES section and reveal the path in the tree. */
+  let revealNonce = 0;
+  function revealInTree(path: string): void {
+    filesOpen = true;
+    treeReveal = { path, nonce: ++revealNonce };
+  }
+
   /** Guards overlapping boots (initial load racing a workspace switch). */
   let bootSeq = 0;
 
@@ -410,6 +473,22 @@
    *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
    */
   function onKeydown(e: KeyboardEvent): void {
+    // Per-pane terminal font size (Cmd/Ctrl +/−/0, spec-pinned chords):
+    // intercepted ONLY while the focused pane shows a terminal, so browser
+    // zoom keeps working everywhere else.
+    if (!pickerOpen && !quickOpenOpen && layoutReady) {
+      const step = fontChord(e);
+      if (step !== null) {
+        const p = findPane(layout.root, layout.focusedPaneId);
+        const active = p?.tabs[p.active];
+        if (p !== null && active !== undefined && active.surface === "terminal") {
+          e.preventDefault();
+          e.stopPropagation();
+          adjustFont(p.id, step);
+          return;
+        }
+      }
+    }
     if (!isAppChord(e)) return;
     const l2 = isLayer2(e);
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -743,6 +822,20 @@
     });
   }
 
+  /**
+   * Step (or reset, delta 0) a pane's terminal font size — the chords and
+   * the pane-bar A−/A+ controls both land here; persisted with the layout.
+   */
+  function adjustFont(paneId: string, delta: 1 | -1 | 0): void {
+    const p = findPane(layout.root, paneId);
+    if (p === null) return;
+    if (delta === 0) {
+      layout = setPaneFont(layout, paneId, undefined);
+      return;
+    }
+    layout = setPaneFont(layout, paneId, (p.fontSize ?? pool.BASE_FONT_SIZE) + delta);
+  }
+
   /** The focused pane's fitted size, for spawning sessions at the right grid. */
   function spawnSize(): { cols: number; rows: number } | null {
     const pane = findPane(layout.root, layout.focusedPaneId);
@@ -851,6 +944,12 @@
     },
     closeView(paneId) {
       closeView(paneId);
+    },
+    openFileFrom(paneId, path, newSplit) {
+      openFileFromPane(paneId, path, newSplit);
+    },
+    adjustFont(paneId, delta) {
+      adjustFont(paneId, delta);
     },
   };
 
@@ -1133,6 +1232,7 @@
                 onOpen={openFilePath}
                 onDragStart={onTreeEntryDown}
                 activePath={focusedFilePath}
+                reveal={treeReveal}
               />
             </div>
           {/if}
@@ -1167,6 +1267,7 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            wsRoot={workspace?.root ?? null}
             {ctrl}
           />
         {:else}
@@ -1177,6 +1278,7 @@
             sessions={sessionsById}
             names={displayNames}
             fileNames={fileTitles}
+            wsRoot={workspace?.root ?? null}
             {ctrl}
           />
         {/if}

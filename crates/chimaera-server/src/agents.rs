@@ -54,6 +54,9 @@ impl AgentState {
     }
 }
 
+/// Cap on the per-session touched-files list.
+const FILES_TOUCHED_CAP: usize = 100;
+
 /// Server-side wrapper state for one agent session.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentRecord {
@@ -69,6 +72,11 @@ pub(crate) struct AgentRecord {
     /// First prompt seen in a `UserPromptSubmit` hook payload; provisional
     /// display name until a real title exists.
     pub(crate) first_prompt: Option<String>,
+    /// Files this session has written (PostToolUse hooks for file-writing
+    /// tools): ordered, de-duplicated, most recently touched last, capped at
+    /// [`FILES_TOUCHED_CAP`]. Never cleared — the list lives as long as the
+    /// session.
+    pub(crate) files_touched: Vec<String>,
 }
 
 impl AgentRecord {
@@ -80,7 +88,25 @@ impl AgentRecord {
             custom_title: None,
             ai_title: None,
             first_prompt: None,
+            files_touched: Vec::new(),
         }
+    }
+
+    /// Record a file write: a re-touched path moves to the end (newest last),
+    /// a new one appends, and the oldest entries fall off past the cap.
+    /// Returns whether the list changed (re-touching the newest is a no-op).
+    pub(crate) fn touch_file(&mut self, path: &str) -> bool {
+        if self.files_touched.last().is_some_and(|last| last == path) {
+            return false;
+        }
+        if let Some(pos) = self.files_touched.iter().position(|p| p == path) {
+            self.files_touched.remove(pos);
+        }
+        self.files_touched.push(path.to_string());
+        if self.files_touched.len() > FILES_TOUCHED_CAP {
+            self.files_touched.remove(0);
+        }
+        true
     }
 
     /// Display title: latest customTitle wins over latest aiTitle.
@@ -288,6 +314,15 @@ pub(crate) async fn ingest(
         }
     }
 
+    // File-writing tools feed the touched-files list (clickable "N files"
+    // chips in the UI). Real payloads verified against claude 2.1.196: the
+    // path lives in tool_input.file_path (notebook_path for NotebookEdit).
+    if event == "PostToolUse" {
+        if let Some(path) = touched_file(&payload) {
+            changed |= record.touch_file(path);
+        }
+    }
+
     if let Some(next) = map_event(event, &payload) {
         if record.state != next {
             record.state = next;
@@ -300,6 +335,23 @@ pub(crate) async fn ingest(
         state.changes.notify_waiters();
     }
     Json(json!({})).into_response()
+}
+
+/// The file path a PostToolUse payload touched, if its tool writes files.
+/// Field names verified against real hook payloads: Write/Edit (and
+/// MultiEdit, same tool family) carry `tool_input.file_path`; NotebookEdit
+/// carries `tool_input.notebook_path`.
+fn touched_file(payload: &serde_json::Value) -> Option<&str> {
+    let field = match payload.get("tool_name")?.as_str()? {
+        "Write" | "Edit" | "MultiEdit" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+    payload
+        .get("tool_input")?
+        .get(field)?
+        .as_str()
+        .filter(|path| !path.is_empty())
 }
 
 /// Map a hook event to the agent state it implies, if any. `SessionEnd`
@@ -523,6 +575,67 @@ mod tests {
         );
         assert_eq!(map_event("SessionEnd", &empty), None);
         assert_eq!(map_event("SomethingNew", &empty), None);
+    }
+
+    #[test]
+    fn touched_file_reads_the_right_field_per_tool() {
+        // Shaped like real claude 2.1.196 PostToolUse payloads.
+        let payload = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/w/a.rs", "content": "hi"},
+        });
+        assert_eq!(touched_file(&payload), Some("/w/a.rs"));
+        let payload = json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/w/b.rs", "old_string": "x", "new_string": "y"},
+        });
+        assert_eq!(touched_file(&payload), Some("/w/b.rs"));
+        let payload = json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {"file_path": "/w/c.rs", "edits": []},
+        });
+        assert_eq!(touched_file(&payload), Some("/w/c.rs"));
+        let payload = json!({
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "/w/d.ipynb", "new_source": ""},
+        });
+        assert_eq!(touched_file(&payload), Some("/w/d.ipynb"));
+        // Non-writing tools, wrong field, empty path, missing input: no touch.
+        assert_eq!(
+            touched_file(&json!({"tool_name": "Bash", "tool_input": {"command": "ls"}})),
+            None
+        );
+        assert_eq!(
+            touched_file(&json!({"tool_name": "Write", "tool_input": {"notebook_path": "/x"}})),
+            None
+        );
+        assert_eq!(
+            touched_file(&json!({"tool_name": "Write", "tool_input": {"file_path": ""}})),
+            None
+        );
+        assert_eq!(touched_file(&json!({"tool_name": "Write"})), None);
+        assert_eq!(touched_file(&json!({})), None);
+    }
+
+    #[test]
+    fn touch_file_dedupes_orders_and_caps() {
+        let mut record = AgentRecord::new("k".into());
+        assert!(record.touch_file("/w/a"));
+        assert!(record.touch_file("/w/b"));
+        // Re-touching the newest entry changes nothing.
+        assert!(!record.touch_file("/w/b"));
+        assert_eq!(record.files_touched, ["/w/a", "/w/b"]);
+        // Re-touching an older entry moves it to the end (newest last).
+        assert!(record.touch_file("/w/a"));
+        assert_eq!(record.files_touched, ["/w/b", "/w/a"]);
+        // The cap drops the oldest entries, keeping the newest 100.
+        for i in 0..150 {
+            record.touch_file(&format!("/w/f{i}"));
+        }
+        assert_eq!(record.files_touched.len(), FILES_TOUCHED_CAP);
+        assert_eq!(record.files_touched.first().unwrap(), "/w/f50");
+        assert_eq!(record.files_touched.last().unwrap(), "/w/f149");
     }
 
     #[test]

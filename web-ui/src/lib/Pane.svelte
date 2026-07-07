@@ -17,6 +17,8 @@
     sessions: Map<string, Session>;
     names: Map<string, string>;
     fileNames: Map<string, string>;
+    /** Active workspace root (touched-files paths relativize against it). */
+    wsRoot: string | null;
     ctrl: LayoutCtrl;
   }
 
@@ -28,6 +30,7 @@
     sessions,
     names,
     fileNames,
+    wsRoot,
     ctrl,
   }: Props = $props();
 
@@ -63,11 +66,11 @@
 >
   <!-- Every pane always has its top bar — orientation, drag handle, and the
        mouse home for zoom/split/close, even single-pane single-tab. -->
-  <PaneTabs {node} {zoomed} {sessions} {names} {fileNames} {dropSpot} {ctrl} bind:el={tabbarEl} />
+  <PaneTabs {node} {zoomed} {sessions} {names} {fileNames} {wsRoot} {dropSpot} {ctrl} bind:el={tabbarEl} />
   <div class="content" bind:this={contentEl}>
     {#if activeTab !== null}
       {#if activeTab.surface === "terminal"}
-        <TerminalView sessionId={activeTab.sessionId} {focused} />
+        <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else}
         <FileView path={activeTab.path} />
       {/if}

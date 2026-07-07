@@ -88,7 +88,8 @@ pub(crate) async fn create_workspace(
 }
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
-/// `agent_state`, `agent_title`, `display_name` and `cwd_current` fields.
+/// `agent_state`, `agent_title`, `files_touched`, `display_name` and
+/// `cwd_current` fields.
 /// `agent` is the wrapper record for kind "agent" sessions; `None` means a
 /// plain shell. `polled` / `polled_cwd` are the shell naming watcher's
 /// latest values, if any; `cwd_current` falls back to the spawn cwd (agents,
@@ -125,6 +126,10 @@ pub(crate) fn session_json(
         agent
             .and_then(|a| a.title())
             .map_or(serde_json::Value::Null, |t| json!(t)),
+    );
+    map.insert(
+        "files_touched".to_string(),
+        agent.map_or(serde_json::Value::Null, |a| json!(a.files_touched)),
     );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the

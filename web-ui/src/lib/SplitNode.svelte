@@ -13,6 +13,8 @@
     sessions: Map<string, Session>;
     names: Map<string, string>;
     fileNames: Map<string, string>;
+    /** Active workspace root (touched-files paths relativize against it). */
+    wsRoot: string | null;
     ctrl: LayoutCtrl;
   }
 
@@ -23,6 +25,7 @@
     sessions,
     names,
     fileNames,
+    wsRoot,
     ctrl,
   }: Props = $props();
 
@@ -110,11 +113,11 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+  <Pane {node} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
     </div>
     <div
       class="divider"
@@ -128,7 +131,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {wsRoot} {ctrl} />
     </div>
   </div>
 {/if}

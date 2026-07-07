@@ -45,6 +45,12 @@ export interface Session {
    * half lands; the client falls back to the spawn cwd.
    */
   cwd_current?: string | null;
+  /**
+   * Files this agent wrote/edited (PostToolUse hooks, Write/Edit-class
+   * tools): absolute paths, oldest first, deduped, capped server-side.
+   * Null for shells; optional until the daemon half lands.
+   */
+  files_touched?: string[] | null;
 }
 
 /** The one display name for a session, used identically everywhere. */
