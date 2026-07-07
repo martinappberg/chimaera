@@ -1354,16 +1354,16 @@
    * `tab`: panes showing a live agent session, when the payload is a shell
    * terminal (files and agents themselves never link).
    */
-  function linkTargetsFor(tab: Tab): ReadonlySet<string> | undefined {
+  function linkTargetsFor(tab: Tab): ReadonlyMap<string, string> | undefined {
     if (tab.surface !== "terminal") return undefined;
     if (sessionsById.get(tab.sessionId)?.kind !== "shell") return undefined;
-    const targets = new Set<string>();
+    const targets = new Map<string, string>();
     const walk = (n: typeof layout.root): void => {
       if (n.type === "pane") {
         const active = n.tabs[n.active];
         if (active !== undefined && active.surface === "terminal") {
           const s = sessionsById.get(active.sessionId);
-          if (s !== undefined && s.kind === "agent" && s.alive) targets.add(n.id);
+          if (s !== undefined && s.kind === "agent" && s.alive) targets.set(n.id, s.id);
         }
         return;
       }
@@ -1411,7 +1411,7 @@
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
     const linkSessions = linkSessionsFor(tab);
-    if (linkTargets !== undefined) for (const id of linkTargets) armed.add(id);
+    if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
     if (tab.surface === "file") {
       for (const p of panesOf(layout.root)) {
         const a = p.tabs[p.active];
@@ -1429,11 +1429,7 @@
       e,
       { tab, label },
       {
-        onSpot: (s) => {
-          // A link-intent drag only lands on an agent: never flash a move/tile
-          // preview over an ordinary pane (it would promise a drop that no-ops).
-          dropSpot = linkIntent && s !== null && s.kind !== "link" && s.kind !== "linkrow" ? null : s;
-        },
+        onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
           if (spot.kind === "ref") {
             // Drag-to-reference: type into the session, never open a tab.
@@ -1441,11 +1437,13 @@
             return;
           }
           if (spot.kind === "link") {
+            // Plain tab drag onto an agent pane's band.
             if (tab.surface === "terminal") linkByDrop(tab.sessionId, spot.paneId);
             return;
           }
-          if (spot.kind === "linkrow") {
-            // Dropped on an agent's rail row: link, then surface the agent.
+          if (spot.kind === "linkpane" || spot.kind === "linktab" || spot.kind === "linkrow") {
+            // Link-intent drop on an agent (its view, tab, or rail row): link,
+            // then surface the agent.
             if (tab.surface === "terminal") linkBySession(tab.sessionId, spot.sessionId);
             return;
           }
@@ -1484,7 +1482,7 @@
           );
         },
       },
-      { linkTargets, linkSessions, leash: linkIntent },
+      { linkTargets, linkSessions, linkIntent },
     );
   }
 

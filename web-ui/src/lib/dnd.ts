@@ -16,9 +16,15 @@ export type DropSpot =
   | { kind: "edge"; edge: Side }
   /** The "@ reference" band over a session pane's bottom (file drags only). */
   | { kind: "ref"; paneId: string }
-  /** The "link to agent" band over an agent pane's input area (only while
-   *  dragging a shell terminal; see startDrag's linkTargets). */
+  /** The "link to agent" band over an agent pane's input area — a plain
+   *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }
+  /** A whole agent pane, lit end-to-end while a LINK-INTENT drag (from the
+   *  link icon) hovers anywhere inside it. */
+  | { kind: "linkpane"; paneId: string; sessionId: string }
+  /** An agent's TAB, lit while a link-intent drag hovers it — links to that
+   *  agent even when it isn't the pane's active view. */
+  | { kind: "linktab"; paneId: string; index: number; sessionId: string }
   /** An agent's rail row, highlighted while a shell terminal is dragged over
    *  it — the always-present link target (the agent needn't be open in a
    *  pane). See startDrag's linkSessions. */
@@ -140,6 +146,9 @@ function sameSpot(a: DropSpot | null, b: DropSpot | null): boolean {
   if (a.kind === "zone" && b.kind === "zone") return a.paneId === b.paneId && a.zone === b.zone;
   if (a.kind === "ref" && b.kind === "ref") return a.paneId === b.paneId;
   if (a.kind === "link" && b.kind === "link") return a.paneId === b.paneId;
+  if (a.kind === "linkpane" && b.kind === "linkpane") return a.paneId === b.paneId;
+  if (a.kind === "linktab" && b.kind === "linktab")
+    return a.paneId === b.paneId && a.index === b.index;
   if (a.kind === "linkrow" && b.kind === "linkrow") return a.sessionId === b.sessionId;
   return false;
 }
@@ -179,6 +188,54 @@ function windowEdgeAt(x: number, y: number): DropSpot | null {
 export const REF_BAND_FRAC = 0.22;
 
 /**
+ * Link-intent hit-test (a drag from a pane's link icon): the WHOLE agent view
+ * is the target. In priority: an agent's rail row, then an agent's tab (links
+ * to that agent even when it isn't the active view), then anywhere inside an
+ * agent pane. Over anything else — a non-agent pane, empty space — nothing
+ * responds, so the gesture only ever links.
+ */
+function linkSpotAt(
+  x: number,
+  y: number,
+  linkTargets: ReadonlyMap<string, string> | undefined,
+  linkSessions: ReadonlySet<string> | undefined,
+): DropSpot | null {
+  if (linkSessions !== undefined) {
+    for (const [sid, el] of linkRowRegs) {
+      if (!linkSessions.has(sid)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        return { kind: "linkrow", sessionId: sid };
+      }
+    }
+  }
+  for (const [paneId, reg] of paneRegs) {
+    const r = reg.root.getBoundingClientRect();
+    if (r.width === 0 || x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+    // An agent's tab links to THAT agent, active view or not.
+    if (reg.tabbar !== null) {
+      const tr = reg.tabbar.getBoundingClientRect();
+      if (y >= tr.top && y <= tr.bottom) {
+        for (const t of reg.tabbar.querySelectorAll<HTMLElement>("[data-tab-index]")) {
+          const tb = t.getBoundingClientRect();
+          if (x >= tb.left && x <= tb.right) {
+            const agentId = t.dataset.linkAgent;
+            if (agentId != null && agentId.length > 0) {
+              return { kind: "linktab", paneId, index: Number(t.dataset.tabIndex), sessionId: agentId };
+            }
+            break; // a non-agent tab: fall through to the whole-pane check
+          }
+        }
+      }
+    }
+    const agentId = linkTargets?.get(paneId);
+    if (agentId !== undefined) return { kind: "linkpane", paneId, sessionId: agentId };
+    return null; // a non-agent pane during a link drag: no-op
+  }
+  return null;
+}
+
+/**
  * Hit-test priority: tab bars (precise insertion beats everything), then the
  * bottom band when armed — "@ reference" for file drags over session panes,
  * "link to agent" for shell-terminal drags over agent panes; either owns the
@@ -189,21 +246,14 @@ function spotAt(
   x: number,
   y: number,
   refFor: ((paneId: string) => boolean) | null,
-  linkTargets: ReadonlySet<string> | undefined,
+  linkTargets: ReadonlyMap<string, string> | undefined,
   linkSessions: ReadonlySet<string> | undefined,
+  linkIntent: boolean,
 ): DropSpot | null {
-  // Agent rail rows first: an always-present link target for a shell-terminal
-  // drag, so the agent needn't be open in a pane. The rail never overlaps the
-  // stage, so checking it up front costs nothing elsewhere.
-  if (linkSessions !== undefined) {
-    for (const [sid, el] of linkRowRegs) {
-      if (!linkSessions.has(sid)) continue;
-      const r = el.getBoundingClientRect();
-      if (r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        return { kind: "linkrow", sessionId: sid };
-      }
-    }
-  }
+  // A link-intent drag is link-only: the whole agent view is the target and
+  // nothing else responds (never a tab move / tile).
+  if (linkIntent) return linkSpotAt(x, y, linkTargets, linkSessions);
+
   let paneHit: { paneId: string; r: DOMRect } | null = null;
   for (const [paneId, reg] of paneRegs) {
     const r = reg.root.getBoundingClientRect();
@@ -306,6 +356,22 @@ function leashAnchor(spot: DropSpot | null): { x: number; y: number } | null {
       return { x: r.left + r.width / 2, y: r.bottom - r.height * 0.11 };
     }
   }
+  if (spot.kind === "linkpane") {
+    const reg = paneRegs.get(spot.paneId);
+    if (reg !== undefined) {
+      const r = reg.root.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+  }
+  if (spot.kind === "linktab") {
+    const tab = paneRegs
+      .get(spot.paneId)
+      ?.tabbar?.querySelector<HTMLElement>(`[data-tab-index="${spot.index}"]`);
+    if (tab != null) {
+      const r = tab.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+  }
   return null;
 }
 
@@ -337,14 +403,19 @@ function drawLeash(
 }
 
 export interface DragOptions {
-  /** Panes whose input band is a "link to agent" target for this payload. */
-  linkTargets?: ReadonlySet<string>;
+  /** Agent panes (paneId → the agent session shown there) whose input band is
+   *  a "link to agent" target for a plain shell-terminal TAB drag. */
+  linkTargets?: ReadonlyMap<string, string>;
   /** Agent session ids whose rail rows are "link to agent" targets for this
    *  payload (a shell terminal). Independent of whether the agent is open. */
   linkSessions?: ReadonlySet<string>;
-  /** Draw a "leash" chain from the drag origin to the pointer (link drags):
-   *  it snaps taut onto the hovered link target. */
-  leash?: boolean;
+  /**
+   * This drag started from a pane's link icon: it exists only to link. It
+   * draws the leash chain and makes the WHOLE agent view a target — any part
+   * of an agent pane, an agent's tab, or an agent's rail row — never a tab
+   * move. (A plain tab drag keeps the precise band via linkTargets instead.)
+   */
+  linkIntent?: boolean;
 }
 
 /**
@@ -386,7 +457,14 @@ export function startDrag(
     if (ghost !== null) {
       ghost.style.transform = `translate(${lastX + 14}px, ${lastY + 10}px)`;
     }
-    const next = spotAt(lastX, lastY, refFor, opts.linkTargets, opts.linkSessions);
+    const next = spotAt(
+      lastX,
+      lastY,
+      refFor,
+      opts.linkTargets,
+      opts.linkSessions,
+      opts.linkIntent === true,
+    );
     if (!sameSpot(next, spot)) {
       spot = next;
       cb.onSpot(spot);
@@ -402,7 +480,7 @@ export function startDrag(
       if (Math.hypot(lastX - sx, lastY - sy) < DRAG_THRESHOLD_PX) return;
       active = true;
       ghost = makeGhost(payload.label);
-      if (opts.leash === true) leash = makeLeash();
+      if (opts.linkIntent === true) leash = makeLeash();
       document.body.classList.add("dragging");
     }
     if (raf === 0) raf = requestAnimationFrame(update);

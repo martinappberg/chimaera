@@ -262,10 +262,17 @@
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
   <div class="tabs" role="tablist">
     {#each node.tabs as tab, i (tabKey(tab))}
+      {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
+      {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
       <div
         class="tab"
         class:active={i === node.active}
         class:insert={insertIndex === i}
+        class:link-target={dropSpot?.kind === "linktab" &&
+          dropSpot.paneId === node.id &&
+          dropSpot.index === i}
+        style:--hue={sid !== null && ts?.kind === "agent" ? agentHue(sid) : null}
+        data-link-agent={sid !== null && ts?.kind === "agent" && ts.alive ? sid : undefined}
         role="tab"
         aria-selected={i === node.active}
         tabindex="-1"
@@ -599,6 +606,15 @@
   .tab.active {
     color: var(--fg);
     font-weight: 600;
+  }
+
+  /* A link-intent drag hovers this agent's tab: light it in the agent's hue
+     (the tab is a link target even when it isn't the active view). */
+  .tab.link-target {
+    color: var(--fg);
+    background: hsl(var(--hue) 55% 55% / 0.18);
+    box-shadow: inset 0 0 0 1px hsl(var(--hue) 55% 55% / 0.6);
+    border-radius: 5px;
   }
 
   /* Drag insertion caret. */
