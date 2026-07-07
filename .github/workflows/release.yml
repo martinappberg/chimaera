@@ -39,9 +39,7 @@ jobs:
         with:
           name: web-ui-dist
           path: web-ui/dist
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - run: rustup show
       - uses: mlugg/setup-zig@v2
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-zigbuild
@@ -61,7 +59,7 @@ jobs:
         with:
           name: web-ui-dist
           path: web-ui/dist
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p chimaera
       - run: cp target/release/chimaera chimaera-aarch64-apple-darwin
@@ -77,7 +75,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/chimaera-app

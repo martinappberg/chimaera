@@ -1,0 +1,10 @@
+# Single source of truth for the Rust toolchain, so a local `cargo clippy`
+# and CI lint against the exact same compiler. Drift here is why a green
+# local build failed CI on clippy lints new in 1.96. Bump in ONE place;
+# rustup auto-installs it on the next cargo invocation (local and CI).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+# The musl targets the release/musl jobs cross-compile for; harmless on
+# native jobs, and it keeps target install out of the workflow YAML.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

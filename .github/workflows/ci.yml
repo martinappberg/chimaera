@@ -33,9 +33,9 @@ jobs:
         with:
           name: web-ui-dist
           path: web-ui/dist
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain arg: rustup installs the channel + components pinned in
+      # rust-toolchain.toml, so CI lints against the same compiler as local.
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -53,9 +53,8 @@ jobs:
         with:
           name: web-ui-dist
           path: web-ui/dist
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the channel and both musl targets.
+      - run: rustup show
       - uses: mlugg/setup-zig@v2
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-zigbuild

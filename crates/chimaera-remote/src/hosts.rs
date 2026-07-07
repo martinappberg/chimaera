@@ -95,7 +95,7 @@ impl HostsStore {
     /// added order).
     pub fn list(&self) -> Vec<HostEntry> {
         let mut out = self.items.clone();
-        out.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+        out.sort_by_key(|h| std::cmp::Reverse(h.last_connected_at));
         out
     }
 

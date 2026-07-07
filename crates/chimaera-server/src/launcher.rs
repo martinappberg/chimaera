@@ -466,7 +466,7 @@ pub(crate) fn scan_resumables(dir: &Path, exclude: &[PathBuf]) -> Vec<serde_json
             Some((path, meta.modified().ok()?))
         })
         .collect();
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
 
     let mut out = Vec::new();
     for (path, mtime) in files {
