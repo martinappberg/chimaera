@@ -4,6 +4,10 @@
    * the right. A modified row (value differs from default) carries a quiet
    * accent bar and a reset affordance — the VS Code gutter language, muted.
    */
+  import { onDestroy } from "svelte";
+  import { ACTION_BY_ID, captureChord, displayChord, isBrowserReserved } from "../keys";
+  import { modifierSetting, setCapturing } from "../keybindings";
+  import { isNativeShell } from "../native";
   import type { SettingDef, SettingId, SettingValue } from "./schema";
   import { activeTheme, getSetting, isModified, resetSetting, setSetting } from "./store.svelte";
 
@@ -20,6 +24,61 @@
   function set(v: SettingValue): void {
     setSetting(id, v as never);
   }
+
+  // --- keybinding --------------------------------------------------------------
+
+  /** Arrow-set actions record any arrow as the four-arrow wildcard. */
+  const arrowSet = $derived(ACTION_BY_ID.get(def.id.replace(/^keys\./, ""))?.arrowSet === true);
+
+  let listening = $state(false);
+
+  function stopCapture(): void {
+    if (!listening) return;
+    listening = false;
+    setCapturing(false);
+    window.removeEventListener("keydown", onCaptureKey, true);
+  }
+
+  function onCaptureKey(e: KeyboardEvent): void {
+    // The press belongs to the recorder — it must not scroll, type, or fire
+    // the action it happens to collide with (App's handler checks the flag).
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.key === "Escape") {
+      stopCapture();
+      return;
+    }
+    const chord = captureChord(e, arrowSet);
+    if (chord === null) return; // modifier-only or uncapturable — keep listening
+    set(chord);
+    stopCapture();
+  }
+
+  function startCapture(): void {
+    if (listening) {
+      stopCapture();
+      return;
+    }
+    listening = true;
+    setCapturing(true);
+    window.addEventListener("keydown", onCaptureKey, true);
+  }
+
+  onDestroy(stopCapture);
+
+  const chordLabel = $derived.by(() => {
+    if (def.type !== "keybinding") return "";
+    const v = value as string;
+    return v === "" ? "" : displayChord(v, modifierSetting());
+  });
+
+  /** The bound chord never reaches a browser page — only the app sees it. */
+  const reservedInBrowser = $derived(
+    def.type === "keybinding" &&
+      (value as string) !== "" &&
+      !isNativeShell() &&
+      isBrowserReserved(value as string, modifierSetting()),
+  );
 
   // --- number ----------------------------------------------------------------
 
@@ -114,6 +173,7 @@
             max={def.max}
             step={def.step ?? 1}
             value={value as number}
+            style:--p={`${(((value as number) - def.min) / (def.max - def.min)) * 100}%`}
             aria-label={def.title}
             oninput={(e) => set(Number(e.currentTarget.value))}
           />
@@ -184,6 +244,34 @@
           {/each}
         </select>
       {/if}
+    {:else if def.type === "keybinding"}
+      <div class="keybind">
+        <div class="kb-row">
+          <button
+            class="kb-btn"
+            class:listening
+            class:unbound={(value as string) === "" && !listening}
+            title={listening ? "press a chord — Esc cancels" : "click, then press the new chord"}
+            onclick={startCapture}
+          >
+            {#if listening}
+              recording…
+            {:else if (value as string) === ""}
+              disabled
+            {:else}
+              <kbd>{chordLabel}</kbd>
+            {/if}
+          </button>
+          {#if (value as string) !== "" && !listening}
+            <button class="kb-clear" title="disable this chord" onclick={() => set("")}>
+              &times;
+            </button>
+          {/if}
+        </div>
+        {#if reservedInBrowser}
+          <p class="kb-warn">browser-reserved — fires only in the chimaera app</p>
+        {/if}
+      </div>
     {:else if def.type === "color"}
       <div class="color">
         <input
@@ -420,9 +508,68 @@
     gap: 10px;
   }
 
+  /* Quiet slider: a hairline track with a soft accent fill up to the thumb
+     (--p, set inline) and a small bordered knob — the native accent-color
+     widget reads as a loud foreign control next to the rest of the chrome. */
   .slider {
+    appearance: none;
     width: 110px;
-    accent-color: var(--accent);
+    height: 16px;
+    margin: 0;
+    background: none;
+    cursor: pointer;
+  }
+
+  .slider::-webkit-slider-runnable-track {
+    height: 3px;
+    border-radius: 2px;
+    background: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--accent) 55%, var(--row-active)) 0 var(--p, 50%),
+      var(--row-active) var(--p, 50%)
+    );
+  }
+
+  .slider::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    margin-top: -4.5px;
+    border-radius: 50%;
+    background: var(--overlay-bg);
+    border: 1.5px solid var(--muted);
+    transition: border-color 0.12s ease;
+  }
+
+  .slider:hover::-webkit-slider-thumb,
+  .slider:active::-webkit-slider-thumb {
+    border-color: var(--accent);
+  }
+
+  .slider::-moz-range-track {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--row-active);
+  }
+
+  .slider::-moz-range-progress {
+    height: 3px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 55%, var(--row-active));
+  }
+
+  .slider::-moz-range-thumb {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--overlay-bg);
+    border: 1.5px solid var(--muted);
+    transition: border-color 0.12s ease;
+  }
+
+  .slider:hover::-moz-range-thumb,
+  .slider:active::-moz-range-thumb {
+    border-color: var(--accent);
   }
 
   .numbox {
@@ -572,6 +719,78 @@
     padding: 3px 6px;
   }
 
+  /* --- keybinding --- */
+  .keybind {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+  }
+
+  .kb-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .kb-btn {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: var(--term-bg);
+    border-radius: 6px;
+    min-width: 96px;
+    padding: 3px 10px;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--fg);
+    cursor: pointer;
+    transition:
+      border-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .kb-btn kbd {
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+  }
+
+  .kb-btn:hover {
+    border-color: color-mix(in srgb, var(--fg) 25%, var(--edge));
+  }
+
+  .kb-btn.listening {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .kb-btn.unbound {
+    color: var(--muted);
+    font-style: italic;
+  }
+
+  .kb-clear {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .kb-clear:hover {
+    color: var(--err);
+  }
+
+  .kb-warn {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--warn);
+  }
+
   /* --- color --- */
   .color {
     display: flex;
@@ -713,8 +932,12 @@
     .select {
       max-width: 100%;
     }
+  }
 
-    /* A joined segmented bar can't shrink, so let it wrap as separated pills. */
+  /* Very narrow: guarantee nothing overflows. The slider yields to its numbox,
+     the hex field shrinks to fit, and the segmented bar — which can't shrink —
+     wraps as separated pills. */
+  @container settings (max-width: 360px) {
     .seg {
       flex-wrap: wrap;
       gap: 5px;
@@ -727,11 +950,7 @@
       border: 1px solid var(--edge);
       border-radius: 6px;
     }
-  }
 
-  /* Very narrow: guarantee nothing overflows. The slider yields to its numbox
-     and the hex field shrinks to fit. */
-  @container settings (max-width: 360px) {
     .num {
       gap: 8px;
     }

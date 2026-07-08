@@ -13,6 +13,7 @@
  * the same file.
  */
 
+import { ACTIONS, parseChord } from "../keys";
 import { themesOfKind, type ThemeDef } from "./themes";
 
 /** Value types a setting can carry (mirrors the JSON representation). */
@@ -25,7 +26,8 @@ export type SettingType =
   | "string"
   | "enum"
   | "color"
-  | "string-list";
+  | "string-list"
+  | "keybinding";
 
 export interface EnumOption {
   value: string;
@@ -65,12 +67,16 @@ export interface SettingDef {
   control?: "theme-cards";
 }
 
+/** `keys.<action>` ids, generated from the keys.ts registry. */
+type KeyBindingId = `keys.${(typeof ACTIONS)[number]["id"]}`;
+
 /**
  * Typed view of the settings map: ids -> value types. Kept adjacent to DEFS
- * (same file, same order) — the `satisfies` check below guarantees every key
- * has a def and every default matches its declared type.
+ * (same file, same order) — the `satisfies` check below guarantees every
+ * statically-declared key has a def and every default matches its declared
+ * type; the keybinding rows come from the keys.ts registry.
  */
-export interface SettingsMap {
+export type SettingsMap = {
   "appearance.theme": "system" | "light" | "dark";
   "appearance.lightTheme": string;
   "appearance.darkTheme": string;
@@ -94,7 +100,8 @@ export interface SettingsMap {
   "quickOpen.maxResults": number;
   "quickOpen.ignoreDirs": string[];
   "daemon.scrollbackLines": number;
-}
+  "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
+} & Record<KeyBindingId, string>;
 
 export type SettingId = keyof SettingsMap;
 
@@ -362,13 +369,44 @@ const DEFS = {
     scope: "daemon",
     note: "Applies to sessions started after the change.",
   },
-} as const satisfies Record<SettingId, Omit<SettingDef, "id">>;
+
+  // --- Keyboard ----------------------------------------------------------------
+  "keys.modifier": {
+    title: "Base Modifier",
+    category: "Keyboard",
+    description:
+      "The modifier every Mod-based chord builds on. Auto uses ⌘ on macOS and Ctrl+Shift elsewhere. The terminal always owns bare Ctrl, so there is no Ctrl-alone option.",
+    type: "enum",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Auto" },
+      { value: "cmd", label: "⌘ / Meta" },
+      { value: "ctrl-shift", label: "Ctrl+Shift" },
+      { value: "alt", label: "Alt" },
+    ],
+    scope: "client",
+  },
+} as const satisfies Record<Exclude<SettingId, KeyBindingId>, Omit<SettingDef, "id">>;
+
+/**
+ * The keybinding rows, straight from the keys.ts action registry — the
+ * registry is the single source for labels, descriptions, and defaults.
+ */
+const KEY_DEFS: SettingDef[] = ACTIONS.map((a) => ({
+  id: `keys.${a.id}`,
+  title: a.label,
+  category: "Keyboard",
+  description: a.description,
+  type: "keybinding",
+  default: a.def,
+  scope: "client",
+}));
 
 /** All settings, registry order (drives category and row order in the UI). */
-export const SETTINGS: readonly SettingDef[] = Object.entries(DEFS).map(([id, def]) => ({
-  id,
-  ...def,
-})) as SettingDef[];
+export const SETTINGS: readonly SettingDef[] = [
+  ...(Object.entries(DEFS).map(([id, def]) => ({ id, ...def })) as SettingDef[]),
+  ...KEY_DEFS,
+];
 
 const BY_ID = new Map<string, SettingDef>(SETTINGS.map((d) => [d.id, d]));
 
@@ -377,7 +415,7 @@ export function settingDef(id: string): SettingDef | undefined {
 }
 
 export function defaultValue<K extends SettingId>(id: K): SettingsMap[K] {
-  return DEFS[id].default as SettingsMap[K];
+  return BY_ID.get(id)?.default as SettingsMap[K];
 }
 
 /** Categories in registry order. */
@@ -415,6 +453,12 @@ export function sanitize(def: SettingDef, value: unknown): SettingValue | null {
       return Array.isArray(value)
         ? value.filter((x): x is string => typeof x === "string" && x.length > 0)
         : null;
+    case "keybinding":
+      // "" = binding disabled; validation is structural, so Mod tokens are
+      // checked without caring which modifier setting is active.
+      return typeof value === "string" && (value === "" || parseChord(value, "auto") !== null)
+        ? value
+        : null;
   }
 }
 
@@ -441,6 +485,8 @@ export function expectedType(def: SettingDef): string {
       return `one of: ${(def.options ?? []).map((o) => JSON.stringify(o.value)).join(", ")}`;
     case "string-list":
       return "array of strings";
+    case "keybinding":
+      return 'chord like "Mod+e" or "Meta+Shift+d" (or "" to disable)';
   }
 }
 
@@ -479,6 +525,9 @@ export function settingsJsonSchema(): Record<string, unknown> {
       case "string-list":
         prop.type = "array";
         prop.items = { type: "string" };
+        break;
+      case "keybinding":
+        prop.type = "string";
         break;
     }
     properties[def.id] = prop;

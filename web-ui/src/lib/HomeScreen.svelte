@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import BrandMark from "./BrandMark.svelte";
-  import { KEYS } from "./keys";
+  import { keyHint } from "./keybindings";
   import { needsAttention, type Session, type Workspace } from "./sessions";
   import {
     addHost,
@@ -304,7 +304,7 @@
       <div class="sec-head">
         <span class="sec-title">workspaces</span>
         <button class="ghost" onclick={onOpenFolder}
-          >open a folder… <kbd>{KEYS.picker}</kbd></button
+          >open a folder… <kbd>{keyHint("picker")}</kbd></button
         >
       </div>
       {#if sorted.length === 0}

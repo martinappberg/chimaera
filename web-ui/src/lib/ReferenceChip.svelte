@@ -7,7 +7,7 @@
    * and funnels through the same handler as the chord (parity principle).
    */
   import { referenceTarget, requestReference } from "./reference";
-  import { KEYS } from "./keys";
+  import { PINNED } from "./keys";
 
   interface Props {
     /** Position within the nearest positioned ancestor, px. */
@@ -27,7 +27,7 @@
   disabled={target === null}
   title={target === null
     ? "no agent session in this workspace — start one to reference"
-    : `reference in ${target.name} (${KEYS.reference})`}
+    : `reference in ${target.name} (${PINNED.reference})`}
   onpointerdown={(e) => {
     // Keep the selection alive: the press must never collapse it or start
     // a drag; the click alone acts.

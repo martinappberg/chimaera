@@ -451,6 +451,21 @@ export function toggleZoom(l: Layout): Layout {
 }
 
 /**
+ * Carry the focused pane's active tab into the neighboring pane in `dir`,
+ * focus following the tab. No-op without a neighbor, and while zoomed —
+ * the other panes aren't visible, so a silent move would be disorienting.
+ */
+export function moveTabDirection(l: Layout, dir: FocusDir): Layout {
+  if (l.zoomedPaneId !== null) return l;
+  const p = findPane(l.root, l.focusedPaneId);
+  if (p === null || p.tabs.length === 0) return l;
+  const probe = moveFocus(l, dir);
+  if (probe.focusedPaneId === l.focusedPaneId) return l;
+  // center drop detaches from the source pane and focuses the target
+  return dropTab(l, p.tabs[p.active], probe.focusedPaneId, "center");
+}
+
+/**
  * Drop a surface onto a pane. Edge zones tear off into a new split on that
  * side; center adds (or moves) the tab into the pane. The surface's existing
  * tab, if any, is detached first — the no-duplicates invariant holds.
