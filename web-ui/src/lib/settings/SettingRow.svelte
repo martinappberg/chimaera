@@ -713,8 +713,12 @@
     .select {
       max-width: 100%;
     }
+  }
 
-    /* A joined segmented bar can't shrink, so let it wrap as separated pills. */
+  /* Very narrow: guarantee nothing overflows. The slider yields to its numbox,
+     the hex field shrinks to fit, and the segmented bar — which can't shrink —
+     wraps as separated pills. */
+  @container settings (max-width: 360px) {
     .seg {
       flex-wrap: wrap;
       gap: 5px;
@@ -727,11 +731,7 @@
       border: 1px solid var(--edge);
       border-radius: 6px;
     }
-  }
 
-  /* Very narrow: guarantee nothing overflows. The slider yields to its numbox
-     and the hex field shrinks to fit. */
-  @container settings (max-width: 360px) {
     .num {
       gap: 8px;
     }

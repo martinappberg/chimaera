@@ -320,6 +320,12 @@
     gap: 14px;
   }
 
+  /* The UI/JSON mode switch lives in the header's far corner — next to the
+     h1 it read as part of the title. */
+  .title-row .tabs {
+    margin-left: auto;
+  }
+
   .title {
     margin: 0;
     font-size: 17px;
@@ -579,11 +585,14 @@
       flex-direction: column;
     }
 
+    /* The rail folds into a quiet text tab strip (the pane-tab language, not
+       buttons): muted labels, the active one carrying an accent underline
+       that sits on the strip's own hairline. */
     .nav {
       width: auto;
       flex-direction: row;
-      gap: 6px;
-      padding: 8px 12px;
+      gap: 2px;
+      padding: 4px 10px 0;
       overflow-x: auto;
       overflow-y: hidden;
       border-bottom: 1px solid var(--edge);
@@ -598,15 +607,20 @@
     .nav-item {
       flex: none;
       white-space: nowrap;
-      padding: 3px 11px;
-      border: 1px solid var(--edge);
-      border-radius: 999px;
-      background: var(--term-bg);
+      font-size: var(--text-sm);
+      padding: 4px 9px 7px;
+      border-radius: 0;
+      background: none;
+    }
+
+    .nav-item:hover {
+      background: none;
+      color: var(--fg);
     }
 
     .nav-item.on {
-      background: color-mix(in srgb, var(--accent) 14%, transparent);
-      border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
+      background: none;
+      box-shadow: inset 0 -2px 0 var(--accent);
     }
 
     .list {
