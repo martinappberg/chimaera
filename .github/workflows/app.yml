@@ -5,16 +5,32 @@ name: app
 # catches app breakage before merge. macOS runners are expensive, so it only
 # runs on PRs that change the app or the UI it embeds (release.yml builds and
 # publishes the app on merge, so no main-push trigger here).
+#
+# `ready_for_review` is in `types` (which overrides the default set, so the
+# defaults are respelled) purely so promoting a draft re-triggers the build the
+# draft guard below skipped. Without it, a draft PR marked ready would never
+# build the app until its next push.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "crates/chimaera-app/**"
       - "web-ui/**"
       - ".github/workflows/app.yml"
   workflow_dispatch:
 
+# macOS runners are the scarcest resource here (5 concurrent, 5 min a build):
+# never leave an obsolete bundle building after a new commit supersedes it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos:
+    # Don't spend a macOS bundle on a draft. Safe *only* because `macos` is not
+    # a required status check — a required check that never reports would block
+    # the PR forever on "Expected — waiting for status".
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +41,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/chimaera-app
+          # rust-cache keys on job name unless overridden, so this job (`macos`)
+          # could never restore the ~460 MB app cache that release.yml's `app`
+          # job writes on main — every PR compiled the app's deps cold. The
+          # shared-key replaces only that job-name slot, so `app` reproduces the
+          # exact key release.yml already writes (`v0-rust-app-<os>-<arch>-…`)
+          # and hits main's existing entry. release.yml pins the same value
+          # explicitly, so renaming its job can't silently break this.
+          shared-key: app
+          # Main saves, PRs restore. A PR-scoped cache is unreadable by every
+          # other PR yet still burns the repo's 10 GiB LRU quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm install
         working-directory: crates/chimaera-app
       # tauri's beforeBuildCommand builds web-ui (npm install + vite build);
