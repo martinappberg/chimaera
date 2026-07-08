@@ -56,6 +56,15 @@
   --ficon-config: #78788a;
   --ficon-bio: #8a5bb0;
   --ficon-vcs: #b0603c;
+  /* Git status tints (VS Code grammar, muted). Semantic and shared across all
+     themes by mode, so they live here (not in each theme's token set) like the
+     ficon fallbacks — status color is universal, not a per-theme choice. */
+  --git-modified: #a6720a;
+  --git-added: #2e7d33;
+  --git-untracked: #2e7d33;
+  --git-deleted: #c0392b;
+  --git-renamed: #1f7a8c;
+  --git-conflict: #d1541f;
 }
 
 :root[data-theme="dark"] {
@@ -93,6 +102,12 @@
   --ficon-config: #9a9ab0;
   --ficon-bio: #b78fdc;
   --ficon-vcs: #e0855c;
+  --git-modified: #d9a441;
+  --git-added: #6cc06f;
+  --git-untracked: #6cc06f;
+  --git-deleted: #e06c6c;
+  --git-renamed: #56b6c2;
+  --git-conflict: #e08a4f;
 }
 
 * {

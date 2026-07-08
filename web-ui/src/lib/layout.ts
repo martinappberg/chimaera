@@ -10,6 +10,8 @@
  * bottom of the module assert the core invariants.
  */
 
+import type { DiffMode } from "./git";
+
 export type SplitDir = "row" | "col";
 export type FocusDir = "left" | "right" | "up" | "down";
 export type Zone = "left" | "right" | "top" | "bottom" | "center";
@@ -42,13 +44,29 @@ export interface FinderTab {
   id: string;
   path: string;
 }
-export type Tab = TerminalTab | FileTab | SettingsTab | FinderTab;
+/** A side-by-side git diff of one file, at a chosen comparison. The mode is
+ *  part of the identity, so unstaged/staged diffs of the same file coexist. */
+export interface DiffTab {
+  surface: "diff";
+  /** Absolute path of the file being diffed. */
+  path: string;
+  mode: DiffMode;
+}
+/** The source-control (changes) panel — a singleton view like settings. */
+export interface GitTab {
+  surface: "git";
+}
+export type Tab = TerminalTab | FileTab | SettingsTab | FinderTab | DiffTab | GitTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
   if (t.surface === "terminal") return `s:${t.sessionId}`;
   if (t.surface === "file") return `f:${t.path}`;
   if (t.surface === "finder") return `d:${t.id}`;
+  // `g:`, not `d:` — the Finder owns the `d:` namespace, and two surfaces
+  // sharing a key prefix would alias inside the no-duplicates set.
+  if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
+  if (t.surface === "git") return "v:git";
   return "v:settings";
 }
 
@@ -338,6 +356,16 @@ export function openFile(l: Layout, path: string): Layout {
   return openTab(l, { surface: "file", path });
 }
 
+/** Open (or focus) a side-by-side diff of `path` at the given comparison. */
+export function openDiff(l: Layout, path: string, mode: DiffMode): Layout {
+  return openTab(l, { surface: "diff", path, mode });
+}
+
+/** Open (or focus) the source-control panel. */
+export function openGit(l: Layout): Layout {
+  return openTab(l, { surface: "git" });
+}
+
 export function openSettings(l: Layout): Layout {
   return openTab(l, { surface: "settings" });
 }
@@ -622,10 +650,20 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 
 // --- (de)serialization ------------------------------------------------------
 
-/** Tab wire form: `{s}` terminal, `{f}` file, `{v}` view (additive within
- *  blob v1; `v` currently only "settings"), `{d,di}` finder (dir + instance
- *  id). */
-type STab = { s: string } | { f: string } | { v: string } | { d: string; di: string };
+/** Tab wire form: `{s}` terminal, `{f}` file, `{d,di}` finder (dir + instance
+ *  id), `{gd,dm}` git diff (path + mode), `{v}` view (additive within blob v1;
+ *  `v` is "settings" or "git"). */
+type STab =
+  | { s: string }
+  | { f: string }
+  | { v: string }
+  | { d: string; di: string }
+  | { gd: string; dm?: string };
+
+/** Coerce a persisted diff mode, defaulting to unstaged. */
+function diffModeOf(x: unknown): DiffMode {
+  return x === "staged" || x === "head" ? x : "unstaged";
+}
 interface SPane {
   t: "p";
   id: string;
@@ -653,6 +691,8 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "terminal") return { s: t.sessionId };
         if (t.surface === "file") return { f: t.path };
         if (t.surface === "finder") return { d: t.path, di: t.id };
+        if (t.surface === "diff") return { gd: t.path, dm: t.mode };
+        if (t.surface === "git") return { v: "git" };
         return { v: "settings" };
       }),
       active: node.active,
@@ -704,6 +744,10 @@ function deserNode(
         // blobs that somehow carry `d` without it).
         const id = typeof t.di === "string" && t.di.length > 0 ? t.di : uid();
         tab = { surface: "finder", id, path: t.d };
+      } else if (typeof t.gd === "string" && t.gd.length > 0 && t.gd.length <= 4096) {
+        tab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
+      } else if (t.v === "git") {
+        tab = { surface: "git" };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

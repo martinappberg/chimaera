@@ -484,7 +484,11 @@ enum WriteOutcome {
 /// `{"error":"file changed on disk"}` when `expect_mtime` (the token from a
 /// previous GET/PUT) no longer matches — the check is skipped when the param
 /// is absent; 413 over 1MB (editing is for small text files).
-pub(crate) async fn put_file(Query(query): Query<PutFileQuery>, body: Bytes) -> Response {
+pub(crate) async fn put_file(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PutFileQuery>,
+    body: Bytes,
+) -> Response {
     if body.len() > MAX_WRITE_BYTES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -499,6 +503,9 @@ pub(crate) async fn put_file(Query(query): Query<PutFileQuery>, body: Bytes) -> 
     }
     match write_file_atomic(&query.path, &body, query.expect_mtime.as_deref()) {
         Ok(WriteOutcome::Written(mtime)) => {
+            // A save is a git-relevant change: nudge the workspace(s) holding
+            // this path so the tree/panel refetch without any polling.
+            crate::git::mark_path_dirty(&state, &query.path);
             let mut response = StatusCode::NO_CONTENT.into_response();
             response.headers_mut().insert(
                 HeaderName::from_static("x-mtime"),

@@ -385,9 +385,11 @@ pub(crate) async fn ingest(
     // File-writing tools feed the touched-files list (clickable "N files"
     // chips in the UI). Real payloads verified against claude 2.1.196: the
     // path lives in tool_input.file_path (notebook_path for NotebookEdit).
+    let mut touched_path: Option<String> = None;
     if event == "PostToolUse" {
         if let Some(path) = touched_file(&payload) {
             changed |= record.touch_file(path);
+            touched_path = Some(path.to_string());
         }
     }
 
@@ -401,6 +403,12 @@ pub(crate) async fn ingest(
 
     if changed {
         state.changes.notify_waiters();
+    }
+
+    // An agent writing a file is the signature git refresh trigger: the hook we
+    // already ingest IS the mechanism — no polling, no terminal-text parsing.
+    if let Some(path) = touched_path {
+        crate::git::mark_path_dirty(&state, &path);
     }
 
     // `@term:` mentions in the user's prompt auto-link those terminals to

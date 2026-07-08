@@ -18,6 +18,12 @@ export interface EventsSocketHandlers {
    */
   onSettings?(settings: Record<string, unknown>): void;
   /**
+   * Per-workspace git epoch map (invalidate-and-pull): fired after auth and
+   * whenever any workspace's git state may have changed. The caller refetches
+   * `GET /git/status` for its active workspace iff that workspace's epoch moved.
+   */
+  onGit?(epochs: Record<string, number>): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -35,6 +41,7 @@ interface ServerEventFrame {
   sessions?: Session[];
   links?: Link[];
   settings?: Record<string, unknown>;
+  epochs?: Record<string, number>;
   message?: string;
 }
 
@@ -89,6 +96,13 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onSettings?.(msg.settings);
+      } else if (
+        msg.type === "git" &&
+        typeof msg.epochs === "object" &&
+        msg.epochs !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onGit?.(msg.epochs);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

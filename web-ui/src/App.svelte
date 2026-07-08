@@ -84,10 +84,12 @@
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    openDiff,
     openFile,
     openFinder,
     findFinder,
     setFinderPath,
+    openGit,
     openSession,
     openSettings,
     paneForTab,
@@ -109,6 +111,7 @@
   import type { PathKind } from "./lib/links";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
+  import { activateGitWorkspace, gitStatus, onGitNudge, type DiffMode } from "./lib/git";
   import {
     paneContentEl,
     paneRootEl,
@@ -339,6 +342,12 @@
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+
+  // Keep the git store pointed at the active workspace. It fetches status on
+  // change; the events-socket epoch nudge refetches on subsequent changes.
+  $effect(() => {
+    void activateGitWorkspace(activeWsId);
+  });
   // The rail groups terminals (few) above agents (many); this order is also
   // the mod+1–9 chord order and the focus-mode strip order, so what you see
   // is what the numbers mean.
@@ -522,6 +531,7 @@
         if (linkList !== undefined) links = linkList;
       },
       onSettings: applyRemoteSettings,
+      onGit: onGitNudge,
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -760,6 +770,30 @@
     }
     // A file surface took focus: pull DOM focus off the terminal so plain
     // keys stop reaching a PTY that is no longer the focused view.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Same grammar as openFileFromPane, for a diff opened from the git panel. */
+  function openDiffFromPane(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void {
+    const existing = paneForTab(layout.root, { surface: "diff", path, mode });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openDiff(focusPane(layout, neighbor), path, mode);
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openDiff(layout, path, mode);
+      }
+    }
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open (or focus) the source-control panel in the focused pane. */
+  function openGitPanel(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openGit(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
@@ -1632,6 +1666,9 @@
     navigateFinder(id, path) {
       layout = setFinderPath(layout, id, path);
     },
+    openDiffFrom(paneId, path, mode, newSplit) {
+      openDiffFromPane(paneId, path, mode, newSplit);
+    },
     adjustFont(paneId, delta) {
       adjustFont(paneId, delta);
     },
@@ -1694,7 +1731,11 @@
           ? (fileTitles.get(tab.path) ?? basename(tab.path))
           : tab.surface === "finder"
             ? (basename(tab.path) || "Finder")
-            : "Settings";
+            : tab.surface === "diff"
+              ? `${basename(tab.path)} (diff)`
+              : tab.surface === "git"
+                ? "Source Control"
+                : "Settings";
     // Arm the bottom bands for this drag: reference targets for file drags,
     // link targets for shell-terminal drags. Drives the partitioned zone
     // previews (the band region is reserved, never flashed over).
@@ -2396,6 +2437,40 @@
         <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
           >{getHostLabel()}</span
         >
+        {#if $gitStatus !== null}
+          <!-- Always-on orientation: what branch you're on and how dirty the
+               tree is; one click opens the source-control panel. -->
+          <button
+            class="daemon-git"
+            onclick={openGitPanel}
+            title={`${$gitStatus.detached ? `detached at ${$gitStatus.head ?? "?"}` : ($gitStatus.branch ?? "unborn branch")}${$gitStatus.upstream ? ` · ${$gitStatus.upstream}` : ""} — open source control`}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <path
+                d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+              <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+            <span class="dg-branch"
+              >{$gitStatus.detached
+                ? ($gitStatus.head ?? "detached")
+                : ($gitStatus.branch ?? "unborn")}</span
+            >
+            {#if $gitStatus.ahead > 0}<span class="dg-ab">↑{$gitStatus.ahead}</span>{/if}
+            {#if $gitStatus.behind > 0}<span class="dg-ab">↓{$gitStatus.behind}</span>{/if}
+            {#if $gitStatus.counts.total > 0}
+              <span class="dg-dirty" title="{$gitStatus.counts.total} changed">
+                ●{$gitStatus.counts.total}
+              </span>
+            {/if}
+          </button>
+        {/if}
         {#if activeWsId !== null}
           <button
             class="daemon-settings"
@@ -2446,6 +2521,7 @@
             links={linksByTerminal}
             {linkCtrl}
             wsRoot={workspace?.root ?? null}
+            wsId={activeWsId}
             {bandPanes}
             {ctrl}
           />
@@ -2460,6 +2536,7 @@
             links={linksByTerminal}
             {linkCtrl}
             wsRoot={workspace?.root ?? null}
+            wsId={activeWsId}
             {bandPanes}
             {ctrl}
           />
@@ -3352,6 +3429,51 @@
   .strip-host.remote {
     color: var(--accent);
     font-weight: 600;
+  }
+
+  /* Branch + dirty count: always-on git orientation, quiet until it matters. */
+  .daemon-git {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 0.22rem;
+    max-width: 50%;
+    height: 20px;
+    padding: 0 0.3rem;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    font: inherit;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .daemon-git:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .dg-branch {
+    font-family: var(--mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  .dg-ab,
+  .dg-dirty {
+    flex: none;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .dg-dirty {
+    color: var(--git-modified);
   }
 
   /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */

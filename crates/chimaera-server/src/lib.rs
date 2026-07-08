@@ -2,6 +2,7 @@ mod agents;
 mod api;
 mod assets;
 mod fs;
+mod git;
 mod launcher;
 mod links;
 mod mcp;
@@ -73,6 +74,9 @@ pub(crate) struct AppState {
     pub(crate) tickets: Mutex<fs::TicketStore>,
     /// Quick-open walk cache (short TTL, per workspace).
     pub(crate) quickopen: Mutex<quickopen::QuickOpenCache>,
+    /// Read-only git service (status/diff): discovery cache, per-workspace nudge
+    /// epochs, and a bounded pool for `git` child processes. Never persisted.
+    pub(crate) git: git::GitService,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
@@ -141,6 +145,7 @@ impl AppState {
             links: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
+            git: git::GitService::new(),
             changes: tokio::sync::Notify::new(),
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
@@ -203,6 +208,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/table", get(fs::table))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        .route("/git/status", get(git::status))
+        .route("/git/diff", get(git::diff))
         .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
@@ -278,6 +285,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     ) {
         tracing::warn!(%err, "failed to write theming shims");
     }
+
+    // Backstop poll for out-of-band git changes (external editor, terminal
+    // `git` commands); event-driven refresh covers the rest. Idle-cheap.
+    tokio::spawn(git::backstop_poll(state.clone()));
 
     axum::serve(listener, app(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -3601,6 +3612,10 @@ mod tests {
                 WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
                 _ => continue,
             };
+            // settings/git frames interleave on this bus; only sessions matter here.
+            if frame["type"] != "sessions" {
+                continue;
+            }
             let done = frame["sessions"].as_array().unwrap().iter().any(|s| {
                 s["id"] == id && s["files_touched"] == serde_json::json!(["/w/touched.rs"])
             });
@@ -3610,6 +3625,134 @@ mod tests {
         }
 
         state.sessions.kill(&id).ok();
+    }
+
+    /// End-to-end against a REAL repo: status must resolve the branch and
+    /// classify a modified tracked file vs an untracked one. A directory that
+    /// is not a repo answers `{"repo":false}` rather than failing.
+    #[tokio::test]
+    async fn git_status_reads_a_real_repo() {
+        let repo = test_dir("gitrepo");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                // Hermetic: never read the developer's global/system config.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .expect("git must be installed");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "init"]);
+        // A tracked file modified in the worktree, plus a brand-new file.
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "hi\n").unwrap();
+
+        let state = test_state();
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": repo.to_string_lossy()})),
+        )
+        .await;
+        assert!(status.is_success(), "workspace create failed: {ws}");
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        let (status, body) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/git/status?workspace_id={ws_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["repo"], true);
+        assert_eq!(body["branch"], "main");
+        assert_eq!(body["detached"], false);
+
+        let entries = body["entries"].as_array().unwrap();
+        let modified = entries
+            .iter()
+            .find(|e| e["rel"] == "tracked.txt")
+            .expect("modified file present");
+        assert_eq!(modified["unstaged"], true);
+        assert_eq!(modified["staged"], false);
+        assert_eq!(modified["untracked"], false);
+        assert_eq!(modified["y"], "M");
+
+        let untracked = entries
+            .iter()
+            .find(|e| e["rel"] == "new.txt")
+            .expect("untracked file present");
+        assert_eq!(untracked["untracked"], true);
+        assert_eq!(body["counts"]["untracked"], 1);
+        assert_eq!(body["counts"]["unstaged"], 1);
+
+        // The diff endpoint returns both blob sides for the modified file.
+        let path = repo.join("tracked.txt");
+        let (status, diff) = request(
+            &state,
+            Method::GET,
+            &format!(
+                "/api/v1/git/diff?workspace_id={ws_id}&path={}&mode=unstaged",
+                urlencode(&path.to_string_lossy())
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diff["binary"], false);
+        assert_eq!(diff["a"], "one\n");
+        assert_eq!(diff["b"], "two\n");
+    }
+
+    #[tokio::test]
+    async fn git_status_on_a_non_repo_says_so() {
+        let plain = test_dir("notarepo");
+        let state = test_state();
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": plain.to_string_lossy()})),
+        )
+        .await;
+        assert!(status.is_success(), "workspace create failed: {ws}");
+        let ws_id = ws["id"].as_str().unwrap();
+        let (status, body) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/git/status?workspace_id={ws_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["repo"], false);
+    }
+
+    /// Percent-encode a path for a query string (tests only).
+    fn urlencode(s: &str) -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -3676,6 +3819,10 @@ mod tests {
                 WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
                 _ => continue,
             };
+            // settings/git frames interleave on this bus; only sessions matter here.
+            if frame["type"] != "sessions" {
+                continue;
+            }
             let done = frame["sessions"]
                 .as_array()
                 .unwrap()
@@ -3698,6 +3845,10 @@ mod tests {
                 WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
                 _ => continue,
             };
+            // settings/git frames interleave on this bus; only sessions matter here.
+            if frame["type"] != "sessions" {
+                continue;
+            }
             let gone = !frame["sessions"]
                 .as_array()
                 .unwrap()

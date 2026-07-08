@@ -895,9 +895,68 @@ setup into a new session. Distinctive, deferred.
 
 ### Git + Slurm
 
-- **Git**: shell out to system git and parse porcelain output (adversarial reviews flagged
-  gitoxide's diff gaps forcing a two-backend layer — shelling out is simpler and adequate for
-  read-mostly status/log/diff/show).
+- **Git** (design pass 2026-07-07 — read-only inspection first, worktree-aware). Shell out to
+  system git and parse porcelain (adversarial reviews flagged gitoxide's diff gaps forcing a
+  two-backend layer; shelling out is simpler and adequate for read-mostly status/log/diff/show).
+  A `git` service (`chimaera-server/src/git.rs`, modeled on `view_state.rs`) that:
+  - **Discovers the repo per workspace** and caches it: `git -C <root> rev-parse
+    --show-toplevel --git-common-dir` → repo or `None`. `--git-common-dir` groups all worktrees
+    of one repo — the workspace root may itself be a *linked* worktree (Chimaera is developed in
+    one), so that is the common case, not the edge.
+  - **One status command carries almost everything**: `git --no-optional-locks -C <top> status
+    --porcelain=v2 --branch -z --untracked-files=all` — per-path X/Y staged/unstaged codes,
+    rename scores, submodule state, *and* the branch header (name, upstream, ahead/behind) in a
+    single call. `--no-optional-locks` is load-bearing: status must never contend on the index
+    lock with a `git commit` the user or an agent runs in a terminal (slow/shared FS).
+  - **Resource discipline is the design** (login-node budget): every invocation is
+    `tokio::process` with a hard timeout (kill the child), an output-size cap, and an
+    entry-count cap (truncate to "N+ changes", never materialize a 50k-file list); one
+    in-flight status per repo, concurrent asks coalesce. **Git state is never persisted** — it
+    is reconstructible, so nothing new lands under `~/.chimaera`.
+  - **Refresh is event-driven, not polled** (a 2 s `git status` loop is exactly the steady-state
+    cost the budget forbids, and NFS/Lustre inotify is unreliable where Chimaera runs, so no
+    file-watcher either). Recompute on signals the daemon already has: a daemon file save
+    (`PUT /fs/file`), an **agent PostToolUse write** (`files_touched` is already ingested — the
+    signature integration: agent writes → tree lights up, zero polling), a linked-terminal
+    command completing (OSC 133 boundary), and explicit UI refresh. A slow (~10–15 s) backstop
+    poll, gated on "a client is actually looking at this workspace's git," catches out-of-band
+    external-editor edits; idle workspaces cost nothing.
+  - **Wire = invalidate-and-pull**, not push-the-payload. `/ws/events` gains only a tiny
+    `{type:"git", workspace_id, epoch}` nudge (the settings-generation trick); the client, if it
+    is showing that workspace, pulls `GET /api/v1/git/status?workspace_id=`. Big path-lists stay
+    off the daemon-wide firehose and materialize per-active-workspace. Diffs are always pull:
+    `GET /api/v1/git/diff?workspace_id=&path=&mode=unstaged|staged|head`, capped, with "binary
+    differs" and "diff too large → open the file" fallbacks.
+  - **Tree decoration is an overlay, not baked into `fs::list`** (status changes independently of
+    directory contents, and the tree lists lazily per-dir): a client `gitStatus` store keyed by
+    path (parallel to the `dirtyFiles` store), rolled up to collapsed ancestor folders on the
+    client. VS Code's grammar, muted to the theme: filename tint + a single M/A/D/U/? badge at
+    the row's right edge; new `--git-*` tokens in `themes.ts`/`app.css` (both schemes); one
+    shared status→color helper reused by tree rows, pane tabs (a modified file's tab tints), and
+    the changes panel.
+  - **Diff is a new pane surface** `{surface:"diff", path, mode}` (the `FileTab`
+    payload-carrying template): a diff tile *tiles next to the agent that produced the change*
+    and participates in the context bridge (select a hunk → "reference in agent"). **Side-by-side
+    from the start** via vendored `@codemirror/merge` `MergeView`.
+  - **Changes panel is a full-pane singleton surface** `{surface:"git"}` (the `SettingsTab`
+    template) — deliberately simple: branch header (branch · ahead/behind), grouped changed
+    files, click-to-diff. Plus always-on orientation: a `⎇ branch ↑2 ●7` indicator in the status
+    strip, and the branch on each session row (the header `branch` slot the interaction model
+    already reserves).
+  - **Worktree dimension (author, 2026-07-07 — a worktree is a dimension of ONE workspace, not a
+    peer workspace).** Parallel agents collide in one checkout; the fix is a worktree per agent
+    (shared `.git`, own branch, isolated tree). The workspace stays "the folder you opened"; the
+    git service knows the repo's worktrees (`git worktree list --porcelain`) and **agent↔branch
+    is derived, not stored** — match each session's polled cwd against the worktree paths.
+    Phased: **P1** the read-only inspection above; **P2** worktree orientation (branch per
+    session row/header, a **Branches** view in the changes panel listing each worktree + the
+    agents in it, status/diffs scoped to the active session's worktree — all read-only, nearly
+    free: one cheap `worktree list` on the git cadence + path-prefix matching); **P3**
+    orchestration — the launcher's one deliberate mutation, "new agent / new terminal in a new
+    branch" (`git worktree add -b`) + worktree removal (clean-check + confirm). Open P3
+    sub-decision: managed-worktree location — `~/.chimaera/worktrees/<repo>/<branch>`
+    (daemon-owned prefix, no repo pollution) vs a repo-relative `.worktrees/` (more discoverable,
+    closer to the `.claude/worktrees/` convention).
 - **Slurm**: `squeue`/`sacct --json` poller with backoff; job strip in the sidebar;
   job↔session linking (detect agent-submitted sbatch); degrades to no-op off-cluster.
   Post-v1: launch agent sessions *as* Slurm jobs for heavy work — but note most compute nodes
@@ -1057,6 +1116,16 @@ which is the survival property that matters.
   fallback for SSH'd remotes with a `chimaera shell-integration` one-liner for full fidelity.
   `@term:` mention by the *user* auto-links; agents cannot self-link. Link ≠ layout — the
   sidecar split is default placement, not a container. Approvals remain Claude Code's own.
+- **2026-07-07 — git integration scoped (M4), read-only-first + worktree-aware.** Read-only
+  inspection ships first (status decoration, side-by-side diff via `@codemirror/merge`, a simple
+  full-pane changes panel, strip/session branch orientation) — stage/commit stay in a terminal
+  for now. Refresh is event-driven (file save + agent PostToolUse write + terminal command-done
+  + slow backstop), never a status poll; wire is an `/ws/events` invalidate-nudge + per-workspace
+  pull; tree status is a client overlay, not baked into `fs::list`. A **git worktree is a
+  dimension of one workspace** (not a peer workspace): agent↔branch is derived from cwd +
+  `git worktree list`; P2 adds read-only worktree orientation (Branches view, branch per agent),
+  P3 adds the one mutation (spawn agent/terminal into a new branch via `git worktree add`). Full
+  treatment in Architecture → Git + Slurm.
 
 Still open:
 

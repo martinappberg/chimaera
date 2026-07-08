@@ -8,6 +8,8 @@
   import { tick, untrack } from "svelte";
   import { fsList, type FsEntry } from "./files";
   import { getSetting } from "./settings/store.svelte";
+  import { gitIndex } from "./git";
+  import { decoFor, dirColor } from "./gitDeco";
   import FileIcon from "./FileIcon.svelte";
   import FolderIcon from "./FolderIcon.svelte";
 
@@ -285,6 +287,9 @@
     <div class="tree-empty">no matches</div>
   {/if}
   {#each rows as { entry, depth } (entry.path)}
+    {@const gEntry = entry.kind === "file" ? $gitIndex.files.get(entry.path) : undefined}
+    {@const gDeco = gEntry ? decoFor(gEntry) : null}
+    {@const gDir = entry.kind === "dir" ? $gitIndex.dirs.get(entry.path) : undefined}
     <div
       class="node"
       class:active={entry.path === activePath}
@@ -335,7 +340,21 @@
           <FileIcon path={entry.path} size={14} />
         {/if}
       </span>
-      <span class="node-name" class:dir={entry.kind === "dir"}>{entry.name}</span>
+      <span
+        class="node-name"
+        class:dir={entry.kind === "dir"}
+        style:color={gDeco ? gDeco.color : undefined}>{entry.name}</span>
+      {#if gDeco}
+        <span class="git-badge" style:color={gDeco.color} title={gDeco.label}
+          >{gDeco.letter}</span>
+      {:else if gDir}
+        <span
+          class="git-dot"
+          style:background={dirColor(gDir)}
+          title="contains changes"
+          aria-hidden="true"
+        ></span>
+      {/if}
     </div>
   {/each}
   </div>
@@ -512,5 +531,25 @@
 
   .node.active .node-name {
     color: var(--fg);
+  }
+
+  /* Git status: a single-letter badge (files) or a rollup dot (collapsed dirs),
+     pushed to the row's right edge — quiet, only present when state matters. */
+  .git-badge {
+    flex: none;
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 0.66rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  .git-dot {
+    flex: none;
+    margin-left: auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    opacity: 0.85;
   }
 </style>

@@ -8,6 +8,7 @@
  * Escape cancels an active drag.
  */
 
+import type { DiffMode } from "./git";
 import type { Side, SplitDir, Tab, Zone } from "./layout";
 
 export type DropSpot =
@@ -66,6 +67,12 @@ export interface LayoutCtrl {
   openFileFrom(paneId: string, path: string, newSplit: boolean): void;
   /** Persist a Finder instance's current directory (its navigation state). */
   navigateFinder(id: string, path: string): void;
+  /**
+   * Open a side-by-side diff surfaced FROM `paneId` (a changes-panel row):
+   * same adjacent-pane / fresh-split grammar as `openFileFrom`, so the panel
+   * stays visible beside the diff it opened.
+   */
+  openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void;
   /**
    * Step the pane's terminal font size (`delta` +1/-1), or reset to the
    * default (`delta` 0). Same action as the Cmd/Ctrl +/−/0 chords.
