@@ -64,6 +64,8 @@ export interface LayoutCtrl {
    * has one pane / `newSplit` (Cmd/Ctrl) is set.
    */
   openFileFrom(paneId: string, path: string, newSplit: boolean): void;
+  /** Persist a Finder instance's current directory (its navigation state). */
+  navigateFinder(id: string, path: string): void;
   /**
    * Step the pane's terminal font size (`delta` +1/-1), or reset to the
    * default (`delta` 0). Same action as the Cmd/Ctrl +/−/0 chords.

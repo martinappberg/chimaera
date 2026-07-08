@@ -84,6 +84,9 @@
     moveFocus,
     moveTabToIndex,
     openFile,
+    openFinder,
+    findFinder,
+    setFinderPath,
     openSession,
     openSettings,
     paneForTab,
@@ -605,12 +608,17 @@
 
   /** A confirmed terminal path link was activated. */
   function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    const fromPane = loc?.paneId ?? layout.focusedPaneId;
     if (kind === "dir") {
+      // Directory names open in the Finder (browsing anywhere, in or out of the
+      // workspace); an in-workspace dir is ALSO revealed in the FILES side-tree
+      // (revealInTree is a no-op outside the root).
+      openDirInFinder(fromPane, path, newSplit);
       revealInTree(path);
       return;
     }
-    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
-    openFileFromPane(loc?.paneId ?? layout.focusedPaneId, path, newSplit);
+    openFileFromPane(fromPane, path, newSplit);
   }
 
   /**
@@ -642,6 +650,71 @@
   function revealInTree(path: string): void {
     filesOpen = true;
     treeReveal = { path, nonce: ++revealNonce };
+  }
+
+  // --- the Finder (Miller-columns file browser) ------------------------------
+
+  /** Finder instances this window focused, most recent first (dir-link reuse). */
+  let finderMru = $state<string[]>([]);
+  $effect(() => {
+    const fp = findPane(layout.root, layout.focusedPaneId);
+    const active = fp?.tabs[fp.active];
+    if (active === undefined || active.surface !== "finder") return;
+    const id = active.id;
+    if (finderMru[0] === id) return;
+    finderMru = [id, ...finderMru.filter((x) => x !== id)].slice(0, 16);
+  });
+
+  /** Every open Finder instance's id, in tree order. */
+  function allFinderIds(): string[] {
+    const out: string[] = [];
+    for (const p of panesOf(layout.root)) {
+      for (const t of p.tabs) if (t.surface === "finder") out.push(t.id);
+    }
+    return out;
+  }
+
+  /**
+   * The Finder a directory link should drive: the one in the focused pane, else
+   * the most-recently-focused still-open one, else any open one. Null when none
+   * is open (the caller opens a fresh Finder instead).
+   */
+  function targetFinderId(): string | null {
+    const fp = findPane(layout.root, layout.focusedPaneId);
+    const active = fp?.tabs[fp.active];
+    if (active !== undefined && active.surface === "finder") return active.id;
+    for (const fid of finderMru) if (findFinder(layout, fid) !== null) return fid;
+    return allFinderIds()[0] ?? null;
+  }
+
+  /** The FILES-header button / menu: open a fresh Finder at the workspace root. */
+  function openFinderSurface(): void {
+    if (activeWsId === null || !layoutReady || workspace === null) return;
+    layout = openFinder(layout, workspace.root).layout;
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /**
+   * A directory link from a pane: reuse an open Finder (unless Cmd/Ctrl forced a
+   * split), else open a fresh Finder beside the source terminal — adjacent pane,
+   * or a split to the right when the window has one pane.
+   */
+  function openDirInFinder(paneId: string, path: string, newSplit: boolean): void {
+    const targetId = newSplit ? null : targetFinderId();
+    if (targetId !== null) {
+      layout = setFinderPath(layout, targetId, path);
+      const loc = findFinder(layout, targetId);
+      if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openFinder(focusPane(layout, neighbor), path).layout;
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openFinder(layout, path).layout;
+      }
+    }
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
   /** Guards overlapping boots (initial load racing a workspace switch). */
@@ -1433,6 +1506,9 @@
     openFileFrom(paneId, path, newSplit) {
       openFileFromPane(paneId, path, newSplit);
     },
+    navigateFinder(id, path) {
+      layout = setFinderPath(layout, id, path);
+    },
     adjustFont(paneId, delta) {
       adjustFont(paneId, delta);
     },
@@ -1493,7 +1569,9 @@
           tab.sessionId.slice(0, 8))
         : tab.surface === "file"
           ? (fileTitles.get(tab.path) ?? basename(tab.path))
-          : "Settings";
+          : tab.surface === "finder"
+            ? (basename(tab.path) || "Finder")
+            : "Settings";
     // Arm the bottom bands for this drag: reference targets for file drags,
     // link targets for shell-terminal drags. Drives the partitioned zone
     // previews (the band region is reserved, never flashed over).
@@ -2137,23 +2215,38 @@
           ></div>
         {/if}
         <section class="files" class:open={filesOpen} style:flex-basis={filesOpen ? `${filesFrac * 100}%` : "auto"}>
-          <button
-            class="files-header"
-            aria-expanded={filesOpen}
-            onclick={() => (filesOpen = !filesOpen)}
-          >
-            <svg class="files-chev" class:open={filesOpen} viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
-              <path
-                d="M6 4l4 4-4 4"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-            <span>files</span>
-          </button>
+          <div class="files-head">
+            <button
+              class="files-header"
+              aria-expanded={filesOpen}
+              onclick={() => (filesOpen = !filesOpen)}
+            >
+              <svg class="files-chev" class:open={filesOpen} viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+                <path
+                  d="M6 4l4 4-4 4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span>files</span>
+            </button>
+            <button
+              class="files-finder"
+              title="new finder"
+              aria-label="new finder"
+              onclick={openFinderSurface}
+            >
+              <!-- A columns glyph: the Miller-columns file browser. -->
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3" />
+                <line x1="6.7" y1="3" x2="6.7" y2="13" stroke="currentColor" stroke-width="1.3" />
+                <line x1="11" y1="3" x2="11" y2="13" stroke="currentColor" stroke-width="1.3" />
+              </svg>
+            </button>
+          </div>
           {#if filesOpen}
             <div class="files-body">
               <FileTree
@@ -2974,8 +3067,17 @@
     flex-grow: 0;
   }
 
-  .files-header {
+  /* Header row: the collapse toggle (left, fills the row) + the new-finder
+     button (right), mirroring how .workspace pairs its button with an action. */
+  .files-head {
     flex: none;
+    display: flex;
+    align-items: center;
+  }
+
+  .files-header {
+    flex: 1;
+    min-width: 0;
     appearance: none;
     border: none;
     background: none;
@@ -2995,6 +3097,32 @@
 
   .files-header:hover {
     color: var(--fg);
+  }
+
+  .files-finder {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3px;
+    margin-right: 10px;
+    border-radius: 5px;
+    color: var(--muted);
+    opacity: 0.75;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      opacity 0.12s ease,
+      background-color 0.12s ease;
+  }
+
+  .files-finder:hover {
+    color: var(--fg);
+    opacity: 1;
+    background: var(--row-hover);
   }
 
   .files-chev {

@@ -9,6 +9,7 @@
   import { fsList, type FsEntry } from "./files";
   import { getSetting } from "./settings/store.svelte";
   import FileIcon from "./FileIcon.svelte";
+  import FolderIcon from "./FolderIcon.svelte";
 
   interface Props {
     /** Workspace root on the daemon's filesystem. */
@@ -325,8 +326,15 @@
           />
         </svg>
       {:else}
-        <span class="file-glyph"><FileIcon path={entry.path} size={14} /></span>
+        <span class="chev-spacer" aria-hidden="true"></span>
       {/if}
+      <span class="row-glyph">
+        {#if entry.kind === "dir"}
+          <FolderIcon open={expanded.has(entry.path)} size={14} />
+        {:else}
+          <FileIcon path={entry.path} size={14} />
+        {/if}
+      </span>
       <span class="node-name" class:dir={entry.kind === "dir"}>{entry.name}</span>
     </div>
   {/each}
@@ -429,7 +437,7 @@
   .node {
     display: flex;
     align-items: center;
-    gap: 0.35rem;
+    gap: 4px;
     height: 22px;
     padding-right: 0.45rem;
     border-radius: 4px;
@@ -473,13 +481,19 @@
     opacity: 0.4;
   }
 
-  /* File glyph sits in the chevron column; a hair inset so its 14px body
-     lines up with the 9px dir chevrons above it. */
-  .file-glyph {
+  /* Blank disclosure slot for files, so their folder/file glyph aligns under
+     the folder icons of sibling directories (fixed chevron column). */
+  .chev-spacer {
+    flex: none;
+    width: 9px;
+  }
+
+  /* The folder/file glyph column, a hair tighter to the disclosure. */
+  .row-glyph {
     flex: none;
     display: flex;
     align-items: center;
-    margin: 0 -2px 0 -3px;
+    margin-left: -1px;
   }
 
   .node-name {
