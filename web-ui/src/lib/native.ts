@@ -8,6 +8,7 @@
  * with crates/chimaera-app — change them in lockstep.
  */
 
+import { writable } from "svelte/store";
 import { getToken } from "./api";
 import type { Workspace } from "./sessions";
 
@@ -209,13 +210,18 @@ export function onConnectProgress(
 /** Live tunnel liveness pushed by the shell (health monitor + reconnect). */
 export interface HostStatusEvent {
   alias: string;
-  /** "down" = the forward stopped accepting (remote daemon or ssh died). */
-  status: "connected" | "down";
+  /** "down" = the forward stopped answering (remote daemon or ssh died);
+   *  "error" = a connect attempt failed (whoever started it). */
+  status: "connected" | "down" | "error";
   /** Local end of the tunnel (may change across a reconnect). */
   local_port: number | null;
   /** New daemon token, on "connected" only — lets a window re-home if the
-   *  remote daemon restarted. Absent on "down". */
+   *  remote daemon restarted. Absent on "down"/"error". */
   token?: string;
+  /** The connect failure, on "error" only — so a home screen that merely
+   *  observed the attempt (startup restore) can surface it instead of
+   *  showing "connecting" forever. */
+  error?: string;
 }
 
 /**
@@ -271,6 +277,36 @@ export function onAskpass(handler: (p: AskpassPrompt) => void): Promise<() => vo
   if (t === null) return Promise.resolve(() => {});
   return t.event.listen<AskpassPrompt>("ssh-askpass", (e) => handler(e.payload));
 }
+
+/**
+ * SSH prompts already waiting when this window mounted. The `ssh-askpass`
+ * event only reaches windows that exist at emit time — startup window
+ * restore starts connecting before the first webview loads, so without this
+ * fetch that prompt would be lost and the host stuck "connecting" with
+ * nothing to answer.
+ */
+export async function listAskpass(): Promise<AskpassPrompt[]> {
+  const t = tauri();
+  if (t === null) return [];
+  return t.core.invoke<AskpassPrompt[]>("list_askpass");
+}
+
+/**
+ * Prompt `id` was resolved somewhere else (answered in another window, or it
+ * timed out) — dismiss it here too.
+ */
+export function onAskpassDone(handler: (id: number) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<number>("ssh-askpass-done", (e) => handler(e.payload));
+}
+
+/**
+ * Whether an SSH auth prompt is currently on screen (set by AskpassModal).
+ * The reconnect overlay reads it to say "waiting for authentication" instead
+ * of showing a competing spinner/error under the prompt.
+ */
+export const askpassActive = writable(false);
 
 /**
  * Answer prompt `id`. `secret` null cancels it, letting the waiting ssh fail

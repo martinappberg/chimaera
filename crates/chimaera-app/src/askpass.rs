@@ -41,23 +41,35 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Prompts awaiting a UI answer, keyed by a per-request id. Managed as Tauri
 /// state so the socket task and the `answer_askpass` command share it.
+///
+/// The prompt TEXT is kept alongside the answer channel because the
+/// `ssh-askpass` emit is fire-and-forget: a window that mounts after the
+/// emit (startup window restore kicks off remote connects before any webview
+/// has loaded) would otherwise never learn a prompt exists, and ssh would
+/// silently wait out the timeout — the "host stuck connecting with no
+/// prompt" failure. The UI fetches `pending()` on mount to close that gap.
 #[derive(Default)]
 pub struct Askpass {
-    pending: Mutex<HashMap<u64, oneshot::Sender<Option<String>>>>,
+    pending: Mutex<HashMap<u64, PendingPrompt>>,
     seq: AtomicU64,
+}
+
+struct PendingPrompt {
+    prompt: String,
+    tx: oneshot::Sender<Option<String>>,
 }
 
 /// `ssh-askpass` event payload: a prompt the UI must answer.
 #[derive(Clone, Serialize)]
-struct PromptEvent {
+pub struct PromptEvent {
     id: u64,
     prompt: String,
 }
 
 impl Askpass {
-    fn register(&self, tx: oneshot::Sender<Option<String>>) -> u64 {
+    fn register(&self, prompt: String, tx: oneshot::Sender<Option<String>>) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        lock(&self.pending).insert(id, tx);
+        lock(&self.pending).insert(id, PendingPrompt { prompt, tx });
         id
     }
 
@@ -66,10 +78,30 @@ impl Askpass {
     }
 
     /// Resolve prompt `id` with the user's answer (`None` = cancelled).
-    pub fn answer(&self, id: u64, secret: Option<String>) {
-        if let Some(tx) = lock(&self.pending).remove(&id) {
-            let _ = tx.send(secret);
+    /// Returns whether the prompt was still pending — the caller broadcasts
+    /// `ssh-askpass-done` so every OTHER window showing it dismisses too.
+    pub fn answer(&self, id: u64, secret: Option<String>) -> bool {
+        match lock(&self.pending).remove(&id) {
+            Some(p) => {
+                let _ = p.tx.send(secret);
+                true
+            }
+            None => false,
         }
+    }
+
+    /// The prompts still awaiting an answer, oldest first (ssh asks
+    /// sequentially, so order is answer order).
+    pub fn pending(&self) -> Vec<PromptEvent> {
+        let mut prompts: Vec<PromptEvent> = lock(&self.pending)
+            .iter()
+            .map(|(id, p)| PromptEvent {
+                id: *id,
+                prompt: p.prompt.clone(),
+            })
+            .collect();
+        prompts.sort_by_key(|p| p.id);
+        prompts
     }
 }
 
@@ -154,11 +186,12 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
 
     let state = app.state::<Askpass>();
     let (tx, rx) = oneshot::channel();
-    let id = state.register(tx);
-    let event = PromptEvent {
-        id,
-        prompt: prompt.trim_end().to_string(),
-    };
+    let prompt = prompt.trim_end().to_string();
+    let id = state.register(prompt.clone(), tx);
+    let event = PromptEvent { id, prompt };
+    // The emit reaches only windows that are ALREADY listening; windows that
+    // mount later find this prompt via `pending()` (`list_askpass`). Zero
+    // windows at emit time is therefore fine — not an error.
     if app.emit("ssh-askpass", event).is_err() {
         state.discard(id);
         return;
@@ -167,9 +200,12 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
     let answer = match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
         Ok(Ok(Some(secret))) => secret,
         // Cancelled, timed out, or the app dropped the sender: no answer, so
-        // ssh moves on and fails cleanly rather than hanging.
+        // ssh moves on and fails cleanly rather than hanging. Windows still
+        // showing the prompt must drop it — there is no one left to receive
+        // an answer.
         _ => {
             state.discard(id);
+            let _ = app.emit("ssh-askpass-done", id);
             String::new()
         }
     };

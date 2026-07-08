@@ -1255,6 +1255,45 @@ old to have the toast. Home screen's version mark now says `daemon dev·<ref>` f
 builds instead of posing as an ordinary `v0.0.1` (field confusion: an app reinstall
 attached to a still-running dev daemon and nothing on screen said so).
 
+## Field notes: laptop-sleep reconnect (2026-07-08)
+
+The first real close-the-laptop-overnight cycle against the cluster broke reconnect in
+three compounding ways. Findings and the invariants they forced:
+
+- **A dead ssh forward keeps accepting.** After wake, the `-N -L` child's local listener
+  still accepts TCP while the connection behind it is gone — so every `TcpStream::connect`
+  liveness probe said "up", `connect_host` concluded "already connected" and healed
+  nothing, while the window's WebSocket retried a black hole forever. Invariant: **tunnel
+  liveness is an HTTP response end-to-end** (`http_alive`: any HTTP status on the loopback
+  port within 2s — even a 401 proves the daemon answered). A bare TCP accept is never
+  proof of anything. Corollary: chimaera ssh now carries `ServerAliveInterval=15`/
+  `CountMax=3` + `ConnectTimeout=15`, so dead masters and forwards exit in ~45s instead
+  of holding their listeners (and their lies) for hours.
+- **Askpass prompts are state, not just an event.** Startup window restore begins
+  connecting before any webview exists; a Duo prompt emitted then reached zero listeners
+  and vanished — ssh waited out its 180s timeout with the host stuck "connecting" and
+  nothing on screen to answer (the "blue bar, no prompts" bug). Invariant: pending
+  prompts are held in the shell (`list_askpass`) and every window fetches them on mount;
+  the emit is just the fast path. Answering in one window broadcasts `ssh-askpass-done`
+  so the others dismiss.
+- **Connects coalesce per alias.** A drop used to fan out: every window's reconnect plus
+  the home screen plus startup restore each called `connect_host`, the first won and the
+  rest bounced with "a connection attempt is already running" (or worse, queued more 2FA
+  prompts). Now one flight owns the ssh per alias and every concurrent caller awaits its
+  outcome — one Duo push per host, ever. The fresh-port retry after a reused-port failure
+  is gated on a typed `TunnelPhaseError`, because re-running the whole connect on an auth
+  cancel re-prompted 2FA.
+- **Remote windows come back with the first successful connect**, not just the next
+  launch: reopening persisted windows rides `connect` itself (dedup'd on stable window
+  id), so a host that was unreachable at launch restores its windows the moment a
+  home-screen click or auto-reconnect lands.
+- **Sessions snapshots wait for resurrection.** The daemon serves while the ledger is
+  still respawning, and a window's first `/ws/events` snapshot taken mid-restore read as
+  "those sessions died" — the client pruned their tabs out of the restored layout.
+  `GET /sessions` fed the same half-truth to the remote update decision ("0 live
+  sessions" → safe to replace the daemon → kills the sessions being resurrected). Both
+  now gate on restore completion (bounded at 15s so a wedged respawn can't blank the UI).
+
 ## Field notes: first cluster deployment (2026-07-06)
 
 M0 `connect` validated end-to-end against a production HPC cluster (CentOS 7.9 login

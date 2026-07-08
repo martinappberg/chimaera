@@ -15,14 +15,23 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
 
+/// A connect attempt's shared outcome: `None` while in flight, then the
+/// result. Joiners wait on this instead of racing their own ssh — see
+/// `do_connect`.
+type ConnectFlight = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
 /// App-global shell state.
 pub struct Shell {
     /// The local daemon (mutable: the update affordance replaces it).
     pub local: Mutex<LocalDaemon>,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
-    /// Aliases with a connect in flight (guards double-clicks).
-    connecting: Mutex<HashSet<String>>,
+    /// In-flight connect per alias. One flight owns the ssh; every other
+    /// caller (other windows' reconnects, the home screen, startup restore)
+    /// awaits its outcome — so a drop never fans out into an auth-prompt
+    /// stampede, and a click during a stuck attempt joins it instead of
+    /// bouncing with an error.
+    connecting: Mutex<HashMap<String, ConnectFlight>>,
     /// What each open window currently shows, keyed by window label. Drives
     /// focus-existing (open the same workspace → raise its window instead of a
     /// duplicate). The SPA reports its own scope because it swaps `ws`
@@ -70,7 +79,10 @@ struct ConnectProgress {
 /// Live tunnel liveness, pushed as hosts drop or reconnect (see the health
 /// monitor and `host-status` in native.ts). `token` rides the `connected`
 /// transition so a window whose remote daemon restarted (fresh token) can
-/// re-home; it is omitted on `down`.
+/// re-home; it is omitted on `down`. `error` rides the `error` transition (a
+/// connect flight failed) so surfaces that only observe events — a home
+/// screen watching a startup-restore connect — don't stay "connecting"
+/// forever on a failure they never hear about.
 #[derive(Clone, Serialize)]
 struct HostStatus {
     alias: String,
@@ -78,6 +90,8 @@ struct HostStatus {
     local_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// The local daemon's build parity, as the home screen sees it.
@@ -192,7 +206,7 @@ async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
     let store = HostsStore::load_default();
     let tunnels = state.tunnels.lock().await;
-    let connecting = crate::shell::lock(&state.connecting).clone();
+    let connecting: HashSet<String> = lock(&state.connecting).keys().cloned().collect();
     Ok(store
         .list()
         .iter()
@@ -277,7 +291,10 @@ async fn connect_host(
 }
 
 /// The connect flow behind the `connect_host` command, callable from
-/// startup window restore too (no `State` extractor).
+/// startup window restore too (no `State` extractor). Coalescing: only one
+/// attempt per alias runs at a time; every concurrent caller awaits that
+/// flight's outcome, so N windows reconnecting share ONE ssh auth flow (one
+/// 2FA prompt) instead of stampeding or bouncing with errors.
 async fn do_connect(
     app: &AppHandle,
     alias: String,
@@ -285,18 +302,113 @@ async fn do_connect(
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
-    // Reuse a live tunnel; a dead one is torn down and rebuilt on its old
-    // loopback port so open windows heal in place. An update never reuses:
-    // the old tunnel points at the daemon being replaced.
-    let reuse_port = {
-        let mut tunnels = state.tunnels.lock().await;
-        if let Some(t) = tunnels.get(&alias) {
-            if !update_daemon && t.is_up().await {
-                let entry = host_entry(&alias);
-                return Ok(state_for(&entry, "connected", Some(t)));
+    loop {
+        // Reuse a live tunnel. `is_up` is an end-to-end HTTP probe: after
+        // laptop sleep ssh's local listener often survives its dead
+        // connection, and a bare TCP check here would return "connected"
+        // without healing anything. An update never reuses — the old tunnel
+        // points at the daemon being replaced.
+        if !update_daemon {
+            let tunnels = state.tunnels.lock().await;
+            if let Some(t) = tunnels.get(&alias) {
+                if t.is_up().await {
+                    let entry = host_entry(&alias);
+                    return Ok(state_for(&entry, "connected", Some(t)));
+                }
             }
         }
-        match tunnels.remove(&alias) {
+        let flight = {
+            let mut connecting = lock(&state.connecting);
+            match connecting.get(&alias) {
+                Some(rx) => Err(rx.clone()),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    connecting.insert(alias.clone(), rx);
+                    Ok(tx)
+                }
+            }
+        };
+        let tx = match flight {
+            // Someone else owns the attempt: await its outcome. The clone
+            // frees the watch borrow before we touch `rx` again below.
+            Err(mut rx) => {
+                let outcome = rx.wait_for(|v| v.is_some()).await.map(|v| v.clone());
+                match outcome {
+                    Ok(outcome) => match outcome.expect("wait_for guarantees Some") {
+                        Ok(()) if !update_daemon => {
+                            let tunnels = state.tunnels.lock().await;
+                            match tunnels.get(&alias) {
+                                Some(t) => {
+                                    let entry = host_entry(&alias);
+                                    return Ok(state_for(&entry, "connected", Some(t)));
+                                }
+                                // Disconnected between the flight landing and
+                                // us looking — treat like any failed connect.
+                                None => {
+                                    return Err(format!("{alias} disconnected while connecting"))
+                                }
+                            }
+                        }
+                        // An update must still run its own flight — loop and
+                        // own the next one.
+                        Ok(()) => continue,
+                        Err(e) => return Err(e),
+                    },
+                    // The owner died without reporting (task dropped). Clear
+                    // the stale flight so the next iteration can own a fresh
+                    // one instead of spinning on a closed channel.
+                    Err(_) => {
+                        let mut connecting = lock(&state.connecting);
+                        if connecting.get(&alias).is_some_and(|r| r.same_channel(&rx)) {
+                            connecting.remove(&alias);
+                        }
+                        continue;
+                    }
+                }
+            }
+            Ok(tx) => tx,
+        };
+
+        // We own the flight: run it, then publish the outcome — every path
+        // out of `run_flight` must land here or joiners would hang.
+        let result = run_flight(app, &alias, update_daemon).await;
+        lock(&state.connecting).remove(&alias);
+        let _ = tx.send(Some(match &result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.clone()),
+        }));
+        // Surfaces that only watch events (a home screen observing a
+        // startup-restore connect) need the failure too, or their row sits
+        // in "connecting" forever. Windows ignore this status: it carries no
+        // port/token to re-home to, and only "down" arms their reconnect.
+        if let Err(e) = &result {
+            let _ = app.emit(
+                "host-status",
+                HostStatus {
+                    alias: alias.clone(),
+                    status: "error",
+                    local_port: None,
+                    token: None,
+                    error: Some(e.clone()),
+                },
+            );
+        }
+        return result;
+    }
+}
+
+/// One owned connect attempt: tear down the dead tunnel (keeping its
+/// loopback port so open windows heal in place), run the connect, install
+/// the new tunnel, and reopen this host's persisted windows.
+async fn run_flight(
+    app: &AppHandle,
+    alias: &str,
+    update_daemon: bool,
+) -> Result<HostState, String> {
+    let state = app.state::<Shell>();
+    let reuse_port = {
+        let mut tunnels = state.tunnels.lock().await;
+        match tunnels.remove(alias) {
             Some(old) => {
                 let port = old.local_port;
                 old.close().await;
@@ -305,31 +417,32 @@ async fn do_connect(
             None => None,
         }
     };
-    if !lock(&state.connecting).insert(alias.clone()) {
-        return Err("a connection attempt is already running".to_string());
-    }
-
     let entry = HostsStore::load_default()
-        .add(&alias, None)
+        .add(alias, None)
         .map_err(|e| format!("{e:#}"))?;
-    let result = run_connect(app, &alias, &entry, reuse_port, update_daemon).await;
+    let result = run_connect(app, alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
     // but socket teardown can lag; fall back to an OS-assigned port so a
-    // reconnect never fails on a transient bind clash.
+    // reconnect never fails on a transient bind clash. Only forward-phase
+    // failures retry — re-running the whole connect after an auth failure
+    // or cancel would raise a second 2FA prompt.
     let result = match result {
-        Err(e) if reuse_port.is_some() => {
+        Err(e)
+            if reuse_port.is_some()
+                && e.downcast_ref::<chimaera_remote::TunnelPhaseError>()
+                    .is_some() =>
+        {
             tracing::warn!("reconnect on port {reuse_port:?} failed ({e:#}); retrying fresh");
-            run_connect(app, &alias, &entry, None, update_daemon).await
+            run_connect(app, alias, &entry, None, update_daemon).await
         }
         other => other,
     };
-    lock(&state.connecting).remove(&alias);
 
     let tunnel = result.map_err(|e| format!("{e:#}"))?;
-    if let Err(e) = HostsStore::load_default().record_connected(&alias) {
+    if let Err(e) = HostsStore::load_default().record_connected(alias) {
         tracing::debug!("could not record host {alias}: {e}");
     }
-    let entry = host_entry(&alias);
+    let entry = host_entry(alias);
     let host_state = state_for(&entry, "connected", Some(&tunnel));
     // Tell open windows on this host to re-home if the port or token moved
     // (daemon restart / update); a same-port+token reconnect is a no-op for
@@ -337,14 +450,44 @@ async fn do_connect(
     let _ = app.emit(
         "host-status",
         HostStatus {
-            alias: alias.clone(),
+            alias: alias.to_string(),
             status: "connected",
             local_port: Some(tunnel.local_port),
             token: Some(tunnel.manifest.token.clone()),
+            error: None,
         },
     );
-    state.tunnels.lock().await.insert(alias.clone(), tunnel);
+    let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());
+    state.tunnels.lock().await.insert(alias.to_string(), tunnel);
+    // Any persisted windows for this host that aren't open come back now.
+    // The registry keeps records across a failed launch-time restore
+    // precisely so the first connect that DOES land — a home-screen click,
+    // a window's reconnect — restores them, not just the next app start.
+    reopen_windows(app, alias, port, &token);
     Ok(host_state)
+}
+
+/// Open every persisted window record for `alias` without a live window
+/// (matched on the record's stable id — an open window re-homes in place
+/// and must not be duplicated).
+fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return;
+    };
+    let open: HashSet<String> = lock(&shell.windows)
+        .values()
+        .map(|s| s.stable_id.clone())
+        .collect();
+    let records: Vec<WindowRecord> = lock(&shell.registry)
+        .list()
+        .into_iter()
+        .filter(|r| r.alias.as_deref() == Some(alias) && !open.contains(&r.id))
+        .collect();
+    for record in records {
+        if let Err(e) = open_ui_window(app, port, token, &record) {
+            tracing::warn!("could not reopen window {}: {e}", record.id);
+        }
+    }
 }
 
 #[tauri::command]
@@ -494,15 +637,29 @@ async fn install_app_update(app: AppHandle) -> Result<(), String> {
 }
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
-/// the user cancelled, which lets the waiting ssh fail cleanly.
+/// the user cancelled, which lets the waiting ssh fail cleanly. The done
+/// broadcast dismisses the prompt in every other window showing it.
 #[tauri::command]
 async fn answer_askpass(
+    app: AppHandle,
     askpass: State<'_, crate::askpass::Askpass>,
     id: u64,
     secret: Option<String>,
 ) -> Result<(), String> {
-    askpass.answer(id, secret);
+    if askpass.answer(id, secret) {
+        let _ = app.emit("ssh-askpass-done", id);
+    }
     Ok(())
+}
+
+/// SSH prompts still awaiting an answer. Each window fetches this on mount:
+/// the `ssh-askpass` emit reaches only windows that already exist, and
+/// startup window restore starts connecting before the first webview has
+/// loaded — without this, that prompt is lost and the host sits in
+/// "connecting" until ssh times out, with nothing for the user to answer.
+#[tauri::command]
+fn list_askpass(askpass: State<'_, crate::askpass::Askpass>) -> Vec<crate::askpass::PromptEvent> {
+    askpass.pending()
 }
 
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
@@ -615,9 +772,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Without this a dropped forward (remote daemon or ssh died) goes unnoticed
 /// until the user clicks. A single task is the sole emitter — windows and the
 /// home screen just listen, so there is no per-window reconnect stampede. The
-/// probe is a pure loopback connect (no ssh), cheap enough for a shared login
-/// node; it proves the forward is up, not that the remote daemon is healthy
-/// (same limitation as `Tunnel::is_up`).
+/// probe is an end-to-end HTTP health check on the loopback port (no extra
+/// ssh child): a bare TCP connect would keep reporting "up" after laptop
+/// sleep, when ssh's local listener survives its dead connection — the state
+/// that made reconnect a silent no-op.
 fn spawn_health_monitor(handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut prev: HashMap<String, bool> = HashMap::new();
@@ -639,9 +797,7 @@ fn spawn_health_monitor(handle: AppHandle) {
             // them without emitting a spurious `down`.
             prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
             for (alias, port, token) in &snap {
-                let up = tokio::net::TcpStream::connect(("127.0.0.1", *port))
-                    .await
-                    .is_ok();
+                let up = chimaera_remote::http_alive(*port).await;
                 if prev.insert(alias.clone(), up) == Some(up) {
                     continue; // no transition
                 }
@@ -652,6 +808,7 @@ fn spawn_health_monitor(handle: AppHandle) {
                         status: if up { "connected" } else { "down" },
                         local_port: Some(*port),
                         token: up.then(|| token.clone()),
+                        error: None,
                     },
                 );
             }
@@ -687,31 +844,13 @@ fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> bool {
     }
     for alias in remote_aliases {
         let handle = handle.clone();
-        let records: Vec<WindowRecord> = records
-            .iter()
-            .filter(|r| r.alias.as_deref() == Some(alias.as_str()))
-            .cloned()
-            .collect();
         tauri::async_runtime::spawn(async move {
-            match do_connect(&handle, alias.clone(), false).await {
-                Ok(_) => {
-                    let (port, token) = {
-                        let shell = handle.state::<Shell>();
-                        let tunnels = shell.tunnels.lock().await;
-                        match tunnels.get(&alias) {
-                            Some(t) => (t.local_port, t.manifest.token.clone()),
-                            None => return,
-                        }
-                    };
-                    for record in &records {
-                        if let Err(e) = open_ui_window(&handle, port, &token, record) {
-                            tracing::warn!("could not reopen window {}: {e}", record.id);
-                        }
-                    }
-                }
-                // The records stay in the registry: the windows come back
-                // when the host does (next launch, or a manual connect).
-                Err(e) => tracing::warn!("could not reconnect {alias} to restore windows: {e}"),
+            // Window reopening rides the connect itself (`reopen_windows` in
+            // `run_flight`), and the records survive failure: the windows
+            // come back with the first connect that lands — a home-screen
+            // click, a window's reconnect, or the next launch.
+            if let Err(e) = do_connect(&handle, alias.clone(), false).await {
+                tracing::warn!("could not reconnect {alias} to restore windows: {e}");
             }
         });
     }
@@ -737,6 +876,7 @@ pub fn run() {
             begin_update,
             shell_build,
             answer_askpass,
+            list_askpass,
             report_window_scope,
             focus_window,
         ])
@@ -824,7 +964,7 @@ pub fn run() {
             app.manage(Shell {
                 local: Mutex::new(local),
                 tunnels: tokio::sync::Mutex::new(HashMap::new()),
-                connecting: Mutex::new(HashSet::new()),
+                connecting: Mutex::new(HashMap::new()),
                 windows: Mutex::new(HashMap::new()),
                 registry: Mutex::new(WindowRegistry::load_default()),
                 quitting: AtomicBool::new(false),

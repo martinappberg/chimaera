@@ -35,6 +35,11 @@ pub struct ServerConfig {
     pub port: Option<u16>,
 }
 
+/// Upper bound on how long a sessions snapshot waits for ledger restore.
+/// Restore is normally sub-second; past this the snapshot serves whatever
+/// truth exists rather than blanking the UI behind a wedged respawn.
+const RESTORE_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Shared state for request handlers.
 pub(crate) struct AppState {
     pub(crate) token: String,
@@ -96,6 +101,13 @@ pub(crate) struct AppState {
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
+    /// False while the boot ledger is being consumed (sessions resurrected /
+    /// retired). Sessions snapshots wait for it: serving starts concurrently
+    /// with resurrection, and a snapshot taken mid-restore reads as "those
+    /// sessions are gone" — the UI would prune their tabs out of restored
+    /// layouts. Defaults true (no restore pending); `run` flips it false
+    /// before the listener accepts, `ledger::run` back once restore is done.
+    pub(crate) restored: tokio::sync::watch::Sender<bool>,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
@@ -174,6 +186,7 @@ impl AppState {
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             git: git::GitService::new(),
             changes: tokio::sync::Notify::new(),
+            restored: tokio::sync::watch::channel(true).0,
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
@@ -183,6 +196,15 @@ impl AppState {
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),
         }
+    }
+
+    /// Wait (bounded by `RESTORE_WAIT_CAP`) until the boot ledger has been
+    /// consumed. Every surface that reports the session list calls this
+    /// first, so a client connecting during resurrection never sees — and
+    /// acts on — a half-restored roster.
+    pub(crate) async fn wait_restored(&self) {
+        let mut rx = self.restored.subscribe();
+        let _ = tokio::time::timeout(RESTORE_WAIT_CAP, rx.wait_for(|done| *done)).await;
     }
 }
 
@@ -348,7 +370,11 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(git::backstop_poll(state.clone()));
 
     // Session ledger: consume what the previous daemon left (resurrect /
-    // retire), then keep sessions.json reconciled until shutdown.
+    // retire), then keep sessions.json reconciled until shutdown. Flip
+    // `restored` false HERE, before the listener accepts: the spawned task
+    // may not have run yet when the first client connects, and that client's
+    // sessions snapshot must wait out the resurrection (see AppState).
+    state.restored.send_replace(false);
     tokio::spawn(ledger::run(state.clone()));
 
     // Release awareness (GET /api/v1/update + the `update` ws frame).

@@ -129,7 +129,9 @@
       phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
     }).then((u) => unlisteners.push(u));
     // Keep host rows live: the shell's health monitor reports a dropped or
-    // recovered tunnel without the user having to click.
+    // recovered tunnel, and connect flights report their outcome — including
+    // ones this window didn't start (startup restore, another window's
+    // reconnect), which otherwise leave the row "connecting" forever.
     void onHostStatus((e) => {
       hosts = hosts.map((h) =>
         h.alias === e.alias
@@ -140,7 +142,28 @@
             }
           : h,
       );
+      // Any terminal transition ends the phase line, whoever ran the connect.
+      phases = mapWithout(phases, e.alias);
       if (e.status === "down") remoteWs = mapWithout(remoteWs, e.alias);
+      if (e.status === "error" && e.error !== undefined) {
+        hostErrors = new Map(hostErrors).set(e.alias, e.error);
+      } else if (e.status === "connected") {
+        hostErrors = mapWithout(hostErrors, e.alias);
+        // A connect this window didn't run (startup restore, another
+        // window) still gets its workspace list, so the row is browsable.
+        if (!remoteWs.has(e.alias)) {
+          void remoteWorkspaces(e.alias)
+            .then((list) => {
+              remoteWs = new Map(remoteWs).set(
+                e.alias,
+                [...list].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
+              );
+            })
+            .catch(() => {
+              // dropped again in between; the next transition retries
+            });
+        }
+      }
     }).then((u) => unlisteners.push(u));
     return () => unlisteners.forEach((u) => u());
   });

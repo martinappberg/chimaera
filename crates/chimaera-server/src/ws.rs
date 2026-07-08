@@ -330,6 +330,10 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
+    // A window connecting during ledger resurrection must not receive a
+    // half-restored roster as its first snapshot — it would prune the
+    // still-respawning sessions' tabs out of its restored layout.
+    state.wait_restored().await;
     if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
         .await
         .is_err()

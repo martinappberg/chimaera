@@ -47,7 +47,15 @@ fn control_path() -> String {
 /// it has never seen would otherwise fail outright. `accept-new` records an
 /// unknown key automatically but still *refuses* a changed one — keeping the
 /// MITM protection that a blanket `=no` would throw away.
-fn ssh_opts() -> [String; 8] {
+///
+/// *Liveness* — `ConnectTimeout` bounds the TCP connect so an unreachable
+/// host fails in seconds instead of the OS default (minutes) — a hung
+/// connect pins the UI in "connecting". `ServerAliveInterval`/`CountMax`
+/// make the ControlMaster and `-N` tunnel children *notice* a dead link
+/// (laptop sleep, network change) within ~45s and exit; without them a dead
+/// tunnel keeps its local listener open for hours, so every liveness probe
+/// lies "up" and reconnect becomes a no-op.
+fn ssh_opts() -> [String; 14] {
     [
         "-o".into(),
         "ControlMaster=auto".into(),
@@ -57,6 +65,12 @@ fn ssh_opts() -> [String; 8] {
         "ControlPersist=10m".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ConnectTimeout=15".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
     ]
 }
 
@@ -153,6 +167,21 @@ pub fn update_decision(
     Decision::ConnectOutdated
 }
 
+/// A failure in the local-forward phase of [`connect`] (port bind / forward
+/// setup), as opposed to auth, probe, or install failures. Distinguished so
+/// callers retry ONLY these on a fresh local port — blindly re-running the
+/// whole connect on an auth failure re-prompts the user's 2FA.
+#[derive(Debug)]
+pub struct TunnelPhaseError(pub String);
+
+impl std::fmt::Display for TunnelPhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TunnelPhaseError {}
+
 /// A live port-forward to a remote daemon. Dropping it kills the ssh child
 /// (but a ControlMaster-held forward survives — call [`Tunnel::close`] to
 /// cancel it explicitly).
@@ -191,11 +220,10 @@ impl Tunnel {
         self.child.wait().await
     }
 
-    /// Whether the forwarded local port currently accepts connections.
+    /// Whether the daemon behind the forward actually answers. See
+    /// [`http_alive`] for why a bare TCP connect would not do.
     pub async fn is_up(&self) -> bool {
-        tokio::net::TcpStream::connect(("127.0.0.1", self.local_port))
-            .await
-            .is_ok()
+        http_alive(self.local_port).await
     }
 
     /// Kill the tunnel child and cancel any master-held forward so local
@@ -214,6 +242,44 @@ impl Tunnel {
             .output()
             .await;
     }
+}
+
+/// Whether an HTTP server answers on `127.0.0.1:port` within 2s. A bare TCP
+/// connect is NOT a liveness probe here: after laptop sleep an ssh forward's
+/// local listener keeps accepting while the connection behind it is dead, so
+/// only a served response proves the daemon end-to-end. Any HTTP status
+/// counts — even a 401 had to come from the daemon.
+pub async fn http_alive(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!(
+                    "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut buf = Vec::with_capacity(16);
+        while buf.len() < 5 {
+            let mut chunk = [0u8; 16];
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf.starts_with(b"HTTP/").then_some(())
+    };
+    tokio::time::timeout(Duration::from_secs(2), attempt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Connect to the daemon on `host`, installing and starting it if needed,
@@ -786,7 +852,7 @@ fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
         .arg(host)
         .kill_on_drop(true)
         .spawn()
-        .context("failed to spawn ssh tunnel")
+        .map_err(|e| TunnelPhaseError(format!("failed to spawn ssh tunnel: {e}")).into())
 }
 
 /// Poll the local tunnel port until it accepts connections (15s timeout).
@@ -802,7 +868,9 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
                 if status.success() {
                     mux_delegated = true;
                 } else {
-                    bail!("ssh tunnel exited early: {status}");
+                    return Err(
+                        TunnelPhaseError(format!("ssh tunnel exited early: {status}")).into(),
+                    );
                 }
             }
         }
@@ -813,7 +881,10 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
             return Ok(mux_delegated);
         }
         if tokio::time::Instant::now() > deadline {
-            bail!("tunnel did not come up on 127.0.0.1:{port} within 15s");
+            return Err(TunnelPhaseError(format!(
+                "tunnel did not come up on 127.0.0.1:{port} within 15s"
+            ))
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -850,9 +921,10 @@ mod tests {
     use super::*;
 
     /// Every ssh/scp call must carry the ControlMaster trio (so one auth
-    /// covers the whole session; socket path uses ssh's short `%C` token) plus
+    /// covers the whole session; socket path uses ssh's short `%C` token),
     /// the trust-on-first-use host-key policy that lets a fresh install reach
-    /// a never-seen host with no tty.
+    /// a never-seen host with no tty, and the liveness bounds that keep a
+    /// dead link (laptop sleep) from leaving zombie masters and forwards.
     #[test]
     fn ssh_opts_multiplex_and_accept_new_hosts() {
         let opts = ssh_opts();
@@ -865,6 +937,79 @@ mod tests {
         assert_eq!(opts[5], "ControlPersist=10m");
         assert_eq!(opts[6], "-o");
         assert_eq!(opts[7], "StrictHostKeyChecking=accept-new");
+        assert_eq!(opts[8], "-o");
+        assert_eq!(opts[9], "ConnectTimeout=15");
+        assert_eq!(opts[10], "-o");
+        assert_eq!(opts[11], "ServerAliveInterval=15");
+        assert_eq!(opts[12], "-o");
+        assert_eq!(opts[13], "ServerAliveCountMax=3");
+    }
+
+    /// The fresh-port retry in the app keys off this downcast; if the tunnel
+    /// errors stop carrying the marker, every failure would re-run the whole
+    /// connect (and re-prompt 2FA).
+    #[test]
+    fn tunnel_phase_errors_downcast_through_anyhow() {
+        let err: anyhow::Error = TunnelPhaseError("bind clash".into()).into();
+        assert!(err.downcast_ref::<TunnelPhaseError>().is_some());
+        assert_eq!(format!("{err}"), "bind clash");
+        let other = anyhow::anyhow!("auth failed");
+        assert!(other.downcast_ref::<TunnelPhaseError>().is_none());
+    }
+
+    /// The whole point of the HTTP probe: a listener that accepts but never
+    /// answers (a dead ssh forward after laptop sleep looks exactly like
+    /// this) is DOWN, while anything that answers HTTP is up. A bare TCP
+    /// connect can't tell them apart — that regression made reconnect a
+    /// silent no-op.
+    #[tokio::test]
+    async fn http_alive_requires_a_response_not_just_an_accept() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Accepts and holds the socket open, never writing: down.
+        let silent = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = silent.accept().await {
+                held.push(s); // keep it open so this mimics a live-but-dead forward
+            }
+        });
+        assert!(
+            !http_alive(silent_port).await,
+            "accept-only listener must read as down"
+        );
+
+        // Answers any bytes with an HTTP status line: up (even a 401 proves
+        // the daemon end-to-end).
+        let http = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = http.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        assert!(
+            http_alive(http_port).await,
+            "an HTTP answer must read as up"
+        );
+
+        // Nothing listening at all: down.
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free_port = free.local_addr().unwrap().port();
+        drop(free);
+        assert!(
+            !http_alive(free_port).await,
+            "closed port must read as down"
+        );
     }
 
     #[test]
