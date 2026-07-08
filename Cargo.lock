@@ -296,6 +296,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chimaera-agent"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "chimaera-core"
 version = "0.0.1"
 dependencies = [
@@ -344,6 +357,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "chimaera-agent",
  "chimaera-core",
  "chimaera-pty",
  "comrak",
@@ -1923,6 +1937,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.3.4",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

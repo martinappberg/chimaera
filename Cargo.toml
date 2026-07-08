@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/chimaera",
+    "crates/chimaera-agent",
     "crates/chimaera-core",
     "crates/chimaera-pty",
     "crates/chimaera-remote",
@@ -38,6 +39,7 @@ futures = "0.3"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 
+chimaera-agent = { path = "crates/chimaera-agent" }
 chimaera-core = { path = "crates/chimaera-core" }
 chimaera-pty = { path = "crates/chimaera-pty" }
 chimaera-remote = { path = "crates/chimaera-remote" }

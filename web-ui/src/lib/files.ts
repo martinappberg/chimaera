@@ -142,20 +142,25 @@ export interface QuickOpenEntry {
   rel: string;
   name: string;
   mtime: number;
+  /** Absent on older daemons — treat as "file". */
+  kind?: "file" | "dir";
 }
 
 /**
  * Fuzzy file index for the quick-open palette. The daemon walks the workspace
  * root (ignoring .git/node_modules/target/…), subsequence-matches `q` against
  * the relative path, and returns up to `limit` ranked entries. An empty `q`
- * returns the most-recently-modified files.
+ * returns the most-recently-modified files. `dirs` admits directories too
+ * (chat @-mentions tag folders; the Cmd+P palette stays files-only).
  */
 export async function fsQuickOpen(
   workspaceId: string,
   q: string,
   limit = 50,
+  dirs = false,
 ): Promise<QuickOpenEntry[]> {
   const params = new URLSearchParams({ workspace_id: workspaceId, q, limit: String(limit) });
+  if (dirs) params.set("dirs", "true");
   const body = await json<{ entries: QuickOpenEntry[] }>(
     await api(`/fs/quickopen?${params.toString()}`),
   );
@@ -302,6 +307,11 @@ export type FileViewKind =
   | "text";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+
+/** Whether a path renders as an image (chat cards inline-preview these). */
+export function isImagePath(path: string): boolean {
+  return IMAGE_EXTS.has(extension(path));
+}
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
 const TABLE_EXTS = new Set(["csv", "tsv"]);
@@ -344,6 +354,15 @@ export function viewKindFor(path: string): FileViewKind {
   if (ext === "pdf") return "pdf";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
+}
+
+/** View kinds the chat renders inline under tool cards (images, tabular
+ *  data, PDFs — the "job output" formats worth seeing without a click). */
+const INLINE_PREVIEW_KINDS = new Set<FileViewKind>(["image", "table", "pdf"]);
+
+/** True when the chat can inline-preview this path's kind. */
+export function canInlinePreview(path: string): boolean {
+  return INLINE_PREVIEW_KINDS.has(viewKindFor(path));
 }
 
 /** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */

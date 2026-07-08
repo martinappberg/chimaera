@@ -1,5 +1,5 @@
 import { api, ApiError } from "./api";
-import { resolvedTheme } from "./settings/store.svelte";
+import { getSetting, resolvedTheme } from "./settings/store.svelte";
 
 export interface Workspace {
   id: string;
@@ -67,6 +67,14 @@ export interface Session {
   phase?: "unknown" | "ready" | "running";
   /** Stage of an in-flight agent exec against this terminal, else null. */
   exec_stage?: "queued" | "executing" | null;
+  /**
+   * Which surface the session's process runs behind: "chat" (structured
+   * stream-json driver) or "term" (a PTY). Server truth — the pane renders
+   * whichever the daemon says. Optional on old daemons (= "term").
+   */
+  ui?: "chat" | "term";
+  /** Whether this agent can run as a chat session (drives the toggle). */
+  chat_capable?: boolean;
 }
 
 /** The one display name for a session, used identically everywhere. */
@@ -88,9 +96,10 @@ export function agentKind(s: Session): string {
   return s.kind === "agent" ? (s.agent_kind ?? "claude") : "shell";
 }
 
-/** True for agents with no hook integration yet (state is honestly unknown). */
+/** True for agents with no hook integration yet (state is honestly unknown).
+ *  Chat sessions always have protocol-derived state, whatever the agent. */
 function unintegrated(s: Session): boolean {
-  return s.kind === "agent" && agentKind(s) !== "claude";
+  return s.kind === "agent" && agentKind(s) !== "claude" && s.ui !== "chat";
 }
 
 /**
@@ -245,6 +254,16 @@ export async function createSession(
   if (kind === "agent") {
     if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
+    // New agent sessions open in the structured chat view by default (the
+    // agents.defaultView setting); the terminal is one pane-bar toggle away,
+    // and the daemon degrades to a PTY on its own if the protocol handshake
+    // fails.
+    if (
+      ["claude", "codex"].includes(spawn.agent ?? "claude") &&
+      getSetting("agents.defaultView") === "chat"
+    ) {
+      extras.ui = "chat";
+    }
   }
   // Every spawn (shell AND agent) carries the UI's current scheme: the
   // daemon's shims inject it so TUIs boot themed to match. The SETTINGS
@@ -263,6 +282,39 @@ export async function createSession(
 
 export async function deleteSession(id: string): Promise<void> {
   await json<void>(await api(`/sessions/${id}`, { method: "DELETE" }));
+}
+
+/**
+ * Switch a session between the chat and terminal surfaces. The daemon stops
+ * the current process and resumes the same conversation in the other mode
+ * (same session id). 409 with `busy` when the agent is mid-task and `force`
+ * is false — callers confirm with the user and retry.
+ */
+export async function switchSessionView(
+  id: string,
+  ui: "chat" | "term",
+  force = false,
+): Promise<void> {
+  await json<void>(
+    await api(`/sessions/${id}/view`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ui, force }),
+    }),
+  );
+}
+
+/** Fork the conversation at a checkpoint (claude chat sessions): the files
+ *  were already restored through the chat socket; this respawns the driver
+ *  with the transcript truncated at `resumeAt`. */
+export async function rewindSession(id: string, resumeAt: string): Promise<void> {
+  await json<void>(
+    await api(`/sessions/${id}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resume_at: resumeAt }),
+    }),
+  );
 }
 
 /** Pin a user-chosen display name on a session (any kind — the app owns

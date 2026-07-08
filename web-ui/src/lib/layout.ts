@@ -56,7 +56,24 @@ export interface DiffTab {
 export interface GitTab {
   surface: "git";
 }
-export type Tab = TerminalTab | FileTab | SettingsTab | FinderTab | DiffTab | GitTab;
+/**
+ * A review of the files ONE session changed — a session-scoped changes list
+ * built on the same git status/diff APIs as the source-control panel. Keyed by
+ * session so re-opening focuses the existing tab; it reads the session's live
+ * touched-files list.
+ */
+export interface ChangesTab {
+  surface: "changes";
+  sessionId: string;
+}
+export type Tab =
+  | TerminalTab
+  | FileTab
+  | SettingsTab
+  | FinderTab
+  | DiffTab
+  | GitTab
+  | ChangesTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
@@ -67,6 +84,7 @@ export function tabKey(t: Tab): string {
   // sharing a key prefix would alias inside the no-duplicates set.
   if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
   if (t.surface === "git") return "v:git";
+  if (t.surface === "changes") return `changes:${t.sessionId}`;
   return "v:settings";
 }
 
@@ -366,6 +384,11 @@ export function openGit(l: Layout): Layout {
   return openTab(l, { surface: "git" });
 }
 
+/** Open (or focus) the session-scoped changes review. */
+export function openChanges(l: Layout, sessionId: string): Layout {
+  return openTab(l, { surface: "changes", sessionId });
+}
+
 export function openSettings(l: Layout): Layout {
   return openTab(l, { surface: "settings" });
 }
@@ -594,9 +617,15 @@ function pruneTabs(l: Layout, keep: (t: Tab) => boolean): Layout {
   return normalize({ ...l, root: root ?? emptyPane() });
 }
 
-/** Drop terminal tabs whose sessions no longer exist; file tabs are untouched. */
+/** Drop terminal AND session-changes tabs whose sessions no longer exist; a
+ *  changes review outlives nothing its session left behind. File and (path-
+ *  keyed) git-diff tabs are untouched. */
 export function pruneSessions(l: Layout, live: ReadonlySet<string>): Layout {
-  return pruneTabs(l, (t) => t.surface !== "terminal" || live.has(t.sessionId));
+  return pruneTabs(
+    l,
+    (t) =>
+      (t.surface !== "terminal" && t.surface !== "changes") || live.has(t.sessionId),
+  );
 }
 
 /** Drop file tabs whose paths are known-dead (404 on restore). */
@@ -666,14 +695,15 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 // --- (de)serialization ------------------------------------------------------
 
 /** Tab wire form: `{s}` terminal, `{f}` file, `{d,di}` finder (dir + instance
- *  id), `{gd,dm}` git diff (path + mode), `{v}` view (additive within blob v1;
- *  `v` is "settings" or "git"). */
+ *  id), `{gd,dm}` git diff (path + mode), `{cs}` session changes, `{v}` view
+ *  (additive within blob v1; `v` is "settings" or "git"). */
 type STab =
   | { s: string }
   | { f: string }
   | { v: string }
   | { d: string; di: string }
-  | { gd: string; dm?: string };
+  | { gd: string; dm?: string }
+  | { cs: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
@@ -708,6 +738,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "finder") return { d: t.path, di: t.id };
         if (t.surface === "diff") return { gd: t.path, dm: t.mode };
         if (t.surface === "git") return { v: "git" };
+        if (t.surface === "changes") return { cs: t.sessionId };
         return { v: "settings" };
       }),
       active: node.active,
@@ -763,6 +794,8 @@ function deserNode(
         tab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
       } else if (t.v === "git") {
         tab = { surface: "git" };
+      } else if (typeof t.cs === "string" && t.cs.length > 0) {
+        tab = { surface: "changes", sessionId: t.cs };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

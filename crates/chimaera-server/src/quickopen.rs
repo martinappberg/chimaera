@@ -40,8 +40,8 @@ const CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 
-/// One indexed file. The lowercase copies are precomputed once per walk so
-/// matching stays allocation-free per keystroke.
+/// One indexed entry (file or directory). The lowercase copies are
+/// precomputed once per walk so matching stays allocation-free per keystroke.
 pub(crate) struct IndexedFile {
     path: String,
     rel: String,
@@ -49,6 +49,7 @@ pub(crate) struct IndexedFile {
     mtime: u64,
     rel_lower: String,
     name_lower: String,
+    is_dir: bool,
 }
 
 /// Per-workspace walk cache with a [`CACHE_TTL`] freshness window.
@@ -77,10 +78,15 @@ pub(crate) struct QuickOpenQuery {
     q: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// Also return directories (`"kind":"dir"`). Off by default so the
+    /// Cmd+P palette stays a file finder; the chat composer's @-mentions
+    /// opt in (folders are taggable in the agent CLIs).
+    #[serde(default)]
+    dirs: bool,
 }
 
-/// GET /api/v1/fs/quickopen?workspace_id=&q=&limit=50 —
-/// `{"entries":[{"path","rel","name","mtime"}]}`, ranked name-prefix >
+/// GET /api/v1/fs/quickopen?workspace_id=&q=&limit=50&dirs=false —
+/// `{"entries":[{"path","rel","name","mtime","kind"}]}`, ranked name-prefix >
 /// name-substring > path-subsequence (case-insensitive), newest mtime
 /// breaking ties. An empty query returns the most recently modified files.
 pub(crate) async fn quickopen(
@@ -112,13 +118,14 @@ pub(crate) async fn quickopen(
     };
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    Json(json!({"entries": search(&files, &query.q, limit)})).into_response()
+    Json(json!({"entries": search(&files, &query.q, limit, query.dirs)})).into_response()
 }
 
-/// Walk `root` collecting regular files, skipping the ignored dirs
-/// (`ignore` override from settings, else [`IGNORED_DIRS`]) and all
-/// symlinks (never followed: loop safety), stopping at [`MAX_INDEX_FILES`].
-/// Unreadable entries are skipped silently, matching `fs/list`.
+/// Walk `root` collecting regular files and directories, skipping the
+/// ignored dirs (`ignore` override from settings, else [`IGNORED_DIRS`]) and
+/// all symlinks (never followed: loop safety), stopping at
+/// [`MAX_INDEX_FILES`]. Unreadable entries are skipped silently, matching
+/// `fs/list`.
 fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
     let ignored = |name: &str| match ignore {
         Some(list) => list.iter().any(|d| d == name),
@@ -136,13 +143,13 @@ fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
                 continue;
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if file_type.is_dir() {
-                if !ignored(&name) {
-                    stack.push(entry.path());
+            let is_dir = file_type.is_dir();
+            if is_dir {
+                if ignored(&name) {
+                    continue;
                 }
-                continue;
-            }
-            if !file_type.is_file() {
+                stack.push(entry.path());
+            } else if !file_type.is_file() {
                 continue;
             }
             if files.len() >= MAX_INDEX_FILES {
@@ -171,6 +178,7 @@ fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
                 rel,
                 name,
                 mtime,
+                is_dir,
             });
         }
     }
@@ -178,10 +186,11 @@ fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
 }
 
 /// Rank, sort, and serialize the matching entries.
-fn search(files: &[IndexedFile], q: &str, limit: usize) -> Vec<serde_json::Value> {
+fn search(files: &[IndexedFile], q: &str, limit: usize, dirs: bool) -> Vec<serde_json::Value> {
     let q = q.trim().to_lowercase();
     let mut hits: Vec<(u8, &IndexedFile)> = files
         .iter()
+        .filter(|f| dirs || !f.is_dir)
         .filter_map(|f| rank(f, &q).map(|r| (r, f)))
         .collect();
     hits.sort_by(|a, b| {
@@ -191,7 +200,15 @@ fn search(files: &[IndexedFile], q: &str, limit: usize) -> Vec<serde_json::Value
     });
     hits.into_iter()
         .take(limit)
-        .map(|(_, f)| json!({"path": f.path, "rel": f.rel, "name": f.name, "mtime": f.mtime}))
+        .map(|(_, f)| {
+            json!({
+                "path": f.path,
+                "rel": f.rel,
+                "name": f.name,
+                "mtime": f.mtime,
+                "kind": if f.is_dir { "dir" } else { "file" },
+            })
+        })
         .collect()
 }
 

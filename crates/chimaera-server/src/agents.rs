@@ -530,7 +530,12 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
         loop {
             tokio::time::sleep(poll_interval()).await;
 
-            let Some(info) = state.sessions.get(&session_id) else {
+            // Liveness spans BOTH registries: an agent session may run as a
+            // PTY TUI or as a structured chat driver (and hop between them
+            // via the view toggle) under one id. Retiring on PTY absence
+            // alone would kill every chat session ~2s after spawn.
+            let info = state.sessions.get(&session_id);
+            if info.is_none() && !crate::chat::session_alive(&state, &session_id) {
                 crate::recents::retire(
                     &state,
                     &session_id,
@@ -538,10 +543,12 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                     last_osc.as_deref(),
                 );
                 return;
-            };
-            last_pin = info.renamed.then(|| info.name.clone());
-            if info.title.is_some() {
-                last_osc = info.title;
+            }
+            if let Some(info) = info {
+                last_pin = info.renamed.then(|| info.name.clone());
+                if info.title.is_some() {
+                    last_osc = info.title;
+                }
             }
 
             let path = {

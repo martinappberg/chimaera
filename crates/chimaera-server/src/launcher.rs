@@ -39,10 +39,11 @@ pub(crate) fn models(kind: AgentKind) -> &'static [(&'static str, &'static str)]
         // Claude Code resolves the opus/sonnet/haiku aliases to the latest
         // snapshots itself, so this list never goes stale.
         AgentKind::Claude => &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")],
-        // Source: `codex --help` on this machine (codex-cli 0.1.2504161551)
-        // documents `-m, --model` with default o4-mini; o3/gpt-4.1 are the
-        // alternatives its README suggests for the CLI.
-        AgentKind::Codex => &[("o4-mini", "o4-mini"), ("o3", "o3"), ("gpt-4.1", "GPT-4.1")],
+        // Source: the user config codex-cli 0.142.5 writes on this machine
+        // (`model = "gpt-5.5"`). The app-server likely exposes a model list
+        // (the official extension shows one) — adopt it when the codex
+        // driver grows a models probe.
+        AgentKind::Codex => &[("gpt-5.5", "GPT-5.5")],
         // agy picks its own model; no curated list until its integration.
         AgentKind::Antigravity => &[],
         // Static list (gemini is not installed here to probe): the models
@@ -331,6 +332,16 @@ pub(crate) async fn list_agents(
                 .map(|(id, label)| json!({"id": id, "label": label}))
                 .collect();
             row.insert("models".into(), json!(models));
+            // Whether this agent can spawn as a structured chat session
+            // (claude stream-json / codex app-server drivers).
+            row.insert(
+                "chat_capable".into(),
+                json!(
+                    matches!(kind, AgentKind::Claude | AgentKind::Codex)
+                        && detection.path.is_ok()
+                        && !is_outdated(kind, detection.version.as_deref())
+                ),
+            );
             row.insert(
                 "install".into(),
                 json!({"command": install_command(kind), "url": docs_url(kind)}),
@@ -393,6 +404,46 @@ pub(crate) fn build_agent_command(
     if let Some(resume) = resume {
         cmd.push("--resume".to_string());
         cmd.push(resume.to_string());
+    }
+    cmd
+}
+
+/// Argv for a structured chat session (claude stream-json driver): the
+/// protocol flags come from `chimaera_agent::claude::chat_args` (live-
+/// verified against the pinned CLI version there), plus the same per-session
+/// `--settings`/`--mcp-config` files the TUI spawn uses — hooks and linked
+/// terminals work identically in both surfaces. `session_uuid` pins the
+/// native session id at spawn (`--session-id`); resumes leave it `None`
+/// because claude forks a fresh id on `--resume`.
+pub(crate) fn build_chat_command(
+    bin: &Path,
+    settings: &Path,
+    mcp_config: &Path,
+    model: Option<&str>,
+    resume: Option<&str>,
+    session_uuid: Option<&str>,
+    fork_at: Option<&str>,
+) -> Vec<String> {
+    debug_assert!(
+        resume.is_none() || session_uuid.is_none(),
+        "resume forks a new native id; pinning one is contradictory"
+    );
+    let mut cmd = vec![bin.to_string_lossy().into_owned()];
+    cmd.extend(chimaera_agent::claude::chat_args(model, resume));
+    cmd.push("--settings".to_string());
+    cmd.push(settings.to_string_lossy().into_owned());
+    cmd.push("--mcp-config".to_string());
+    cmd.push(mcp_config.to_string_lossy().into_owned());
+    if let Some(uuid) = session_uuid {
+        cmd.push("--session-id".to_string());
+        cmd.push(uuid.to_string());
+    }
+    // Checkpoint rewind: resume the transcript as a fork truncated at the
+    // given message uuid (rides with --resume; the fork gets a new id).
+    if let Some(at) = fork_at {
+        cmd.push("--fork-session".to_string());
+        cmd.push("--resume-session-at".to_string());
+        cmd.push(at.to_string());
     }
     cmd
 }

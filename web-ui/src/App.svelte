@@ -25,6 +25,7 @@
     renameSession,
     needsAttention,
     pollSessions,
+    switchSessionView,
     touchWorkspace,
     type AgentSpawn,
     type Session,
@@ -52,6 +53,7 @@
     type LinkCtrl,
   } from "./lib/agentLinks";
   import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
+  import { insertIntoComposer } from "./lib/chat/composerBus";
   import { get } from "svelte/store";
   import {
     activeSelection,
@@ -84,6 +86,7 @@
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    openChanges,
     openDiff,
     openFile,
     openFinder,
@@ -742,6 +745,16 @@
    * pane, surface it so the typed reference is reviewable at a glance.
    */
   function typeIntoSession(id: string, text: string): void {
+    // Chat sessions: the input is the mounted Composer, not a PTY socket.
+    if (sessionsById.get(id)?.ui === "chat") {
+      const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+      if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
+      if (!insertIntoComposer(id, text)) {
+        // Not mounted yet (tab was inactive): give the swap one frame.
+        setTimeout(() => insertIntoComposer(id, text), 120);
+      }
+      return;
+    }
     if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
     if (loc !== null) {
@@ -862,6 +875,24 @@
       } else {
         layout = splitPane(layout, paneId, "row");
         layout = openDiff(layout, path, mode);
+      }
+    }
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** The "N files changed" chip: open (or focus) this session's changes review,
+   *  beside the source pane — adjacent pane, or a split when it stands alone. */
+  function openChangesFromPane(paneId: string, sessionId: string, newSplit: boolean): void {
+    const existing = paneForTab(layout.root, { surface: "changes", sessionId });
+    if (existing !== null) {
+      layout = activateTab(layout, existing.paneId, existing.index);
+    } else {
+      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
+      if (neighbor !== null) {
+        layout = openChanges(focusPane(layout, neighbor), sessionId);
+      } else {
+        layout = splitPane(layout, paneId, "row");
+        layout = openChanges(layout, sessionId);
       }
     }
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -1297,6 +1328,13 @@
     list.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
     sessions = list;
     gotSessions = true;
+    // A session now running as chat has no PTY: dispose any warm terminal
+    // for it in THIS window (every window sees the flip on the bus), so a
+    // later toggle back to terminal mounts fresh instead of replaying a
+    // dead socket's screen.
+    for (const s of list) {
+      if (s.ui === "chat") pool.disposeSession(s.id);
+    }
     // An install session that has exited (gone from the roster, or alive:false)
     // means the catalog may have changed: re-probe so the button reflects it.
     if (pendingInstalls.size > 0) {
@@ -1352,8 +1390,11 @@
   }
 
   function onExited(id: string, _status: number | null): void {
-    // Exited sessions vanish, tmux-style — the daemon has already reaped
-    // them; drop the row without waiting for the next poll.
+    // An agent PTY dying may BE the chat⇄terminal toggle doing its job —
+    // the events bus (which carries the mid-switch placeholder row) is
+    // authoritative for agents and corrects within a tick. Shells vanish
+    // instantly, tmux-style.
+    if (sessions.find((s) => s.id === id)?.kind === "agent") return;
     applySessions(sessions.filter((s) => s.id !== id));
   }
 
@@ -1807,6 +1848,17 @@
     openFileFrom(paneId, path, newSplit) {
       openFileFromPane(paneId, path, newSplit);
     },
+    openPathFrom(paneId, path, kind, newSplit) {
+      if (kind === "dir") {
+        openDirInFinder(paneId, path, newSplit);
+        revealInTree(path);
+      } else {
+        openFileFromPane(paneId, path, newSplit);
+      }
+    },
+    openChangesFrom(paneId, sessionId, newSplit) {
+      openChangesFromPane(paneId, sessionId, newSplit);
+    },
     navigateFinder(id, path) {
       layout = setFinderPath(layout, id, path);
     },
@@ -1819,7 +1871,41 @@
     adjustFont(paneId, delta) {
       adjustFont(paneId, delta);
     },
+    switchView(sessionId, target) {
+      void switchView(sessionId, target);
+    },
   };
+
+  /**
+   * The chat⇄terminal toggle: the daemon stops the current process and
+   * resumes the same conversation in the other mode; the session row's `ui`
+   * flips on the events bus and every pane follows. A mid-task agent 409s
+   * until the user confirms the interruption.
+   */
+  async function switchView(sessionId: string, target: "chat" | "term"): Promise<void> {
+    try {
+      await switchSessionView(sessionId, target, false);
+    } catch (e) {
+      const busy = e instanceof ApiError && e.status === 409;
+      if (!busy) {
+        console.error("view switch failed", e);
+        return;
+      }
+      const go = confirm(
+        "The agent is mid-task. Switching restarts it via resume and interrupts the current turn — switch anyway?",
+      );
+      if (!go) return;
+      try {
+        await switchSessionView(sessionId, target, true);
+      } catch (err) {
+        console.error("forced view switch failed", err);
+        return;
+      }
+    }
+    // The PTY died on purpose; a stale pooled xterm would replay its exited
+    // screen if the session ever toggles back to a terminal.
+    if (target === "chat") pool.disposeSession(sessionId);
+  }
 
   /**
    * Panes whose input band should read "link to this agent" while dragging

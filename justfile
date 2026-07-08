@@ -15,6 +15,12 @@ check:
 fmt:
     cargo fmt --all
 
+# Live agent-protocol smoke tests against the real installed claude/codex
+# binaries (needs auth + network, bills a few tiny turns). Run whenever
+# chimaera-agent's protocol clients change or the CLIs update.
+chat-smoke:
+    cargo test -p chimaera-agent --test live -- --ignored --test-threads=1 --nocapture
+
 # Run the daemon locally (foreground)
 serve: ui
     cargo run -p chimaera -- serve

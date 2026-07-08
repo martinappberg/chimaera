@@ -26,6 +26,7 @@ Rust workspace (the daemon) + a Svelte web UI it embeds + a separate Tauri app.
 | Path | What it is |
 |---|---|
 | `crates/chimaera` | The binary. CLI + daemon entrypoint: `serve`, `connect <host>`, `status`, `kill`, `doctor`. |
+| `crates/chimaera-agent` | The structured-agent engine (the chat surface's other half): drives `claude` over bidirectional stream-json and `codex` over app-server JSON-RPC behind an `AgentAdapter` trait, with a per-session seq-numbered event journal (gap-replay reconnects). The wire formats are unversioned — **read `crates/chimaera-agent/PROTOCOL.md` first, and run `just chat-smoke` (live, bills a few cents) whenever a driver or an agent CLI changes.** |
 | `crates/chimaera-core` | Shared types, version/build-id helpers, shell integration. |
 | `crates/chimaera-pty` | The persistent terminal engine. PTY sessions mirrored into a headless `alacritty_terminal` grid so full screen state survives with zero attached clients; `attach` returns a snapshot escape stream that rebuilds the terminal in a fresh xterm.js. |
 | `crates/chimaera-remote` | SSH orchestration for `connect`: host discovery, musl-binary install, daemon start, port-forward tunnels. Never reimplements the ssh client — inherits `~/.ssh/config` (ProxyJump, ControlMaster, 2FA). |
@@ -99,6 +100,13 @@ See the **[develop](.claude/skills/develop/SKILL.md)** skill for the full loop.
   across the wire (the client is xterm.js, not Rust) — re-emit an escape-sequence
   snapshot on attach/resize. Resize/resync has subtle invariants; read DESIGN.md
   `## Architecture` → "Resize repaint refinement" before touching that path.
+- **Agent wire formats are pinned, not trusted.** The claude stream-json and
+  codex app-server protocols are unversioned; the drivers in `chimaera-agent`
+  are verified against pinned CLI versions (`TESTED_*_VERSION`). Touching a
+  driver — or updating an agent CLI — requires `just chat-smoke` (live suite,
+  bills a few cents); hermetic tests cannot catch upstream drift. Quirks and
+  wire facts live in `crates/chimaera-agent/PROTOCOL.md` — extend it when you
+  learn a new one the hard way.
 - **Comments state constraints and *why*, not narration.** Explain why the code
   must be this way ("BGZF is standard multi-member gzip"), never what the next
   line does. `cargo fmt` and `clippy -D warnings` must pass clean.

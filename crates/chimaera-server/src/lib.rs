@@ -1,6 +1,7 @@
 mod agents;
 mod api;
 mod assets;
+mod chat;
 mod fs;
 mod git;
 mod launcher;
@@ -74,6 +75,19 @@ pub(crate) struct AppState {
     pub(crate) settings: Mutex<settings::SettingsStore>,
     /// Owner of all PTY sessions; outlives any client connection.
     pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
+    /// Owner of all structured chat sessions (Tier B agent drivers).
+    pub(crate) chat: Arc<chimaera_agent::ChatManager>,
+    /// The chat manager's hook signals; `chat::spawn_signal_task` (called
+    /// from `app()`) takes and consumes this for the daemon's lifetime.
+    pub(crate) chat_signals: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<chat::ChatSignal>>>,
+    /// Respawn ingredients per chat session, for the degrade-to-PTY path.
+    pub(crate) chat_recipes: Mutex<HashMap<String, chat::ChatRecipe>>,
+    /// Sessions mid view-switch (id -> target ui "chat"|"term"): their
+    /// intentional process deaths must not retire records or trigger the
+    /// degrade path, and `sessions_json` synthesizes a placeholder row for
+    /// the moment the id is in neither registry — a vanishing row would make
+    /// every window prune the session's tabs mid-toggle.
+    pub(crate) chat_switching: Mutex<HashMap<String, String>>,
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
@@ -158,6 +172,7 @@ impl AppState {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let (chat, chat_signals_rx) = chat::new_manager(data_dir.join("chat"));
         AppState {
             token,
             started: Instant::now(),
@@ -180,6 +195,10 @@ impl AppState {
                 config_dir.join("settings.json"),
             )),
             sessions: chimaera_pty::SessionManager::new(),
+            chat,
+            chat_signals: Mutex::new(Some(chat_signals_rx)),
+            chat_recipes: Mutex::new(HashMap::new()),
+            chat_switching: Mutex::new(HashMap::new()),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),
@@ -223,6 +242,9 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
 pub(crate) fn app(state: Arc<AppState>) -> Router {
+    // Consumes the chat manager's hook signals for the daemon's lifetime
+    // (no-op when already running — tests may build several routers).
+    chat::spawn_signal_task(state.clone());
     let api = Router::new()
         .route("/health", get(api::health))
         .route(
@@ -247,6 +269,8 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
         .route("/sessions/{id}/journal", get(api::session_journal))
+        .route("/sessions/{id}/view", post(chat::switch_view))
+        .route("/sessions/{id}/rewind", post(chat::rewind_session))
         .route("/links", get(links::list_links).put(links::put_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
@@ -299,6 +323,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // the bearer-authed POST /api/v1/fs/ticket) authorizes each fetch instead.
     let ws = Router::new()
         .route("/ws/sessions/{id}", get(ws::session_ws))
+        .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
         .with_state(state);
@@ -559,6 +584,117 @@ mod tests {
             })
         };
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_session_validates_chat_ui() {
+        let state = test_state();
+        let root = test_dir("ws-root");
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let wid = ws["id"].as_str().unwrap().to_string();
+
+        // "chat" is an agent-session surface; a shell cannot have one.
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": wid, "ui": "chat"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": wid, "ui": "bogus"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // Unknown session for the view switch.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions/s-nope/view",
+            Some(serde_json::json!({"ui": "chat"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The degrade contract end-to-end minus a real agent: a chat driver
+    /// whose handshake cannot complete (cat echoes our initialize request
+    /// back) must be respawned as a PTY session under the SAME id, with the
+    /// AgentRecord intact, via the signal task.
+    #[tokio::test]
+    async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = test_state();
+        chat::spawn_signal_task(state.clone());
+
+        let dir = test_dir("chat-degrade");
+        let tui = dir.join("fake-tui.sh");
+        std::fs::write(&tui, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&tui, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = dir.join("mcp.json");
+        std::fs::write(&mcp, "{}").unwrap();
+
+        let id = "s-degrade".to_string();
+        crate::lock(&state.agents).insert(
+            id.clone(),
+            agents::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+        );
+        crate::lock(&state.chat_recipes).insert(
+            id.clone(),
+            chat::ChatRecipe {
+                workspace_root: dir.clone(),
+                kind: agents::AgentKind::Claude,
+                bin: tui.clone(),
+                settings: Some(settings),
+                mcp_config: Some(mcp),
+                model: None,
+                resume: None,
+                fork_at: None,
+                theme: "dark".into(),
+            },
+        );
+
+        let mut spec = chimaera_agent::driver::SpawnSpec::new(
+            id.clone(),
+            vec!["/bin/cat".to_string()],
+            dir.clone(),
+        );
+        spec.handshake_timeout = std::time::Duration::from_millis(300);
+        state
+            .chat
+            .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.sessions.get(&id).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "degrade never respawned a PTY session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!state.chat.contains(&id), "chat registry slot freed");
+        assert!(
+            crate::lock(&state.agents).contains_key(&id),
+            "agent record survives the degrade"
+        );
+        let _ = state.sessions.kill(&id);
     }
 
     #[tokio::test]
@@ -5646,10 +5782,36 @@ mod tests {
         let (_, json) = request(&state, Method::GET, &uri, None).await;
         assert_eq!(json["entries"][0]["rel"], "src/main.rs");
 
-        // Empty query: every indexed file, most recent first.
+        // Empty query: every indexed file, most recent first. Directories
+        // stay out unless asked for (the Cmd+P palette is a file finder).
         let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=");
         let (_, json) = request(&state, Method::GET, &uri, None).await;
         assert_eq!(json["entries"].as_array().unwrap().len(), 5);
+        assert!(json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] == "file"));
+
+        // dirs=true admits directories (chat @-mentions tag folders too) —
+        // and ignored dirs still never appear, even as entries themselves.
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=&dirs=true");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 8); // 5 files + src, map, docs
+        let dir_rels: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["kind"] == "dir")
+            .map(|e| e["rel"].as_str().unwrap())
+            .collect();
+        assert_eq!(dir_rels.len(), 3);
+        for rel in ["src", "map", "docs"] {
+            assert!(dir_rels.contains(&rel), "missing dir {rel}");
+        }
+        let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=src&dirs=true");
+        let (_, json) = request(&state, Method::GET, &uri, None).await;
+        assert_eq!(json["entries"][0]["rel"], "src");
+        assert_eq!(json["entries"][0]["kind"], "dir");
 
         // limit is honored.
         let uri = format!("/api/v1/fs/quickopen?workspace_id={ws_id}&q=main&limit=2");

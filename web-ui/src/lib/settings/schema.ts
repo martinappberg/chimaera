@@ -81,6 +81,7 @@ export type SettingsMap = {
   "appearance.lightTheme": string;
   "appearance.darkTheme": string;
   "appearance.accentColor": string;
+  "agents.defaultView": "chat" | "terminal";
   "terminal.fontSize": number;
   "terminal.fontFamily": string;
   "terminal.lineHeight": number;
@@ -164,6 +165,21 @@ const DEFS = {
       "Accent used for focus, selection, live-session dots, and primary actions. Empty uses the selected theme's own accent.",
     type: "color",
     default: "",
+    scope: "client",
+  },
+
+  // --- Agents ----------------------------------------------------------------
+  "agents.defaultView": {
+    title: "New Agent Sessions",
+    category: "Agents",
+    description:
+      "How new Claude sessions open: the structured chat view, or the agent's own terminal UI. Every session can be switched either way from the pane bar; if the chat protocol ever fails to start, the session falls back to a terminal on its own.",
+    type: "enum",
+    default: "chat",
+    options: [
+      { value: "chat", label: "Chat" },
+      { value: "terminal", label: "Terminal (TUI)" },
+    ],
     scope: "client",
   },
 

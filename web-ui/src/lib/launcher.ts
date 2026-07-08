@@ -32,6 +32,10 @@ export interface AgentInfo {
   managedInstall: boolean;
   /** Official docs URL — a clickable link on every launcher row. */
   installUrl: string | null;
+  /** Curated model choices for this agent (`--model` ids + labels). */
+  models: { id: string; label: string }[];
+  /** Whether this agent can run as a structured chat session. */
+  chatCapable: boolean;
 }
 
 
@@ -73,6 +77,15 @@ export async function listAgents(refresh = false): Promise<AgentInfo[]> {
         path: typeof a.path === "string" ? a.path : null,
         managedInstall: a.managed_install === true,
         installUrl: typeof install.url === "string" ? install.url : null,
+        models: Array.isArray(a.models)
+          ? a.models.flatMap((m): { id: string; label: string }[] => {
+              const mm = m as Record<string, unknown>;
+              return typeof mm.id === "string" && typeof mm.label === "string"
+                ? [{ id: mm.id, label: mm.label }]
+                : [];
+            })
+          : [],
+        chatCapable: a.chat_capable === true,
       },
     ];
   });

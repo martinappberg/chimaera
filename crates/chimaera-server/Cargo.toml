@@ -16,6 +16,7 @@ tracing.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
 hostname.workspace = true
+chimaera-agent.workspace = true
 chimaera-core.workspace = true
 chimaera-pty.workspace = true
 futures.workspace = true

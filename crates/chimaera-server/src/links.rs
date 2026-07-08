@@ -24,7 +24,7 @@ use crate::AppState;
 pub(crate) fn links_json(state: &AppState) -> Vec<serde_json::Value> {
     let mut links = crate::lock(&state.links);
     links.retain(|terminal, agent| {
-        state.sessions.get(terminal).is_some() && state.sessions.get(agent).is_some()
+        state.sessions.get(terminal).is_some() && crate::chat::session_alive(state, agent)
     });
     let mut entries: Vec<(&String, &String)> = links.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
@@ -39,7 +39,7 @@ pub(crate) fn links_json(state: &AppState) -> Vec<serde_json::Value> {
 pub(crate) fn terminals_of(state: &AppState, agent_id: &str) -> Vec<String> {
     let mut links = crate::lock(&state.links);
     links.retain(|terminal, agent| {
-        state.sessions.get(terminal).is_some() && state.sessions.get(agent).is_some()
+        state.sessions.get(terminal).is_some() && crate::chat::session_alive(state, agent)
     });
     let mut out: Vec<String> = links
         .iter()
@@ -58,7 +58,7 @@ pub(crate) fn link(
     terminal_id: &str,
     agent_id: &str,
 ) -> Result<Option<String>, (StatusCode, String)> {
-    if state.sessions.get(agent_id).is_none() {
+    if !crate::chat::session_alive(state, agent_id) {
         return Err((
             StatusCode::NOT_FOUND,
             format!("unknown agent session {agent_id}"),
