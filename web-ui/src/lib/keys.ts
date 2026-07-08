@@ -132,8 +132,9 @@ export const ACTIONS = [
   {
     id: "focusArrows",
     label: "Move Pane Focus",
-    description: "Move focus to the neighboring pane (all four arrows).",
-    def: "Mod+Alt+Arrow",
+    description:
+      "Switch focus to the neighboring pane (all four arrows) — the spatial cousin of Mod+1–9.",
+    def: "Mod+Arrow",
     arrowSet: true,
   },
   {
@@ -141,7 +142,7 @@ export const ACTIONS = [
     label: "Move Tab to Pane",
     description:
       "Carry the focused pane's active tab into the neighboring pane (all four arrows).",
-    def: "Mod+Arrow",
+    def: "Mod+Alt+Arrow",
     arrowSet: true,
   },
 ] as const satisfies readonly ActionDef[];
