@@ -1692,6 +1692,16 @@
     applySessions(sessions.filter((s) => s.id !== id));
   }
 
+  /** End every live session in a workspace — the home-screen "stop". The
+   *  workspace registration itself is untouched; only its running work ends. */
+  async function stopWorkspace(w: Workspace): Promise<void> {
+    const live = sessions.filter((s) => s.workspace_id === w.id && s.alive);
+    if (live.length === 0) return;
+    await Promise.allSettled(live.map((s) => deleteSession(s.id)));
+    const killed = new Set(live.map((s) => s.id));
+    applySessions(sessions.filter((s) => !killed.has(s.id)));
+  }
+
   /** Inline rename (double-click / F2 on a rail row): chimaera owns the
    *  pin — it works for every session kind, not just claude's /rename. */
   function startRename(s: Session): void {
@@ -2208,6 +2218,7 @@
       connected={eventsUp}
       onOpen={activateWorkspace}
       onRemove={removeWorkspace}
+      onStop={stopWorkspace}
       onOpenFolder={openPicker}
     />
   {:else}

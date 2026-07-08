@@ -35,12 +35,23 @@
     onOpen: (w: Workspace) => void;
     /** Remove `w` from the daemon's registry (files untouched). */
     onRemove: (w: Workspace) => void;
+    /** End every live session in `w` (the registration itself is untouched). */
+    onStop: (w: Workspace) => void;
     /** Open the folder picker (browse/register a new folder). */
     onOpenFolder: () => void;
   }
 
-  let { workspaces, sessions, hostLabel, health, connected, onOpen, onRemove, onOpenFolder }: Props =
-    $props();
+  let {
+    workspaces,
+    sessions,
+    hostLabel,
+    health,
+    connected,
+    onOpen,
+    onRemove,
+    onStop,
+    onOpenFolder,
+  }: Props = $props();
 
   const native = isNativeShell();
 
@@ -62,6 +73,8 @@
 
   /** Confirm target for workspace removal (one at a time, Escape cancels). */
   let confirmRemoveId = $state<string | null>(null);
+  /** Confirm target for ending a workspace's live sessions. */
+  let confirmStopId = $state<string | null>(null);
 
   // --- remote hosts (native shell only) --------------------------------------
 
@@ -244,6 +257,18 @@
     return dot === -1 ? build : build.slice(0, dot);
   }
 
+  /**
+   * Plain-English tooltip for the outdated-daemon note. The raw build id
+   * ("a9cdd60-dirty") is developer shorthand — surface it on hover, but spell
+   * out what it means so the visible line reads clearly to anyone.
+   */
+  function buildNote(build: string | null): string {
+    const dirty = build?.includes("-dirty")
+      ? ' The "-dirty" tag means it was compiled from a working tree with uncommitted changes.'
+      : "";
+    return `Running daemon build: ${shortBuild(build)}.${dirty} Updating restarts the daemon on a matching current build; its live sessions end first.`;
+  }
+
   /** What clicking "update" ends, spelled out next to the action. */
   function endsLabel(n: number | null): string {
     if (n === null) return " (session count unknown)";
@@ -314,8 +339,8 @@
         {/if}
       </div>
       {#if native && hostLabel === "local" && localState?.outdated}
-        <div class="update-line">
-          <span>daemon from {shortBuild(localState.build)} —</span>
+        <div class="update-line" title={buildNote(localState.build)}>
+          <span>daemon is an older build —</span>
           <button class="update-act" disabled={localUpdating} onclick={() => void updateLocal()}>
             {localUpdating ? "updating…" : `update${endsLabel(liveNow)}`}
           </button>
@@ -353,7 +378,23 @@
         <div class="rows">
           {#each sorted as w (w.id)}
             {@const live = liveByWs.get(w.id)}
-            {#if confirmRemoveId === w.id}
+            {@const wsState = live && live.attn > 0 ? "attn" : live && live.live > 0 ? "alive" : ""}
+            {#if confirmStopId === w.id}
+              <div class="row confirm" role="alertdialog" aria-label="end sessions?">
+                <span class="name">{w.name}</span>
+                <span class="confirm-label"
+                  >end {live?.live} running session{live?.live === 1 ? "" : "s"}?</span
+                >
+                <button
+                  class="confirm-yes"
+                  onclick={() => {
+                    confirmStopId = null;
+                    onStop(w);
+                  }}>end sessions</button
+                >
+                <button class="confirm-no" onclick={() => (confirmStopId = null)}>cancel</button>
+              </div>
+            {:else if confirmRemoveId === w.id}
               <div class="row confirm" role="alertdialog" aria-label="remove workspace?">
                 <span class="name">{w.name}</span>
                 <span class="confirm-label">remove from this list?</span>
@@ -367,8 +408,16 @@
                 <button class="confirm-no" onclick={() => (confirmRemoveId = null)}>cancel</button>
               </div>
             {:else}
-              <div class="rowwrap" role="presentation">
+              <div class="rowwrap" role="presentation" class:live={wsState === "alive"} class:attn={wsState === "attn"}>
                 <button class="row" title={w.root} onclick={(e) => openRow(e, w)}>
+                  <span
+                    class="dot {wsState}"
+                    title={wsState === "attn"
+                      ? `${live?.attn} need${live?.attn === 1 ? "s" : ""} you`
+                      : wsState === "alive"
+                        ? `${live?.live} live session${live?.live === 1 ? "" : "s"}`
+                        : "no live sessions"}
+                  ></span>
                   <span class="name">{w.name}</span>
                   <span class="path">{tildify(w.root)}</span>
                   {#if live !== undefined && live.attn > 0}
@@ -386,6 +435,15 @@
                   {/if}
                   <span class="when">{ago(w.last_opened_at)}</span>
                 </button>
+                {#if live !== undefined && live.live > 0}
+                  <button
+                    class="side stop shown"
+                    title="end this workspace's {live.live} running session{live.live === 1
+                      ? ''
+                      : 's'}"
+                    onclick={() => (confirmStopId = w.id)}>stop</button
+                  >
+                {/if}
                 <button
                   class="side"
                   title="open in a new window"
@@ -474,7 +532,7 @@
                   <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
                 </div>
               {:else}
-                <div class="rowwrap" role="presentation">
+                <div class="rowwrap" role="presentation" class:connected={h.status === "connected"}>
                   <button
                     class="row"
                     title={h.status === "connected"
@@ -492,6 +550,11 @@
                         : h.status === 'connecting'
                           ? 'starting'
                           : ''}"
+                      title={h.status === "connected"
+                        ? "connected"
+                        : h.status === "connecting"
+                          ? "connecting…"
+                          : "not connected"}
                     ></span>
                     <span class="name">{h.alias}</span>
                     {#if phase !== undefined}
@@ -501,9 +564,23 @@
                     {:else}
                       <span class="when">{ago(h.last_connected_at)}</span>
                     {/if}
+                    {#if h.status === "connected" && (h.live_sessions ?? 0) > 0}
+                      <span
+                        class="badge"
+                        title="{h.live_sessions} live session{h.live_sessions === 1
+                          ? ''
+                          : 's'} on {h.alias}"
+                      >
+                        <span class="dot alive"></span>{h.live_sessions}
+                      </span>
+                    {/if}
                   </button>
                   {#if h.status === "connected"}
-                    <button class="side" onclick={() => void disconnect(h.alias)}>disconnect</button>
+                    <button
+                      class="side"
+                      title="close the tunnel — sessions keep running on {h.alias}"
+                      onclick={() => void disconnect(h.alias)}>disconnect</button
+                    >
                   {/if}
                   <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
                     >&times;</button
@@ -513,8 +590,8 @@
                   <div class="err-line">{err}</div>
                 {/if}
                 {#if h.status === "connected" && h.outdated && phase === undefined}
-                  <div class="note-line">
-                    daemon from {shortBuild(h.remote_build)} —
+                  <div class="note-line" title={buildNote(h.remote_build)}>
+                    daemon is an older build —
                     <button class="update-act" onclick={() => void connect(h.alias, true)}>
                       update{endsLabel(h.live_sessions)}
                     </button>
@@ -799,6 +876,30 @@
     background: var(--row-hover);
   }
 
+  /* Running workspaces and connected hosts carry a faint accent wash so they
+     cluster apart from the dormant rows; attention pulls toward amber. Hover
+     still wins so the row reacts under the cursor. */
+  .rowwrap.live,
+  .rowwrap.connected {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+
+  .rowwrap.attn {
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+  }
+
+  .rowwrap.live:hover,
+  .rowwrap.connected:hover,
+  .rowwrap.attn:hover {
+    background: var(--row-hover);
+  }
+
+  /* A connected host wears its alias in the accent — the same "this is live"
+     language the rail uses for a remote window's host label. */
+  .rowwrap.connected > .row > .name {
+    color: var(--accent);
+  }
+
   .row {
     flex: 1;
     min-width: 0;
@@ -887,6 +988,54 @@
     border-color: color-mix(in srgb, var(--warn) 40%, transparent);
   }
 
+  /* Session/host state dot. This is the home screen's at-a-glance liveness
+     signal — a dormant workspace reads muted, live work glows in the accent,
+     an agent that needs you glows amber, and a connecting host pulses. */
+  .dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    opacity: 0.4;
+  }
+
+  .dot.alive {
+    background: var(--accent);
+    opacity: 1;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+
+  .dot.attn {
+    background: var(--warn);
+    opacity: 1;
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent);
+  }
+
+  .dot.starting {
+    background: var(--muted);
+    opacity: 1;
+    animation: dotpulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes dotpulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.3;
+    }
+  }
+
+  /* Inside a count pill the halo would clip against the border — the pill's
+     own tint already carries the state, so the inner dot stays flat. */
+  .badge .dot {
+    width: 6px;
+    height: 6px;
+    box-shadow: none;
+  }
+
   .when {
     flex: none;
     margin-left: auto;
@@ -917,8 +1066,23 @@
     color: var(--err);
   }
 
+  .side.stop:hover {
+    color: var(--err);
+  }
+
   .rowwrap:hover .side {
     visibility: visible;
+  }
+
+  /* The stop control stays visible for a running workspace (not hover-gated
+     like the others) — ending live work should never be a hidden gesture. */
+  .side.shown {
+    visibility: visible;
+    color: var(--warn);
+  }
+
+  .side.shown:hover {
+    color: var(--err);
   }
 
   .remote-ws {
