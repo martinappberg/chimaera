@@ -12,6 +12,7 @@
   import {
     createWorktree,
     gitEnv,
+    gitRepoError,
     gitStatus,
     gitWorktrees,
     notifyWorkspacesChanged,
@@ -53,13 +54,26 @@
   const env = $derived($gitEnv);
   const gitBad = $derived(env !== null && env.ok === false);
 
+  // Git resolved fine but couldn't READ this repo (dubious ownership on shared
+  // storage, a permission problem, a timeout). Shown only when it isn't the
+  // git-binary itself that's the problem, and there's genuinely no repo to
+  // render — turning the flat "not a git repository" dead end into a fix.
+  const repoError = $derived(!gitBad && status === null ? $gitRepoError : null);
+  // The most common HPC cause is git refusing a repo it considers unsafe; when
+  // that's it, offer the exact one-line remedy with the path git named.
+  const dubiousPath = $derived.by(() => {
+    if (repoError === null) return null;
+    const m = /dubious ownership in repository at '([^']+)'/.exec(repoError);
+    return m ? m[1] : null;
+  });
+
   // Seed the path field from the current setting the first time the bad-git
   // state appears; the user edits from there (blank clears the override).
   let gitPathInput = $state("");
   let gitSeeded = false;
   let savingGit = $state(false);
   $effect(() => {
-    if (gitBad && !gitSeeded) {
+    if ((gitBad || repoError !== null) && !gitSeeded) {
       gitPathInput = getSetting("git.path");
       gitSeeded = true;
     }
@@ -210,6 +224,21 @@
           />
         </svg>
       </button>
+    {:else if repoError !== null}
+      <span class="branch none warn">can’t read repo</span>
+      <span class="spacer"></span>
+      <button class="refresh" title="re-check git" onclick={() => refreshGit()}>
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path
+            d="M13 8a5 5 0 1 1-1.6-3.7M13 2.5V5.5H10"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
     {:else if status === null}
       <span class="branch none">{wsId === null ? "no workspace" : "not a git repository"}</span>
     {:else}
@@ -296,6 +325,50 @@
             disabled={savingGit}
             onclick={() => void saveGitPath()}>{savingGit ? "checking…" : "use this git"}</button>
         </div>
+      </div>
+    {:else if repoError !== null}
+      <div class="gitenv">
+        <div class="gitenv-title">Couldn’t read this repository</div>
+        <p class="gitenv-body">
+          Git is fine, but it wouldn’t open the repo here. This is a real repo —
+          it isn’t showing because git returned:
+        </p>
+        <p class="gitenv-where"><span class="mono err">{repoError}</span></p>
+        {#if dubiousPath}
+          <p class="gitenv-hint">
+            Git refuses repos it thinks another user owns (common on shared
+            cluster storage). If this checkout is yours, mark it trusted:
+          </p>
+          <p class="gitenv-where">
+            <span class="mono">git config --global --add safe.directory {dubiousPath}</span>
+          </p>
+          <p class="gitenv-hint">Then re-check.</p>
+        {:else}
+          <p class="gitenv-hint">
+            Often a permissions or filesystem issue in the checkout. If a
+            different git would help (e.g. a newer one via
+            <span class="mono">module load git</span>), point chimaera at it —
+            leave blank to resolve from your login shell.
+          </p>
+          <div class="gitenv-form">
+            <input
+              class="compose-input"
+              bind:value={gitPathInput}
+              placeholder="path to git ≥ {env?.min ?? '2.15'}"
+              spellcheck="false"
+              autocapitalize="off"
+              autocorrect="off"
+              disabled={savingGit}
+              onkeydown={(e) => {
+                if (e.key === "Enter") void saveGitPath();
+              }}
+            />
+            <button
+              class="compose-go"
+              disabled={savingGit}
+              onclick={() => void saveGitPath()}>{savingGit ? "checking…" : "use this git"}</button>
+          </div>
+        {/if}
       </div>
     {:else if status === null}
       <div class="empty">
@@ -858,6 +931,18 @@
     padding: 0.03rem 0.28rem;
     border-radius: 4px;
     white-space: nowrap;
+  }
+  /* The remedy command and the raw git error can be long — let them wrap and
+     break rather than overflow the narrow panel. */
+  .gitenv-where .mono {
+    display: inline-block;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .gitenv .mono.err {
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
   }
   .gitenv-form {
     display: flex;

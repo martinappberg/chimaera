@@ -74,6 +74,14 @@ export interface GitStatus {
   git_ok?: boolean;
   /** The resolved git binary + its version diagnostic. */
   git?: GitEnv;
+  /**
+   * Present (with `repo:false`, `git_ok:true`) when git resolved fine but
+   * couldn't READ this repository — dubious ownership on shared storage, a
+   * permission problem, or a timeout on a wedged filesystem. Distinct from a
+   * genuine non-repo (where it is absent): the panel turns it into an
+   * actionable message instead of a blank "not a git repository".
+   */
+  repo_error?: string;
 }
 
 export type DiffMode = "unstaged" | "staged" | "head";
@@ -225,6 +233,14 @@ const gitEnvStore = writable<GitEnv | null>(null);
  */
 export const gitEnv: Readable<GitEnv | null> = gitEnvStore;
 
+const gitRepoErrorStore = writable<string | null>(null);
+/**
+ * Why a resolved-fine git couldn't read the workspace's repo (dubious
+ * ownership, permission, timeout), or `null`. Tracked alongside `gitEnv` so the
+ * panel can explain it even though `gitStatus` is null (no repo to render).
+ */
+export const gitRepoError: Readable<string | null> = gitRepoErrorStore;
+
 let currentWs: string | null = null;
 let refreshSeq = 0;
 const lastEpoch = new Map<string, number>();
@@ -235,6 +251,7 @@ export async function activateGitWorkspace(wsId: string | null): Promise<void> {
   currentWs = wsId;
   statusStore.set(null);
   worktreesStore.set([]);
+  gitRepoErrorStore.set(null);
   if (wsId) await refresh(wsId);
 }
 
@@ -253,6 +270,9 @@ async function refresh(wsId: string): Promise<void> {
     // Git-binary diagnostic rides every status response, repo or not — so a
     // too-old git surfaces even when there's no repo to render.
     gitEnvStore.set(status.git ?? null);
+    // "not a repo" leaves this null; a real repo we couldn't read carries the
+    // reason so the panel can explain it (see repo_error).
+    gitRepoErrorStore.set(status.repo ? null : (status.repo_error ?? null));
     statusStore.set(status.repo ? status : null);
     worktreesStore.set(status.repo ? (wt.worktrees ?? []) : []);
   } catch {
