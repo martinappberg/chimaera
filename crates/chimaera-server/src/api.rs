@@ -226,6 +226,10 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
 
 /// GET /api/v1/sessions
 pub(crate) async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    // Mid-restore the roster is a lie — and this endpoint feeds the remote
+    // update decision, where an undercount reads as "safe to replace the
+    // daemon" and would kill the very sessions being resurrected.
+    state.wait_restored().await;
     Json(serde_json::Value::Array(sessions_json(&state)))
 }
 

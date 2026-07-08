@@ -134,6 +134,7 @@
   import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/keys";
   import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/keybindings";
   import {
+    askpassActive,
     closeThisWindow,
     connectHost,
     focusWindow,
@@ -2819,32 +2820,46 @@
 {/if}
 
 {#if showReconnect}
-  <!-- A remote window's tunnel dropped: we re-run the SSH connect (auth modal
-       appears above this only if ssh re-asks). A same-port heal resumes this
-       window in place; a moved daemon re-homes it. -->
+  <!-- A remote window's tunnel dropped: we re-run the SSH connect. While ssh
+       is asking for auth the modal above owns the interaction — this overlay
+       steps back to a quiet status line so the user never faces a spinner,
+       an error, AND a password field all claiming the same reconnect. A
+       same-port heal resumes this window in place; a moved daemon re-homes. -->
   <div class="reconnect-overlay" role="alertdialog" aria-modal="true" aria-label="reconnecting">
     <div class="reconnect-panel">
       <div class="reconnect-head">
-        <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
+        <span
+          class="reconnect-spinner"
+          class:spin={reconnecting || $askpassActive}
+          aria-hidden="true"
+        ></span>
         <span class="reconnect-title">
-          {reconnectError !== null ? `can’t reach ${hostAlias}` : `reconnecting to ${hostAlias}…`}
+          {$askpassActive
+            ? `authenticating to ${hostAlias}…`
+            : reconnectError !== null
+              ? `can’t reach ${hostAlias}`
+              : `reconnecting to ${hostAlias}…`}
         </span>
       </div>
       <p class="reconnect-body">
-        {reconnectError ??
-          "re-establishing the SSH tunnel — this window resumes where it left off."}
+        {$askpassActive
+          ? "ssh needs your credentials — answer the prompt to resume this window."
+          : (reconnectError ??
+            "re-establishing the SSH tunnel — this window resumes where it left off.")}
       </p>
-      <div class="reconnect-actions">
-        <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
-        <button
-          class="reconnect-retry"
-          use:focusOnMount
-          disabled={reconnecting}
-          onclick={() => void attemptReconnect()}
-        >
-          {reconnecting ? "reconnecting…" : "retry"}
-        </button>
-      </div>
+      {#if !$askpassActive}
+        <div class="reconnect-actions">
+          <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
+          <button
+            class="reconnect-retry"
+            use:focusOnMount
+            disabled={reconnecting}
+            onclick={() => void attemptReconnect()}
+          >
+            {reconnecting ? "reconnecting…" : "retry"}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

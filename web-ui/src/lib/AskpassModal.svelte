@@ -4,40 +4,74 @@
   // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). Mounted once
   // at the App root so ANY window can answer — a mid-session reconnect on the
   // workbench needs to prompt just as much as the home screen does.
+  //
+  // Prompts queue rather than replace: ssh asks sequentially (password, then
+  // a Duo passcode), and clobbering an unanswered prompt would strand its ssh
+  // waiting on an answer that can no longer be given.
   import { onMount } from "svelte";
-  import { answerAskpass, onAskpass, type AskpassPrompt } from "./native";
+  import {
+    answerAskpass,
+    askpassActive,
+    listAskpass,
+    onAskpass,
+    onAskpassDone,
+    type AskpassPrompt,
+  } from "./native";
 
-  /** The pending SSH auth prompt, or null when none is in flight. */
-  let askpass = $state<AskpassPrompt | null>(null);
+  /** Prompts awaiting an answer, oldest first; the head is on screen. */
+  let queue = $state<AskpassPrompt[]>([]);
+  const askpass = $derived(queue[0] ?? null);
   /** What the user has typed into the field. */
   let secretValue = $state("");
   /** Reveal the typed secret (a passcode is easier to check than a password). */
   let revealSecret = $state(false);
 
-  onMount(() => {
-    let unlisten: (() => void) | null = null;
-    void onAskpass((p) => {
-      askpass = p;
+  // Tell the rest of the UI (the reconnect overlay) a prompt is on screen.
+  $effect(() => {
+    askpassActive.set(askpass !== null);
+  });
+
+  function enqueue(p: AskpassPrompt): void {
+    if (queue.some((q) => q.id === p.id)) return;
+    if (queue.length === 0) {
       secretValue = "";
       revealSecret = false;
-    }).then((u) => (unlisten = u));
-    return () => unlisten?.();
+    }
+    queue = [...queue, p];
+  }
+
+  onMount(() => {
+    const unlisteners: Array<() => void> = [];
+    void onAskpass(enqueue).then((u) => unlisteners.push(u));
+    // A prompt resolved elsewhere (another window answered, or ssh gave up
+    // waiting) must leave this window's queue too.
+    void onAskpassDone((id) => {
+      queue = queue.filter((q) => q.id !== id);
+    }).then((u) => unlisteners.push(u));
+    // Pick up prompts raised before this window existed (startup restore
+    // connects before any webview loads; the emit-only path would lose them).
+    void listAskpass().then((pending) => pending.forEach(enqueue));
+    return () => unlisteners.forEach((u) => u());
   });
+
+  function advance(): void {
+    queue = queue.slice(1);
+    secretValue = "";
+    revealSecret = false;
+  }
 
   function submit(): void {
     const p = askpass;
     if (p === null) return;
-    askpass = null;
     void answerAskpass(p.id, secretValue);
-    secretValue = "";
+    advance();
   }
 
   function cancel(): void {
     const p = askpass;
     if (p === null) return;
-    askpass = null;
     void answerAskpass(p.id, null);
-    secretValue = "";
+    advance();
   }
 
   /** Focus the field the moment the prompt appears. */

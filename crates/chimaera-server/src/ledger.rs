@@ -250,6 +250,9 @@ pub(crate) async fn run(state: Arc<AppState>) {
     // first write replaces it with the current — initially empty — truth.
     let boot = crate::lock(&state.ledger).load_boot();
     restore(&state, boot).await;
+    // Serving started concurrently; sessions snapshots held back by
+    // `wait_restored` may flow now that the roster is whole.
+    state.restored.send_replace(true);
     loop {
         tokio::select! {
             _ = state.changes.notified() => {}
