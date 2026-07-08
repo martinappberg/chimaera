@@ -114,6 +114,7 @@
   import { dirtyFiles } from "./lib/editing";
   import {
     activateGitWorkspace,
+    gitEnv,
     gitStatus,
     onGitNudge,
     workspacesChanged,
@@ -2590,6 +2591,26 @@
               </span>
             {/if}
           </button>
+        {:else if $gitEnv?.ok === false}
+          <!-- No repo shown because git itself can't run (too old / missing).
+               One click opens source control, which explains the fix. -->
+          <button
+            class="daemon-git bad"
+            onclick={openGitPanel}
+            title={`git ${$gitEnv.version ? `${$gitEnv.version} is too old (need ≥ ${$gitEnv.min})` : "not found"} — open source control to fix`}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <path
+                d="M8 1.8 14.6 13H1.4L8 1.8ZM8 6.4v3.1M8 11.2v.1"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="dg-branch">git {$gitEnv.version ? "too old" : "missing"}</span>
+          </button>
         {/if}
         {#if activeWsId !== null}
           <button
@@ -3581,6 +3602,10 @@
   .daemon-git:hover {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  .daemon-git.bad {
+    color: var(--warn);
   }
 
   .dg-branch {

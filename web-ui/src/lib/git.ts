@@ -39,6 +39,22 @@ export interface GitCounts {
   total: number;
 }
 
+/** The git binary the daemon resolved, and whether it can drive the service. */
+export interface GitEnv {
+  /** The resolved git clears the minimum version — the service can run. */
+  ok: boolean;
+  /** Absolute path (or bare "git") the daemon is invoking. */
+  path: string;
+  /** How it was found: an explicit setting, the login shell, or PATH. */
+  source: "setting" | "login-shell" | "path";
+  /** Parsed "MAJOR.MINOR.PATCH", or null when git could not be run at all. */
+  version: string | null;
+  /** Raw `git --version` line, for the diagnostic. */
+  raw: string | null;
+  /** The minimum version chimaera needs ("2.15"). */
+  min: string;
+}
+
 export interface GitStatus {
   repo: boolean;
   workspace_id: string;
@@ -54,6 +70,10 @@ export interface GitStatus {
   truncated: boolean;
   /** Set when the repo exists but status momentarily failed. */
   error?: string;
+  /** False when the resolved git is missing or too old (see `git`). */
+  git_ok?: boolean;
+  /** The resolved git binary + its version diagnostic. */
+  git?: GitEnv;
 }
 
 export type DiffMode = "unstaged" | "staged" | "head";
@@ -197,6 +217,14 @@ const worktreesStore = writable<GitWorktree[]>([]);
 /** Every worktree of the active workspace's repo (empty when not a repo). */
 export const gitWorktrees: Readable<GitWorktree[]> = worktreesStore;
 
+const gitEnvStore = writable<GitEnv | null>(null);
+/**
+ * The daemon's resolved git binary + version. Tracked independently of `repo`
+ * so the panel can explain a too-old / missing git (`ok:false`) even where
+ * there is no repo to show — the "(unborn)"-looking dead end on old HPC git.
+ */
+export const gitEnv: Readable<GitEnv | null> = gitEnvStore;
+
 let currentWs: string | null = null;
 let refreshSeq = 0;
 const lastEpoch = new Map<string, number>();
@@ -222,6 +250,9 @@ async function refresh(wsId: string): Promise<void> {
     // Drop stale responses (workspace switched or a newer refresh overtook us).
     if (currentWs !== wsId || seq !== refreshSeq) return;
     if (typeof status.epoch === "number") lastEpoch.set(wsId, status.epoch);
+    // Git-binary diagnostic rides every status response, repo or not — so a
+    // too-old git surfaces even when there's no repo to render.
+    gitEnvStore.set(status.git ?? null);
     statusStore.set(status.repo ? status : null);
     worktreesStore.set(status.repo ? (wt.worktrees ?? []) : []);
   } catch {
