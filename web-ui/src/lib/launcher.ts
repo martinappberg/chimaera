@@ -19,6 +19,9 @@ export interface AgentInfo {
   /** The resolved binary lives under ~/.chimaera/agents — installed (or
    *  updated) by chimaera's managed-runtime flow, not the user's own PATH. */
   managed: boolean;
+  /** The resolved binary came from the user's explicit `agents.<id>.path`
+   *  setting (a runnable one) — provenance for the Agents settings panel. */
+  explicit: boolean;
   /** The resolved binary's absolute path (which `{id}` a spawn will run);
    *  null when not installed. Surfaced in the launcher's version tooltip so
    *  "yours" vs "chimaera" is answerable at a glance. */
@@ -66,6 +69,7 @@ export async function listAgents(refresh = false): Promise<AgentInfo[]> {
         outdated: a.outdated === true,
         version: typeof a.version === "string" ? a.version : null,
         managed: a.managed === true,
+        explicit: a.explicit === true,
         path: typeof a.path === "string" ? a.path : null,
         managedInstall: a.managed_install === true,
         installUrl: typeof install.url === "string" ? install.url : null,
@@ -94,6 +98,19 @@ export async function installAgent(agentId: string, workspaceId: string): Promis
     throw new ApiError(500, "malformed install response");
   }
   return body.session_id;
+}
+
+/**
+ * DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent
+ * binary (the symlink + version tree under ~/.chimaera/agents). Only touches
+ * chimaera's own prefix; a user's own install is never affected. Returns
+ * whether anything managed was actually removed.
+ */
+export async function uninstallAgent(agentId: string): Promise<boolean> {
+  const body = await json<{ removed?: unknown }>(
+    await api(`/agents/${encodeURIComponent(agentId)}/install`, { method: "DELETE" }),
+  );
+  return body.removed === true;
 }
 
 /** A launcher selection: what to spawn (and, for resume rows, from where). */

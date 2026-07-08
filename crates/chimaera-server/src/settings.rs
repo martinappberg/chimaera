@@ -156,6 +156,17 @@ impl SettingsStore {
         (!s.is_empty()).then(|| s.to_string())
     }
 
+    /// Daemon-consumed key: an explicit path to an agent's binary
+    /// (`agents.<kind>.path`). `None` (unset or blank) means "resolve from the
+    /// login shell, then a chimaera-managed install". The same escape hatch as
+    /// [`git_path`], per agent — for hosts where the agent lives somewhere the
+    /// login shell doesn't surface.
+    pub(crate) fn agent_path(&mut self, kind: crate::agents::AgentKind) -> Option<String> {
+        let key = format!("agents.{}.path", kind.as_str());
+        let s = self.current().get(&key)?.as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
     /// Daemon-consumed key: directory names quick-open skips while walking.
     /// None = the built-in default list.
     pub(crate) fn quickopen_ignore_dirs(&mut self) -> Option<Vec<String>> {
@@ -216,19 +227,39 @@ pub(crate) async fn put_settings(State(state): State<Arc<AppState>>, body: Bytes
                 .into_response();
         }
     };
-    match crate::lock(&state.settings).put(map) {
-        Ok(()) => {
-            // Wake /ws/events subscribers so every window converges live.
-            state.changes.notify_waiters();
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(err) => {
+    // Persist, tracking whether any per-agent path override moved so we can
+    // rebuild the shims for it. Scoped so the settings lock is released before
+    // regenerate_shims (which re-locks settings) — no deadlock.
+    let agent_paths_changed = {
+        let mut settings = crate::lock(&state.settings);
+        let before = agent_path_snapshot(settings.current());
+        if let Err(err) = settings.put(map) {
             tracing::error!(%err, "failed to persist settings");
-            (
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": err.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
+        before != agent_path_snapshot(settings.current())
+    };
+    if agent_paths_changed {
+        // A per-agent binary override moved: rebuild the shims (add/remove/point
+        // one) and drop the detection cache so the next spawn resolves anew.
+        crate::runtimes::regenerate_shims(&state);
     }
+    // Wake /ws/events subscribers so every window converges live.
+    state.changes.notify_waiters();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The `agents.<kind>.path` entries of a settings map, for diffing a PUT: only
+/// these keys drive shim regeneration.
+fn agent_path_snapshot(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    map.iter()
+        .filter(|(k, _)| k.starts_with("agents.") && k.ends_with(".path"))
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
 }
