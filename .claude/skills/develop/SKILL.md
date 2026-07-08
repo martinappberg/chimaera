@@ -1,6 +1,6 @@
 ---
 name: develop
-description: Run Chimaera locally and iterate on it — the daemon + Vite web-UI dev loop, ports, dev-mode auth, the build-embeds-UI gotcha, and where things live. Use when starting to develop or run the app, when a change needs the real daemon/UI to see, or when the dev server won't come up.
+description: Run Chimaera locally and iterate on it — the daemon + Vite web-UI dev loop, ports, dev-mode auth, the build-embeds-UI gotcha, the isolated per-worktree daemon (chimaerad-isolated), and where things live. Use when starting to develop or run the app, when a change needs the real daemon/UI to see, when working in a git worktree or alongside another daemon, or when the dev server won't come up (port in use, Node version, blank UI).
 ---
 
 # Developing Chimaera locally
@@ -32,6 +32,42 @@ cargo run -p chimaera -- serve --port 9700
 production builds), so the page picks up the bearer token itself — don't
 hand-copy tokens. Point a second UI at a different daemon with
 `CHIMAERA_DEV_TARGET=http://127.0.0.1:<port>` (see the `web-ui-sandbox` config).
+
+## Isolated per-worktree run (coding agents — use this in a worktree)
+
+The default `chimaerad` / `web-ui` configs hardcode ports 9700 / 5173 and share
+`~/.chimaera`. That collides the moment a second worktree or chat is live:
+`serve` **writes the manifest on start and REMOVES it on stop**, so a shared
+daemon deletes a sibling's manifest and breaks its dev auth. When another
+daemon may be up, run **`chimaerad-isolated`** instead — a self-contained
+daemon just for this worktree:
+
+```
+preview_start  →  config "chimaerad-isolated"
+```
+
+It runs [`serve-isolated.sh`](serve-isolated.sh), which sets
+`CHIMAERA_HOME=<worktree>/.chimaera-dev` (its own manifest/workspaces/recents,
+gitignored) and takes an **auto-assigned free port** (`autoPort`, via `$PORT`).
+`CHIMAERA_HOME` moves only the daemon's bookkeeping — spawned shells/agents keep
+the real `$HOME`, so `~/.claude` auth still works. No Vite, so no 5173 clash and
+no Node needed at run time.
+
+**One-time build first** (the script fails fast if either is missing):
+
+```sh
+cargo build -p chimaera                       # builds target/debug/chimaera
+nvm use 22 && npm --prefix web-ui ci \
+  && npm --prefix web-ui run build            # Node 22 — the nvm default (16) errors
+```
+
+Then `preview_start chimaerad-isolated`, read the printed
+`http://127.0.0.1:<port>/#token=…` from `preview_logs`, and navigate the preview
+there (serve mode has no `/dev/manifest` auto-auth — the token rides the URL
+fragment). A **debug** daemon reads `web-ui/dist` from disk per request, so after
+a UI change just rebuild the UI and reload the page — no daemon restart.
+
+To reset this worktree's isolated daemon state, delete `.chimaera-dev/`.
 
 ## Running the built daemon (production-like)
 

@@ -8,6 +8,13 @@
       "port": 9700
     },
     {
+      "comment": "This worktree's daemon on an isolated state dir + an auto-assigned port. Use this (not chimaerad) when other worktrees/chats may have a daemon up. See the develop skill.",
+      "name": "chimaerad-isolated",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [".claude/skills/develop/serve-isolated.sh"],
+      "autoPort": true
+    },
+    {
       "name": "web-ui",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "web-ui", "run", "dev", "--", "--port", "5173", "--strictPort"],
