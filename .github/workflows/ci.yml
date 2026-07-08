@@ -1,9 +1,23 @@
 name: ci
 
+# `push: [main]` looks redundant with the PR run — squash-merging an up-to-date
+# branch lands a byte-identical tree, so it re-tests something already green.
+# Keep it anyway: it is the ONLY writer of the base-branch Rust caches every PR
+# restores from. rust-cache keys on job name, so release.yml's `daemon`/`app`
+# jobs never populate `rust`/`musl`. Delete this trigger and every PR pays a
+# cold clippy+test build.
 on:
   push:
     branches: [main]
   pull_request:
+
+# A superseded PR run is worthless: cancel it the moment a new commit lands.
+# Pushes to main are never cancelled — they prime the caches described above.
+# The group is per-workflow, so this can never interfere with release.yml
+# (which triggers independently on push:[main] and owns the `release` group).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ui:
@@ -37,6 +51,11 @@ jobs:
       # rust-toolchain.toml, so CI lints against the same compiler as local.
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+        # Main saves, PRs restore. A PR-scoped cache is unreadable by every
+        # other PR, yet still consumes the repo's 10 GiB LRU cache quota — left
+        # unchecked it evicts the very main entries this job exists to prime.
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -57,6 +76,8 @@ jobs:
       - run: rustup show
       - uses: mlugg/setup-zig@v2
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-zigbuild
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
       - uses: actions/upload-artifact@v4
