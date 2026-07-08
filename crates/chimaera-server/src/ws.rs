@@ -42,6 +42,12 @@ enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// `/ws/events` only: "this window is looking at workspace W" (null when it
+    /// has none). Gates the git backstop poll — see `git::WatchGuard`.
+    Watch {
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
 }
 
 /// GET /ws/sessions/{id}
@@ -230,8 +236,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 tracing::debug!(%id, %err, "ws resize failed");
                             }
                         }
-                        // Ignore re-auth and unknown message types.
-                        Ok(ClientMessage::Auth { .. }) | Err(_) => {}
+                        // Ignore re-auth, the events-bus `watch` frame, and
+                        // unknown message types.
+                        Ok(ClientMessage::Auth { .. }) | Ok(ClientMessage::Watch { .. }) | Err(_) => {}
                     }
                 }
                 // Client went away: drop the attachment, the session lives on.
@@ -309,8 +316,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
+    // Released on every exit path below (a leaked watcher would poll git forever).
+    let mut watch = crate::git::WatchGuard::new(state.clone());
+
     let mut last_sent: Option<String> = None;
     let mut last_settings_gen: Option<u64> = None;
+    let mut last_git: Option<String> = None;
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
         .await
         .is_err()
@@ -323,13 +334,29 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
+    if send_git_snapshot(&mut socket, &state, &mut last_git)
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     loop {
         tokio::select! {
             _ = state.changes.notified() => {}
             _ = tokio::time::sleep(EVENTS_TICK) => {}
             msg = socket.recv() => match msg {
-                Some(Ok(_)) => continue, // client frames carry nothing here
+                // The only client frame on this bus: which workspace this window
+                // is showing, so the git backstop knows what to poll.
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ClientMessage::Watch { workspace_id }) =
+                        serde_json::from_str::<ClientMessage>(&text)
+                    {
+                        watch.set(workspace_id);
+                    }
+                    continue;
+                }
+                Some(Ok(_)) => continue,
                 Some(Err(_)) | None => return,
             },
         }
@@ -340,6 +367,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
         if send_sessions_snapshot(&mut socket, &state, &mut last_sent)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if send_git_snapshot(&mut socket, &state, &mut last_git)
             .await
             .is_err()
         {
@@ -367,6 +400,27 @@ async fn send_settings_snapshot(
     let frame = json!({"type": "settings", "settings": map}).to_string();
     socket.send(Message::Text(frame.into())).await?;
     *last_gen = Some(generation);
+    Ok(())
+}
+
+/// Send a `{"type":"git","epochs":{workspace_id:epoch}}` invalidate frame when
+/// any workspace's git epoch moved. The status payload never rides this bus —
+/// the client refetches `GET /git/status` for its active workspace
+/// (invalidate-and-pull keeps big path lists off the daemon-wide firehose). The
+/// map is ordered (BTreeMap) so an unchanged snapshot compares equal.
+async fn send_git_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let epochs: std::collections::BTreeMap<String, u64> =
+        state.git.epochs_snapshot().into_iter().collect();
+    let frame = json!({"type": "git", "epochs": epochs}).to_string();
+    if last.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(frame.clone().into())).await?;
+    *last = Some(frame);
     Ok(())
 }
 

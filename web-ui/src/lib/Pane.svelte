@@ -8,6 +8,8 @@
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
   import FileView from "./FileView.svelte";
+  import DiffView from "./DiffView.svelte";
+  import GitView from "./GitView.svelte";
   import SettingsView from "./SettingsView.svelte";
   import FinderView from "./FinderView.svelte";
 
@@ -25,6 +27,8 @@
     linkCtrl: LinkCtrl;
     /** Active workspace root (touched-files paths relativize against it). */
     wsRoot: string | null;
+    /** Active workspace id (the git surfaces query the daemon with it). */
+    wsId: string | null;
     /** Panes whose bottom band is armed for the current drag. */
     bandPanes: ReadonlySet<string>;
     ctrl: LayoutCtrl;
@@ -41,6 +45,7 @@
     links,
     linkCtrl,
     wsRoot,
+    wsId,
     bandPanes,
     ctrl,
   }: Props = $props();
@@ -134,6 +139,21 @@
           {wsRoot}
           onOpenFile={(p, split) => ctrl.openFileFrom(node.id, p, split)}
           onNavigate={(p) => ctrl.navigateFinder(activeTab.id, p)}
+        />
+      {:else if activeTab.surface === "diff"}
+        <!-- Keyed per (path, mode): switching between two diff tabs in one pane
+             must remount, never reuse the view with a stale comparison. -->
+        {#key `${activeTab.mode}:${activeTab.path}`}
+          <DiffView path={activeTab.path} mode={activeTab.mode} {wsId} />
+        {/key}
+      {:else if activeTab.surface === "git"}
+        <GitView
+          {wsId}
+          paneId={node.id}
+          {ctrl}
+          {sessions}
+          {names}
+          onOpenSession={ctrl.revealWorktreeSession}
         />
       {:else}
         <SettingsView />

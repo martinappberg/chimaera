@@ -18,6 +18,8 @@
   import { agentHue, type LinkCtrl } from "./agentLinks";
   import { basename, midTruncate, viewKindFor } from "./files";
   import { dirtyFiles } from "./editing";
+  import { gitIndex } from "./git";
+  import { decoFor } from "./gitDeco";
   import { KEYS } from "./keys";
   import { activeSelection, referenceTarget, requestReference } from "./reference";
   import { workspaceRelative } from "./reference";
@@ -184,6 +186,8 @@
     }
     if (tab.surface === "settings") return "Settings";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
+    if (tab.surface === "git") return "Source Control";
+    if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
     return fileNames.get(tab.path) ?? basename(tab.path);
   }
 
@@ -266,6 +270,8 @@
     {#each node.tabs as tab, i (tabKey(tab))}
       {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
       {@const ts = sid !== null ? (sessions.get(sid) ?? null) : null}
+      {@const fEntry = tab.surface === "file" ? $gitIndex.files.get(tab.path) : undefined}
+      {@const fDeco = fEntry ? decoFor(fEntry) : null}
       <div
         class="tab"
         class:active={i === node.active}
@@ -279,7 +285,9 @@
         aria-selected={i === node.active}
         tabindex="-1"
         data-tab-index={i}
-        title={tab.surface === "file" || tab.surface === "finder" ? tab.path : label(tab)}
+        title={tab.surface === "file" || tab.surface === "finder" || tab.surface === "diff"
+          ? tab.path
+          : label(tab)}
         onpointerdowncapture={(e) => {
           // Capture-phase (directly attached, not delegated); ignore presses
           // on the close button so it stays a plain click.
@@ -321,6 +329,32 @@
           <span class="tab-glyph" class:on={i === node.active}>
             <FolderIcon size={13} plain={i === node.active} />
           </span>
+        {:else if tab.surface === "git"}
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>source control</title>
+            <path
+              d="M5 4v5.2M11 4v2a2.4 2.4 0 0 1-2.4 2.4H5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+            />
+            <circle cx="5" cy="12" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="5" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <circle cx="11" cy="2.6" r="1.7" fill="none" stroke="currentColor" stroke-width="1.4" />
+          </svg>
+        {:else if tab.surface === "diff"}
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>diff</title>
+            <path
+              d="M2.5 2.5h4v11h-4zM9.5 2.5h4v11h-4z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linejoin="round"
+            />
+            <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
         {:else if $dirtyFiles.has(tab.path)}
           <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
           <span class="dirty-dot" title="unsaved changes"></span>
@@ -329,7 +363,7 @@
             <FileIcon path={tab.path} size={13} plain={i === node.active} />
           </span>
         {/if}
-        <span class="tab-name">{label(tab)}</span>
+        <span class="tab-name" style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span>
         <button
           class="tab-close"
           aria-label="close tab"
