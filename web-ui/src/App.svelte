@@ -137,11 +137,15 @@
     connectHost,
     focusWindow,
     isNativeShell,
+    onAppUpdate,
     onHostStatus,
     onLocalDaemonUpdated,
     onMenu,
     reportWindowScope,
+    shellBuild,
   } from "./lib/native";
+  import UpdateToast from "./lib/UpdateToast.svelte";
+  import { currentOffer, updateState } from "./lib/update.svelte";
   import * as pool from "./lib/termPool";
   import {
     applyRemoteSettings,
@@ -170,6 +174,10 @@
   import Pane from "./lib/Pane.svelte";
 
   let health = $state<Health | null>(null);
+  /** This app binary's build id (native only); vs health.build = skew. */
+  let appBuild = $state<string | null>(null);
+  /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
+  let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
   let sessions = $state<Session[]>([]);
   /** Linked-terminal edges, mirrored from /ws/events snapshots. */
@@ -292,8 +300,6 @@
   // --- the rail's Recents section (ended agent conversations) ---
   let recents = $state<RecentConvo[]>([]);
   let recentsExpanded = $state(false);
-  /** Follow-up fetch timer: retirement lands on the daemon's ~2s watch tick. */
-  let recentsTimer: ReturnType<typeof setTimeout> | null = null;
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
   /** Rail row currently in inline rename (double-click or F2). */
@@ -492,6 +498,21 @@
     ),
   );
 
+  // Daemon/app build skew (native): the daemon serving this window is a
+  // different build than the app — the update toast offers the restart.
+  // Health rides a poll, so this stays current without extra traffic. The
+  // build-timestamp suffix is ignored, like core's builds_match: the same
+  // commit built at different moments must not read as skew.
+  $effect(() => {
+    updateState.buildSkew =
+      appBuild !== null &&
+      typeof health?.build === "string" &&
+      health.build.split(".")[0] !== appBuild.split(".")[0];
+  });
+
+  /** The one update worth offering in this window right now. */
+  const updateOffer = $derived(currentOffer(scopeAlias));
+
   // /ws/events pushes full session snapshots; the 5s poll only runs as a
   // fallback while the socket is down (including before the first frame).
   // Links normally ride the socket frames; the fallback refreshes them too.
@@ -560,6 +581,15 @@
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
+      onUpdate: (status) => (updateState.daemon = status),
+      onRecents: (epoch) => {
+        // Invalidate-and-pull, like git: a conversation retired somewhere;
+        // refetch this window's workspace list iff the epoch moved.
+        if (lastRecentsEpoch !== epoch) {
+          lastRecentsEpoch = epoch;
+          refreshRecents();
+        }
+      },
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -579,7 +609,13 @@
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
+    let unlistenAppUpdate: (() => void) | null = null;
     if (isNativeShell()) {
+      // Build-skew + app-update signals for the update toast.
+      void shellBuild().then((b) => (appBuild = b));
+      void onAppUpdate((version) => (updateState.appVersion = version)).then(
+        (u) => (unlistenAppUpdate = u),
+      );
       void onMenu((action) => {
         switch (action) {
           case "close-view":
@@ -594,13 +630,17 @@
             break;
         }
       }).then((u) => (unlistenMenu = u));
-      // The local daemon was replaced (self-update): its old origin is
-      // gone. Windows on the local daemon re-home themselves to the new
-      // port + token, keeping their workspace; tunnel windows are unmoved.
+      // The local daemon was replaced (self-update). With the restart
+      // handoff the new daemon usually keeps the port AND token — then the
+      // origin is intact and the sockets just reconnect; reloading would
+      // only flicker. Re-home (carrying the window id, so the layout
+      // follows) only when the origin actually moved.
       void onLocalDaemonUpdated(({ port, token }) => {
         if (getHostLabel() !== "local") return;
+        if (String(port) === location.port && token === getToken()) return;
         const params = new URLSearchParams();
         params.set("token", token);
+        params.set("win", windowKey());
         if (activeWsId !== null) params.set("ws", activeWsId);
         location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
       }).then((u) => (unlistenDaemonMoved = u));
@@ -621,6 +661,7 @@
         if (portMoved || tokenMoved) {
           const params = new URLSearchParams();
           if (token !== null) params.set("token", token);
+          params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
           params.set("host", hostAlias);
           location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
@@ -644,6 +685,7 @@
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
+      unlistenAppUpdate?.();
       document.removeEventListener("copy", onCopy);
       stopChordHints();
       setReferenceHandler(null);
@@ -1253,7 +1295,7 @@
     const changed =
       agentIds.size !== prevAgentIds.size || [...prevAgentIds].some((id) => !agentIds.has(id));
     prevAgentIds = agentIds;
-    if (changed) refreshRecents(true);
+    if (changed) refreshRecents();
     pruneAndAutoOpen();
   }
 
@@ -1592,14 +1634,15 @@
   // --- the rail's Recents section ---
 
   /** Monotone fetch counter: a slow early /recents response must not
-   *  clobber a newer one (the follow-up fetch exists precisely to carry
-   *  fresher data than its predecessor). */
+   *  clobber a newer one. */
   let recentsSeq = 0;
 
-  /** Reload the workspace's ended agent conversations. `follow` schedules a
-   *  second fetch: a killed agent retires into recents on the daemon's ~2s
-   *  watch tick, after the session already vanished from the snapshot. */
-  function refreshRecents(follow = false): void {
+  /** Reload the workspace's ended agent conversations. Retire timing needs
+   *  no guessing: the daemon pushes a `recents` epoch frame the moment a
+   *  conversation lands in the store, and this refetches on it. This path
+   *  also runs on agent-set changes — a conversation resumed into a live
+   *  session must drop off the list even though the store didn't change. */
+  function refreshRecents(): void {
     const ws = activeWsId;
     if (ws === null) {
       recents = [];
@@ -1613,13 +1656,6 @@
       .catch(() => {
         // rail stays on its last list; the next snapshot retries
       });
-    if (follow) {
-      if (recentsTimer !== null) clearTimeout(recentsTimer);
-      recentsTimer = setTimeout(() => {
-        recentsTimer = null;
-        refreshRecents();
-      }, 2600);
-    }
   }
 
   $effect(() => {
@@ -2754,6 +2790,12 @@
 <!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
      the workbench can prompt just like the home screen. Self-gating. -->
 <AskpassModal />
+
+<!-- Ambient update offer (small, snoozable): a newer release, or a daemon
+     older than this app. One per window; dismissals are origin-wide. -->
+{#if updateOffer !== null}
+  <UpdateToast offer={updateOffer} />
+{/if}
 
 {#if showReconnect}
   <!-- A remote window's tunnel dropped: we re-run the SSH connect (auth modal

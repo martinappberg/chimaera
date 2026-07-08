@@ -156,6 +156,36 @@ export async function installAppUpdate(): Promise<void> {
   await t.core.invoke<void>("install_app_update");
 }
 
+/**
+ * The one-click update chain: install the signed app update and relaunch;
+ * the new process finishes by updating the local daemon (sessions resurrect
+ * via the daemon's ledger, windows reopen from the shell's registry). Does
+ * not return on success.
+ */
+export async function beginUpdate(): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("begin_update");
+}
+
+/** This app binary's build id (null in a browser), for skew detection
+ *  against the daemon's `/health` build. */
+export async function shellBuild(): Promise<string | null> {
+  const t = tauri();
+  if (t === null) return null;
+  return t.core.invoke<string>("shell_build");
+}
+
+/**
+ * A newer signed app build exists (the shell's periodic updater check).
+ * Broadcast to every window; presentation and snoozing are the UI's job.
+ */
+export function onAppUpdate(handler: (version: string) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<string>("app-update", (e) => handler(e.payload));
+}
+
 export async function disconnectHost(alias: string): Promise<void> {
   await tauri()?.core.invoke<void>("disconnect_host", { alias });
 }

@@ -5,10 +5,10 @@
   import { needsAttention, type Session, type Workspace } from "./sessions";
   import {
     addHost,
+    beginUpdate,
     checkAppUpdate,
     connectHost,
     disconnectHost,
-    installAppUpdate,
     isNativeShell,
     listHosts,
     localDaemonState,
@@ -93,8 +93,10 @@
     appUpdateError = null;
     appUpdating = true;
     try {
-      await installAppUpdate();
-      // Never returns on success — the app relaunches into the new build.
+      // The full chain: app bundle now, then the relaunched process updates
+      // the local daemon (windows and sessions restore via the shell's
+      // window registry + the daemon's ledger). Never returns on success.
+      await beginUpdate();
     } catch (e) {
       appUpdateError = e instanceof Error ? e.message : String(e);
       appUpdating = false;
