@@ -100,6 +100,10 @@ export type SettingsMap = {
   "quickOpen.maxResults": number;
   "quickOpen.ignoreDirs": string[];
   "git.path": string;
+  "agents.claude.path": string;
+  "agents.codex.path": string;
+  "agents.gemini.path": string;
+  "agents.agy.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "update.autoCheck": boolean;
@@ -369,6 +373,55 @@ const DEFS = {
     placeholder: "resolve from login shell / PATH",
     scope: "daemon",
     note: "Resolved by the daemon; takes effect on the next status refresh.",
+  },
+
+  // --- Agents ----------------------------------------------------------------
+  // Per-agent binary overrides. The key uses the agent's CLI id, so
+  // Antigravity is `agents.agy.path` (matching the daemon's `agents.<id>.path`).
+  // Empty resolves from the login shell, then a chimaera-managed install.
+  "agents.claude.path": {
+    title: "Claude Code Binary",
+    category: "Agents",
+    description:
+      "Absolute path to the `claude` binary chimaera runs — for launched agents and when you type `claude` in a chimaera terminal. Empty resolves it from your login shell, then a chimaera-managed install. Set this when your install lives somewhere your login shell doesn't surface (e.g. ~/.npm-global/bin on an HPC node).",
+    type: "string",
+    default: "",
+    placeholder: "resolve from login shell / PATH",
+    scope: "daemon",
+    note: "Resolved by the daemon; used for spawns and terminal shims.",
+  },
+  "agents.codex.path": {
+    title: "Codex Binary",
+    category: "Agents",
+    description:
+      "Absolute path to the `codex` binary chimaera runs. Empty resolves it from your login shell, then a chimaera-managed install.",
+    type: "string",
+    default: "",
+    placeholder: "resolve from login shell / PATH",
+    scope: "daemon",
+    note: "Resolved by the daemon; used for spawns and terminal shims.",
+  },
+  "agents.gemini.path": {
+    title: "Gemini CLI Binary",
+    category: "Agents",
+    description:
+      "Absolute path to the `gemini` binary chimaera runs. Empty resolves it from your login shell, then a chimaera-managed install.",
+    type: "string",
+    default: "",
+    placeholder: "resolve from login shell / PATH",
+    scope: "daemon",
+    note: "Resolved by the daemon; used for spawns and terminal shims.",
+  },
+  "agents.agy.path": {
+    title: "Antigravity CLI Binary",
+    category: "Agents",
+    description:
+      "Absolute path to the `agy` (Antigravity CLI) binary chimaera runs. Empty resolves it from your login shell, then a chimaera-managed install. Point this at the standalone CLI, not the Antigravity IDE's app launcher.",
+    type: "string",
+    default: "",
+    placeholder: "resolve from login shell / PATH",
+    scope: "daemon",
+    note: "Resolved by the daemon; used for spawns and terminal shims.",
   },
 
   // --- Daemon ----------------------------------------------------------------

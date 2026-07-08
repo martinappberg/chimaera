@@ -10,6 +10,7 @@
   import { isModified, settingsLoaded } from "./settings/store.svelte";
   import SettingRow from "./settings/SettingRow.svelte";
   import SettingsJson from "./settings/SettingsJson.svelte";
+  import AgentsSettings from "./settings/AgentsSettings.svelte";
   import { PINNED } from "./keys";
   import { activeModLabel } from "./keybindings";
 
@@ -160,12 +161,21 @@
 
       <div class="list" bind:this={listEl} onscroll={onScroll}>
         {#each groups as group (group.category)}
-          <section data-section={group.category}>
-            <h2 class="cat">{group.category}</h2>
-            {#each group.defs as def (def.id)}
-              <SettingRow {def} />
-            {/each}
-          </section>
+          {#if group.category === "Agents"}
+            <!-- Bespoke panel: fuses live daemon detection with the
+                 agents.<id>.path settings and an uninstall action. It renders
+                 its own <h2>, so the generic rows are skipped here. -->
+            <section data-section={group.category}>
+              <AgentsSettings />
+            </section>
+          {:else}
+            <section data-section={group.category}>
+              <h2 class="cat">{group.category}</h2>
+              {#each group.defs as def (def.id)}
+                <SettingRow {def} />
+              {/each}
+            </section>
+          {/if}
         {/each}
 
         {#if keyboardVisible}

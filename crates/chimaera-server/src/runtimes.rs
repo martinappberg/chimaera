@@ -71,6 +71,7 @@
 //! - agy 1.0.16: no theme flag (`--help`) or env var (only internal
 //!   protobuf editor-theme types). Un-themed, same reasoning.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -83,6 +84,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agents::AgentKind;
+use crate::launcher::managed_fallback;
 use crate::AppState;
 
 /// The managed bin dir: one symlink per installed agent, swapped atomically
@@ -426,9 +428,8 @@ fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String
             installed = detection.path.is_ok(),
             "re-detected agent after install session ended"
         );
-        if let Err(err) = write_shims(&state.shims_dir, &managed_bin_dir(&state.managed_root)) {
-            tracing::warn!(%err, "failed to regenerate shims after install");
-        }
+        // A managed install just landed — a shim for it should now exist.
+        regenerate_shims(&state);
         // Clear only this watcher's own session: a stale-slot reclaim may
         // have installed a newer reservation under the same agent.
         let mut installs = crate::lock(&state.installs);
@@ -438,6 +439,76 @@ fn spawn_install_watch(state: Arc<AppState>, kind: AgentKind, session_id: String
         drop(installs);
         state.changes.notify_waiters();
     });
+}
+
+// --- DELETE /api/v1/agents/{id}/install --------------------------------------
+
+/// Remove a directory tree, treating "already gone" as success.
+fn remove_dir_if_exists(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+/// DELETE /api/v1/agents/{id}/install — uninstall a chimaera-MANAGED agent: the
+/// active symlink plus its version tree under `~/.chimaera/agents`. Only ever
+/// touches chimaera's own prefix — the user's own install (and its auth in
+/// `$HOME`) is never touched. Running sessions keep their already-exec'd binary
+/// (the inode survives the unlink). 404 unknown id; 409 while an install for the
+/// same agent is in flight; 200 `{"removed": bool}` otherwise (`false` = nothing
+/// chimaera-managed to remove).
+pub(crate) async fn uninstall_agent(
+    State(state): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    let Some(kind) = AgentKind::parse(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent {id:?}")})),
+        )
+            .into_response();
+    };
+    // Never yank files from under a running install of the same agent.
+    {
+        let installs = crate::lock(&state.installs);
+        if let Some((existing, reserved)) = installs.get(&kind) {
+            if state.sessions.get(existing).is_some()
+                || reserved.elapsed() < INSTALL_RESERVATION_GRACE
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!(
+                        "an install session for {} is running", kind.product_name()
+                    )})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let managed_bin = managed_bin_dir(&state.managed_root);
+    if managed_fallback(kind.as_str(), &managed_bin).is_none() {
+        // Nothing of ours to remove (a user's own install is not ours to touch).
+        return Json(json!({"removed": false})).into_response();
+    }
+    // Drop the active symlink first (so nothing resolves a half-deleted tree),
+    // then the version tree.
+    let link = managed_bin.join(kind.as_str());
+    let tree = state.managed_root.join(kind.as_str());
+    if let Err(err) = remove_if_exists(&link).and_then(|()| remove_dir_if_exists(&tree)) {
+        tracing::error!(%err, agent = kind.as_str(), "failed to uninstall managed agent");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    // The shim for it now disappears (unless an explicit path keeps it), and the
+    // detection cache must forget the managed binary.
+    regenerate_shims(&state);
+    state.changes.notify_waiters();
+    Json(json!({"removed": true})).into_response()
 }
 
 // --- theming shims ------------------------------------------------------------
@@ -498,10 +569,51 @@ pub(crate) fn codex_user_theme_set(config_path: &Path) -> bool {
     })
 }
 
+/// The explicit `agents.<kind>.path` overrides from settings, as a map.
+pub(crate) fn explicit_agent_paths(state: &AppState) -> HashMap<AgentKind, String> {
+    let mut settings = crate::lock(&state.settings);
+    let mut map = HashMap::new();
+    for kind in AgentKind::ALL {
+        if let Some(path) = settings.agent_path(kind) {
+            map.insert(kind, path);
+        }
+    }
+    map
+}
+
+/// Regenerate the shims from current settings + managed installs, and drop the
+/// agent detection cache so the next spawn re-resolves. Called at daemon start
+/// and after anything that changes resolution: an install, an uninstall, or a
+/// settings edit to `agents.*.path`.
+pub(crate) fn regenerate_shims(state: &AppState) {
+    let explicit = explicit_agent_paths(state);
+    if let Err(err) = write_shims(
+        &state.shims_dir,
+        &managed_bin_dir(&state.managed_root),
+        &explicit,
+    ) {
+        tracing::warn!(%err, "failed to regenerate shims");
+    }
+    // The next detection must see the new world (a removed managed binary, a
+    // new explicit path), so clear the daemon-lifetime cache.
+    crate::lock(&state.agent_bins).clear();
+}
+
 /// Generate `~/.chimaera/shims/*`: called at daemon start and after every
-/// install session. The shims are daemon-owned, but live sessions exec
-/// them, so every file goes in via tmp + rename — never truncated in place.
-pub(crate) fn write_shims(shim_dir: &Path, managed_bin: &Path) -> anyhow::Result<()> {
+/// install/uninstall/settings change (via [`regenerate_shims`]). The shims are
+/// daemon-owned, but live sessions exec them, so every file goes in via tmp +
+/// rename — never truncated in place.
+///
+/// A shim is written for a kind ONLY when chimaera has something to contribute:
+/// a managed install of it exists, or the user pinned an explicit
+/// `agents.<kind>.path`. Otherwise the shim is REMOVED (or never created), so
+/// typing `<bin>` resolves through the user's own PATH exactly like a plain
+/// terminal — chimaera never shadows an install it doesn't own and then fails.
+pub(crate) fn write_shims(
+    shim_dir: &Path,
+    managed_bin: &Path,
+    explicit: &HashMap<AgentKind, String>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(shim_dir)
         .with_context(|| format!("failed to create {}", shim_dir.display()))?;
     // The minimal theme settings files the claude shim points --settings at
@@ -516,13 +628,30 @@ pub(crate) fn write_shims(shim_dir: &Path, managed_bin: &Path) -> anyhow::Result
     }
     for kind in AgentKind::ALL {
         let path = shim_dir.join(kind.as_str());
-        write_atomic(
-            &path,
-            shim_script(kind, shim_dir, managed_bin).as_bytes(),
-            0o755,
-        )?;
+        let explicit_path = explicit.get(&kind).map(String::as_str);
+        let managed = managed_fallback(kind.as_str(), managed_bin).is_some();
+        if explicit_path.is_some() || managed {
+            write_atomic(
+                &path,
+                shim_script(kind, shim_dir, managed_bin, explicit_path).as_bytes(),
+                0o755,
+            )?;
+        } else {
+            // A prior managed install now uninstalled, or a cleared explicit
+            // path: drop the stale shim so it stops shadowing the user's own.
+            remove_if_exists(&path)?;
+        }
     }
     Ok(())
+}
+
+/// Remove a file, treating "already gone" as success (idempotent shim cleanup).
+fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 /// Put a file in place via `<path>.tmp` + rename(2): the targets are live
@@ -544,34 +673,46 @@ fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One shim: resolve the real binary (user install first — with the shim
-/// dir stripped from PATH so the shim never finds itself — managed
-/// fallback), then exec with the scheme-matched theme when inside a
-/// chimaera session.
-fn shim_script(kind: AgentKind, shim_dir: &Path, managed_bin: &Path) -> String {
+/// One shim: resolve the real binary (an explicit `agents.<kind>.path` wins,
+/// then the user's own install — with the shim dir stripped from PATH so the
+/// shim never finds itself — then a chimaera-managed install), then exec with
+/// the scheme-matched theme when inside a chimaera session.
+fn shim_script(
+    kind: AgentKind,
+    shim_dir: &Path,
+    managed_bin: &Path,
+    explicit: Option<&str>,
+) -> String {
     let bin = kind.as_str();
     let resolve = format!(
         r#"#!/bin/sh
 # generated by chimaera — do not edit (rewritten at daemon start and after installs)
-# Resolves the real {bin} (your own install first, chimaera-managed fallback)
-# and themes it to match the chimaera pane. Applies ONLY inside chimaera
-# sessions (CHIMAERA_SESSION); elsewhere this dir is simply not on PATH.
+# Resolves the real {bin} (an explicit path you set, else your own install, else
+# a chimaera-managed one) and themes it to match the chimaera pane. Applies ONLY
+# inside chimaera sessions (CHIMAERA_SESSION); elsewhere this dir is not on PATH.
 shims={shims}
-clean=''
-old_ifs="${{IFS-}}"; IFS=:
-for d in $PATH; do
-  [ "$d" = "$shims" ] && continue
-  clean="${{clean:+$clean:}}$d"
-done
-IFS="$old_ifs"
-# An empty $clean (PATH held only the shim dir) never reaches command -v:
-# some shells search the cwd through an empty PATH.
 real=''
-if [ -n "$clean" ]; then
-  real="$(PATH="$clean" command -v {bin} 2>/dev/null || true)"
+# An explicit agents.{bin}.path setting wins outright when it is runnable.
+explicit={explicit}
+if [ -n "$explicit" ] && [ -x "$explicit" ]; then
+  real="$explicit"
+else
+  clean=''
+  old_ifs="${{IFS-}}"; IFS=:
+  for d in $PATH; do
+    [ "$d" = "$shims" ] && continue
+    clean="${{clean:+$clean:}}$d"
+  done
+  IFS="$old_ifs"
+  # An empty $clean (PATH held only the shim dir) never reaches command -v:
+  # some shells search the cwd through an empty PATH.
+  if [ -n "$clean" ]; then
+    real="$(PATH="$clean" command -v {bin} 2>/dev/null || true)"
+  fi
 fi
 "#,
         shims = sq(&shim_dir.display().to_string()),
+        explicit = explicit.map(sq).unwrap_or_else(|| "''".to_string()),
     );
     // The Antigravity IDE ships an `agy` symlink to its own app launcher
     // (opens the GUI, exits 0) — same guard as server-side detection.
@@ -642,6 +783,25 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Write an executable stub at `path` (parent dirs must exist).
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A managed bin dir holding an executable stub for every agent, so
+    /// `write_shims` writes a shim for each (a shim only exists when chimaera
+    /// manages the binary or an explicit path is set).
+    fn managed_with_all(dir: &Path) -> PathBuf {
+        let managed = dir.join("agents").join("bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        for kind in AgentKind::ALL {
+            write_exec(&managed.join(kind.as_str()), "#!/bin/sh\n");
+        }
+        managed
     }
 
     #[test]
@@ -756,8 +916,9 @@ mod tests {
     fn shims_resolve_user_first_then_managed_and_gate_on_session() {
         let dir = test_dir("shims");
         let shim_dir = dir.join("shims");
-        let managed = dir.join("agents").join("bin");
-        write_shims(&shim_dir, &managed).unwrap();
+        // Every agent managed, so a shim is written for each.
+        let managed = managed_with_all(&dir);
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
 
         for kind in AgentKind::ALL {
             let path = shim_dir.join(kind.as_str());
@@ -814,8 +975,12 @@ mod tests {
 
         let dir = test_dir("shim-exec");
         let shim_dir = dir.join("shims");
+        // A managed claude makes the shim exist; the user's own (on PATH) still
+        // wins the resolution below.
         let managed = dir.join("agents").join("bin");
-        write_shims(&shim_dir, &managed).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_exec(&managed.join("claude"), "#!/bin/sh\necho managed-claude\n");
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
 
         // A fake "user install" of claude that prints its argv.
         let user_bin = dir.join("user-bin");
@@ -869,18 +1034,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// With no user install on PATH the shim falls back to the managed
-    /// binary under ~/.chimaera/agents/bin, and reports 127 honestly when
-    /// neither exists.
+    /// With a managed install present and no user install on PATH, the shim
+    /// resolves the managed binary under ~/.chimaera/agents/bin and themes it.
     #[test]
-    fn shim_falls_back_to_managed_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn shim_execs_managed_binary_when_user_has_none() {
         let dir = test_dir("shim-managed");
         let shim_dir = dir.join("shims");
         let managed = dir.join("agents").join("bin");
         std::fs::create_dir_all(&managed).unwrap();
-        write_shims(&shim_dir, &managed).unwrap();
+        // A managed codex → the shim exists and, with no user codex on PATH,
+        // falls to the managed one.
+        write_exec(
+            &managed.join("codex"),
+            "#!/bin/sh\necho \"managed-codex $*\"\n",
+        );
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
 
@@ -895,22 +1063,12 @@ mod tests {
             cmd.output().expect("shim ran")
         };
 
-        // Nothing installed: exit 127 with an actionable message (bring your
-        // own, or install one from the launcher) — no internal-path jargon.
-        let out = run();
-        assert_eq!(out.status.code(), Some(127));
-        let err = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert!(err.contains("codex is not installed"), "{err}");
-        assert!(err.contains("agent launcher"), "{err}");
-
-        // A managed install appears: the shim finds it and themes it.
-        let fake = managed.join("codex");
-        std::fs::write(&fake, "#!/bin/sh\necho \"managed-codex $*\"\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let out = run();
         assert!(out.status.success(), "{out:?}");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(stdout.trim(), "managed-codex -c tui.theme=catppuccin-latte");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "managed-codex -c tui.theme=catppuccin-latte"
+        );
 
         // A dotted-key theme in the user's own config suppresses injection
         // just like the [tui] spelling.
@@ -923,30 +1081,100 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Never shadow the user's own binary: a shim is written ONLY when chimaera
+    /// manages the binary or an explicit path is set, and a stale shim is
+    /// removed the moment neither holds (an uninstall).
+    #[test]
+    fn shim_written_only_when_managed_or_explicit() {
+        let dir = test_dir("shim-active");
+        let shim_dir = dir.join("shims");
+        let managed = dir.join("agents").join("bin");
+        std::fs::create_dir_all(&managed).unwrap();
+
+        // Nothing managed, no explicit path → no shim, so `codex` resolves
+        // through the user's own PATH instead of being shadowed.
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
+        assert!(!shim_dir.join("codex").exists());
+
+        // A managed codex lands → a shim appears.
+        write_exec(&managed.join("codex"), "#!/bin/sh\n");
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
+        assert!(shim_dir.join("codex").exists());
+
+        // It is uninstalled → the stale shim is removed.
+        std::fs::remove_file(managed.join("codex")).unwrap();
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
+        assert!(!shim_dir.join("codex").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An explicit `agents.<kind>.path` wins outright — over both a user install
+    /// on PATH and a chimaera-managed one — and is still themed.
+    #[test]
+    fn shim_prefers_explicit_path_over_user_and_managed() {
+        let dir = test_dir("shim-explicit");
+        let shim_dir = dir.join("shims");
+        let managed = dir.join("agents").join("bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        write_exec(&managed.join("codex"), "#!/bin/sh\necho managed-codex\n");
+        let user_bin = dir.join("user-bin");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        write_exec(&user_bin.join("codex"), "#!/bin/sh\necho user-codex\n");
+        let explicit_bin = dir.join("elsewhere-codex");
+        write_exec(&explicit_bin, "#!/bin/sh\necho \"explicit-codex $*\"\n");
+
+        let mut map = HashMap::new();
+        map.insert(AgentKind::Codex, explicit_bin.display().to_string());
+        write_shims(&shim_dir, &managed, &map).unwrap();
+
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = std::process::Command::new(shim_dir.join("codex"));
+        cmd.env_clear();
+        cmd.env(
+            "PATH",
+            format!(
+                "{}:{}:/usr/bin:/bin",
+                shim_dir.display(),
+                user_bin.display()
+            ),
+        );
+        cmd.env("HOME", &home);
+        cmd.env("CHIMAERA_SESSION", "s-1");
+        cmd.env("CHIMAERA_THEME", "light");
+        let out = cmd.output().expect("shim ran");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "explicit-codex -c tui.theme=catppuccin-latte"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// PATH holding only the shim dir strips to an empty $clean — the shim
     /// must not resolve through an empty PATH (some shells search the cwd)
     /// and falls straight to the managed binary.
     #[test]
     fn shim_skips_user_resolution_when_path_strips_to_empty() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_dir("shim-empty-path");
         let shim_dir = dir.join("shims");
         let managed = dir.join("agents").join("bin");
         std::fs::create_dir_all(&managed).unwrap();
-        write_shims(&shim_dir, &managed).unwrap();
+        // Managed codex present so the shim is written.
+        write_exec(
+            &managed.join("codex"),
+            "#!/bin/sh\necho \"managed-codex $*\"\n",
+        );
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
 
         // A booby-trapped ./codex in the cwd: an empty PATH must not run it.
         let cwd = dir.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
-        let trap = cwd.join("codex");
-        std::fs::write(&trap, "#!/bin/sh\necho cwd-codex-ran\n").unwrap();
-        std::fs::set_permissions(&trap, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let fake = managed.join("codex");
-        std::fs::write(&fake, "#!/bin/sh\necho \"managed-codex $*\"\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&cwd.join("codex"), "#!/bin/sh\necho cwd-codex-ran\n");
 
         let mut cmd = std::process::Command::new(shim_dir.join("codex"));
         cmd.env_clear();
@@ -965,19 +1193,19 @@ mod tests {
     /// quoting (sq): resolution and fallback still work.
     #[test]
     fn shim_survives_quoted_prefix() {
-        use std::os::unix::fs::PermissionsExt;
-
         let base = test_dir("shim-quoted");
         let dir = base.join("o'brien");
         let shim_dir = dir.join("shims");
         let managed = dir.join("agents").join("bin");
         std::fs::create_dir_all(&managed).unwrap();
-        write_shims(&shim_dir, &managed).unwrap();
+        // Managed codex present so the shim is written.
+        write_exec(
+            &managed.join("codex"),
+            "#!/bin/sh\necho \"managed-codex $*\"\n",
+        );
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let fake = managed.join("codex");
-        std::fs::write(&fake, "#!/bin/sh\necho \"managed-codex $*\"\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(shim_dir.join("codex"));
         cmd.env_clear();
