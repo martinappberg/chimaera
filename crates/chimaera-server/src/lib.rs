@@ -210,6 +210,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/validate", post(fs::validate))
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
+        .route("/git/worktrees", get(git::worktrees))
         .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
@@ -3717,6 +3718,90 @@ mod tests {
         assert_eq!(diff["binary"], false);
         assert_eq!(diff["a"], "one\n");
         assert_eq!(diff["b"], "two\n");
+    }
+
+    /// A workspace opened AT A LINKED WORKTREE — how Chimaera itself is
+    /// developed, so the common case, not the edge. Status must resolve that
+    /// worktree's own branch, and the worktree list must see the whole repo.
+    #[tokio::test]
+    async fn git_worktrees_from_a_linked_worktree() {
+        let repo = test_dir("gitwtrepo");
+        let linked = test_dir("gitwtlinked").join("linked");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .expect("git must be installed");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/x",
+            &linked.to_string_lossy(),
+        ]);
+
+        // The workspace is the LINKED worktree, not the main checkout.
+        let state = test_state();
+        let (status, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": linked.to_string_lossy()})),
+        )
+        .await;
+        assert!(status.is_success(), "workspace create failed: {ws}");
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Status reports the LINKED worktree's branch, not main's.
+        let (status, body) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/git/status?workspace_id={ws_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["repo"], true);
+        assert_eq!(body["branch"], "feat/x");
+
+        // The worktree list sees the whole repo, and marks OUR worktree current.
+        let (status, body) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/git/worktrees?workspace_id={ws_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body["worktrees"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "main + linked");
+        let branches: Vec<&str> = list.iter().filter_map(|w| w["branch"].as_str()).collect();
+        assert!(branches.contains(&"main"));
+        assert!(branches.contains(&"feat/x"));
+        let current: Vec<&str> = list
+            .iter()
+            .filter(|w| w["current"] == true)
+            .filter_map(|w| w["branch"].as_str())
+            .collect();
+        assert_eq!(current, vec!["feat/x"], "the opened worktree is current");
     }
 
     #[tokio::test]

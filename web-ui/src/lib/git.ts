@@ -74,6 +74,21 @@ export interface GitDiff {
   error?: string;
 }
 
+/** One worktree of the repo (the main checkout, or a linked one). */
+export interface GitWorktree {
+  /** Absolute working-tree root. */
+  path: string;
+  /** Short branch name; `null` when detached. */
+  branch: string | null;
+  head: string | null;
+  detached: boolean;
+  bare: boolean;
+  locked: boolean;
+  prunable: boolean;
+  /** The worktree the active workspace has checked out. */
+  current: boolean;
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `request failed with status ${res.status}`;
@@ -102,11 +117,22 @@ export async function fetchGitDiff(
   return json(await api(`/git/diff?${q.toString()}`));
 }
 
+export async function fetchGitWorktrees(
+  workspaceId: string,
+): Promise<{ repo: boolean; worktrees: GitWorktree[] }> {
+  const q = new URLSearchParams({ workspace_id: workspaceId });
+  return json(await api(`/git/worktrees?${q.toString()}`));
+}
+
 // ---- reactive store (active workspace only) ---------------------------------
 
 const statusStore = writable<GitStatus | null>(null);
 /** The active workspace's git status (`null` = no repo / not loaded yet). */
 export const gitStatus: Readable<GitStatus | null> = statusStore;
+
+const worktreesStore = writable<GitWorktree[]>([]);
+/** Every worktree of the active workspace's repo (empty when not a repo). */
+export const gitWorktrees: Readable<GitWorktree[]> = worktreesStore;
 
 let currentWs: string | null = null;
 let refreshSeq = 0;
@@ -117,20 +143,50 @@ export async function activateGitWorkspace(wsId: string | null): Promise<void> {
   if (wsId === currentWs) return;
   currentWs = wsId;
   statusStore.set(null);
+  worktreesStore.set([]);
   if (wsId) await refresh(wsId);
 }
 
 async function refresh(wsId: string): Promise<void> {
   const seq = ++refreshSeq;
   try {
-    const status = await fetchGitStatus(wsId);
+    // `git worktree list` is cheap (reads refs), and a checkout in ANOTHER
+    // worktree only surfaces here, so it rides every refresh.
+    const [status, wt] = await Promise.all([
+      fetchGitStatus(wsId),
+      fetchGitWorktrees(wsId).catch(() => ({ repo: false, worktrees: [] })),
+    ]);
     // Drop stale responses (workspace switched or a newer refresh overtook us).
     if (currentWs !== wsId || seq !== refreshSeq) return;
     if (typeof status.epoch === "number") lastEpoch.set(wsId, status.epoch);
     statusStore.set(status.repo ? status : null);
+    worktreesStore.set(status.repo ? (wt.worktrees ?? []) : []);
   } catch {
-    if (currentWs === wsId && seq === refreshSeq) statusStore.set(null);
+    if (currentWs === wsId && seq === refreshSeq) {
+      statusStore.set(null);
+      worktreesStore.set([]);
+    }
   }
+}
+
+/**
+ * The worktree containing `path`, longest root first. The longest match matters:
+ * linked worktrees often live INSIDE the main checkout (`.claude/worktrees/…`),
+ * so a plain first-match would attribute every session to the main worktree.
+ */
+export function worktreeForPath(
+  worktrees: GitWorktree[],
+  path: string | null | undefined,
+): GitWorktree | null {
+  if (!path) return null;
+  let best: GitWorktree | null = null;
+  for (const w of worktrees) {
+    const root = w.path.endsWith("/") ? w.path : `${w.path}/`;
+    if (path === w.path || path.startsWith(root)) {
+      if (best === null || w.path.length > best.path.length) best = w;
+    }
+  }
+  return best;
 }
 
 /**

@@ -9,17 +9,30 @@
    * grammar), so the panel stays visible beside what you are reviewing.
    */
   import type { LayoutCtrl } from "./dnd";
-  import { gitStatus, refreshGit, type DiffMode, type GitEntry } from "./git";
+  import {
+    gitStatus,
+    gitWorktrees,
+    refreshGit,
+    worktreeForPath,
+    type DiffMode,
+    type GitEntry,
+  } from "./git";
   import { decoFor } from "./gitDeco";
   import { midTruncate } from "./files";
+  import type { Session } from "./sessions";
   import FileIcon from "./FileIcon.svelte";
+  import SessionGlyph from "./SessionGlyph.svelte";
 
   interface Props {
     wsId: string | null;
     paneId: string;
     ctrl: LayoutCtrl;
+    /** Every live session (daemon-wide): agents in OTHER worktrees of this repo
+     *  belong in the Branches view too — that is the whole point of it. */
+    sessions: Map<string, Session>;
+    names: Map<string, string>;
   }
-  let { wsId, paneId, ctrl }: Props = $props();
+  let { wsId, paneId, ctrl, sessions, names }: Props = $props();
 
   const status = $derived($gitStatus);
   const entries = $derived(status?.entries ?? []);
@@ -41,6 +54,27 @@
   );
 
   const clean = $derived(status !== null && entries.length === 0);
+
+  // Branches: each worktree of the repo, and which sessions live in it. The
+  // agent↔branch edge is DERIVED from the session's cwd — nothing is stored.
+  // A single-worktree repo shows nothing here: the header already names the
+  // branch, and an empty section is chrome that hasn't earned its pixels.
+  const worktrees = $derived($gitWorktrees);
+  const allBranches = $derived(
+    worktrees.length < 2
+      ? []
+      : worktrees.map((wt) => ({
+          wt,
+          sessions: [...sessions.values()]
+            .filter((s) => s.alive)
+            .filter((s) => worktreeForPath(worktrees, s.cwd_current ?? s.cwd)?.path === wt.path),
+        })),
+  );
+  // Only what you can act on: the worktree you're in, and any holding sessions.
+  // A repo can carry dozens of stale worktrees (this one does) — listing them
+  // all is chrome that hasn't earned its pixels, so the rest fold into a count.
+  const branches = $derived(allBranches.filter((b) => b.wt.current || b.sessions.length > 0));
+  const otherWorktrees = $derived(allBranches.length - branches.length);
 
   function openDiff(e: MouseEvent, entry: GitEntry, mode: DiffMode): void {
     ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey);
@@ -131,6 +165,45 @@
       {#if status.truncated}
         <div class="trunc">Too many changes to list them all.</div>
       {/if}
+    {/if}
+
+    {#if branches.length > 0}
+      <div class="group branches">
+        <div class="gtitle">
+          <span>Branches</span>
+          <span class="gcount">{branches.length}</span>
+        </div>
+        {#each branches as b (b.wt.path)}
+          <div class="wt" class:current={b.wt.current}>
+            <div class="wt-head" title={b.wt.path}>
+              <span class="wt-branch">
+                {#if b.wt.detached}
+                  <span class="detached">detached</span> <span class="sha">{b.wt.head ?? "?"}</span>
+                {:else}
+                  {b.wt.branch ?? "(unborn)"}
+                {/if}
+              </span>
+              {#if b.wt.current}<span class="wt-tag">current</span>{/if}
+              {#if b.wt.locked}<span class="wt-tag muted">locked</span>{/if}
+              {#if b.wt.prunable}<span class="wt-tag muted">prunable</span>{/if}
+              {#if b.sessions.length > 0}
+                <span class="wt-count">{b.sessions.length}</span>
+              {/if}
+            </div>
+            {#each b.sessions as s (s.id)}
+              <div class="wt-session" title={s.cwd_current ?? s.cwd}>
+                <SessionGlyph kind={s.kind} agentKind={s.agent_kind} size={10} title={s.kind} />
+                <span class="wt-session-name">{names.get(s.id) ?? s.name}</span>
+              </div>
+            {/each}
+          </div>
+        {/each}
+        {#if otherWorktrees > 0}
+          <div class="wt-more">
+            {otherWorktrees} other worktree{otherWorktrees === 1 ? "" : "s"}, no sessions
+          </div>
+        {/if}
+      </div>
     {/if}
   </div>
 </div>
@@ -297,6 +370,83 @@
     font-size: 0.66rem;
     font-weight: 600;
     line-height: 1;
+  }
+
+  /* Branches: one block per worktree, with the sessions living in it. */
+  .branches {
+    margin-top: 0.35rem;
+    border-top: 1px solid var(--edge);
+    padding-top: 0.2rem;
+  }
+
+  .wt {
+    padding: 0.1rem 0.7rem 0.25rem;
+  }
+
+  .wt-head {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    height: 20px;
+  }
+
+  .wt-branch {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wt.current .wt-branch {
+    color: var(--fg);
+  }
+
+  .wt-tag {
+    flex: none;
+    font-size: 0.58rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.03rem 0.28rem;
+    border-radius: 3px;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .wt-tag.muted {
+    color: var(--muted);
+    background: var(--row-hover);
+  }
+
+  .wt-count {
+    flex: none;
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 0.64rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+
+  .wt-session {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0 0 0 0.9rem;
+    height: 18px;
+    color: var(--muted);
+  }
+
+  .wt-session-name {
+    font-size: 0.7rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .wt-more {
+    padding: 0.15rem 0.7rem 0.2rem;
+    font-size: 0.66rem;
+    color: var(--muted);
+    opacity: 0.7;
   }
 
   .empty,

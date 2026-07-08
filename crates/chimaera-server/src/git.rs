@@ -196,6 +196,81 @@ impl GitService {
         }
         Ok(parse_status(&out.stdout, out.truncated))
     }
+
+    /// Every worktree of this repo (the main checkout plus linked ones). Cheap
+    /// and rarely-changing, so it is computed on demand rather than cached.
+    async fn worktrees(&self, repo: &RepoInfo) -> anyhow::Result<Vec<WorktreeInfo>> {
+        let out = run_git(
+            &self.procs,
+            &repo.toplevel,
+            &["--no-optional-locks", "worktree", "list", "--porcelain"],
+            1024 * 1024,
+        )
+        .await?;
+        if !out.success {
+            anyhow::bail!("git worktree list failed: {}", out.stderr);
+        }
+        Ok(parse_worktrees(&out.stdout))
+    }
+}
+
+/// One entry of `git worktree list --porcelain`.
+#[derive(Default)]
+struct WorktreeInfo {
+    path: PathBuf,
+    /// Short HEAD sha.
+    head: Option<String>,
+    /// Short branch name (`refs/heads/x` -> `x`); `None` when detached.
+    branch: Option<String>,
+    detached: bool,
+    bare: bool,
+    locked: bool,
+    prunable: bool,
+}
+
+/// Parse `git worktree list --porcelain`: blank-line-separated records of
+/// `worktree <path>` followed by `HEAD`/`branch`/`detached`/`bare`/`locked`/
+/// `prunable` attributes. (Line-oriented, not `-z`: a path containing a newline
+/// is pathological and would only mis-split that one record.)
+fn parse_worktrees(bytes: &[u8]) -> Vec<WorktreeInfo> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Vec<WorktreeInfo> = Vec::new();
+    let mut current: Option<WorktreeInfo> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            out.extend(current.take());
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            out.extend(current.take());
+            current = Some(WorktreeInfo {
+                path: PathBuf::from(path),
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(w) = current.as_mut() else { continue };
+        if let Some(sha) = line.strip_prefix("HEAD ") {
+            w.head = Some(sha.trim().chars().take(7).collect());
+        } else if let Some(reference) = line.strip_prefix("branch ") {
+            w.branch = Some(
+                reference
+                    .trim()
+                    .trim_start_matches("refs/heads/")
+                    .to_string(),
+            );
+        } else if line == "detached" {
+            w.detached = true;
+        } else if line == "bare" {
+            w.bare = true;
+        } else if line == "locked" || line.starts_with("locked ") {
+            w.locked = true;
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            w.prunable = true;
+        }
+    }
+    out.extend(current.take());
+    out
 }
 
 /// Run `git rev-parse` to resolve the working-tree root and common git dir.
@@ -696,6 +771,50 @@ pub(crate) async fn status(
     }
 }
 
+/// GET /api/v1/git/worktrees?workspace_id= — every worktree of this repo, with
+/// the branch each is on. The client maps its sessions into them by cwd, so
+/// "which agent is on which branch" is derived, never stored.
+pub(crate) async fn worktrees(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StatusQuery>,
+) -> Response {
+    let Some(ws) = crate::lock(&state.workspaces).get(&q.workspace_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown workspace"})),
+        )
+            .into_response();
+    };
+    let Some(repo) = state.git.discover(&q.workspace_id, &ws.root).await else {
+        return Json(json!({"repo": false, "worktrees": []})).into_response();
+    };
+    match state.git.worktrees(&repo).await {
+        Ok(list) => {
+            let items: Vec<serde_json::Value> = list
+                .iter()
+                .map(|w| {
+                    json!({
+                        "path": w.path.to_string_lossy(),
+                        "branch": w.branch,
+                        "head": w.head,
+                        "detached": w.detached,
+                        "bare": w.bare,
+                        "locked": w.locked,
+                        "prunable": w.prunable,
+                        // The worktree this workspace actually has checked out.
+                        "current": w.path == repo.toplevel,
+                    })
+                })
+                .collect();
+            Json(json!({"repo": true, "worktrees": items})).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(%err, workspace = %q.workspace_id, "git worktree list failed");
+            Json(json!({"repo": true, "worktrees": [], "error": err.to_string()})).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct DiffQuery {
     workspace_id: String,
@@ -937,6 +1056,39 @@ mod tests {
         svc.bump("w");
         svc.invalidate("w");
         assert_eq!(svc.publish("w", &clean), (2, false));
+    }
+
+    #[test]
+    fn parses_worktree_list() {
+        let out = concat!(
+            "worktree /repo\n",
+            "HEAD 1234567890abcdef\n",
+            "branch refs/heads/main\n",
+            "\n",
+            "worktree /repo/.claude/worktrees/feat\n",
+            "HEAD abcdef1234567890\n",
+            "branch refs/heads/claude/feat\n",
+            "\n",
+            "worktree /repo/detached\n",
+            "HEAD 0badc0de0badc0de\n",
+            "detached\n",
+            "locked being rebased\n",
+            "\n",
+        );
+        let list = parse_worktrees(out.as_bytes());
+        assert_eq!(list.len(), 3);
+
+        assert_eq!(list[0].path, PathBuf::from("/repo"));
+        assert_eq!(list[0].branch.as_deref(), Some("main"));
+        assert_eq!(list[0].head.as_deref(), Some("1234567"));
+        assert!(!list[0].detached);
+
+        // refs/heads/ is stripped, but a slash INSIDE the branch name survives.
+        assert_eq!(list[1].branch.as_deref(), Some("claude/feat"));
+
+        assert!(list[2].detached);
+        assert_eq!(list[2].branch, None);
+        assert!(list[2].locked);
     }
 
     #[test]

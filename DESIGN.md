@@ -961,12 +961,18 @@ setup into a new session. Distinctive, deferred.
     (shared `.git`, own branch, isolated tree). The workspace stays "the folder you opened"; the
     git service knows the repo's worktrees (`git worktree list --porcelain`) and **agent↔branch
     is derived, not stored** — match each session's polled cwd against the worktree paths.
-    Phased: **P1** the read-only inspection above; **P2** worktree orientation (branch per
-    session row/header, a **Branches** view in the changes panel listing each worktree + the
-    agents in it, status/diffs scoped to the active session's worktree — all read-only, nearly
-    free: one cheap `worktree list` on the git cadence + path-prefix matching); **P3**
-    orchestration — the launcher's one deliberate mutation, "new agent / new terminal in a new
-    branch" (`git worktree add -b`) + worktree removal (clean-check + confirm). Open P3
+    Phased: **P1 (SHIPPED)** the read-only inspection above. **P2 (SHIPPED)** worktree
+    orientation: `GET /api/v1/git/worktrees` runs `git worktree list --porcelain`, and the client
+    maps each session into a worktree by its polled cwd — **longest-root-wins**, because linked
+    worktrees usually live INSIDE the main checkout (`.claude/worktrees/…`) and a first-match
+    would file every session under `main`. The changes panel grows a **Branches** section: one
+    block per worktree, its branch, a `current` tag, and the live sessions in it. A repo can
+    carry dozens of stale worktrees (this one carries 17), so only the current worktree and those
+    holding sessions are listed; the rest fold into "N other worktrees, no sessions". Deferred
+    from P2: a branch chip on every rail session row (the Branches view already answers "which
+    agent is on which branch"), and scoping status/diffs to a non-active worktree.
+    **P3** orchestration — the launcher's one deliberate mutation, "new agent / new terminal in a
+    new branch" (`git worktree add -b`) + worktree removal (clean-check + confirm). Open P3
     sub-decision: managed-worktree location — `~/.chimaera/worktrees/<repo>/<branch>`
     (daemon-owned prefix, no repo pollution) vs a repo-relative `.worktrees/` (more discoverable,
     closer to the `.claude/worktrees/` convention).

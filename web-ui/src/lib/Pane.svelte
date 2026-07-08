@@ -147,7 +147,7 @@
           <DiffView path={activeTab.path} mode={activeTab.mode} {wsId} />
         {/key}
       {:else if activeTab.surface === "git"}
-        <GitView {wsId} paneId={node.id} {ctrl} />
+        <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} />
       {:else}
         <SettingsView />
       {/if}
