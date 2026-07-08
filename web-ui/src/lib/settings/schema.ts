@@ -99,6 +99,7 @@ export type SettingsMap = {
   "files.tableRowsPerPage": number;
   "quickOpen.maxResults": number;
   "quickOpen.ignoreDirs": string[];
+  "git.path": string;
   "daemon.scrollbackLines": number;
   "daemon.restoreSessions": boolean;
   "update.autoCheck": boolean;
@@ -355,6 +356,19 @@ const DEFS = {
     placeholder: "node_modules",
     scope: "daemon",
     note: "Consumed by the daemon's file walker; leave empty for the built-in list.",
+  },
+
+  // --- Git -------------------------------------------------------------------
+  "git.path": {
+    title: "Git Binary Path",
+    category: "Git",
+    description:
+      "Absolute path to the git the source-control features use (status, diffs, worktrees). Empty resolves git from your login shell, then PATH. Set this when the host's default git is too old — e.g. an HPC login node still on git 1.8: run `module load git` (or similar), then paste `command -v git` here. chimaera needs git ≥ 2.15.",
+    type: "string",
+    default: "",
+    placeholder: "resolve from login shell / PATH",
+    scope: "daemon",
+    note: "Resolved by the daemon; takes effect on the next status refresh.",
   },
 
   // --- Daemon ----------------------------------------------------------------

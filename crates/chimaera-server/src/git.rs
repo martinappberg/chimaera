@@ -50,6 +50,12 @@ const MAX_CONCURRENT_GIT: usize = 4;
 /// Backstop cadence: catches out-of-band changes (external editor, a `git`
 /// command in a terminal) that fire none of the event-driven refresh triggers.
 const BACKSTOP_INTERVAL: Duration = Duration::from_secs(12);
+/// The oldest git this service can drive. Every core command uses a flag or
+/// subcommand younger than this: `worktree` and `rev-parse --git-common-dir`
+/// (2.5), `status --porcelain=v2` (2.11), and `--no-optional-locks` (2.15).
+/// Below it we degrade to an honest "your git is too old" instead of parsing
+/// garbage — a real hazard on HPC login nodes still shipping RHEL 7's 1.8.3.1.
+const MIN_GIT: (u32, u32) = (2, 15);
 
 /// The read-only git service: discovery cache, per-workspace nudge epochs, and
 /// the concurrency permit shared by every invocation.
@@ -72,6 +78,11 @@ pub(crate) struct GitService {
     /// workspace id -> hash of the last computed status, so the backstop only
     /// bumps the epoch when something actually changed.
     hashes: Mutex<HashMap<String, u64>>,
+    /// The resolved git binary, cached keyed by the `git.path` setting so an
+    /// edit re-resolves. Resolution runs a login shell (to pick up a
+    /// module-loaded git in the user's dotfiles), so it must not happen per
+    /// invocation — every git call reads the cached path.
+    resolved_git: Mutex<Option<(Option<String>, Arc<GitBinary>)>>,
     /// Bounds concurrent `git` processes across the whole daemon.
     procs: Arc<Semaphore>,
 }
@@ -95,8 +106,27 @@ impl GitService {
             epochs: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
+            resolved_git: Mutex::new(None),
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
         }
+    }
+
+    /// Resolve the git binary to use, honoring an explicit `git.path` setting
+    /// (`configured`) and otherwise the user's login-shell git, then the daemon
+    /// PATH. Cached and keyed by `configured`, so changing the setting (or
+    /// clearing it) re-resolves on the next call and nothing else does.
+    async fn resolve_git(&self, configured: Option<String>) -> Arc<GitBinary> {
+        {
+            let cache = crate::lock(&self.resolved_git);
+            if let Some((key, bin)) = cache.as_ref() {
+                if *key == configured {
+                    return bin.clone();
+                }
+            }
+        }
+        let bin = Arc::new(resolve_git_binary(configured.clone()).await);
+        *crate::lock(&self.resolved_git) = Some((configured, bin.clone()));
+        bin
     }
 
     fn epoch(&self, ws_id: &str) -> u64 {
@@ -167,22 +197,23 @@ impl GitService {
     }
 
     /// Discover the repo for `ws_id` rooted at `root`, caching the result.
-    async fn discover(&self, ws_id: &str, root: &Path) -> Option<RepoInfo> {
+    async fn discover(&self, git: &Path, ws_id: &str, root: &Path) -> Option<RepoInfo> {
         if let Some(cached) = crate::lock(&self.repos).get(ws_id) {
             if cached.is_some() {
                 return cached.clone();
             }
         }
-        let info = probe_repo(&self.procs, root).await;
+        let info = probe_repo(git, &self.procs, root).await;
         crate::lock(&self.repos).insert(ws_id.to_string(), info.clone());
         info
     }
 
-    async fn status(&self, repo: &RepoInfo) -> anyhow::Result<StatusData> {
+    async fn status(&self, git: &Path, repo: &RepoInfo) -> anyhow::Result<StatusData> {
         // `--no-optional-locks` is load-bearing: refreshing the index for status
         // must never contend on the index lock with a `git commit` the user or an
         // agent runs in a terminal (slow/shared FS makes that contention real).
         let out = run_git(
+            git,
             &self.procs,
             &repo.toplevel,
             &[
@@ -204,8 +235,9 @@ impl GitService {
 
     /// Every worktree of this repo (the main checkout plus linked ones). Cheap
     /// and rarely-changing, so it is computed on demand rather than cached.
-    async fn worktrees(&self, repo: &RepoInfo) -> anyhow::Result<Vec<WorktreeInfo>> {
+    async fn worktrees(&self, git: &Path, repo: &RepoInfo) -> anyhow::Result<Vec<WorktreeInfo>> {
         let out = run_git(
+            git,
             &self.procs,
             &repo.toplevel,
             &["--no-optional-locks", "worktree", "list", "--porcelain"],
@@ -279,8 +311,9 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<WorktreeInfo> {
 }
 
 /// Run `git rev-parse` to resolve the working-tree root and common git dir.
-async fn probe_repo(procs: &Semaphore, root: &Path) -> Option<RepoInfo> {
+async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> Option<RepoInfo> {
     let out = run_git(
+        git,
         procs,
         root,
         &["rev-parse", "--show-toplevel", "--git-common-dir"],
@@ -314,6 +347,153 @@ async fn probe_repo(procs: &Semaphore, root: &Path) -> Option<RepoInfo> {
     })
 }
 
+/// How the git binary was found — surfaced so the UI can explain what it is
+/// pointed at ("your login shell's git" vs "the path you set").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitSource {
+    /// The explicit `git.path` setting.
+    Setting,
+    /// `command -v git` in the user's login shell (picks up module loads).
+    LoginShell,
+    /// The daemon's own PATH (`git`) — the last resort.
+    Path,
+}
+
+impl GitSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            GitSource::Setting => "setting",
+            GitSource::LoginShell => "login-shell",
+            GitSource::Path => "path",
+        }
+    }
+}
+
+/// The resolved git the whole service runs on: which binary, how it was found,
+/// and whether it clears [`MIN_GIT`]. Daemon-global (one git for every
+/// workspace), recomputed only when the `git.path` setting changes.
+struct GitBinary {
+    /// The binary to spawn (absolute when resolved, bare `git` as a last resort).
+    path: PathBuf,
+    source: GitSource,
+    /// `git --version`'s raw line, e.g. "git version 2.39.1 (Apple Git-…)".
+    /// `None` when the binary could not be run at all (missing / not executable).
+    raw: Option<String>,
+    /// Parsed (major, minor, patch), when the raw line was understood.
+    parsed: Option<(u32, u32, u32)>,
+    /// The parsed version clears [`MIN_GIT`] — the service can actually run.
+    adequate: bool,
+}
+
+impl GitBinary {
+    /// The parsed version as "MAJOR.MINOR.PATCH", for the diagnostic UI.
+    fn version_str(&self) -> Option<String> {
+        self.parsed.map(|(a, b, c)| format!("{a}.{b}.{c}"))
+    }
+
+    /// The diagnostic block carried on every git-status response, so the client
+    /// can explain a too-old / missing git instead of rendering a blank repo.
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "ok": self.adequate,
+            "path": self.path.to_string_lossy(),
+            "source": self.source.as_str(),
+            "version": self.version_str(),
+            "raw": self.raw,
+            "min": format!("{}.{}", MIN_GIT.0, MIN_GIT.1),
+        })
+    }
+}
+
+/// Resolve the git binary: an explicit path wins, then the login shell's git
+/// (so `module load git` in a user's dotfiles is picked up with zero config),
+/// then the daemon's PATH. Whatever is chosen is version-probed so the caller
+/// can gate on [`MIN_GIT`].
+async fn resolve_git_binary(configured: Option<String>) -> GitBinary {
+    let (path, source) = match configured {
+        Some(p) => (PathBuf::from(p), GitSource::Setting),
+        None => match login_shell_git().await {
+            Some(p) => (p, GitSource::LoginShell),
+            None => (PathBuf::from("git"), GitSource::Path),
+        },
+    };
+    let raw = probe_git_version(&path).await;
+    let parsed = raw.as_deref().and_then(parse_git_version);
+    let adequate = parsed.is_some_and(|(maj, min, _)| (maj, min) >= MIN_GIT);
+    GitBinary {
+        path,
+        source,
+        raw,
+        parsed,
+        adequate,
+    }
+}
+
+/// `command -v git` through the user's login shell — the same trick the agent
+/// launcher uses, because the daemon's own PATH on an HPC login node is the
+/// stock `/usr/bin/git`, while the modern one lives behind `module load git`
+/// that only a login shell (sourcing the user's profile) has applied.
+async fn login_shell_git() -> Option<PathBuf> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = tokio::process::Command::new(&shell)
+        .arg("-lc")
+        .arg("command -v git")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(5), output)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Login shells may print banners; the path is the last non-empty line.
+    let path = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?
+        .to_string();
+    path.starts_with('/').then(|| PathBuf::from(path))
+}
+
+/// First non-empty line of `<bin> --version`, or `None` if it cannot run.
+async fn probe_git_version(bin: &Path) -> Option<String> {
+    let output = tokio::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(2), output)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Parse a `git --version` line into (major, minor, patch). Lenient about the
+/// trailing junk real builds carry ("2.39.GIT", "2.39.5 (Apple Git-154)"):
+/// non-digits are stripped per component and a missing component reads as 0.
+fn parse_git_version(raw: &str) -> Option<(u32, u32, u32)> {
+    // "git version 2.39.1 …" — the version token is the third word.
+    let token = raw.split_whitespace().nth(2)?;
+    let mut parts = token
+        .split('.')
+        .map(|p| p.trim_matches(|c: char| !c.is_ascii_digit()));
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
 /// The bounded output of one git invocation.
 struct GitOutput {
     stdout: Vec<u8>,
@@ -327,6 +507,7 @@ struct GitOutput {
 /// and a kill-on-timeout. stdout and stderr are drained concurrently so a
 /// chatty git cannot deadlock by filling the stderr pipe while we read stdout.
 async fn run_git(
+    git: &Path,
     procs: &Semaphore,
     dir: &Path,
     args: &[&str],
@@ -336,11 +517,13 @@ async fn run_git(
         .acquire()
         .await
         .expect("git semaphore is never closed");
-    let mut child = Command::new("git")
+    let mut child = Command::new(git)
         .current_dir(dir)
         .args(args)
         // Belt-and-suspenders with `--no-optional-locks`, and never block on a
-        // credential/terminal prompt — this is a headless read.
+        // credential/terminal prompt — this is a headless read. The rest of the
+        // environment is inherited untouched, so git reads the user's own
+        // ~/.gitconfig, credentials, and SSH setup — never a config we impose.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -348,7 +531,12 @@ async fn run_git(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn git (is it installed?): {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn git at {} (is it installed?): {e}",
+                git.display()
+            )
+        })?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -708,15 +896,22 @@ pub(crate) async fn backstop_poll(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(BACKSTOP_INTERVAL).await;
         let watched = state.git.watched();
+        if watched.is_empty() {
+            continue;
+        }
+        let git = state.git.resolve_git(configured_git(&state)).await;
+        if !git.adequate {
+            continue;
+        }
         let mut bumped = false;
         for ws_id in watched {
             let Some(ws) = crate::lock(&state.workspaces).get(&ws_id) else {
                 continue;
             };
-            let Some(repo) = state.git.discover(&ws_id, &ws.root).await else {
+            let Some(repo) = state.git.discover(&git.path, &ws_id, &ws.root).await else {
                 continue;
             };
-            let Ok(data) = state.git.status(&repo).await else {
+            let Ok(data) = state.git.status(&git.path, &repo).await else {
                 continue;
             };
             let (_, changed) = state.git.publish(&ws_id, &data);
@@ -735,7 +930,15 @@ pub(crate) struct StatusQuery {
     workspace_id: String,
 }
 
+/// The explicit `git.path` override, if the user set one.
+fn configured_git(state: &AppState) -> Option<String> {
+    crate::lock(&state.settings).git_path()
+}
+
 /// GET /api/v1/git/status?workspace_id= — the repo's status, or `{repo:false}`.
+/// Every response carries a `git` diagnostic block and a `git_ok` flag; when
+/// `git_ok` is false the resolved git is missing or too old (see [`MIN_GIT`])
+/// and the client shows how to point chimaera at a modern git.
 pub(crate) async fn status(
     State(state): State<Arc<AppState>>,
     Query(q): Query<StatusQuery>,
@@ -747,12 +950,37 @@ pub(crate) async fn status(
         )
             .into_response();
     };
-    let Some(repo) = state.git.discover(&q.workspace_id, &ws.root).await else {
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        // The git binary itself can't drive the service — report that
+        // distinctly from "not a repo" so the panel explains WHY and offers
+        // the fix, instead of parsing an ancient git's output into "(unborn)".
         let epoch = state.git.epoch(&q.workspace_id);
-        return Json(json!({"repo": false, "workspace_id": q.workspace_id, "epoch": epoch}))
-            .into_response();
+        return Json(json!({
+            "repo": false,
+            "git_ok": false,
+            "git": git.json(),
+            "workspace_id": q.workspace_id,
+            "epoch": epoch,
+        }))
+        .into_response();
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &q.workspace_id, &ws.root)
+        .await
+    else {
+        let epoch = state.git.epoch(&q.workspace_id);
+        return Json(json!({
+            "repo": false,
+            "git_ok": true,
+            "git": git.json(),
+            "workspace_id": q.workspace_id,
+            "epoch": epoch,
+        }))
+        .into_response();
     };
-    match state.git.status(&repo).await {
+    match state.git.status(&git.path, &repo).await {
         Ok(data) => {
             // Publishing may discover an unannounced change (an external editor,
             // a terminal `git` command) and bump the epoch; read the epoch after,
@@ -761,7 +989,10 @@ pub(crate) async fn status(
             if bumped {
                 state.changes.notify_waiters();
             }
-            Json(status_json(&q.workspace_id, epoch, &repo, &data)).into_response()
+            let mut body = status_json(&q.workspace_id, epoch, &repo, &data);
+            body["git_ok"] = json!(true);
+            body["git"] = git.json();
+            Json(body).into_response()
         }
         Err(err) => {
             tracing::warn!(%err, workspace = %q.workspace_id, "git status failed");
@@ -771,6 +1002,8 @@ pub(crate) async fn status(
             let epoch = state.git.epoch(&q.workspace_id);
             let mut body = status_json(&q.workspace_id, epoch, &repo, &StatusData::default());
             body["error"] = json!(err.to_string());
+            body["git_ok"] = json!(true);
+            body["git"] = git.json();
             Json(body).into_response()
         }
     }
@@ -790,10 +1023,19 @@ pub(crate) async fn worktrees(
         )
             .into_response();
     };
-    let Some(repo) = state.git.discover(&q.workspace_id, &ws.root).await else {
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        // Too old to list worktrees; the status endpoint carries the diagnostic.
+        return Json(json!({"repo": false, "worktrees": []})).into_response();
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &q.workspace_id, &ws.root)
+        .await
+    else {
         return Json(json!({"repo": false, "worktrees": []})).into_response();
     };
-    match state.git.worktrees(&repo).await {
+    match state.git.worktrees(&git.path, &repo).await {
         Ok(list) => {
             let managed_root = std::fs::canonicalize(&state.worktrees_root)
                 .unwrap_or_else(|_| state.worktrees_root.clone());
@@ -858,20 +1100,29 @@ fn repo_key(repo: &RepoInfo) -> String {
 /// could be read as a flag. `check-ref-format --branch` already rules out `..`,
 /// control characters, and trailing junk — the leading-`-` guard keeps the name
 /// from being parsed as an option before git ever sees it.
-async fn valid_branch(procs: &Semaphore, dir: &Path, branch: &str) -> bool {
+async fn valid_branch(git: &Path, procs: &Semaphore, dir: &Path, branch: &str) -> bool {
     if branch.is_empty() || branch.len() > 200 || branch.starts_with('-') {
         return false;
     }
-    match run_git(procs, dir, &["check-ref-format", "--branch", branch], 4096).await {
+    match run_git(
+        git,
+        procs,
+        dir,
+        &["check-ref-format", "--branch", branch],
+        4096,
+    )
+    .await
+    {
         Ok(out) => out.success,
         Err(_) => false,
     }
 }
 
 /// Does `refs/heads/<branch>` already exist?
-async fn branch_exists(procs: &Semaphore, dir: &Path, branch: &str) -> bool {
+async fn branch_exists(git: &Path, procs: &Semaphore, dir: &Path, branch: &str) -> bool {
     let refname = format!("refs/heads/{branch}");
     match run_git(
+        git,
         procs,
         dir,
         &["rev-parse", "--verify", "--quiet", &refname],
@@ -890,6 +1141,24 @@ fn conflict(message: &str) -> Response {
 
 fn bad_request(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+}
+
+/// The mutation handlers' response when the resolved git can't run the service.
+fn git_too_old(git: &GitBinary) -> Response {
+    let msg = match git.version_str() {
+        Some(v) => format!(
+            "git {v} is too old for this — chimaera needs git ≥ {}.{}. \
+             Point it at a newer git in Settings (git.path).",
+            MIN_GIT.0, MIN_GIT.1
+        ),
+        None => format!(
+            "no runnable git at {} — set git.path to a git ≥ {}.{} in Settings.",
+            git.path.display(),
+            MIN_GIT.0,
+            MIN_GIT.1
+        ),
+    };
+    bad_request(&msg)
 }
 
 #[derive(Deserialize)]
@@ -917,11 +1186,19 @@ pub(crate) async fn create_worktree(
         )
             .into_response();
     };
-    let Some(repo) = state.git.discover(&body.workspace_id, &ws.root).await else {
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return git_too_old(&git);
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &body.workspace_id, &ws.root)
+        .await
+    else {
         return bad_request("not a git repository");
     };
     let branch = body.branch.trim().to_string();
-    if !valid_branch(&state.git.procs, &repo.toplevel, &branch).await {
+    if !valid_branch(&git.path, &state.git.procs, &repo.toplevel, &branch).await {
         return bad_request("invalid branch name");
     }
     if let Some(base) = body.base.as_deref() {
@@ -957,7 +1234,7 @@ pub(crate) async fn create_worktree(
     let path_str = path.to_string_lossy().into_owned();
     // An existing branch is checked out as-is; a new one is created off `base`
     // (or HEAD). git itself refuses if the branch is checked out elsewhere.
-    let exists = branch_exists(&state.git.procs, &repo.toplevel, &branch).await;
+    let exists = branch_exists(&git.path, &state.git.procs, &repo.toplevel, &branch).await;
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if exists {
         args.push(&path_str);
@@ -970,7 +1247,15 @@ pub(crate) async fn create_worktree(
             args.push(base);
         }
     }
-    let out = match run_git(&state.git.procs, &repo.toplevel, &args, 64 * 1024).await {
+    let out = match run_git(
+        &git.path,
+        &state.git.procs,
+        &repo.toplevel,
+        &args,
+        64 * 1024,
+    )
+    .await
+    {
         Ok(out) => out,
         Err(err) => {
             return (
@@ -1037,7 +1322,15 @@ pub(crate) async fn remove_worktree(
         )
             .into_response();
     };
-    let Some(repo) = state.git.discover(&body.workspace_id, &ws.root).await else {
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return git_too_old(&git);
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &body.workspace_id, &ws.root)
+        .await
+    else {
         return bad_request("not a git repository");
     };
     let Ok(target) = std::fs::canonicalize(&body.path) else {
@@ -1086,6 +1379,7 @@ pub(crate) async fn remove_worktree(
     // Fence 4: uncommitted work is not ours to throw away.
     if !body.force {
         match run_git(
+            &git.path,
             &state.git.procs,
             &target,
             &["--no-optional-locks", "status", "--porcelain"],
@@ -1107,7 +1401,15 @@ pub(crate) async fn remove_worktree(
         args.push("--force");
     }
     args.push(&target_str);
-    match run_git(&state.git.procs, &repo.toplevel, &args, 64 * 1024).await {
+    match run_git(
+        &git.path,
+        &state.git.procs,
+        &repo.toplevel,
+        &args,
+        64 * 1024,
+    )
+    .await
+    {
         Ok(out) if out.success => {}
         Ok(out) => return conflict(&out.stderr),
         Err(err) => {
@@ -1161,7 +1463,15 @@ pub(crate) async fn diff(
         )
             .into_response();
     };
-    let Some(repo) = state.git.discover(&q.workspace_id, &ws.root).await else {
+    let git = state.git.resolve_git(configured_git(&state)).await;
+    if !git.adequate {
+        return git_too_old(&git);
+    }
+    let Some(repo) = state
+        .git
+        .discover(&git.path, &q.workspace_id, &ws.root)
+        .await
+    else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "not a git repository"})),
@@ -1192,11 +1502,11 @@ pub(crate) async fn diff(
     // Fetch both sides (a = base, b = target). A missing object is a valid
     // outcome: no HEAD blob = added; no worktree file = deleted.
     let a = match a_spec {
-        Some(spec) => show_blob(&state.git, &repo, &spec).await,
+        Some(spec) => show_blob(&git.path, &state.git, &repo, &spec).await,
         None => Ok(None),
     };
     let b = match b_spec {
-        Some(spec) => show_blob(&state.git, &repo, &spec).await,
+        Some(spec) => show_blob(&git.path, &state.git, &repo, &spec).await,
         None => read_worktree(&repo.toplevel.join(&rel)).await,
     };
     let (a, b) = match (a, b) {
@@ -1234,13 +1544,20 @@ pub(crate) async fn diff(
 /// `git show <spec>` → the blob bytes, `None` if the object does not exist, or
 /// `Err("too_large")` past the cap.
 async fn show_blob(
+    git_bin: &Path,
     git: &GitService,
     repo: &RepoInfo,
     spec: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let out = run_git(&git.procs, &repo.toplevel, &["show", spec], MAX_DIFF_BYTES)
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = run_git(
+        git_bin,
+        &git.procs,
+        &repo.toplevel,
+        &["show", spec],
+        MAX_DIFF_BYTES,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if out.truncated {
         return Err("too_large".into());
     }
@@ -1293,6 +1610,28 @@ fn repo_relative(toplevel: &Path, abs: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_git_versions_and_gates_on_min() {
+        // The version token is the third word; trailing build junk is tolerated.
+        assert_eq!(parse_git_version("git version 2.39.1"), Some((2, 39, 1)));
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)"),
+            Some((2, 39, 5))
+        );
+        assert_eq!(parse_git_version("git version 2.20.GIT"), Some((2, 20, 0)));
+        assert_eq!(parse_git_version("git version 1.8.3.1"), Some((1, 8, 3)));
+        assert_eq!(parse_git_version("not a version line"), None);
+
+        // The gate that decides the "too old" panel: RHEL 7's 1.8.3.1 fails,
+        // the 2.15 floor and anything above it passes.
+        let adequate =
+            |raw: &str| parse_git_version(raw).is_some_and(|(maj, min, _)| (maj, min) >= MIN_GIT);
+        assert!(!adequate("git version 1.8.3.1"));
+        assert!(!adequate("git version 2.14.9"));
+        assert!(adequate("git version 2.15.0"));
+        assert!(adequate("git version 2.39.1"));
+    }
 
     #[test]
     fn parses_branch_header_and_mixed_entries() {

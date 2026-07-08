@@ -148,6 +148,14 @@ impl SettingsStore {
             .unwrap_or(true)
     }
 
+    /// Daemon-consumed key: an explicit path to the `git` binary. `None` (unset
+    /// or blank) means "resolve git from the login shell, then PATH". Set on HPC
+    /// login nodes whose stock `/usr/bin/git` is too old for the git service.
+    pub(crate) fn git_path(&mut self) -> Option<String> {
+        let s = self.current().get("git.path")?.as_str()?.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
     /// Daemon-consumed key: directory names quick-open skips while walking.
     /// None = the built-in default list.
     pub(crate) fn quickopen_ignore_dirs(&mut self) -> Option<Vec<String>> {

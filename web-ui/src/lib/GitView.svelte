@@ -11,6 +11,7 @@
   import type { LayoutCtrl } from "./dnd";
   import {
     createWorktree,
+    gitEnv,
     gitStatus,
     gitWorktrees,
     notifyWorkspacesChanged,
@@ -21,6 +22,7 @@
     type GitEntry,
     type GitWorktree,
   } from "./git";
+  import { flushSettings, getSetting, setSetting } from "./settings/store.svelte";
   import { decoFor } from "./gitDeco";
   import { midTruncate } from "./files";
   import { createSession, type Session, type SessionKind } from "./sessions";
@@ -44,6 +46,46 @@
 
   const status = $derived($gitStatus);
   const entries = $derived(status?.entries ?? []);
+
+  // The daemon's resolved git binary. When `ok` is false it is missing or too
+  // old to drive the service (e.g. an HPC login node's git 1.8), so the panel
+  // shows how to point chimaera at a modern git instead of a blank repo.
+  const env = $derived($gitEnv);
+  const gitBad = $derived(env !== null && env.ok === false);
+
+  // Seed the path field from the current setting the first time the bad-git
+  // state appears; the user edits from there (blank clears the override).
+  let gitPathInput = $state("");
+  let gitSeeded = false;
+  let savingGit = $state(false);
+  $effect(() => {
+    if (gitBad && !gitSeeded) {
+      gitPathInput = getSetting("git.path");
+      gitSeeded = true;
+    }
+  });
+
+  function sourceLabel(source: string | undefined): string {
+    return source === "setting"
+      ? "the path you set"
+      : source === "login-shell"
+        ? "your login shell"
+        : "the daemon's PATH";
+  }
+
+  async function saveGitPath(): Promise<void> {
+    if (savingGit) return;
+    savingGit = true;
+    try {
+      // "" removes the override (resolve from login shell / PATH). Flush now so
+      // the daemon has the new value before we ask it to re-resolve.
+      setSetting("git.path", gitPathInput.trim());
+      await flushSettings();
+      refreshGit();
+    } finally {
+      savingGit = false;
+    }
+  }
 
   // An entry can sit in two groups at once (staged edit + further worktree
   // edit) — VS Code semantics; the letter badge tells them apart.
@@ -153,7 +195,22 @@
 
 <div class="git-view">
   <header class="ghead">
-    {#if status === null}
+    {#if gitBad}
+      <span class="branch none warn">git {env?.version ? "too old" : "not found"}</span>
+      <span class="spacer"></span>
+      <button class="refresh" title="re-check git" onclick={() => refreshGit()}>
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path
+            d="M13 8a5 5 0 1 1-1.6-3.7M13 2.5V5.5H10"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    {:else if status === null}
       <span class="branch none">{wsId === null ? "no workspace" : "not a git repository"}</span>
     {:else}
       <svg class="bicon" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
@@ -200,7 +257,47 @@
   </header>
 
   <div class="glist">
-    {#if status === null}
+    {#if gitBad}
+      <div class="gitenv">
+        <div class="gitenv-title">
+          {env?.version ? `Git ${env.version} is too old` : "No usable git found"}
+        </div>
+        <p class="gitenv-body">
+          Source control (status, diffs, worktrees) needs <b>git ≥ {env?.min ?? "2.15"}</b>.
+          {#if env?.version}
+            The git here is <span class="mono">{env.version}</span> — from before
+            porcelain-v2 and <span class="mono">worktree</span> existed.
+          {/if}
+        </p>
+        <p class="gitenv-where">
+          Looking at <span class="mono">{env?.path}</span>
+          <span class="gitenv-src">({sourceLabel(env?.source)})</span>
+        </p>
+        <p class="gitenv-hint">
+          On a cluster, load a newer git — e.g. <span class="mono">module load git</span> — then
+          paste its path below (run <span class="mono">command&nbsp;-v&nbsp;git</span> to find it).
+          Leave blank to resolve from your login shell.
+        </p>
+        <div class="gitenv-form">
+          <input
+            class="compose-input"
+            bind:value={gitPathInput}
+            placeholder="path to git ≥ {env?.min ?? '2.15'}"
+            spellcheck="false"
+            autocapitalize="off"
+            autocorrect="off"
+            disabled={savingGit}
+            onkeydown={(e) => {
+              if (e.key === "Enter") void saveGitPath();
+            }}
+          />
+          <button
+            class="compose-go"
+            disabled={savingGit}
+            onclick={() => void saveGitPath()}>{savingGit ? "checking…" : "use this git"}</button>
+        </div>
+      </div>
+    {:else if status === null}
       <div class="empty">
         {wsId === null
           ? "Open a workspace to see its git state."
@@ -721,6 +818,51 @@
     color: var(--git-deleted);
     background: color-mix(in srgb, var(--git-deleted) 10%, transparent);
     border-radius: 4px;
+  }
+
+  .branch.none.warn {
+    color: var(--warn);
+  }
+
+  .gitenv {
+    padding: 0.9rem 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .gitenv-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .gitenv-body,
+  .gitenv-where,
+  .gitenv-hint {
+    margin: 0;
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .gitenv-body b {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .gitenv-src {
+    opacity: 0.75;
+  }
+  .gitenv .mono {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    color: var(--fg);
+    background: var(--row-active);
+    padding: 0.03rem 0.28rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .gitenv-form {
+    display: flex;
+    gap: 0.35rem;
+    margin-top: 0.15rem;
   }
 
   .empty,
