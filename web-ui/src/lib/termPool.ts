@@ -16,6 +16,7 @@ import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { registerPathLinks, type LinkContext, type PathKind } from "./links";
 import { activeTheme, getSetting, onSettingsChange } from "./settings/store.svelte";
+import { isMac } from "./keys";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
@@ -192,6 +193,55 @@ function scheduleFit(entry: PoolEntry): void {
   }, REFIT_DEBOUNCE_MS);
 }
 
+/**
+ * Wire clipboard writes through the terminal — the same in a local PTY and a
+ * remote one, since both are just bytes on the wire from the browser's view.
+ *
+ * OSC 52 is how a program running INSIDE the terminal (most often a remote
+ * agent, whose "copy" has no other way back to the Mac clipboard) sets the
+ * system clipboard, exactly as it would under iTerm2 or Terminal.app. xterm
+ * has no built-in handler, so those copies were silently dropped. Clipboard
+ * *reads* (`OSC 52 ; c ; ?`) are ignored on purpose: a program that can emit
+ * escape codes must not be able to exfiltrate the clipboard back over the PTY.
+ *
+ * Cmd+C (Ctrl+Shift+C off macOS — bare Ctrl stays SIGINT) copies the
+ * terminal's OWN selection: xterm keeps its selection off the DOM, so the
+ * browser's native copy grabs nothing. copyOnSelect is the separate
+ * as-you-select convenience; this is the explicit-chord path.
+ */
+function registerTerminalClipboard(term: Terminal): void {
+  term.parser.registerOscHandler(52, (data) => {
+    const semi = data.indexOf(";");
+    if (semi === -1) return false; // malformed; let xterm's default run
+    const payload = data.slice(semi + 1);
+    if (payload === "" || payload === "?") return true; // read/clear: swallow, never leak
+    let text: string;
+    try {
+      text = new TextDecoder().decode(Uint8Array.from(atob(payload), (c) => c.charCodeAt(0)));
+    } catch {
+      return true; // not valid base64: swallow, like a native terminal
+    }
+    void navigator.clipboard?.writeText(text).catch(() => {
+      // clipboard permission denied; nothing more we can do
+    });
+    return true;
+  });
+
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown" || (e.key !== "c" && e.key !== "C")) return true;
+    const copyChord = isMac
+      ? e.metaKey && !e.ctrlKey && !e.altKey
+      : e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey;
+    if (!copyChord) return true;
+    const selection = term.getSelection();
+    if (selection === "") return true; // nothing selected: let the chord fall through
+    void navigator.clipboard?.writeText(selection).catch(() => {});
+    e.preventDefault();
+    e.stopPropagation();
+    return false;
+  });
+}
+
 function createEntry(id: string, parent: HTMLElement, fontOverride: number | undefined): PoolEntry {
   const fontSize = fontOverride ?? baseFontSize();
   const el = document.createElement("div");
@@ -223,6 +273,8 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
   } catch {
     // WebGL unavailable; DOM renderer is already active.
   }
+
+  registerTerminalClipboard(term);
 
   const entry: PoolEntry = {
     id,

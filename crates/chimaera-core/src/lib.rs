@@ -4,7 +4,7 @@ pub mod shellint;
 
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,11 +43,34 @@ pub fn builds_match(local: &str, remote: Option<&str>) -> bool {
     l == r && !l.is_empty() && !l.starts_with("unknown")
 }
 
-/// Per-user data directory (`~/.chimaera`), created on demand.
+/// Optional isolated root for ALL per-user chimaera state. When `CHIMAERA_HOME`
+/// is set, the daemon's data/config/runtime dirs live under it instead of the
+/// shared `~/.chimaera` — so parallel daemons (git worktrees, CI, a second dev
+/// instance) never clobber each other's manifest. Only the daemon's own
+/// bookkeeping moves; spawned shells and agents keep the real `$HOME`
+/// (dotfiles, `~/.claude` auth). Empty means unset.
+fn state_home() -> Option<PathBuf> {
+    match std::env::var_os("CHIMAERA_HOME") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => None,
+    }
+}
+
+/// Resolve the data dir given an optional isolated [`state_home`] (pure; the
+/// public [`data_dir`] wraps this and creates the directory).
+fn data_dir_in(home: Option<&Path>) -> PathBuf {
+    match home {
+        Some(home) => home.join("data"),
+        None => dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".chimaera"),
+    }
+}
+
+/// Per-user data directory (`~/.chimaera`, or `$CHIMAERA_HOME/data` when
+/// isolated), created on demand.
 pub fn data_dir() -> PathBuf {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".chimaera");
+    let dir = data_dir_in(state_home().as_deref());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create data dir {}: {e}", dir.display());
     }
@@ -55,16 +78,22 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Per-user config directory (`$XDG_CONFIG_HOME/chimaera`, else
-/// `~/.config/chimaera`), created on demand. Holds user-editable files
-/// (settings.json) as opposed to daemon-owned state in [`data_dir`].
+/// `~/.config/chimaera`; `$CHIMAERA_HOME/config` when isolated), created on
+/// demand. Holds user-editable files (settings.json) as opposed to
+/// daemon-owned state in [`data_dir`].
 pub fn config_dir() -> PathBuf {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(base) if !base.is_empty() => PathBuf::from(base),
-        _ => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".config"),
+    let dir = match state_home() {
+        Some(home) => home.join("config"),
+        None => {
+            let base = match std::env::var_os("XDG_CONFIG_HOME") {
+                Some(base) if !base.is_empty() => PathBuf::from(base),
+                _ => dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".config"),
+            };
+            base.join("chimaera")
+        }
     };
-    let dir = base.join("chimaera");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create config dir {}: {e}", dir.display());
     }
@@ -72,14 +101,18 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Per-user runtime directory: `$XDG_RUNTIME_DIR/chimaera` if set, else
-/// `/tmp/chimaera-$UID`. Created with mode 0700 on demand.
+/// `/tmp/chimaera-$UID` (`$CHIMAERA_HOME/run` when isolated). Created with
+/// mode 0700 on demand.
 pub fn runtime_dir() -> PathBuf {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(base) if !base.is_empty() => PathBuf::from(base).join("chimaera"),
-        _ => PathBuf::from(format!(
-            "/tmp/chimaera-{}",
-            nix::unistd::Uid::current().as_raw()
-        )),
+    let dir = match state_home() {
+        Some(home) => home.join("run"),
+        None => match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(base) if !base.is_empty() => PathBuf::from(base).join("chimaera"),
+            _ => PathBuf::from(format!(
+                "/tmp/chimaera-{}",
+                nix::unistd::Uid::current().as_raw()
+            )),
+        },
     };
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
@@ -164,6 +197,15 @@ mod tests {
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         assert_ne!(generate_token(), token, "tokens should be random");
+    }
+
+    #[test]
+    fn data_dir_honors_isolated_home() {
+        // CHIMAERA_HOME relocates the daemon's state under its own root...
+        let iso = Path::new("/tmp/example-chimaera-home");
+        assert_eq!(data_dir_in(Some(iso)), iso.join("data"));
+        // ...while the default still resolves to ~/.chimaera.
+        assert!(data_dir_in(None).ends_with(".chimaera"));
     }
 
     #[test]

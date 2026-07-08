@@ -61,7 +61,7 @@ serve live UI (below).
 
 ### Dev loop
 
-`.claude/launch.json` ships two configs — run both, develop against
+`.claude/launch.json` ships a daemon + a Vite config — run both, develop against
 `http://localhost:5173`:
 
 - **chimaerad** — `cargo run -p chimaera -- serve --port 9700` (the daemon).
@@ -71,6 +71,14 @@ serve live UI (below).
 Vite exposes the local daemon's `~/.chimaera/manifest.json` at `/dev/manifest`
 (dev-only middleware, never in a production build), so the dev page authenticates
 itself — no hand-copying bearer tokens.
+
+**Working in a git worktree, with another worktree/chat possibly running a
+daemon?** Don't use `chimaerad` (hardcoded port 9700, shared `~/.chimaera` — and
+`serve` *removes* the manifest on stop, breaking the sibling). Use the
+**`chimaerad-isolated`** launch config: its own `CHIMAERA_HOME=.chimaera-dev`
+state dir + an auto-assigned port, serving this worktree's own build. Node 22 is
+required to build the UI (the nvm default 16 errors). Full steps in the develop
+skill.
 
 See the **[develop](.claude/skills/develop/SKILL.md)** skill for the full loop.
 
