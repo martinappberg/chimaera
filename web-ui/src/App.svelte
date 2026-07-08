@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import {
     ApiError,
     getActiveWorkspaceId,
@@ -111,7 +111,13 @@
   import type { PathKind } from "./lib/links";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
   import { dirtyFiles } from "./lib/editing";
-  import { activateGitWorkspace, gitStatus, onGitNudge, type DiffMode } from "./lib/git";
+  import {
+    activateGitWorkspace,
+    gitStatus,
+    onGitNudge,
+    workspacesChanged,
+    type DiffMode,
+  } from "./lib/git";
   import {
     paneContentEl,
     paneRootEl,
@@ -355,6 +361,18 @@
     const wsId = activeWsId;
     void activateGitWorkspace(wsId);
     eventsSocket?.watch(wsId);
+  });
+
+  // A worktree create/remove changed the daemon's workspace registry: re-fetch
+  // the list so the home screen and switcher stay honest (a removed worktree's
+  // workspace disappears; a created one appears).
+  let lastWsChange = 0;
+  $effect(() => {
+    const n = $workspacesChanged;
+    if (n !== lastWsChange) {
+      lastWsChange = n;
+      refreshWorkspaces();
+    }
   });
   // The rail groups terminals (few) above agents (many); this order is also
   // the mod+1–9 chord order and the focus-mode strip order, so what you see
@@ -1284,6 +1302,45 @@
     pool.focusTerminal(id);
   }
 
+  /**
+   * Focus a session that may live in another workspace (a worktree branch). If
+   * it is in the active workspace, open it here; otherwise switch to its
+   * workspace (fetching it when a just-created worktree isn't in the list yet)
+   * — the incoming workspace auto-opens its freshly-spawned session, and a
+   * workspace with saved layout restores the session's tab.
+   */
+  async function revealWorktreeSession(sessionId: string, workspaceId: string): Promise<void> {
+    if (workspaceId === activeWsId) {
+      openSess(sessionId);
+      return;
+    }
+    let target = workspaces.find((w) => w.id === workspaceId);
+    if (target === undefined) {
+      const list = await listWorkspaces().catch(() => null);
+      if (list !== null) {
+        workspaces = list;
+        target = list.find((w) => w.id === workspaceId);
+      }
+    }
+    if (target !== undefined) {
+      activateWorkspace(target);
+      // The session arrives async after the switch, and the incoming layout
+      // boots async too — so defer the open to when the layout is ready rather
+      // than racing bootViewState (which would clobber an eager openSession).
+      pendingReveal = sessionId;
+    }
+  }
+
+  // Focus a pending session once the incoming workspace's layout has booted.
+  let pendingReveal: string | null = null;
+  $effect(() => {
+    if (layoutReady && pendingReveal !== null) {
+      const id = pendingReveal;
+      pendingReveal = null;
+      untrack(() => openSess(id));
+    }
+  });
+
   /** Open/focus a file preview tab (FILES tree click). */
   function openFilePath(path: string): void {
     layout = openFile(layout, path);
@@ -1679,6 +1736,9 @@
     },
     openDiffFrom(paneId, path, mode, newSplit) {
       openDiffFromPane(paneId, path, mode, newSplit);
+    },
+    revealWorktreeSession(sessionId, workspaceId) {
+      void revealWorktreeSession(sessionId, workspaceId);
     },
     adjustFont(paneId, delta) {
       adjustFont(paneId, delta);

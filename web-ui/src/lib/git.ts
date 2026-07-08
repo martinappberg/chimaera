@@ -87,6 +87,8 @@ export interface GitWorktree {
   prunable: boolean;
   /** The worktree the active workspace has checked out. */
   current: boolean;
+  /** Created by chimaera under its managed root — the only ones it removes. */
+  managed: boolean;
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -122,6 +124,67 @@ export async function fetchGitWorktrees(
 ): Promise<{ repo: boolean; worktrees: GitWorktree[] }> {
   const q = new URLSearchParams({ workspace_id: workspaceId });
   return json(await api(`/git/worktrees?${q.toString()}`));
+}
+
+export interface CreatedWorktree {
+  worktree: { path: string; branch: string };
+  /** The worktree is registered as a workspace, so the branch is openable. */
+  workspace: { id: string; root: string; name: string };
+}
+
+/**
+ * Create a worktree for `branch` under the daemon's managed root and register it
+ * as a workspace. Additive — it never touches an existing checkout. The daemon
+ * rejects names git would refuse, and 409s if that branch is already checked out.
+ */
+export async function createWorktree(
+  workspaceId: string,
+  branch: string,
+  base?: string,
+): Promise<CreatedWorktree> {
+  return json(
+    await api(`/git/worktrees`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId, branch, ...(base ? { base } : {}) }),
+    }),
+  );
+}
+
+/**
+ * Remove a MANAGED worktree. Destructive: the daemon refuses anything it did not
+ * create, the worktree this workspace is open on, one holding a live session, or
+ * one with uncommitted work (unless `force`). The branch itself survives.
+ */
+export async function removeWorktree(
+  workspaceId: string,
+  path: string,
+  force = false,
+): Promise<void> {
+  const res = await api(`/git/worktrees`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workspace_id: workspaceId, path, force }),
+  });
+  if (!res.ok) {
+    let message = `request failed with status ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      // non-JSON error body; keep the generic message
+    }
+    throw new ApiError(res.status, message);
+  }
+}
+
+/**
+ * Bumped whenever the daemon's workspace registry changed underneath the UI
+ * (a worktree was created or removed). App re-fetches its workspace list.
+ */
+export const workspacesChanged = writable(0);
+export function notifyWorkspacesChanged(): void {
+  workspacesChanged.update((n) => n + 1);
 }
 
 // ---- reactive store (active workspace only) ---------------------------------

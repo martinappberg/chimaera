@@ -74,6 +74,12 @@ export interface LayoutCtrl {
    */
   openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void;
   /**
+   * Focus a session that may live in ANOTHER workspace (a worktree branch):
+   * switch to its workspace if needed, then open it. Used by the git panel's
+   * Branches view and its spawn-into-a-new-branch flow.
+   */
+  revealWorktreeSession(sessionId: string, workspaceId: string): void;
+  /**
    * Step the pane's terminal font size (`delta` +1/-1), or reset to the
    * default (`delta` 0). Same action as the Cmd/Ctrl +/−/0 chords.
    */

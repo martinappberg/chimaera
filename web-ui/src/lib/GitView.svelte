@@ -10,16 +10,20 @@
    */
   import type { LayoutCtrl } from "./dnd";
   import {
+    createWorktree,
     gitStatus,
     gitWorktrees,
+    notifyWorkspacesChanged,
     refreshGit,
+    removeWorktree,
     worktreeForPath,
     type DiffMode,
     type GitEntry,
+    type GitWorktree,
   } from "./git";
   import { decoFor } from "./gitDeco";
   import { midTruncate } from "./files";
-  import type { Session } from "./sessions";
+  import { createSession, type Session, type SessionKind } from "./sessions";
   import FileIcon from "./FileIcon.svelte";
   import SessionGlyph from "./SessionGlyph.svelte";
 
@@ -31,8 +35,12 @@
      *  belong in the Branches view too — that is the whole point of it. */
     sessions: Map<string, Session>;
     names: Map<string, string>;
+    /** Focus a session that may live in another workspace (a worktree branch);
+     *  used to reveal a session spawned into a fresh worktree, and the Branches
+     *  session rows. */
+    onOpenSession: (sessionId: string, workspaceId: string) => void;
   }
-  let { wsId, paneId, ctrl, sessions, names }: Props = $props();
+  let { wsId, paneId, ctrl, sessions, names, onOpenSession }: Props = $props();
 
   const status = $derived($gitStatus);
   const entries = $derived(status?.entries ?? []);
@@ -70,14 +78,76 @@
             .filter((s) => worktreeForPath(worktrees, s.cwd_current ?? s.cwd)?.path === wt.path),
         })),
   );
-  // Only what you can act on: the worktree you're in, and any holding sessions.
-  // A repo can carry dozens of stale worktrees (this one does) — listing them
-  // all is chrome that hasn't earned its pixels, so the rest fold into a count.
-  const branches = $derived(allBranches.filter((b) => b.wt.current || b.sessions.length > 0));
+  // Only what you can act on: the worktree you're in, any holding sessions, and
+  // any Chimaera created (managed — those you can remove here). A repo can carry
+  // dozens of the user's own stale worktrees (this one does); listing them all
+  // is chrome that hasn't earned its pixels, so the rest fold into a count.
+  const branches = $derived(
+    allBranches.filter((b) => b.wt.current || b.sessions.length > 0 || b.wt.managed),
+  );
   const otherWorktrees = $derived(allBranches.length - branches.length);
 
   function openDiff(e: MouseEvent, entry: GitEntry, mode: DiffMode): void {
     ctrl.openDiffFrom(paneId, entry.path, mode, e.metaKey || e.ctrlKey);
+  }
+
+  // ---- worktree orchestration (the panel's only mutations) ------------------
+
+  // The composer: pick "terminal" or an agent, type a branch, and Chimaera
+  // creates the worktree + spawns the session into it. Kept collapsed until the
+  // "+ branch" affordance is clicked so the panel stays quiet.
+  let composing = $state(false);
+  let newBranch = $state("");
+  let newKind = $state<SessionKind>("agent");
+  let busy = $state(false);
+  let actionError = $state<string | null>(null);
+  let branchInput = $state<HTMLInputElement | null>(null);
+
+  function startCompose(): void {
+    composing = true;
+    actionError = null;
+    void Promise.resolve().then(() => branchInput?.focus());
+  }
+
+  async function spawnInNewBranch(): Promise<void> {
+    const branch = newBranch.trim();
+    if (busy || wsId === null || branch === "") return;
+    busy = true;
+    actionError = null;
+    try {
+      const created = await createWorktree(wsId, branch);
+      // The new worktree is its own workspace; spawn the session there and
+      // reveal it. `refreshGit` picks up the new branch in the Branches view.
+      const session = await createSession(created.workspace.id, newKind);
+      notifyWorkspacesChanged();
+      refreshGit();
+      onOpenSession(session.id, created.workspace.id);
+      composing = false;
+      newBranch = "";
+    } catch (e) {
+      actionError = e instanceof Error ? e.message : "failed to create the worktree";
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function remove(wt: GitWorktree): Promise<void> {
+    if (busy || wsId === null) return;
+    // Removal deletes a working tree — a real confirm, with the branch named.
+    if (!confirm(`Remove the worktree for "${wt.branch ?? wt.path}"?\n\nThe branch is kept; only this checkout is deleted.`)) {
+      return;
+    }
+    busy = true;
+    actionError = null;
+    try {
+      await removeWorktree(wsId, wt.path);
+      notifyWorkspacesChanged();
+      refreshGit();
+    } catch (e) {
+      actionError = e instanceof Error ? e.message : "failed to remove the worktree";
+    } finally {
+      busy = false;
+    }
   }
 </script>
 
@@ -167,12 +237,58 @@
       {/if}
     {/if}
 
-    {#if branches.length > 0}
+    {#if status !== null && worktrees.length >= 1}
       <div class="group branches">
         <div class="gtitle">
           <span>Branches</span>
-          <span class="gcount">{branches.length}</span>
+          {#if branches.length > 0}<span class="gcount">{branches.length}</span>{/if}
+          <span class="spacer"></span>
+          <button class="gt-action" title="new branch in its own worktree" onclick={startCompose}>
+            + branch
+          </button>
         </div>
+
+        {#if composing}
+          <!-- Create a worktree for a new branch and spawn a session into it. -->
+          <div class="compose">
+            <div class="compose-row">
+              <div class="seg" role="group" aria-label="session kind">
+                <button class="seg-btn" class:on={newKind === "agent"} onclick={() => (newKind = "agent")}
+                  >agent</button>
+                <button class="seg-btn" class:on={newKind === "shell"} onclick={() => (newKind = "shell")}
+                  >terminal</button>
+              </div>
+              <input
+                class="compose-input"
+                bind:this={branchInput}
+                bind:value={newBranch}
+                placeholder="new-branch-name"
+                spellcheck="false"
+                autocapitalize="off"
+                autocorrect="off"
+                disabled={busy}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") void spawnInNewBranch();
+                  else if (e.key === "Escape") {
+                    composing = false;
+                    newBranch = "";
+                  }
+                }}
+              />
+            </div>
+            <div class="compose-actions">
+              <button
+                class="compose-go"
+                disabled={busy || newBranch.trim() === ""}
+                onclick={() => void spawnInNewBranch()}>{busy ? "creating…" : "create + open"}</button>
+              <button class="compose-cancel" disabled={busy} onclick={() => (composing = false)}>cancel</button>
+            </div>
+          </div>
+        {/if}
+        {#if actionError !== null}
+          <div class="wt-error" role="alert">{actionError}</div>
+        {/if}
+
         {#each branches as b (b.wt.path)}
           <div class="wt" class:current={b.wt.current}>
             <div class="wt-head" title={b.wt.path}>
@@ -189,12 +305,26 @@
               {#if b.sessions.length > 0}
                 <span class="wt-count">{b.sessions.length}</span>
               {/if}
+              <!-- Remove only where the daemon would allow it: a managed
+                   worktree that is neither the current one nor holding sessions. -->
+              {#if b.wt.managed && !b.wt.current && b.sessions.length === 0}
+                <button
+                  class="wt-remove"
+                  title="remove this worktree (keeps the branch)"
+                  aria-label="remove worktree"
+                  disabled={busy}
+                  onclick={() => void remove(b.wt)}>&times;</button>
+              {/if}
             </div>
             {#each b.sessions as s (s.id)}
-              <div class="wt-session" title={s.cwd_current ?? s.cwd}>
+              <button
+                class="wt-session"
+                title={s.cwd_current ?? s.cwd}
+                onclick={() => onOpenSession(s.id, s.workspace_id)}
+              >
                 <SessionGlyph kind={s.kind} agentKind={s.agent_kind} size={10} title={s.kind} />
                 <span class="wt-session-name">{names.get(s.id) ?? s.name}</span>
-              </div>
+              </button>
             {/each}
           </div>
         {/each}
@@ -430,9 +560,20 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    padding: 0 0 0 0.9rem;
+    width: 100%;
+    padding: 0 0.7rem 0 0.9rem;
     height: 18px;
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     color: var(--muted);
+  }
+  .wt-session:hover {
+    background: var(--row-hover);
+    color: var(--fg);
   }
 
   .wt-session-name {
@@ -442,11 +583,144 @@
     white-space: nowrap;
   }
 
+  .wt-remove {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 0.9rem;
+    line-height: 1;
+    padding: 0 0.15rem;
+    border-radius: 3px;
+    opacity: 0;
+    transition:
+      opacity 0.1s ease,
+      color 0.1s ease,
+      background-color 0.1s ease;
+  }
+  .wt:hover .wt-remove {
+    opacity: 0.7;
+  }
+  .wt-remove:hover {
+    opacity: 1;
+    color: var(--git-deleted);
+    background: var(--row-hover);
+  }
+
   .wt-more {
     padding: 0.15rem 0.7rem 0.2rem;
     font-size: 0.66rem;
     color: var(--muted);
     opacity: 0.7;
+  }
+
+  /* The gtitle action ("+ branch") sits at the section header's right. */
+  .gt-action {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: 0.64rem;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .gt-action:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .compose {
+    padding: 0.25rem 0.7rem 0.4rem;
+  }
+  .compose-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .seg {
+    flex: none;
+    display: flex;
+    gap: 1px;
+    background: var(--edge);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .seg-btn {
+    appearance: none;
+    border: none;
+    background: var(--term-bg);
+    font: inherit;
+    font-size: 0.62rem;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.14rem 0.4rem;
+  }
+  .seg-btn.on {
+    background: var(--row-active);
+    color: var(--fg);
+  }
+  .compose-input {
+    flex: 1;
+    min-width: 0;
+    appearance: none;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    padding: 0.16rem 0.4rem;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--fg);
+  }
+  .compose-input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .compose-actions {
+    display: flex;
+    gap: 0.35rem;
+    margin-top: 0.3rem;
+  }
+  .compose-go,
+  .compose-cancel {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: var(--term-bg);
+    font: inherit;
+    font-size: 0.68rem;
+    color: var(--fg);
+    cursor: pointer;
+    padding: 0.14rem 0.55rem;
+    border-radius: 5px;
+  }
+  .compose-go {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
+    color: var(--accent);
+  }
+  .compose-go:disabled {
+    opacity: 0.5;
+    cursor: default;
+    color: var(--muted);
+    border-color: var(--edge);
+  }
+  .compose-go:not(:disabled):hover,
+  .compose-cancel:hover {
+    background: var(--row-hover);
+  }
+
+  .wt-error {
+    margin: 0.1rem 0.7rem 0.3rem;
+    padding: 0.2rem 0.4rem;
+    font-size: 0.66rem;
+    color: var(--git-deleted);
+    background: color-mix(in srgb, var(--git-deleted) 10%, transparent);
+    border-radius: 4px;
   }
 
   .empty,

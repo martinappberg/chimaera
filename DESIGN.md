@@ -968,14 +968,23 @@ setup into a new session. Distinctive, deferred.
     would file every session under `main`. The changes panel grows a **Branches** section: one
     block per worktree, its branch, a `current` tag, and the live sessions in it. A repo can
     carry dozens of stale worktrees (this one carries 17), so only the current worktree and those
-    holding sessions are listed; the rest fold into "N other worktrees, no sessions". Deferred
+    holding sessions are listed; the rest fold into "N other worktrees, no sessions" (managed
+    worktrees always show, so the ones you can remove from here are never hidden). Deferred
     from P2: a branch chip on every rail session row (the Branches view already answers "which
     agent is on which branch"), and scoping status/diffs to a non-active worktree.
-    **P3** orchestration — the launcher's one deliberate mutation, "new agent / new terminal in a
-    new branch" (`git worktree add -b`) + worktree removal (clean-check + confirm). Open P3
-    sub-decision: managed-worktree location — `~/.chimaera/worktrees/<repo>/<branch>`
-    (daemon-owned prefix, no repo pollution) vs a repo-relative `.worktrees/` (more discoverable,
-    closer to the `.claude/worktrees/` convention).
+    **P3 (SHIPPED)** orchestration — the Branches section's "+ branch" composer: type a name, pick
+    agent/terminal, and the daemon runs `git worktree add -b <branch>` then spawns the session
+    INTO it, switching the window to the new worktree's workspace (the session auto-reveals once
+    that workspace's layout boots — deferred past bootViewState, never racing it). Managed
+    worktrees live at `~/.chimaera/worktrees/<repo-key>/<branch>` (author, 2026-07-07 — the
+    daemon-owned prefix, consistent with managed runtimes; `repo-key` = repo dirname + a hash of
+    the common git dir, so two same-named checkouts never collide). Removal is fenced FOUR ways,
+    and the fences ARE the design: chimaera removes only worktrees under its managed root (never a
+    checkout it did not create), never the one the workspace is open on, never one a live session
+    sits in (matched by cwd — not even with `force`), and never one with uncommitted work unless
+    forced. The branch always survives — removing a worktree is not `rm -rf` history. The remove
+    control shows in the UI exactly where the daemon would allow it. All four fences are
+    unit-tested, and the create → land-in-session → remove loop was driven live.
 - **Slurm**: `squeue`/`sacct --json` poller with backoff; job strip in the sidebar;
   job↔session linking (detect agent-submitted sbatch); degrades to no-op off-cluster.
   Post-v1: launch agent sessions *as* Slurm jobs for heavy work — but note most compute nodes

@@ -91,6 +91,12 @@ pub(crate) struct AppState {
     /// in `<agent>/<version>/bin/` here, activated via per-agent symlinks
     /// in `bin/`. Derived from the data dir, so tests are isolated for free.
     pub(crate) managed_root: PathBuf,
+    /// Managed-worktree prefix (`~/.chimaera/worktrees/<repo>/<branch>`).
+    /// Chimaera creates worktrees ONLY here, and removes ONLY what is under
+    /// here — the containment check is what keeps `worktree remove` from ever
+    /// touching the user's own checkouts. Derived from the data dir, so an
+    /// isolated `CHIMAERA_HOME` (and every test) is sandboxed for free.
+    pub(crate) worktrees_root: PathBuf,
     /// Theming-shim dir (`~/.chimaera/shims`), prepended to every session's
     /// PATH via spawn env only — user dotfiles are never touched.
     pub(crate) shims_dir: PathBuf,
@@ -150,6 +156,7 @@ impl AppState {
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
+            worktrees_root: data_dir.join("worktrees"),
             shims_dir: data_dir.join("shims"),
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
@@ -210,7 +217,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/validate", post(fs::validate))
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
-        .route("/git/worktrees", get(git::worktrees))
+        .route(
+            "/git/worktrees",
+            get(git::worktrees)
+                .post(git::create_worktree)
+                .delete(git::remove_worktree),
+        )
         .route("/fs/ticket", post(fs::create_ticket))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
@@ -3802,6 +3814,243 @@ mod tests {
             .filter_map(|w| w["branch"].as_str())
             .collect();
         assert_eq!(current, vec!["feat/x"], "the opened worktree is current");
+    }
+
+    /// Create a temp repo with one commit; returns (repo dir, git runner).
+    fn init_temp_repo(label: &str) -> PathBuf {
+        let repo = test_dir(label);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .args(args)
+                .output()
+                .expect("git must be installed");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "init"]);
+        repo
+    }
+
+    /// Worktree CREATE: lands under the managed root, checks out the new branch,
+    /// and registers a workspace so the branch is immediately openable.
+    #[tokio::test]
+    async fn git_worktree_create_is_managed_and_registered() {
+        let repo = init_temp_repo("wtcreate");
+        let state = test_state();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": repo.to_string_lossy()})),
+        )
+        .await;
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // A name git rejects never reaches `worktree add`.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "branch": "bad..name"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "invalid branch rejected");
+
+        let (status, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "branch": "feat/x"})),
+        )
+        .await;
+        assert!(status.is_success(), "create failed: {body}");
+        let wt_path = PathBuf::from(body["worktree"]["path"].as_str().unwrap());
+        assert_eq!(body["worktree"]["branch"], "feat/x");
+        assert!(wt_path.join("a.txt").exists(), "worktree is checked out");
+        // Confined to the managed root.
+        let managed = std::fs::canonicalize(&state.worktrees_root).unwrap();
+        assert!(
+            wt_path.starts_with(&managed),
+            "{wt_path:?} under {managed:?}"
+        );
+        // And registered as a workspace you can open.
+        let new_ws = body["workspace"]["id"].as_str().unwrap();
+        assert!(crate::lock(&state.workspaces).get(new_ws).is_some());
+
+        // The list marks it managed (the UI only offers remove where the daemon allows it).
+        let (_, list) = request(
+            &state,
+            Method::GET,
+            &format!("/api/v1/git/worktrees?workspace_id={ws_id}"),
+            None,
+        )
+        .await;
+        let entry = list["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["branch"] == "feat/x")
+            .expect("new worktree listed");
+        assert_eq!(entry["managed"], true);
+        let main_entry = list["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["branch"] == "main")
+            .unwrap();
+        assert_eq!(
+            main_entry["managed"], false,
+            "the user's checkout is not ours"
+        );
+
+        // A second create for the same branch collides rather than clobbering.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "branch": "feat/x"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Worktree REMOVE is destructive, so every fence gets a test: unmanaged
+    /// paths are refused outright, uncommitted work blocks it, and only then
+    /// does it delete (leaving the branch, and unregistering the workspace).
+    #[tokio::test]
+    async fn git_worktree_remove_is_fenced() {
+        let repo = init_temp_repo("wtremove");
+        let state = test_state();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": repo.to_string_lossy()})),
+        )
+        .await;
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+        let (_, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "branch": "feat/y"})),
+        )
+        .await;
+        let wt_path = body["worktree"]["path"].as_str().unwrap().to_string();
+        let new_ws = body["workspace"]["id"].as_str().unwrap().to_string();
+
+        // Fence 1: a checkout chimaera did not create is never removed — even
+        // though it IS a real worktree of this repo.
+        let (status, err) = request(
+            &state,
+            Method::DELETE,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "path": repo.to_string_lossy()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(repo.join("a.txt").exists(), "the user's checkout survived");
+
+        // Fence 4: uncommitted work blocks removal.
+        std::fs::write(PathBuf::from(&wt_path).join("scratch.txt"), "wip\n").unwrap();
+        let (status, err) = request(
+            &state,
+            Method::DELETE,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "path": wt_path})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(PathBuf::from(&wt_path).exists(), "dirty worktree survived");
+
+        // Clean it, and the removal goes through.
+        std::fs::remove_file(PathBuf::from(&wt_path).join("scratch.txt")).unwrap();
+        let (status, err) = request(
+            &state,
+            Method::DELETE,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "path": wt_path})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir removed");
+        assert!(
+            crate::lock(&state.workspaces).get(&new_ws).is_none(),
+            "its workspace registration is gone"
+        );
+        // The branch itself is untouched — removing a worktree is not rm -rf history.
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/feat/y"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "branch feat/y still exists");
+    }
+
+    /// Fence 3: a live session inside a managed worktree blocks removal — pulling
+    /// the directory out from under someone's shell is never acceptable.
+    #[tokio::test]
+    async fn git_worktree_remove_refuses_with_a_live_session_inside() {
+        let repo = init_temp_repo("wtsession");
+        let state = test_state();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": repo.to_string_lossy()})),
+        )
+        .await;
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+        let (_, body) = request(
+            &state,
+            Method::POST,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "branch": "feat/z"})),
+        )
+        .await;
+        let wt_path = body["worktree"]["path"].as_str().unwrap().to_string();
+        let new_ws = body["workspace"]["id"].as_str().unwrap().to_string();
+
+        // A shell living in the new worktree.
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({"workspace_id": new_ws, "kind": "shell"})),
+        )
+        .await;
+        assert!(status.is_success(), "spawn failed: {session}");
+        let sid = session["id"].as_str().unwrap().to_string();
+
+        let (status, err) = request(
+            &state,
+            Method::DELETE,
+            "/api/v1/git/worktrees",
+            Some(serde_json::json!({"workspace_id": ws_id, "path": wt_path, "force": true})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "even force must not evict a session"
+        );
+        assert!(err["error"].as_str().unwrap().contains("live session"));
+        assert!(PathBuf::from(&wt_path).exists());
+
+        state.sessions.kill(&sid).ok();
     }
 
     #[tokio::test]
