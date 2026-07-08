@@ -4,6 +4,7 @@
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
+    getToken,
     health as fetchHealth,
     notifyUnauthorized,
     pollHealth,
@@ -120,7 +121,16 @@
     type LayoutCtrl,
   } from "./lib/dnd";
   import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
-  import { closeThisWindow, isNativeShell, onLocalDaemonUpdated, onMenu } from "./lib/native";
+  import {
+    closeThisWindow,
+    connectHost,
+    focusWindow,
+    isNativeShell,
+    onHostStatus,
+    onLocalDaemonUpdated,
+    onMenu,
+    reportWindowScope,
+  } from "./lib/native";
   import * as pool from "./lib/termPool";
   import {
     applyRemoteSettings,
@@ -140,6 +150,7 @@
   import { hintsActive, initChordHints } from "./lib/chordHints.svelte";
   import FolderPicker from "./lib/FolderPicker.svelte";
   import HomeScreen from "./lib/HomeScreen.svelte";
+  import AskpassModal from "./lib/AskpassModal.svelte";
   import Launcher from "./lib/Launcher.svelte";
   import SessionGlyph from "./lib/SessionGlyph.svelte";
   import QuickOpen from "./lib/QuickOpen.svelte";
@@ -159,6 +170,89 @@
   let quickOpenRestoreEl: HTMLElement | null = null;
   let eventsUp = $state(false);
   let createError = $state<string | null>(null);
+
+  // --- remote window: auto-reconnect a dropped tunnel ------------------------
+  /** This window's host alias ("local" for the local daemon). */
+  const hostAlias = getHostLabel();
+  const isRemoteWindow = hostAlias !== "local";
+  /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
+  const canReconnect = isRemoteWindow && isNativeShell();
+  /** This window's scope key for the shell registry (null alias = local). */
+  const scopeAlias = isRemoteWindow ? hostAlias : null;
+  /** The reconnect overlay is showing (tunnel dropped, healing). */
+  let showReconnect = $state(false);
+  /** A connectHost call is in flight. */
+  let reconnecting = $state(false);
+  /** Last reconnect failure, surfaced with a Retry. */
+  let reconnectError = $state<string | null>(null);
+  /** The user dismissed the overlay; don't auto-reshow until state changes. */
+  let reconnectDismissed = $state(false);
+  let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
+
+  /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
+   *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
+   *  navigation. Surfaces the SSH auth modal (mounted app-wide) only if ssh
+   *  actually re-prompts. */
+  async function attemptReconnect(): Promise<void> {
+    if (!canReconnect || reconnecting) return;
+    reconnecting = true;
+    reconnectError = null;
+    try {
+      await connectHost(hostAlias);
+      // Same-port heal → our WebSocket reconnects and eventsUp clears the
+      // overlay; a moved port/token re-homes this window via onHostStatus.
+    } catch (e) {
+      reconnectError = e instanceof Error ? e.message : String(e);
+    } finally {
+      reconnecting = false;
+    }
+  }
+
+  function beginReconnect(): void {
+    if (!canReconnect || eventsUp) return;
+    reconnectDismissed = false;
+    showReconnect = true;
+    void attemptReconnect();
+  }
+
+  function dismissReconnect(): void {
+    showReconnect = false;
+    reconnectDismissed = true;
+    if (reconnectGrace !== null) {
+      clearTimeout(reconnectGrace);
+      reconnectGrace = null;
+    }
+  }
+
+  // A remote window whose events socket stays down past a short grace has lost
+  // its tunnel (not just a daemon blip): show the overlay and reconnect. When
+  // it recovers, clear everything. host-status "down" skips the grace.
+  $effect(() => {
+    if (!canReconnect) return;
+    if (eventsUp) {
+      if (reconnectGrace !== null) {
+        clearTimeout(reconnectGrace);
+        reconnectGrace = null;
+      }
+      showReconnect = false;
+      reconnectError = null;
+      reconnectDismissed = false;
+      return;
+    }
+    if (reconnectGrace === null && !showReconnect && !reconnectDismissed) {
+      reconnectGrace = setTimeout(() => {
+        reconnectGrace = null;
+        beginReconnect();
+      }, 1500);
+    }
+  });
+
+  // Keep the shell's window registry current so "open this workspace" raises
+  // this window instead of duplicating it (the SPA swaps `ws` client-side, so
+  // the shell can't see the change otherwise).
+  $effect(() => {
+    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId);
+  });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
   let agentDefault = $state(getAgentDefault());
@@ -443,6 +537,7 @@
     // chords a browser reserves for tabs.
     let unlistenMenu: (() => void) | null = null;
     let unlistenDaemonMoved: (() => void) | null = null;
+    let unlistenHostStatus: (() => void) | null = null;
     if (isNativeShell()) {
       void onMenu((action) => {
         switch (action) {
@@ -468,6 +563,28 @@
         if (activeWsId !== null) params.set("ws", activeWsId);
         location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
       }).then((u) => (unlistenDaemonMoved = u));
+      // This remote window's tunnel dropped or came back. "down" → reconnect
+      // now (the shell confirmed the forward is dead); "connected" → re-home
+      // only if the origin actually moved (daemon restart / update), else the
+      // heal is in place and the WebSocket just reconnects.
+      void onHostStatus((e) => {
+        if (!canReconnect || e.alias !== hostAlias) return;
+        if (e.status === "down") {
+          beginReconnect();
+          return;
+        }
+        const port = e.local_port;
+        const token = e.token ?? null;
+        const portMoved = port !== null && String(port) !== location.port;
+        const tokenMoved = token !== null && token !== getToken();
+        if (portMoved || tokenMoved) {
+          const params = new URLSearchParams();
+          if (token !== null) params.set("token", token);
+          if (activeWsId !== null) params.set("ws", activeWsId);
+          params.set("host", hostAlias);
+          location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
+        }
+      }).then((u) => (unlistenHostStatus = u));
     }
 
     const onPagehide = () => {
@@ -485,6 +602,7 @@
       window.removeEventListener("pagehide", onPagehide);
       unlistenMenu?.();
       unlistenDaemonMoved?.();
+      unlistenHostStatus?.();
       document.removeEventListener("copy", onCopy);
       stopChordHints();
       setReferenceHandler(null);
@@ -998,8 +1116,13 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
-  /** Scope this window to `w` (open in THIS window). */
-  function activateWorkspace(w: Workspace): void {
+  /** Scope this window to `w` (open in THIS window) — unless it's already
+   *  open in another window, in which case raise that one instead. */
+  async function activateWorkspace(w: Workspace): Promise<void> {
+    if (isNativeShell() && (await focusWindow(scopeAlias, w.id))) {
+      closePicker();
+      return;
+    }
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];
@@ -2270,7 +2393,9 @@
           title={eventsUp ? "connected" : "disconnected"}
           aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
-        <span class="daemon-host" title={health?.hostname}>{getHostLabel()}</span>
+        <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
+          >{getHostLabel()}</span
+        >
         {#if activeWsId !== null}
           <button
             class="daemon-settings"
@@ -2412,7 +2537,9 @@
       {#if needsYou > 0}
         <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
       {/if}
-      <span class="strip-host" title={health?.hostname}>{getHostLabel()}</span>
+      <span class="strip-host" class:remote={isRemoteWindow} title={health?.hostname}
+        >{getHostLabel()}</span
+      >
     </footer>
   {/if}
   {/if}
@@ -2459,6 +2586,41 @@
       {#if authRetryMsg}
         <div class="auth-msg">{authRetryMsg}</div>
       {/if}
+    </div>
+  </div>
+{/if}
+
+<!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
+     the workbench can prompt just like the home screen. Self-gating. -->
+<AskpassModal />
+
+{#if showReconnect}
+  <!-- A remote window's tunnel dropped: we re-run the SSH connect (auth modal
+       appears above this only if ssh re-asks). A same-port heal resumes this
+       window in place; a moved daemon re-homes it. -->
+  <div class="reconnect-overlay" role="alertdialog" aria-modal="true" aria-label="reconnecting">
+    <div class="reconnect-panel">
+      <div class="reconnect-head">
+        <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
+        <span class="reconnect-title">
+          {reconnectError !== null ? `can’t reach ${hostAlias}` : `reconnecting to ${hostAlias}…`}
+        </span>
+      </div>
+      <p class="reconnect-body">
+        {reconnectError ??
+          "re-establishing the SSH tunnel — this window resumes where it left off."}
+      </p>
+      <div class="reconnect-actions">
+        <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
+        <button
+          class="reconnect-retry"
+          use:focusOnMount
+          disabled={reconnecting}
+          onclick={() => void attemptReconnect()}
+        >
+          {reconnecting ? "reconnecting…" : "retry"}
+        </button>
+      </div>
     </div>
   </div>
 {/if}
@@ -3184,6 +3346,14 @@
     white-space: nowrap;
   }
 
+  /* A remote window wears its host name in the accent, so you always know the
+     work is running on the cluster, not this laptop. */
+  .daemon-host.remote,
+  .strip-host.remote {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
   /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */
   .daemon-settings {
     appearance: none;
@@ -3479,5 +3649,100 @@
     margin-top: 8px;
     font-size: var(--text-xs);
     color: var(--err);
+  }
+
+  /* --- remote reconnect overlay --- */
+
+  .reconnect-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 190;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    background: var(--scrim);
+    animation: authfade 0.1s ease-out;
+  }
+
+  .reconnect-panel {
+    margin-top: 20vh;
+    width: min(420px, calc(100vw - 2rem));
+    padding: 20px;
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.22);
+  }
+
+  .reconnect-head {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-bottom: 8px;
+  }
+
+  .reconnect-spinner {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+  }
+
+  .reconnect-spinner.spin {
+    animation: reconnect-spin 0.7s linear infinite;
+  }
+
+  @keyframes reconnect-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .reconnect-title {
+    font-size: var(--text-md);
+    font-weight: 600;
+  }
+
+  .reconnect-body {
+    margin: 0 0 12px;
+    font-size: var(--text-md);
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  .reconnect-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .reconnect-dismiss,
+  .reconnect-retry {
+    appearance: none;
+    border: 1px solid var(--edge);
+    background: none;
+    padding: 4px 16px;
+    border-radius: 5px;
+    font: inherit;
+    font-size: var(--text-md);
+    color: var(--fg);
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+  }
+
+  .reconnect-dismiss {
+    color: var(--muted);
+  }
+
+  .reconnect-retry:hover:enabled,
+  .reconnect-dismiss:hover {
+    background: var(--row-hover);
+  }
+
+  .reconnect-retry:disabled {
+    color: var(--muted);
+    cursor: default;
   }
 </style>

@@ -22,6 +22,19 @@ pub struct Shell {
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
     /// Aliases with a connect in flight (guards double-clicks).
     connecting: Mutex<HashSet<String>>,
+    /// What each open window currently shows, keyed by window label. Drives
+    /// focus-existing (open the same workspace → raise its window instead of a
+    /// duplicate). The SPA reports its own scope because it swaps `ws`
+    /// client-side without a shell round-trip.
+    windows: Mutex<HashMap<String, WindowScope>>,
+}
+
+/// The (host, workspace) a window is showing. `alias` None = the local
+/// daemon; `ws` None = the home screen.
+#[derive(Clone, Default, PartialEq)]
+pub struct WindowScope {
+    pub alias: Option<String>,
+    pub ws: Option<String>,
 }
 
 /// Host list entry as the UI sees it (see HostState in native.ts).
@@ -43,6 +56,19 @@ pub struct HostState {
 struct ConnectProgress {
     alias: String,
     phase: &'static str,
+}
+
+/// Live tunnel liveness, pushed as hosts drop or reconnect (see the health
+/// monitor and `host-status` in native.ts). `token` rides the `connected`
+/// transition so a window whose remote daemon restarted (fresh token) can
+/// re-home; it is omitted on `down`.
+#[derive(Clone, Serialize)]
+struct HostStatus {
+    alias: String,
+    status: &'static str,
+    local_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 /// The local daemon's build parity, as the home screen sees it.
@@ -88,12 +114,39 @@ pub fn open_ui_window(
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
-    WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
+    WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .title(title)
         .inner_size(1280.0, 840.0)
         .min_inner_size(680.0, 440.0)
         .build()?;
+    // Track the new window's scope so focus-existing can raise it. Startup
+    // manages Shell before opening the home window, so it registers too.
+    if let Some(shell) = app.try_state::<Shell>() {
+        lock(&shell.windows).insert(
+            label,
+            WindowScope {
+                alias: host_alias.map(str::to_string),
+                ws: ws.map(str::to_string),
+            },
+        );
+    }
     Ok(())
+}
+
+/// The label of an open window showing `(alias, ws)`, if any, excluding
+/// `exclude` — used to raise an already-open workspace instead of duplicating.
+fn find_by_scope(
+    windows: &Mutex<HashMap<String, WindowScope>>,
+    alias: &Option<String>,
+    ws: &Option<String>,
+    exclude: Option<&str>,
+) -> Option<String> {
+    lock(windows)
+        .iter()
+        .find(|(label, scope)| {
+            exclude != Some(label.as_str()) && &scope.alias == alias && &scope.ws == ws
+        })
+        .map(|(label, _)| label.clone())
 }
 
 fn state_for(
@@ -156,45 +209,24 @@ async fn remove_host(state: State<'_, Shell>, alias: String) -> Result<(), Strin
     Ok(())
 }
 
-#[tauri::command]
-async fn connect_host(
-    app: AppHandle,
-    state: State<'_, Shell>,
-    alias: String,
-    update_daemon: Option<bool>,
-) -> Result<HostState, String> {
-    let update_daemon = update_daemon.unwrap_or(false);
-    tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
-    // Reuse a live tunnel; a dead one is torn down and rebuilt. An update
-    // request never reuses: the old tunnel points at the daemon being
-    // replaced, so it comes down before the connect flow runs.
-    {
-        let mut tunnels = state.tunnels.lock().await;
-        if let Some(t) = tunnels.get(&alias) {
-            if !update_daemon && t.is_up().await {
-                let entry = host_entry(&alias);
-                return Ok(state_for(&entry, "connected", Some(t)));
-            }
-            if let Some(old) = tunnels.remove(&alias) {
-                old.close().await;
-            }
-        }
-    }
-    if !lock(&state.connecting).insert(alias.clone()) {
-        return Err("a connection attempt is already running".to_string());
-    }
-
-    let entry = HostsStore::load_default()
-        .add(&alias, None)
-        .map_err(|e| format!("{e:#}"))?;
+/// One `chimaera_remote::connect` attempt, wiring each phase to a
+/// `connect-progress` event. Factored out so a reconnect can retry on a fresh
+/// port after a reused one clashes.
+async fn run_connect(
+    app: &AppHandle,
+    alias: &str,
+    entry: &chimaera_remote::hosts::HostEntry,
+    local_port: Option<u16>,
+    update_daemon: bool,
+) -> anyhow::Result<Tunnel> {
     let opts = ConnectOpts {
-        local_port: None,
+        local_port,
         binary: entry.binary.clone(),
         update_daemon,
     };
     let progress_app = app.clone();
-    let progress_alias = alias.clone();
-    let result = chimaera_remote::connect(&alias, opts, move |phase| {
+    let progress_alias = alias.to_string();
+    chimaera_remote::connect(alias, opts, move |phase| {
         let phase = match phase {
             Phase::Probing => "probing",
             Phase::Updating => "updating",
@@ -211,7 +243,56 @@ async fn connect_host(
             },
         );
     })
-    .await;
+    .await
+}
+
+#[tauri::command]
+async fn connect_host(
+    app: AppHandle,
+    state: State<'_, Shell>,
+    alias: String,
+    update_daemon: Option<bool>,
+) -> Result<HostState, String> {
+    let update_daemon = update_daemon.unwrap_or(false);
+    tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
+    // Reuse a live tunnel; a dead one is torn down and rebuilt on its old
+    // loopback port so open windows heal in place. An update never reuses:
+    // the old tunnel points at the daemon being replaced.
+    let reuse_port = {
+        let mut tunnels = state.tunnels.lock().await;
+        if let Some(t) = tunnels.get(&alias) {
+            if !update_daemon && t.is_up().await {
+                let entry = host_entry(&alias);
+                return Ok(state_for(&entry, "connected", Some(t)));
+            }
+        }
+        match tunnels.remove(&alias) {
+            Some(old) => {
+                let port = old.local_port;
+                old.close().await;
+                (!update_daemon).then_some(port)
+            }
+            None => None,
+        }
+    };
+    if !lock(&state.connecting).insert(alias.clone()) {
+        return Err("a connection attempt is already running".to_string());
+    }
+
+    let entry = HostsStore::load_default()
+        .add(&alias, None)
+        .map_err(|e| format!("{e:#}"))?;
+    let result = run_connect(&app, &alias, &entry, reuse_port, update_daemon).await;
+    // The reused port was free a moment ago (we just cancelled the forward),
+    // but socket teardown can lag; fall back to an OS-assigned port so a
+    // reconnect never fails on a transient bind clash.
+    let result = match result {
+        Err(e) if reuse_port.is_some() => {
+            tracing::warn!("reconnect on port {reuse_port:?} failed ({e:#}); retrying fresh");
+            run_connect(&app, &alias, &entry, None, update_daemon).await
+        }
+        other => other,
+    };
     lock(&state.connecting).remove(&alias);
 
     let tunnel = result.map_err(|e| format!("{e:#}"))?;
@@ -220,6 +301,18 @@ async fn connect_host(
     }
     let entry = host_entry(&alias);
     let host_state = state_for(&entry, "connected", Some(&tunnel));
+    // Tell open windows on this host to re-home if the port or token moved
+    // (daemon restart / update); a same-port+token reconnect is a no-op for
+    // them — their WebSocket just reconnects.
+    let _ = app.emit(
+        "host-status",
+        HostStatus {
+            alias: alias.clone(),
+            status: "connected",
+            local_port: Some(tunnel.local_port),
+            token: Some(tunnel.manifest.token.clone()),
+        },
+    );
     state.tunnels.lock().await.insert(alias.clone(), tunnel);
     Ok(host_state)
 }
@@ -289,16 +382,28 @@ async fn remote_workspaces(
     .map_err(|e| format!("{e}"))?
 }
 
-/// Open a new window on the local daemon (`alias` None) or a connected
-/// remote. `ws_id` None lands on the home screen.
+/// Open a window on the local daemon (`alias` None) or a connected remote.
+/// `ws_id` None lands on the home screen. Unless `new_window`, an existing
+/// window already showing this `(alias, ws)` is raised instead of duplicated.
 #[tauri::command]
 async fn open_window(
     app: AppHandle,
     state: State<'_, Shell>,
     alias: Option<String>,
     ws_id: Option<String>,
+    new_window: Option<bool>,
 ) -> Result<(), String> {
-    tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?}");
+    let new_window = new_window.unwrap_or(false);
+    tracing::info!("ipc: open_window alias={alias:?} ws={ws_id:?} new_window={new_window}");
+    if !new_window {
+        if let Some(label) = find_by_scope(&state.windows, &alias, &ws_id, None) {
+            if let Some(win) = app.get_webview_window(&label) {
+                return win
+                    .set_focus()
+                    .map_err(|e| format!("could not focus window: {e}"));
+            }
+        }
+    }
     let (port, token, host) = match alias {
         None => {
             let local = lock(&state.local);
@@ -370,6 +475,37 @@ async fn answer_askpass(
     Ok(())
 }
 
+/// The SPA reporting what this window now shows — it swaps `ws` client-side,
+/// so the shell can't see it otherwise. Keyed by the calling window's label.
+#[tauri::command]
+fn report_window_scope(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: Option<String>,
+    ws: Option<String>,
+) {
+    lock(&state.windows).insert(webview.label().to_string(), WindowScope { alias, ws });
+}
+
+/// Raise an existing window showing `(alias, ws)`, other than the caller.
+/// Returns whether one was found — the UI activates in-place only when false.
+#[tauri::command]
+fn focus_window(
+    app: AppHandle,
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
+    alias: Option<String>,
+    ws: Option<String>,
+) -> bool {
+    match find_by_scope(&state.windows, &alias, &ws, Some(webview.label())) {
+        Some(label) => app
+            .get_webview_window(&label)
+            .map(|w| w.set_focus().is_ok())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
     HostsStore::load_default()
         .get(alias)
@@ -385,6 +521,54 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Watch live tunnels and broadcast `host-status` on up↔down transitions.
+/// Without this a dropped forward (remote daemon or ssh died) goes unnoticed
+/// until the user clicks. A single task is the sole emitter — windows and the
+/// home screen just listen, so there is no per-window reconnect stampede. The
+/// probe is a pure loopback connect (no ssh), cheap enough for a shared login
+/// node; it proves the forward is up, not that the remote daemon is healthy
+/// (same limitation as `Tunnel::is_up`).
+fn spawn_health_monitor(handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut prev: HashMap<String, bool> = HashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            // No managed Shell means the app is tearing down — stop the loop.
+            let Some(shell) = handle.try_state::<Shell>() else {
+                break;
+            };
+            // Snapshot under the lock, then drop it before probing sockets.
+            let snap: Vec<(String, u16, String)> = {
+                let tunnels = shell.tunnels.lock().await;
+                tunnels
+                    .iter()
+                    .map(|(a, t)| (a.clone(), t.local_port, t.manifest.token.clone()))
+                    .collect()
+            };
+            // Aliases gone from the map were disconnected by the user; forget
+            // them without emitting a spurious `down`.
+            prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
+            for (alias, port, token) in &snap {
+                let up = tokio::net::TcpStream::connect(("127.0.0.1", *port))
+                    .await
+                    .is_ok();
+                if prev.insert(alias.clone(), up) == Some(up) {
+                    continue; // no transition
+                }
+                let _ = handle.emit(
+                    "host-status",
+                    HostStatus {
+                        alias: alias.clone(),
+                        status: if up { "connected" } else { "down" },
+                        local_port: Some(*port),
+                        token: up.then(|| token.clone()),
+                    },
+                );
+            }
+        }
+    });
 }
 
 /// Build and run the Tauri app.
@@ -404,7 +588,19 @@ pub fn run() {
             check_app_update,
             install_app_update,
             answer_askpass,
+            report_window_scope,
+            focus_window,
         ])
+        .on_window_event(|window, event| {
+            // Forget a window's scope once it's gone, so focus-existing never
+            // raises a dead label. Destroyed (not CloseRequested, which can be
+            // vetoed) fires after teardown completes.
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(shell) = window.try_state::<Shell>() {
+                    lock(&shell.windows).remove(window.label());
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             crate::menu::install(app)?;
@@ -423,13 +619,18 @@ pub fn run() {
                     tracing::error!("{e:#}");
                     std::io::Error::other(format!("{e:#}"))
                 })?;
-            open_ui_window(&handle, local.port, &local.token, None, None)?;
-            tracing::info!("home window open on 127.0.0.1:{}", local.port);
+            let (port, token) = (local.port, local.token.clone());
+            // Manage Shell BEFORE opening the home window so it can register
+            // its own scope in the window map.
             app.manage(Shell {
                 local: Mutex::new(local),
                 tunnels: tokio::sync::Mutex::new(HashMap::new()),
                 connecting: Mutex::new(HashSet::new()),
+                windows: Mutex::new(HashMap::new()),
             });
+            open_ui_window(&handle, port, &token, None, None)?;
+            tracing::info!("home window open on 127.0.0.1:{port}");
+            spawn_health_monitor(handle.clone());
             Ok(())
         })
         .build(tauri::generate_context!())

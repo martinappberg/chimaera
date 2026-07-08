@@ -168,6 +168,8 @@ export interface DirListing {
   path: string;
   parent: string | null;
   dirs: DirEntry[];
+  /** The daemon capped a very large directory; some entries are omitted. */
+  truncated?: boolean;
 }
 
 /** The daemon user's home directory. */

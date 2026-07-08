@@ -775,6 +775,11 @@ fn pick_local_port(requested: Option<u16>, remote_port: u16) -> anyhow::Result<u
 
 fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
     ssh_base()
+        // Exit non-zero the instant the local bind fails instead of sitting
+        // idle: a reconnect that reuses a not-quite-released port then fails
+        // in <1s (caught by wait_for_port's early-exit branch) rather than
+        // eating the full 15s timeout before the fresh-port retry.
+        .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{remote}"))

@@ -42,6 +42,12 @@ const MAX_TABLE_ROWS: usize = 1000;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one
 /// request per visible-viewport scan).
 const MAX_VALIDATE_CANDIDATES: usize = 50;
+/// Hard cap on entries returned by a single `fs/dirs` / `fs/list` listing.
+/// The daemon runs on shared login nodes over NFS/Lustre where a scratch dir
+/// can hold hundreds of thousands of entries; without a ceiling a single
+/// listing balloons the response and the allocation. Past this the answer is
+/// honestly `truncated`.
+const MAX_DIR_ENTRIES: usize = 4000;
 /// How long a raw-access ticket stays valid.
 const TICKET_TTL: Duration = Duration::from_secs(600);
 
@@ -168,15 +174,43 @@ struct DirEntry {
 
 /// GET /api/v1/fs/dirs?path=<path>&hidden=<bool>
 pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
-    match list_dirs(&query.path, query.hidden) {
-        Ok(body) => Json(body).into_response(),
-        Err(err) => bad_request(&err),
+    blocking_listing(move || list_dirs(&query.path, query.hidden)).await
+}
+
+/// Run a directory-listing on a blocking thread and shape the result — a slow
+/// Lustre `read_dir` must never wedge a tokio worker.
+async fn blocking_listing<F>(work: F) -> Response
+where
+    F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(err)) => bad_request(&err),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("listing task failed: {join}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether a directory entry is (or resolves to) a directory, preferring the
+/// `readdir`-provided d_type so the common case costs no extra syscall. Only a
+/// symlink — or a filesystem that reports an unknown type — falls back to a
+/// `metadata()` stat, which follows the link so symlinks-to-dirs still count.
+/// This is what defuses the per-entry stat storm on a big NFS/Lustre listing.
+fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(ft) if ft.is_dir() => true,
+        Ok(ft) if ft.is_file() => false,
+        _ => std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()),
     }
 }
 
 /// Canonicalize `raw` (after tilde expansion) and list its subdirectories:
 /// directories and symlinks resolving to directories only, dotted names
-/// excluded unless `hidden`, sorted case-insensitively by name.
+/// excluded unless `hidden`, sorted case-insensitively by name, capped at
+/// [`MAX_DIR_ENTRIES`].
 fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     let path = canonical(raw)?;
     if !path.is_dir() {
@@ -186,6 +220,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     let entries = std::fs::read_dir(&path)
         .with_context(|| format!("{}: failed to read directory", path.display()))?;
     let mut dirs = Vec::new();
+    let mut truncated = false;
     for entry in entries {
         // Unreadable entries are skipped silently.
         let Ok(entry) = entry else { continue };
@@ -193,14 +228,16 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         if !hidden && name.starts_with('.') {
             continue;
         }
-        let entry_path = entry.path();
-        // metadata() follows symlinks, so a symlink to a directory counts;
-        // files, broken symlinks, and unreadable entries are skipped.
-        if std::fs::metadata(&entry_path).is_ok_and(|meta| meta.is_dir()) {
-            dirs.push(DirEntry {
-                name,
-                path: entry_path.to_string_lossy().into_owned(),
-            });
+        if !entry_is_dir(&entry) {
+            continue;
+        }
+        dirs.push(DirEntry {
+            name,
+            path: entry.path().to_string_lossy().into_owned(),
+        });
+        if dirs.len() >= MAX_DIR_ENTRIES {
+            truncated = true;
+            break;
         }
     }
     dirs.sort_by(|a, b| {
@@ -214,6 +251,7 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         "path": path.to_string_lossy(),
         "parent": path.parent().map(|p| p.to_string_lossy()),
         "dirs": dirs,
+        "truncated": truncated,
     }))
 }
 
@@ -231,15 +269,14 @@ struct FsEntry {
 /// GET /api/v1/fs/list?path=<path>&hidden=<bool> — full directory listing
 /// (dirs and files) for the file tree.
 pub(crate) async fn list(Query(query): Query<DirsQuery>) -> Response {
-    match list_entries(&query.path, query.hidden) {
-        Ok(body) => Json(body).into_response(),
-        Err(err) => bad_request(&err),
-    }
+    blocking_listing(move || list_entries(&query.path, query.hidden)).await
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
 /// case-insensitively; dot entries excluded unless `hidden`; unreadable
-/// entries (including broken symlinks) skipped.
+/// entries (including broken symlinks) skipped; capped at [`MAX_DIR_ENTRIES`].
+/// Unlike `list_dirs` this needs each entry's size + mtime, so it stats — the
+/// cap is what bounds that on a huge directory.
 fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     let path = canonical(raw)?;
     if !path.is_dir() {
@@ -249,6 +286,7 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
     let read = std::fs::read_dir(&path)
         .with_context(|| format!("{}: failed to read directory", path.display()))?;
     let mut entries = Vec::new();
+    let mut truncated = false;
     for entry in read {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -273,6 +311,10 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
             size: meta.len(),
             mtime,
         });
+        if entries.len() >= MAX_DIR_ENTRIES {
+            truncated = true;
+            break;
+        }
     }
     entries.sort_by(|a, b| {
         (a.kind != "dir")
@@ -285,6 +327,7 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
         "path": path.to_string_lossy(),
         "parent": path.parent().map(|p| p.to_string_lossy()),
         "entries": entries,
+        "truncated": truncated,
     }))
 }
 
