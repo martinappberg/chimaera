@@ -22,10 +22,10 @@
   --focus-ring: color-mix(in srgb, var(--accent) 70%, transparent);
   --bg: #fbfbfc;
   --fg: #1d1d20;
-  --muted: #6c6c74;
+  --muted: #65656d;
   --accent: #2e9e6b;
   --err: #cc4444;
-  --warn: #b8862b; /* agent needs_permission / idle_prompt dot */
+  --warn: #a5730d; /* agent needs_permission / idle_prompt dot */
   --rate: #8a68c0; /* agent rate_limited dot */
   --rail-bg: #f3f3f5;
   --row-hover: #ececef;
@@ -38,8 +38,8 @@
   /* Syntax accents for the read-only code view (CodeMirror), muted to match
      the terminal's ANSI palette. */
   --syn-keyword: #9a4fa8;
-  --syn-string: #2f8a57;
-  --syn-comment: #8a8a93;
+  --syn-string: #2b8654;
+  --syn-comment: #80808a;
   --syn-number: #a05e2a;
   --syn-type: #2f7a9b;
   --syn-func: #3e6fc0;
@@ -70,24 +70,24 @@
 :root[data-theme="dark"] {
   /* Fallback only — the live palette comes inline from settings/themes.ts. */
   color-scheme: dark;
-  --bg: #131316;
+  --bg: #17171c;
   --fg: #e7e7ea;
-  --muted: #92929c;
+  --muted: #9a9aa6;
   --accent: #3fbf85;
   --err: #d96b6b;
   --warn: #d0a355;
   --rate: #a58fd6;
-  --rail-bg: #18181c;
-  --row-hover: #1f1f24;
-  --row-active: #26262c;
+  --rail-bg: #1c1c23;
+  --row-hover: #25252d;
+  --row-active: #2d2d36;
   --term-selection: #e7e7ea33;
-  --term-bg: #0f0f13;
+  --term-bg: #121218;
   --scrim: rgba(0, 0, 0, 0.5);
-  --overlay-bg: #1b1b20;
-  --edge: #2b2b32;
+  --overlay-bg: #202028;
+  --edge: #31313b;
   --syn-keyword: #c586d6;
   --syn-string: #7cc99a;
-  --syn-comment: #7a7a85;
+  --syn-comment: #7d7e89;
   --syn-number: #d0a355;
   --syn-type: #6fb3d2;
   --syn-func: #82a7e8;
