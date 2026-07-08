@@ -115,6 +115,7 @@
   import {
     activateGitWorkspace,
     gitEnv,
+    gitRepoError,
     gitStatus,
     onGitNudge,
     workspacesChanged,
@@ -2636,6 +2637,27 @@
               />
             </svg>
             <span class="dg-branch">git {$gitEnv.version ? "too old" : "missing"}</span>
+          </button>
+        {:else if $gitRepoError !== null}
+          <!-- Git runs, but couldn't read this repo (dubious ownership, a
+               permission/filesystem problem). Without this the diagnostic
+               would be unreachable — there's no branch header to click. -->
+          <button
+            class="daemon-git bad"
+            onclick={openGitPanel}
+            title="git couldn’t read this repository — open source control to fix"
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <path
+                d="M8 1.8 14.6 13H1.4L8 1.8ZM8 6.4v3.1M8 11.2v.1"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="dg-branch">can’t read repo</span>
           </button>
         {/if}
         {#if activeWsId !== null}

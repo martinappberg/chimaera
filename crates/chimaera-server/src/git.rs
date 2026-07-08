@@ -197,15 +197,20 @@ impl GitService {
     }
 
     /// Discover the repo for `ws_id` rooted at `root`, caching the result.
-    async fn discover(&self, git: &Path, ws_id: &str, root: &Path) -> Option<RepoInfo> {
-        if let Some(cached) = crate::lock(&self.repos).get(ws_id) {
-            if cached.is_some() {
-                return cached.clone();
-            }
+    ///
+    /// Only a real repo is cached (its root is stable for the daemon's life). A
+    /// non-repo OR a transient probe error is re-probed on demand — so a
+    /// `git init`, a fixed permission, or an added `safe.directory` surfaces
+    /// without a restart. The full [`ProbeOutcome`] is returned so the status
+    /// handler can tell "not a repo" from "git couldn't read it" (dubious
+    /// ownership, a wedged filesystem) and explain the latter.
+    async fn discover(&self, git: &Path, ws_id: &str, root: &Path) -> ProbeOutcome {
+        if let Some(Some(cached)) = crate::lock(&self.repos).get(ws_id) {
+            return ProbeOutcome::Repo(cached.clone());
         }
-        let info = probe_repo(git, &self.procs, root).await;
-        crate::lock(&self.repos).insert(ws_id.to_string(), info.clone());
-        info
+        let outcome = probe_repo(git, &self.procs, root).await;
+        crate::lock(&self.repos).insert(ws_id.to_string(), outcome.repo().cloned());
+        outcome
     }
 
     async fn status(&self, git: &Path, repo: &RepoInfo) -> anyhow::Result<StatusData> {
@@ -310,9 +315,61 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<WorktreeInfo> {
     out
 }
 
+/// The result of probing a directory for a git repository.
+enum ProbeOutcome {
+    /// A real repository.
+    Repo(RepoInfo),
+    /// git ran and cleanly reported this is not a work tree — the ordinary
+    /// "open a non-repo folder" case.
+    NotARepo,
+    /// git could not answer: it errored (dubious ownership on shared storage,
+    /// a permission problem) or timed out on a wedged filesystem. Carries the
+    /// reason so the UI can explain it — a real repo must never silently read
+    /// as "not a git repository".
+    Error(String),
+}
+
+impl ProbeOutcome {
+    fn repo(&self) -> Option<&RepoInfo> {
+        match self {
+            ProbeOutcome::Repo(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    fn into_repo(self) -> Option<RepoInfo> {
+        match self {
+            ProbeOutcome::Repo(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The failure reason, for the status JSON (`None` for a real repo or a
+    /// genuine non-repo — both are unremarkable).
+    fn error(&self) -> Option<&str> {
+        match self {
+            ProbeOutcome::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
+/// Classify a `git rev-parse` that exited non-zero: git prints "not a git
+/// repository" only for the genuine no-repo case, so anything else on stderr
+/// (dubious ownership, permission denied) is a real error the user must see.
+/// An empty stderr is treated as the ordinary non-repo rather than nagging.
+fn classify_probe_failure(stderr: &str) -> ProbeOutcome {
+    let stderr = stderr.trim();
+    if stderr.is_empty() || stderr.contains("not a git repository") {
+        ProbeOutcome::NotARepo
+    } else {
+        ProbeOutcome::Error(stderr.to_string())
+    }
+}
+
 /// Run `git rev-parse` to resolve the working-tree root and common git dir.
-async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> Option<RepoInfo> {
-    let out = run_git(
+async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> ProbeOutcome {
+    let out = match run_git(
         git,
         procs,
         root,
@@ -320,13 +377,22 @@ async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> Option<RepoIn
         8 * 1024,
     )
     .await
-    .ok()?;
+    {
+        Ok(out) => out,
+        // Spawn failure or the kill-on-timeout: not "no repo" — we couldn't
+        // even ask. Surface it (e.g. "git timed out after 8s" on a wedged NFS).
+        Err(err) => return ProbeOutcome::Error(err.to_string()),
+    };
     if !out.success {
-        return None; // not a repo (or git absent) — caller renders "no repo"
+        return classify_probe_failure(&out.stderr);
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut lines = text.lines();
-    let toplevel = PathBuf::from(lines.next()?.trim());
+    // A success with no toplevel line is pathological; treat as non-repo.
+    let Some(toplevel) = lines.next().map(str::trim).filter(|l| !l.is_empty()) else {
+        return ProbeOutcome::NotARepo;
+    };
+    let toplevel = PathBuf::from(toplevel);
     // `--git-common-dir` prints relative to the CWD we ran in unless it is an
     // absolute path into the main checkout (the linked-worktree case).
     let common = lines.next().map(str::trim).unwrap_or("");
@@ -341,7 +407,7 @@ async fn probe_repo(git: &Path, procs: &Semaphore, root: &Path) -> Option<RepoIn
             }
         }
     };
-    Some(RepoInfo {
+    ProbeOutcome::Repo(RepoInfo {
         toplevel,
         common_dir,
     })
@@ -908,7 +974,12 @@ pub(crate) async fn backstop_poll(state: Arc<AppState>) {
             let Some(ws) = crate::lock(&state.workspaces).get(&ws_id) else {
                 continue;
             };
-            let Some(repo) = state.git.discover(&git.path, &ws_id, &ws.root).await else {
+            let Some(repo) = state
+                .git
+                .discover(&git.path, &ws_id, &ws.root)
+                .await
+                .into_repo()
+            else {
                 continue;
             };
             let Ok(data) = state.git.status(&git.path, &repo).await else {
@@ -965,20 +1036,27 @@ pub(crate) async fn status(
         }))
         .into_response();
     }
-    let Some(repo) = state
+    let repo = match state
         .git
         .discover(&git.path, &q.workspace_id, &ws.root)
         .await
-    else {
-        let epoch = state.git.epoch(&q.workspace_id);
-        return Json(json!({
-            "repo": false,
-            "git_ok": true,
-            "git": git.json(),
-            "workspace_id": q.workspace_id,
-            "epoch": epoch,
-        }))
-        .into_response();
+    {
+        ProbeOutcome::Repo(repo) => repo,
+        // Not a repo, or git couldn't read one (dubious ownership, a wedged
+        // filesystem). `repo_error` is the reason for the latter — the client
+        // turns it into an actionable panel instead of a blank "no repo".
+        other => {
+            let epoch = state.git.epoch(&q.workspace_id);
+            return Json(json!({
+                "repo": false,
+                "git_ok": true,
+                "git": git.json(),
+                "repo_error": other.error(),
+                "workspace_id": q.workspace_id,
+                "epoch": epoch,
+            }))
+            .into_response();
+        }
     };
     match state.git.status(&git.path, &repo).await {
         Ok(data) => {
@@ -1032,6 +1110,7 @@ pub(crate) async fn worktrees(
         .git
         .discover(&git.path, &q.workspace_id, &ws.root)
         .await
+        .into_repo()
     else {
         return Json(json!({"repo": false, "worktrees": []})).into_response();
     };
@@ -1194,6 +1273,7 @@ pub(crate) async fn create_worktree(
         .git
         .discover(&git.path, &body.workspace_id, &ws.root)
         .await
+        .into_repo()
     else {
         return bad_request("not a git repository");
     };
@@ -1330,6 +1410,7 @@ pub(crate) async fn remove_worktree(
         .git
         .discover(&git.path, &body.workspace_id, &ws.root)
         .await
+        .into_repo()
     else {
         return bad_request("not a git repository");
     };
@@ -1471,6 +1552,7 @@ pub(crate) async fn diff(
         .git
         .discover(&git.path, &q.workspace_id, &ws.root)
         .await
+        .into_repo()
     else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1690,6 +1772,35 @@ mod tests {
     fn paths_with_spaces_survive() {
         let data = parse_status(b"1 .M N... 100644 100644 100644 a b src/a file.rs\0", false);
         assert_eq!(data.entries[0].rel, "src/a file.rs");
+    }
+
+    /// A real repo must never silently read as "not a git repository": only
+    /// git's own "not a git repository" (and an empty stderr) is the ordinary
+    /// non-repo; dubious ownership and permission failures are surfaced errors.
+    #[test]
+    fn classify_probe_failure_distinguishes_no_repo_from_error() {
+        assert!(matches!(
+            classify_probe_failure(
+                "fatal: not a git repository (or any of the parent directories): .git"
+            ),
+            ProbeOutcome::NotARepo
+        ));
+        assert!(matches!(
+            classify_probe_failure("  "),
+            ProbeOutcome::NotARepo
+        ));
+
+        // The HPC-shared-storage case: git refuses a repo it considers unsafe.
+        let dubious = "fatal: detected dubious ownership in repository at '/oak/x/repo'";
+        match classify_probe_failure(dubious) {
+            ProbeOutcome::Error(msg) => assert!(msg.contains("dubious ownership")),
+            other => panic!("expected Error, got {:?}", other.error()),
+        }
+
+        assert!(matches!(
+            classify_probe_failure("fatal: Could not read from remote repository"),
+            ProbeOutcome::Error(_)
+        ));
     }
 
     /// The baseline-ownership invariant. A pull must ANNOUNCE any change it
