@@ -14,6 +14,8 @@ fn main() {
             "open_window",
             "check_app_update",
             "install_app_update",
+            "begin_update",
+            "shell_build",
             "answer_askpass",
         ]),
     ))

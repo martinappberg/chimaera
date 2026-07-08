@@ -67,6 +67,11 @@ pub struct SpawnOpts {
     /// `CHIMAERA_SESSION`/`CHIMAERA_THEME`, the shim dir, and the shell
     /// integration bootstrap into every session it spawns.
     pub env: Vec<(String, String)>,
+    /// Inherited variables to REMOVE from the child's environment. The
+    /// daemon uses this to scrub launcher-context markers (e.g. a Claude
+    /// Code session having started the daemon) that would make spawned
+    /// programs believe they run nested inside that launcher.
+    pub env_remove: Vec<String>,
     /// Scrollback lines kept server-side. `None` = the default (10k).
     pub scrollback: Option<usize>,
 }

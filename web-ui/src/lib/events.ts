@@ -1,6 +1,7 @@
 import { getToken } from "./api";
 import type { Link } from "./agentLinks";
 import type { Session } from "./sessions";
+import type { UpdateStatus } from "./update.svelte";
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 10_000;
@@ -24,6 +25,17 @@ export interface EventsSocketHandlers {
    */
   onGit?(epochs: Record<string, number>): void;
   /**
+   * The daemon's release knowledge (same shape as GET /api/v1/update),
+   * pushed after auth and whenever it changes.
+   */
+  onUpdate?(status: UpdateStatus): void;
+  /**
+   * Recents invalidate (a conversation retired somewhere): fired after auth
+   * and whenever the store changes. The caller refetches GET /recents for
+   * its own workspace iff the epoch moved.
+   */
+  onRecents?(epoch: number): void;
+  /**
    * Connection state. While false the caller should fall back to polling;
    * fired only on transitions.
    */
@@ -42,6 +54,11 @@ interface ServerEventFrame {
   links?: Link[];
   settings?: Record<string, unknown>;
   epochs?: Record<string, number>;
+  epoch?: number;
+  available?: boolean;
+  current?: string;
+  build?: string;
+  latest?: UpdateStatus["latest"];
   message?: string;
 }
 
@@ -123,6 +140,17 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onGit?.(msg.epochs);
+      } else if (msg.type === "update" && typeof msg.available === "boolean") {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onUpdate?.({
+          current: msg.current ?? "",
+          build: msg.build ?? null,
+          available: msg.available,
+          latest: msg.latest ?? null,
+        });
+      } else if (msg.type === "recents" && typeof msg.epoch === "number") {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onRecents?.(msg.epoch);
       } else if (msg.type === "error") {
         // Bad auth or a server-side failure; give up and surface it (the
         // app shows the blocking re-auth overlay on "unauthorized").

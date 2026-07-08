@@ -1189,6 +1189,72 @@ component decisions:
   pays full handshake+2FA cost there. russh only becomes interesting if a no-external-binary
   Windows client is ever required.
 
+## Verified component notes (2026-07-07/08): child-marked claude persists no transcript — scrub launcher env
+
+Found during live verification of session resurrection, initially misdiagnosed as a
+claude 2.1.204 regression, then bisected to its true cause: **claude suppresses
+interactive transcript persistence when its environment marks it as a child of another
+Claude Code session** (`CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_CHILD_SESSION`; both
+bisected live against 2.1.204 — same shell, same cwd: markers present → no transcript
+ever, markers removed → transcript within 2s of the first prompt). Hooks still *report*
+a `transcript_path`; the file never materializes, and `claude --resume <id>` dies with
+"No conversation found".
+
+Why chimaera hits this: a daemon started **from inside a claude session** — dev loops
+do this constantly ("restart the daemon" typed to an agent, agent-driven verification,
+a linked terminal running `chimaera serve`) — inherits those markers and passes them to
+every session it spawns, so every agent under it silently loses `--resume`, and even a
+`claude` typed by hand into a chimaera shell goes transcript-silent. A daemon started
+by the app or a plain terminal is unaffected (which is why normal usage never sees it).
+
+Fixes, both kept even though the root cause is environmental:
+- **Launcher-context scrub**: PTY spawn gained `env_remove`; the daemon strips the
+  CLAUDE* marker family (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_AGENT_*`,
+  `CLAUDE_EFFORT`, `AI_AGENT`) from every session it spawns — none of it can describe
+  a chimaera session truthfully, and anything the user set in their own profile comes
+  back through the login-shell wrap.
+- **A resume id is a claim, not a promise.** Everything that mints one — the session
+  ledger's boot resurrection, `retire()` into Recents — verifies the transcript exists
+  on disk first (hook-recorded path, or the conventional store location for the cwd).
+  No transcript → resurrection respawns a fresh TUI carrying the old display title,
+  and Recents rows omit `resume` (the row honestly starts fresh). Defense in depth:
+  transcripts also vanish via claude's own `cleanupPeriodDays`, old contaminated
+  daemons, and whatever comes next.
+
+## Decisions log addendum (2026-07-07): stateful restarts + update surface — SHIPPED
+
+The update-safety chain, three layers, each independently useful:
+- **Session ledger + resurrection** (`sessions.json`, reconciled from live state ≤2s
+  behind truth, flushed on graceful shutdown): on boot, shells respawn at their last
+  polled cwd and claude conversations respawn `--resume` (transcript-verified, above) —
+  all **under their original session ids**, which is the single property that lets every
+  persisted layout tab, linked-terminal edge, and window rebind with zero client
+  migration. Non-resumable agents retire into Recents (also fixes: agents that died
+  while the daemon was down used to vanish). `daemon.restoreSessions` opts out;
+  opting out still retires conversations into Recents.
+- **Restart handoff** (`handoff.json`, written by every graceful stop, consumed once
+  within 120s): the successor daemon rebinds the same port with the same token, so ssh
+  forwards stay valid and every client — app window or plain browser tab — heals with a
+  plain WebSocket reconnect. No re-home, no re-auth. Crashes never leave one, so
+  unplanned restarts keep fresh credentials.
+- **Window registry** (`windows.json`, app shell): the open window set (host, workspace,
+  logical geometry, stable per-window id) is persisted and reopened on launch; the
+  stable id rides the window URL as `win=` and seeds the SPA's view-state key, so a
+  reopened window IS its predecessor. Closing a window forgets it (macOS convention);
+  quitting keeps the set.
+
+Update awareness rides on top: the daemon checks GitHub a few times a day (bounded curl,
+off for dev builds, `update.autoCheck` opt-out) and pushes an `update` frame on
+`/ws/events`; the app shell separately watches the signed-app updater and exposes its
+build id for skew detection against `/health`'s. One toast per window merges the three
+signals into the single offer a click can act on there — full app+daemon chain (intent
+file carries consent across the relaunch), daemon-only restart, or a "new release
+exists" notice in browsers. The toast cannot over-promise resurrection by construction:
+the UI is embedded in the daemon, so a daemon too old to have the ledger serves a UI too
+old to have the toast. Home screen's version mark now says `daemon dev·<ref>` for dev
+builds instead of posing as an ordinary `v0.0.1` (field confusion: an app reinstall
+attached to a still-running dev daemon and nothing on screen said so).
+
 ## Field notes: first cluster deployment (2026-07-06)
 
 M0 `connect` validated end-to-end against a production HPC cluster (CentOS 7.9 login

@@ -3,18 +3,27 @@ import { writable } from "svelte/store";
 const TOKEN_KEY = "chimaera:token";
 const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
+/** Same key viewState.windowKey() reads — the hash seeds it. */
+const WIN_KEY = "chimaera.win";
 
 /**
- * Read the access token, workspace id, and host label from the URL fragment
- * (#token=...&ws=...&host=...) once, persist them to sessionStorage, and
- * strip the fragment from the address bar. Falls back to previously stored
- * values on reload.
+ * Read the access token, workspace id, host label, and window id from the
+ * URL fragment (#token=...&ws=...&host=...&win=...) once, persist them to
+ * sessionStorage, and strip the fragment from the address bar. Falls back
+ * to previously stored values on reload.
+ *
+ * `win` is the window's stable view-state identity. sessionStorage alone
+ * cannot carry it across an app restart (new webview) or a re-home to a
+ * moved daemon port (new origin), so the shell — and the re-home paths —
+ * put it in the hash; adopting it here is what makes a reopened window THE
+ * SAME window, layout and all.
  */
 function initFromHash(): string | null {
   const params = new URLSearchParams(location.hash.slice(1));
   const tokenFromHash = params.get("token");
   const wsFromHash = params.get("ws");
   const hostFromHash = params.get("host");
+  const winFromHash = params.get("win");
   if (tokenFromHash !== null) {
     sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
@@ -24,7 +33,15 @@ function initFromHash(): string | null {
   if (hostFromHash !== null) {
     sessionStorage.setItem(HOST_KEY, hostFromHash);
   }
-  if (tokenFromHash !== null || wsFromHash !== null || hostFromHash !== null) {
+  if (winFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(winFromHash)) {
+    sessionStorage.setItem(WIN_KEY, winFromHash);
+  }
+  if (
+    tokenFromHash !== null ||
+    wsFromHash !== null ||
+    hostFromHash !== null ||
+    winFromHash !== null
+  ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
   return tokenFromHash ?? sessionStorage.getItem(TOKEN_KEY);
@@ -111,6 +128,8 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
 export interface Health {
   name: string;
   version: string;
+  /** Daemon build id (undefined from daemons predating build ids). */
+  build?: string;
   hostname: string;
   pid: number;
   uptime_secs: number;

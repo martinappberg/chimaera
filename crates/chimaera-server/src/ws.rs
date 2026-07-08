@@ -322,6 +322,8 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_sent: Option<String> = None;
     let mut last_settings_gen: Option<u64> = None;
     let mut last_git: Option<String> = None;
+    let mut last_update_epoch: Option<u64> = None;
+    let mut last_recents_epoch: Option<u64> = None;
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
         .await
         .is_err()
@@ -335,6 +337,18 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     if send_git_snapshot(&mut socket, &state, &mut last_git)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if send_update_snapshot(&mut socket, &state, &mut last_update_epoch)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if send_recents_snapshot(&mut socket, &state, &mut last_recents_epoch)
         .await
         .is_err()
     {
@@ -378,8 +392,61 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
+        if send_update_snapshot(&mut socket, &state, &mut last_update_epoch)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if send_recents_snapshot(&mut socket, &state, &mut last_recents_epoch)
+            .await
+            .is_err()
+        {
+            return;
+        }
         tokio::time::sleep(EVENTS_THROTTLE).await;
     }
+}
+
+/// Send a `{"type":"update", ...}` frame when the daemon's release knowledge
+/// changed (see `update`). The payload is the same shape GET /api/v1/update
+/// returns, so the client has one parser.
+async fn send_update_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_epoch: &mut Option<u64>,
+) -> Result<(), axum::Error> {
+    let epoch = state
+        .update_epoch
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if *last_epoch == Some(epoch) {
+        return Ok(());
+    }
+    let mut frame = crate::lock(&state.update).to_json();
+    frame["type"] = serde_json::json!("update");
+    socket.send(Message::Text(frame.to_string().into())).await?;
+    *last_epoch = Some(epoch);
+    Ok(())
+}
+
+/// Send a `{"type":"recents","epoch":N}` invalidate frame when any workspace's
+/// recents changed. Like the git frame, the payload never rides the bus —
+/// the client refetches GET /recents for its own workspace.
+async fn send_recents_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last_epoch: &mut Option<u64>,
+) -> Result<(), axum::Error> {
+    let epoch = state
+        .recents_epoch
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if *last_epoch == Some(epoch) {
+        return Ok(());
+    }
+    let frame = json!({"type": "recents", "epoch": epoch}).to_string();
+    socket.send(Message::Text(frame.into())).await?;
+    *last_epoch = Some(epoch);
+    Ok(())
 }
 
 /// Send a `{"type":"settings","settings":{...}}` frame when the settings

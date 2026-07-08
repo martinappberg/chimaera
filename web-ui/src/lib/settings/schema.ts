@@ -100,6 +100,8 @@ export type SettingsMap = {
   "quickOpen.maxResults": number;
   "quickOpen.ignoreDirs": string[];
   "daemon.scrollbackLines": number;
+  "daemon.restoreSessions": boolean;
+  "update.autoCheck": boolean;
   "keys.modifier": "auto" | "cmd" | "ctrl-shift" | "alt";
 } & Record<KeyBindingId, string>;
 
@@ -368,6 +370,26 @@ const DEFS = {
     step: 1000,
     scope: "daemon",
     note: "Applies to sessions started after the change.",
+  },
+  "daemon.restoreSessions": {
+    title: "Restore Sessions on Restart",
+    category: "Daemon",
+    description:
+      "When the daemon restarts (update, crash, machine reboot), bring sessions back where they were: shells respawn at their last directory, Claude conversations resume, other agents land in Recents. Off: nothing respawns, but agent conversations still retire into Recents.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
+  },
+
+  // --- Updates ----------------------------------------------------------------
+  "update.autoCheck": {
+    title: "Check for Updates",
+    category: "Updates",
+    description:
+      "Let the daemon check GitHub a few times a day for newer chimaera releases and offer them in the UI. Only the public releases feed is read; nothing installs without a click.",
+    type: "boolean",
+    default: true,
+    scope: "daemon",
   },
 
   // --- Keyboard ----------------------------------------------------------------

@@ -84,7 +84,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
                         let local = crate::shell::lock(&shell.local);
                         (local.port, local.token.clone())
                     };
-                    let _ = crate::shell::open_ui_window(app, port, &token, None, None);
+                    let _ = crate::shell::open_ui_window(
+                        app,
+                        port,
+                        &token,
+                        &crate::windows::WindowRecord::new(None, None),
+                    );
                 }
             }
             "close-view" | "new-terminal" | "new-agent" => {

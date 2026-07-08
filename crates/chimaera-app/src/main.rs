@@ -10,6 +10,8 @@ mod askpass;
 mod daemon;
 mod menu;
 mod shell;
+mod update;
+mod windows;
 
 fn main() {
     // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh
