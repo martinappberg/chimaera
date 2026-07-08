@@ -504,6 +504,41 @@ pub(crate) async fn delete_session(
     }
 }
 
+/// DELETE /api/v1/sessions — end every live session; the daemon stays up.
+/// This is "kill everything here" without the teardown: the caller can start
+/// fresh work immediately, no reconnect. Returns how many were ended.
+pub(crate) async fn delete_all_sessions(State(state): State<Arc<AppState>>) -> Response {
+    let killed = state.sessions.kill_all();
+    if killed > 0 {
+        state.changes.notify_waiters();
+    }
+    Json(json!({ "killed": killed })).into_response()
+}
+
+/// POST /api/v1/shutdown — end every session, then stop the daemon.
+///
+/// The kill has to complete BEFORE the process exits: a session that ignores
+/// SIGHUP is force-killed on a detached thread (see `kill_all`) that would die
+/// with the daemon, so exiting immediately could orphan it and reparent it to
+/// init. So we SIGHUP everything now, reply at once (the caller's tunnel is
+/// about to drop with the daemon), and let a background task outlast the
+/// escalation grace before tripping the graceful-shutdown future.
+pub(crate) async fn shutdown(State(state): State<Arc<AppState>>) -> Response {
+    let killed = state.sessions.kill_all();
+    if killed > 0 {
+        state.changes.notify_waiters();
+    }
+    tracing::info!("in-band shutdown requested; ending {killed} session(s) then stopping");
+    tokio::spawn(async move {
+        tokio::time::sleep(
+            chimaera_pty::KILL_ESCALATION_GRACE + std::time::Duration::from_millis(500),
+        )
+        .await;
+        state.shutdown.notify_one();
+    });
+    Json(json!({ "killed": killed, "shutdown": true })).into_response()
+}
+
 /// Foreground commands that forward keystrokes to a shell somewhere else
 /// (remote or containerized), making sentinel-typing over a `running` phase
 /// safe. Anything else running in the foreground (sleep, vim, tail) refuses.

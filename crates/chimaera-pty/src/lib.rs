@@ -15,6 +15,7 @@ mod snapshot;
 
 pub use exec::{ExecError, ExecMode, ExecOptions, ExecOutcome, ExecStage};
 pub use marks::{CommandSource, CommandView, Marks, ShellPhase};
+pub use session::KILL_ESCALATION_GRACE;
 
 #[cfg(test)]
 mod tests;
@@ -266,6 +267,20 @@ impl SessionManager {
             session.kill();
         }
         Ok(())
+    }
+
+    /// Terminate every live session (same SIGHUP-then-SIGKILL-escalation as
+    /// [`kill`](Self::kill), per session). Returns how many were signalled.
+    /// Idempotent. The daemon-wide "end all sessions" and shutdown paths use
+    /// this; a caller that then exits the process must first wait
+    /// [`KILL_ESCALATION_GRACE`] so the detached escalation can land.
+    pub fn kill_all(&self) -> usize {
+        let sessions: Vec<Arc<session::Session>> =
+            lock_unpoisoned(&self.sessions).values().cloned().collect();
+        for session in &sessions {
+            session.kill();
+        }
+        sessions.len()
     }
 
     /// The final screen of a recently exited session, if still remembered

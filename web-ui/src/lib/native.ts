@@ -191,6 +191,27 @@ export async function disconnectHost(alias: string): Promise<void> {
   await tauri()?.core.invoke<void>("disconnect_host", { alias });
 }
 
+/**
+ * End every session on a connected host; its daemon and the tunnel stay up.
+ * "Kill everything running here" without the teardown — reconnect not needed.
+ */
+export async function endHostSessions(alias: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("end_host_sessions", { alias });
+}
+
+/**
+ * Shut a connected host down: end every session AND stop its daemon, then drop
+ * the tunnel. The real off switch (disconnect leaves the daemon running);
+ * reconnecting later starts a fresh daemon.
+ */
+export async function shutdownHost(alias: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("shutdown_host", { alias });
+}
+
 /** The connected host's registered workspaces (proxied through the shell). */
 export async function remoteWorkspaces(alias: string): Promise<Workspace[]> {
   const t = tauri();

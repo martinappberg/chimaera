@@ -9,6 +9,7 @@
     checkAppUpdate,
     connectHost,
     disconnectHost,
+    endHostSessions,
     isNativeShell,
     listHosts,
     localDaemonState,
@@ -17,6 +18,7 @@
     openWindow,
     remoteWorkspaces,
     removeHost,
+    shutdownHost,
     updateLocalDaemon,
     type ConnectProgress,
     type HostState,
@@ -88,6 +90,9 @@
   let addAlias = $state("");
   let addError = $state<string | null>(null);
   let confirmForget = $state<string | null>(null);
+  /** Host pending a "end all sessions" / "shut down" confirm (alias). */
+  let confirmEnd = $state<string | null>(null);
+  let confirmShutdown = $state<string | null>(null);
 
   // --- local daemon build parity (native shell, local window only) ------------
 
@@ -219,6 +224,30 @@
     confirmForget = null;
     await removeHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
+    void refreshHosts();
+  }
+
+  /** End all sessions on a host; its daemon and the tunnel stay up. */
+  async function endSessions(alias: string): Promise<void> {
+    confirmEnd = null;
+    hostErrors = mapWithout(hostErrors, alias);
+    try {
+      await endHostSessions(alias);
+    } catch (e) {
+      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Shut a host down: end all sessions AND stop its daemon, drop the tunnel. */
+  async function shutdown(alias: string): Promise<void> {
+    confirmShutdown = null;
+    hostErrors = mapWithout(hostErrors, alias);
+    try {
+      await shutdownHost(alias);
+      remoteWs = mapWithout(remoteWs, alias);
+    } catch (e) {
+      hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
+    }
     void refreshHosts();
   }
 
@@ -524,7 +553,32 @@
               {@const phase = phases.get(h.alias)}
               {@const err = hostErrors.get(h.alias)}
               {@const ws = remoteWs.get(h.alias)}
-              {#if confirmForget === h.alias}
+              {#if confirmShutdown === h.alias}
+                <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
+                  <span class="name">{h.alias}</span>
+                  <span class="confirm-label"
+                    >shut down — end {h.live_sessions ?? 0} session{h.live_sessions === 1
+                      ? ""
+                      : "s"} and stop the daemon?</span
+                  >
+                  <button class="confirm-yes" onclick={() => void shutdown(h.alias)}>shut down</button
+                  >
+                  <button class="confirm-no" onclick={() => (confirmShutdown = null)}>cancel</button>
+                </div>
+              {:else if confirmEnd === h.alias}
+                <div class="row confirm" role="alertdialog" aria-label="end sessions?">
+                  <span class="name">{h.alias}</span>
+                  <span class="confirm-label"
+                    >end {h.live_sessions ?? 0} running session{h.live_sessions === 1
+                      ? ""
+                      : "s"}? (the daemon keeps running)</span
+                  >
+                  <button class="confirm-yes" onclick={() => void endSessions(h.alias)}
+                    >end sessions</button
+                  >
+                  <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
+                </div>
+              {:else if confirmForget === h.alias}
                 <div class="row confirm" role="alertdialog" aria-label="forget host?">
                   <span class="name">{h.alias}</span>
                   <span class="confirm-label">forget this host?</span>
@@ -576,10 +630,22 @@
                     {/if}
                   </button>
                   {#if h.status === "connected"}
+                    {#if (h.live_sessions ?? 0) > 0}
+                      <button
+                        class="side"
+                        title="end all sessions on {h.alias} — the daemon keeps running"
+                        onclick={() => (confirmEnd = h.alias)}>end sessions</button
+                      >
+                    {/if}
                     <button
                       class="side"
                       title="close the tunnel — sessions keep running on {h.alias}"
                       onclick={() => void disconnect(h.alias)}>disconnect</button
+                    >
+                    <button
+                      class="side stop"
+                      title="shut down {h.alias} — end all sessions and stop the daemon"
+                      onclick={() => (confirmShutdown = h.alias)}>shut down</button
                     >
                   {/if}
                   <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
@@ -1104,6 +1170,12 @@
     padding: 9px 10px;
     border-radius: 6px;
     background: var(--row-active);
+  }
+
+  /* The most final action (shut down a host) reads in the danger tone. */
+  .confirm.strong {
+    background: color-mix(in srgb, var(--err) 11%, var(--row-active));
+    box-shadow: inset 2px 0 0 var(--err);
   }
 
   .confirm-label {

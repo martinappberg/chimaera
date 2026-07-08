@@ -498,6 +498,64 @@ async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), S
     Ok(())
 }
 
+/// End every session on a connected host — its daemon and our tunnel stay up.
+/// "Kill everything running here" without the teardown, so the user can start
+/// fresh immediately (no reconnect). Proxied in-band through the tunnel.
+#[tauri::command]
+async fn end_host_sessions(state: State<'_, Shell>, alias: String) -> Result<(), String> {
+    let (port, token) = {
+        let tunnels = state.tunnels.lock().await;
+        let t = tunnels
+            .get(&alias)
+            .ok_or_else(|| format!("{alias} is not connected"))?;
+        (t.local_port, t.manifest.token.clone())
+    };
+    let sent = tokio::task::spawn_blocking(move || {
+        ureq::delete(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(15))
+            .call()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    sent.map_err(|e| format!("could not end sessions on {alias}: {e}"))
+}
+
+/// Shut a connected host down: end every session AND stop its daemon, then
+/// drop the tunnel. Unlike `disconnect_host` (which deliberately leaves the
+/// daemon and its sessions running), this is the real off switch — reconnecting
+/// later starts a fresh daemon. Driven in-band via `POST /shutdown` through the
+/// tunnel: the daemon replies before it exits, then we cancel the forward.
+#[tauri::command]
+async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
+    let (port, token) = {
+        let tunnels = state.tunnels.lock().await;
+        let t = tunnels
+            .get(&alias)
+            .ok_or_else(|| format!("{alias} is not connected"))?;
+        (t.local_port, t.manifest.token.clone())
+    };
+    let sent = tokio::task::spawn_blocking(move || {
+        ureq::post(&format!("http://127.0.0.1:{port}/api/v1/shutdown"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(15))
+            .call()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    sent.map_err(|e| format!("could not shut down {alias}: {e}"))?;
+    // The daemon is on its way out; cancel our forward so the host reads as
+    // down instead of lingering on a socket that's about to close.
+    if let Some(tunnel) = state.tunnels.lock().await.remove(&alias) {
+        tunnel.close().await;
+    }
+    Ok(())
+}
+
 /// The local daemon's build parity (home screen: quiet update note).
 #[tauri::command]
 async fn local_state(state: State<'_, Shell>) -> Result<LocalState, String> {
@@ -867,6 +925,8 @@ pub fn run() {
             remove_host,
             connect_host,
             disconnect_host,
+            end_host_sessions,
+            shutdown_host,
             local_state,
             update_local_daemon,
             remote_workspaces,
