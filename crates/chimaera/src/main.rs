@@ -58,6 +58,12 @@ enum Command {
     ShellIntegration,
 }
 
+/// Parse a `$PORT`-style listen port. An unset, empty, or unparsable value
+/// yields `None` — the daemon then binds an OS-assigned free port.
+fn parse_port(raw: Option<String>) -> Option<u16> {
+    raw?.trim().parse().ok()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -69,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Serve { port } => {
+            // `--port` wins; else honor $PORT (twelve-factor) so autoPort dev
+            // tooling and PaaS can assign it; else the OS picks a free port.
+            let port = port.or_else(|| parse_port(std::env::var("PORT").ok()));
             chimaera_server::run(chimaera_server::ServerConfig { port }).await
         }
         Command::Status { host } => status::run(host.as_deref()).await,
@@ -113,6 +122,17 @@ mod tests {
             }
             _ => panic!("expected connect"),
         }
+    }
+
+    #[test]
+    fn parse_port_reads_valid_values_only() {
+        assert_eq!(parse_port(Some("9700".into())), Some(9700));
+        assert_eq!(parse_port(Some("  8080 ".into())), Some(8080));
+        // Unset, empty, and unparsable all fall back to an OS-assigned port.
+        assert_eq!(parse_port(None), None);
+        assert_eq!(parse_port(Some("".into())), None);
+        assert_eq!(parse_port(Some("notaport".into())), None);
+        assert_eq!(parse_port(Some("99999".into())), None); // out of u16 range
     }
 
     #[test]
