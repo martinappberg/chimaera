@@ -142,7 +142,7 @@ export const ACTIONS = [
     label: "Move Tab to Pane",
     description:
       "Carry the focused pane's active tab into the neighboring pane (all four arrows).",
-    def: "Mod+Alt+Arrow",
+    def: "Mod2+Arrow",
     arrowSet: true,
   },
 ] as const satisfies readonly ActionDef[];
