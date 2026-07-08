@@ -584,7 +584,8 @@ fi
     let fallback = format!(
         r#"[ -n "$real" ] || real={managed}
 if [ ! -x "$real" ]; then
-  echo "chimaera: {bin} is not installed (checked your PATH and $real)" >&2
+  echo "chimaera: {bin} is not installed." >&2
+  echo "  add your own {bin} to your PATH, or install one from the agent launcher (+ new agent)." >&2
   exit 127
 fi
 "#,
@@ -893,11 +894,13 @@ mod tests {
             cmd.output().expect("shim ran")
         };
 
-        // Nothing installed: exit 127 with a pointer at both places checked.
+        // Nothing installed: exit 127 with an actionable message (bring your
+        // own, or install one from the launcher) — no internal-path jargon.
         let out = run();
         assert_eq!(out.status.code(), Some(127));
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(err.contains("codex is not installed"), "{err}");
+        assert!(err.contains("agent launcher"), "{err}");
 
         // A managed install appears: the shim finds it and themes it.
         let fake = managed.join("codex");

@@ -3,8 +3,10 @@
 //!
 //! Shells resolve as: foreground command while one is running ("snakemake")
 //! -> workspace-relative cwd while idle ("results/qc") -> shell name at the
-//! workspace root ("zsh"). An OSC title set by the running program (already
-//! captured as `SessionInfo::title`) wins over polled values, and an
+//! workspace root ("zsh"). An OSC title a running *program* sets (captured as
+//! `SessionInfo::title`) wins over polled values — but a shell's own prompt
+//! title ("user@host:~/dir") is ignored: it names where the shell lives, not
+//! what it does, and duplicates the location the row already shows. An
 //! explicitly pinned name (`SessionInfo::renamed`) wins over everything.
 //! Agents resolve in `agents.rs` (customTitle > aiTitle > first prompt >
 //! "claude").
@@ -87,21 +89,46 @@ pub(crate) fn spawn_shell_watch(state: Arc<AppState>, session_id: String) {
     });
 }
 
-/// Effective display name for a shell session: OSC title when the running
-/// program set one, else the watcher's polled value, else the spawn name.
-/// (`renamed` pins are applied by the caller, uniformly for all kinds.)
+/// Effective display name for a shell session: OSC title when a running
+/// program set a meaningful one, else the watcher's polled value, else the
+/// spawn name. (`renamed` pins are applied by the caller, for all kinds.)
 pub(crate) fn shell_display_name(info: &chimaera_pty::SessionInfo, polled: Option<&str>) -> String {
+    // A program that titles itself ("vim README.md", "htop") names the session
+    // better than we can poll — honor it. But an interactive shell also emits a
+    // title from its prompt ("user@host:~/dir"); that is pure location (naming
+    // rule zero says never name by that) and duplicates the row's cwd, so skip
+    // it and let the polled foreground-command / cwd-relative name win.
     if let Some(title) = info
         .title
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
+        .filter(|t| !is_shell_prompt_title(t))
     {
         return title.to_string();
     }
     polled
         .map(str::to_string)
         .unwrap_or_else(|| info.name.clone())
+}
+
+/// A shell prompt's default window title — "user@host", "user@host:~/dir", or
+/// "user@host: ~/dir" — set by the shell itself, not by a running program.
+/// Matched by the canonical "user@host" shape (no whitespace flanking the
+/// `@`), which real program titles essentially never take; a command line that
+/// happens to contain an address ("ssh user@host") keeps its title because the
+/// user part then holds a space. A false negative only costs a
+/// slightly-less-specific name for one poll cycle.
+fn is_shell_prompt_title(title: &str) -> bool {
+    let Some((user, rest)) = title.split_once('@') else {
+        return false;
+    };
+    // The host runs up to the cwd separator (":"), a space, or end-of-title.
+    let host = rest.split([':', ' ']).next().unwrap_or("");
+    !user.is_empty()
+        && !user.contains(char::is_whitespace)
+        && !host.is_empty()
+        && !host.contains(char::is_whitespace)
 }
 
 /// One poll: resolve what the shell is doing right now, per naming rule zero.
@@ -255,5 +282,67 @@ mod proc_info {
 
     pub(super) fn cwd(_pid: i32) -> Option<PathBuf> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(title: Option<&str>) -> chimaera_pty::SessionInfo {
+        chimaera_pty::SessionInfo {
+            id: "s1".to_string(),
+            name: "zsh".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            created_at: 0,
+            alive: true,
+            exit_status: None,
+            title: title.map(str::to_string),
+            pid: None,
+            renamed: false,
+            phase: chimaera_pty::ShellPhase::Unknown,
+        }
+    }
+
+    #[test]
+    fn prompt_titles_are_recognized() {
+        for t in [
+            "mkjellbe@smsh11dsu-srcf-d15-37:~",
+            "mkjellbe@smsh11dsu-srcf-d15-37:~/pd_project/notes",
+            "user@host: ~/dir",
+            "me@laptop",
+        ] {
+            assert!(is_shell_prompt_title(t), "{t:?} should read as a prompt");
+        }
+    }
+
+    #[test]
+    fn program_titles_are_not_prompts() {
+        // Program-set titles (and command lines carrying an address) are the
+        // most specific signal we have — never mistaken for a prompt.
+        for t in ["vim README.md", "htop", "npm run dev", "ssh user@host", ""] {
+            assert!(!is_shell_prompt_title(t), "{t:?} should be kept");
+        }
+    }
+
+    #[test]
+    fn shell_display_name_drops_the_prompt_title() {
+        // A prompt title is ignored: the polled cwd-relative name wins...
+        assert_eq!(
+            shell_display_name(
+                &info(Some("mkjellbe@host:~/pd_project/notes")),
+                Some("notes")
+            ),
+            "notes"
+        );
+        // ...but a program's own title still outranks the polled value.
+        assert_eq!(
+            shell_display_name(&info(Some("vim README.md")), Some("vim")),
+            "vim README.md"
+        );
+        // With no usable title and no poll yet, fall back to the spawn name.
+        assert_eq!(shell_display_name(&info(Some("me@box:~")), None), "zsh");
     }
 }

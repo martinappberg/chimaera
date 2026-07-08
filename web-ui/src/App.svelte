@@ -32,6 +32,7 @@
   import {
     getAgentDefault,
     installAgent,
+    listAgents,
     listRecents,
     relativeAge,
     setAgentDefault,
@@ -158,6 +159,22 @@
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
   let agentDefault = $state(getAgentDefault());
+  /** The host's agent catalog (install status per CLI), so the split button
+   *  can reflect whether its default is installed. Null until first fetched;
+   *  the launcher popover reports its fresher probe back via onAgents. */
+  let agents = $state<AgentInfo[] | null>(null);
+  /** Install sessions we spawned; when one exits the catalog is re-probed so
+   *  the button flips from "install" to spawn without a manual refresh. */
+  const pendingInstalls = new Set<string>();
+  /** The catalog row for the default agent, once the catalog is loaded. */
+  const defaultAgentInfo = $derived(
+    agents?.find((a) => a.id === agentDefault.agent) ?? null,
+  );
+  /** Known-missing: the catalog is loaded and says the default isn't here.
+   *  (Null catalog / unknown agent falls back to spawn — the common path.) */
+  const defaultMissing = $derived(defaultAgentInfo !== null && !defaultAgentInfo.installed);
+  /** Missing but chimaera can install it in place (managed runtime). */
+  const defaultInstallable = $derived(defaultMissing && (defaultAgentInfo?.managedInstall ?? false));
   let launcherOpen = $state(false);
   /** The split button's rect at open time; the popover hangs below it. */
   let launcherAnchor = $state<DOMRect | null>(null);
@@ -416,6 +433,7 @@
     refreshWorkspaces();
     void bootViewState();
     void loadSettings();
+    void refreshAgents();
 
     // Native menu items the shell forwards to the focused window. Cmd+W
     // closes the focused VIEW (a home window just closes), reclaiming the
@@ -433,7 +451,7 @@
             newShell();
             break;
           case "new-agent":
-            spawnDefaultAgent();
+            newAgentPrimary();
             break;
         }
       }).then((u) => (unlistenMenu = u));
@@ -778,10 +796,10 @@
     }
     if (key === "e" && plain) {
       intercept();
-      // mod2+E spawns the persisted default agent config (same as the split
-      // button's main surface); the launcher popover stays mouse-opened —
-      // nothing chord-new.
-      if (l2) spawnDefaultAgent();
+      // mod2+E does what the split button's main surface does — spawn the
+      // persisted default agent, or install it when it's missing; the
+      // launcher popover stays mouse-opened, nothing chord-new.
+      if (l2) newAgentPrimary();
       else newShell();
       return;
     }
@@ -948,6 +966,17 @@
     list.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
     sessions = list;
     gotSessions = true;
+    // An install session that has exited (gone from the roster, or alive:false)
+    // means the catalog may have changed: re-probe so the button reflects it.
+    if (pendingInstalls.size > 0) {
+      for (const id of pendingInstalls) {
+        const s = list.find((x) => x.id === id);
+        if (s === undefined || !s.alive) {
+          pendingInstalls.delete(id);
+          void refreshAgents(true);
+        }
+      }
+    }
     const agentIds = new Set(list.filter((s) => s.kind === "agent").map((s) => s.id));
     const changed =
       agentIds.size !== prevAgentIds.size || [...prevAgentIds].some((id) => !agentIds.has(id));
@@ -1139,6 +1168,31 @@
     void spawnSession("agent", { agent: agentDefault.agent });
   }
 
+  /** What the main surface / new-agent shortcut does: normally spawn the
+   *  default instantly, but when it isn't installed, don't launch a doomed
+   *  pane — install it in place (managed) or, if there's no managed install,
+   *  open the launcher to pick an agent that has one. */
+  function newAgentPrimary(): void {
+    launcherOpen = false;
+    if (defaultMissing) {
+      if (defaultInstallable && defaultAgentInfo !== null) launcherInstall(defaultAgentInfo);
+      else openLauncher();
+      return;
+    }
+    spawnDefaultAgent();
+  }
+
+  /** Re-probe the host's agent catalog. `force` bypasses the daemon's
+   *  detection cache (after an install, or when the launcher opens). Failures
+   *  keep the last-known catalog rather than blanking the button. */
+  async function refreshAgents(force = false): Promise<void> {
+    try {
+      agents = await listAgents(force);
+    } catch {
+      // keep the last catalog; the next trigger retries
+    }
+  }
+
   // --- the agent launcher popover ---
 
   /** When the popover opened, so a chevron click landing right after a
@@ -1201,6 +1255,9 @@
     void installAgent(a.id, ws)
       .then(async (sessionId) => {
         recentlyCreated.set(sessionId, Date.now());
+        // Watch this install session: when it exits, re-probe the catalog so
+        // the split button flips from "install" to a plain spawn.
+        pendingInstalls.add(sessionId);
         // The daemon spawned the session; a racing events snapshot may not
         // carry it yet, so fetch the roster before surfacing it exactly
         // like any new session (active tab in the focused pane).
@@ -1945,7 +2002,12 @@
                   ondblclick={() => startRename(s)}
                 >
                   <span class="name">{displayNames.get(s.id) ?? displayName(s)}</span>
-                  {#if s.title && s.title !== s.name && s.title !== s.agent_title}
+                  <!-- Second line only when it adds something over the name.
+                       Shells never do: the name already resolves to the title
+                       (program-set) or the cwd (the shell's "user@host:dir"
+                       prompt title is dropped server-side). Agents show their
+                       own PTY title as context when it differs from the name. -->
+                  {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
                     <span class="title">{s.title}</span>
                   {/if}
                 </span>
@@ -1990,14 +2052,22 @@
         <div class="new-split" role="group" aria-label="new agent" bind:this={newSplitEl}>
           <button
             class="row new primary main"
-            title="start {agentDefault.agent} ({KEYS.newAgent})"
-            onclick={() => {
-              launcherOpen = false;
-              spawnDefaultAgent();
-            }}
+            class:want-install={defaultMissing}
+            title={defaultMissing
+              ? defaultInstallable
+                ? `${agentDefault.agent} isn’t installed — download the official build into ~/.chimaera/agents, in a terminal you can watch`
+                : `${agentDefault.agent} isn’t installed — choose an agent to set up`
+              : `start ${agentDefault.agent} (${KEYS.newAgent})`}
+            onclick={newAgentPrimary}
           >
-            <span class="new-label">+ new agent</span>
-            <span class="new-default">{agentDefault.agent}</span>
+            <!-- When the default isn't installed the surface installs it
+                 (managed) rather than spawning a pane that would just print
+                 the shim's error — so the label becomes the action and the
+                 agent name takes the accent. -->
+            <span class="new-label"
+              >{defaultMissing ? (defaultInstallable ? "install" : "set up") : "+ new agent"}</span
+            >
+            <span class="new-default" class:accent={defaultMissing}>{agentDefault.agent}</span>
           </button>
           <button
             class="new-chev"
@@ -2261,6 +2331,7 @@
     onPick={launcherPick}
     onInstall={launcherInstall}
     onClose={closeLauncher}
+    onAgents={(a) => (agents = a)}
   />
 {/if}
 
@@ -2699,6 +2770,13 @@
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  /* Default agent isn't installed: the surface installs instead of spawning,
+     so the agent name takes the accent — the label ("install"/"set up") and
+     tooltip say what will happen. */
+  .new-default.accent {
+    color: var(--accent);
   }
 
   .new-chev {

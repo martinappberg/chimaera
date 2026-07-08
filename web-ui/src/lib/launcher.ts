@@ -19,6 +19,10 @@ export interface AgentInfo {
   /** The resolved binary lives under ~/.chimaera/agents — installed (or
    *  updated) by chimaera's managed-runtime flow, not the user's own PATH. */
   managed: boolean;
+  /** The resolved binary's absolute path (which `{id}` a spawn will run);
+   *  null when not installed. Surfaced in the launcher's version tooltip so
+   *  "yours" vs "chimaera" is answerable at a glance. */
+  path: string | null;
   /** Whether POST /agents/{id}/install has a curated managed install.
    *  False (gemini: node runtime, phase 2) means the POST would 400 —
    *  no install chip; the docs link is the affordance. */
@@ -62,6 +66,7 @@ export async function listAgents(refresh = false): Promise<AgentInfo[]> {
         outdated: a.outdated === true,
         version: typeof a.version === "string" ? a.version : null,
         managed: a.managed === true,
+        path: typeof a.path === "string" ? a.path : null,
         managedInstall: a.managed_install === true,
         installUrl: typeof install.url === "string" ? install.url : null,
       },
