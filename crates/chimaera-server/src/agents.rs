@@ -483,6 +483,20 @@ fn map_event(event: &str, payload: &serde_json::Value) -> Option<AgentState> {
     }
 }
 
+/// A stale "needs you" state that fresh transcript output invalidates. New
+/// conversation content means the agent is actively producing — it is running,
+/// not blocked on the user — so a `needs you` that no hook flipped back is
+/// stale and gets cleared. This closes the gap where a long tool-free stretch
+/// (streaming prose, or an auto-continuing agent that fires no
+/// `UserPromptSubmit`) leaves the session pinned at `idle_prompt`/`errored`.
+///
+/// `NeedsPermission` and `Finished` are deliberately excluded: a pending
+/// permission appends nothing to the transcript while it blocks, and a
+/// finished run is meant to sit silently until its own next-turn hook.
+fn cleared_by_output(state: AgentState) -> Option<AgentState> {
+    matches!(state, AgentState::IdlePrompt | AgentState::Errored).then_some(AgentState::Running)
+}
+
 /// Transcript poll interval: 2s in production, fast in tests. (Shared with
 /// the install-session watcher in `runtimes`.)
 pub(crate) fn poll_interval() -> Duration {
@@ -556,6 +570,13 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
                 };
                 for line in &lines {
                     changed |= apply_title_line(line, record);
+                }
+                // Reaching here means the transcript grew: the agent is
+                // producing content, so clear a stale "needs you" no hook
+                // flipped back (see `cleared_by_output`).
+                if let Some(next) = cleared_by_output(record.state) {
+                    record.state = next;
+                    changed = true;
                 }
             }
             if changed {
@@ -676,6 +697,28 @@ mod tests {
         );
         assert_eq!(map_event("SessionEnd", &empty), None);
         assert_eq!(map_event("SomethingNew", &empty), None);
+    }
+
+    #[test]
+    fn fresh_output_clears_only_stale_waiting_states() {
+        // A "needs you" that no hook cleared is stale once the agent resumes
+        // writing to the transcript — it is running again.
+        assert_eq!(
+            cleared_by_output(AgentState::IdlePrompt),
+            Some(AgentState::Running)
+        );
+        assert_eq!(
+            cleared_by_output(AgentState::Errored),
+            Some(AgentState::Running)
+        );
+        // A pending permission writes no transcript while it blocks, and a
+        // finished run stays silent: neither is cleared by output alone.
+        assert_eq!(cleared_by_output(AgentState::NeedsPermission), None);
+        assert_eq!(cleared_by_output(AgentState::Finished), None);
+        // States that are not "needs you" are left untouched.
+        assert_eq!(cleared_by_output(AgentState::Running), None);
+        assert_eq!(cleared_by_output(AgentState::RateLimited), None);
+        assert_eq!(cleared_by_output(AgentState::Unknown), None);
     }
 
     #[test]
