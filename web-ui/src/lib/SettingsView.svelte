@@ -3,18 +3,18 @@
    * The settings surface (⌘, / gear): a VS Code-grade settings page rendered
    * entirely from the schema registry — category nav, search, typed controls,
    * modified markers — plus a JSON tab editing the settings.json ground truth
-   * itself, and a read-only keyboard reference (chords come from keys.ts).
+   * itself. Keybindings are ordinary rows (the keys.* settings); the few
+   * spec-pinned chords render read-only at the end of the Keyboard section.
    */
-  import { onMount } from "svelte";
   import { CATEGORIES, SETTINGS, type SettingDef } from "./settings/schema";
   import { isModified, settingsLoaded } from "./settings/store.svelte";
   import SettingRow from "./settings/SettingRow.svelte";
   import SettingsJson from "./settings/SettingsJson.svelte";
-  import { KEYS, isAppChord, isLayer2, chordDigit, fontChord } from "./keys";
+  import { PINNED } from "./keys";
+  import { activeModLabel } from "./keybindings";
 
-  const KEYBOARD = "Keyboard";
-  /** Nav sections: schema categories + the keyboard reference. */
-  const sections = [...CATEGORIES, KEYBOARD];
+  /** Nav sections come straight from the schema categories. */
+  const sections = CATEGORIES;
 
   let tab = $state<"ui" | "json">("ui");
   let query = $state("");
@@ -22,8 +22,6 @@
   let listEl = $state<HTMLDivElement | null>(null);
   let searchEl = $state<HTMLInputElement | null>(null);
   let navEl = $state<HTMLElement | null>(null);
-  /** The keyboard row lit by a live chord press (id from chordGroups). */
-  let litId = $state<string | null>(null);
 
   const q = $derived(query.trim().toLowerCase());
 
@@ -55,7 +53,8 @@
     return out;
   });
 
-  const keyboardVisible = $derived(q === "" || KEYBOARD.toLowerCase().includes(q));
+  /** The pinned-chords block travels with the Keyboard section. */
+  const keyboardVisible = $derived(groups.some((g) => g.category === "Keyboard"));
 
   function jumpTo(section: string): void {
     activeSection = section;
@@ -87,106 +86,17 @@
   });
 
   /**
-   * The chord reference, grouped for scannability. `id` matches the keys.ts
-   * field and drives the live-highlight below; labels/chords are unchanged.
+   * The spec-pinned chords — not rebindable, listed for reference. openN
+   * follows the base modifier; the rest shadow browser conventions too
+   * carefully to be worth opening up (see keys.ts).
    */
-  const chordGroups: {
-    label: string;
-    rows: { id: string; label: string; chord: string }[];
-  }[] = [
-    {
-      label: "Navigation & panels",
-      rows: [
-        { id: "settings", label: "Open settings", chord: KEYS.settings },
-        { id: "picker", label: "Open folder picker", chord: KEYS.picker },
-        { id: "quickOpen", label: "Quick open (files + sessions)", chord: KEYS.quickOpen },
-        { id: "openN", label: "Open session 1–9", chord: KEYS.openN },
-        { id: "cycleTabs", label: "Cycle tabs", chord: KEYS.cycleTabs },
-        { id: "focusArrows", label: "Move pane focus", chord: KEYS.focusArrows },
-        { id: "focusMode", label: "Focus mode (hide sidebar)", chord: KEYS.focusMode },
-      ],
-    },
-    {
-      label: "Sessions & layout",
-      rows: [
-        { id: "newTerminal", label: "New terminal", chord: KEYS.newTerminal },
-        { id: "newAgent", label: "New agent", chord: KEYS.newAgent },
-        { id: "splitRight", label: "Split right", chord: KEYS.splitRight },
-        { id: "splitDown", label: "Split down", chord: KEYS.splitDown },
-        { id: "closeView", label: "Close view", chord: KEYS.closeView },
-        { id: "zoom", label: "Zoom pane", chord: KEYS.zoom },
-      ],
-    },
-    {
-      label: "Selection & terminal",
-      rows: [
-        { id: "reference", label: "Reference selection in agent", chord: KEYS.reference },
-        { id: "fontPlus", label: "Terminal text larger", chord: KEYS.fontPlus },
-        { id: "fontMinus", label: "Terminal text smaller", chord: KEYS.fontMinus },
-        { id: "fontReset", label: "Terminal text reset", chord: KEYS.fontReset },
-      ],
-    },
-  ];
-
-  /**
-   * Live-learning touch: match a real chord press to its reference row so it
-   * briefly lights up. We reuse keys.ts's modifier logic verbatim so the
-   * mapping stays honest, and only claim the unambiguous chords — the
-   * arrow/bracket ones are skipped rather than guessed.
-   */
-  function matchChord(e: KeyboardEvent): string | null {
-    const font = fontChord(e); // Cmd/Ctrl with +, −, 0 → terminal font size
-    if (font === 1) return "fontPlus";
-    if (font === -1) return "fontMinus";
-    if (font === 0) return "fontReset";
-
-    if (!isAppChord(e)) return null;
-    const layer2 = isLayer2(e);
-
-    if (chordDigit(e) !== null && !layer2) return "openN";
-
-    switch (e.code) {
-      case "Comma":
-        return layer2 ? null : "settings";
-      case "KeyO":
-        return layer2 ? null : "picker";
-      case "KeyP":
-        return layer2 ? null : "quickOpen";
-      case "KeyE":
-        return layer2 ? "newAgent" : "newTerminal";
-      case "KeyD":
-        return layer2 ? "splitDown" : "splitRight";
-      case "KeyB":
-        return layer2 ? null : "focusMode";
-      case "KeyR":
-        return "reference"; // R only ever means reference (layer differs per platform)
-      case "Backspace":
-        return layer2 ? null : "closeView";
-      case "Enter":
-        return layer2 ? "zoom" : null;
-      default:
-        return null;
-    }
-  }
-
-  onMount(() => {
-    let clear: ReturnType<typeof setTimeout> | undefined;
-    function onKey(e: KeyboardEvent): void {
-      if (tab !== "ui" || !keyboardVisible) return; // nothing on screen to light up
-      const id = matchChord(e);
-      if (id === null) return;
-      litId = id;
-      clearTimeout(clear);
-      clear = setTimeout(() => (litId = null), 1000);
-    }
-    // Capture so the chord registers even if a pane handler stops propagation;
-    // we never preventDefault, so the real command still fires underneath.
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("keydown", onKey, true);
-      clearTimeout(clear);
-    };
-  });
+  const pinnedRows = $derived([
+    { label: "Open session 1–9", chord: `${activeModLabel()}1–9` },
+    { label: "Reference selection in agent", chord: PINNED.reference },
+    { label: "Terminal text larger", chord: PINNED.fontPlus },
+    { label: "Terminal text smaller", chord: PINNED.fontMinus },
+    { label: "Terminal text reset", chord: PINNED.fontReset },
+  ]);
 </script>
 
 <div class="settings">
@@ -234,10 +144,7 @@
     <div class="body">
       <nav class="nav" aria-label="setting categories" bind:this={navEl}>
         {#each sections as section (section)}
-          {@const shown =
-            section === KEYBOARD
-              ? keyboardVisible
-              : groups.some((g) => g.category === section)}
+          {@const shown = groups.some((g) => g.category === section)}
           {#if shown}
             <button
               class="nav-item"
@@ -262,29 +169,24 @@
         {/each}
 
         {#if keyboardVisible}
-          <section data-section={KEYBOARD}>
-            <h2 class="cat">{KEYBOARD}</h2>
+          <div class="kbd-group">
+            <h3 class="kbd-group-title">Pinned chords</h3>
             <p class="kbd-note">
-              Platform-aware chords — the terminal owns bare Ctrl on every platform. Rebinding
-              lands with <code>~/.config/chimaera/keys.toml</code>. Press one to see it light up.
+              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
+              browser conventions too carefully to open up.
             </p>
-            {#each chordGroups as group (group.label)}
-              <div class="kbd-group">
-                <h3 class="kbd-group-title">{group.label}</h3>
-                <ul class="kbd-list">
-                  {#each group.rows as row (row.id)}
-                    <li class="kbd-row" class:lit={litId === row.id}>
-                      <span class="kbd-label">{row.label}</span>
-                      <kbd class="kbd-pill">{row.chord}</kbd>
-                    </li>
-                  {/each}
-                </ul>
-              </div>
-            {/each}
-          </section>
+            <ul class="kbd-list">
+              {#each pinnedRows as row (row.label)}
+                <li class="kbd-row">
+                  <span class="kbd-label">{row.label}</span>
+                  <kbd class="kbd-pill">{row.chord}</kbd>
+                </li>
+              {/each}
+            </ul>
+          </div>
         {/if}
 
-        {#if groups.length === 0 && !keyboardVisible}
+        {#if groups.length === 0}
           <div class="empty">no settings match “{query}”</div>
         {/if}
       </div>
@@ -493,12 +395,6 @@
     max-width: 60ch;
   }
 
-  .kbd-note code {
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    overflow-wrap: anywhere;
-  }
-
   .kbd-group {
     margin: 14px 14px 0;
   }
@@ -532,18 +428,10 @@
     gap: 4px 16px;
     padding: 6px 12px;
     font-size: var(--text-md);
-    /* Slow default transition owns the fade-out; .lit owns the quick fade-in. */
-    transition: background-color 0.5s ease;
   }
 
   .kbd-row + .kbd-row {
     border-top: 1px solid var(--edge);
-  }
-
-  /* Live-learning flash: a soft accent wash that fades after ~1s. */
-  .kbd-row.lit {
-    background: color-mix(in srgb, var(--accent) 13%, transparent);
-    transition: background-color 0.15s ease;
   }
 
   .kbd-label {

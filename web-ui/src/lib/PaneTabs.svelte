@@ -20,7 +20,8 @@
   import { dirtyFiles } from "./editing";
   import { gitIndex } from "./git";
   import { decoFor } from "./gitDeco";
-  import { KEYS } from "./keys";
+  import { PINNED } from "./keys";
+  import { keyHint } from "./keybindings";
   import { activeSelection, referenceTarget, requestReference } from "./reference";
   import { workspaceRelative } from "./reference";
   import FileIcon from "./FileIcon.svelte";
@@ -424,7 +425,7 @@
         disabled={$referenceTarget === null}
         title={$referenceTarget === null
           ? "no agent session in this workspace — start one to reference"
-          : `reference selection in ${$referenceTarget.name} (${KEYS.reference})`}
+          : `reference selection in ${$referenceTarget.name} (${PINNED.reference})`}
         onclick={(e) => {
           e.stopPropagation();
           requestReference();
@@ -477,7 +478,7 @@
            zoomed, so a collapse glyph + label says what the click DOES. -->
       <button
         class="zoom-badge"
-        title="restore — exit zoom ({KEYS.zoom})"
+        title="restore — exit zoom ({keyHint("zoom")})"
         aria-label="restore pane"
         onclick={() => ctrl.zoomPane(node.id)}
       >
@@ -537,20 +538,20 @@
              (terminals and rendered markdown alike). -->
         <button
           class="ctl ctl-font"
-          title="smaller text ({KEYS.fontMinus})"
+          title="smaller text ({PINNED.fontMinus})"
           aria-label="smaller text"
           onclick={() => ctrl.adjustFont(node.id, -1)}>A−</button
         >
         <button
           class="ctl ctl-font"
-          title="larger text ({KEYS.fontPlus}) · reset {KEYS.fontReset}"
+          title="larger text ({PINNED.fontPlus}) · reset {PINNED.fontReset}"
           aria-label="larger text"
           onclick={() => ctrl.adjustFont(node.id, 1)}>A+</button
         >
       {/if}
       <button
         class="ctl"
-        title="split right ({KEYS.splitRight})"
+        title="split right ({keyHint("splitRight")})"
         aria-label="split right"
         onclick={() => ctrl.splitPaneAt(node.id, "row")}
       >
@@ -561,7 +562,7 @@
       </button>
       <button
         class="ctl"
-        title="split down ({KEYS.splitDown})"
+        title="split down ({keyHint("splitDown")})"
         aria-label="split down"
         onclick={() => ctrl.splitPaneAt(node.id, "col")}
       >
@@ -571,7 +572,7 @@
         </svg>
       </button>
       {#if !zoomed}
-        <button class="ctl" title="zoom ({KEYS.zoom})" aria-label="zoom" onclick={() => ctrl.zoomPane(node.id)}>
+        <button class="ctl" title="zoom ({keyHint("zoom")})" aria-label="zoom" onclick={() => ctrl.zoomPane(node.id)}>
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
             <path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5L9 7M2.5 13.5L7 9" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
           </svg>
@@ -579,7 +580,7 @@
       {/if}
       <button
         class="ctl"
-        title="close view ({KEYS.closeView})"
+        title="close view ({keyHint("closeView")})"
         aria-label="close view"
         onclick={() => ctrl.closeView(node.id)}
       >

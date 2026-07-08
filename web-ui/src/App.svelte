@@ -101,6 +101,7 @@
     setPaneFont,
     setRatio,
     splitPane,
+    moveTabDirection,
     tabCount,
     toggleZoom,
     type FocusDir,
@@ -129,7 +130,8 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/dnd";
-  import { chordDigit, fontChord, isAppChord, isLayer2, isMac, KEYS } from "./lib/keys";
+  import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/keys";
+  import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/keybindings";
   import {
     closeThisWindow,
     connectHost,
@@ -944,16 +946,16 @@
 
   /**
    * The chords intercepted even when a terminal has focus (capture phase).
-   * Modifier policy: Cmd-based on macOS, Ctrl+Shift-based elsewhere — the
-   * terminal owns bare Ctrl on every platform (tmux Ctrl+B, EOF Ctrl+D,
-   * zsh/vim Ctrl+O all reach the PTY untouched). The second layer is Shift
-   * on macOS and Alt elsewhere (see keys.ts):
-   *   mod+O picker toggle · mod+1..9 open Nth session · mod+E terminal /
-   *   mod2+E agent · mod+D / mod2+D splits · mod+Backspace close view ·
-   *   mod+Alt+arrows focus · mod+Alt+[ ] tabs · mod2+Enter zoom · mod+B
-   *   focus mode. Cmd+W/Cmd+T/Cmd+Shift+W stay unbound (browser-reserved).
+   * Bindings and the base modifier come from the keys.* settings (keys.ts
+   * registry + keybindings.ts); the terminal owns bare Ctrl on every
+   * platform (tmux Ctrl+B, EOF Ctrl+D, zsh/vim Ctrl+O all reach the PTY
+   * untouched). Only the reference chord, Mod+1–9, and the font chords are
+   * spec-pinned. Cmd+W/Cmd+T never reach a browser page (the native app
+   * menu carries them instead).
    */
   function onKeydown(e: KeyboardEvent): void {
+    // A settings row is recording a chord — the press is the recorder's.
+    if (isCapturing()) return;
     // Per-pane text size (Cmd/Ctrl +/−/0, spec-pinned chords): intercepted
     // ONLY while the focused pane shows a font-sizable surface (a terminal or
     // a rendered markdown document), so browser zoom keeps working elsewhere.
@@ -974,18 +976,18 @@
         }
       }
     }
-    if (!isAppChord(e)) return;
-    const l2 = isLayer2(e);
-    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    // On macOS, Alt is reserved for the navigation layer, so letter/digit
-    // chords must not fire with Alt held. Elsewhere Alt IS the second layer.
-    const plain = !isMac || !e.altKey;
     const intercept = () => {
       e.preventDefault();
       e.stopPropagation();
     };
 
-    if (key === "o" && !l2 && plain) {
+    // Every rebindable action resolves through the keybindings store; the
+    // pinned chords (reference, Mod+1–9) are matched below on a miss.
+    const hit = matchAction(e);
+
+    // The folder picker toggles even while open; while it owns the keyboard
+    // every other chord stands down.
+    if (hit?.id === "picker") {
       intercept();
       if (pickerOpen) closePicker();
       else openPicker();
@@ -994,9 +996,7 @@
     if (pickerOpen) return;
     if (activeWsId === null || !layoutReady) return;
 
-    // Quick-open palette (files + sessions). Toggles like the folder picker;
-    // while open it owns the keyboard, so all other chords stand down.
-    if (key === "p" && !l2 && plain) {
+    if (hit?.id === "quickOpen") {
       intercept();
       if (quickOpenOpen) closeQuickOpen();
       else openQuickOpen();
@@ -1004,84 +1004,97 @@
     }
     if (quickOpenOpen) return;
 
-    // Navigation layer (Alt on both platforms): arrows move pane focus,
-    // brackets cycle the focused pane's tabs.
-    if (e.altKey) {
-      const dirs: Record<string, FocusDir> = {
-        ArrowLeft: "left",
-        ArrowRight: "right",
-        ArrowUp: "up",
-        ArrowDown: "down",
-      };
-      const dir = dirs[e.key];
-      if (dir !== undefined) {
-        intercept();
-        focusDirection(dir);
+    if (hit === null) {
+      // Context bridge: reference the current selection in the target agent.
+      // Spec-pinned chord — ⇧⌘R / Ctrl+Shift+R. Intercepts only while a
+      // selection exists, so the browser's reload chord survives when there
+      // is nothing to reference. Plain Cmd+C is never touched.
+      if (matchChord(e, REFERENCE_CHORD) !== null) {
+        if (get(activeSelection) !== null) {
+          intercept();
+          referenceSelection();
+        }
         return;
       }
-      if (e.code === "BracketLeft") {
+      // Pinned Mod+1–9: open the Nth rail session.
+      const n = chordDigit(e, modifierSetting());
+      if (n !== null && n <= railSessions.length) {
+        intercept();
+        openSess(railSessions[n - 1].id);
+      }
+      return;
+    }
+
+    // Arrow chords in an editable surface belong to the text caret (rename
+    // fields, search boxes, the file editor) — xterm's hidden textarea is
+    // exempt, terminals don't use modifier-arrows for editing.
+    if (hit.dir !== null && isEditableTarget(e.target)) return;
+
+    switch (hit.id) {
+      case "settings":
+        intercept();
+        openSettingsSurface();
+        return;
+      case "newTerminal":
+        intercept();
+        newShell();
+        return;
+      case "newAgent":
+        // Does what the split button's main surface does — spawn the
+        // persisted default agent, or install it when it's missing.
+        intercept();
+        newAgentPrimary();
+        return;
+      case "splitRight":
+        intercept();
+        split("row");
+        return;
+      case "splitDown":
+        intercept();
+        split("col");
+        return;
+      case "zoom":
+        intercept();
+        layout = toggleZoom(layout);
+        return;
+      case "closeView":
+        intercept();
+        closeView(layout.focusedPaneId);
+        return;
+      case "focusMode":
+        intercept();
+        layout = { ...layout, focusMode: !layout.focusMode };
+        return;
+      case "cyclePrev":
         intercept();
         cycle(-1);
         return;
-      }
-      if (e.code === "BracketRight") {
+      case "cycleNext":
         intercept();
         cycle(1);
         return;
-      }
-    }
-
-    // Context bridge: reference the current selection in the target agent.
-    // Spec-pinned chord — ⇧⌘R on macOS, Ctrl+Shift+R elsewhere. Intercepts
-    // only while a selection exists, so the browser's reload chord survives
-    // when there is nothing to reference. Plain Cmd+C is never touched.
-    if (key === "r" && (isMac ? l2 : !l2) && plain) {
-      if (get(activeSelection) !== null) {
+      case "focusArrows":
         intercept();
-        referenceSelection();
-      }
-      return;
+        focusDirection(hit.dir as FocusDir);
+        return;
+      case "moveTab":
+        intercept();
+        layout = moveTabDirection(layout, hit.dir as FocusDir);
+        return;
     }
+  }
 
-    if (key === "d" && plain) {
-      intercept();
-      split(l2 ? "col" : "row");
-      return;
-    }
-    if (key === "e" && plain) {
-      intercept();
-      // mod2+E does what the split button's main surface does — spawn the
-      // persisted default agent, or install it when it's missing; the
-      // launcher popover stays mouse-opened, nothing chord-new.
-      if (l2) newAgentPrimary();
-      else newShell();
-      return;
-    }
-    if (key === "Enter" && l2) {
-      intercept();
-      layout = toggleZoom(layout);
-      return;
-    }
-    if (key === "Backspace" && !l2 && plain) {
-      intercept();
-      closeView(layout.focusedPaneId);
-      return;
-    }
-    if (key === "b" && !l2 && plain) {
-      intercept();
-      layout = { ...layout, focusMode: !layout.focusMode };
-      return;
-    }
-    if (key === "," && !l2 && plain) {
-      intercept();
-      openSettingsSurface();
-      return;
-    }
-    const n = chordDigit(e);
-    if (n !== null && !l2 && plain && n <= railSessions.length) {
-      intercept();
-      openSess(railSessions[n - 1].id);
-    }
+  /**
+   * Focus sits in a text-editing surface (inputs, the CodeMirror editor,
+   * contenteditable) — arrow chords must stay with the caret there. xterm's
+   * helper textarea is NOT editable in this sense: it's the terminal's key
+   * sink, and app chords are expected to work over a focused terminal.
+   */
+  function isEditableTarget(t: EventTarget | null): boolean {
+    if (!(t instanceof HTMLElement)) return false;
+    if (t.classList.contains("xterm-helper-textarea")) return false;
+    if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return true;
+    return t.isContentEditable || t.closest(".cm-content") !== null;
   }
 
   $effect(() => {
@@ -2196,7 +2209,7 @@
         {/if}
         <button
           class="rail-collapse"
-          title="hide sidebar ({KEYS.focusMode})"
+          title="hide sidebar ({keyHint("focusMode")})"
           aria-label="hide sidebar"
           onclick={() => (layout = { ...layout, focusMode: true })}
         >
@@ -2351,7 +2364,7 @@
         {/each}
         <button
           class="row new"
-          title="open a terminal ({KEYS.newTerminal})"
+          title="open a terminal ({keyHint("newTerminal")})"
           onclick={newShell}>+ terminal</button
         >
 
@@ -2370,7 +2383,7 @@
               ? defaultInstallable
                 ? `${agentDefault.agent} isn’t installed — download the official build into ~/.chimaera/agents, in a terminal you can watch`
                 : `${agentDefault.agent} isn’t installed — choose an agent to set up`
-              : `start ${agentDefault.agent} (${KEYS.newAgent})`}
+              : `start ${agentDefault.agent} (${keyHint("newAgent")})`}
             onclick={newAgentPrimary}
           >
             <!-- When the default isn't installed the surface installs it
@@ -2545,7 +2558,7 @@
         {#if activeWsId !== null}
           <button
             class="daemon-settings"
-            title="settings ({KEYS.settings})"
+            title="settings ({keyHint("settings")})"
             aria-label="settings"
             onclick={openSettingsSurface}
           >
@@ -2626,7 +2639,7 @@
     <footer class="strip">
       <button
         class="strip-show"
-        title="show sidebar ({KEYS.focusMode})"
+        title="show sidebar ({keyHint("focusMode")})"
         aria-label="show sidebar"
         onclick={() => (layout = { ...layout, focusMode: false })}
       >
@@ -2654,7 +2667,7 @@
       </button>
       <button
         class="strip-ws"
-        title="show sidebar ({KEYS.focusMode})"
+        title="show sidebar ({keyHint("focusMode")})"
         onclick={() => (layout = { ...layout, focusMode: false })}
         >{workspace?.name ?? "chimaera"}</button
       >

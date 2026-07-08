@@ -4,7 +4,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane } from "./dnd";
   import { agentHue, type LinkCtrl } from "./agentLinks";
-  import { KEYS, MOD_LABEL } from "./keys";
+  import { activeModLabel, keyHint } from "./keybindings";
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
   import FileView from "./FileView.svelte";
@@ -161,13 +161,13 @@
     {:else if names.size === 0}
       <!-- No sessions to open or drag yet: point at creating one. -->
       <div class="hint">
-        <span><kbd>{KEYS.newAgent}</kbd> new agent</span>
+        <span><kbd>{keyHint("newAgent")}</kbd> new agent</span>
         <span class="hint-sep">·</span>
-        <span><kbd>{KEYS.newTerminal}</kbd> new terminal</span>
+        <span><kbd>{keyHint("newTerminal")}</kbd> new terminal</span>
       </div>
     {:else}
       <div class="hint">
-        <span><kbd>{MOD_LABEL}1–9</kbd> opens a session</span>
+        <span><kbd>{activeModLabel()}1–9</kbd> opens a session</span>
         <span class="hint-sep">·</span>
         <span>drag one here</span>
       </div>
