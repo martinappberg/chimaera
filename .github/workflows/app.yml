@@ -43,9 +43,14 @@ jobs:
           workspaces: crates/chimaera-app
           # rust-cache keys on job name unless overridden, so this job (`macos`)
           # could never restore the ~460 MB app cache that release.yml's `app`
-          # job writes on main — every PR compiled the app's deps cold. Pinning
-          # both to one shared-key makes them the same cache entry.
-          shared-key: chimaera-app
+          # job writes on main — every PR compiled the app's deps cold. The
+          # shared-key replaces only that job-name slot, so `app` reproduces the
+          # exact key release.yml already writes (`v0-rust-app-<os>-<arch>-…`)
+          # and hits main's existing entry. release.yml pins the same value
+          # explicitly, so renaming its job can't silently break this.
+          shared-key: app
+          # Main saves, PRs restore. A PR-scoped cache is unreadable by every
+          # other PR yet still burns the repo's 10 GiB LRU quota.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm install
         working-directory: crates/chimaera-app

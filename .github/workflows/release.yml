@@ -118,10 +118,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/chimaera-app
-          # Shared with app.yml's PR build so that build restores instead of
-          # compiling cold — see the note there. This job runs only on main, so
+          # A no-op today (rust-cache's default key is the job name, `app`), but
+          # pinned so a future rename of this job cannot silently stop app.yml's
+          # PR build from restoring this cache. This job runs only on main, so
           # it is the writer; rust-cache's default `save-if: true` is correct.
-          shared-key: chimaera-app
+          shared-key: app
       - run: npm install
         working-directory: crates/chimaera-app
       # The app version drives both the bundle and the updater comparison.
