@@ -25,8 +25,11 @@ use crate::{
 
 /// How long `kill()` waits after SIGHUP before force-killing a still-living
 /// child with SIGKILL. A shell normally exits on SIGHUP at once, so this only
-/// elapses for a child that ignores or misses it.
-const KILL_ESCALATION_GRACE: Duration = Duration::from_secs(2);
+/// elapses for a child that ignores or misses it. Public because the daemon's
+/// shutdown path must outlive it: the escalation runs on a detached thread that
+/// dies with the process, so a caller about to `exit()` has to wait this long
+/// after `kill_all` for the force-kill to actually land.
+pub const KILL_ESCALATION_GRACE: Duration = Duration::from_secs(2);
 
 /// Scrollback history kept per session.
 const SCROLLBACK_LINES: usize = 10_000;

@@ -108,6 +108,10 @@ pub(crate) struct AppState {
     /// layouts. Defaults true (no restore pending); `run` flips it false
     /// before the listener accepts, `ledger::run` back once restore is done.
     pub(crate) restored: tokio::sync::watch::Sender<bool>,
+    /// Signalled by `POST /shutdown` to trigger graceful exit in-band (the
+    /// only non-signal way to stop the daemon). Awaited alongside SIGINT/
+    /// SIGTERM by the server's graceful-shutdown future.
+    pub(crate) shutdown: tokio::sync::Notify,
     /// Agent binaries resolved via the login shell (with `--version`),
     /// cached per agent for the daemon's lifetime;
     /// `GET /api/v1/agents?refresh=true` bypasses and refills it.
@@ -187,6 +191,7 @@ impl AppState {
             git: git::GitService::new(),
             changes: tokio::sync::Notify::new(),
             restored: tokio::sync::watch::channel(true).0,
+            shutdown: tokio::sync::Notify::new(),
             agent_bins: Mutex::new(HashMap::new()),
             claude_projects_dir: home.join(".claude").join("projects"),
             managed_root: data_dir.join("agents"),
@@ -228,12 +233,18 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/workspaces/{id}/open", post(api::open_workspace))
         .route(
             "/sessions",
-            get(api::list_sessions).post(api::create_session),
+            get(api::list_sessions)
+                .post(api::create_session)
+                .delete(api::delete_all_sessions),
         )
         .route(
             "/sessions/{id}",
             delete(api::delete_session).patch(api::rename_session),
         )
+        // In-band graceful shutdown: end every session, then stop the daemon.
+        // The only way (besides an OS signal) to bring the daemon down — the
+        // app drives it through the tunnel to shut a remote host down.
+        .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
         .route("/sessions/{id}/journal", get(api::session_journal))
         .route("/links", get(links::list_links).put(links::put_link))
@@ -380,8 +391,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Release awareness (GET /api/v1/update + the `update` ws frame).
     tokio::spawn(update::run_checker(state.clone()));
 
+    // `state.clone()` (not a move) so the post-serve ledger snapshot + handoff
+    // below still own it after graceful shutdown returns.
     axum::serve(listener, app(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(state.clone()))
         .await
         .context("server error")?;
 
@@ -418,8 +431,9 @@ async fn rebind(port: u16) -> Option<TcpListener> {
     None
 }
 
-/// Resolve when SIGINT (ctrl-c) or SIGTERM is received.
-async fn shutdown_signal() {
+/// Resolve when SIGINT (ctrl-c) or SIGTERM is received, or when an in-band
+/// `POST /shutdown` signals `state.shutdown`.
+async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(%err, "failed to install ctrl-c handler");
@@ -446,6 +460,7 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = state.shutdown.notified() => {},
     }
     tracing::info!("shutdown signal received");
 }

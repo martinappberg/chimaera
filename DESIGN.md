@@ -1154,6 +1154,24 @@ which is the survival property that matters.
   `git worktree list`; P2 adds read-only worktree orientation (Branches view, branch per agent),
   P3 adds the one mutation (spawn agent/terminal into a new branch via `git worktree add`). Full
   treatment in Architecture → Git + Slurm.
+- **2026-07-08 — disconnect ≠ shutdown; explicit teardown is first-class (SHIPPED).**
+  Disconnect stays non-destructive: it drops the tunnel and leaves the remote daemon and its
+  agents running (the survive-disconnect promise — close the laptop, the HPC run keeps going).
+  The missing half was an *explicit* off switch, so a connected host row gains two confirmed
+  actions distinct from disconnect: **end sessions** (force-kill every session; the daemon and
+  tunnel stay up, so you start fresh without reconnecting) and **shut down** (end every session
+  AND stop the daemon, then drop the tunnel; reconnecting starts a fresh daemon). This is the
+  deliberate complement to the "never *silently* kill sessions" rule — accidental loss is
+  forbidden, user-confirmed teardown is a feature. Correctness note that shaped the mechanism:
+  killing the daemon does NOT reliably kill its work — on SIGTERM the daemon just stops serving
+  and removes its manifest, so its PTY children only get a kernel SIGHUP, and a HUP-ignoring
+  agent survives and reparents to init. So shutdown force-kills the sessions *first* and waits
+  out the SIGKILL-escalation grace before the process exits. Built in-band (uniform local/
+  remote, no ssh): `POST /api/v1/shutdown` (end all → trip graceful exit after the grace) and
+  `DELETE /api/v1/sessions` (end all, daemon stays), driven through the tunnel with the remote
+  token; `SessionManager::kill_all` + a public `KILL_ESCALATION_GRACE`. Local-daemon shutdown
+  is intentionally not surfaced — quitting the app is the local equivalent, and the endpoints
+  already work on loopback if that changes.
 
 Still open:
 
