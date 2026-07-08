@@ -250,7 +250,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/links", get(links::list_links).put(links::put_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))
-        .route("/agents/{id}/install", post(runtimes::install_agent))
+        .route(
+            "/agents/{id}/install",
+            post(runtimes::install_agent).delete(runtimes::uninstall_agent),
+        )
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))
@@ -367,14 +370,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         chimaera_core::config_dir(),
     ));
 
-    // Theming shims: regenerated at every daemon start (and after installs)
-    // so they always match this build's resolution and theme logic.
-    if let Err(err) = runtimes::write_shims(
-        &state.shims_dir,
-        &runtimes::managed_bin_dir(&state.managed_root),
-    ) {
-        tracing::warn!(%err, "failed to write theming shims");
-    }
+    // Theming shims: regenerated at every daemon start (and after installs /
+    // uninstalls / settings edits) so they always match this build's resolution
+    // and the current managed-install + explicit-path picture.
+    runtimes::regenerate_shims(&state);
 
     // Backstop poll for out-of-band git changes (external editor, terminal
     // `git` commands); event-driven refresh covers the rest. Idle-cheap.
@@ -1122,6 +1121,7 @@ mod tests {
                 path,
                 version: version.map(str::to_string),
                 managed,
+                explicit: false,
             },
         );
     }

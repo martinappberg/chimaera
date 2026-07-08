@@ -96,6 +96,10 @@ pub(crate) struct AgentDetection {
     pub(crate) path: Result<PathBuf, String>,
     pub(crate) version: Option<String>,
     pub(crate) managed: bool,
+    /// The resolved binary is the user's explicit `agents.<kind>.path` setting
+    /// (a runnable one) — surfaced so the launcher can label provenance as the
+    /// path you set, distinct from "yours" (PATH) or "chimaera" (managed).
+    pub(crate) explicit: bool,
 }
 
 /// Detect one agent binary, served from the daemon-lifetime cache unless
@@ -109,7 +113,13 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
             return hit.clone();
         }
     }
-    let path = resolve_bin(kind, &crate::runtimes::managed_bin_dir(&state.managed_root)).await;
+    let explicit = crate::lock(&state.settings).agent_path(kind);
+    let path = resolve_bin(
+        kind,
+        &crate::runtimes::managed_bin_dir(&state.managed_root),
+        explicit.clone(),
+    )
+    .await;
     let version = match &path {
         Ok(bin) => probe_version(bin).await,
         Err(_) => None,
@@ -117,10 +127,17 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
     let managed = path
         .as_ref()
         .is_ok_and(|p| crate::runtimes::is_managed(p, &state.managed_root));
+    // The explicit path was set AND it's what resolved (resolve_bin returns it
+    // verbatim only when runnable; a typo falls through to normal resolution).
+    let used_explicit = explicit.as_deref().is_some_and(|e| {
+        path.as_ref()
+            .is_ok_and(|p| p.as_os_str() == std::ffi::OsStr::new(e))
+    });
     let detection = AgentDetection {
         path,
         version,
         managed,
+        explicit: used_explicit,
     };
     crate::lock(&state.agent_bins).insert(kind, detection.clone());
     detection
@@ -135,10 +152,33 @@ pub(crate) fn managed_fallback(bin: &str, managed_bin: &Path) -> Option<PathBuf>
     (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(path)
 }
 
-/// Resolve an agent binary through the user's login shell (`command -v`),
-/// falling back to the managed bin dir when the shell misses (managed
-/// installs are deliberately NOT on the user's PATH — dotfiles stay theirs).
-async fn resolve_bin(kind: AgentKind, managed_bin: &Path) -> Result<PathBuf, String> {
+/// Whether `path` is a runnable regular file (follows symlinks).
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve an agent binary: an explicit `agents.<kind>.path` wins when runnable,
+/// then the user's login shell (`command -v`), then the managed bin dir when the
+/// shell misses (managed installs are deliberately NOT on the user's PATH —
+/// dotfiles stay theirs).
+async fn resolve_bin(
+    kind: AgentKind,
+    managed_bin: &Path,
+    explicit: Option<String>,
+) -> Result<PathBuf, String> {
+    // An explicit path the user set is authoritative when it's actually
+    // runnable. A stale/typo'd one falls through to normal resolution rather
+    // than hard-failing every spawn — the launcher surfaces the setting either
+    // way, so a mistake is visible without bricking the agent.
+    if let Some(p) = explicit.as_deref() {
+        let path = PathBuf::from(p);
+        if is_executable_file(&path) {
+            return Ok(path);
+        }
+    }
     let bin = kind.as_str();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let output = tokio::process::Command::new(&shell)
@@ -275,6 +315,10 @@ pub(crate) async fn list_agents(
                 // The resolved binary is a chimaera-managed install under
                 // ~/.chimaera/agents (the user has none of their own).
                 row.insert("managed".into(), json!(true));
+            }
+            if detection.explicit {
+                // Resolved from the user's explicit agents.<id>.path setting.
+                row.insert("explicit".into(), json!(true));
             }
             // Whether POST /agents/{id}/install has a curated managed
             // install for this agent (gemini needs a node runtime: phase 2).
