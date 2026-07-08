@@ -3,7 +3,7 @@
 //! command and event names in lockstep).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::daemon::LocalDaemon;
+use crate::windows::{WindowRecord, WindowRegistry};
 
 /// App-global shell state.
 pub struct Shell {
@@ -27,14 +28,22 @@ pub struct Shell {
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
     windows: Mutex<HashMap<String, WindowScope>>,
+    /// The persisted window set (windows.json) — what the next launch reopens.
+    registry: Mutex<WindowRegistry>,
+    /// Set on ExitRequested: window teardown during quit must NOT remove
+    /// records from the registry, or quitting would forget every window.
+    quitting: AtomicBool,
 }
 
 /// The (host, workspace) a window is showing. `alias` None = the local
-/// daemon; `ws` None = the home screen.
+/// daemon; `ws` None = the home screen. `stable_id` is the window's
+/// registry/view-state identity — unlike the volatile Tauri label, it
+/// survives app restarts.
 #[derive(Clone, Default, PartialEq)]
 pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
+    pub stable_id: String,
 }
 
 /// Host list entry as the UI sees it (see HostState in native.ts).
@@ -89,46 +98,58 @@ struct LocalDaemonMoved {
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Open a UI window on a daemon: local (`alias` None) or a connected
-/// remote's tunnel. `ws` scopes the window to a workspace; None lands on
-/// the home screen.
+/// Open a UI window on a daemon: local (`record.alias` None) or a connected
+/// remote's tunnel. `record.ws` scopes the window to a workspace; None lands
+/// on the home screen. The record's stable id rides the hash as `win=` — the
+/// SPA keys its daemon-side view state on it, so reopening this record IS
+/// reopening this window — and its geometry (when present: a restore)
+/// replaces the default placement.
 pub fn open_ui_window(
     app: &AppHandle,
     port: u16,
     token: &str,
-    host_alias: Option<&str>,
-    ws: Option<&str>,
+    record: &WindowRecord,
 ) -> tauri::Result<()> {
     let mut hash = format!("token={}", urlencoding::encode(token));
-    if let Some(ws) = ws {
+    hash.push_str(&format!("&win={}", urlencoding::encode(&record.id)));
+    if let Some(ws) = &record.ws {
         hash.push_str(&format!("&ws={}", urlencoding::encode(ws)));
     }
-    if let Some(alias) = host_alias {
+    if let Some(alias) = &record.alias {
         hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
     }
     let url = format!("http://127.0.0.1:{port}/#{hash}")
         .parse()
         .expect("daemon url is always valid");
     let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
-    let title = match host_alias {
+    let title = match &record.alias {
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
-    WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
+    let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .title(title)
         .inner_size(1280.0, 840.0)
-        .min_inner_size(680.0, 440.0)
-        .build()?;
-    // Track the new window's scope so focus-existing can raise it. Startup
-    // manages Shell before opening the home window, so it registers too.
+        .min_inner_size(680.0, 440.0);
+    if let (Some(w), Some(h)) = (record.width, record.height) {
+        builder = builder.inner_size(w, h);
+    }
+    if let (Some(x), Some(y)) = (record.x, record.y) {
+        builder = builder.position(x, y);
+    }
+    builder.build()?;
+    // Track the new window's scope so focus-existing can raise it, and
+    // persist it so the next launch reopens it. Startup manages Shell before
+    // opening any window, so every window registers.
     if let Some(shell) = app.try_state::<Shell>() {
         lock(&shell.windows).insert(
             label,
             WindowScope {
-                alias: host_alias.map(str::to_string),
-                ws: ws.map(str::to_string),
+                alias: record.alias.clone(),
+                ws: record.ws.clone(),
+                stable_id: record.id.clone(),
             },
         );
+        lock(&shell.registry).upsert(record.clone());
     }
     Ok(())
 }
@@ -249,11 +270,20 @@ async fn run_connect(
 #[tauri::command]
 async fn connect_host(
     app: AppHandle,
-    state: State<'_, Shell>,
     alias: String,
     update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
-    let update_daemon = update_daemon.unwrap_or(false);
+    do_connect(&app, alias, update_daemon.unwrap_or(false)).await
+}
+
+/// The connect flow behind the `connect_host` command, callable from
+/// startup window restore too (no `State` extractor).
+async fn do_connect(
+    app: &AppHandle,
+    alias: String,
+    update_daemon: bool,
+) -> Result<HostState, String> {
+    let state = app.state::<Shell>();
     tracing::info!("ipc: connect_host {alias} (update_daemon: {update_daemon})");
     // Reuse a live tunnel; a dead one is torn down and rebuilt on its old
     // loopback port so open windows heal in place. An update never reuses:
@@ -282,14 +312,14 @@ async fn connect_host(
     let entry = HostsStore::load_default()
         .add(&alias, None)
         .map_err(|e| format!("{e:#}"))?;
-    let result = run_connect(&app, &alias, &entry, reuse_port, update_daemon).await;
+    let result = run_connect(app, &alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
     // but socket teardown can lag; fall back to an OS-assigned port so a
     // reconnect never fails on a transient bind clash.
     let result = match result {
         Err(e) if reuse_port.is_some() => {
             tracing::warn!("reconnect on port {reuse_port:?} failed ({e:#}); retrying fresh");
-            run_connect(&app, &alias, &entry, None, update_daemon).await
+            run_connect(app, &alias, &entry, None, update_daemon).await
         }
         other => other,
     };
@@ -417,7 +447,7 @@ async fn open_window(
             (t.local_port, t.manifest.token.clone(), Some(alias.clone()))
         }
     };
-    open_ui_window(&app, port, &token, host.as_deref(), ws_id.as_deref())
+    open_ui_window(&app, port, &token, &WindowRecord::new(host, ws_id))
         .map_err(|e| format!("could not open window: {e}"))
 }
 
@@ -476,7 +506,9 @@ async fn answer_askpass(
 }
 
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
-/// so the shell can't see it otherwise. Keyed by the calling window's label.
+/// so the shell can't see it otherwise. Keyed by the calling window's label;
+/// the persisted record follows so the next launch reopens the window on
+/// what it was ACTUALLY showing, not what it was opened on.
 #[tauri::command]
 fn report_window_scope(
     webview: tauri::WebviewWindow,
@@ -484,7 +516,63 @@ fn report_window_scope(
     alias: Option<String>,
     ws: Option<String>,
 ) {
-    lock(&state.windows).insert(webview.label().to_string(), WindowScope { alias, ws });
+    let mut windows = lock(&state.windows);
+    let stable_id = windows
+        .get(webview.label())
+        .map(|s| s.stable_id.clone())
+        .unwrap_or_default();
+    windows.insert(
+        webview.label().to_string(),
+        WindowScope {
+            alias: alias.clone(),
+            ws: ws.clone(),
+            stable_id: stable_id.clone(),
+        },
+    );
+    drop(windows);
+    if !stable_id.is_empty() {
+        lock(&state.registry).set_scope(&stable_id, alias, ws);
+    }
+}
+
+/// This app binary's build id, for daemon-skew detection in the UI (the
+/// daemon's own build rides GET /api/v1/health).
+#[tauri::command]
+fn shell_build() -> String {
+    chimaera_core::BUILD_ID.to_string()
+}
+
+/// The one-click update chain, step one: record the user's consent (the
+/// intent file), then download, verify, and install the app bundle and
+/// relaunch into it. Step two — replacing the local daemon — happens in the
+/// NEW process's startup, which consumes the intent; the daemon's restart
+/// handoff + session ledger are what make that step keep every window,
+/// tab, and session. Diverges on success; on failure the intent is cleared
+/// so nothing acts on it later.
+#[tauri::command]
+async fn begin_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    tracing::info!("ipc: begin_update");
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no update available".to_string())?;
+    crate::update::write_intent().map_err(|e| format!("{e:#}"))?;
+    match update
+        .download_and_install(|_downloaded, _total| {}, || {})
+        .await
+    {
+        Ok(()) => {
+            tracing::info!("app update {} installed; relaunching", update.version);
+            app.restart();
+        }
+        Err(e) => {
+            crate::update::clear_intent();
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Raise an existing window showing `(alias, ws)`, other than the caller.
@@ -571,6 +659,65 @@ fn spawn_health_monitor(handle: AppHandle) {
     });
 }
 
+/// Reopen the persisted window set: local-daemon windows immediately;
+/// remote windows as their host tunnels come up (one connect per alias, in
+/// the background — an unreachable host must not hold up launch). Returns
+/// whether any window opens immediately, so startup can fall back to a home
+/// window and never come up invisible.
+fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> bool {
+    let records = {
+        let shell = handle.state::<Shell>();
+        let records = lock(&shell.registry).list();
+        records
+    };
+    let mut opened = false;
+    let mut remote_aliases: Vec<String> = Vec::new();
+    for record in &records {
+        match &record.alias {
+            None => match open_ui_window(handle, port, token, record) {
+                Ok(()) => opened = true,
+                Err(e) => tracing::warn!("could not reopen window {}: {e}", record.id),
+            },
+            Some(alias) => {
+                if !remote_aliases.contains(alias) {
+                    remote_aliases.push(alias.clone());
+                }
+            }
+        }
+    }
+    for alias in remote_aliases {
+        let handle = handle.clone();
+        let records: Vec<WindowRecord> = records
+            .iter()
+            .filter(|r| r.alias.as_deref() == Some(alias.as_str()))
+            .cloned()
+            .collect();
+        tauri::async_runtime::spawn(async move {
+            match do_connect(&handle, alias.clone(), false).await {
+                Ok(_) => {
+                    let (port, token) = {
+                        let shell = handle.state::<Shell>();
+                        let tunnels = shell.tunnels.lock().await;
+                        match tunnels.get(&alias) {
+                            Some(t) => (t.local_port, t.manifest.token.clone()),
+                            None => return,
+                        }
+                    };
+                    for record in &records {
+                        if let Err(e) = open_ui_window(&handle, port, &token, record) {
+                            tracing::warn!("could not reopen window {}: {e}", record.id);
+                        }
+                    }
+                }
+                // The records stay in the registry: the windows come back
+                // when the host does (next launch, or a manual connect).
+                Err(e) => tracing::warn!("could not reconnect {alias} to restore windows: {e}"),
+            }
+        });
+    }
+    opened
+}
+
 /// Build and run the Tauri app.
 pub fn run() {
     tauri::Builder::default()
@@ -587,18 +734,55 @@ pub fn run() {
             open_window,
             check_app_update,
             install_app_update,
+            begin_update,
+            shell_build,
             answer_askpass,
             report_window_scope,
             focus_window,
         ])
         .on_window_event(|window, event| {
-            // Forget a window's scope once it's gone, so focus-existing never
-            // raises a dead label. Destroyed (not CloseRequested, which can be
-            // vetoed) fires after teardown completes.
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                if let Some(shell) = window.try_state::<Shell>() {
-                    lock(&shell.windows).remove(window.label());
+            let Some(shell) = window.try_state::<Shell>() else {
+                return;
+            };
+            match event {
+                // Forget a window's scope once it's gone, so focus-existing
+                // never raises a dead label. Destroyed (not CloseRequested,
+                // which can be vetoed) fires after teardown completes. The
+                // persisted record goes too — a deliberately closed window
+                // stays closed (macOS convention) — EXCEPT during quit, when
+                // teardown destroys every window and forgetting them would
+                // defeat restore.
+                tauri::WindowEvent::Destroyed => {
+                    let scope = lock(&shell.windows).remove(window.label());
+                    if !shell.quitting.load(Ordering::Relaxed) {
+                        if let Some(scope) = scope {
+                            lock(&shell.registry).remove(&scope.stable_id);
+                        }
+                    }
                 }
+                // Track geometry in memory on every move/resize; a slow tick
+                // (and exit) persists — never a file write per drag event.
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                    let Some(stable_id) = lock(&shell.windows)
+                        .get(window.label())
+                        .map(|s| s.stable_id.clone())
+                    else {
+                        return;
+                    };
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
+                        let pos = pos.to_logical::<f64>(scale);
+                        let size = size.to_logical::<f64>(scale);
+                        lock(&shell.registry).set_geometry(
+                            &stable_id,
+                            pos.x,
+                            pos.y,
+                            size.width,
+                            size.height,
+                        );
+                    }
+                }
+                _ => {}
             }
         })
         .setup(|app| {
@@ -614,32 +798,75 @@ pub fn run() {
             }
             // The daemon must be up before the first window points at it;
             // block setup on it (fast when a daemon is already running).
-            let local = tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon())
+            let mut local = tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon())
                 .map_err(|e| {
                     tracing::error!("{e:#}");
                     std::io::Error::other(format!("{e:#}"))
                 })?;
+            // A fresh update intent = the user clicked "update" in the OLD
+            // process and the app half already swapped; finish the chain by
+            // replacing the outdated daemon NOW, before any window loads its
+            // (old) embedded UI. The daemon's handoff keeps port + token and
+            // its ledger resurrects the sessions, so the windows restored
+            // below land on the new daemon with everything where it was.
+            if crate::update::consume_intent() && local.outdated {
+                tracing::info!("update intent: replacing the outdated local daemon");
+                match tauri::async_runtime::block_on(crate::daemon::update_local_daemon()) {
+                    Ok(fresh) => local = fresh,
+                    // The old daemon keeps serving; the update stays a
+                    // visible affordance instead of a silent failure.
+                    Err(e) => tracing::warn!("daemon update after app update failed: {e:#}"),
+                }
+            }
             let (port, token) = (local.port, local.token.clone());
-            // Manage Shell BEFORE opening the home window so it can register
-            // its own scope in the window map.
+            // Manage Shell BEFORE opening any window so each can register
+            // its scope in the window map.
             app.manage(Shell {
                 local: Mutex::new(local),
                 tunnels: tokio::sync::Mutex::new(HashMap::new()),
                 connecting: Mutex::new(HashSet::new()),
                 windows: Mutex::new(HashMap::new()),
+                registry: Mutex::new(WindowRegistry::load_default()),
+                quitting: AtomicBool::new(false),
             });
-            open_ui_window(&handle, port, &token, None, None)?;
-            tracing::info!("home window open on 127.0.0.1:{port}");
+            // Reopen last session's windows; first launch (or an all-remote
+            // set that is still connecting) gets the home window so the app
+            // never comes up invisible.
+            if !restore_windows(&handle, port, &token) {
+                open_ui_window(&handle, port, &token, &WindowRecord::new(None, None))?;
+                tracing::info!("home window open on 127.0.0.1:{port}");
+            }
             spawn_health_monitor(handle.clone());
+            crate::update::spawn_update_watch(handle.clone());
+            // Slow flush for the geometry dirty flag (window drags).
+            let flush = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let Some(shell) = flush.try_state::<Shell>() else {
+                        break;
+                    };
+                    lock(&shell.registry).save_if_dirty();
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building chimaera")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app, event| match event {
+            // Quit teardown destroys every window; flag it FIRST so those
+            // Destroyed events keep the registry intact for the next launch.
+            tauri::RunEvent::ExitRequested { .. } => {
+                if let Some(state) = app.try_state::<Shell>() {
+                    state.quitting.store(true, Ordering::Relaxed);
+                    lock(&state.registry).save_if_dirty();
+                }
+            }
+            tauri::RunEvent::Exit => {
                 // Kill tunnel children so forwarded ports don't leak past
                 // the app (the daemons keep running by design).
                 if let Some(state) = app.try_state::<Shell>() {
+                    lock(&state.registry).save_if_dirty();
                     tauri::async_runtime::block_on(async {
                         let mut tunnels = state.tunnels.lock().await;
                         for (_, tunnel) in tunnels.drain() {
@@ -648,5 +875,6 @@ pub fn run() {
                     });
                 }
             }
+            _ => {}
         });
 }

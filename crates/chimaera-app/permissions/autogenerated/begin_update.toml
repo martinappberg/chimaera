@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-begin-update"
+description = "Enables the begin_update command without any pre-configured scope."
+commands.allow = ["begin_update"]
+
+[[permission]]
+identifier = "deny-begin-update"
+description = "Denies the begin_update command without any pre-configured scope."
+commands.deny = ["begin_update"]

@@ -20,6 +20,8 @@
     "allow-open-window",
     "allow-check-app-update",
     "allow-install-app-update",
+    "allow-begin-update",
+    "allow-shell-build",
     "allow-answer-askpass"
   ]
 }
