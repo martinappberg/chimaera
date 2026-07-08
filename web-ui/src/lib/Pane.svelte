@@ -9,6 +9,7 @@
   import TerminalView from "./Terminal.svelte";
   import FileView from "./FileView.svelte";
   import SettingsView from "./SettingsView.svelte";
+  import FinderView from "./FinderView.svelte";
 
   interface Props {
     node: PaneNode;
@@ -127,6 +128,13 @@
         <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else if activeTab.surface === "file"}
         <FileView path={activeTab.path} fontSize={node.fontSize} />
+      {:else if activeTab.surface === "finder"}
+        <FinderView
+          path={activeTab.path}
+          {wsRoot}
+          onOpenFile={(p, split) => ctrl.openFileFrom(node.id, p, split)}
+          onNavigate={(p) => ctrl.navigateFinder(activeTab.id, p)}
+        />
       {:else}
         <SettingsView />
       {/if}

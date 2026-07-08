@@ -31,12 +31,24 @@ export interface FileTab {
 export interface SettingsTab {
   surface: "settings";
 }
-export type Tab = TerminalTab | FileTab | SettingsTab;
+/**
+ * A Finder (Miller-columns file browser). Keyed by a stable `id` — NOT by
+ * `path` — so several Finders can coexist and each navigates freely; `path` is
+ * that instance's current directory (mutable navigation state, persisted so a
+ * reload restores where it was browsing).
+ */
+export interface FinderTab {
+  surface: "finder";
+  id: string;
+  path: string;
+}
+export type Tab = TerminalTab | FileTab | SettingsTab | FinderTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
   if (t.surface === "terminal") return `s:${t.sessionId}`;
   if (t.surface === "file") return `f:${t.path}`;
+  if (t.surface === "finder") return `d:${t.id}`;
   return "v:settings";
 }
 
@@ -330,6 +342,41 @@ export function openSettings(l: Layout): Layout {
   return openTab(l, { surface: "settings" });
 }
 
+/**
+ * Open a fresh Finder at `path` (a new instance every call — Finders are keyed
+ * by id, so this never dedupes onto an existing one). Returns the new layout
+ * and the minted id, so the caller can drive that instance afterward.
+ */
+export function openFinder(l: Layout, path: string): { layout: Layout; id: string } {
+  const id = uid();
+  return { layout: openTab(l, { surface: "finder", id, path }), id };
+}
+
+/** The Finder instance with `id`, and where it lives, if open. */
+export function findFinder(
+  l: Layout,
+  id: string,
+): { paneId: string; index: number; tab: FinderTab } | null {
+  for (const p of panes(l.root)) {
+    const index = p.tabs.findIndex((t) => t.surface === "finder" && t.id === id);
+    if (index >= 0) return { paneId: p.id, index, tab: p.tabs[index] as FinderTab };
+  }
+  return null;
+}
+
+/** Update a specific Finder's current directory (its navigation state). */
+export function setFinderPath(l: Layout, id: string, path: string): Layout {
+  const loc = findFinder(l, id);
+  if (loc === null || loc.tab.path === path) return l;
+  const root = withPane(l.root, loc.paneId, (p) => ({
+    ...p,
+    tabs: p.tabs.map((t, i) =>
+      i === loc.index && t.surface === "finder" ? { ...t, path } : t,
+    ),
+  }));
+  return root === l.root ? l : { ...l, root };
+}
+
 /** Cycle the focused pane's active tab by `delta` (wraps). */
 export function cycleTab(l: Layout, delta: number): Layout {
   const p = findPane(l.root, l.focusedPaneId);
@@ -576,8 +623,9 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
 // --- (de)serialization ------------------------------------------------------
 
 /** Tab wire form: `{s}` terminal, `{f}` file, `{v}` view (additive within
- *  blob v1; `v` currently only "settings"). */
-type STab = { s: string } | { f: string } | { v: string };
+ *  blob v1; `v` currently only "settings"), `{d,di}` finder (dir + instance
+ *  id). */
+type STab = { s: string } | { f: string } | { v: string } | { d: string; di: string };
 interface SPane {
   t: "p";
   id: string;
@@ -604,6 +652,7 @@ function serNode(node: LayoutNode): SNode {
       tabs: node.tabs.map((t): STab => {
         if (t.surface === "terminal") return { s: t.sessionId };
         if (t.surface === "file") return { f: t.path };
+        if (t.surface === "finder") return { d: t.path, di: t.id };
         return { v: "settings" };
       }),
       active: node.active,
@@ -650,6 +699,11 @@ function deserNode(
         tab = { surface: "terminal", sessionId: t.s };
       } else if (typeof t.f === "string" && t.f.length > 0 && t.f.length <= 4096) {
         tab = { surface: "file", path: t.f };
+      } else if (typeof t.d === "string" && t.d.length > 0 && t.d.length <= 4096) {
+        // Finder: `di` is the instance id (mint a fresh one for pre-finder
+        // blobs that somehow carry `d` without it).
+        const id = typeof t.di === "string" && t.di.length > 0 ? t.di : uid();
+        tab = { surface: "finder", id, path: t.d };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {
@@ -791,6 +845,25 @@ if (import.meta.env.DEV) {
     stRound !== null &&
       findPane(stRound.root, stRound.focusedPaneId)?.tabs[0]?.surface === "settings",
     "settings tab round-trips",
+  );
+
+  // finder surface: keyed by id, so two coexist; each navigates independently
+  // and both survive serialization with their own path.
+  let fd = defaultLayout();
+  const o1 = openFinder(fd, "/tmp");
+  fd = o1.layout;
+  const o2 = openFinder(fd, "/etc");
+  fd = o2.layout;
+  ok(tabCount(fd) === 2, "openFinder never dedupes — two Finders coexist");
+  fd = setFinderPath(fd, o1.id, "/tmp/sub");
+  ok(findFinder(fd, o1.id)?.tab.path === "/tmp/sub", "setFinderPath moves one instance");
+  ok(findFinder(fd, o2.id)?.tab.path === "/etc", "the other Finder is untouched");
+  const fdRound = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(fd))));
+  ok(
+    fdRound !== null &&
+      findFinder(fdRound, o1.id)?.tab.path === "/tmp/sub" &&
+      findFinder(fdRound, o2.id)?.tab.path === "/etc",
+    "both Finders round-trip with their ids and paths",
   );
 
   // window-edge root split: new pane spans the full edge; same-place no-ops

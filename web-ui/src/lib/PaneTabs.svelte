@@ -22,6 +22,7 @@
   import { activeSelection, referenceTarget, requestReference } from "./reference";
   import { workspaceRelative } from "./reference";
   import FileIcon from "./FileIcon.svelte";
+  import FolderIcon from "./FolderIcon.svelte";
 
   interface Props {
     node: PaneNode;
@@ -182,6 +183,7 @@
       return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
     }
     if (tab.surface === "settings") return "Settings";
+    if (tab.surface === "finder") return basename(tab.path) || "Finder";
     return fileNames.get(tab.path) ?? basename(tab.path);
   }
 
@@ -277,7 +279,7 @@
         aria-selected={i === node.active}
         tabindex="-1"
         data-tab-index={i}
-        title={tab.surface === "file" ? tab.path : label(tab)}
+        title={tab.surface === "file" || tab.surface === "finder" ? tab.path : label(tab)}
         onpointerdowncapture={(e) => {
           // Capture-phase (directly attached, not delegated); ignore presses
           // on the close button so it stays a plain click.
@@ -315,6 +317,10 @@
               stroke-linecap="round"
             />
           </svg>
+        {:else if tab.surface === "finder"}
+          <span class="tab-glyph" class:on={i === node.active}>
+            <FolderIcon size={13} plain={i === node.active} />
+          </span>
         {:else if $dirtyFiles.has(tab.path)}
           <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
           <span class="dirty-dot" title="unsaved changes"></span>
