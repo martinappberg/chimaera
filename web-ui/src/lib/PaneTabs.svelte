@@ -411,7 +411,7 @@
         <button
           class="touched-chip"
           class:open={touchedOpen}
-          title="files this agent touched"
+          title="files this agent created or edited this session — click to view"
           aria-haspopup="menu"
           aria-expanded={touchedOpen}
           onclick={(e) => {
@@ -419,7 +419,11 @@
             touchedOpen = !touchedOpen;
           }}
         >
-          {touched.length} file{touched.length === 1 ? "" : "s"}
+          <svg class="touched-edit" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+            <path d="M13.5 6.5l4 4" />
+          </svg>
+          {touched.length} file{touched.length === 1 ? "" : "s"} changed
         </button>
         {#if touchedOpen}
           <div class="touched-pop" role="menu" aria-label="files touched">
@@ -1020,6 +1024,9 @@
   .touched-chip {
     appearance: none;
     border: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
     font: inherit;
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
@@ -1033,6 +1040,11 @@
     transition:
       background-color 0.12s ease,
       color 0.12s ease;
+  }
+
+  .touched-edit {
+    flex: none;
+    opacity: 0.8;
   }
 
   .touched-chip:hover,

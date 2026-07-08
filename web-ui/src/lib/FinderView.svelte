@@ -273,13 +273,20 @@
       {/each}
     </div>
     <div class="actions">
-      {#if outsideWs}
-        <span class="chip" title={location}>outside workspace</span>
+      {#if outsideWs && wsNorm !== null}
+        <!-- Not just a marker: click to jump back into the workspace. -->
+        <button class="chip" title="back to the workspace" onclick={() => void navigateTo(wsNorm)}>
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 14l-4 -4l4 -4" />
+            <path d="M5 10h11a4 4 0 1 1 0 8h-1" />
+          </svg>
+          outside workspace
+        </button>
       {/if}
       {#if wsNorm !== null}
-        <button class="act" title="workspace root" onclick={() => void navigateTo(wsNorm)}>root</button>
+        <button class="act" title="go to the workspace root" onclick={() => void navigateTo(wsNorm)}>workspace</button>
       {/if}
-      <button class="act" title="home" onclick={goHome}>home</button>
+      <button class="act" title="go to your home folder" onclick={goHome}>home</button>
     </div>
   </div>
 
@@ -420,14 +427,27 @@
   }
 
   .chip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    appearance: none;
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
     border-radius: 999px;
-    padding: 1px 7px;
+    padding: 1px 8px 1px 6px;
     white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .chip:hover {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--accent) 24%, transparent);
   }
 
   .act {

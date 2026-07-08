@@ -127,7 +127,7 @@
       {#if activeTab.surface === "terminal"}
         <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
       {:else if activeTab.surface === "file"}
-        <FileView path={activeTab.path} fontSize={node.fontSize} />
+        <FileView path={activeTab.path} {wsRoot} fontSize={node.fontSize} />
       {:else if activeTab.surface === "finder"}
         <FinderView
           path={activeTab.path}
