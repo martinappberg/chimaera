@@ -861,6 +861,7 @@ mod tests {
                 command: None,
                 id: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn session");
@@ -950,6 +951,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn session");
@@ -1050,6 +1052,7 @@ mod tests {
                 command: None,
                 id: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn session");
@@ -2673,6 +2676,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn shell");
@@ -2810,6 +2814,7 @@ mod tests {
                 command: Some(launch.argv),
                 id: None,
                 env,
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn integrated bash");
@@ -2871,6 +2876,7 @@ mod tests {
                 command: Some(launch.argv),
                 id: None,
                 env,
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn integrated bash");
@@ -2906,6 +2912,7 @@ mod tests {
                 ]),
                 id: None,
                 env: Vec::new(),
+                env_remove: Vec::new(),
                 scrollback: None,
             })
             .expect("spawn plain bash");
@@ -3093,6 +3100,7 @@ mod tests {
                     command: None,
                     id: None,
                     env: Vec::new(),
+                    env_remove: Vec::new(),
                     scrollback: None,
                 })
                 .expect("spawn shell");

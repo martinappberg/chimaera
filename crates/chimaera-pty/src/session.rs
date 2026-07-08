@@ -155,6 +155,9 @@ impl Session {
         };
         cmd.cwd(&cwd);
         cmd.env("TERM", "xterm-256color");
+        for name in &opts.env_remove {
+            cmd.env_remove(name);
+        }
         for (name, value) in &opts.env {
             cmd.env(name, value);
         }

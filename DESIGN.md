@@ -1189,27 +1189,37 @@ component decisions:
   pays full handshake+2FA cost there. russh only becomes interesting if a no-external-binary
   Windows client is ever required.
 
-## Verified component notes (2026-07-07): claude 2.1.204 stopped persisting interactive transcripts
+## Verified component notes (2026-07-07/08): child-marked claude persists no transcript — scrub launcher env
 
-Found during live verification of session resurrection, reproduced outside chimaera
-(user-style `claude` typed into a plain shell, same cwd): **claude 2.1.204 interactive
-TUI sessions write NO transcript to `~/.claude/projects/<cwd-key>/`** — not during the
-conversation, not on clean `/exit`. Print mode (`claude -p`) still writes them, and
-2.1.19x interactive sessions did (their files are still on disk). Hooks still *report* a
-`transcript_path`; the file simply never materializes, and `claude --resume <id>` for
-such a conversation dies with "No conversation found".
+Found during live verification of session resurrection, initially misdiagnosed as a
+claude 2.1.204 regression, then bisected to its true cause: **claude suppresses
+interactive transcript persistence when its environment marks it as a child of another
+Claude Code session** (`CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_CHILD_SESSION`; both
+bisected live against 2.1.204 — same shell, same cwd: markers present → no transcript
+ever, markers removed → transcript within 2s of the first prompt). Hooks still *report*
+a `transcript_path`; the file never materializes, and `claude --resume <id>` dies with
+"No conversation found".
 
-Consequences, absorbed into the design rather than assumed away:
+Why chimaera hits this: a daemon started **from inside a claude session** — dev loops
+do this constantly ("restart the daemon" typed to an agent, agent-driven verification,
+a linked terminal running `chimaera serve`) — inherits those markers and passes them to
+every session it spawns, so every agent under it silently loses `--resume`, and even a
+`claude` typed by hand into a chimaera shell goes transcript-silent. A daemon started
+by the app or a plain terminal is unaffected (which is why normal usage never sees it).
+
+Fixes, both kept even though the root cause is environmental:
+- **Launcher-context scrub**: PTY spawn gained `env_remove`; the daemon strips the
+  CLAUDE* marker family (`CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_AGENT_*`,
+  `CLAUDE_EFFORT`, `AI_AGENT`) from every session it spawns — none of it can describe
+  a chimaera session truthfully, and anything the user set in their own profile comes
+  back through the login-shell wrap.
 - **A resume id is a claim, not a promise.** Everything that mints one — the session
   ledger's boot resurrection, `retire()` into Recents — verifies the transcript exists
   on disk first (hook-recorded path, or the conventional store location for the cwd).
-  No transcript → resurrection respawns a fresh TUI carrying the old display title
-  (the pane comes back; the context honestly cannot), and Recents rows omit `resume`
-  (the row starts fresh — the UI already had that affordance).
-- "Claude's own transcripts are the source of truth" (State storage) now has a version
-  asterisk: the transcript-scan half of Recents and `--resume` only cover print-mode
-  and pre-2.1.204 conversations until claude's behavior changes back or the new
-  location (if any) is found. Re-verify on claude upgrades.
+  No transcript → resurrection respawns a fresh TUI carrying the old display title,
+  and Recents rows omit `resume` (the row honestly starts fresh). Defense in depth:
+  transcripts also vanish via claude's own `cleanupPeriodDays`, old contaminated
+  daemons, and whatever comes next.
 
 ## Decisions log addendum (2026-07-07): stateful restarts + update surface — SHIPPED
 

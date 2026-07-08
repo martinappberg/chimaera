@@ -80,6 +80,7 @@ pub(crate) async fn spawn_session(
         command: None,
         id: Some(id.clone()),
         env: crate::api::session_env(state, &id, &spec.theme),
+        env_remove: crate::api::launcher_context_env(),
         // settings.json ground truth; applies to sessions spawned from now on.
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };

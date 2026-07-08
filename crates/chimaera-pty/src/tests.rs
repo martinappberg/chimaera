@@ -40,6 +40,7 @@ fn opts(command: Option<Vec<String>>) -> SpawnOpts {
         command,
         id: None,
         env: Vec::new(),
+        env_remove: Vec::new(),
         scrollback: None,
     }
 }
@@ -196,6 +197,37 @@ fn visible_text<T>(term: &Term<T>) -> Vec<String> {
 
 /// (a) A plain command produces output on the live stream and an Exited event,
 /// then the session unregisters itself.
+/// `env_remove` strips an inherited variable from the child, and `env`
+/// overlays still apply — the daemon relies on this to scrub launcher
+/// -context markers (a Claude Code session having started the daemon)
+/// without touching anything it deliberately injects.
+#[tokio::test]
+async fn spawn_env_remove_strips_inherited_variables() {
+    // Unique name: set_var is process-global, but nothing else reads it.
+    std::env::set_var("CHIMAERA_PTY_TEST_CONTAMINANT", "leaked");
+    let mgr = SessionManager::new();
+    let mut o = opts(Some(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        // Print marker+value so the assertion can't match the echoed argv.
+        "echo scrubbed=[${CHIMAERA_PTY_TEST_CONTAMINANT}] kept=[${CHIMAERA_PTY_TEST_KEPT}]"
+            .to_string(),
+    ]));
+    o.env_remove = vec!["CHIMAERA_PTY_TEST_CONTAMINANT".to_string()];
+    o.env
+        .push(("CHIMAERA_PTY_TEST_KEPT".to_string(), "yes".to_string()));
+    let info = mgr.spawn(o).expect("spawn failed");
+
+    let mut att = mgr.attach(&info.id).expect("attach failed");
+    let mut seen = String::from_utf8_lossy(&att.snapshot).into_owned();
+    if !seen.contains("kept=[yes]") {
+        seen.push_str(&read_until(&mut att.output, "kept=[yes]").await);
+    }
+    assert!(seen.contains("scrubbed=[]"), "output was: {seen:?}");
+    assert!(seen.contains("kept=[yes]"), "output was: {seen:?}");
+    std::env::remove_var("CHIMAERA_PTY_TEST_CONTAMINANT");
+}
+
 #[tokio::test]
 async fn spawn_echo_collects_output_and_exited_event() {
     let mgr = SessionManager::new();
