@@ -229,12 +229,34 @@ pub(crate) fn retire(
     // them would keep those agents out of recents entirely).
     let skip = record.kind == AgentKind::Claude && title == record.kind.as_str();
     if let Some(workspace_id) = workspace_id.filter(|_| !skip) {
+        // Only promise resumption a transcript can deliver: claude 2.1.204
+        // interactive sessions persist NO transcript (verified 2026-07-07),
+        // so an unverified id would mint a row whose click dies with "No
+        // conversation found". The resumed-from ancestor is the fallback
+        // target when the session's own transcript never materialized.
+        let workspace_root = crate::lock(&state.workspaces)
+            .get(&workspace_id)
+            .map(|w| w.root);
+        let resume =
+            [record.resume_id(), record.resumed_from.clone()]
+                .into_iter()
+                .flatten()
+                .find(|id| {
+                    record.transcript_path.as_deref().is_some_and(|p| {
+                        p.file_stem().is_some_and(|s| s == id.as_str()) && p.is_file()
+                    }) || workspace_root.as_deref().is_some_and(|root| {
+                        state
+                            .claude_projects_dir
+                            .join(crate::launcher::encode_cwd(root))
+                            .join(id)
+                            .with_extension("jsonl")
+                            .is_file()
+                    })
+                });
         let entry = RecentEntry {
             kind: record.kind,
             title,
-            // Fall back to the resumed-from id when no hook ever reported a
-            // transcript: the old conversation is still the resume target.
-            resume: record.resume_id().or_else(|| record.resumed_from.clone()),
+            resume,
             supersedes: Vec::new(), // push() records the ancestor chain
             last_active: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

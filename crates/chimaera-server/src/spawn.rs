@@ -44,6 +44,10 @@ pub(crate) struct SpawnSpec {
     pub(crate) rows: Option<u16>,
     /// "light" | "dark" (validated by the caller).
     pub(crate) theme: String,
+    /// Provisional display title for agent sessions (resurrection carries
+    /// the dead session's title so the rail row stays recognizable until
+    /// the agent re-titles itself). Ignored for shells.
+    pub(crate) title_hint: Option<String>,
     pub(crate) kind: SpawnKind,
 }
 
@@ -172,6 +176,10 @@ pub(crate) async fn spawn_session(
             // Claude forks a new session id on --resume; remember the ancestor
             // so recents can hide (and later supersede) the old conversation.
             record.resumed_from = resume.clone();
+            // A carried-over title slots in as the provisional first-prompt
+            // name: it loses to any real title the agent produces, exactly
+            // like a first prompt would.
+            record.first_prompt = spec.title_hint.clone();
             crate::lock(&state.agents).insert(id.clone(), record);
             spawned_agent = Some(agent_kind);
         }

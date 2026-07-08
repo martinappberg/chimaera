@@ -51,10 +51,18 @@ pub(crate) struct LedgerEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LedgerAgent {
     pub(crate) kind: AgentKind,
-    /// Claude conversation id (`--resume <id>`), when known.
+    /// Claude conversation id (`--resume <id>`), when known. A recorded id
+    /// is a CLAIM, not a promise: claude 2.1.204 interactive sessions do
+    /// not persist their transcripts (verified 2026-07-07 — print mode
+    /// does; 2.1.19x did), and `--resume` against a conversation with no
+    /// transcript dies with "No conversation found". Restore verifies the
+    /// transcript on disk before resuming.
     pub(crate) resume: Option<String>,
-    /// Current display title — what a Recents row would say if this agent
-    /// had to retire instead of resurrect.
+    /// The transcript path claude's hooks reported, when any — the exact
+    /// file `--resume` needs to exist.
+    pub(crate) transcript: Option<PathBuf>,
+    /// Current display title — carried onto the successor session (or a
+    /// Recents row) so the conversation stays recognizable either way.
     pub(crate) title: String,
 }
 
@@ -82,6 +90,7 @@ impl LedgerEntry {
             "agent": self.agent.as_ref().map(|a| json!({
                 "kind": a.kind.as_str(),
                 "resume": a.resume,
+                "transcript": a.transcript,
                 "title": a.title,
             })),
         })
@@ -93,6 +102,10 @@ impl LedgerEntry {
             Some(a) => Some(LedgerAgent {
                 kind: AgentKind::parse(a.get("kind")?.as_str()?)?,
                 resume: a.get("resume").and_then(|r| r.as_str()).map(str::to_string),
+                transcript: a
+                    .get("transcript")
+                    .and_then(|t| t.as_str())
+                    .map(PathBuf::from),
                 title: a.get("title")?.as_str()?.to_string(),
             }),
         };
@@ -275,6 +288,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             let agent = agents.get(&info.id).map(|record| LedgerAgent {
                 kind: record.kind,
                 resume: record.resume_id().or_else(|| record.resumed_from.clone()),
+                transcript: record.transcript_path.clone(),
                 title: record.display_name(info.title.as_deref()),
             });
             Some(LedgerEntry {
@@ -393,6 +407,27 @@ fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bo
     }
 }
 
+/// The resume id to actually pass, verified against disk: the recorded
+/// transcript path, or the conventional store location for this cwd. A
+/// conversation whose transcript does not exist gets `None` — resuming it
+/// would only produce an instantly-dead "No conversation found" pane.
+/// (Claude 2.1.204 interactive sessions persist no transcript, so this is
+/// a normal case, not a corruption case.)
+fn resolve_resume(claude_projects_dir: &std::path::Path, entry: &LedgerEntry) -> Option<String> {
+    let agent = entry.agent.as_ref()?;
+    let id = agent.resume.as_deref()?;
+    let recorded = agent
+        .transcript
+        .as_deref()
+        .is_some_and(|path| path.is_file());
+    let derived = claude_projects_dir
+        .join(crate::launcher::encode_cwd(&entry.cwd))
+        .join(id)
+        .with_extension("jsonl")
+        .is_file();
+    (recorded || derived).then(|| id.to_string())
+}
+
 async fn respawn(
     state: &Arc<AppState>,
     entry: &LedgerEntry,
@@ -405,13 +440,25 @@ async fn respawn(
     } else {
         workspace.root.clone()
     };
+    let mut title_hint = None;
     let kind = match &entry.agent {
         None => crate::spawn::SpawnKind::Shell,
-        Some(agent) => crate::spawn::SpawnKind::Agent {
-            kind: agent.kind,
-            model: None,
-            resume: agent.resume.clone(),
-        },
+        Some(agent) => {
+            let resume = resolve_resume(&state.claude_projects_dir, entry);
+            if resume.is_none() && agent.resume.is_some() {
+                tracing::info!(session = %entry.id,
+                    "conversation transcript is gone; respawning fresh instead of --resume");
+            }
+            // Whether resuming or starting over, the successor keeps the old
+            // display title until claude re-titles it — the rail row must
+            // not reset to a bare "claude".
+            title_hint = Some(agent.title.clone());
+            crate::spawn::SpawnKind::Agent {
+                kind: agent.kind,
+                model: None,
+                resume,
+            }
+        }
     };
     let spec = crate::spawn::SpawnSpec {
         workspace,
@@ -421,6 +468,7 @@ async fn respawn(
         cols: Some(entry.cols),
         rows: Some(entry.rows),
         theme: entry.theme.clone(),
+        title_hint,
         kind,
     };
     match crate::spawn::spawn_session(state, spec).await {
@@ -447,7 +495,9 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
-        resume: agent.resume.clone(),
+        // Only promise resumption the transcript can actually deliver; a
+        // row without `resume` honestly starts fresh (existing UI rule).
+        resume: resolve_resume(&state.claude_projects_dir, entry),
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
             last_active
@@ -481,10 +531,52 @@ mod tests {
             agent: Some(LedgerAgent {
                 kind,
                 resume: resume.map(str::to_string),
+                transcript: None,
                 title: "fix the tests".into(),
             }),
             ..shell_entry()
         }
+    }
+
+    /// `--resume` is only passed when the conversation's transcript exists —
+    /// at the hook-recorded path or the conventional store location. Claude
+    /// 2.1.204 interactive sessions write no transcript, so a missing file
+    /// is the NORMAL case, and resuming it would spawn an instantly-dead
+    /// "No conversation found" pane.
+    #[test]
+    fn resume_requires_a_transcript_on_disk() {
+        let dir = std::env::temp_dir().join(format!("chimaera-resume-test-{}", std::process::id()));
+        let store = dir.join("projects");
+        let cwd = dir.join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut entry = agent_entry(AgentKind::Claude, Some("conv-1"));
+        entry.cwd = cwd.clone();
+
+        // No transcript anywhere: no resume.
+        assert_eq!(resolve_resume(&store, &entry), None);
+
+        // The conventional store location for this cwd counts.
+        let derived_dir = store.join(crate::launcher::encode_cwd(&cwd));
+        std::fs::create_dir_all(&derived_dir).unwrap();
+        std::fs::write(derived_dir.join("conv-1.jsonl"), "{}\n").unwrap();
+        assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
+        std::fs::remove_file(derived_dir.join("conv-1.jsonl")).unwrap();
+
+        // The hook-recorded path counts wherever it points.
+        let recorded = dir.join("elsewhere-conv-1.jsonl");
+        std::fs::write(&recorded, "{}\n").unwrap();
+        entry.agent.as_mut().unwrap().transcript = Some(recorded);
+        assert_eq!(resolve_resume(&store, &entry), Some("conv-1".to_string()));
+
+        // Shells and resume-less agents never resolve.
+        assert_eq!(resolve_resume(&store, &shell_entry()), None);
+        assert_eq!(
+            resolve_resume(&store, &agent_entry(AgentKind::Claude, None)),
+            None
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

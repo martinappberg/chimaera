@@ -382,6 +382,7 @@ pub(crate) async fn create_session(
         cols: body.cols,
         rows: body.rows,
         theme: theme.to_string(),
+        title_hint: None,
         kind,
     };
     match crate::spawn::spawn_session(&state, spec).await {

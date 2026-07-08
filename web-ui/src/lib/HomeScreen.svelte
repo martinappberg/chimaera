@@ -263,7 +263,19 @@
 
 <div class="home">
   {#if health !== null}
-    <span class="version-mark" title="running version">v{health.version}</span>
+    <!-- The mark identifies the DAEMON serving this window (the daemon
+         outlives app reinstalls by design, so this is the version that
+         actually matters — and a dev daemon must say so instead of posing
+         as an ordinary "v0.0.1"). -->
+    {#if health.version === "0.0.1"}
+      <span
+        class="version-mark"
+        title="this window is served by a development daemon (build {health.build ?? 'unknown'})"
+        >daemon dev·{(health.build ?? "unknown").split(".")[0]}</span
+      >
+    {:else}
+      <span class="version-mark" title="daemon version">v{health.version}</span>
+    {/if}
   {/if}
   <div class="inner">
     <header class="masthead">

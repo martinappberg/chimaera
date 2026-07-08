@@ -1851,13 +1851,18 @@ mod tests {
         let data_dir = test_dir("recents");
         let state = test_state_with_data_dir(0, data_dir.clone());
         let ws = make_workspace(&state, "recents-root").await;
+        // The transcript must exist on disk: retire only mints resume ids a
+        // click can deliver (claude 2.1.204 interactive sessions persist no
+        // transcript, so unverified ids are common, not corrupt).
+        let transcript = data_dir.join("abc-123.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
         plant_agent_record(
             &state,
             "s-1",
             &ws,
             agents::AgentKind::Claude,
             Some("fix the flaky test"),
-            Some("/tmp/store/proj/abc-123.jsonl"),
+            Some(transcript.to_str().unwrap()),
         );
 
         recents::retire(&state, "s-1", None, None);
@@ -1920,6 +1925,10 @@ mod tests {
     async fn recents_hide_live_conversations_and_dedupe_resumes() {
         let state = test_state();
         let ws = make_workspace(&state, "recents-live").await;
+        let store = test_dir("recents-live-transcripts");
+        let transcript = store.join("conv-9.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let transcript = transcript.to_str().unwrap();
 
         plant_agent_record(
             &state,
@@ -1927,7 +1936,7 @@ mod tests {
             &ws,
             agents::AgentKind::Claude,
             Some("hooks online"),
-            Some("/tmp/store/proj/conv-9.jsonl"),
+            Some(transcript),
         );
         recents::retire(&state, "s-a", None, None);
         assert_eq!(recents_of(&state, &ws).await.len(), 1);
@@ -1939,7 +1948,7 @@ mod tests {
             &ws,
             agents::AgentKind::Claude,
             Some("hooks online"),
-            Some("/tmp/store/proj/conv-9.jsonl"),
+            Some(transcript),
         );
         assert!(recents_of(&state, &ws).await.is_empty());
 
@@ -1963,11 +1972,13 @@ mod tests {
 
         // It ends under its new id: the ancestor entry is superseded by the
         // continuation — one entry, newest title, resumable via the NEW id.
+        let continuation = store.join("conv-10.jsonl");
+        std::fs::write(&continuation, "{}\n").unwrap();
         {
             let mut agents_map = lock(&state.agents);
             let record = agents_map.get_mut("s-c").unwrap();
             record.ai_title = Some("hooks online v3".to_string());
-            record.transcript_path = Some(PathBuf::from("/tmp/store/proj/conv-10.jsonl"));
+            record.transcript_path = Some(continuation);
         }
         recents::retire(&state, "s-c", None, None);
         let entries = recents_of(&state, &ws).await;
@@ -6103,6 +6114,7 @@ mod tests {
             agent: Some(ledger::LedgerAgent {
                 kind: agents::AgentKind::Codex,
                 resume: None,
+                transcript: None,
                 title: "port the parser".to_string(),
             }),
         });
@@ -6170,6 +6182,10 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
+        // The conversation's transcript exists (hook-recorded path), so its
+        // recents row must stay resumable through retirement.
+        let transcript = data.join("conv-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
         let boot = ledger::BootLedger {
             sessions: vec![
                 ledger::LedgerEntry {
@@ -6193,6 +6209,7 @@ mod tests {
                     agent: Some(ledger::LedgerAgent {
                         kind: agents::AgentKind::Claude,
                         resume: Some("conv-1".to_string()),
+                        transcript: Some(transcript),
                         title: "fix the flaky tests".to_string(),
                     }),
                 },
