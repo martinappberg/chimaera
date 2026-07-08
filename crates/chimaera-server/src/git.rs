@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -41,9 +41,6 @@ const MAX_STATUS_ENTRIES: usize = 5000;
 /// Daemon-wide ceiling on concurrent git child processes (bounds CPU on a
 /// shared node — an accidental fan-out of statuses cannot saturate cores).
 const MAX_CONCURRENT_GIT: usize = 4;
-/// A workspace is "watched" (eligible for the backstop poll) if its status was
-/// pulled within this window. Idle workspaces cost nothing.
-const WATCH_TTL: Duration = Duration::from_secs(60);
 /// Backstop cadence: catches out-of-band changes (external editor, a `git`
 /// command in a terminal) that fire none of the event-driven refresh triggers.
 const BACKSTOP_INTERVAL: Duration = Duration::from_secs(12);
@@ -59,8 +56,13 @@ pub(crate) struct GitService {
     /// may have changed. Surfaced on `/ws/events` so the client refetches; the
     /// payload never rides the firehose (invalidate-and-pull).
     epochs: Mutex<HashMap<String, u64>>,
-    /// workspace id -> last time a client pulled status (backstop gate).
-    watching: Mutex<HashMap<String, Instant>>,
+    /// workspace id -> how many connected clients are LOOKING at it (registered
+    /// over `/ws/events`, released on disconnect). This gates the backstop poll.
+    ///
+    /// Deliberately not "was pulled recently": pulls only happen when something
+    /// changed, so a recency window decays to zero on a quiet repo and the
+    /// backstop would stop watching exactly when it is needed.
+    watchers: Mutex<HashMap<String, usize>>,
     /// workspace id -> hash of the last computed status, so the backstop only
     /// bumps the epoch when something actually changed.
     hashes: Mutex<HashMap<String, u64>>,
@@ -86,7 +88,7 @@ impl GitService {
         GitService {
             repos: Mutex::new(HashMap::new()),
             epochs: Mutex::new(HashMap::new()),
-            watching: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
             hashes: Mutex::new(HashMap::new()),
             procs: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT)),
         }
@@ -107,8 +109,56 @@ impl GitService {
         *epochs.entry(ws_id.to_string()).or_insert(0) += 1;
     }
 
-    fn mark_watching(&self, ws_id: &str) {
-        crate::lock(&self.watching).insert(ws_id.to_string(), Instant::now());
+    /// Forget the published hash: the next computed status is accepted as the new
+    /// baseline WITHOUT a second epoch bump. Paired with an event-driven bump
+    /// (a save / an agent write), whose change we have already announced.
+    fn invalidate(&self, ws_id: &str) {
+        crate::lock(&self.hashes).remove(ws_id);
+    }
+
+    /// Record a freshly computed status as the published baseline.
+    ///
+    /// If it differs from the previously published one, the world moved without
+    /// an event trigger (an external editor, a `git` command in a terminal, or a
+    /// change absorbed between polls) — so bump the epoch and let EVERY client
+    /// refetch. Whoever computed it reports the post-bump epoch, so the caller's
+    /// own client is already current and does not refetch. A first observation
+    /// establishes the baseline silently: there is nothing to invalidate yet.
+    ///
+    /// This ownership matters: if a plain pull could overwrite the baseline
+    /// without announcing, one client's fetch would hide the change from every
+    /// other client and from the backstop.
+    fn publish(&self, ws_id: &str, data: &StatusData) -> (u64, bool) {
+        let hash = hash_status(data);
+        let bumped = match crate::lock(&self.hashes).insert(ws_id.to_string(), hash) {
+            Some(previous) => previous != hash,
+            None => false,
+        };
+        if bumped {
+            self.bump(ws_id);
+        }
+        (self.epoch(ws_id), bumped)
+    }
+
+    fn watch(&self, ws_id: &str) {
+        *crate::lock(&self.watchers)
+            .entry(ws_id.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn unwatch(&self, ws_id: &str) {
+        let mut watchers = crate::lock(&self.watchers);
+        if let Some(count) = watchers.get_mut(ws_id) {
+            *count -= 1;
+            if *count == 0 {
+                watchers.remove(ws_id);
+            }
+        }
+    }
+
+    /// Workspaces at least one connected client is currently looking at.
+    fn watched(&self) -> Vec<String> {
+        crate::lock(&self.watchers).keys().cloned().collect()
     }
 
     /// Discover the repo for `ws_id` rooted at `root`, caching the result.
@@ -501,6 +551,42 @@ fn status_json(ws_id: &str, epoch: u64, repo: &RepoInfo, d: &StatusData) -> serd
     })
 }
 
+/// One `/ws/events` connection's "I am looking at workspace W" registration.
+/// A guard because that socket has many exit paths (auth failure, send error,
+/// client close) and a leaked watcher would poll git forever.
+pub(crate) struct WatchGuard {
+    state: Arc<AppState>,
+    ws: Option<String>,
+}
+
+impl WatchGuard {
+    pub(crate) fn new(state: Arc<AppState>) -> Self {
+        WatchGuard { state, ws: None }
+    }
+
+    /// Point this connection at `ws` (or nothing), releasing any previous one.
+    pub(crate) fn set(&mut self, ws: Option<String>) {
+        if self.ws == ws {
+            return;
+        }
+        if let Some(previous) = self.ws.take() {
+            self.state.git.unwatch(&previous);
+        }
+        if let Some(next) = ws {
+            self.state.git.watch(&next);
+            self.ws = Some(next);
+        }
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        if let Some(ws) = self.ws.take() {
+            self.state.git.unwatch(&ws);
+        }
+    }
+}
+
 // ---- refresh triggers -------------------------------------------------------
 
 /// Bump the epoch of every workspace whose root contains `path`, then wake the
@@ -514,6 +600,9 @@ pub(crate) fn mark_path_dirty(state: &AppState, path: &str) {
         // Component-wise prefix (so `/repo` never matches `/repo2`).
         if target.starts_with(&ws.root) {
             state.git.bump(&ws.id);
+            // We just announced this change; drop the published baseline so the
+            // pull it triggers adopts the new status without bumping again.
+            state.git.invalidate(&ws.id);
             bumped = true;
         }
     }
@@ -531,21 +620,14 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-/// Backstop poll: for each recently-watched workspace, recompute status and bump
-/// its epoch only when the status actually changed. Catches out-of-band edits
-/// (external editor, a `git` command in a terminal) that fire no event trigger.
-/// Idle workspaces are skipped entirely, so this costs nothing at rest.
+/// Backstop poll: for each workspace a connected client is looking at, recompute
+/// status and bump its epoch only when it actually changed. Catches out-of-band
+/// edits (external editor, a `git` command in a terminal) that fire no event
+/// trigger. With no window open, `watched()` is empty and this costs nothing.
 pub(crate) async fn backstop_poll(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(BACKSTOP_INTERVAL).await;
-        let watched: Vec<String> = {
-            let now = Instant::now();
-            crate::lock(&state.git.watching)
-                .iter()
-                .filter(|(_, seen)| now.duration_since(**seen) < WATCH_TTL)
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
+        let watched = state.git.watched();
         let mut bumped = false;
         for ws_id in watched {
             let Some(ws) = crate::lock(&state.workspaces).get(&ws_id) else {
@@ -557,13 +639,8 @@ pub(crate) async fn backstop_poll(state: Arc<AppState>) {
             let Ok(data) = state.git.status(&repo).await else {
                 continue;
             };
-            let hash = hash_status(&data);
-            let changed = crate::lock(&state.git.hashes).get(&ws_id) != Some(&hash);
-            if changed {
-                crate::lock(&state.git.hashes).insert(ws_id.clone(), hash);
-                state.git.bump(&ws_id);
-                bumped = true;
-            }
+            let (_, changed) = state.git.publish(&ws_id, &data);
+            bumped |= changed;
         }
         if bumped {
             state.changes.notify_waiters();
@@ -590,15 +667,20 @@ pub(crate) async fn status(
         )
             .into_response();
     };
-    state.git.mark_watching(&q.workspace_id);
-    let epoch = state.git.epoch(&q.workspace_id);
     let Some(repo) = state.git.discover(&q.workspace_id, &ws.root).await else {
+        let epoch = state.git.epoch(&q.workspace_id);
         return Json(json!({"repo": false, "workspace_id": q.workspace_id, "epoch": epoch}))
             .into_response();
     };
     match state.git.status(&repo).await {
         Ok(data) => {
-            crate::lock(&state.git.hashes).insert(q.workspace_id.clone(), hash_status(&data));
+            // Publishing may discover an unannounced change (an external editor,
+            // a terminal `git` command) and bump the epoch; read the epoch after,
+            // so THIS response is already current and the caller won't refetch.
+            let (epoch, bumped) = state.git.publish(&q.workspace_id, &data);
+            if bumped {
+                state.changes.notify_waiters();
+            }
             Json(status_json(&q.workspace_id, epoch, &repo, &data)).into_response()
         }
         Err(err) => {
@@ -606,6 +688,7 @@ pub(crate) async fn status(
             // Degrade honestly: the repo exists, status is momentarily
             // unavailable. Same shape as success (plus `error`) so the client
             // never has to special-case missing fields.
+            let epoch = state.git.epoch(&q.workspace_id);
             let mut body = status_json(&q.workspace_id, epoch, &repo, &StatusData::default());
             body["error"] = json!(err.to_string());
             Json(body).into_response()
@@ -826,6 +909,34 @@ mod tests {
     fn paths_with_spaces_survive() {
         let data = parse_status(b"1 .M N... 100644 100644 100644 a b src/a file.rs\0", false);
         assert_eq!(data.entries[0].rel, "src/a file.rs");
+    }
+
+    /// The baseline-ownership invariant. A pull must ANNOUNCE any change it
+    /// discovers (otherwise one client's fetch hides it from every other client
+    /// and from the backstop), but must not double-announce a change an event
+    /// trigger already published.
+    #[test]
+    fn publish_announces_each_unannounced_change_exactly_once() {
+        let svc = GitService::new();
+        let clean = StatusData::default();
+        let dirty = StatusData {
+            entries: vec![Entry::untracked("new.txt".to_string())],
+            ..Default::default()
+        };
+
+        // First observation establishes the baseline silently.
+        assert_eq!(svc.publish("w", &clean), (0, false));
+
+        // An unannounced change (external editor / terminal git) bumps once...
+        assert_eq!(svc.publish("w", &dirty), (1, true));
+        // ...and re-publishing the same status does not bump again.
+        assert_eq!(svc.publish("w", &dirty), (1, false));
+
+        // An event-driven bump (a save) announces, then invalidates the baseline;
+        // the pull it triggers adopts the new status WITHOUT a second bump.
+        svc.bump("w");
+        svc.invalidate("w");
+        assert_eq!(svc.publish("w", &clean), (2, false));
     }
 
     #[test]

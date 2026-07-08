@@ -42,6 +42,12 @@ enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// `/ws/events` only: "this window is looking at workspace W" (null when it
+    /// has none). Gates the git backstop poll — see `git::WatchGuard`.
+    Watch {
+        #[serde(default)]
+        workspace_id: Option<String>,
+    },
 }
 
 /// GET /ws/sessions/{id}
@@ -230,8 +236,9 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 tracing::debug!(%id, %err, "ws resize failed");
                             }
                         }
-                        // Ignore re-auth and unknown message types.
-                        Ok(ClientMessage::Auth { .. }) | Err(_) => {}
+                        // Ignore re-auth, the events-bus `watch` frame, and
+                        // unknown message types.
+                        Ok(ClientMessage::Auth { .. }) | Ok(ClientMessage::Watch { .. }) | Err(_) => {}
                     }
                 }
                 // Client went away: drop the attachment, the session lives on.
@@ -309,6 +316,9 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
+    // Released on every exit path below (a leaked watcher would poll git forever).
+    let mut watch = crate::git::WatchGuard::new(state.clone());
+
     let mut last_sent: Option<String> = None;
     let mut last_settings_gen: Option<u64> = None;
     let mut last_git: Option<String> = None;
@@ -336,7 +346,17 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             _ = state.changes.notified() => {}
             _ = tokio::time::sleep(EVENTS_TICK) => {}
             msg = socket.recv() => match msg {
-                Some(Ok(_)) => continue, // client frames carry nothing here
+                // The only client frame on this bus: which workspace this window
+                // is showing, so the git backstop knows what to poll.
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(ClientMessage::Watch { workspace_id }) =
+                        serde_json::from_str::<ClientMessage>(&text)
+                    {
+                        watch.set(workspace_id);
+                    }
+                    continue;
+                }
+                Some(Ok(_)) => continue,
                 Some(Err(_)) | None => return,
             },
         }

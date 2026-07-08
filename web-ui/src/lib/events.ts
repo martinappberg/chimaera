@@ -59,9 +59,27 @@ export class EventsSocket {
   private connected = false;
   private backoffMs = INITIAL_BACKOFF_MS;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The workspace this window shows; re-sent after every (re)connect. */
+  private watching: string | null = null;
 
   constructor(private readonly handlers: EventsSocketHandlers) {
     this.connect();
+  }
+
+  /**
+   * Tell the daemon which workspace this window is looking at. That registration
+   * — not "pulled recently" — is what gates the daemon's git backstop poll, so a
+   * quiet repo keeps being watched while a window is open, and nothing is polled
+   * once every window is closed.
+   */
+  watch(workspaceId: string | null): void {
+    this.watching = workspaceId;
+    this.sendWatch();
+  }
+
+  private sendWatch(): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "watch", workspace_id: this.watching }));
   }
 
   private connect(): void {
@@ -72,6 +90,8 @@ export class EventsSocket {
 
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: "auth", token: getToken() ?? "" }));
+      // Re-assert interest: a reconnect starts a fresh watcher registration.
+      this.sendWatch();
     };
 
     ws.onmessage = (ev: MessageEvent) => {

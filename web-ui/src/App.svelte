@@ -343,10 +343,18 @@
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
 
+  /** The daemon-wide events socket (created in onMount); used to register the
+   *  workspace this window watches, which gates the daemon's git backstop. */
+  let eventsSocket: EventsSocket | null = null;
+
   // Keep the git store pointed at the active workspace. It fetches status on
-  // change; the events-socket epoch nudge refetches on subsequent changes.
+  // change; the events-socket epoch nudge refetches on subsequent changes. The
+  // watch registration tells the daemon to keep polling this repo for
+  // out-of-band changes (a terminal `git` command, an external editor).
   $effect(() => {
-    void activateGitWorkspace(activeWsId);
+    const wsId = activeWsId;
+    void activateGitWorkspace(wsId);
+    eventsSocket?.watch(wsId);
   });
   // The rail groups terminals (few) above agents (many); this order is also
   // the mod+1–9 chord order and the focus-mode strip order, so what you see
@@ -537,6 +545,9 @@
         if (message === "unauthorized") notifyUnauthorized();
       },
     });
+    eventsSocket = events;
+    // Register this window's workspace so the daemon's git backstop polls it.
+    events.watch(activeWsId);
     refreshWorkspaces();
     void bootViewState();
     void loadSettings();

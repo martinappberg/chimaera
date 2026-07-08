@@ -917,23 +917,36 @@ setup into a new session. Distinctive, deferred.
     cost the budget forbids, and NFS/Lustre inotify is unreliable where Chimaera runs, so no
     file-watcher either). Recompute on signals the daemon already has: a daemon file save
     (`PUT /fs/file`), an **agent PostToolUse write** (`files_touched` is already ingested — the
-    signature integration: agent writes → tree lights up, zero polling), a linked-terminal
-    command completing (OSC 133 boundary), and explicit UI refresh. A slow (~10–15 s) backstop
-    poll, gated on "a client is actually looking at this workspace's git," catches out-of-band
-    external-editor edits; idle workspaces cost nothing.
+    signature integration: agent writes → tree lights up, zero polling), and explicit UI refresh.
+    A 12 s backstop poll catches out-of-band edits (an external editor, a `git` command in a
+    terminal) that fire no trigger. Its gate is an explicit **watch registration**: each
+    `/ws/events` connection sends `{type:"watch", workspace_id}` naming the workspace its window
+    shows, refcounted and released (RAII guard) on disconnect. Gating on "pulled recently" instead
+    is a trap — pulls only happen when something *changed*, so a recency window decays to zero on
+    a quiet repo and the backstop stops watching exactly when it is needed (found in live
+    verification, not in tests). With no window open, nothing is polled.
   - **Wire = invalidate-and-pull**, not push-the-payload. `/ws/events` gains only a tiny
-    `{type:"git", workspace_id, epoch}` nudge (the settings-generation trick); the client, if it
-    is showing that workspace, pulls `GET /api/v1/git/status?workspace_id=`. Big path-lists stay
-    off the daemon-wide firehose and materialize per-active-workspace. Diffs are always pull:
+    `{type:"git", epochs:{workspace_id: epoch}}` nudge (the settings-generation trick); the
+    client, if it is showing that workspace, pulls `GET /api/v1/git/status?workspace_id=`. Big
+    path-lists stay off the daemon-wide firehose and materialize per-active-workspace.
+    **The published-status hash is daemon-owned, not owned by whoever pulls**: a pull that
+    discovers an unannounced change bumps the epoch (and reports the post-bump epoch, so the
+    caller is already current and does not refetch) — otherwise one client's fetch would silently
+    absorb a change, hiding it from every other client *and* from the backstop. An event-driven
+    bump invalidates that baseline, so the pull it triggers adopts the new status without
+    double-announcing. Diffs are always pull:
     `GET /api/v1/git/diff?workspace_id=&path=&mode=unstaged|staged|head`, capped, with "binary
     differs" and "diff too large → open the file" fallbacks.
   - **Tree decoration is an overlay, not baked into `fs::list`** (status changes independently of
     directory contents, and the tree lists lazily per-dir): a client `gitStatus` store keyed by
     path (parallel to the `dirtyFiles` store), rolled up to collapsed ancestor folders on the
     client. VS Code's grammar, muted to the theme: filename tint + a single M/A/D/U/? badge at
-    the row's right edge; new `--git-*` tokens in `themes.ts`/`app.css` (both schemes); one
-    shared status→color helper reused by tree rows, pane tabs (a modified file's tab tints), and
-    the changes panel.
+    the row's right edge; new `--git-*` tokens in `app.css` for both schemes (semantic and shared
+    across every theme, like the `--ficon-*` fallbacks — status color is not a per-theme choice);
+    one shared status→color helper reused by tree rows, pane tabs (a modified file's tab tints),
+    and the changes panel. An epoch bump also **re-lists the visible directories**: a brand-new
+    untracked file has a status but no row to hang it on until its dir is re-listed, so without
+    that, "the agent just created three files" stays invisible.
   - **Diff is a new pane surface** `{surface:"diff", path, mode}` (the `FileTab`
     payload-carrying template): a diff tile *tiles next to the agent that produced the change*
     and participates in the context bridge (select a hunk → "reference in agent"). **Side-by-side

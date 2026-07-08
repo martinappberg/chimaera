@@ -8,7 +8,7 @@
   import { tick, untrack } from "svelte";
   import { fsList, type FsEntry } from "./files";
   import { getSetting } from "./settings/store.svelte";
-  import { gitIndex } from "./git";
+  import { gitIndex, gitStatus } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import FileIcon from "./FileIcon.svelte";
   import FolderIcon from "./FolderIcon.svelte";
@@ -139,6 +139,24 @@
     untrack(() => {
       if (hidden === lastHidden) return;
       lastHidden = hidden;
+      void load(root);
+      for (const dir of expanded) void load(dir);
+    });
+  });
+
+  // A git epoch bump means files may have APPEARED or vanished (an agent wrote
+  // a new file, a checkout removed one). Re-list every visible dir so the tree
+  // matches the status overlay — otherwise a brand-new untracked file carries a
+  // status the tree has no row to show it on. Plain `let` (not $state): written
+  // inside the effect that reads the epoch.
+  let lastGitEpoch = -1;
+  $effect(() => {
+    const epoch = $gitStatus?.epoch ?? -1;
+    untrack(() => {
+      if (epoch < 0 || epoch === lastGitEpoch) return;
+      const first = lastGitEpoch < 0;
+      lastGitEpoch = epoch;
+      if (first) return; // the initial fetch's listing is already current
       void load(root);
       for (const dir of expanded) void load(dir);
     });
