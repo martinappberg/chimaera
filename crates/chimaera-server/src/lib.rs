@@ -4,6 +4,7 @@ mod assets;
 mod fs;
 mod git;
 mod launcher;
+mod ledger;
 mod links;
 mod mcp;
 mod naming;
@@ -11,6 +12,8 @@ mod quickopen;
 mod recents;
 mod runtimes;
 mod settings;
+mod spawn;
+mod update;
 mod view_state;
 mod workspaces;
 mod ws;
@@ -48,6 +51,19 @@ pub(crate) struct AppState {
     /// Ended agent conversations per workspace (the rail's Recents section),
     /// persisted to `recents.json` on change.
     pub(crate) recents: Mutex<recents::RecentsStore>,
+    /// Bumped whenever the recents store changes; `/ws/events` pushes a
+    /// `recents` frame so the rail refetches instead of guessing at timing.
+    pub(crate) recents_epoch: std::sync::atomic::AtomicU64,
+    /// Durable session ledger (`sessions.json`): reconciled from live state,
+    /// consumed at boot to resurrect sessions across restarts. See `ledger`.
+    pub(crate) ledger: Mutex<ledger::LedgerStore>,
+    /// session id -> the scheme ("light"/"dark") it was spawned/themed for;
+    /// resurrection re-themes successors with it. Pruned by the reconciler.
+    pub(crate) session_themes: Mutex<HashMap<String, String>>,
+    /// What the daemon knows about newer releases (see `update`).
+    pub(crate) update: Mutex<update::UpdateStatus>,
+    /// Bumped when the update status changes; drives the `update` ws frame.
+    pub(crate) update_epoch: std::sync::atomic::AtomicU64,
     /// User settings (the settings.json ground truth), stored in the config
     /// dir; mtime-checked on read so hand-edits surface without a restart.
     pub(crate) settings: Mutex<settings::SettingsStore>,
@@ -139,6 +155,11 @@ impl AppState {
                 data_dir.join("view-state.json"),
             )),
             recents: Mutex::new(recents::RecentsStore::load(data_dir.join("recents.json"))),
+            recents_epoch: std::sync::atomic::AtomicU64::new(0),
+            ledger: Mutex::new(ledger::LedgerStore::new(data_dir.join("sessions.json"))),
+            session_themes: Mutex::new(HashMap::new()),
+            update: Mutex::new(update::UpdateStatus::default()),
+            update_epoch: std::sync::atomic::AtomicU64::new(0),
             settings: Mutex::new(settings::SettingsStore::load(
                 config_dir.join("settings.json"),
             )),
@@ -199,6 +220,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/agents/{id}/install", post(runtimes::install_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
+        .route("/update", get(update::get_update))
         .route(
             "/view-state/{key}",
             get(view_state::get_view_state).put(view_state::put_view_state),
@@ -254,12 +276,34 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", cfg.port.unwrap_or(0)))
-        .await
-        .context("failed to bind 127.0.0.1")?;
+    // A predecessor that stopped gracefully left a handoff: rebind its port
+    // with its token so ssh forwards stay valid and every client heals with
+    // a plain reconnect — the "update without losing your windows" half of
+    // the restart story (the ledger is the sessions half). An explicit
+    // conflicting --port wins over the handoff; a crash never leaves one.
+    let (listener, token) = match chimaera_core::Handoff::consume()
+        .filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
+    {
+        Some(handoff) => match rebind(handoff.port).await {
+            Some(listener) => (listener, handoff.token),
+            None => {
+                tracing::warn!(
+                    port = handoff.port,
+                    "handoff port still busy; starting fresh"
+                );
+                (
+                    fresh_listener(cfg.port).await?,
+                    chimaera_core::generate_token(),
+                )
+            }
+        },
+        None => (
+            fresh_listener(cfg.port).await?,
+            chimaera_core::generate_token(),
+        ),
+    };
     let port = listener.local_addr()?.port();
 
-    let token = chimaera_core::generate_token();
     let hostname = hostname::get()
         .context("failed to read hostname")?
         .to_string_lossy()
@@ -303,14 +347,49 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // `git` commands); event-driven refresh covers the rest. Idle-cheap.
     tokio::spawn(git::backstop_poll(state.clone()));
 
-    axum::serve(listener, app(state))
+    // Session ledger: consume what the previous daemon left (resurrect /
+    // retire), then keep sessions.json reconciled until shutdown.
+    tokio::spawn(ledger::run(state.clone()));
+
+    // Release awareness (GET /api/v1/update + the `update` ws frame).
+    tokio::spawn(update::run_checker(state.clone()));
+
+    axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
 
+    // Graceful stop = planned: flush the ledger (the reconciler's last write
+    // may be a few seconds stale) and leave a handoff so a successor within
+    // the freshness window keeps this port + token. Sessions die with this
+    // process — the ledger written here is exactly what resurrects them.
+    let (entries, links) = ledger::snapshot(&state);
+    lock(&state.ledger).write_if_changed(&entries, &links);
+    if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
+        tracing::warn!(%err, "failed to write restart handoff");
+    }
+
     chimaera_core::Manifest::remove().context("failed to remove manifest")?;
     tracing::info!("chimaera daemon stopped");
     Ok(())
+}
+
+async fn fresh_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
+        .await
+        .context("failed to bind 127.0.0.1")
+}
+
+/// Try the handoff port for ~5s: the predecessor releases it at exit, but
+/// its teardown can lag the successor's start.
+async fn rebind(port: u16) -> Option<TcpListener> {
+    for _ in 0..20 {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+            return Some(listener);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    None
 }
 
 /// Resolve when SIGINT (ctrl-c) or SIGTERM is received.
@@ -5960,6 +6039,175 @@ mod tests {
         assert_eq!(session["cols"], 80);
         assert_eq!(session["rows"], 24);
         state.sessions.kill(session["id"].as_str().unwrap()).ok();
+    }
+
+    /// The stateful-restart contract end to end: a live shell recorded in
+    /// the ledger comes back UNDER THE SAME SESSION ID after a "restart"
+    /// (a second AppState over the same data dir) — at its cwd, with its
+    /// pinned name and theme — while a non-resumable agent entry retires
+    /// into the workspace's recents instead of vanishing.
+    #[tokio::test]
+    async fn ledger_resurrects_sessions_across_restart() {
+        let data = test_dir("ledger-restart");
+        let state = test_state_with_data_dir(0, data.clone());
+        // Canonicalized like create_workspace canonicalizes it (macOS /var
+        // is a symlink to /private/var).
+        let root = std::fs::canonicalize(test_dir("ledger-restart-root")).unwrap();
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+
+        let (status, session) = request(
+            &state,
+            Method::POST,
+            "/api/v1/sessions",
+            Some(serde_json::json!({
+                "workspace_id": workspace_id,
+                "name": "data wrangling",
+                "theme": "light",
+                "cols": 132,
+                "rows": 43,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "spawn failed: {session}");
+        let sid = session["id"].as_str().unwrap().to_string();
+
+        // Persist the ledger the way the reconcile loop would, then kill the
+        // PTY: the "daemon" is going down, taking its children with it.
+        let (entries, links) = ledger::snapshot(&state);
+        assert_eq!(entries.len(), 1, "the live shell is in the ledger");
+        lock(&state.ledger).write_if_changed(&entries, &links);
+        state.sessions.kill(&sid).ok();
+
+        // "Restart": a fresh AppState over the same data dir. The boot
+        // ledger carries the shell — plus an agent entry we add by hand (a
+        // codex conversation the old daemon was running), which cannot
+        // resurrect and must retire into recents.
+        let state2 = test_state_with_data_dir(0, data);
+        let mut boot = lock(&state2.ledger).load_boot();
+        assert_eq!(boot.sessions.len(), 1);
+        boot.sessions.push(ledger::LedgerEntry {
+            id: "s-dead-codex".to_string(),
+            workspace_id: workspace_id.clone(),
+            cwd: root.clone(),
+            pinned_name: None,
+            cols: 80,
+            rows: 24,
+            theme: "dark".to_string(),
+            agent: Some(ledger::LedgerAgent {
+                kind: agents::AgentKind::Codex,
+                resume: None,
+                title: "port the parser".to_string(),
+            }),
+        });
+        ledger::restore(&state2, boot).await;
+
+        // The shell is back under ITS OLD ID — that identity is what lets
+        // every persisted layout tab rebind without migration.
+        let infos = state2.sessions.list();
+        assert_eq!(infos.len(), 1, "exactly the shell respawned");
+        let info = &infos[0];
+        assert_eq!(info.id, sid, "session id survives the restart");
+        assert_eq!(info.cwd, root);
+        assert_eq!(info.name, "data wrangling");
+        assert!(info.renamed, "the pinned name stays pinned");
+        assert_eq!((info.cols, info.rows), (132, 43));
+        assert_eq!(
+            lock(&state2.session_workspaces).get(&sid),
+            Some(&workspace_id)
+        );
+        assert_eq!(
+            lock(&state2.session_themes).get(&sid).map(String::as_str),
+            Some("light"),
+            "the spawn theme carries across"
+        );
+
+        // The codex conversation retired into recents (resumable rows are
+        // the statefulness story for agents that cannot resurrect).
+        let recents = lock(&state2.recents).list(&workspace_id);
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].title, "port the parser");
+        assert_eq!(recents[0].kind, agents::AgentKind::Codex);
+        assert!(
+            state2
+                .recents_epoch
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "the recents epoch moved so the rail refetches"
+        );
+
+        state2.sessions.kill(&sid).ok();
+    }
+
+    /// Restore is opt-out: with `daemon.restoreSessions` false the shell is
+    /// dropped, but agent conversations still retire into recents — turning
+    /// restore off must never make history vanish.
+    #[tokio::test]
+    async fn ledger_restore_disabled_still_lands_recents() {
+        let data = test_dir("ledger-optout");
+        let state = test_state_with_data_dir(0, data.clone());
+        let root = test_dir("ledger-optout-root");
+        let (_, ws) = request(
+            &state,
+            Method::POST,
+            "/api/v1/workspaces",
+            Some(serde_json::json!({"root": root.to_string_lossy()})),
+        )
+        .await;
+        let workspace_id = ws["id"].as_str().unwrap().to_string();
+        let (status, _) = request(
+            &state,
+            Method::PUT,
+            "/api/v1/settings",
+            Some(serde_json::json!({"daemon.restoreSessions": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let boot = ledger::BootLedger {
+            sessions: vec![
+                ledger::LedgerEntry {
+                    id: "s-shell".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    cwd: root.clone(),
+                    pinned_name: None,
+                    cols: 80,
+                    rows: 24,
+                    theme: "dark".to_string(),
+                    agent: None,
+                },
+                ledger::LedgerEntry {
+                    id: "s-claude".to_string(),
+                    workspace_id: workspace_id.clone(),
+                    cwd: root.clone(),
+                    pinned_name: None,
+                    cols: 80,
+                    rows: 24,
+                    theme: "dark".to_string(),
+                    agent: Some(ledger::LedgerAgent {
+                        kind: agents::AgentKind::Claude,
+                        resume: Some("conv-1".to_string()),
+                        title: "fix the flaky tests".to_string(),
+                    }),
+                },
+            ],
+            links: std::collections::HashMap::new(),
+            written_at: 1_750_000_000,
+        };
+        ledger::restore(&state, boot).await;
+
+        assert!(state.sessions.list().is_empty(), "nothing respawns");
+        let recents = lock(&state.recents).list(&workspace_id);
+        assert_eq!(recents.len(), 1, "the conversation is still findable");
+        assert_eq!(recents[0].title, "fix the flaky tests");
+        assert_eq!(recents[0].resume.as_deref(), Some("conv-1"));
+        assert_eq!(recents[0].last_active, 1_750_000_000);
     }
 
     #[tokio::test]

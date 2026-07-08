@@ -187,6 +187,107 @@ impl Manifest {
     }
 }
 
+/// Carryover from a daemon stopped for a *planned* restart (update/replace):
+/// the successor rebinds the same port with the same token, so existing ssh
+/// forwards stay valid and every attached client heals with a plain WebSocket
+/// reconnect — no re-home, no re-auth. Written by whoever drives the restart
+/// (the app, `chimaera connect`), consumed exactly once by the next `serve`.
+/// A crash never writes one, so unplanned restarts keep fresh credentials.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Handoff {
+    pub port: u16,
+    pub token: String,
+    /// Unix seconds at write time; stale files are ignored (a handoff is only
+    /// meaningful for the restart it was written for).
+    pub written_at: u64,
+}
+
+/// A handoff older than this is orphaned (the planned restart never happened
+/// or already consumed a fallback path) and must not resurrect its token.
+const HANDOFF_MAX_AGE_SECS: u64 = 120;
+
+impl Handoff {
+    /// Path of the handoff file: `data_dir()/handoff.json`.
+    pub fn path() -> PathBuf {
+        data_dir().join("handoff.json")
+    }
+
+    pub fn new(port: u16, token: String) -> Self {
+        let written_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Handoff {
+            port,
+            token,
+            written_at,
+        }
+    }
+
+    /// Atomically write the handoff (tmp + rename), mode 0600 — it carries
+    /// the bearer token.
+    pub fn write(&self) -> anyhow::Result<()> {
+        self.write_at(&Self::path())
+    }
+
+    /// Take the pending handoff: read it, delete the file, and return it only
+    /// if fresh. Consume-once semantics — even a stale or unparsable file is
+    /// removed, so a dead handoff can never linger and leak an old token into
+    /// some later boot.
+    pub fn consume() -> Option<Handoff> {
+        Self::consume_at(&Self::path())
+    }
+
+    /// [`Handoff::write`] against an explicit path (pure of [`data_dir`], so
+    /// tests need no HOME mutation — the same split as [`data_dir_in`]).
+    pub fn write_at(&self, path: &Path) -> anyhow::Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// [`Handoff::consume`] against an explicit path.
+    pub fn consume_at(path: &Path) -> Option<Handoff> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!("failed to remove {}: {e}", path.display());
+        }
+        let handoff: Handoff = serde_json::from_str(&contents).ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (now.saturating_sub(handoff.written_at) <= HANDOFF_MAX_AGE_SECS).then_some(handoff)
+    }
+}
+
+/// Parse `x.y.z` (an optional leading `v` is tolerated — release tags carry
+/// one) into a comparable tuple. Anything else is `None`: pre-release or
+/// exotic versions never win a comparison by accident.
+pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+/// Whether `latest` denotes a strictly newer release than `current`. Dev
+/// builds (the `0.0.1` workspace sentinel — never a published tag) are never
+/// "outdated": a dev daemon nagging about GitHub releases is noise.
+pub fn release_is_newer(current: &str, latest: &str) -> bool {
+    if current == "0.0.1" {
+        return false;
+    }
+    match (parse_version(current), parse_version(latest)) {
+        (Some(cur), Some(new)) => new > cur,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +378,59 @@ mod tests {
             "timestamp is unix secs: {secs}"
         );
         assert_eq!(build_ref(BUILD_ID), source);
+    }
+
+    #[test]
+    fn version_parse_and_release_comparison() {
+        assert_eq!(parse_version("0.6.0"), Some((0, 6, 0)));
+        assert_eq!(parse_version("v1.2.30"), Some((1, 2, 30)));
+        assert_eq!(parse_version("1.2"), None);
+        assert_eq!(parse_version("1.2.3.4"), None);
+        assert_eq!(parse_version("1.2.x"), None);
+        assert_eq!(parse_version(""), None);
+
+        assert!(release_is_newer("0.5.0", "v0.6.0"));
+        assert!(release_is_newer("0.5.9", "0.5.10"));
+        assert!(!release_is_newer("0.6.0", "v0.6.0"));
+        assert!(!release_is_newer("0.6.1", "v0.6.0"));
+        // Unparsable versions never win.
+        assert!(!release_is_newer("0.5.0", "v0.6.0-rc1"));
+        // The dev sentinel is never outdated.
+        assert!(!release_is_newer("0.0.1", "v99.0.0"));
+    }
+
+    #[test]
+    fn handoff_consume_once_and_freshness() {
+        // Explicit-path variants: no HOME mutation (which would race the
+        // manifest test across parallel test threads).
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-handoff-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handoff.json");
+
+        assert!(Handoff::consume_at(&path).is_none(), "no handoff yet");
+
+        let h = Handoff::new(43_211, "tok".to_string());
+        h.write_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "handoff carries the token");
+        let taken = Handoff::consume_at(&path).expect("fresh handoff consumed");
+        assert_eq!((taken.port, taken.token.as_str()), (43_211, "tok"));
+        assert!(Handoff::consume_at(&path).is_none(), "consume-once");
+
+        // Stale handoffs are removed AND rejected.
+        let stale = Handoff {
+            written_at: 1_000,
+            ..Handoff::new(43_212, "old".to_string())
+        };
+        stale.write_at(&path).unwrap();
+        assert!(
+            Handoff::consume_at(&path).is_none(),
+            "stale handoff rejected"
+        );
+        assert!(!path.exists(), "stale file removed");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

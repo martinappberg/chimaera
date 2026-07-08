@@ -242,6 +242,11 @@ pub(crate) fn retire(
                 .unwrap_or(0),
         };
         crate::lock(&state.recents).push(&workspace_id, entry, record.resumed_from.as_deref());
+        // The epoch rides /ws/events so the rail refetches exactly when a
+        // row landed, instead of guessing at the watch loop's timing.
+        state
+            .recents_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     state.changes.notify_waiters();
 }

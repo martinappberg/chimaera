@@ -36,6 +36,9 @@ pub(crate) async fn health(State(state): State<Arc<AppState>>) -> Json<serde_jso
     Json(json!({
         "name": "chimaera",
         "version": chimaera_core::VERSION,
+        // The build id lets clients spot daemon/client skew (semver is the
+        // 0.0.1 sentinel on every dev build, so it cannot).
+        "build": chimaera_core::BUILD_ID,
         "hostname": state.hostname,
         "pid": state.pid,
         "uptime_secs": state.started.elapsed().as_secs(),
@@ -302,7 +305,9 @@ pub(crate) fn spawn_path(shims: &str, inherited: &str) -> String {
 /// agent TUI (kind "agent") at the workspace root. Claude agents get the
 /// injected hook settings (and `--model`/`--resume` when given); codex and
 /// gemini spawn their TUIs as plain PTY sessions — hook-driven attention
-/// state stays claude-only until their integrations land.
+/// state stays claude-only until their integrations land. Validation lives
+/// here; the spawn itself is `spawn::spawn_session`, shared with boot
+/// resurrection.
 pub(crate) async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSession>,
@@ -329,194 +334,66 @@ pub(crate) async fn create_session(
         }
     };
 
-    // Every session gets a pre-picked id: it rides in the spawn env as
-    // CHIMAERA_SESSION (shells too — typed agents need their session
-    // context) and, for claude, in the hook URL.
-    let id = crate::agents::fresh_session_id();
-    let mut opts = chimaera_pty::SpawnOpts {
-        cwd: workspace.root.clone(),
-        name: body.name,
-        cols: body.cols.map_or(80, |c| c.clamp(20, 500)),
-        rows: body.rows.map_or(24, |r| r.clamp(5, 200)),
-        command: None,
-        id: Some(id.clone()),
-        env: session_env(&state, &id, theme),
-        // settings.json ground truth; applies to sessions spawned from now on.
-        scrollback: crate::lock(&state.settings).scrollback_lines(),
+    let kind = match body.kind {
+        SessionKind::Shell => crate::spawn::SpawnKind::Shell,
+        SessionKind::Agent => {
+            let agent_kind = match &body.agent {
+                None => crate::agents::AgentKind::Claude,
+                Some(name) => match crate::agents::AgentKind::parse(name) {
+                    Some(kind) => kind,
+                    None => {
+                        // Derived, not hand-written: the catalog moves.
+                        let known: Vec<&str> = crate::agents::AgentKind::ALL
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect();
+                        return bad_request(format!(
+                            "unknown agent {name:?} (expected one of {})",
+                            known.join(", ")
+                        ));
+                    }
+                },
+            };
+            if body.resume.is_some() && agent_kind != crate::agents::AgentKind::Claude {
+                return bad_request("resume is only supported for claude sessions".to_string());
+            }
+            // Argv cannot shell-inject, but flag-shaped or control-byte values
+            // have no business in --model/--resume.
+            for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
+                if let Some(value) = value {
+                    if !crate::launcher::safe_arg(value) {
+                        return bad_request(format!("invalid {field} {value:?}"));
+                    }
+                }
+            }
+            crate::spawn::SpawnKind::Agent {
+                kind: agent_kind,
+                model: body.model,
+                resume: body.resume,
+            }
+        }
     };
 
-    // Plain shells get shell integration injected (OSC 133 journal marks);
-    // a failure to materialize the scripts degrades to a plain spawn. Its
-    // env lands ON TOP of the session env (shims PATH, CHIMAERA_*) — the
-    // two use disjoint variable sets, so nothing is clobbered.
-    if body.kind == SessionKind::Shell {
-        match chimaera_core::shellint::shell_launch() {
-            Ok(launch) => {
-                opts.command = Some(launch.argv);
-                opts.env.extend(launch.env);
-            }
-            Err(err) => {
-                tracing::warn!(%err, "shell integration unavailable; spawning plain shell");
-            }
+    let spec = crate::spawn::SpawnSpec {
+        workspace,
+        id: None,
+        name: body.name,
+        cwd: None,
+        cols: body.cols,
+        rows: body.rows,
+        theme: theme.to_string(),
+        kind,
+    };
+    match crate::spawn::spawn_session(&state, spec).await {
+        Ok(session) => Json(session).into_response(),
+        Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => {
+            (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
         }
-    }
-
-    // Agent sessions: resolve the agent binary (cached, via the login
-    // shell; user install first, managed fallback), and — for claude —
-    // generate the per-session settings file that wires its hooks to this
-    // daemon and carries the scheme theme.
-    let mut spawned_agent = None;
-    if body.kind == SessionKind::Agent {
-        let agent_kind = match &body.agent {
-            None => crate::agents::AgentKind::Claude,
-            Some(name) => match crate::agents::AgentKind::parse(name) {
-                Some(kind) => kind,
-                None => {
-                    // Derived, not hand-written: the catalog moves.
-                    let known: Vec<&str> = crate::agents::AgentKind::ALL
-                        .iter()
-                        .map(|k| k.as_str())
-                        .collect();
-                    return bad_request(format!(
-                        "unknown agent {name:?} (expected one of {})",
-                        known.join(", ")
-                    ));
-                }
-            },
-        };
-        if body.resume.is_some() && agent_kind != crate::agents::AgentKind::Claude {
-            return bad_request("resume is only supported for claude sessions".to_string());
-        }
-        // Argv cannot shell-inject, but flag-shaped or control-byte values
-        // have no business in --model/--resume.
-        for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
-            if let Some(value) = value {
-                if !crate::launcher::safe_arg(value) {
-                    return bad_request(format!("invalid {field} {value:?}"));
-                }
-            }
-        }
-
-        let bin = match crate::launcher::detect(&state, agent_kind, false)
-            .await
-            .path
-        {
-            Ok(path) => path,
-            Err(msg) => {
-                return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
-            }
-        };
-        let key = crate::agents::fresh_agent_key();
-        // Hook injection is claude-only: other agents have no hook system
-        // to wire, so their sessions stay honestly "unknown". The scheme
-        // theme rides in the same settings file — unless the user's own
-        // settings already set one (respect the explicit choice).
-        let settings = if agent_kind == crate::agents::AgentKind::Claude {
-            let settings_theme =
-                (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-                    .then_some(theme);
-            match crate::agents::write_settings(&id, &key, state.port, settings_theme) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    tracing::error!(%err, "failed to write agent settings");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": err.to_string()})),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            None
-        };
-        // Codex themes via `-c tui.theme=` (config-file override, verified
-        // against codex 0.142.5); skipped when the user's own config.toml
-        // picks a theme.
-        let codex_theme = (agent_kind == crate::agents::AgentKind::Codex
-            && !crate::runtimes::codex_user_theme_set(&state.codex_config_path))
-        .then(|| crate::runtimes::codex_theme_name(theme));
-        // Claude also carries the linked-terminals MCP config (per-session
-        // endpoint + key); other agents' MCP integrations come later.
-        let mcp_config = if agent_kind == crate::agents::AgentKind::Claude {
-            match crate::agents::write_mcp_config(&id, &key, state.port) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    tracing::error!(%err, "failed to write agent mcp config");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": err.to_string()})),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            None
-        };
-        let mut argv = crate::launcher::build_agent_command(
-            agent_kind,
-            &bin,
-            settings.as_deref(),
-            body.model.as_deref(),
-            body.resume.as_deref(),
-            codex_theme,
-        );
-        if let Some(mcp) = &mcp_config {
-            argv.push("--mcp-config".to_string());
-            argv.push(mcp.to_string_lossy().into_owned());
-        }
-        // Login-shell wrap: agents must see the user's terminal environment
-        // (exported API keys, nvm PATHs) — the daemon's own env never
-        // sourced their profile.
-        opts.command = Some(crate::launcher::wrap_login_shell(
-            &crate::launcher::login_shell(),
-            argv,
-        ));
-        // Register the record before spawning so no hook can beat it in.
-        let mut record = crate::agents::AgentRecord::new(key.clone(), agent_kind);
-        // Claude forks a new session id on --resume; remember the ancestor
-        // so recents can hide (and later supersede) the old conversation.
-        record.resumed_from = body.resume.clone();
-        crate::lock(&state.agents).insert(id.clone(), record);
-        spawned_agent = Some((key, agent_kind));
-    }
-
-    match state.sessions.spawn(opts.clone()) {
-        Ok(info) => {
-            crate::lock(&state.session_workspaces).insert(info.id.clone(), workspace.id.clone());
-            let agent = spawned_agent.map(|(key, kind)| crate::agents::AgentRecord::new(key, kind));
-            let mut polled = None;
-            if agent.is_some() {
-                crate::agents::spawn_agent_watch(state.clone(), info.id.clone());
-            } else {
-                // Prime the display name (a fresh shell sits at the root, so
-                // it is the shell itself) and start the naming watcher.
-                let shell = crate::naming::default_shell_name();
-                crate::lock(&state.display_names).insert(info.id.clone(), shell.clone());
-                polled = Some(shell);
-                crate::naming::spawn_shell_watch(state.clone(), info.id.clone());
-            }
-            state.changes.notify_waiters();
-            Json(session_json(
-                &info,
-                Some(workspace.id),
-                agent.as_ref(),
-                polled.as_deref(),
-                None, // fresh session: cwd_current is the spawn cwd
-                None, // no exec in flight
-            ))
-            .into_response()
-        }
-        Err(err) => {
-            if let Some(id) = &opts.id {
-                crate::lock(&state.agents).remove(id);
-            }
-            tracing::error!(%err, "failed to spawn session");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
-        }
+        Err(crate::spawn::SpawnFailure::Internal(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
     }
 }
 

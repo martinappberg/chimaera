@@ -130,6 +130,24 @@ impl SettingsStore {
         Some(v.clamp(200, 1_000_000) as usize)
     }
 
+    /// Daemon-consumed key: resurrect sessions from the ledger when the
+    /// daemon restarts (see `ledger`).
+    pub(crate) fn restore_sessions(&mut self) -> bool {
+        self.current()
+            .get("daemon.restoreSessions")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    /// Daemon-consumed key: periodically check GitHub for newer releases
+    /// (see `update`).
+    pub(crate) fn update_auto_check(&mut self) -> bool {
+        self.current()
+            .get("update.autoCheck")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Daemon-consumed key: directory names quick-open skips while walking.
     /// None = the built-in default list.
     pub(crate) fn quickopen_ignore_dirs(&mut self) -> Option<Vec<String>> {
