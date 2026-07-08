@@ -20,7 +20,12 @@ interface TauriGlobal {
       handler: (e: { payload: T }) => void,
     ) => Promise<() => void>;
   };
-  window: { getCurrentWindow: () => { close: () => Promise<void> } };
+  window: {
+    getCurrentWindow: () => {
+      close: () => Promise<void>;
+      setTitle: (title: string) => Promise<void>;
+    };
+  };
   webviewWindow: {
     getCurrentWebviewWindow: () => {
       listen: <T>(
@@ -354,6 +359,15 @@ export function onMenu(handler: (action: string) => void): Promise<() => void> {
 /** Close this native window (menu Cmd+W on a home window). */
 export function closeThisWindow(): void {
   void tauri()?.window.getCurrentWindow().close();
+}
+
+/**
+ * Set this native window's OS titlebar. The webview does NOT mirror
+ * document.title to the native title, so the SPA pushes it here (workspace +
+ * host) as the scope changes. No-op in a browser — the tab uses document.title.
+ */
+export function setNativeWindowTitle(title: string): void {
+  void tauri()?.window.getCurrentWindow().setTitle(title);
 }
 
 /**

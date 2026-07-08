@@ -144,6 +144,7 @@
     onLocalDaemonUpdated,
     onMenu,
     reportWindowScope,
+    setNativeWindowTitle,
     shellBuild,
   } from "./lib/native";
   import UpdateToast from "./lib/UpdateToast.svelte";
@@ -1142,8 +1143,21 @@
   }
 
   $effect(() => {
-    const base = workspace ? `${workspace.name} — chimaera` : "chimaera";
-    document.title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
+    // A remote window wears its host so a wall of similar windows is legible:
+    //   "crc_finish • Sherlock — chimaera"  (remote, in a workspace)
+    //   "crc_finish — chimaera"             (local — the host is implicit)
+    // Home (no workspace) drops the workspace but keeps the host when remote.
+    const host = isRemoteWindow ? hostAlias : null;
+    const scope = workspace
+      ? host
+        ? `${workspace.name} • ${host}`
+        : workspace.name
+      : (host ?? "");
+    const base = scope ? `${scope} — chimaera` : "chimaera";
+    const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
+    document.title = title;
+    // The native titlebar doesn't follow document.title — push it explicitly.
+    setNativeWindowTitle(title);
   });
 
   /**
