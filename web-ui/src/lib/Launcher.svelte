@@ -34,9 +34,12 @@
     onPick: (pick: LaunchPick) => void;
     onInstall: (agent: AgentInfo) => void;
     onClose: () => void;
+    /** Report the freshly-probed catalog up so the split button reflects it
+     *  (this popover always re-detects on open). */
+    onAgents?: (agents: AgentInfo[]) => void;
   }
 
-  let { anchor, onPick, onInstall, onClose }: Props = $props();
+  let { anchor, onPick, onInstall, onClose, onAgents }: Props = $props();
 
   let agents = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
@@ -69,6 +72,7 @@
     void listAgents()
       .then((a) => {
         agents = a;
+        onAgents?.(a);
         hl = Math.max(
           0,
           a.findIndex((x) => x.id === def.agent),
@@ -78,7 +82,10 @@
         // would never surface. Show the cached rows instantly, then
         // re-detect in the background and swap in the truth.
         return listAgents(true).then((fresh) => {
-          if (fresh.length > 0) agents = fresh;
+          if (fresh.length > 0) {
+            agents = fresh;
+            onAgents?.(fresh);
+          }
         });
       })
       .catch((e) => {
