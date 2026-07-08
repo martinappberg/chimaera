@@ -47,16 +47,59 @@
       ? []
       : listing.dirs.filter((d) => d.name.toLowerCase().includes(input.trim().toLowerCase())),
   );
+
+  // --- typed-path completion -------------------------------------------------
+  // When the filter holds an absolute/~ path, list the children of its deepest
+  // directory and match the trailing segment — shell-style tab completion,
+  // replacing the old dead-end that only ever offered "open this folder".
+  let pathDirs = $state<DirEntry[]>([]);
+  /** The directory `pathDirs` was listed from (dedupes refetches per keystroke). */
+  let pathBase = $state("");
+  /** The typed path's directory was capped by the daemon. */
+  let pathTruncated = $state(false);
+  /** Monotonic guard so a slow listing can't clobber a newer one. */
+  let pathSeq = 0;
+
+  /** Split a typed path into (dir, trailing segment). */
+  function splitTyped(p: string): { dir: string; tail: string } {
+    const slash = p.lastIndexOf("/");
+    if (slash < 0) return { dir: p, tail: "" };
+    return { dir: p.slice(0, slash + 1), tail: p.slice(slash + 1) };
+  }
+
+  /** Case-insensitive subsequence match (both args already lowercased). */
+  function subseq(needle: string, hay: string): boolean {
+    if (needle === "") return true;
+    let i = 0;
+    for (const c of hay) {
+      if (c === needle[i] && ++i === needle.length) return true;
+    }
+    return false;
+  }
+
+  /** Children of the typed path's directory, filtered by its trailing segment. */
+  const pathMatches = $derived.by((): DirEntry[] => {
+    if (typedPath === null) return [];
+    const t = splitTyped(typedPath).tail.toLowerCase();
+    return t === "" ? pathDirs : pathDirs.filter((d) => subseq(t, d.name.toLowerCase()));
+  });
+
+  /** The navigable dirs under the "open this folder" row, in whichever mode is
+   *  active (typed-path completion vs. filtering the browsed directory). */
+  const browseDirs = $derived(typedPath !== null ? pathMatches : filtered);
+
+  /** The active directory was capped by the daemon (very large folder). */
+  const listTruncated = $derived(typedPath !== null ? pathTruncated : (listing?.truncated ?? false));
+
   const rows = $derived.by((): Row[] => {
     const out: Row[] = [];
     if (showRecents) {
       for (const ws of recents) out.push({ kind: "recent", ws });
     }
-    if (typedPath !== null) {
-      out.push({ kind: "here", path: typedPath });
-    } else if (listing !== null) {
-      out.push({ kind: "here", path: listing.path });
-      for (const dir of filtered) out.push({ kind: "dir", dir });
+    const here = typedPath ?? listing?.path ?? null;
+    if (here !== null) {
+      out.push({ kind: "here", path: here });
+      for (const dir of browseDirs) out.push({ kind: "dir", dir });
     }
     return out;
   });
@@ -90,8 +133,23 @@
       highlight = 0;
       return;
     }
-    // Prefer the first subdirectory (Enter descends); fall back to
-    // "open this folder" when nothing matches.
+    // When completing a path, prefer an exact match of the typed segment so
+    // Enter on "/oak/stanford" descends into stanford even if other fuzzy
+    // matches sort ahead of it.
+    if (typedPath !== null) {
+      const tail = splitTyped(typedPath).tail.toLowerCase();
+      if (tail !== "") {
+        const exact = rows.findIndex(
+          (r) => r.kind === "dir" && r.dir.name.toLowerCase() === tail,
+        );
+        if (exact >= 0) {
+          highlight = exact;
+          return;
+        }
+      }
+    }
+    // Else the first subdirectory (Enter descends); fall back to "open this
+    // folder" when nothing matches.
     const firstDir = rows.findIndex((r) => r.kind === "dir");
     highlight = firstDir >= 0 ? firstDir : 0;
   }
@@ -158,20 +216,18 @@
       if (parent) void navigate(parent);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      if (e.metaKey || e.ctrlKey) {
-        void openHere(rowPath(rows[highlight]));
-        return;
-      }
-      const typed = input.trim();
-      if (typed.startsWith("/") || typed.startsWith("~")) {
-        void navigate(typed);
-        return;
-      }
       const row = rows[highlight];
-      if (row === undefined) return;
-      if (row.kind === "dir") {
+      // Cmd/Ctrl+Enter always opens the highlighted target as a workspace.
+      if (e.metaKey || e.ctrlKey) {
+        void openHere(rowPath(row));
+        return;
+      }
+      // Follow the highlight: a directory descends (this is how a typed path
+      // is entered — its matching completion is highlighted), "open this
+      // folder" opens the current/typed path as a workspace.
+      if (row?.kind === "dir") {
         void navigate(row.dir.path);
-      } else {
+      } else if (row !== undefined) {
         void openHere(rowPath(row));
       }
     }
@@ -206,6 +262,39 @@
     void listing?.path;
     const el = crumbsEl;
     if (el) el.scrollLeft = el.scrollWidth;
+  });
+
+  // Fetch the typed path's directory (debounced) so completions appear as you
+  // type. `pathSeq` drops stale responses; the cleanup cancels a pending fetch
+  // when the path changes again, so keystrokes never stack up requests.
+  $effect(() => {
+    const tp = typedPath;
+    if (tp === null) {
+      pathDirs = [];
+      pathBase = "";
+      return;
+    }
+    const { dir } = splitTyped(tp);
+    if (dir === pathBase) return; // same directory already listed — just refilter
+    const seq = ++pathSeq;
+    const timer = setTimeout(() => {
+      void fsDirs(dir)
+        .then((l) => {
+          if (seq !== pathSeq) return;
+          pathDirs = l.dirs;
+          pathTruncated = l.truncated ?? false;
+          pathBase = dir;
+          resetHighlight();
+        })
+        .catch(() => {
+          if (seq !== pathSeq) return;
+          // Parent doesn't exist yet: no completions, just "open this folder".
+          pathDirs = [];
+          pathTruncated = false;
+          pathBase = dir;
+        });
+    }, 120);
+    return () => clearTimeout(timer);
   });
 </script>
 
@@ -314,7 +403,7 @@
             {@render newWindow(herePath)}
           </div>
         {/if}
-        {#each filtered as dir, j (dir.path)}
+        {#each browseDirs as dir, j (dir.path)}
           {@const idx = browseOffset + 1 + j}
           <div
             class="rowwrap"
@@ -336,6 +425,9 @@
             {@render newWindow(dir.path)}
           </div>
         {/each}
+        {#if listTruncated}
+          <div class="trunc">large folder — showing the first {browseDirs.length}. narrow your filter.</div>
+        {/if}
       {/if}
     </div>
   </div>
@@ -451,6 +543,12 @@
     padding: 8px;
     font-size: var(--text-sm);
     color: var(--err);
+  }
+
+  .trunc {
+    padding: 6px 8px 2px;
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   .rowwrap {

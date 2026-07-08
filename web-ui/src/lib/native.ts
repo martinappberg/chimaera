@@ -176,6 +176,55 @@ export function onConnectProgress(
   return t.event.listen<ConnectProgress>("connect-progress", (e) => handler(e.payload));
 }
 
+/** Live tunnel liveness pushed by the shell (health monitor + reconnect). */
+export interface HostStatusEvent {
+  alias: string;
+  /** "down" = the forward stopped accepting (remote daemon or ssh died). */
+  status: "connected" | "down";
+  /** Local end of the tunnel (may change across a reconnect). */
+  local_port: number | null;
+  /** New daemon token, on "connected" only — lets a window re-home if the
+   *  remote daemon restarted. Absent on "down". */
+  token?: string;
+}
+
+/**
+ * Subscribe to tunnel liveness transitions. Broadcast to every window, so a
+ * handler filters on its own host alias. A remote window uses `down` to arm
+ * its reconnect overlay and `connected` to re-home when the port/token moved;
+ * the home screen uses it to keep host rows live. Returns an unsubscribe.
+ */
+export function onHostStatus(
+  handler: (e: HostStatusEvent) => void,
+): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<HostStatusEvent>("host-status", (e) => handler(e.payload));
+}
+
+/**
+ * Tell the shell what this window now shows so focus-existing can raise it
+ * later (the SPA swaps `ws` client-side, invisible to the shell otherwise).
+ * `alias` null = the local daemon. No-op in a browser.
+ */
+export async function reportWindowScope(
+  alias: string | null,
+  ws: string | null,
+): Promise<void> {
+  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws });
+}
+
+/**
+ * Raise an already-open window showing `(alias, ws)`, other than this one.
+ * Returns true when one was found and focused — the caller then skips opening
+ * in place. Always false in a browser.
+ */
+export async function focusWindow(alias: string | null, ws: string | null): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  return t.core.invoke<boolean>("focus_window", { alias, ws });
+}
+
 /**
  * An SSH auth prompt ssh raised while connecting (no tty in the app, so it
  * comes to us via SSH_ASKPASS). `prompt` is ssh's own text — a password ask,
@@ -221,14 +270,20 @@ export function closeThisWindow(): void {
 }
 
 /**
- * Open a workspace in a new window: a real native window in the shell, a
- * new tab in the browser. `alias` null targets the local daemon; a null
- * `wsId` opens the host's home screen (workspace choice happens there).
+ * Open a workspace window: a real native window in the shell, a new tab in the
+ * browser. `alias` null targets the local daemon; a null `wsId` opens the
+ * host's home screen (workspace choice happens there). Unless `newWindow`, an
+ * existing window already showing this `(alias, wsId)` is raised instead of
+ * duplicated.
  */
-export async function openWindow(alias: string | null, wsId: string | null): Promise<void> {
+export async function openWindow(
+  alias: string | null,
+  wsId: string | null,
+  newWindow = false,
+): Promise<void> {
   const t = tauri();
   if (t !== null) {
-    await t.core.invoke<void>("open_window", { alias, wsId });
+    await t.core.invoke<void>("open_window", { alias, wsId, newWindow });
     return;
   }
   // Browser: only the local origin is reachable (remote tunnels are the

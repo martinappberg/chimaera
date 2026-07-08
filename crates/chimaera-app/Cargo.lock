@@ -506,6 +506,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bytes",
+ "nix 0.29.0",
  "portable-pty",
  "rand 0.8.6",
  "serde",
