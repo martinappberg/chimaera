@@ -445,11 +445,27 @@ impl Drop for WatchGuard {
 /// Bump the epoch of every workspace whose root contains `path`, then wake the
 /// events bus. Called from the file-save and agent-write paths — the moment a
 /// tracked path changes, the client is nudged to refetch (zero polling).
-pub(crate) fn mark_path_dirty(state: &AppState, path: &str) {
+pub(crate) async fn mark_path_dirty(state: &AppState, path: &str) {
     let expanded = expand_tilde(path);
-    let target = Path::new(&expanded);
+    // Canonicalize before the prefix check. Workspace roots are stored
+    // canonical (the create handler canonicalizes), so a `path` carrying `..`,
+    // a relative segment, or a symlinked ancestor would fail `starts_with` and
+    // a genuine in-workspace change would be silently not announced. Off the
+    // reactor (blocking fs); fall back to the raw path when canonicalize fails
+    // (a just-deleted file) — that preserves the prior behavior for that case.
+    let target = {
+        let expanded = expanded.clone();
+        tokio::task::spawn_blocking(move || std::fs::canonicalize(&expanded))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+    .unwrap_or_else(|| std::path::PathBuf::from(&expanded));
+    // Snapshot the list and drop the guard before the loop — a `std::sync`
+    // guard must never be live across an `.await` (this fn is async now).
+    let workspaces = crate::lock(&state.workspaces).list();
     let mut bumped = false;
-    for ws in crate::lock(&state.workspaces).list() {
+    for ws in workspaces {
         // Component-wise prefix (so `/repo` never matches `/repo2`).
         if target.starts_with(&ws.root) {
             state.git.bump(&ws.id);
