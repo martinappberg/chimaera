@@ -1,174 +1,120 @@
-# CLAUDE.md
+# CLAUDE.md — the index
 
-Orientation for coding agents. Read this first — it exists so you don't have to
-re-derive the project every session. **[DESIGN.md](DESIGN.md) is the source of
-truth** for architecture and rationale (`## Architecture` especially); this file
-is the fast map and the working rules.
+Fast orientation for coding agents. This file is a lean **index**: what Chimaera
+is, how to run and check it, the handful of conventions you can't infer from the
+code, and pointers into the deep docs. Read the pointer for what you're touching
+rather than front-loading everything.
+
+> **Docs drift — verify before you trust.** Treat every path, command, and claim
+> here as possibly stale: confirm it against the actual repo before relying on it,
+> and when you find a doc wrong, **fix it in the same change**. That "verify →
+> trust → update" loop is what keeps this orientation trustworthy instead of
+> rotting. A `Stop` hook nudges you when an area's code changed without its map/
+> DESIGN being touched.
 
 ## What Chimaera is
 
 An **agent workbench, not an IDE**. One static Rust binary (`chimaera`) is the
 whole server: it owns your agent sessions as persistent, daemon-owned PTY
-processes on whatever host owns the work — your laptop, a dev server, or an HPC
-login node — and serves a workspace-first web UI around them (file previews,
-terminals, git state). Agents run as the real interactive TUIs (`claude` and
-friends) in daemon-owned PTYs, so they look, behave, and bill exactly like they
-do in any terminal. Close the laptop mid-run and nothing dies — windows are just
-views onto the daemon. A native Tauri app wraps the same UI in real windows.
+processes on whatever host owns the work — laptop, dev server, or HPC login node —
+and serves a workspace-first Svelte web UI around them (file previews, terminals,
+git state). Agents run as the real interactive TUIs (`claude`, `codex`) in
+daemon-owned PTYs, so they look, behave, and bill like any terminal; a structured
+**chat mode** drives the same agents over their JSON protocols. Close the laptop
+mid-run and nothing dies — windows are just views onto the daemon. A native Tauri
+app wraps the same UI in real windows.
 
-The name is lowercase **chimaera** everywhere it's a binary, product, or dock
-label; "Chimaera" as the capitalized proper noun in prose.
+Lowercase **chimaera** for the binary/product/dock label; "Chimaera" as the
+capitalized proper noun in prose.
 
-## Repo layout
+## Where things are (and what to read next)
 
-Rust workspace (the daemon) + a Svelte web UI it embeds + a separate Tauri app.
+A Rust workspace (the daemon) + a Svelte 5 UI it embeds + a separate Tauri app.
+Each area carries its own `CLAUDE.md` map (file table + the invariants that bite)
+— read the most specific one; it wins over this index on local detail.
 
-| Path | What it is |
-|---|---|
-| `crates/chimaera` | The binary. CLI + daemon entrypoint: `serve`, `connect <host>`, `status`, `kill`, `doctor`. |
-| `crates/chimaera-agent` | The structured-agent engine (the chat surface's other half): drives `claude` over bidirectional stream-json and `codex` over app-server JSON-RPC behind an `AgentAdapter` trait, with a per-session seq-numbered event journal (gap-replay reconnects). The wire formats are unversioned — **read `crates/chimaera-agent/PROTOCOL.md` first, and run `just chat-smoke` (live, bills a few cents) whenever a driver or an agent CLI changes.** |
-| `crates/chimaera-core` | Shared types, version/build-id helpers, shell integration. |
-| `crates/chimaera-pty` | The persistent terminal engine. PTY sessions mirrored into a headless `alacritty_terminal` grid so full screen state survives with zero attached clients; `attach` returns a snapshot escape stream that rebuilds the terminal in a fresh xterm.js. |
-| `crates/chimaera-remote` | SSH orchestration for `connect`: host discovery, musl-binary install, daemon start, port-forward tunnels. Never reimplements the ssh client — inherits `~/.ssh/config` (ProxyJump, ControlMaster, 2FA). |
-| `crates/chimaera-server` | The daemon's HTTP/WS surface and all business logic: `workspaces`, `agents`, `launcher`, `runtimes`, `fs`/previews, `links` + `mcp` (linked terminals), `settings`, `quickopen`, `recents`, `naming`, `view_state`, `ws`, `api`, `assets`. Embeds `web-ui/dist`. |
-| `crates/chimaera-app` | The Tauri 2 native shell. **Its own standalone cargo workspace** — Tauri deliberately never enters the daemon workspace so musl/HPC builds stay lean. |
-| `web-ui/` | The client: Svelte 5 + Vite, xterm.js terminals, file previews (image/markdown/csv/pdf/html), the workbench layout. The daemon serves the built `dist/`. |
+| Area | What it is | Map |
+|---|---|---|
+| `crates/chimaera` | the binary: CLI + daemon entrypoint (delegation-only) | [map](crates/chimaera/CLAUDE.md) |
+| `crates/chimaera-core` | shared types, version/build-id, shell integration | [map](crates/chimaera-core/CLAUDE.md) |
+| `crates/chimaera-pty` | the persistent PTY / terminal engine | [map](crates/chimaera-pty/CLAUDE.md) |
+| `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/CLAUDE.md) · [PROTOCOL](crates/chimaera-agent/PROTOCOL.md) |
+| `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
+| `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/CLAUDE.md) |
+| `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/CLAUDE.md) |
+| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/CLAUDE.md) · [settings](web-ui/src/lib/settings/CLAUDE.md) |
 
-### Nested CLAUDE.md maps (agent-first docs)
+Deep docs, read on demand: the **[architecture guide](docs/agent-guides/architecture.md)**
+(the source of truth for how it's built and why), the design spine
+[DESIGN.md](DESIGN.md), and the dated [field notes](docs/history/field-notes.md).
+Area "rules that bite" auto-load from `.claude/rules/` when you open matching files.
 
-Big or subtle subsystems carry their **own `CLAUDE.md`** — a short *map* (what's
-here, the file table, the invariants that bite, where to start a change), so a
-new agent can scope a feature with minimal context. Read the most specific one
-for the files you're touching; it wins over this root map on local detail. This
-is the pattern the repo is standardizing on — when you add a substantial
-subsystem, add its `CLAUDE.md` in the same style (map, not tutorial; link out to
-DESIGN.md/PROTOCOL.md for depth).
+## Run it
 
-- [`crates/chimaera-agent/CLAUDE.md`](crates/chimaera-agent/CLAUDE.md) — the structured-agent engine (drivers, journal, event model).
-- [`crates/chimaera-server/CLAUDE.md`](crates/chimaera-server/CLAUDE.md) — the daemon's routes + business logic + the chat-mode glue.
-- [`web-ui/src/lib/chat/CLAUDE.md`](web-ui/src/lib/chat/CLAUDE.md) — the structured chat UI (store reducer, socket, components).
-
-## Build, test, run
-
-`rust-toolchain.toml` pins the compiler channel and musl targets; `.nvmrc` pins
-Node (UI build needs >= 18). `just` wraps the common flows.
+Node 22 (`.nvmrc`; the nvm default 16 errors). The Rust toolchain is pinned in
+`rust-toolchain.toml` — **format with `cargo +1.96.0 fmt`** (a differing default
+`cargo fmt` can pass locally yet fail CI's pinned check).
 
 ```sh
-# Full local gate (matches CI): fmt + clippy + test
-just check
-#   = cargo fmt --all --check
-#     cargo clippy --workspace --all-targets -- -D warnings
-#     cargo test --workspace
-
-# Web UI
-npm --prefix web-ui install
-npm --prefix web-ui run check      # svelte-check
-npm --prefix web-ui run build      # emits web-ui/dist, which the daemon embeds
-
-# Native shell (separate workspace)
-cd crates/chimaera-app && cargo check      # or: just app-build
+just check                         # fmt --check + clippy -D warnings + test (pinned toolchain)
+npm --prefix web-ui run check      # svelte-check — the UI has no other automated tests
+npm --prefix web-ui run build      # emits web-ui/dist, which the daemon embeds (rust-embed)
+node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
 ```
 
-**The daemon embeds `web-ui/dist` at compile time (rust-embed).** Any *release/
-production* daemon run needs the UI built first — `just serve` and `just ui` do
-this for you. In *dev* you don't rebuild: run the daemon + Vite and let the proxy
-serve live UI (below).
+**Isolated preview — use this in a worktree.** A debug daemon on its own state dir
++ an auto-assigned port, so parallel worktrees don't clobber each other's
+`~/.chimaera`: `preview_start` the **chimaerad-isolated** config, read the
+`#token=` URL from `preview_logs`, open it. A debug daemon reads `web-ui/dist` from
+disk, so after a UI change just rebuild the UI and reload — no daemon restart. Full
+loop + gotchas: the **[develop](.claude/skills/develop/SKILL.md)** skill.
 
-### Dev loop
+## Conventions you can't infer from the code
 
-`.claude/launch.json` ships a daemon + a Vite config — run both, develop against
-`http://localhost:5173`:
+- **Verify live, don't just unit-test.** Terminal state, reconnect, resize, and
+  agent integrations have all had bugs that pass tests but break against the real
+  thing. Drive the flow (the **[verify-app](.claude/skills/verify-app/SKILL.md)**
+  skill); the PR says what you ran and observed. The web UI has **no JS tests** —
+  the live preview is its only runtime net.
+- **The daemon runs on shared HPC login nodes.** ~150 MB RSS, no unbounded buffers,
+  no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable state
+  is append-only, size-capped JSONL under `~/.chimaera`; hot state is reconstructible.
+- **The daemon↔UI wire is a stable public interface.** Core structs serialize
+  straight to it — don't let its shape drift as a side effect of a refactor.
+- **Agent wire formats are pinned, not trusted** — a driver or agent-CLI change
+  needs `just chat-smoke` (live, bills a few cents). **Terminal state is
+  server-side** (never serialize the `alacritty` `Term` grid). **UI quality is an
+  acceptance criterion** (curated light/dark, the brand mark, a real workbench feel).
+- **Comments state constraints and *why*, not narration.** `cargo +1.96.0 fmt` and
+  `clippy -D warnings` must pass clean.
+- Area-specific constraints live in `.claude/rules/*.md` (auto-load with matching
+  files); the nested `CLAUDE.md` maps carry the depth. When you add a substantial
+  subsystem, add its map in the same style.
 
-- **chimaerad** — `cargo run -p chimaera -- serve --port 9700` (the daemon).
-- **web-ui** — Vite on 5173, proxying `/api`, `/ws`, `/raw` to the daemon on 9700
-  (override target with `CHIMAERA_DEV_TARGET`).
+## Releases
 
-Vite exposes the local daemon's `~/.chimaera/manifest.json` at `/dev/manifest`
-(dev-only middleware, never in a production build), so the dev page authenticates
-itself — no hand-copying bearer tokens.
-
-**Working in a git worktree, with another worktree/chat possibly running a
-daemon?** Don't use `chimaerad` (hardcoded port 9700, shared `~/.chimaera` — and
-`serve` *removes* the manifest on stop, breaking the sibling). Use the
-**`chimaerad-isolated`** launch config: its own `CHIMAERA_HOME=.chimaera-dev`
-state dir + an auto-assigned port, serving this worktree's own build. Node 22 is
-required to build the UI (the nvm default 16 errors). Full steps in the develop
-skill.
-
-See the **[develop](.claude/skills/develop/SKILL.md)** skill for the full loop.
-
-## Working rules
-
-- **Verify live, don't just unit-test.** Terminal state, reconnect semantics, and
-  agent integrations have all had bugs that only reproduce against the real thing.
-  If you change behavior, drive it: run the daemon, attach the UI, exercise the
-  flow (spawn a session, kill the socket, reattach, resize). PRs say what you ran
-  and observed. See the **[verify-app](.claude/skills/verify-app/SKILL.md)** skill.
-- **The daemon lives on shared login nodes.** Bounded allocations, no unbounded
-  buffers, no busy loops, hard ceilings on preview extraction. Target ~150 MB RSS,
-  <1 core steady-state. Resource discipline is a review criterion, not a nicety.
-- **No SQLite anywhere near NFS/Lustre.** Durable state is append-only,
-  size-capped JSONL under `~/.chimaera`; hot state (`$XDG_RUNTIME_DIR` / `/tmp`)
-  must be treated as reconstructible (it gets night-scrubbed).
-- **Terminal state is server-side.** Never serialize the `alacritty` `Term` grid
-  across the wire (the client is xterm.js, not Rust) — re-emit an escape-sequence
-  snapshot on attach/resize. Resize/resync has subtle invariants; read DESIGN.md
-  `## Architecture` → "Resize repaint refinement" before touching that path.
-- **Agent wire formats are pinned, not trusted.** The claude stream-json and
-  codex app-server protocols are unversioned; the drivers in `chimaera-agent`
-  are verified against pinned CLI versions (`TESTED_*_VERSION`). Touching a
-  driver — or updating an agent CLI — requires `just chat-smoke` (live suite,
-  bills a few cents); hermetic tests cannot catch upstream drift. Quirks and
-  wire facts live in `crates/chimaera-agent/PROTOCOL.md` — extend it when you
-  learn a new one the hard way.
-- **Comments state constraints and *why*, not narration.** Explain why the code
-  must be this way ("BGZF is standard multi-member gzip"), never what the next
-  line does. `cargo fmt` and `clippy -D warnings` must pass clean.
-- **UI quality is an acceptance criterion.** Curated light/dark themes, the brand
-  mark (`web-ui/src/lib/BrandMark.svelte`), and a real workbench feel — hold the
-  bar.
-
-## Releases & how to skip one
-
-CI and releases are automatic; know which knob you're touching.
-
-- **`ci.yml`** — every PR + push to main: svelte-check + UI build, then
-  `cargo fmt`/`clippy`/`test`, plus musl cross-builds. Branch protection on `main`
-  requires it green.
-- **`app.yml`** — PR-only build-check for the Tauri bundle. Runs *only* when
-  `crates/chimaera-app/**` or `web-ui/**` change (macOS runners are expensive). It
-  builds without updater artifacts (`createUpdaterArtifacts` off), so it needs **no
-  signing key** — signing is a release-only concern (`release.yml` on `main`). The
-  PR bundle carries the `0.0.1` sentinel version; harmless, it's never published.
-- **`release.yml`** — **every merge to `main` cuts a PUBLISHED GitHub release**
-  (daemon musl + macOS binaries + signed app). The installed app auto-updates
-  from it. The version is derived from the last git tag and bumped by the
-  **squash-merge commit message** (Conventional Commits): `feat:` → minor,
-  `BREAKING CHANGE` / `!:` → major, else patch. So prefix commits correctly.
-
-### `[skip release]`
-
-To land a PR **without** cutting a release (docs, chores, tooling — anything that
-shouldn't ship a version), put **`[skip release]`** in the squash-merge commit
-message. The squash subject defaults to the **PR title**, so the reliable way to
-tag a no-release PR is to **put `[skip release]` in the PR title** (and/or the
-body). `release.yml`'s `version` job is gated on
-`!contains(head_commit.message, '[skip release]')`, so the whole release is
-skipped.
+CI + releases are automatic. `ci.yml` (fmt/clippy/test + UI + musl cross-builds)
+gates every PR; `app.yml` build-checks the Tauri bundle when the app or UI change;
+**every merge to `main` cuts a published GitHub release** whose version the
+squash-commit prefix decides. Get the prefix right — or add `[skip release]` — via
+the **[ship-pr](.claude/skills/ship-pr/SKILL.md)** skill, which owns the exact
+version mapping and the no-release path.
 
 ## PR checklist
 
-1. `just check` green; if you touched `web-ui/**` or the app, expect `app.yml` too.
-2. Verified live (not just tests) — note what you ran and observed.
-3. Conventional-Commit prefix so the auto version bump is right, **or**
-   `[skip release]` in the PR title for no-release changes.
-4. First-time contributors: CLA sign-off (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+1. `just check` green (+ `app.yml` if you touched `web-ui/**` or the app).
+2. Verified live, not just tests — note what you ran and observed.
+3. Right Conventional-Commit prefix for the version bump, or `[skip release]`.
+4. First-time contributors: CLA sign-off ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
-## Project skills
+## Skills, rules, subagents, hooks
 
-Under `.claude/skills/` — invoke with `/<name>`:
-
-- **develop** — run Chimaera locally and iterate (daemon + Vite dev loop, ports, auth, gotchas).
-- **verify-app** — drive a change end-to-end against the real daemon + UI + PTY.
-- **ship-pr** — open a PR here: CI gates, Conventional-Commit version bump, `[skip release]`.
-- **chat-mode** — work on structured chat mode (Tier B): drivers, journal/replay, server glue, chat UI; which verification level a change needs (hermetic vs live vs `just chat-smoke`).
+- **Skills** (`/name`): **develop** (run + iterate), **verify-app** (drive a change
+  live), **debug-live-app** (read daemon/UI logs, reproduce, common failure modes),
+  **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack).
+- **Rules**: path-scoped constraints in `.claude/rules/` load with matching files.
+- **Subagents**: `.claude/agents/` — `area-implementer` (scoped edits + live verify)
+  and `diff-reviewer` (read-only invariant check vs `upstream/main`).
+- **Hooks**: `.claude/settings.json` — fmt-on-save, destructive-command + generated-
+  file guards, session orientation, and the doc-drift warn (personal hooks go in the
+  gitignored `.claude/settings.local.json`).
