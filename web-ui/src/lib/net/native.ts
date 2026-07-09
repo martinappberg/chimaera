@@ -65,6 +65,11 @@ export interface HostState {
   remote_build: string | null;
   /** Live sessions counted when the update decision was made. */
   live_sessions: number | null;
+  /**
+   * This host connects to its isolated dev daemon (~/.chimaera-dev on the
+   * host, running this machine's own build) — never the real ~/.chimaera one.
+   */
+  dev: boolean;
 }
 
 /** Progress of an in-flight connect, mirrored from chimaera-remote phases. */
@@ -86,10 +91,16 @@ export async function listHosts(): Promise<HostState[]> {
   return t.core.invoke<HostState[]>("list_hosts");
 }
 
-export async function addHost(alias: string): Promise<HostState> {
+/**
+ * Save a host. `dev` marks it as a dev-daemon connection: connects deploy
+ * THIS machine's build to an isolated ~/.chimaera-dev on the host, leaving
+ * the real daemon untouched. The flag persists on the entry (one-way — to
+ * leave dev mode, forget the host and re-add it).
+ */
+export async function addHost(alias: string, dev = false): Promise<HostState> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
-  return t.core.invoke<HostState>("add_host", { alias });
+  return t.core.invoke<HostState>("add_host", { alias, dev });
 }
 
 export async function removeHost(alias: string): Promise<void> {

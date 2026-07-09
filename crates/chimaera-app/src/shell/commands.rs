@@ -69,14 +69,20 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         .collect())
 }
 
+/// `dev` saves the host as a dev-daemon connection (isolated
+/// `~/.chimaera-dev`, this machine's own build). One-way: re-adding an
+/// existing alias with `dev` upgrades it, and leaving dev mode is forget +
+/// re-add — see `HostEntry::dev`.
 #[tauri::command]
-pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
+pub(super) async fn add_host(alias: String, dev: Option<bool>) -> Result<HostState, String> {
     let alias = alias.trim().to_string();
     if alias.is_empty() || alias.starts_with('-') {
         return Err("that does not look like an ssh alias".to_string());
     }
     let mut store = HostsStore::load_default();
-    let entry = store.add(&alias, None).map_err(|e| format!("{e:#}"))?;
+    let entry = store
+        .add(&alias, None, dev.unwrap_or(false))
+        .map_err(|e| format!("{e:#}"))?;
     Ok(state_for(&entry, "disconnected", None))
 }
 

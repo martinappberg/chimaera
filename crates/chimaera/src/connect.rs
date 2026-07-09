@@ -9,11 +9,19 @@ pub async fn run(
     binary: Option<&Path>,
     no_open: bool,
     update_daemon: bool,
+    dev: bool,
 ) -> anyhow::Result<()> {
+    if dev {
+        tracing::info!(
+            "dev connect: targeting the isolated ~/.chimaera-dev daemon on {host} \
+             (the real ~/.chimaera daemon is left untouched)"
+        );
+    }
     let opts = ConnectOpts {
         local_port,
         binary: binary.map(Path::to_path_buf),
         update_daemon,
+        dev,
     };
     let mut tunnel = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),

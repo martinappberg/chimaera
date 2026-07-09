@@ -114,8 +114,8 @@ apart from your real window. Use it to exercise the full binary end to end — t
 native clipboard command, the reauth overlay, the daemon changes — which the
 browser preview can't reach. A debug daemon reads `web-ui/dist` from disk, so
 after a UI change rebuild the UI and reload the window; no app restart.
-(Verifying a REMOTE flow this way still targets the host's shared `~/.chimaera`
-over ssh — mind a running real session there.)
+(For a REMOTE flow, pair it with a **dev host** — the next section — so the
+host side is isolated too.)
 
 ## Remote (HPC / dev server)
 
@@ -125,6 +125,68 @@ cargo run -p chimaera -- connect <host>   # install-if-missing, start-or-attach,
 ```
 
 `connect` shells out to system `ssh`, inheriting `~/.ssh/config`.
+
+## Remote isolated dev daemon (`connect --dev`)
+
+A plain `connect` targets the host's shared `~/.chimaera`: it installs a
+RELEASE binary, and an idle real daemon of a different build gets REPLACED. To
+test YOUR build against a real host without touching any of that, connect in
+dev mode:
+
+```sh
+just dist                                        # musl-build THIS worktree into ~/.chimaera/dist
+cargo run -p chimaera -- connect <host> --dev    # deploy + start under ~/.chimaera-dev
+cargo run -p chimaera -- status <host> --dev     # its manifest, port, pid, build
+```
+
+Dev mode scopes EVERY remote side effect to `~/.chimaera-dev` on the host: the
+binary (`~/.chimaera-dev/bin/chimaera`), the daemon (started under
+`CHIMAERA_HOME=~/.chimaera-dev`, so its manifest and state live in
+`~/.chimaera-dev/data/`), and the probe/reuse/replace decision. The real daemon
+is never probed, stopped, or replaced — the two run side by side. Dev mode
+never downloads a release: no local build (`just dist` stash or `--binary`) is
+a hard error, so a release binary can't silently impersonate your build.
+
+In the native app, add the host with the amber **dev** toggle in the add-host
+form; the row wears a `dev` pill. The flag persists on the saved host so
+reconnects and window restore stay in dev; to leave dev mode, forget the host
+and re-add it. The isolated app (`just app-dev-isolated`) + a dev host is the
+full end-to-end rig — your app build tunneling to your daemon build on a real
+cluster — which is how you exercise remote-only paths like OSC 52 clipboard
+from a remote TUI or the reauth overlay on a tunnel drop.
+
+Gotchas:
+
+- **Same-commit rebuilds look identical**: build ids compare the git hash, so
+  a rebuilt (even dirty) tree won't auto-replace a running dev daemon. Force it
+  with `--update-daemon` / the row's "update" action.
+- **A dev BUILD doing a NORMAL connect still targets the real `~/.chimaera`**
+  and would replace an idle real daemon with your dev build. If you must
+  attach a dev build to the real daemon, keep a session live on it so connect
+  attaches "outdated" instead of replacing.
+
+## Which build is actually running? (debug workflow)
+
+- **Health = ground truth.** Read `port` + `token` from the manifest —
+  `$CHIMAERA_HOME/data/manifest.json` for an isolated daemon/app, the plain
+  `~/.chimaera/manifest.json` otherwise — then
+  `curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/v1/health`.
+  Its `build` must match your HEAD (`git rev-parse --short HEAD`, `-dirty` if
+  the tree is). Run the same check against the app's TUNNEL port to verify a
+  remote dev daemon end to end; `chimaera status <host> --dev` asks the host
+  directly.
+- **Logs.** The app logs to the terminal that launched it; its local daemon to
+  `$CHIMAERA_HOME/data/logs/serve.log`; a remote dev daemon to
+  `~/.chimaera-dev/data/logs/serve.log` on the host (real: `~/.chimaera/logs/`).
+- **Sockets are health.** While the app runs, its askpass relay socket must
+  EXIST — `$CHIMAERA_HOME/run/askpass.sock` (missing = the bind failed and ssh
+  auth will die promptless). For a too-deep home, both it and the ssh
+  ControlMaster fall back to a short `/tmp/chimaera-<hash>/` dir to stay under
+  the ~104-byte `sun_path` limit — the app's "askpass ready on …" log line
+  says where it actually bound.
+- **Build skew is by design, not an error:** connect Reuses a matching build,
+  Updates a mismatched idle daemon, and attaches "outdated" to a mismatched
+  busy one (the row/CLI then offer the explicit update).
 
 ## Common gotchas
 

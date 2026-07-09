@@ -11,8 +11,9 @@
 # The app's shell state, its daemon's state, and (over ssh) the spawned shells
 # all inherit CHIMAERA_HOME, so nothing lands in the shared ~/.chimaera. The real
 # $HOME is untouched, so ~/.claude auth still works. State lives under
-# <worktree>/.chimaera-dev-app (gitignored). Mirrors serve-isolated.sh, for the
-# app instead of the bare daemon. See the develop skill.
+# ~/.chimaera-dev-app/<worktree> (a short $HOME base — see below). Mirrors
+# serve-isolated.sh, for the app instead of the bare daemon. See the develop
+# skill.
 set -euo pipefail
 
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"

@@ -45,6 +45,12 @@ pub struct HostEntry {
     /// Explicit binary to deploy on this host, overriding dist lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<PathBuf>,
+    /// Connect to this host's isolated DEV daemon (`~/.chimaera-dev`, this
+    /// machine's own build) instead of the real one. Persisted on the entry —
+    /// not per-connect — so auto-reconnects and window restore stay in dev: a
+    /// dev tunnel must never silently heal itself into the real daemon.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
     pub added_at: u64,
     #[serde(default)]
     pub last_connected_at: Option<u64>,
@@ -111,14 +117,27 @@ impl HostsStore {
     }
 
     /// Add `alias` (idempotent; an existing entry is returned unchanged,
-    /// though a newly provided binary path replaces a missing one). Input is
-    /// normalized — `ssh cluster` stores as `cluster` — and rejected with
-    /// a human message when it can't be an ssh destination.
-    pub fn add(&mut self, alias: &str, binary: Option<PathBuf>) -> anyhow::Result<HostEntry> {
+    /// though a newly provided binary path replaces a missing one, and `dev`
+    /// upgrades one-way — `false` here never strips an entry's dev flag,
+    /// because plain reconnect paths pass `false` for "no opinion"; leaving
+    /// dev mode is forget + re-add). Input is normalized — `ssh cluster`
+    /// stores as `cluster` — and rejected with a human message when it can't
+    /// be an ssh destination.
+    pub fn add(
+        &mut self,
+        alias: &str,
+        binary: Option<PathBuf>,
+        dev: bool,
+    ) -> anyhow::Result<HostEntry> {
         let alias = &normalize_alias(alias)?;
         if let Some(existing) = self.items.iter_mut().find(|h| h.alias == *alias) {
-            if existing.binary.is_none() && binary.is_some() {
-                existing.binary = binary;
+            let fill_binary = existing.binary.is_none() && binary.is_some();
+            let raise_dev = dev && !existing.dev;
+            if fill_binary || raise_dev {
+                if fill_binary {
+                    existing.binary = binary;
+                }
+                existing.dev |= dev;
                 let entry = existing.clone();
                 self.save()?;
                 return Ok(entry);
@@ -128,6 +147,7 @@ impl HostsStore {
         let entry = HostEntry {
             alias: alias.to_string(),
             binary,
+            dev,
             added_at: unix_now(),
             last_connected_at: None,
         };
@@ -155,6 +175,7 @@ impl HostsStore {
                 self.items.push(HostEntry {
                     alias: alias.to_string(),
                     binary: None,
+                    dev: false,
                     added_at: unix_now(),
                     last_connected_at: Some(unix_now()),
                 });
@@ -202,9 +223,11 @@ mod tests {
         let (mut store, dir) = tmp_store("round-trip");
         assert!(store.list().is_empty());
 
-        store.add("cluster", None).unwrap();
-        store.add("cluster", None).unwrap(); // idempotent
-        store.add("hpc2", Some(PathBuf::from("/tmp/bin"))).unwrap();
+        store.add("cluster", None, false).unwrap();
+        store.add("cluster", None, false).unwrap(); // idempotent
+        store
+            .add("hpc2", Some(PathBuf::from("/tmp/bin")), false)
+            .unwrap();
         assert_eq!(store.list().len(), 2);
 
         store.record_connected("cluster").unwrap();
@@ -227,6 +250,34 @@ mod tests {
         let (mut store, dir) = tmp_store("record");
         store.record_connected("fresh").unwrap();
         assert_eq!(store.get("fresh").unwrap().alias, "fresh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The dev flag survives the disk round trip (reconnect and window
+    /// restore key off it), upgrades one-way on re-add, and is never stripped
+    /// by the `dev: false` that plain reconnect paths pass — those mean
+    /// "no opinion", and a dev tunnel healing itself into the real daemon
+    /// would defeat the whole isolation.
+    #[test]
+    fn dev_flag_persists_and_never_downgrades() {
+        let (mut store, dir) = tmp_store("dev-flag");
+        store.add("cluster", None, false).unwrap();
+        assert!(!store.get("cluster").unwrap().dev);
+
+        // Re-adding with dev raises the flag on the existing entry…
+        assert!(store.add("cluster", None, true).unwrap().dev);
+        // …and a later dev-less add (a reconnect ensuring the entry exists)
+        // must not lower it.
+        assert!(store.add("cluster", None, false).unwrap().dev);
+
+        let reloaded = HostsStore::load(dir.join("hosts.json"));
+        assert!(reloaded.get("cluster").unwrap().dev, "dev survives reload");
+
+        // Pre-dev hosts.json entries (no `dev` key) parse as non-dev.
+        let legacy = serde_json::json!([{"alias": "old", "added_at": 1}]);
+        std::fs::write(dir.join("hosts.json"), legacy.to_string()).unwrap();
+        let legacy_store = HostsStore::load(dir.join("hosts.json"));
+        assert!(!legacy_store.get("old").unwrap().dev);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -286,7 +337,7 @@ mod tests {
     #[test]
     fn load_heals_legacy_ssh_prefixed_aliases() {
         let (mut store, dir) = tmp_store("heal");
-        store.add("clean", None).unwrap();
+        store.add("clean", None, false).unwrap();
         // Simulate a pre-normalization file by writing entries directly.
         let raw = serde_json::json!([
             {"alias": "ssh cluster", "added_at": 1},
