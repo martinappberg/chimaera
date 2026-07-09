@@ -249,8 +249,13 @@ impl ChatManager {
         if let Some(native) = native_to_index {
             let index = Arc::clone(&self.index);
             let session_id = id.to_string();
-            // Off the pump's worker (blocking fs), off every lock.
-            let _ = tokio::task::spawn_blocking(move || index.record(&native, &session_id)).await;
+            // Fire-and-forget: the native-id index is a side-index consulted
+            // only to seed a resume (`lookup`). Detach the (blocking, possibly
+            // NFS) write so it can NEVER stall the pump — the journal append and
+            // event fan-out below must not wait on it. `record` is idempotent,
+            // so a detached late write is harmless. Awaiting the JoinHandle here
+            // (the old code) re-coupled the pump to that write.
+            tokio::task::spawn_blocking(move || index.record(&native, &session_id));
         }
         let entry = session.journal.append(ev).await;
         let _ = session.events_tx.send(Arc::clone(&entry));
