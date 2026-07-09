@@ -294,62 +294,24 @@ async fn degrade_to_pty(
     recipe: ChatRecipe,
     pinned_name: Option<String>,
 ) {
-    let mut argv = if recipe.kind == AgentKind::Codex {
-        // The codex TUI resumes via a subcommand (`codex resume <uuid>`),
-        // not a flag — build_agent_command's flag surface is claude-shaped.
-        let mut argv = vec![recipe.bin.to_string_lossy().into_owned()];
-        if let Some(resume) = &recipe.resume {
-            argv.push("resume".to_string());
-            argv.push(resume.clone());
-        }
-        // Parity with the TUI spawn path (spawn.rs): carry the scheme theme
-        // (`-c tui.theme=`, skipped when the user's own config.toml sets one)
-        // and the model the chat session was created with — the app-server
-        // chat driver drops both, so a degrade would otherwise land an
-        // un-themed, default-model TUI.
-        // NOTE(needs live confirmation): these flags TRAIL the `resume`
-        // subcommand; confirm codex accepts that argv order (chat-smoke / a
-        // real degrade spawn).
-        if !crate::runtimes::codex_user_theme_set(&state.codex_config_path) {
-            argv.push("-c".to_string());
-            argv.push(format!(
-                "tui.theme={}",
-                crate::runtimes::codex_theme_name(&recipe.theme)
-            ));
-        }
-        if let Some(model) = &recipe.model {
-            argv.push("--model".to_string());
-            argv.push(model.clone());
-        }
-        argv
-    } else {
-        crate::launcher::build_agent_command(
-            recipe.kind,
-            &recipe.bin,
-            recipe.settings.as_deref(),
-            recipe.model.as_deref(),
-            recipe.resume.as_deref(),
-            None,
-        )
-    };
-    // A rewind that respawned as a conversation fork but failed its handshake
-    // must NOT silently become a full-history TUI resume (that undoes the
-    // rewind). Carry the fork flags onto the claude interactive resume so the
-    // degraded terminal opens at the same fork point.
-    // NOTE(needs live confirmation): --fork-session/--resume-session-at on the
-    // *interactive* resume path (verified for the chat driver; the TUI path
-    // needs a chat-smoke / live check).
-    if recipe.kind == AgentKind::Claude {
-        if let Some(fork_at) = &recipe.fork_at {
-            argv.push("--fork-session".to_string());
-            argv.push("--resume-session-at".to_string());
-            argv.push(fork_at.clone());
-        }
-    }
-    if let Some(mcp) = &recipe.mcp_config {
-        argv.push("--mcp-config".to_string());
-        argv.push(mcp.to_string_lossy().into_owned());
-    }
+    // The scheme theme needs AppState (the user's codex config), so resolve it
+    // here; the pure argv assembly (codex-resume subcommand, claude fork/mcp
+    // appends) lives in `launcher` where it is unit-tested. Parity with the TUI
+    // spawn path: carry the theme + model the app-server chat driver drops, so
+    // a degrade doesn't land an un-themed, default-model TUI.
+    let codex_theme = (recipe.kind == AgentKind::Codex
+        && !crate::runtimes::codex_user_theme_set(&state.codex_config_path))
+    .then(|| crate::runtimes::codex_theme_name(&recipe.theme));
+    let argv = crate::launcher::build_agent_resume_command(
+        recipe.kind,
+        &recipe.bin,
+        recipe.settings.as_deref(),
+        recipe.model.as_deref(),
+        recipe.resume.as_deref(),
+        recipe.fork_at.as_deref(),
+        recipe.mcp_config.as_deref(),
+        codex_theme,
+    );
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
         // Carry the user's pinned name across the toggle so the PTY row keeps
