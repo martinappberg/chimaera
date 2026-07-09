@@ -9,11 +9,13 @@ pub async fn run(
     binary: Option<&Path>,
     no_open: bool,
     update_daemon: bool,
-    dev: bool,
 ) -> anyhow::Result<()> {
-    if dev {
+    // Dev is dev: an unstamped build always targets ~/.chimaera-dev on the
+    // host (and defaults its own state there) — say so, since the real
+    // daemon next to it stays untouched and unreported.
+    if chimaera_core::is_dev_build() {
         tracing::info!(
-            "dev connect: targeting the isolated ~/.chimaera-dev daemon on {host} \
+            "dev build: targeting the isolated ~/.chimaera-dev daemon on {host} \
              (the real ~/.chimaera daemon is left untouched)"
         );
     }
@@ -21,7 +23,6 @@ pub async fn run(
         local_port,
         binary: binary.map(Path::to_path_buf),
         update_daemon,
-        dev,
     };
     let mut tunnel = connect(host, opts, |phase| match phase {
         Phase::Probing => tracing::info!("probing {host} for a running daemon"),

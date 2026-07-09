@@ -1,17 +1,12 @@
 use chimaera_core::Manifest;
 use chimaera_remote::RemoteHome;
 
-pub async fn run(host: Option<&str>, dev: bool) -> anyhow::Result<()> {
+pub async fn run(host: Option<&str>) -> anyhow::Result<()> {
     match host {
         None => local(),
-        Some(host) => {
-            let home = if dev {
-                RemoteHome::Dev
-            } else {
-                RemoteHome::Real
-            };
-            remote(host, home).await
-        }
+        // The build picks the home (dev → ~/.chimaera-dev), same as connect:
+        // a dev status reports the daemon a dev connect would talk to.
+        Some(host) => remote(host, RemoteHome::current()).await,
     }
 }
 

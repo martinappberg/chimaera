@@ -26,15 +26,12 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Show daemon status, locally or on a remote ssh host.
+    /// Show daemon status, locally or on a remote ssh host. A dev build
+    /// reports the dev daemon (~/.chimaera-dev) on both ends — dev-ness is
+    /// the build's property, not a flag.
     Status {
         /// Remote ssh host to check instead of the local machine.
         host: Option<String>,
-        /// Inspect the host's isolated dev daemon (~/.chimaera-dev) instead
-        /// of the real one. Requires a host; a local dev daemon is scoped by
-        /// whatever CHIMAERA_HOME launched it — set that instead.
-        #[arg(long, requires = "host")]
-        dev: bool,
     },
     /// Stop the local daemon.
     Kill,
@@ -54,15 +51,15 @@ enum Command {
         /// Replace an outdated remote daemon even if it has live sessions
         /// (they end with it). At zero sessions outdated daemons are
         /// replaced automatically; the stop is always graceful.
+        ///
+        /// A dev build (never release-stamped) always targets the isolated
+        /// dev daemon in ~/.chimaera-dev on the host: it deploys your
+        /// locally built binary (`just dist`) under its own CHIMAERA_HOME,
+        /// next to — never touching — the real ~/.chimaera daemon, and never
+        /// downloads a release. Releases always target ~/.chimaera. There is
+        /// no flag: dev-ness is the build's property.
         #[arg(long)]
         update_daemon: bool,
-        /// Run against an isolated DEV daemon in ~/.chimaera-dev on the host:
-        /// deploys your locally built binary (`just dist`) and starts it
-        /// under its own CHIMAERA_HOME, next to — never touching — the real
-        /// ~/.chimaera daemon. Never downloads a release. Dev builds only —
-        /// a release-stamped chimaera refuses.
-        #[arg(long)]
-        dev: bool,
     },
     /// Check the local environment for common problems.
     Doctor,
@@ -92,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             let port = port.or_else(|| parse_port(std::env::var("PORT").ok()));
             chimaera_server::run(chimaera_server::ServerConfig { port }).await
         }
-        Command::Status { host, dev } => status::run(host.as_deref(), dev).await,
+        Command::Status { host } => status::run(host.as_deref()).await,
         Command::Kill => kill::run().await,
         Command::Connect {
             host,
@@ -100,18 +97,7 @@ async fn main() -> anyhow::Result<()> {
             binary,
             no_open,
             update_daemon,
-            dev,
-        } => {
-            connect::run(
-                &host,
-                local_port,
-                binary.as_deref(),
-                no_open,
-                update_daemon,
-                dev,
-            )
-            .await
-        }
+        } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
         Command::Doctor => doctor::run(),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
@@ -138,43 +124,22 @@ mod tests {
             Command::Connect {
                 host,
                 update_daemon,
-                dev,
                 ..
             } => {
                 assert_eq!(host, "cluster");
                 assert!(update_daemon);
-                assert!(!dev, "dev is opt-in");
             }
             _ => panic!("expected connect"),
         }
     }
 
+    /// Dev-ness is the build's property, not a flag — the old `--dev`
+    /// switches must be gone so nothing can mix a dev client with a real
+    /// home (or vice versa).
     #[test]
-    fn connect_parses_dev_flag() {
-        let cli = Cli::try_parse_from(["chimaera", "connect", "cluster", "--dev"]).unwrap();
-        match cli.command {
-            Command::Connect { host, dev, .. } => {
-                assert_eq!(host, "cluster");
-                assert!(dev);
-            }
-            _ => panic!("expected connect"),
-        }
-    }
-
-    /// `status --dev` reads the host's dev manifest; without a host there is
-    /// no fixed dev home to read (local dev daemons are scoped by whatever
-    /// CHIMAERA_HOME launched them), so clap rejects the combination.
-    #[test]
-    fn status_dev_requires_a_host() {
-        assert!(Cli::try_parse_from(["chimaera", "status", "--dev"]).is_err());
-        let cli = Cli::try_parse_from(["chimaera", "status", "cluster", "--dev"]).unwrap();
-        match cli.command {
-            Command::Status { host, dev } => {
-                assert_eq!(host.as_deref(), Some("cluster"));
-                assert!(dev);
-            }
-            _ => panic!("expected status"),
-        }
+    fn dev_flags_no_longer_parse() {
+        assert!(Cli::try_parse_from(["chimaera", "connect", "cluster", "--dev"]).is_err());
+        assert!(Cli::try_parse_from(["chimaera", "status", "cluster", "--dev"]).is_err());
     }
 
     #[test]
