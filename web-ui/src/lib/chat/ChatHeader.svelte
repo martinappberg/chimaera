@@ -5,7 +5,7 @@
    * rate limit, context). It renders and toggles the shared `menu` state but
    * the picks themselves are the host's callbacks (they ride socket.send).
    */
-  import SessionGlyph from "../SessionGlyph.svelte";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
   import EffortPopover from "./EffortPopover.svelte";
   import type { ChatStore } from "./store.svelte";
 

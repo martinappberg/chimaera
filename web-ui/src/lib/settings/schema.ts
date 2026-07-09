@@ -13,7 +13,7 @@
  * the same file.
  */
 
-import { ACTIONS, parseChord } from "../keys";
+import { ACTIONS, parseChord } from "../shared/keys";
 import { themesOfKind, type ThemeDef } from "./themes";
 
 /** Value types a setting can carry (mirrors the JSON representation). */

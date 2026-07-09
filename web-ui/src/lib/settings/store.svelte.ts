@@ -11,7 +11,7 @@
  * (e.g. the terminal theme rebuild) read them.
  */
 
-import { api } from "../api";
+import { api } from "../net/api";
 import {
   defaultValue,
   sanitize,

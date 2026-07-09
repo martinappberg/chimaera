@@ -1,13 +1,13 @@
 <script lang="ts">
   import { onDestroy, tick } from "svelte";
-  import { rewindSession, renameSession, type Session } from "../sessions";
-  import { fsValidate } from "../files";
-  import { listAgents } from "../launcher";
-  import SessionGlyph from "../SessionGlyph.svelte";
+  import { rewindSession, renameSession, type Session } from "../workspace/sessions";
+  import { fsValidate } from "../previews/files";
+  import { listAgents } from "../workspace/launcher";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer } from "./composerBus";
   import { ChatSocket } from "./chatWs";
   import { ChatStore } from "./store.svelte";
-  import { dismiss } from "../dismiss";
+  import { dismiss } from "../shared/dismiss";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";

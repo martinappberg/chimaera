@@ -5,9 +5,9 @@
    * accent bar and a reset affordance — the VS Code gutter language, muted.
    */
   import { onDestroy } from "svelte";
-  import { ACTION_BY_ID, captureChord, displayChord, isBrowserReserved } from "../keys";
-  import { modifierSetting, setCapturing } from "../keybindings";
-  import { isNativeShell } from "../native";
+  import { ACTION_BY_ID, captureChord, displayChord, isBrowserReserved } from "../shared/keys";
+  import { modifierSetting, setCapturing } from "../shared/keybindings";
+  import { isNativeShell } from "../net/native";
   import type { SettingDef, SettingId, SettingValue } from "./schema";
   import { activeTheme, getSetting, isModified, resetSetting, setSetting } from "./store.svelte";
 
