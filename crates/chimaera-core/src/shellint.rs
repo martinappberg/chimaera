@@ -157,11 +157,13 @@ pub fn shell_launch_for(shell: &str, base: &Path) -> anyhow::Result<ShellLaunch>
     Ok(launch)
 }
 
-/// [`shell_launch_for`] on `$SHELL` (falling back to `/bin/bash`, matching
-/// the PTY engine's plain-spawn default) under the runtime dir.
+/// [`shell_launch_for`] on the user's real login shell under the runtime dir.
+/// Resolved via [`crate::login_shell`] (passwd-backed) rather than raw
+/// `$SHELL`, so a daemon launched from Finder/launchd — where `$SHELL` is
+/// often absent — still opens the user's actual shell, not a `/bin/sh`/bash
+/// stand-in.
 pub fn shell_launch() -> anyhow::Result<ShellLaunch> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    shell_launch_for(&shell, &crate::runtime_dir())
+    shell_launch_for(&crate::login_shell(), &crate::runtime_dir())
 }
 
 #[cfg(test)]

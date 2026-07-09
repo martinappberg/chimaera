@@ -495,14 +495,17 @@ async fn resolve_git_binary(configured: Option<String>) -> GitBinary {
     }
 }
 
-/// `command -v git` through the user's login shell — the same trick the agent
-/// launcher uses, because the daemon's own PATH on an HPC login node is the
-/// stock `/usr/bin/git`, while the modern one lives behind `module load git`
-/// that only a login shell (sourcing the user's profile) has applied.
+/// `command -v git` through the user's interactive login shell — the same
+/// trick the agent launcher uses, because the daemon's own PATH on an HPC
+/// login node is the stock `/usr/bin/git`, while the modern one lives behind
+/// `module load git` that only the user's profile (often the interactive
+/// `.bashrc`/`.zshrc`) has applied. `-ilc` and the passwd-backed
+/// [`chimaera_core::login_shell`] mirror the launcher's resolution so a
+/// GUI-launched daemon resolves git the same way a terminal would.
 async fn login_shell_git() -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = chimaera_core::login_shell();
     let output = tokio::process::Command::new(&shell)
-        .arg("-lc")
+        .arg("-ilc")
         .arg("command -v git")
         .stdin(Stdio::null())
         .kill_on_drop(true)

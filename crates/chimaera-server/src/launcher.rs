@@ -13,10 +13,13 @@
 //! `POST /api/v1/sessions` consumes the catalog too (agent/model/resume);
 //! that stays in `api.rs`, with argv assembly here so it is unit-testable.
 //!
-//! Detection resolves each binary through the user's *login* shell.
-//! Field-tested: `claude` is not on the non-interactive ssh PATH on HPC
-//! login nodes, so a plain `which` from the daemon's environment is not
-//! enough.
+//! Detection resolves each binary the way a human terminal would — through
+//! the user's *interactive login* shell (`-ilc`), then a set of well-known
+//! install prefixes, then the chimaera-managed bin dir. Field-tested: `claude`
+//! is not on the non-interactive ssh PATH on HPC login nodes, and on macOS the
+//! claude installer's `~/.local/bin` PATH line lives in the interactive-only
+//! `.zshrc` — a login-only `-lc` (or a GUI launch with no usable `$SHELL`)
+//! misses both, so a plain `which` from the daemon's environment is not enough.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -140,31 +143,105 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
         managed,
         explicit: used_explicit,
     };
-    crate::lock(&state.agent_bins).insert(kind, detection.clone());
+    // Cache only a positive result for the daemon's lifetime. A miss is often
+    // transient — the daemon started before the login environment was ready,
+    // or the user just fixed their PATH / installed the CLI — and caching it
+    // would wedge the agent as "not installed" until a daemon restart. Leaving
+    // a miss uncached lets the next probe self-heal (the popover already
+    // refreshes on mount; a spawn re-probes rather than acting on stale news).
+    if detection.path.is_ok() {
+        crate::lock(&state.agent_bins).insert(kind, detection.clone());
+    }
     detection
 }
 
 /// The managed install of `bin` under the managed bin dir, if present and
-/// executable — detection's fallback when the login shell misses.
+/// executable — detection's last fallback when the login shell and the
+/// well-known prefixes all miss.
 pub(crate) fn managed_fallback(bin: &str, managed_bin: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let path = managed_bin.join(bin);
-    let meta = std::fs::metadata(&path).ok()?;
-    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(path)
+    is_executable(&path).then_some(path)
 }
 
-/// Whether `path` is a runnable regular file (follows symlinks).
-fn is_executable_file(path: &Path) -> bool {
+/// Whether `path` is a regular executable file (symlinks followed — a
+/// versioned `~/.local/bin/claude` symlink counts).
+fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
-/// Resolve an agent binary: an explicit `agents.<kind>.path` wins when runnable,
-/// then the user's login shell (`command -v`), then the managed bin dir when the
-/// shell misses (managed installs are deliberately NOT on the user's PATH —
-/// dotfiles stay theirs).
+/// Concrete locations an agent binary lands in, checked when the login-shell
+/// probe misses (or is unavailable). Recovers a user's own install even when
+/// the daemon's shell can't see it — a GUI launch with no usable `$SHELL`, a
+/// PATH addition confined to an rc the probe couldn't source, or a hung shell
+/// the timeout gave up on. `home` is the user's home dir (threaded in so the
+/// list is testable without mutating the process environment).
+fn well_known_agent_paths(bin: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = home {
+        // The official claude/agy installers land in ~/.local/bin; ~/bin and
+        // claude's older ~/.claude/local cover manual/legacy layouts.
+        out.push(home.join(".local/bin").join(bin));
+        out.push(home.join("bin").join(bin));
+        if bin == "claude" {
+            out.push(home.join(".claude/local").join(bin));
+        }
+    }
+    // Homebrew (Apple silicon, then Intel / manual /usr/local) — the common
+    // non-HPC case where the login shell should have found it but didn't.
+    out.push(PathBuf::from("/opt/homebrew/bin").join(bin));
+    out.push(PathBuf::from("/usr/local/bin").join(bin));
+    out
+}
+
+/// Timeout for the login-shell resolution probe. An interactive rc can be
+/// slow (completion init, prompt frameworks) or, pathologically, block on
+/// input; the well-known-path and managed fallbacks backstop a timeout, so
+/// this need not be generous.
+const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// `command -v <bin>` through the user's *interactive login* shell. `-ilc`
+/// (not the old login-only `-lc`) so zsh sources `.zshrc` and bash sources
+/// `.bashrc` — where the claude installer and most users keep their PATH
+/// additions; login-only init misses them, and that was the "claude no longer
+/// resolves" bug when the app launched outside a terminal. Banners are
+/// tolerated (last non-empty stdout line is the path); stdin is `/dev/null`
+/// and a timeout backstops a slow or input-reading rc.
+async fn resolve_via_login_shell(shell: &str, bin: &str) -> Option<PathBuf> {
+    let output = tokio::process::Command::new(shell)
+        .arg("-ilc")
+        .arg(format!("command -v {bin}"))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(SHELL_PROBE_TIMEOUT, output)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?
+        .to_string();
+    path.starts_with('/').then(|| PathBuf::from(path))
+}
+
+/// Resolve an agent binary: an explicit `agents.<kind>.path` setting wins when
+/// runnable, else the way a human terminal would, then concrete locations the
+/// daemon can see without any shell:
+///   1. the explicit per-agent path setting (if it points at a runnable file);
+///   2. the user's interactive login shell (`command -v`);
+///   3. well-known install prefixes (the official installers' targets);
+///   4. the chimaera-managed bin dir (installs are deliberately NOT on the
+///      user's PATH — dotfiles stay theirs).
+///
+/// The user's own install always wins over the managed one.
 async fn resolve_bin(
     kind: AgentKind,
     managed_bin: &Path,
@@ -176,64 +253,59 @@ async fn resolve_bin(
     // way, so a mistake is visible without bricking the agent.
     if let Some(p) = explicit.as_deref() {
         let path = PathBuf::from(p);
-        if is_executable_file(&path) {
+        if is_executable(&path) {
             return Ok(path);
         }
     }
+
     let bin = kind.as_str();
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let output = tokio::process::Command::new(&shell)
-        .arg("-lc")
-        .arg(format!("command -v {bin}"))
-        .output()
-        .await;
-    let not_found = || {
-        format!(
-            "{bin} not found via `{shell} -lc 'command -v {bin}'`; install {name} \
-             (`{cmd}`, see {url}) or make `{bin}` resolvable from your login shell",
-            name = kind.product_name(),
-            cmd = install_command(kind),
-            url = docs_url(kind),
-        )
-    };
-    let user = match output {
-        Ok(out) if out.status.success() => {
-            // Login shells may print banners; the path is the last non-empty line.
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let path = stdout
-                .lines()
-                .rev()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("");
-            if !path.starts_with('/') {
-                Err(not_found())
-            } else {
-                let path = PathBuf::from(path);
-                if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
-                    // The Antigravity IDE ships an `agy` symlink to its own
-                    // app launcher (like VS Code's `code`): it opens the GUI
-                    // and exits 0 silently — NOT the CLI. Field-found:
-                    // spawning it made a pane that just said "[exited]".
-                    Err(format!(
-                        "the `agy` on your PATH is the Antigravity IDE's app launcher, \
-                         not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
-                        cmd = install_command(kind),
-                        url = docs_url(kind),
-                    ))
-                } else {
-                    Ok(path)
-                }
-            }
+    let shell = login_shell();
+
+    let candidate = match resolve_via_login_shell(&shell, bin).await {
+        Some(path) => Some(path),
+        None => {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            well_known_agent_paths(bin, home.as_deref())
+                .into_iter()
+                .find(|p| is_executable(p))
         }
-        Ok(_) => Err(not_found()),
-        Err(err) => Err(format!("failed to run login shell {shell}: {err}")),
     };
-    // The user's own install wins; a managed install fills the miss.
-    match user {
-        Ok(path) => Ok(path),
-        Err(msg) => managed_fallback(bin, managed_bin).ok_or(msg),
+
+    // Default miss reason; the agy IDE-shim case overrides it before falling
+    // through to the managed binary.
+    let mut miss = not_found(kind, &shell);
+    if let Some(path) = candidate {
+        // The Antigravity IDE ships an `agy` symlink to its own app launcher
+        // (like VS Code's `code`): it opens the GUI and exits 0 silently — NOT
+        // the CLI. Field-found: spawning it made a pane that just said
+        // "[exited]". Refuse it from every source and prefer a managed agy.
+        if kind == AgentKind::Antigravity && agy_is_ide_shim(&path) {
+            miss = format!(
+                "the `agy` on your PATH is the Antigravity IDE's app launcher, \
+                 not the Antigravity CLI; install the CLI (`{cmd}`, see {url})",
+                cmd = install_command(kind),
+                url = docs_url(kind),
+            );
+        } else {
+            return Ok(path);
+        }
     }
+
+    managed_fallback(bin, managed_bin).ok_or(miss)
+}
+
+/// The actionable "couldn't find it" message the launcher surfaces on a spawn
+/// attempt (GET /agents only exposes the `installed` boolean).
+fn not_found(kind: AgentKind, shell: &str) -> String {
+    let bin = kind.as_str();
+    format!(
+        "{bin} not found via `{shell} -ilc 'command -v {bin}'`, well-known install \
+         locations, or a chimaera-managed install; install {name} (`{cmd}`, see {url}) \
+         or make `{bin}` resolvable from your login shell",
+        name = kind.product_name(),
+        cmd = install_command(kind),
+        url = docs_url(kind),
+    )
 }
 
 /// True when a resolved `agy` is the Antigravity IDE's app launcher rather
@@ -480,9 +552,11 @@ exec "$0" "$@""#
     cmd
 }
 
-/// The user's login shell (the daemon runs as the user, so `$SHELL` is it).
+/// The user's login shell. `$SHELL` when a terminal set it; otherwise the
+/// passwd entry (a GUI-launched daemon often has no usable `$SHELL`) — see
+/// [`chimaera_core::login_shell`].
 pub(crate) fn login_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    chimaera_core::login_shell()
 }
 
 // --- resumable sessions ------------------------------------------------------
@@ -886,6 +960,73 @@ mod tests {
         );
         assert!(script.ends_with("exec $argv"), "{script}");
         assert_eq!(cmd[3..], ["/usr/bin/claude"]);
+    }
+
+    /// The well-known fallback covers the official installers' targets — most
+    /// importantly `~/.local/bin`, where `claude.ai/install.sh` lands and
+    /// which macOS zsh keeps on PATH only via the interactive-only `.zshrc`.
+    #[test]
+    fn well_known_paths_cover_installer_targets() {
+        let home = PathBuf::from("/home/u");
+        let claude = well_known_agent_paths("claude", Some(&home));
+        assert!(claude.contains(&PathBuf::from("/home/u/.local/bin/claude")));
+        assert!(claude.contains(&PathBuf::from("/home/u/bin/claude")));
+        // claude's older local-install layout is claude-only.
+        assert!(claude.contains(&PathBuf::from("/home/u/.claude/local/claude")));
+        assert!(claude.contains(&PathBuf::from("/opt/homebrew/bin/claude")));
+        assert!(claude.contains(&PathBuf::from("/usr/local/bin/claude")));
+
+        // ~/.local/bin wins over homebrew: a user install outranks a system
+        // one, matching login-shell PATH precedence.
+        let idx = |p: &str| claude.iter().position(|c| c == &PathBuf::from(p)).unwrap();
+        assert!(idx("/home/u/.local/bin/claude") < idx("/opt/homebrew/bin/claude"));
+
+        // Non-claude agents don't get the claude-only ~/.claude/local path.
+        let codex = well_known_agent_paths("codex", Some(&home));
+        assert!(!codex.iter().any(|p| p.starts_with("/home/u/.claude")));
+
+        // No HOME (a stripped launchd env): still offers the system prefixes.
+        let headless = well_known_agent_paths("claude", None);
+        assert_eq!(
+            headless,
+            [
+                PathBuf::from("/opt/homebrew/bin/claude"),
+                PathBuf::from("/usr/local/bin/claude"),
+            ]
+        );
+    }
+
+    /// `is_executable` follows symlinks (a versioned `~/.local/bin/claude`
+    /// symlink is the real install shape) and rejects non-exec / missing.
+    #[test]
+    fn is_executable_follows_symlinks_and_checks_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-isexec-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!is_executable(&dir.join("missing")));
+
+        // A non-executable regular file is rejected.
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&plain));
+
+        // A real executable, and a symlink pointing at it (the install shape).
+        let real = dir.join("real");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable(&real));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(is_executable(&link));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
