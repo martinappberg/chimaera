@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::Context;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -106,16 +105,9 @@ impl SettingsStore {
         &mut self,
         map: serde_json::Map<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
         let mut body = serde_json::to_vec_pretty(&map)?;
         body.push(b'\n');
-        std::fs::write(&tmp, body).with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("failed to rename into {}", self.path.display()))?;
+        crate::persist::atomic_write_json(&self.path, body)?;
         if map != self.map {
             self.generation += 1;
         }

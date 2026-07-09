@@ -12,6 +12,7 @@ mod lifecycle;
 mod links;
 mod mcp;
 mod naming;
+mod persist;
 mod quickopen;
 mod recents;
 mod router;
