@@ -205,7 +205,7 @@ pub(crate) async fn spawn_session(
             }
             state.changes.notify_waiters();
             let agent = crate::lock(&state.agents).get(&info.id).cloned();
-            Ok(crate::api::session_json(
+            Ok(crate::session_view::session_json(
                 &info,
                 Some(workspace.id),
                 agent.as_ref(),

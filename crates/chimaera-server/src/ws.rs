@@ -698,7 +698,7 @@ async fn send_sessions_snapshot(
 ) -> Result<(), axum::Error> {
     let snapshot = json!({
         "type": "sessions",
-        "sessions": crate::api::sessions_json(state),
+        "sessions": crate::session_view::sessions_json(state),
         "links": crate::links::links_json(state),
     })
     .to_string();

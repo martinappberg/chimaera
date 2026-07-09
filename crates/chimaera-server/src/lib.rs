@@ -12,6 +12,7 @@ mod naming;
 mod quickopen;
 mod recents;
 mod runtimes;
+mod session_view;
 mod settings;
 mod spawn;
 mod update;
