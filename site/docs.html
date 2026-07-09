@@ -88,7 +88,9 @@
         <h4>Using it</h4>
         <a href="#workspaces">Workspaces &amp; windows</a>
         <a href="#agents">Agents</a>
+        <a href="#chat">Chat mode &amp; the TUI</a>
         <a href="#previews">File previews</a>
+        <a href="#git">Git &amp; worktrees</a>
         <a href="#linked">Linked terminals</a>
         <h4>Operating</h4>
         <a href="#updates">Staying current</a>
@@ -119,11 +121,12 @@
           terminals, git state).
         </p>
         <p>
-          Agents run as the real interactive TUIs (<code>claude</code> and friends)
-          in daemon-owned PTYs, so they look, behave, and bill exactly like they do
-          in any terminal. The daemon owns the sessions and windows are just views,
-          so a closed window or a dropped SSH connection never ends a run. A native
-          Tauri app wraps the same UI in real windows.
+          Each agent runs one of two ways on the same session, a toggle apart: a
+          rich <strong>chat UI</strong> (the default), or its <strong>real
+          interactive TUI</strong> in a daemon-owned PTY (see
+          <a href="#chat">Chat mode &amp; the TUI</a>). The daemon owns the sessions
+          and windows are just views, so a closed window or a dropped SSH connection
+          never ends a run. A native Tauri app wraps the same UI in real windows.
         </p>
 
         <h2 id="install">Install</h2>
@@ -214,24 +217,53 @@
         <h2 id="agents">Agents</h2>
         <p>
           The launcher detects the agent CLIs you have installed and can install or
-          update them from official sources. Binaries live under
-          <code>~/.chimaera</code>, and your credentials stay entirely yours (in
-          <code>HOME</code> and your login-shell environment). Supported today:
+          update them from official sources (curated scripts, checksum-verified,
+          never <code>sudo</code>). Binaries live under <code>~/.chimaera</code>, and
+          your credentials stay entirely yours (in <code>HOME</code> and your
+          login-shell environment).
         </p>
         <ul>
-          <li><strong>Claude Code</strong> (<code>claude</code>): the primary agent.</li>
-          <li><strong>Codex</strong>: the modern Rust CLI with <code>codex login</code>.</li>
-          <li><strong>Gemini CLI</strong>: via API-key auth.</li>
-          <li><strong>Antigravity</strong> (<code>agy</code>): Google's official CLI.</li>
+          <li><strong>Claude Code</strong> (<code>claude</code>) and <strong>Codex</strong>: first-class, and run in chat mode or as the real TUI.</li>
+          <li><strong>Gemini CLI</strong> and <strong>Antigravity</strong> (<code>agy</code>): detected and launchable as TUIs, but not yet first-class (no managed install or attention state).</li>
           <li><strong>Plain shells</strong>: first-class workspace sessions too.</li>
         </ul>
         <p>
-          Agents run as their real TUIs. Injected hooks turn each agent's state
-          into an <strong>attention signal</strong> so a rail badge and the session
-          strip tell you which one is waiting on you, and approval always happens
-          in context, never out of band. Sessions auto-name after what they're
-          actually doing, and ended conversations drop into a per-workspace Recents
-          list you can resume from.
+          Run as many as you want side by side. Each agent's state becomes an
+          <strong>attention signal</strong> so a rail badge and the session strip
+          tell you which one is waiting on you, and approval always happens in
+          context, never out of band. Sessions auto-name after what they're actually
+          doing, and ended conversations drop into a per-workspace Recents list you
+          can resume from.
+        </p>
+
+        <h2 id="chat">Chat mode &amp; the TUI</h2>
+        <p>
+          Every agent runs one of two ways on the same session, a toggle apart. New
+          sessions open in <strong>chat mode</strong> by default; the setting
+          <code>agents.defaultView</code> changes that, and any session flips between
+          the two live.
+        </p>
+        <ul>
+          <li>
+            <strong>Chat mode</strong> drives the CLI over its structured JSON
+            protocol (Claude Code over <code>stream-json</code>, Codex over
+            <code>codex app-server</code>) and renders a first-class chat UI:
+            streamed thinking, tool cards, permission and question prompts,
+            model/effort pickers, rewind, and inline previews of the files each turn
+            produced. It reconnects losslessly, so a dropped socket never loses the
+            transcript.
+          </li>
+          <li>
+            <strong>The real TUI</strong> runs the actual <code>claude</code> /
+            <code>codex</code> terminal in a daemon-owned PTY: full CLI fidelity, and
+            it bills exactly like the interactive terminal.
+          </li>
+        </ul>
+        <p>
+          <strong>Rewind (Claude):</strong> hover a past message to revert the files
+          that turn changed, or fork the conversation from that point. Chat sessions
+          survive a disconnect; they do not yet survive a daemon restart, so a
+          restart retires them to Recents for manual resume.
         </p>
 
         <h2 id="previews">File previews</h2>
@@ -251,6 +283,27 @@
         <p>
           Lightweight editing is built in (CodeMirror, <kbd>⌘S</kbd> to save, a
           dirty indicator), enough to fix a script, not a full IDE.
+        </p>
+
+        <h2 id="git">Git &amp; worktrees</h2>
+        <p>
+          A source-control panel for the workspace's repo: a branch header with
+          ahead/behind counts, and every changed path grouped into conflicts,
+          staged, changes, and untracked. Click any row to open a side-by-side diff
+          in an adjacent pane. It is <strong>review-first</strong> — status and diff,
+          not stage / commit / push; those stay in a terminal for now.
+        </p>
+        <ul>
+          <li><strong>Worktrees.</strong> Spin a branch into its own openable window: create a worktree under a managed root and spawn an agent or terminal into it. Removal is fenced (managed root only, no live session, clean tree), and the branch itself survives.</li>
+          <li><strong>A branch per agent.</strong> The Branches view maps which session runs in which worktree, derived from each session's working directory, so you can jump straight to the agent on another branch.</li>
+          <li><strong>Session-scoped changes.</strong> Review exactly what one agent touched, cross-referenced with live git status.</li>
+        </ul>
+        <p>
+          Refresh is event-driven (a file save, an agent write, a terminal command
+          finishing), never a status poll. Git is resolved through your login shell
+          and needs <strong>version 2.15+</strong>; on old-git or shared-storage
+          clusters the panel turns the two common dead-ends (git too old, "dubious
+          ownership") into one-step fixes.
         </p>
 
         <h2 id="linked">Linked terminals</h2>

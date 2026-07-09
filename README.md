@@ -4,11 +4,12 @@
 
 <h1 align="center">Chimaera</h1>
 
-<p align="center"><strong>An agent workbench, not an IDE.</strong></p>
+<p align="center"><strong>Your agent workbench.</strong></p>
 
 <p align="center">
-  Persistent, daemon-owned agent sessions on whatever host owns the work —<br>
-  your laptop, a remote server, or an HPC login node — with a workspace-first UI around them.
+  Claude Code, Codex, and friends as persistent, daemon-owned sessions on whatever host owns<br>
+  the work — your laptop, a dev server, or an HPC login node. Run them in parallel, drive each<br>
+  from a rich chat UI or its real terminal, and close the laptop mid-run — nothing dies.
 </p>
 
 <p align="center">
@@ -27,15 +28,19 @@
 
 ---
 
-Chimaera runs your agent sessions as persistent, daemon-owned processes on whatever host owns
-the work and gives you a workspace-first UI around them: the file previews, terminals, and git
-state that show what those agents actually produced. One static Rust binary is the whole
-server; the client is a web UI it serves itself, plus a native app that wraps the same UI in
-real windows.
+Chimaera is a workbench, not an IDE — no LSP, no debugger, no completions. The job is
+different: run many coding agents at once, keep them alive on the host that owns the work, and
+see what they produced. One static Rust binary is the whole server; the client is a web UI it
+serves itself, plus a native app that wraps the same UI in real windows. The daemon owns the
+sessions; windows are just views. Close the laptop mid-run and nothing happens — reconnect and
+every session is exactly where you left it.
 
-Agents run as the real interactive TUIs (`claude` and friends) in daemon-owned PTYs, so they
-look, behave, and bill exactly like they do in any terminal. The daemon owns the sessions;
-windows are just views. Close the laptop mid-run and nothing happens.
+Each agent runs one of two ways on the same session, a toggle apart. In **chat mode** (the
+default) Chimaera drives the agent over its structured JSON protocol and renders a first-class
+chat UI — streamed thinking, tool cards, permission prompts, rewind, and inline previews of the
+files each turn produced. Flip to the **real TUI** and the same agent runs as its actual
+`claude`/`codex` terminal in a daemon-owned PTY, looking, behaving, and billing exactly like
+your subscription terminal.
 
 ## Why
 
@@ -83,20 +88,26 @@ in one step, and `just app-build` bundles the native app.
 - **Sessions that survive disconnect.** tmux-grade ownership: the daemon holds every PTY with
   full server-side terminal state. Reload, reconnect, or reattach from another machine and you
   get the identical screen back — no lost scrollback, no broken reconnect tokens.
+- **Chat mode or the real TUI.** Every agent runs two ways on one session, a toggle apart. Chat
+  mode (the default) is a rich structured UI — streamed thinking, tool cards, permission
+  prompts, rewind, and inline previews of what each turn produced. Flip to the real
+  `claude`/`codex` TUI and it looks, behaves, and bills exactly like your subscription terminal.
 - **Multi-agent launcher.** Claude Code, Codex, Gemini CLI, and Antigravity CLI in one
   launcher: detected if installed, resumable per workspace, and installable/updatable from
-  official sources through the UI — binaries live under `~/.chimaera`, credentials stay
-  entirely yours.
+  official sources through the UI — binaries live under `~/.chimaera`, credentials stay entirely
+  yours. Run several at once; attention state tells you which one needs you.
+- **File previews.** Images, Markdown, CSV/TSV (gzip included), PDF, notebooks, and sandboxed
+  self-contained HTML reports — the MultiQC/FastQC class of scientific outputs that normally
+  forces a code-server install. Server extracts, client renders, whole files are never loaded.
+- **Git, built in.** A source-control panel with side-by-side diffs, worktree create/remove, a
+  branch per agent, and a session-scoped view of exactly what an agent changed — the review side
+  of git, without leaving the workbench.
 - **Linked terminals.** Hand an agent a leash to a live shell — the one with your environment
   already loaded — instead of paying setup cost per command. Links are user-granted, scoped,
   and audited in the terminal's own scrollback.
-- **File previews.** Images, Markdown, CSV/TSV (gzip included), PDF, and sandboxed
-  self-contained HTML reports — the MultiQC/FastQC class of scientific outputs that normally
-  forces a code-server install. Server extracts, client renders, whole files are never loaded.
-- **A real workbench layout.** Split panes, tabs, drag-and-drop, focus mode, a session strip
-  that always says where you are, and attention states that tell you which agent needs you.
-- **Themes.** Curated light and dark schemes, applied to the UI and injected into the agents'
-  own TUIs so everything starts matching.
+- **A real workbench layout.** Split panes, tabs, drag-and-drop, focus mode, and a session strip
+  that always says where you are — with curated light/dark themes injected into the agents' own
+  TUIs so everything matches.
 - **Native app.** A Tauri shell wraps the same UI: a window per workspace, a home screen of
   workspaces and remote hosts with one-click connect. Quitting the app kills nothing.
 
