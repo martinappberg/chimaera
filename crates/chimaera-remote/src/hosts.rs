@@ -87,7 +87,14 @@ impl HostsStore {
                 entry.alias = normalized;
             }
         }
-        items.dedup_by(|a, b| a.alias == b.alias);
+        // Keep the first of each alias. `dedup_by` only collapses *adjacent*
+        // equals, but normalization can map two originally-distinct, non-
+        // adjacent entries onto the same alias (e.g. "ssh cluster" + "cluster"),
+        // which `dedup_by` would leave both of — so the host shows up twice and
+        // a stale twin lingers in hosts.json. Retain-with-a-seen-set removes
+        // duplicates at any position; `list()` re-sorts by recency anyway.
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|entry| seen.insert(entry.alias.clone()));
         HostsStore { path, items }
     }
 
@@ -220,6 +227,34 @@ mod tests {
         let (mut store, dir) = tmp_store("record");
         store.record_connected("fresh").unwrap();
         assert_eq!(store.get("fresh").unwrap().alias, "fresh");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Normalization can map two originally-distinct, NON-ADJACENT stored
+    /// entries onto the same alias; `load` must keep only one. The old
+    /// adjacency-only `dedup_by` left both, so the host showed up twice.
+    #[test]
+    fn load_dedups_non_adjacent_aliases_after_heal() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-hosts-test-nonadj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts.json");
+        // "ssh cluster" heals to "cluster", colliding with the last entry —
+        // which is NOT adjacent to it.
+        let json = r#"[
+            {"alias":"ssh cluster","added_at":1},
+            {"alias":"gpu-box","added_at":2},
+            {"alias":"cluster","added_at":3}
+        ]"#;
+        std::fs::write(&path, json).unwrap();
+        let store = HostsStore::load(path);
+        let aliases: Vec<String> = store.list().into_iter().map(|h| h.alias).collect();
+        assert_eq!(
+            aliases.iter().filter(|a| a.as_str() == "cluster").count(),
+            1,
+            "healed non-adjacent duplicate must be removed: {aliases:?}"
+        );
+        assert_eq!(store.list().len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
