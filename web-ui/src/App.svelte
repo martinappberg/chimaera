@@ -25,8 +25,10 @@
     renameSession,
     needsAttention,
     pollSessions,
+    switchingViews,
     switchSessionView,
     touchWorkspace,
+    ViewSwitchConflict,
     type AgentSpawn,
     type Session,
     type Workspace,
@@ -52,7 +54,8 @@
     type Link,
     type LinkCtrl,
   } from "./lib/agentLinks";
-  import { reconnectingSockets, typeIntoDetachedSession } from "./lib/ws";
+  import { typeIntoDetachedSession } from "./lib/ws";
+  import { reconnectingSockets } from "./lib/reconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { get } from "svelte/store";
   import {
@@ -746,13 +749,13 @@
    */
   function typeIntoSession(id: string, text: string): void {
     // Chat sessions: the input is the mounted Composer, not a PTY socket.
+    // insertIntoComposer buffers when the composer hasn't mounted yet (a chat
+    // pane restored on a slow snapshot) and drains on registration, so the
+    // grant is never lost to a mount race.
     if (sessionsById.get(id)?.ui === "chat") {
       const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
       if (loc !== null) layout = activateTab(layout, loc.paneId, loc.index);
-      if (!insertIntoComposer(id, text)) {
-        // Not mounted yet (tab was inactive): give the swap one frame.
-        setTimeout(() => insertIntoComposer(id, text), 120);
-      }
+      insertIntoComposer(id, text);
       return;
     }
     if (!pool.sendText(id, text)) typeIntoDetachedSession(id, text);
@@ -1043,7 +1046,8 @@
         const active = p?.tabs[p.active];
         const sizable =
           active !== undefined &&
-          (active.surface === "terminal" ||
+          ((active.surface === "terminal" &&
+            sessionsById.get(active.sessionId)?.ui !== "chat") ||
             (active.surface === "file" && viewKindFor(active.path) === "markdown"));
         if (p !== null && sizable) {
           e.preventDefault();
@@ -1324,8 +1328,24 @@
    *  leaving them — either way the rail section refetches. */
   let prevAgentIds = new Set<string>();
 
+  /**
+   * Last-known non-zero created_at per session id. The daemon's mid-switch
+   * placeholder row carries created_at:0 (a sentinel); sorting by it verbatim
+   * would teleport a switching session to the rail top and renumber every
+   * ⌘1–9 chord for the switch's duration. Substituting its last-known
+   * created_at keeps the row in place. Pruned to live ids each snapshot.
+   */
+  const lastCreatedAt = new Map<string, number>();
+
   function applySessions(list: Session[]): void {
-    list.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+    for (const s of list) {
+      if (s.created_at !== 0) lastCreatedAt.set(s.id, s.created_at);
+    }
+    const ids = new Set(list.map((s) => s.id));
+    for (const id of lastCreatedAt.keys()) if (!ids.has(id)) lastCreatedAt.delete(id);
+    const sortKey = (s: Session): number =>
+      s.created_at !== 0 ? s.created_at : (lastCreatedAt.get(s.id) ?? 0);
+    list.sort((a, b) => sortKey(a) - sortKey(b) || a.id.localeCompare(b.id));
     sessions = list;
     gotSessions = true;
     // A session now running as chat has no PTY: dispose any warm terminal
@@ -1390,11 +1410,20 @@
   }
 
   function onExited(id: string, _status: number | null): void {
-    // An agent PTY dying may BE the chat⇄terminal toggle doing its job —
-    // the events bus (which carries the mid-switch placeholder row) is
-    // authoritative for agents and corrects within a tick. Shells vanish
-    // instantly, tmux-style.
-    if (sessions.find((s) => s.id === id)?.kind === "agent") return;
+    // An agent PTY dying may BE the chat⇄terminal toggle doing its job, so we
+    // can't just drop the row. The events bus (which carries the mid-switch
+    // placeholder) is authoritative — but with /ws/events down a genuine exit
+    // would linger up to the poll interval, so reconcile immediately from the
+    // roster instead. A real exit drops the row; a toggle's snapshot still
+    // carries the placeholder. Shells vanish instantly, tmux-style.
+    if (sessions.find((s) => s.id === id)?.kind === "agent") {
+      void listSessions()
+        .then(applySessions)
+        .catch(() => {
+          // unreachable daemon; the events socket / poll reconciles later
+        });
+      return;
+    }
     applySessions(sessions.filter((s) => s.id !== id));
   }
 
@@ -1552,7 +1581,14 @@
     }
     createError = null;
     try {
-      const s = await createSession(activeWsId, kind, null, spawnSize(), spawn);
+      // Route a would-be chat spawn straight to the terminal when the catalog
+      // knows this agent's CLI is too old to chat (skips the handshake-watchdog
+      // detour); an unknown/unloaded catalog trusts the default view.
+      const chatCapable =
+        kind === "agent"
+          ? agents?.find((a) => a.id === (spawn.agent ?? "claude"))?.chatCapable
+          : undefined;
+      const s = await createSession(activeWsId, kind, null, spawnSize(), spawn, chatCapable);
       recentlyCreated.set(s.id, Date.now());
       // A racing events snapshot may already have delivered the session.
       if (!sessions.some((x) => x.id === s.id)) sessions.push(s);
@@ -1880,31 +1916,52 @@
    * The chat⇄terminal toggle: the daemon stops the current process and
    * resumes the same conversation in the other mode; the session row's `ui`
    * flips on the events bus and every pane follows. A mid-task agent 409s
-   * until the user confirms the interruption.
+   * (busy) until the user confirms the interruption.
+   *
+   * Guarded against double-fire: the toggle button and its ⌘-chord both call
+   * here, so a switch already in flight for this id is ignored, and the button
+   * disables itself via the `switchingViews` store meanwhile. The server's own
+   * concurrent-switch 409 (without `busy`) is the backstop, dropped silently.
    */
   async function switchView(sessionId: string, target: "chat" | "term"): Promise<void> {
+    if (get(switchingViews).has(sessionId)) return;
+    switchingViews.update((s) => new Set(s).add(sessionId));
     try {
-      await switchSessionView(sessionId, target, false);
-    } catch (e) {
-      const busy = e instanceof ApiError && e.status === 409;
-      if (!busy) {
-        console.error("view switch failed", e);
-        return;
-      }
-      const go = confirm(
-        "The agent is mid-task. Switching restarts it via resume and interrupts the current turn — switch anyway?",
-      );
-      if (!go) return;
       try {
-        await switchSessionView(sessionId, target, true);
-      } catch (err) {
-        console.error("forced view switch failed", err);
-        return;
+        await switchSessionView(sessionId, target, false);
+      } catch (e) {
+        // A concurrent switch already owns this id (409 without busy): the
+        // duplicate is a no-op, no toast, no confirm.
+        if (e instanceof ViewSwitchConflict && !e.busy) return;
+        if (!(e instanceof ViewSwitchConflict)) {
+          console.error("view switch failed", e);
+          return;
+        }
+        const go = confirm(
+          "The agent is mid-task. Switching restarts it via resume and interrupts the current turn — switch anyway?",
+        );
+        if (!go) return;
+        try {
+          await switchSessionView(sessionId, target, true);
+        } catch (err) {
+          console.error("forced view switch failed", err);
+          return;
+        }
       }
+      // Success. Flip the local row's `ui` optimistically in the same tick, so
+      // the pane swaps to the new surface immediately (ChatView mounts now,
+      // instead of blanking until the events bus confirms) — then dispose the
+      // pooled xterm, whose screen is a dead PTY once chat owns the id.
+      const s = sessions.find((x) => x.id === sessionId);
+      if (s !== undefined) s.ui = target;
+      if (target === "chat") pool.disposeSession(sessionId);
+    } finally {
+      switchingViews.update((s) => {
+        const next = new Set(s);
+        next.delete(sessionId);
+        return next;
+      });
     }
-    // The PTY died on purpose; a stale pooled xterm would replay its exited
-    // screen if the session ever toggles back to a terminal.
-    if (target === "chat") pool.disposeSession(sessionId);
   }
 
   /**

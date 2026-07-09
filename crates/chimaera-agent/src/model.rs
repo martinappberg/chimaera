@@ -538,6 +538,16 @@ pub fn cap_output(text: &str) -> (String, bool) {
     cap_head_tail(text, TOOL_OUTPUT_HEAD, TOOL_OUTPUT_TAIL)
 }
 
+/// One-line label truncation with a plain ellipsis — for tool titles and
+/// command previews, where the head/tail "[N bytes omitted]" marker of
+/// [`cap_head_tail`] would be noise. Respects char boundaries.
+pub fn truncate_label(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    format!("{}…", &text[..floor_char_boundary(text, max)])
+}
+
 pub fn cap_head_tail(text: &str, head: usize, tail: usize) -> (String, bool) {
     if text.len() <= head + tail {
         return (text.to_string(), false);

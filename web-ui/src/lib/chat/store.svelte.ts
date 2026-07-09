@@ -8,6 +8,9 @@
 import { canInlinePreview, isImagePath } from "../files";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
+/** The single leading notice a client-side transcript trim leaves behind. */
+const TRIM_NOTICE = "earlier history trimmed";
+
 export interface ToolContent {
   kind: "output" | "diff" | "batch";
   text?: string;
@@ -151,10 +154,6 @@ export class ChatStore {
   degraded = $state(false);
   connected = $state(false);
   fatalError = $state<string | null>(null);
-  /** API-rate estimate from claude's result frames — journaled, never
-   *  rendered by default (subscription plans don't pay per turn). */
-  totalCostUsd = $state(0);
-  totalOutputTokens = $state(0);
   /** Context-window occupancy, 0-100 (claude get_context_usage after each
    *  turn; codex tokenUsage vs modelContextWindow). */
   contextPct = $state<number | null>(null);
@@ -182,8 +181,6 @@ export class ChatStore {
   rewind = $state<RewindReport | null>(null);
   /** MCP inventory (the /mcp panel). */
   mcpServers = $state<McpServer[] | null>(null);
-  /** Conversation title the agent generated (naming rides server-side too). */
-  title = $state<string | null>(null);
   /** CLI-suggested next prompt (claude prompt_suggestion) — composer ghost
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
@@ -235,7 +232,6 @@ export class ChatStore {
         // replayed exit said (toggle round-trips, resumes).
         this.exited = null;
         this.degraded = false;
-        const id = ev.native_session_id as string;
         if (typeof ev.model === "string") this.model = ev.model;
         if (typeof ev.current_mode === "string") this.currentMode = ev.current_mode;
         if (Array.isArray(ev.modes)) this.modes = ev.modes as ModeInfo[];
@@ -252,7 +248,6 @@ export class ChatStore {
             defaultEffort: (m.default_effort as string) ?? null,
           }));
         }
-        void id;
         break;
       }
       case "user_message":
@@ -439,9 +434,6 @@ export class ChatStore {
           limitReached: ev.limit_reached === true,
         };
         break;
-      case "session_title":
-        this.title = ev.title as string;
-        break;
       case "model_switched": {
         // The serving model changed under us (safety reroute, Fable credit
         // fallback): the chip follows the truth, and a retracting switch
@@ -481,12 +473,9 @@ export class ChatStore {
           output_tokens?: number;
           duration_ms?: number;
         };
-        const costUsd = usage.cost_usd ?? null;
-        if (costUsd !== null) this.totalCostUsd += costUsd;
-        this.totalOutputTokens += usage.output_tokens ?? 0;
         this.blocks.push({
           kind: "turn_end",
-          costUsd,
+          costUsd: usage.cost_usd ?? null,
           outputTokens: usage.output_tokens ?? 0,
           durationMs: usage.duration_ms ?? 0,
           artifacts: this.collectTurnArtifacts(),
@@ -531,6 +520,30 @@ export class ChatStore {
       default:
         break;
     }
+    this.trimBlocks();
+  }
+
+  /** Client-side transcript cap. The daemon journal compacts its own history;
+   *  the rendered `blocks` array has no such bound, so a very long session
+   *  would grow it (and the DOM) without limit. Beyond a generous cap we drop
+   *  the oldest blocks behind a single "earlier history trimmed" notice,
+   *  mirroring the server's compaction. The cap is far above the live tail, so
+   *  the streaming message and its tool cards are never touched. */
+  private static readonly BLOCK_CAP = 2000;
+  private trimBlocks(): void {
+    const cap = ChatStore.BLOCK_CAP;
+    if (this.blocks.length <= cap) return;
+    // Drop the oldest overflow plus one more, and land a single leading notice
+    // in their place (an earlier trim's notice is among the dropped, so it
+    // never stacks). Result length settles at exactly the cap.
+    const drop = this.blocks.length - cap + 1;
+    const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
+    this.blocks.splice(0, drop, notice);
+    // The front-splice invalidated every toolIndex position — rebuild it.
+    this.toolIndex.clear();
+    this.blocks.forEach((b, i) => {
+      if (b.kind === "tool") this.toolIndex.set(b.id, i);
+    });
   }
 
   private appendText(kind: "message" | "thought", ev: AgentEvent): void {

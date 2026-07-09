@@ -264,6 +264,13 @@ async fn permission_deny_marks_tool_failed() {
         )
     })
     .await;
+    // The deny sends interrupt:true, which aborts the turn on the real CLI —
+    // the hermetic fake now mirrors that (is_error result → TurnAborted),
+    // instead of the TurnCompleted the old success-result deny produced.
+    wait_for(&mut rx, &mut seen, "TurnAborted", |ev| {
+        matches!(ev, AgentEvent::TurnAborted { .. })
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -1,11 +1,5 @@
-import { writable } from "svelte/store";
 import { getToken } from "./api";
-
-/**
- * Number of session sockets currently trying to reconnect. The daemon dot in
- * the rail pulses while this is non-zero.
- */
-export const reconnectingSockets = writable(0);
+import { Reconnector, UNKNOWN_SESSION_RETRIES } from "./reconnect";
 
 export interface SessionSocketHandlers {
   /** Raw PTY output (including the initial snapshot). Feed to term.write(). */
@@ -43,15 +37,6 @@ interface ServerTextFrame {
   code?: string;
 }
 
-const INITIAL_BACKOFF_MS = 500;
-const MAX_BACKOFF_MS = 10_000;
-/**
- * "unknown session" is retried this many times before it is fatal: during a
- * chat⇄terminal view switch the id briefly has no attachable process, and
- * the pane's socket must ride that out instead of dying on the first probe.
- */
-export const UNKNOWN_SESSION_RETRIES = 12;
-
 /**
  * One WebSocket per attached session, per the /ws/sessions/{id} contract:
  * auth text frame -> ready text frame -> snapshot binary frame -> live
@@ -64,10 +49,8 @@ export class SessionSocket {
   private fatal = false;
   private exited = false;
   private everReady = false;
-  private reconnecting = false;
   private unknownRetries = 0;
-  private backoffMs = INITIAL_BACKOFF_MS;
-  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
   constructor(
@@ -102,10 +85,10 @@ export class SessionSocket {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       if (this.closed || this.fatal || this.exited) {
-        this.clearReconnecting();
+        this.recon.clear();
         return;
       }
-      this.scheduleReconnect();
+      this.recon.schedule();
     };
   }
 
@@ -118,9 +101,8 @@ export class SessionSocket {
     }
     switch (msg.type) {
       case "ready": {
-        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.recon.succeeded();
         this.unknownRetries = 0;
-        this.clearReconnecting();
         // On a reconnect the server re-sends a full snapshot; wipe the stale
         // screen so the snapshot reconstructs state exactly.
         if (this.everReady) this.handlers.onReset();
@@ -171,25 +153,6 @@ export class SessionSocket {
     }
   }
 
-  private scheduleReconnect(): void {
-    if (!this.reconnecting) {
-      this.reconnecting = true;
-      reconnectingSockets.update((n) => n + 1);
-    }
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.connect();
-    }, this.backoffMs);
-    this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
-  }
-
-  private clearReconnecting(): void {
-    if (this.reconnecting) {
-      this.reconnecting = false;
-      reconnectingSockets.update((n) => Math.max(0, n - 1));
-    }
-  }
-
   /** True while the socket is connected and can accept input frames. */
   get isOpen(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
@@ -212,11 +175,8 @@ export class SessionSocket {
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
-    if (this.retryTimer !== null) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
-    this.clearReconnecting();
+    this.recon.cancel();
+    this.recon.clear();
     this.ws?.close();
     this.ws = null;
   }

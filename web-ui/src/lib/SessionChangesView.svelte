@@ -1,5 +1,12 @@
 <script lang="ts">
-  import { gitStatus, type DiffMode, type GitEntry } from "./git";
+  import {
+    fetchGitStatus,
+    gitEnv,
+    gitStatus,
+    type DiffMode,
+    type GitEntry,
+    type GitStatus,
+  } from "./git";
   import { decoFor } from "./gitDeco";
   import { workspaceRelative } from "./reference";
   import { displayName, type Session } from "./sessions";
@@ -24,7 +31,47 @@
 
   let { session, wsRoot, paneId, ctrl }: Props = $props();
 
-  const status = $derived($gitStatus);
+  /** The active workspace's mirrored status (the git store follows the ACTIVE
+   *  workspace only). */
+  const activeStatus = $derived($gitStatus);
+
+  /**
+   * This session may live in a LINKED worktree — its own repo/workspace, not
+   * the active one the git store mirrors. Cross-referencing its touched files
+   * against the active status would mark every row "no current git change", so
+   * when the workspace ids differ we fetch the session's OWN workspace status
+   * locally; when they match we just reuse the store (no extra fetch).
+   */
+  let ownStatus = $state<GitStatus | null>(null);
+  $effect(() => {
+    const wsId = session.workspace_id;
+    // Re-fetch as the touched-files list grows so newly-written files decorate.
+    void session.files_touched?.length;
+    if (activeStatus !== null && activeStatus.workspace_id === wsId) {
+      ownStatus = null; // the store already mirrors this workspace
+      return;
+    }
+    let cancelled = false;
+    void fetchGitStatus(wsId).then(
+      (s) => {
+        if (!cancelled) ownStatus = s.repo ? s : null;
+      },
+      () => {
+        if (!cancelled) ownStatus = null;
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** The status to decorate against: the active store when it already mirrors
+   *  this session's workspace, else the session's own fetched status. */
+  const status = $derived(
+    activeStatus !== null && activeStatus.workspace_id === session.workspace_id
+      ? activeStatus
+      : ownStatus,
+  );
   /** Absolute path -> its git entry, for the touched files. */
   const byPath = $derived.by(() => {
     const m = new Map<string, GitEntry>();
@@ -56,9 +103,12 @@
     <span class="count">{files.length} file{files.length === 1 ? "" : "s"}</span>
   </header>
 
-  {#if status !== null && status.git_ok === false}
+  {#if $gitEnv !== null && !$gitEnv.ok}
+    <!-- gitEnv is tracked independently of `repo` (git.ts), so this explains a
+         too-old / missing git even where gitStatus is null — unlike the old
+         status.git_ok, which is null in exactly that case. -->
     <div class="note">
-      Source control needs <b>git ≥ {status.git?.min ?? "2.15"}</b>. Set a newer
+      Source control needs <b>git ≥ {$gitEnv.min}</b>. Set a newer
       <code>git.path</code> in Settings to see diffs here.
     </div>
   {/if}

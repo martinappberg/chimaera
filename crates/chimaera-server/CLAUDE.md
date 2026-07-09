@@ -12,7 +12,8 @@ the module you need and read its header doc.
 
 | Module | What it owns |
 |---|---|
-| `lib.rs` | `AppState` (every shared handle + lock), `app()` route table, the session ledger (restart handoff / resurrection). |
+| `lib.rs` | `AppState` (every shared handle + lock), `app()` route table, the daemon `run()` lifecycle. |
+| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. (Note: chat sessions are not yet in the snapshot — see the chat-mode seam.) |
 | `api.rs` | REST: session create/delete, `session_env`, the agent/model catalog surface, view-switch entry, shutdown. |
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe), **`/ws/chat/{id}`** (structured events), `/ws/events` (the session-list bus). |
 | `chat.rs` | **The chat-mode glue** (see below). |

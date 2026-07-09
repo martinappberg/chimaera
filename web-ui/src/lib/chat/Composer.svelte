@@ -306,10 +306,10 @@
 
 <div class="composer">
   {#if popover === "slash"}
-    <div class="pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
+    <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
       {#each slashMatches as cmd, i (cmd.name)}
         <button
-          class="pop-row"
+          class="overlay-row pop-row"
           class:sel={i === selected}
           id={`${uid}-opt-${i}`}
           role="option"
@@ -325,10 +325,10 @@
       {/each}
     </div>
   {:else if popover === "term"}
-    <div class="pop" id="{uid}-pop" role="listbox" aria-label="terminals">
+    <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="terminals">
       {#each termMatches as t, i (t.id)}
         <button
-          class="pop-row"
+          class="overlay-row pop-row"
           class:sel={i === selected}
           id={`${uid}-opt-${i}`}
           role="option"
@@ -341,10 +341,10 @@
       {/each}
     </div>
   {:else if popover === "file"}
-    <div class="pop" id="{uid}-pop" role="listbox" aria-label="files and folders">
+    <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="files and folders">
       {#each fileMatches as entry, i (entry.path)}
         <button
-          class="pop-row"
+          class="overlay-row pop-row"
           class:sel={i === selected}
           id={`${uid}-opt-${i}`}
           role="option"
@@ -408,40 +408,22 @@
     border-top: 1px solid var(--edge);
     padding: 8px 10px;
   }
+  /* .overlay-surface / .overlay-row (surface + button reset + hover) live in
+     app.css; .pop and .pop-row add only this popover's position and layout. */
   .pop {
-    position: absolute;
     bottom: 100%;
     left: 10px;
     right: 10px;
     margin-bottom: 4px;
-    padding: 4px;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
-    overflow: hidden;
     z-index: 10;
   }
   .pop-row {
     display: flex;
     align-items: center;
     gap: 10px;
-    width: 100%;
-    padding: 5px 10px;
-    background: none;
-    border: none;
-    border-radius: 5px;
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
   }
-  /* .sel after :hover so the keyboard highlight wins on a hovered selected row. */
-  .pop-row:hover {
-    background: var(--row-hover);
-  }
+  /* Higher specificity than the shared .overlay-row:hover, so the keyboard
+     highlight (.sel) wins even on a hovered selected row. */
   .pop-row.sel {
     background: var(--row-active);
   }

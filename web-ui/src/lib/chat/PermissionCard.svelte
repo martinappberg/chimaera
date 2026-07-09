@@ -178,33 +178,9 @@
     gap: 6px;
     margin-top: 8px;
   }
-  .opt {
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 3px 12px;
-    border-radius: 5px;
-    border: 1px solid var(--edge);
-    background: none;
-    color: var(--fg);
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease,
-      background-color 0.12s ease;
-  }
-  /* Accent tint + --fg ink, not accent-filled: no single fill ink survives
-     both the light themes' dark accents and the dark themes' bright ones. */
-  .opt.primary {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    color: var(--fg);
-  }
-  .opt.primary:hover {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-  }
-  .opt.quiet {
-    color: var(--muted);
-  }
+  /* Base .opt / .opt.primary / .opt.quiet live in app.css. Reject options
+     (the only quiet ones here) turn danger-red on hover instead of the shared
+     neutral hover — the permission prompt's own affordance. */
   .opt.quiet:hover {
     color: var(--err);
     border-color: color-mix(in srgb, var(--err) 45%, var(--edge));

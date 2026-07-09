@@ -799,7 +799,12 @@ function deserNode(
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {
-        return null;
+        // A record-shaped tab of an unrecognized kind is almost certainly a
+        // tab kind from a NEWER build persisted then rolled back to this one:
+        // skip just that tab, don't null the whole pane (which would reset the
+        // entire saved layout to default). Genuinely malformed structure —
+        // a non-record entry (above) — still fails the pane.
+        continue;
       }
       const key = tabKey(tab);
       if (seenTabs.has(key)) continue; // enforce no-duplicates on load
@@ -926,6 +931,20 @@ if (import.meta.env.DEV) {
     "round-trip keeps file tabs",
   );
   ok(deserializeLayout({ v: 1, root: { t: "x" } }) === null, "malformed blobs are rejected");
+
+  // a record-shaped tab of an unknown kind (persisted by a newer build, then
+  // rolled back to this one) is SKIPPED, not fatal — the pane and its other
+  // tabs survive rather than the whole layout resetting to default.
+  const mixed = deserializeLayout({
+    v: 1,
+    focused: "mixp",
+    root: { t: "p", id: "mixp", active: 0, tabs: [{ nb: "/tmp/x.ipynb" }, { f: "/tmp/keep.md" }] },
+  });
+  ok(mixed !== null, "an unknown tab kind does not null its pane");
+  ok(
+    mixed !== null && allFilePaths(mixed).join() === "/tmp/keep.md",
+    "the unknown tab is skipped; its sibling tabs survive",
+  );
 
   // settings surface: singleton (dedupes) and survives serialization
   let st = defaultLayout();

@@ -7,12 +7,17 @@
   import { insertIntoComposer } from "./composerBus";
   import { ChatSocket } from "./chatWs";
   import { ChatStore } from "./store.svelte";
+  import { dismiss } from "./dismiss";
+  import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
+  import UsagePanel from "./UsagePanel.svelte";
+  import McpPanel from "./McpPanel.svelte";
+  import RewindDialog from "./RewindDialog.svelte";
   import Composer, { type ImageAttachment } from "./Composer.svelte";
   import type { ChatBlock } from "./store.svelte";
 
@@ -48,12 +53,18 @@
   let models = $state<{ id: string; label: string }[]>([]);
   // svelte-ignore state_referenced_locally
   const agentKind = session.agent_kind ?? "claude";
-  /** Product name for the identity chip — a workspace can mix agents, so
-   *  the surface always says WHICH one this is. */
-  const agentName =
-    agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind;
+  /** Product name for the identity chip. Prefer the daemon catalog's own name;
+   *  fall back to a built-in map until it resolves (a workspace can mix agents,
+   *  so the surface always says WHICH one this is). */
+  let agentCatalogName = $state<string | null>(null);
+  const agentName = $derived(
+    agentCatalogName ??
+      (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind),
+  );
   void listAgents().then((agents) => {
-    models = agents.find((a) => a.id === agentKind)?.models ?? [];
+    const info = agents.find((a) => a.id === agentKind);
+    models = info?.models ?? [];
+    agentCatalogName = info?.name ?? null;
   });
 
   let transcriptEl = $state<HTMLElement | null>(null);
@@ -112,21 +123,21 @@
     atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   }
 
+  function scrollToBottom() {
+    transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
+  }
+
   // Stick to the bottom while new content streams, unless the user scrolled
-  // up to read history.
+  // up to read history. Guarded on atBottom so a background stream never forces
+  // layout. lastSeq bumps on every applied event (in-place chunk appends and
+  // tool patches change no collection lengths), so streaming keeps following;
+  // Markdown's onReveal keeps us pinned as words grow between wire chunks.
   $effect(() => {
-    // Local notices push blocks without a seq; chunks coalesce into the last
-    // block (last.text += ...) and tool results patch it in place — lastSeq
-    // bumps on every applied event, so streaming keeps following. The reveal
-    // animation grows text between events, so it follows too.
     void store.blocks.length;
     void store.pending.length;
     void store.lastSeq;
-    void reveal;
     if (!atBottom) return;
-    void tick().then(() => {
-      transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
-    });
+    void tick().then(scrollToBottom);
   });
 
   function sendNow(text: string, images: ImageAttachment[]): boolean {
@@ -403,58 +414,12 @@
     }
   });
 
-  // --- smooth streaming reveal ------------------------------------------------
-  // Wire chunks arrive coalesced (2 KiB / 100 ms) — rendering them raw makes
-  // text land in ugly slabs. The tail of the LIVE message block reveals in
-  // WORD BATCHES on a ~75 ms cadence instead, and each fresh batch fades in
-  // (Markdown's fadeWords) — overlapping fades give the soft cascade look.
-  const REVEAL_TICK_MS = 75;
-  const reducedMotion =
-    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let reveal = $state<{ idx: number; chars: number; batchWords: number } | null>(null);
-  $effect(() => {
-    void store.lastSeq;
-    const idx = store.blocks.length - 1;
-    const last = store.blocks[idx];
-    if (reducedMotion || !store.running || last === undefined || last.kind !== "message") {
-      reveal = null;
-      return;
-    }
-    if (reveal === null || reveal.idx !== idx) reveal = { idx, chars: 0, batchWords: 0 };
-  });
-  $effect(() => {
-    const r = reveal;
-    if (r === null) return;
-    void store.lastSeq;
-    const block = store.blocks[r.idx];
-    if (block === undefined || block.kind !== "message") return;
-    if (r.chars >= block.text.length) return;
-    const timer = setTimeout(() => {
-      const text = store.blocks[r.idx];
-      if (text === undefined || text.kind !== "message") return;
-      // Advance a few words, more when the buffer runs ahead — the stream
-      // never lags visibly, it just breathes.
-      const pending = [...text.text.slice(r.chars).matchAll(/\S+\s*/g)];
-      if (pending.length === 0) {
-        reveal = { idx: r.idx, chars: text.text.length, batchWords: 0 };
-        return;
-      }
-      const take = Math.min(pending.length, Math.max(2, Math.ceil(pending.length / 6)));
-      const lastTaken = pending[take - 1];
-      const nextChars = r.chars + (lastTaken.index ?? 0) + lastTaken[0].length;
-      reveal = { idx: r.idx, chars: Math.min(nextChars, text.text.length), batchWords: take };
-    }, REVEAL_TICK_MS);
-    return () => clearTimeout(timer);
-  });
-  function blockText(block: { text: string }, i: number): string {
-    return reveal !== null && reveal.idx === i ? block.text.slice(0, reveal.chars) : block.text;
-  }
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
 
   /** Render list: consecutive tool blocks coalesce into one ToolGroup so a
    *  long run reads as a single condensed line, not a wall of cards. Every
    *  other block passes through as a "single" carrying its ORIGINAL index (the
-   *  reveal animation and blockText key off store.blocks positions). */
+   *  streaming reveal keys off store.blocks positions). */
   type RenderItem =
     | { t: "group"; key: string; tools: Extract<ChatBlock, { kind: "tool" }>[] }
     | { t: "single"; key: string; index: number; block: ChatBlock };
@@ -475,229 +440,42 @@
     });
     return items;
   });
-
-  // Close menus on any press outside a menu host, or Escape (PaneTabs idiom).
-  $effect(() => {
-    if (menu === null) return;
-    const onDown = (e: PointerEvent) => {
-      if (e.target instanceof Element && e.target.closest(".menu-host") !== null) return;
-      menu = null;
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        menu = null;
-      }
-    };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey, true);
-    };
-  });
 </script>
 
-<div class="chat" class:focused>
-  <header class="strip">
-    <span class="agent-id" title="{agentName} chat session">
-      <SessionGlyph kind="agent" {agentKind} size={11} />
-      <span class="agent-name">{agentName}</span>
-    </span>
-    <div class="menu-host">
-      <button
-        class="chip pick"
-        title="model — click to switch"
-        aria-haspopup="menu"
-        aria-expanded={menu === "model"}
-        onclick={() => (menu = menu === "model" ? null : "model")}
-      >
-        {modelLabel ?? "model"}
-        <span class="caret">
-          <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-            <path
-              d="M4 6l4 4 4-4"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
-        </span>
-      </button>
-      {#if menu === "model"}
-        <div class="menu" role="menu" aria-label="model">
-          {#if modelChoices.length === 0}
-            <span class="menu-empty">no known models</span>
-          {/if}
-          {#each modelChoices as m (m.id)}
-            <button
-              class="menu-row"
-              class:current={m.id === store.model ||
-                ("resolved" in m && m.resolved === store.model)}
-              role="menuitem"
-              title={"description" in m && typeof m.description === "string"
-                ? m.description
-                : undefined}
-              onclick={() => pickModel(m.id)}
-            >
-              {m.label}
-            </button>
-          {/each}
-        </div>
-      {/if}
-    </div>
-    {#if store.modes.length > 0}
-      <div class="menu-host">
-        <button
-          class="chip pick"
-          title="permission mode — click to switch"
-          aria-haspopup="menu"
-          aria-expanded={menu === "mode"}
-          onclick={() => (menu = menu === "mode" ? null : "mode")}
-        >
-          {modeLabel ?? "mode"}
-          <span class="caret">
-            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-              <path
-                d="M4 6l4 4 4-4"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </span>
-        </button>
-        {#if menu === "mode"}
-          <div class="menu" role="menu" aria-label="permission mode">
-            {#each store.modes as m (m.id)}
-              <button
-                class="menu-row"
-                class:current={m.id === store.currentMode}
-                role="menuitem"
-                onclick={() => pickMode(m.id)}
-              >
-                {m.label}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    {/if}
-    {#if hasEffort}
-      <div class="menu-host">
-        <button
-          class="chip pick"
-          title={EFFORT_HINT[agentKind] ?? "reasoning effort"}
-          aria-haspopup="menu"
-          aria-expanded={menu === "effort"}
-          onclick={() => (menu = menu === "effort" ? null : "effort")}
-        >
-          {effortShown ?? "effort"}
-          <span class="caret">
-            <svg viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
-              <path
-                d="M4 6l4 4 4-4"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </span>
-        </button>
-        {#if menu === "effort"}
-          <div class="menu effort-pop" role="group" aria-label="reasoning effort">
-            <div class="effort-head">
-              <span>effort</span>
-              <strong>{effortShown ?? "default"}</strong>
-            </div>
-            <div class="effort-scale" aria-hidden="true">
-              <span>faster</span>
-              <span>smarter</span>
-            </div>
-            <div class="effort-track" role="radiogroup" aria-label="effort level">
-              {#each effortChoices as level (level)}
-                <button
-                  class="effort-dot"
-                  class:active={level === effortShown}
-                  role="radio"
-                  aria-checked={level === effortShown}
-                  aria-label={level}
-                  title={level}
-                  onclick={() => pickEffort(level)}
-                ></button>
-              {/each}
-            </div>
-            <div class="effort-names" aria-hidden="true">
-              {#each effortChoices as level (level)}
-                <button
-                  class="effort-name"
-                  class:current={level === effortShown}
-                  tabindex="-1"
-                  onclick={() => pickEffort(level)}
-                >
-                  {level}
-                </button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
-    {/if}
-    {#if hasUltracode}
-      <button
-        class="chip pick"
-        class:uc-on={store.ultracode}
-        title="ultracode — xhigh effort + standing workflow orchestration, this session only"
-        aria-pressed={store.ultracode}
-        onclick={toggleUltracode}
-      >
-        ultracode{store.ultracode ? " on" : ""}
-      </button>
-    {/if}
-    {#if hasThinking}
-      <button
-        class="chip pick"
-        title="extended thinking — toggles from the next message"
-        aria-pressed={thinking === true}
-        onclick={toggleThinking}
-      >
-        thinking{thinking === null ? "" : thinking ? " on" : " off"}
-      </button>
-    {/if}
-    <span class="spacer"></span>
-    {#if store.running}
-      <button class="stop" onclick={interrupt} title="interrupt the agent (Esc)">stop</button>
-    {/if}
-    {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}
-      <span
-        class="ratelimit"
-        class:hit={store.rateLimit.limitReached}
-        title={store.rateLimit.resetsAt !== null
-          ? `resets ${new Date(Number(store.rateLimit.resetsAt) * 1000).toLocaleString()}`
-          : "account rate limit"}
-      >
-        {store.rateLimit.label ?? "usage limit"}
-        {store.rateLimit.limitReached ? "reached" : `${Math.floor(store.rateLimit.utilization)}%`}
-      </span>
-    {/if}
-    {#if store.contextPct !== null}
-      <span
-        class="ctx"
-        class:full={store.contextPct >= 80}
-        title={store.contextTokens !== null
-          ? `context window: ${store.contextTokens.total.toLocaleString()} / ${store.contextTokens.max.toLocaleString()} tokens`
-          : "context window used"}
-      >
-        {Math.round(store.contextPct)}% ctx
-      </span>
-    {/if}
-  </header>
+<!-- The outside-dismiss action closes any open header menu / the /mcp panel on
+     an outside pointerdown or Escape; `.menu-host` marks the surfaces that must
+     stay open (the chips live in ChatHeader, the panel is a sibling overlay). -->
+<div
+  class="chat"
+  class:focused
+  use:dismiss={{
+    enabled: menu !== null,
+    onDismiss: () => (menu = null),
+    keepOpenWithin: ".menu-host",
+  }}
+>
+  <ChatHeader
+    {store}
+    {agentKind}
+    {agentName}
+    bind:menu
+    {modelChoices}
+    {modelLabel}
+    {modeLabel}
+    {hasEffort}
+    {effortChoices}
+    {effortShown}
+    effortHint={EFFORT_HINT[agentKind] ?? "reasoning effort"}
+    {hasUltracode}
+    {hasThinking}
+    {thinking}
+    onPickModel={pickModel}
+    onPickMode={pickMode}
+    onPickEffort={pickEffort}
+    onToggleUltracode={toggleUltracode}
+    onToggleThinking={toggleThinking}
+    onInterrupt={interrupt}
+  />
 
   <!-- Focusable so keyboard scrolling works in WKWebView (Safari never
        auto-focuses scrollers); role="log" announces new agent output. -->
@@ -750,10 +528,13 @@
       {:else if item.block.kind === "message"}
         <div class="msg agent">
           <Markdown
-            text={blockText(item.block, item.index)}
-            fadeWords={reveal !== null && reveal.idx === item.index ? reveal.batchWords : 0}
+            text={item.block.text}
+            streaming={store.running && item.index === store.blocks.length - 1}
             onOpenPath={openProsePath}
             resolvePaths={resolveProsePaths}
+            onReveal={() => {
+              if (atBottom) scrollToBottom();
+            }}
           />
         </div>
       {:else if item.block.kind === "thought"}
@@ -777,23 +558,7 @@
           </div>
         {/if}
       {:else if item.block.kind === "usage"}
-        {@const block = item.block}
-        <div class="usage-panel">
-          {#if block.windows.length === 0}
-            <div class="usage-row"><span>no usage data reported</span></div>
-          {/if}
-          {#each block.windows as w (w.label)}
-            <div class="usage-row">
-              <span class="usage-label">{w.label}</span>
-              <span class="usage-bar"><span
-                  class="usage-fill"
-                  class:high={w.utilization >= 80}
-                  style:width="{Math.min(100, Math.max(0, w.utilization))}%"
-                ></span></span>
-              <span class="usage-pct">{Math.floor(w.utilization)}%</span>
-            </div>
-          {/each}
-        </div>
+        <UsagePanel windows={item.block.windows} />
       {/if}
     {/each}
 
@@ -833,10 +598,7 @@
     {/if}
 
     {#if !atBottom && store.pending.length > 0}
-      <button
-        class="jump"
-        onclick={() => transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight })}
-      >
+      <button class="jump" onclick={scrollToBottom}>
         permission needed ↓
       </button>
     {/if}
@@ -858,121 +620,22 @@
   {/if}
 
   {#if rewindIntent !== null}
-    <div class="dialog-veil">
-      <div class="dialog" role="alertdialog" aria-label="rewind to checkpoint">
-        {#if rewindIntent.stage === "applying"}
-          <div class="dialog-title">rewinding…</div>
-        {:else if rewindReport === null}
-          <div class="dialog-title">checking checkpoint…</div>
-          <div class="dialog-actions">
-            <button class="opt quiet" onclick={() => (rewindIntent = null)}>cancel</button>
-          </div>
-        {:else if !rewindReport.canRewind}
-          <div class="dialog-title">no checkpoint available for this message</div>
-          {#if rewindReport.error !== null}
-            <div class="dialog-note">{rewindReport.error}</div>
-          {/if}
-          <div class="dialog-actions">
-            <button class="opt quiet" onclick={() => (rewindIntent = null)}>close</button>
-          </div>
-        {:else}
-          <div class="dialog-title">
-            rewind files to before this message
-            {#if rewindReport.filesChanged.length > 0}
-              — {rewindReport.filesChanged.length} file{rewindReport.filesChanged.length > 1
-                ? "s"
-                : ""} will change
-            {/if}
-          </div>
-          {#if rewindReport.filesChanged.length > 0}
-            <ul class="dialog-files">
-              {#each rewindReport.filesChanged as f (f)}
-                <li>
-                  <button class="file-link" title="open in a pane" onclick={() => onOpenFile?.(f)}>
-                    {f}
-                  </button>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-          <div class="dialog-actions">
-            <button class="opt primary" onclick={() => confirmRewind(false)}>
-              restore files
-            </button>
-            {#if rewindIntent.preceding !== null}
-              <button
-                class="opt primary"
-                title="also truncate the conversation here (forks to a new native session)"
-                onclick={() => confirmRewind(true)}
-              >
-                restore + rewind conversation
-              </button>
-            {/if}
-            <button class="opt quiet" onclick={() => (rewindIntent = null)}>cancel</button>
-          </div>
-        {/if}
-      </div>
-    </div>
+    <RewindDialog
+      intent={rewindIntent}
+      report={rewindReport}
+      onCancel={() => (rewindIntent = null)}
+      onConfirm={confirmRewind}
+      {onOpenFile}
+    />
   {/if}
 
   {#if menu === "mcp"}
-    <div class="menu-host mcp-host">
-      <div class="menu mcp-panel" role="dialog" aria-label="MCP servers">
-        <div class="mcp-title">MCP servers</div>
-        {#if store.mcpServers === null}
-          <span class="menu-empty">loading…</span>
-        {:else if store.mcpServers.length === 0}
-          <span class="menu-empty">no MCP servers configured</span>
-        {:else}
-          {#each store.mcpServers as s (s.name)}
-            <div class="mcp-row">
-              <span
-                class="mcp-glyph"
-                class:ok={s.status === "connected"}
-                class:bad={s.status === "failed"}
-                class:warn={s.status === "needs-auth"}
-              >
-                {s.status === "connected"
-                  ? "✓"
-                  : s.status === "failed"
-                    ? "✗"
-                    : s.status === "needs-auth"
-                      ? "⚠"
-                      : s.status === "pending"
-                        ? "◐"
-                        : "○"}
-              </span>
-              <span class="mcp-name" title={s.error ?? s.status}>{s.name}</span>
-              {#if s.tools > 0}
-                <span class="mcp-tools">{s.tools} tools</span>
-              {/if}
-              {#if s.status === "failed" || s.status === "needs-auth"}
-                <button
-                  class="mcp-act"
-                  onclick={() => socket.send({ type: "reconnect_mcp", server: s.name })}
-                >
-                  reconnect
-                </button>
-              {/if}
-              <button
-                class="mcp-act"
-                onclick={() =>
-                  socket.send({
-                    type: "set_mcp_enabled",
-                    server: s.name,
-                    enabled: s.status === "disabled",
-                  })}
-              >
-                {s.status === "disabled" ? "enable" : "disable"}
-              </button>
-            </div>
-            {#if s.error !== null}
-              <div class="mcp-error">{s.error}</div>
-            {/if}
-          {/each}
-        {/if}
-      </div>
-    </div>
+    <McpPanel
+      servers={store.mcpServers}
+      onReconnect={(server) => socket.send({ type: "reconnect_mcp", server })}
+      onToggleEnabled={(server, enabled) =>
+        socket.send({ type: "set_mcp_enabled", server, enabled })}
+    />
   {/if}
 
   {#if store.promptSuggestion !== null && !store.running}
@@ -1023,192 +686,6 @@
     /* The reading measure (the Claude Desktop proportion) shared by the
        transcript column, the composer, and their satellites. */
     --chat-measure: 52rem;
-  }
-  .strip {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap; /* narrow panes get a clean second chip row, not clipping */
-    gap: 4px 6px;
-    padding: 4px 10px;
-    border-bottom: 1px solid var(--edge);
-    font-size: var(--text-xs);
-    color: var(--muted);
-    flex: none;
-  }
-  .menu-host {
-    position: relative;
-  }
-  .agent-id {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    color: var(--fg);
-    font-family: var(--mono);
-    flex: none;
-    padding-right: 4px;
-    border-right: 1px solid var(--edge);
-    margin-right: 2px;
-  }
-  .agent-name {
-    white-space: nowrap;
-  }
-  .file-link {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--accent);
-    font: inherit;
-    font-family: var(--mono, monospace);
-    cursor: pointer;
-    text-align: left;
-    word-break: break-all;
-  }
-  .file-link:hover {
-    text-decoration: underline;
-  }
-  .chip {
-    border: 1px solid var(--edge);
-    border-radius: 999px;
-    padding: 0 8px;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 18px;
-    /* Fixed-height pill: the label must clip, never wrap out of it. */
-    white-space: nowrap;
-    min-width: 0;
-    overflow: hidden;
-  }
-  .chip.pick {
-    background: none;
-    color: var(--muted);
-    font: inherit;
-    font-family: var(--mono);
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease;
-  }
-  .chip.pick:hover {
-    color: var(--fg);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
-  }
-  .chip.uc-on {
-    color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-  .caret {
-    display: inline-flex;
-    opacity: 0.7;
-  }
-  .menu {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    margin-top: 4px;
-    min-width: 180px;
-    padding: 4px;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
-    overflow: hidden;
-    z-index: 20;
-  }
-  .menu-row {
-    display: block;
-    width: 100%;
-    padding: 5px 12px;
-    background: none;
-    border: none;
-    border-radius: 4px;
-    color: var(--fg);
-    font: inherit;
-    font-size: var(--text-sm);
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
-  }
-  .menu-row:hover {
-    background: var(--row-hover);
-  }
-  .menu-row.current {
-    color: var(--accent);
-  }
-  .menu-empty {
-    display: block;
-    padding: 6px 12px;
-    color: var(--muted);
-    font-size: var(--text-sm);
-  }
-  .spacer {
-    flex: 1;
-  }
-  .stop {
-    font: inherit;
-    font-size: var(--text-xs);
-    border: 1px solid color-mix(in srgb, var(--err) 50%, var(--edge));
-    color: var(--err);
-    background: none;
-    border-radius: 5px;
-    padding: 0 10px;
-    line-height: 16px;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
-  }
-  .stop:hover {
-    background: color-mix(in srgb, var(--err) 10%, transparent);
-  }
-  .ctx {
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
-  }
-  .ctx.full {
-    color: var(--warn);
-  }
-  .usage-panel {
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    padding: 8px 10px;
-    margin: 6px 0;
-    font-size: var(--text-sm);
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .usage-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .usage-label {
-    flex: none;
-    width: 120px;
-    color: var(--muted);
-  }
-  .usage-bar {
-    flex: 1;
-    height: 4px;
-    border-radius: 2px;
-    background: color-mix(in srgb, var(--fg) 8%, transparent);
-    overflow: hidden;
-  }
-  .usage-fill {
-    display: block;
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-  }
-  .usage-fill.high {
-    background: var(--warn);
-  }
-  .usage-pct {
-    flex: none;
-    width: 36px;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
   }
   .transcript {
     flex: 1;
@@ -1273,7 +750,7 @@
     word-break: break-word;
     line-height: 1.5;
     font-size: var(--text-md);
-    animation: rise 0.15s ease;
+    animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }
   @media (prefers-reduced-motion: reduce) {
     .msg {
@@ -1391,76 +868,6 @@
       animation: none;
     }
   }
-  .effort-pop {
-    min-width: 240px;
-    padding: 10px 14px 12px;
-  }
-  .effort-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    color: var(--muted);
-    font-size: var(--text-sm);
-    padding-bottom: 8px;
-  }
-  .effort-head strong {
-    color: var(--fg);
-    font-family: var(--mono, monospace);
-    font-weight: 600;
-  }
-  .effort-scale {
-    display: flex;
-    justify-content: space-between;
-    color: var(--muted);
-    font-size: var(--text-xs);
-    padding-bottom: 4px;
-  }
-  .effort-track {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: color-mix(in srgb, var(--fg) 6%, transparent);
-    border-radius: 999px;
-    padding: 5px 8px;
-  }
-  .effort-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    border: none;
-    background: color-mix(in srgb, var(--fg) 30%, transparent);
-    padding: 0;
-    cursor: pointer;
-    transition:
-      transform 0.12s ease,
-      background-color 0.12s ease;
-  }
-  .effort-dot:hover {
-    transform: scale(1.5);
-    background: var(--fg);
-  }
-  .effort-dot.active {
-    background: var(--accent);
-    transform: scale(1.75);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
-  }
-  .effort-names {
-    display: flex;
-    justify-content: space-between;
-    padding-top: 6px;
-  }
-  .effort-name {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--muted);
-    font-size: var(--text-xs);
-    font-family: var(--mono, monospace);
-    cursor: pointer;
-  }
-  .effort-name.current {
-    color: var(--accent);
-  }
   .plan {
     flex: none;
     border-top: 1px solid var(--edge);
@@ -1488,21 +895,6 @@
     color: var(--accent);
     flex: none;
   }
-  .ratelimit {
-    font-variant-numeric: tabular-nums;
-    color: var(--warn);
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--edge));
-    border-radius: 999px;
-    padding: 0 8px;
-    height: 18px;
-    display: inline-flex;
-    align-items: center;
-    animation: rise 0.18s ease;
-  }
-  .ratelimit.hit {
-    color: var(--err);
-    border-color: color-mix(in srgb, var(--err) 55%, var(--edge));
-  }
   .bubble-row {
     display: flex;
     align-items: center;
@@ -1529,155 +921,12 @@
   .rewind-btn:hover {
     color: var(--accent);
   }
-  .dialog-veil {
-    position: absolute;
-    inset: 0;
-    background: color-mix(in srgb, var(--bg) 55%, transparent);
-    display: grid;
-    place-items: center;
-    z-index: 30;
-    animation: fade 0.12s ease;
-  }
-  .dialog {
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
-    padding: 12px 14px;
-    max-width: min(440px, 90%);
-    font-size: var(--text-sm);
-    animation: rise 0.14s ease;
-  }
-  .dialog-title {
-    color: var(--fg);
-  }
-  .dialog-note {
-    color: var(--muted);
-    margin-top: 4px;
-  }
-  .dialog-files {
-    margin: 8px 0 0;
-    padding-left: 18px;
-    max-height: 140px;
-    overflow-y: auto;
-    scrollbar-width: thin;
-    color: var(--muted);
-    font-family: var(--mono, monospace);
-  }
-  .dialog-actions {
-    display: flex;
-    gap: 6px;
-    margin-top: 10px;
-    flex-wrap: wrap;
-  }
-  .opt {
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 3px 12px;
-    border-radius: 5px;
-    border: 1px solid var(--edge);
-    background: none;
-    color: var(--fg);
-    cursor: pointer;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease,
-      background-color 0.12s ease;
-  }
-  .opt.primary {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .opt.primary:hover {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-  }
-  .opt.quiet {
-    color: var(--muted);
-  }
-  .opt.quiet:hover {
-    color: var(--fg);
-  }
-  .mcp-host {
-    position: absolute;
-    top: 28px;
-    left: 10px;
-    z-index: 25;
-  }
-  .mcp-panel {
-    min-width: 300px;
-    max-width: 420px;
-  }
-  .mcp-title {
-    padding: 4px 12px 6px;
-    color: var(--muted);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
-  .mcp-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 12px;
-    font-size: var(--text-sm);
-  }
-  .mcp-glyph {
-    flex: none;
-    width: 14px;
-    color: var(--muted);
-  }
-  .mcp-glyph.ok {
-    color: var(--accent);
-  }
-  .mcp-glyph.bad {
-    color: var(--err);
-  }
-  .mcp-glyph.warn {
-    color: var(--warn);
-  }
-  .mcp-name {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--mono, monospace);
-  }
-  .mcp-tools {
-    color: var(--muted);
-    font-size: var(--text-xs);
-    flex: none;
-  }
-  .mcp-act {
-    background: none;
-    border: 1px solid var(--edge);
-    border-radius: 4px;
-    color: var(--muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    padding: 0 6px;
-    cursor: pointer;
-    flex: none;
-    transition:
-      color 0.12s ease,
-      border-color 0.12s ease;
-  }
-  .mcp-act:hover {
-    color: var(--fg);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
-  }
-  .mcp-error {
-    padding: 0 12px 4px 34px;
-    color: var(--err);
-    font-size: var(--text-xs);
-    word-break: break-word;
-  }
   .suggestion-row {
     display: flex;
     align-items: center;
     gap: 4px;
     padding: 4px 10px 0;
-    animation: rise 0.15s ease;
+    animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }
   .suggestion {
     display: inline-flex;
@@ -1720,24 +969,6 @@
   }
   .suggestion-x:hover {
     color: var(--fg);
-  }
-  @keyframes fade {
-    from {
-      opacity: 0;
-    }
-  }
-  @keyframes rise {
-    from {
-      opacity: 0;
-      transform: translateY(3px);
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .dialog-veil,
-    .dialog,
-    .ratelimit {
-      animation: none;
-    }
   }
   .jump {
     position: sticky;

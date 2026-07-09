@@ -81,7 +81,7 @@
     </div>
   {/each}
   <div class="q-actions">
-    <button class="q-submit" disabled={!complete} onclick={submit}>answer</button>
+    <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
   </div>
 </div>
 
@@ -92,13 +92,7 @@
     border-radius: 8px;
     padding: 10px 12px;
     margin: 6px 0;
-    animation: rise 0.15s ease;
-  }
-  @keyframes rise {
-    from {
-      opacity: 0;
-      transform: translateY(3px);
-    }
+    animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }
   @media (prefers-reduced-motion: reduce) {
     .question {
@@ -169,21 +163,5 @@
     justify-content: flex-end;
     margin-top: 10px;
   }
-  .q-submit {
-    font: inherit;
-    font-size: var(--text-sm);
-    padding: 3px 14px;
-    border-radius: 5px;
-    border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    color: var(--fg);
-    cursor: pointer;
-  }
-  .q-submit:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .q-submit:not(:disabled):hover {
-    background: color-mix(in srgb, var(--accent) 24%, transparent);
-  }
+  /* The answer button is the shared .opt.primary (app.css). */
 </style>

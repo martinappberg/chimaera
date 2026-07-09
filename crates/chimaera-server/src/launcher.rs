@@ -337,7 +337,7 @@ pub(crate) async fn list_agents(
             row.insert(
                 "chat_capable".into(),
                 json!(
-                    matches!(kind, AgentKind::Claude | AgentKind::Codex)
+                    kind.chat_capable()
                         && detection.path.is_ok()
                         && !is_outdated(kind, detection.version.as_deref())
                 ),

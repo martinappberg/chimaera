@@ -92,13 +92,7 @@
     margin: 4px 0;
     background: color-mix(in srgb, var(--fg) 2%, transparent);
     overflow: hidden;
-    animation: rise 0.15s ease;
-  }
-  @keyframes rise {
-    from {
-      opacity: 0;
-      transform: translateY(3px);
-    }
+    animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }
   @media (prefers-reduced-motion: reduce) {
     .group {

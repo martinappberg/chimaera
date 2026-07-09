@@ -79,7 +79,7 @@ pub(crate) struct AppState {
     pub(crate) chat: Arc<chimaera_agent::ChatManager>,
     /// The chat manager's hook signals; `chat::spawn_signal_task` (called
     /// from `app()`) takes and consumes this for the daemon's lifetime.
-    pub(crate) chat_signals: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<chat::ChatSignal>>>,
+    pub(crate) chat_signals: Mutex<Option<tokio::sync::mpsc::Receiver<chat::ChatSignal>>>,
     /// Respawn ingredients per chat session, for the degrade-to-PTY path.
     pub(crate) chat_recipes: Mutex<HashMap<String, chat::ChatRecipe>>,
     /// Sessions mid view-switch (id -> target ui "chat"|"term"): their
@@ -428,6 +428,18 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // process — the ledger written here is exactly what resurrects them.
     let (entries, links) = ledger::snapshot(&state);
     lock(&state.ledger).write_if_changed(&entries, &links);
+
+    // Chat sessions are daemon-owned drivers that die with this process, and
+    // the ledger does not yet resurrect them (sv-11: real resurrection is a
+    // follow-up in `ledger` — snapshot()/restore() cover only PTY sessions).
+    // So at a graceful stop (update / restart), retire their conversations
+    // into Recents here, so a survivor is offered for manual resume instead of
+    // vanishing. Idempotent: a session already retired by an in-band
+    // `close-all`/`shutdown` has no AgentRecord left, and `retire` no-ops.
+    for info in state.chat.list() {
+        recents::retire(&state, &info.id, None, None);
+    }
+
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");
     }

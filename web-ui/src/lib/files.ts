@@ -177,24 +177,41 @@ export interface ValidatedPath {
 /** Server cap on candidates per /fs/validate request. */
 export const VALIDATE_MAX = 50;
 
+/** Hard ceiling on candidates validated per call, across all batches — bounds
+ *  the daemon round-trips a single message can trigger (VALIDATE_CAP /
+ *  VALIDATE_MAX requests, currently 4). */
+export const VALIDATE_CAP = 200;
+
 /**
  * Batch existence check behind the terminal link provider, per the
  * /fs/validate contract: candidates resolve absolutely or against the
  * absolute `base`, `~` expands, and only hits come back (keyed by the
  * candidate as sent). Misses are simply absent — never errors.
+ *
+ * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
+ * list as resolved, so anything past that cap would otherwise stick as a
+ * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
+ * so every candidate is actually validated. Batches run sequentially to keep
+ * the daemon's concurrent load low.
  */
 export async function fsValidate(
   candidates: string[],
   base: string,
 ): Promise<Record<string, ValidatedPath>> {
-  const body = await json<{ valid: Record<string, ValidatedPath> }>(
-    await api("/fs/validate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ candidates: candidates.slice(0, VALIDATE_MAX), base }),
-    }),
-  );
-  return body.valid;
+  const capped = candidates.slice(0, VALIDATE_CAP);
+  const out: Record<string, ValidatedPath> = {};
+  for (let i = 0; i < capped.length; i += VALIDATE_MAX) {
+    const batch = capped.slice(i, i + VALIDATE_MAX);
+    const body = await json<{ valid: Record<string, ValidatedPath> }>(
+      await api("/fs/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candidates: batch, base }),
+      }),
+    );
+    Object.assign(out, body.valid);
+  }
+  return out;
 }
 
 export async function fsMarkdown(path: string): Promise<string> {

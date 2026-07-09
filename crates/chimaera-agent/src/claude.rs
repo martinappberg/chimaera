@@ -27,11 +27,14 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
-use crate::driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec, KILL_GRACE};
+use crate::driver::{
+    run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
+    SpawnSpec,
+};
 use crate::model::{
-    cap_head_tail, cap_output, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
-    ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand,
-    ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, COALESCE_INTERVAL_MS, DIFF_FILE_BUDGET,
+    cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
+    ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, DIFF_FILE_BUDGET,
     DIFF_TURN_BUDGET,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
@@ -286,158 +289,67 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn spawn(&self, spec: SpawnSpec, io: DriverIo) -> Result<JoinHandle<DriverExit>> {
         anyhow::ensure!(!spec.argv.is_empty(), "empty argv");
-        Ok(tokio::spawn(run_driver(spec, io)))
+        Ok(tokio::spawn(run_driver(ClaudeDriver, spec, io)))
     }
 }
 
-async fn run_driver(spec: SpawnSpec, mut io: DriverIo) -> DriverExit {
-    let mut env = spec.env.clone();
-    env.push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
-    // File checkpointing (rewind_files) is gated off under -p unless the
-    // client opts in — the SDK's own enablement env (live: without it every
-    // rewind answers "File rewinding is not enabled.").
-    env.push((
-        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
-        "true".to_string(),
-    ));
-    let child = match JsonlChild::spawn(
-        &spec.argv[0],
-        &spec.argv[1..],
-        &spec.cwd,
-        &env,
-        &spec.env_remove,
-    ) {
-        Ok(child) => child,
-        Err(err) => {
-            return DriverExit::HandshakeFailed {
-                reason: format!("spawn failed: {err:#}"),
-                stderr_tail: String::new(),
-            }
+struct ClaudeDriver;
+
+impl Driver for ClaudeDriver {
+    type Mapper = ClaudeMapper;
+
+    fn env_extra(&self) -> Vec<(String, String)> {
+        vec![
+            ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
+            // File checkpointing (rewind_files) is gated off under -p unless the
+            // client opts in — the SDK's own enablement env (live: without it
+            // every rewind answers "File rewinding is not enabled.").
+            (
+                "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_string(),
+                "true".to_string(),
+            ),
+        ]
+    }
+
+    async fn handshake<'a>(
+        &'a self,
+        sink: &'a mut JsonlSink,
+        stream: &'a mut JsonlStream,
+        spec: &'a SpawnSpec,
+    ) -> std::result::Result<Handshake<ClaudeMapper>, String> {
+        // The spawn handshake is a client-initiated `initialize` control
+        // request; the CLI answers with the slash-command + model catalog.
+        if let Err(err) = sink.send(&initialize_request("init")).await {
+            return Err(format!("initialize write failed: {err:#}"));
         }
-    };
-    let (mut sink, mut stream, mut guard) = child.split();
+        let commands_catalog = await_initialize(stream).await?;
 
-    // Handshake watchdog: a session that cannot prove the protocol works
-    // must fail fast so the server can respawn it as a PTY instead.
-    if let Err(err) = sink.send(&initialize_request("init")).await {
-        let tail = guard.stderr_tail();
-        guard.shutdown(Duration::ZERO).await;
-        return DriverExit::HandshakeFailed {
-            reason: format!("initialize write failed: {err:#}"),
-            stderr_tail: tail,
-        };
-    }
-    let commands_catalog =
-        match tokio::time::timeout(spec.handshake_timeout, await_initialize(&mut stream)).await {
-            Ok(Ok(catalog)) => catalog,
-            Ok(Err(reason)) => {
-                let tail = guard.stderr_tail();
-                guard.shutdown(Duration::ZERO).await;
-                return DriverExit::HandshakeFailed {
-                    reason,
-                    stderr_tail: tail,
-                };
-            }
-            Err(_) => {
-                let tail = guard.stderr_tail();
-                guard.shutdown(Duration::ZERO).await;
-                return DriverExit::HandshakeFailed {
-                    reason: format!("no initialize response within {:?}", spec.handshake_timeout),
-                    stderr_tail: tail,
-                };
-            }
-        };
-
-    let mut mapper = Mapper::new(spec.pinned_native_id.clone(), &commands_catalog);
-    if io.events.send(mapper.init_event()).await.is_err() {
-        guard.shutdown(Duration::ZERO).await;
-        return DriverExit::Killed;
-    }
-    // Seed the effort/ultracode chips with the CLI's applied settings.
-    {
-        let mut step = Step::default();
+        let mut mapper = ClaudeMapper::new(spec.pinned_native_id.clone(), &commands_catalog);
+        let mut initial: Vec<DriverStep> = Vec::new();
+        // Seed the effort/ultracode chips with the CLI's applied settings.
+        let mut step = DriverStep::default();
         mapper.request_settings(&mut step);
-        if !deliver(&mut sink, &io, step).await {
-            guard.shutdown(Duration::ZERO).await;
-            return DriverExit::Killed;
-        }
-    }
-    // Parked prompts survive client swaps: the initialize response redelivers
-    // unanswered permission/dialog requests — replay them through the mapper
-    // so a reattach shows the cards instead of a wedged session.
-    for key in [
-        "pending_permission_requests",
-        "pending_user_dialog_requests",
-    ] {
-        let Some(parked) = commands_catalog[key].as_array() else {
-            continue;
-        };
-        for envelope in parked.clone() {
-            let frame = json!({
-                "type": "control_request",
-                "request_id": envelope["request_id"],
-                "request": envelope["request"],
-            });
-            let out = mapper.on_frame(&frame);
-            if !deliver(&mut sink, &io, out).await {
-                guard.shutdown(Duration::ZERO).await;
-                return DriverExit::Killed;
+        initial.push(step);
+        // Parked prompts survive client swaps: the initialize response
+        // redelivers unanswered permission/dialog requests — replay them
+        // through the mapper so a reattach shows the cards, not a wedge.
+        for key in [
+            "pending_permission_requests",
+            "pending_user_dialog_requests",
+        ] {
+            let Some(parked) = commands_catalog[key].as_array() else {
+                continue;
+            };
+            for envelope in parked {
+                let frame = json!({
+                    "type": "control_request",
+                    "request_id": envelope["request_id"],
+                    "request": envelope["request"],
+                });
+                initial.push(mapper.on_frame(&frame));
             }
         }
-    }
-
-    let mut tick = tokio::time::interval(Duration::from_millis(COALESCE_INTERVAL_MS));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let exit = loop {
-        tokio::select! {
-            frame = stream.next() => match frame {
-                Ok(Some(frame)) => {
-                    let out = mapper.on_frame(&frame);
-                    if !deliver(&mut sink, &io, out).await {
-                        break DriverExit::Killed;
-                    }
-                }
-                Ok(None) => {
-                    let status = guard.wait().await;
-                    break DriverExit::Clean(status);
-                }
-                Err(err) => break DriverExit::ProtocolError(format!("{err:#}")),
-            },
-            cmd = io.commands.recv() => match cmd {
-                Some(cmd) => {
-                    let out = mapper.on_command(cmd);
-                    if !deliver(&mut sink, &io, out).await {
-                        break DriverExit::Killed;
-                    }
-                }
-                None => break DriverExit::Killed,
-            },
-            _ = io.kill.changed() => break DriverExit::Killed,
-            _ = tick.tick() => {
-                if let Some(ev) = mapper.flush() {
-                    if io.events.send(ev).await.is_err() {
-                        break DriverExit::Killed;
-                    }
-                }
-            }
-        }
-    };
-
-    if let Some(ev) = mapper.flush() {
-        let _ = io.events.send(ev).await;
-    }
-    let status = match exit {
-        DriverExit::Clean(status) => status,
-        _ => {
-            drop(sink);
-            guard.shutdown(KILL_GRACE).await
-        }
-    };
-    let _ = io.events.send(AgentEvent::Exited { status }).await;
-    match exit {
-        DriverExit::Clean(_) => DriverExit::Clean(status),
-        other => other,
+        Ok(Handshake { mapper, initial })
     }
 }
 
@@ -457,28 +369,6 @@ async fn await_initialize(stream: &mut JsonlStream) -> std::result::Result<Value
             Err(err) => return Err(format!("{err:#}")),
         }
     }
-}
-
-/// Ship a mapper step's outbound frames and events. Returns false when the
-/// event receiver is gone (session torn down).
-async fn deliver(sink: &mut JsonlSink, io: &DriverIo, out: Step) -> bool {
-    for frame in out.outbound {
-        if let Err(err) = sink.send(&frame).await {
-            tracing::warn!(%err, "claude stdin write failed");
-        }
-    }
-    for ev in out.events {
-        if io.events.send(ev).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
-#[derive(Default)]
-struct Step {
-    events: Vec<AgentEvent>,
-    outbound: Vec<Value>,
 }
 
 enum PendingControl {
@@ -511,8 +401,9 @@ enum PendingControl {
 
 /// Protocol → normalized-model translator. Pure state machine: consumes
 /// frames/commands, yields events + outbound frames; owns no I/O, so it is
-/// testable without a process.
-struct Mapper {
+/// testable without a process. Implements the harness [`Mapper`] trait via a
+/// thin delegator below.
+struct ClaudeMapper {
     native_session_id: Option<String>,
     model: Option<String>,
     current_mode: Option<String>,
@@ -561,7 +452,7 @@ struct Mapper {
     next_ctl: u64,
 }
 
-impl Mapper {
+impl ClaudeMapper {
     fn new(pinned_native_id: Option<String>, commands_catalog: &Value) -> Self {
         let slash_commands = commands_catalog["commands"]
             .as_array()
@@ -646,7 +537,7 @@ impl Mapper {
 
     /// One get_settings round-trip → EffortState. Issued at spawn and after
     /// every apply_flag_settings, so the chips always show the CLI's truth.
-    fn request_settings(&mut self, step: &mut Step) {
+    fn request_settings(&mut self, step: &mut DriverStep) {
         let id = self.ctl_id();
         self.pending_controls
             .insert(id.clone(), PendingControl::Settings);
@@ -660,12 +551,28 @@ impl Mapper {
         format!("t{}", self.turn_n)
     }
 
+    /// Defensive turn boundary: content/tool frames must never stream into a
+    /// turn that was never opened. A wrong queue assumption (the CLI's native
+    /// queue after an abort is unverified) or a parked-prompt replay can leave
+    /// `turn_active` false when a stream/assistant/tool frame arrives; opening
+    /// a boundary here degrades that to a correct TurnStarted instead of a
+    /// phantom turn with no start event.
+    fn ensure_turn(&mut self, step: &mut DriverStep) {
+        if !self.turn_active {
+            self.turn_n += 1;
+            self.turn_active = true;
+            step.events.push(AgentEvent::TurnStarted {
+                turn_id: self.turn_id(),
+            });
+        }
+    }
+
     fn flush(&mut self) -> Option<AgentEvent> {
         self.coalescer.flush()
     }
 
-    fn on_frame(&mut self, frame: &Value) -> Step {
-        let mut step = Step::default();
+    fn on_frame(&mut self, frame: &Value) -> DriverStep {
+        let mut step = DriverStep::default();
         // Subagent-attributed transcript frames are hidden (the official
         // client does the same — the visible surface is the Task tool row);
         // only task-status frames pass, whoever they're attributed to.
@@ -714,7 +621,7 @@ impl Mapper {
         step
     }
 
-    fn on_system(&mut self, frame: &Value, step: &mut Step) {
+    fn on_system(&mut self, frame: &Value, step: &mut DriverStep) {
         match frame["subtype"].as_str() {
             Some("init") => {
                 if let Some(id) = frame["session_id"].as_str() {
@@ -904,7 +811,7 @@ impl Mapper {
     /// utilization (0-1), resetsAt (epoch s), overageInUse}}`. status
     /// "allowed" means the window is fine (the header chip still updates);
     /// "rejected" means requests are being refused.
-    fn on_rate_limit(&mut self, frame: &Value, step: &mut Step) {
+    fn on_rate_limit(&mut self, frame: &Value, step: &mut DriverStep) {
         let info = &frame["rate_limit_info"];
         if !info.is_object() {
             return;
@@ -929,19 +836,20 @@ impl Mapper {
 
     /// `user` frames: tool results, plus the message uuid that moves the
     /// fork anchor (the transcript position rewinds resume AT).
-    fn on_user_frame(&mut self, frame: &Value, step: &mut Step) {
+    fn on_user_frame(&mut self, frame: &Value, step: &mut DriverStep) {
         if let Some(uuid) = frame["uuid"].as_str() {
             self.last_msg_uuid = Some(uuid.to_string());
         }
         self.on_tool_results(&frame["message"], step);
     }
 
-    fn on_stream_event(&mut self, event: &Value, step: &mut Step) {
+    fn on_stream_event(&mut self, event: &Value, step: &mut DriverStep) {
         match event["type"].as_str() {
             Some("message_start") => {
                 self.current_stream_msg = event["message"]["id"].as_str().map(String::from);
             }
             Some("content_block_delta") => {
+                self.ensure_turn(step);
                 let turn = self.turn_id();
                 let (kind, text) = match event["delta"]["type"].as_str() {
                     Some("text_delta") => (ChunkKind::Message, event["delta"]["text"].as_str()),
@@ -962,7 +870,8 @@ impl Mapper {
         }
     }
 
-    fn on_assistant(&mut self, frame: &Value, step: &mut Step) {
+    fn on_assistant(&mut self, frame: &Value, step: &mut DriverStep) {
+        self.ensure_turn(step);
         if let Some(uuid) = frame["uuid"].as_str() {
             self.last_msg_uuid = Some(uuid.to_string());
         }
@@ -1027,7 +936,7 @@ impl Mapper {
         }
     }
 
-    fn on_tool_use(&mut self, block: &Value, step: &mut Step) {
+    fn on_tool_use(&mut self, block: &Value, step: &mut DriverStep) {
         let id = block["id"].as_str().unwrap_or_default().to_string();
         let name = block["name"].as_str().unwrap_or_default();
         let input = &block["input"];
@@ -1077,7 +986,7 @@ impl Mapper {
         }
     }
 
-    fn on_tool_results(&mut self, message: &Value, step: &mut Step) {
+    fn on_tool_results(&mut self, message: &Value, step: &mut DriverStep) {
         let Some(blocks) = message["content"].as_array() else {
             return;
         };
@@ -1112,7 +1021,7 @@ impl Mapper {
         }
     }
 
-    fn on_control_request(&mut self, frame: &Value, step: &mut Step) {
+    fn on_control_request(&mut self, frame: &Value, step: &mut DriverStep) {
         let request = &frame["request"];
         let request_id = frame["request_id"].as_str().unwrap_or_default().to_string();
         if request["subtype"] == "request_user_dialog" {
@@ -1217,7 +1126,7 @@ impl Mapper {
 
     /// request_user_dialog → a decision card (mined kinds + exact result
     /// strings; anything else answers cancelled so nothing parks).
-    fn on_user_dialog(&mut self, request_id: &str, request: &Value, step: &mut Step) {
+    fn on_user_dialog(&mut self, request_id: &str, request: &Value, step: &mut DriverStep) {
         let payload = &request["payload"];
         let opt = |id: &str, label: String, kind: PermissionOptionKind| PermissionOption {
             id: id.into(),
@@ -1294,7 +1203,7 @@ impl Mapper {
         });
     }
 
-    fn on_control_response(&mut self, frame: &Value, step: &mut Step) {
+    fn on_control_response(&mut self, frame: &Value, step: &mut DriverStep) {
         let id = frame["response"]["request_id"]
             .as_str()
             .unwrap_or_default()
@@ -1477,7 +1386,7 @@ impl Mapper {
         }
     }
 
-    fn on_result(&mut self, frame: &Value, step: &mut Step) {
+    fn on_result(&mut self, frame: &Value, step: &mut DriverStep) {
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
         }
@@ -1547,8 +1456,8 @@ impl Mapper {
         }
     }
 
-    fn on_command(&mut self, cmd: AgentCommand) -> Step {
-        let mut step = Step::default();
+    fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
+        let mut step = DriverStep::default();
         match cmd {
             AgentCommand::Send { blocks } => {
                 let text: String = blocks
@@ -1862,6 +1771,24 @@ impl Mapper {
     }
 }
 
+/// Harness adapter: the inherent methods above ARE the state machine; these
+/// forward the harness's generic calls to them (inherent methods win in
+/// `self.x()` resolution, so there is no recursion).
+impl Mapper for ClaudeMapper {
+    fn init_event(&self) -> AgentEvent {
+        self.init_event()
+    }
+    fn on_frame(&mut self, frame: &Value) -> DriverStep {
+        self.on_frame(frame)
+    }
+    fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
+        self.on_command(cmd)
+    }
+    fn flush(&mut self) -> Option<AgentEvent> {
+        self.flush()
+    }
+}
+
 fn claude_modes() -> Vec<ModeInfo> {
     vec![
         ModeInfo {
@@ -1915,23 +1842,9 @@ fn tool_title(name: &str, input: &Value) -> String {
         _ => None,
     };
     match detail {
-        Some(detail) => format!("{name}: {}", truncate_title(detail)),
+        Some(detail) => format!("{name}: {}", truncate_label(detail, 120)),
         None => name.to_string(),
     }
-}
-
-/// Titles truncate with a plain ellipsis — the head/tail "[N bytes omitted]"
-/// marker belongs in stored output, not in a one-line label.
-fn truncate_title(text: &str) -> String {
-    const MAX: usize = 120;
-    if text.len() <= MAX {
-        return text.to_string();
-    }
-    let mut end = MAX;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
 }
 
 fn tool_locations(input: &Value) -> Vec<String> {
@@ -2050,8 +1963,8 @@ fn cap_preview(value: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn mapper() -> Mapper {
-        Mapper::new(
+    fn mapper() -> ClaudeMapper {
+        ClaudeMapper::new(
             Some("native-1".into()),
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
@@ -2128,6 +2041,7 @@ mod tests {
     #[test]
     fn tool_use_maps_kind_title_and_diff() {
         let mut m = mapper();
+        m.turn_active = true; // a real tool_use always lands inside a turn
         let frame = json!({
             "type": "assistant",
             "message": { "id": "m1", "content": [
@@ -2167,6 +2081,7 @@ mod tests {
     #[test]
     fn todo_write_becomes_plan() {
         let mut m = mapper();
+        m.turn_active = true;
         let frame = json!({
             "type": "assistant",
             "message": { "id": "m1", "content": [
@@ -2538,6 +2453,7 @@ mod tests {
     #[test]
     fn superseding_assistant_message_retracts_before_appending() {
         let mut m = mapper();
+        m.turn_active = true;
         let step = m.on_frame(&json!({
             "type": "assistant",
             "uuid": "a-2",
@@ -2545,6 +2461,26 @@ mod tests {
             "message": { "id": "m2", "content": [{ "type": "text", "text": "replacement" }] },
         }));
         assert!(matches!(step.events[0], AgentEvent::MessagesSuperseded));
+    }
+
+    #[test]
+    fn orphan_frame_opens_a_defensive_turn() {
+        // A stream/assistant frame arriving with no active turn (a wrong queue
+        // assumption or a parked-prompt replay) must open a TurnStarted rather
+        // than stream into a phantom turn.
+        let mut m = mapper();
+        assert!(!m.turn_active);
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{ "type": "tool_use", "id": "tu1",
+                "name": "Bash", "input": { "command": "ls" } }] },
+        }));
+        assert!(
+            matches!(&step.events[0], AgentEvent::TurnStarted { turn_id } if turn_id == "t1"),
+            "orphan frame opens a turn first: {:?}",
+            step.events
+        );
+        assert!(m.turn_active);
     }
 
     #[test]

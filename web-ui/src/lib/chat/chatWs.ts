@@ -1,5 +1,5 @@
 import { getToken } from "../api";
-import { reconnectingSockets, UNKNOWN_SESSION_RETRIES } from "../ws";
+import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../reconnect";
 
 /**
  * Normalized agent events from the daemon (chimaera-agent's AgentEvent,
@@ -46,9 +46,6 @@ export interface ChatSocketHandlers {
   lastSeq(): number;
 }
 
-const INITIAL_BACKOFF_MS = 500;
-const MAX_BACKOFF_MS = 10_000;
-
 /**
  * One WebSocket per attached chat session, per the /ws/chat/{id} contract:
  * auth (with last_seq) -> ready -> batched journal replay -> live seq-tagged
@@ -60,10 +57,8 @@ export class ChatSocket {
   private closed = false;
   private fatal = false;
   private ended = false;
-  private reconnecting = false;
   private unknownRetries = 0;
-  private backoffMs = INITIAL_BACKOFF_MS;
-  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly recon = new Reconnector(() => this.connect());
 
   constructor(
     private readonly sessionId: string,
@@ -98,9 +93,8 @@ export class ChatSocket {
       }
       switch (msg.type) {
         case "ready":
-          this.backoffMs = INITIAL_BACKOFF_MS;
+          this.recon.succeeded();
           this.unknownRetries = 0;
-          this.clearReconnecting();
           this.handlers.onReady(
             msg.session as ChatSessionInfo,
             (msg.replay_from as number) ?? 0,
@@ -151,13 +145,13 @@ export class ChatSocket {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       if (this.closed || this.fatal || this.ended) {
-        this.clearReconnecting();
+        this.recon.clear();
         return;
       }
       // Live no longer: the composer must stop claiming the agent hears us and
       // stop clearing drafts into a closed socket until we reconnect.
       this.handlers.onDisconnected();
-      this.scheduleReconnect();
+      this.recon.schedule();
     };
   }
 
@@ -170,25 +164,6 @@ export class ChatSocket {
     }
   }
 
-  private scheduleReconnect(): void {
-    if (!this.reconnecting) {
-      this.reconnecting = true;
-      reconnectingSockets.update((n) => n + 1);
-    }
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.connect();
-    }, this.backoffMs);
-    this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
-  }
-
-  private clearReconnecting(): void {
-    if (this.reconnecting) {
-      this.reconnecting = false;
-      reconnectingSockets.update((n) => Math.max(0, n - 1));
-    }
-  }
-
   /** Send an AgentCommand frame; false when the socket is not open. */
   send(command: Record<string, unknown>): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
@@ -198,11 +173,8 @@ export class ChatSocket {
 
   close(): void {
     this.closed = true;
-    if (this.retryTimer !== null) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
-    this.clearReconnecting();
+    this.recon.cancel();
+    this.recon.clear();
     this.ws?.close();
     this.ws = null;
   }

@@ -53,8 +53,13 @@ fn main() {
         } else if frame["type"] == "user" {
             run_canned_turn();
         } else if frame["type"] == "control_response" {
-            let allowed = frame["response"]["response"]["behavior"] == "allow";
-            finish_turn(allowed);
+            // Only the scripted permission round-trip (req-1) drives the turn;
+            // ignore any other control_response so a future non-permission
+            // answer (get_settings, title, …) can't corrupt this state machine.
+            if frame["response"]["request_id"] == "req-1" {
+                let allowed = frame["response"]["response"]["behavior"] == "allow";
+                finish_turn(allowed);
+            }
         } else if frame["type"] == "control_request" {
             // interrupt / set_permission_mode / set_model: acknowledge.
             emit(json!({
@@ -121,7 +126,16 @@ fn finish_turn(allowed: bool) {
                   "content": "done", "is_error": false },
             ]},
         }));
+        emit(json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "done", "session_id": "fake-native-1",
+            "total_cost_usd": 0.01, "duration_ms": 42,
+            "usage": { "input_tokens": 10, "output_tokens": 5 },
+        }));
     } else {
+        // The driver's deny sends `interrupt:true`, which ABORTS the turn on
+        // the real CLI: the tool errors, then the turn ends is_error (the
+        // TurnAborted path) — NOT a success result.
         emit(json!({
             "type": "user",
             "message": { "content": [
@@ -129,11 +143,11 @@ fn finish_turn(allowed: bool) {
                   "content": "User rejected this action", "is_error": true },
             ]},
         }));
+        emit(json!({
+            "type": "result", "subtype": "error", "is_error": true,
+            "result": "turn aborted by user", "session_id": "fake-native-1",
+            "duration_ms": 42,
+            "usage": { "input_tokens": 10, "output_tokens": 5 },
+        }));
     }
-    emit(json!({
-        "type": "result", "subtype": "success", "is_error": false,
-        "result": "done", "session_id": "fake-native-1",
-        "total_cost_usd": 0.01, "duration_ms": 42,
-        "usage": { "input_tokens": 10, "output_tokens": 5 },
-    }));
 }

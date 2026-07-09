@@ -26,6 +26,24 @@ use crate::ndjson::JsonlChild;
 /// CLI version these frame shapes were verified against (2026-07-07).
 pub const TESTED_CODEX_VERSION: &str = "0.142.5";
 
+/// The `initialize` request both the probe client and the driver handshake
+/// send. Declares `experimentalApi` so `thread/settings/update` is available
+/// (live: -32600 "requires experimentalApi capability" without it).
+fn initialize_request(id: u64) -> Value {
+    json!({
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "chimaera",
+                "title": "Chimaera",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": { "experimentalApi": true },
+        },
+    })
+}
+
 pub struct CodexChat {
     io: JsonlChild,
     next_id: u64,
@@ -43,22 +61,7 @@ impl CodexChat {
     /// signal on failure/timeout.
     pub async fn initialize(&mut self, timeout: Duration) -> Result<Value> {
         let id = self.request_id();
-        self.io
-            .send(&json!({
-                "id": id,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "chimaera",
-                        "title": "Chimaera",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    // Gates thread/settings/update (live: -32600 "requires
-                    // experimentalApi capability" without it).
-                    "capabilities": { "experimentalApi": true },
-                },
-            }))
-            .await?;
+        self.io.send(&initialize_request(id)).await?;
         let result = self.await_result(id, timeout).await?;
         self.io.send(&json!({ "method": "initialized" })).await?;
         Ok(result)
@@ -184,10 +187,13 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::task::JoinHandle;
 
-use crate::driver::{AgentAdapter, DriverExit, DriverIo, SpawnSpec, KILL_GRACE};
+use crate::driver::{
+    run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
+    SpawnSpec,
+};
 use crate::model::{
-    cap_output, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock, PermissionOption,
-    PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage, COALESCE_INTERVAL_MS,
+    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
+    PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -200,116 +206,28 @@ impl AgentAdapter for CodexAdapter {
 
     fn spawn(&self, spec: SpawnSpec, io: DriverIo) -> Result<JoinHandle<DriverExit>> {
         anyhow::ensure!(!spec.argv.is_empty(), "empty argv");
-        Ok(tokio::spawn(run_driver(spec, io)))
+        Ok(tokio::spawn(run_driver(CodexDriver, spec, io)))
     }
 }
 
-async fn run_driver(spec: SpawnSpec, mut io: DriverIo) -> DriverExit {
-    let child = match JsonlChild::spawn(
-        &spec.argv[0],
-        &spec.argv[1..],
-        &spec.cwd,
-        &spec.env,
-        &spec.env_remove,
-    ) {
-        Ok(child) => child,
-        Err(err) => {
-            return DriverExit::HandshakeFailed {
-                reason: format!("spawn failed: {err:#}"),
-                stderr_tail: String::new(),
-            }
-        }
-    };
-    let (mut sink, mut stream, mut guard) = child.split();
+struct CodexDriver;
+
+impl Driver for CodexDriver {
+    type Mapper = CodexMapper;
 
     // Handshake covers initialize AND thread start/resume — a driver that
     // cannot open a thread is as dead as one that cannot speak at all.
-    let handshake = tokio::time::timeout(
-        spec.handshake_timeout,
-        codex_handshake(&mut sink, &mut stream, &spec),
-    )
-    .await;
-    let (thread_id, models) = match handshake {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(reason)) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
-            return DriverExit::HandshakeFailed {
-                reason,
-                stderr_tail: tail,
-            };
-        }
-        Err(_) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
-            return DriverExit::HandshakeFailed {
-                reason: format!(
-                    "no app-server handshake within {:?}",
-                    spec.handshake_timeout
-                ),
-                stderr_tail: tail,
-            };
-        }
-    };
-
-    let mut mapper = CodexMapper::new(thread_id, models);
-    if io.events.send(mapper.init_event()).await.is_err() {
-        guard.shutdown(Duration::ZERO).await;
-        return DriverExit::Killed;
-    }
-
-    let mut tick = tokio::time::interval(Duration::from_millis(COALESCE_INTERVAL_MS));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let exit = loop {
-        tokio::select! {
-            frame = stream.next() => match frame {
-                Ok(Some(frame)) => {
-                    let out = mapper.on_frame(&frame);
-                    if !deliver(&mut sink, &io, out).await {
-                        break DriverExit::Killed;
-                    }
-                }
-                Ok(None) => {
-                    let status = guard.wait().await;
-                    break DriverExit::Clean(status);
-                }
-                Err(err) => break DriverExit::ProtocolError(format!("{err:#}")),
-            },
-            cmd = io.commands.recv() => match cmd {
-                Some(cmd) => {
-                    let out = mapper.on_command(cmd);
-                    if !deliver(&mut sink, &io, out).await {
-                        break DriverExit::Killed;
-                    }
-                }
-                None => break DriverExit::Killed,
-            },
-            _ = io.kill.changed() => break DriverExit::Killed,
-            _ = tick.tick() => {
-                if let Some(ev) = mapper.flush() {
-                    if io.events.send(ev).await.is_err() {
-                        break DriverExit::Killed;
-                    }
-                }
-            }
-        }
-    };
-
-    if let Some(ev) = mapper.flush() {
-        let _ = io.events.send(ev).await;
-    }
-    let status = match exit {
-        DriverExit::Clean(status) => status,
-        _ => {
-            drop(sink);
-            guard.shutdown(KILL_GRACE).await
-        }
-    };
-    let _ = io.events.send(AgentEvent::Exited { status }).await;
-    match exit {
-        DriverExit::Clean(_) => DriverExit::Clean(status),
-        other => other,
+    async fn handshake<'a>(
+        &'a self,
+        sink: &'a mut JsonlSink,
+        stream: &'a mut JsonlStream,
+        spec: &'a SpawnSpec,
+    ) -> std::result::Result<Handshake<CodexMapper>, String> {
+        let (thread_id, models) = codex_handshake(sink, stream, spec).await?;
+        Ok(Handshake {
+            mapper: CodexMapper::new(thread_id, models),
+            initial: Vec::new(),
+        })
     }
 }
 
@@ -318,25 +236,7 @@ async fn codex_handshake(
     stream: &mut JsonlStream,
     spec: &SpawnSpec,
 ) -> std::result::Result<(String, Vec<crate::model::ModelInfo>), String> {
-    let send = |v: Value| v; // readability alias for frame construction below
-    if sink
-        .send(&send(json!({
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "chimaera",
-                    "title": "Chimaera",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                // Gates thread/settings/update (live: -32600 "requires
-                // experimentalApi capability" without it).
-                "capabilities": { "experimentalApi": true },
-            },
-        })))
-        .await
-        .is_err()
-    {
+    if sink.send(&initialize_request(0)).await.is_err() {
         return Err("initialize write failed".into());
     }
     await_rpc_result(stream, 0).await?;
@@ -378,7 +278,12 @@ async fn codex_handshake(
         .await
         .is_ok()
     {
-        if let Ok(list) = await_rpc_result(stream, 2).await {
+        // Per-request cap so a binary that silently drops this unknown method
+        // can't wedge the whole handshake until the 20s watchdog fires — the
+        // model catalog is optional, so a timeout is just an empty catalog.
+        let listed =
+            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, 2)).await;
+        if let Ok(Ok(list)) = listed {
             for m in list["data"].as_array().unwrap_or(&Vec::new()) {
                 if let Some(id) = m["model"].as_str() {
                     if m["hidden"] == true {
@@ -424,26 +329,6 @@ async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Res
     }
 }
 
-async fn deliver(sink: &mut JsonlSink, io: &DriverIo, out: CodexStep) -> bool {
-    for frame in out.outbound {
-        if let Err(err) = sink.send(&frame).await {
-            tracing::warn!(%err, "codex stdin write failed");
-        }
-    }
-    for ev in out.events {
-        if io.events.send(ev).await.is_err() {
-            return false;
-        }
-    }
-    true
-}
-
-#[derive(Default)]
-struct CodexStep {
-    events: Vec<AgentEvent>,
-    outbound: Vec<Value>,
-}
-
 /// What an outstanding client→server JSON-RPC id is waiting for.
 enum PendingRpc {
     TurnStart,
@@ -485,6 +370,13 @@ struct CodexMapper {
     settings_update_unsupported: bool,
     turn_id: String,
     turn_active: bool,
+    /// A turn/start is in flight but turn/started hasn't landed yet. Sends in
+    /// this window must NOT fire a second turn/start (the server rejects it and
+    /// the already-echoed user message is lost) — they buffer instead.
+    turn_pending: bool,
+    /// Sends captured during the turn/start→turn/started window; flushed as
+    /// steers once the turn id arrives (or re-driven if the start fails).
+    buffered_sends: Vec<(Value, String)>,
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
@@ -534,6 +426,8 @@ impl CodexMapper {
             settings_update_unsupported: false,
             turn_id: String::new(),
             turn_active: false,
+            turn_pending: false,
+            buffered_sends: Vec::new(),
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             pending_approvals: HashMap::new(),
@@ -568,8 +462,8 @@ impl CodexMapper {
         id
     }
 
-    fn on_frame(&mut self, frame: &Value) -> CodexStep {
-        let mut step = CodexStep::default();
+    fn on_frame(&mut self, frame: &Value) -> DriverStep {
+        let mut step = DriverStep::default();
         let method = frame["method"].as_str().unwrap_or_default();
 
         // Server→client REQUEST (id + method): approvals.
@@ -592,9 +486,13 @@ impl CodexMapper {
                     .unwrap_or_default()
                     .to_string();
                 self.turn_active = true;
+                self.turn_pending = false;
                 step.events.push(AgentEvent::TurnStarted {
                     turn_id: self.turn_id.clone(),
                 });
+                // Sends captured during the start window steer into the
+                // now-identified turn instead of being lost.
+                self.flush_buffered(&mut step);
             }
             // A new reasoning-summary section: keep the thought stream
             // readable with a paragraph break instead of one run-on blob.
@@ -656,6 +554,16 @@ impl CodexMapper {
             }
             "item/started" => self.on_item(&frame["params"]["item"], false, &mut step),
             "item/completed" => self.on_item(&frame["params"]["item"], true, &mut step),
+            // Live wholesale-replace of a fileChange item's patch (PROTOCOL.md:
+            // item/fileChange/patchUpdated). Re-upsert the row's locations and
+            // title so an approval arriving after it names the right files.
+            "item/fileChange/patchUpdated" => {
+                let params = &frame["params"];
+                if let Some(item_id) = params["itemId"].as_str() {
+                    let changes = params["changes"].as_array().cloned().unwrap_or_default();
+                    self.file_change_upsert(item_id, &changes, &mut step);
+                }
+            }
             // The turn's todo list (entries {step, status}).
             "turn/plan/updated" => {
                 if let Some(plan) = frame["params"]["plan"].as_array() {
@@ -835,23 +743,41 @@ impl CodexMapper {
         self.streamed.clear();
         self.out_streamed.clear();
         self.safety_notified = false;
+        // Defensive: a turn that ends without ever emitting turn/started must
+        // not leave the start-window flag stuck true.
+        self.turn_pending = false;
         // Approvals only ever reference items of the current turn; keeping
         // these forever is unbounded growth over a long session.
         self.item_locations.clear();
     }
 
     /// A response to one of our client→server requests.
-    fn on_response(&mut self, id: u64, frame: &Value, step: &mut CodexStep) {
+    fn on_response(&mut self, id: u64, frame: &Value, step: &mut DriverStep) {
         let Some(pending) = self.pending_rpcs.remove(&id) else {
             return;
         };
         let error = frame.get("error").filter(|e| !e.is_null());
         match (pending, error) {
             (PendingRpc::TurnStart, Some(err)) => {
-                step.events.push(AgentEvent::Error {
-                    message: format!("turn/start failed: {}", err["message"]),
-                    fatal: false,
-                });
+                self.turn_pending = false;
+                let msg = err["message"].as_str().unwrap_or_default();
+                // If a turn was already active, the error names it: adopt that
+                // turn and steer the buffered sends rather than erroring.
+                if let Some(live) = parse_expected_turn_id(msg) {
+                    self.turn_id = live;
+                    self.turn_active = true;
+                    self.flush_buffered(step);
+                } else {
+                    step.events.push(AgentEvent::Error {
+                        message: format!("turn/start failed: {}", err["message"]),
+                        fatal: false,
+                    });
+                    // Re-drive any buffered sends so they aren't stranded.
+                    if !self.buffered_sends.is_empty() {
+                        let (input, client_msg_id) = self.buffered_sends.remove(0);
+                        self.emit_turn_start(input, client_msg_id, step);
+                    }
+                }
             }
             (
                 PendingRpc::Steer {
@@ -886,6 +812,10 @@ impl CodexMapper {
                             },
                         }));
                     }
+                    // Not a turn-id mismatch: if the turn ended between our send
+                    // and this steer, re-drive the saved input as a fresh turn
+                    // instead of dropping the already-echoed user message.
+                    None if !self.turn_active => self.emit_turn_start(input, client_msg_id, step),
                     None => {
                         step.events.push(AgentEvent::Error {
                             message: format!("steer failed: {msg}"),
@@ -894,11 +824,22 @@ impl CodexMapper {
                     }
                 }
             }
-            (PendingRpc::Steer { retried: true, .. }, Some(err)) => {
-                step.events.push(AgentEvent::Error {
-                    message: format!("steer failed: {}", err["message"]),
-                    fatal: false,
-                });
+            (
+                PendingRpc::Steer {
+                    input,
+                    client_msg_id,
+                    retried: true,
+                },
+                Some(err),
+            ) => {
+                if !self.turn_active {
+                    self.emit_turn_start(input, client_msg_id, step);
+                } else {
+                    step.events.push(AgentEvent::Error {
+                        message: format!("steer failed: {}", err["message"]),
+                        fatal: false,
+                    });
+                }
             }
             (PendingRpc::Interrupt, Some(err)) => {
                 // "no active turn to interrupt" is a benign race.
@@ -942,7 +883,7 @@ impl CodexMapper {
     /// account/read result → RateLimit chip (+ /usage windows on request).
     /// Wire shape: rate_limit.{primary_window,secondary_window} each
     /// {used_percent 0-100, limit_window_seconds, reset_at epoch-s}.
-    fn on_account(&mut self, result: &Value, report: bool, step: &mut CodexStep) {
+    fn on_account(&mut self, result: &Value, report: bool, step: &mut DriverStep) {
         let rl = &result["rate_limit"];
         let window = |w: &Value| -> Option<(f64, Option<String>, String)> {
             let pct = w["used_percent"].as_f64()?;
@@ -985,7 +926,30 @@ impl CodexMapper {
         }
     }
 
-    fn on_item(&mut self, item: &Value, completed: bool, step: &mut CodexStep) {
+    /// Upsert a fileChange tool row from its current changes: remember the
+    /// touched paths (approval requests reference the item by id only) and
+    /// re-emit the in-progress ToolCall so clients update its locations/title.
+    /// Shared by item/started and item/fileChange/patchUpdated.
+    fn file_change_upsert(&mut self, id: &str, changes: &[Value], step: &mut DriverStep) {
+        let locations: Vec<String> = changes
+            .iter()
+            .filter_map(|c| c["path"].as_str().map(String::from))
+            .collect();
+        self.item_locations
+            .insert(id.to_string(), locations.clone());
+        step.events.push(AgentEvent::ToolCall {
+            id: id.to_string(),
+            kind: ToolKind::Edit,
+            title: match locations.as_slice() {
+                [only] => only.clone(),
+                many => format!("{} files changed", many.len()),
+            },
+            locations,
+            status: ToolStatus::InProgress,
+        });
+    }
+
+    fn on_item(&mut self, item: &Value, completed: bool, step: &mut DriverStep) {
         let id = item["id"].as_str().unwrap_or_default().to_string();
         match item["type"].as_str() {
             Some("agentMessage") if completed => {
@@ -1043,25 +1007,16 @@ impl CodexMapper {
                 // add|delete|update, move_path}}]; diff is full content for
                 // add/delete, unified hunks for update.
                 let changes = item["changes"].as_array().cloned().unwrap_or_default();
-                let locations: Vec<String> = changes
-                    .iter()
-                    .filter_map(|c| c["path"].as_str().map(String::from))
-                    .collect();
-                // Approval requests reference the item by id only; remember
-                // what it touches so the permission card can say so.
-                self.item_locations.insert(id.clone(), locations.clone());
                 if !completed {
-                    step.events.push(AgentEvent::ToolCall {
-                        id,
-                        kind: ToolKind::Edit,
-                        title: match locations.as_slice() {
-                            [only] => only.clone(),
-                            many => format!("{} files changed", many.len()),
-                        },
-                        locations,
-                        status: ToolStatus::InProgress,
-                    });
+                    self.file_change_upsert(&id, &changes, step);
                 } else {
+                    // Approval requests reference the item by id only; keep the
+                    // touched paths so a late approval card can still name them.
+                    let locations: Vec<String> = changes
+                        .iter()
+                        .filter_map(|c| c["path"].as_str().map(String::from))
+                        .collect();
+                    self.item_locations.insert(id.clone(), locations);
                     let failed =
                         matches!(item["status"].as_str(), Some("declined") | Some("failed"));
                     let diffs: Vec<ToolContent> = changes
@@ -1208,8 +1163,7 @@ impl CodexMapper {
                         kind: ToolKind::Other,
                         title: match item["revisedPrompt"].as_str() {
                             Some(p) if !p.is_empty() => {
-                                let (capped, _) = crate::model::cap_head_tail(p, 120, 0);
-                                format!("image: {capped}")
+                                format!("image: {}", truncate_label(p, 120))
                             }
                             _ => "generated image".into(),
                         },
@@ -1255,7 +1209,7 @@ impl CodexMapper {
     /// variants); the Permission command just looks its option up. Unknown
     /// decision strings are silently treated as decline by the server, so
     /// only mined/verified shapes are ever offered.
-    fn on_server_request(&mut self, frame: &Value, step: &mut CodexStep) {
+    fn on_server_request(&mut self, frame: &Value, step: &mut DriverStep) {
         let rpc_id = frame["id"].clone();
         let params = &frame["params"];
         let method = frame["method"].as_str().unwrap_or_default();
@@ -1415,7 +1369,7 @@ impl CodexMapper {
                     .as_str()
                     .or(params["command"].as_str())
                     .unwrap_or("codex action");
-                title = crate::model::cap_head_tail(raw_title, 120, 0).0;
+                title = truncate_label(raw_title, 120);
                 input_preview = json!({
                     "command": cap_output(params["command"].as_str().unwrap_or_default()).0,
                     "cwd": params["cwd"],
@@ -1485,8 +1439,70 @@ impl CodexMapper {
         });
     }
 
-    fn on_command(&mut self, cmd: AgentCommand) -> CodexStep {
-        let mut step = CodexStep::default();
+    /// Inject a send into the running turn (type-through). A stale
+    /// expectedTurnId retries once via the error-parse path in `on_response`.
+    fn emit_steer(&mut self, input: Value, client_msg_id: String, step: &mut DriverStep) {
+        let id = self.rpc_id();
+        self.pending_rpcs.insert(
+            id,
+            PendingRpc::Steer {
+                input: input.clone(),
+                client_msg_id: client_msg_id.clone(),
+                retried: false,
+            },
+        );
+        step.outbound.push(json!({
+            "id": id, "method": "turn/steer",
+            "params": {
+                "threadId": self.thread_id,
+                "clientUserMessageId": client_msg_id,
+                "input": input,
+                "expectedTurnId": self.turn_id,
+            },
+        }));
+    }
+
+    /// Open a fresh turn. Sets turn_pending so a fast second send buffers
+    /// instead of racing a second turn/start into the same window.
+    fn emit_turn_start(&mut self, input: Value, client_msg_id: String, step: &mut DriverStep) {
+        let id = self.rpc_id();
+        let mut params = json!({
+            "threadId": self.thread_id,
+            "clientUserMessageId": client_msg_id,
+            "input": input,
+        });
+        if let Some(model) = &self.pending_model {
+            params["model"] = json!(model);
+        }
+        if let Some(effort) = &self.pending_effort {
+            params["effort"] = json!(effort);
+        }
+        // Mode fields ride per-turn only when settings/update proved
+        // unsupported (the extension's fallback path).
+        if let Some(mode_fields) = &self.mode_per_turn {
+            if let Some(fields) = mode_fields.as_object() {
+                for (k, v) in fields {
+                    params[k] = v.clone();
+                }
+            }
+        }
+        self.pending_rpcs.insert(id, PendingRpc::TurnStart);
+        self.turn_pending = true;
+        step.outbound.push(json!({
+            "id": id, "method": "turn/start", "params": params,
+        }));
+    }
+
+    /// Steer every send buffered during the start window into the turn whose
+    /// id just became known.
+    fn flush_buffered(&mut self, step: &mut DriverStep) {
+        for (input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
+            self.emit_steer(input, client_msg_id, step);
+        }
+    }
+
+    fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
+        let mut step = DriverStep::default();
         match cmd {
             AgentCommand::Send { blocks } => {
                 let text: String = blocks
@@ -1517,53 +1533,18 @@ impl CodexMapper {
                     text: text.clone(),
                     attachments,
                 });
+                let input = json!(input);
                 let client_msg_id = crate::model::fresh_uuid();
-                let id = self.rpc_id();
                 if self.turn_active && !self.turn_id.is_empty() {
-                    // Type-through: inject into the RUNNING turn (steer); a
-                    // stale expectedTurnId retries via the error parse.
-                    self.pending_rpcs.insert(
-                        id,
-                        PendingRpc::Steer {
-                            input: json!(input),
-                            client_msg_id: client_msg_id.clone(),
-                            retried: false,
-                        },
-                    );
-                    step.outbound.push(json!({
-                        "id": id, "method": "turn/steer",
-                        "params": {
-                            "threadId": self.thread_id,
-                            "clientUserMessageId": client_msg_id,
-                            "input": input,
-                            "expectedTurnId": self.turn_id,
-                        },
-                    }));
+                    // Type-through: inject into the RUNNING turn (steer).
+                    self.emit_steer(input, client_msg_id, &mut step);
+                } else if self.turn_pending {
+                    // A turn/start is in flight but unidentified: buffer to
+                    // steer once turn/started lands, so we don't race a second
+                    // turn/start (rejected) and lose the echoed message.
+                    self.buffered_sends.push((input, client_msg_id));
                 } else {
-                    let mut params = json!({
-                        "threadId": self.thread_id,
-                        "clientUserMessageId": client_msg_id,
-                        "input": input,
-                    });
-                    if let Some(model) = &self.pending_model {
-                        params["model"] = json!(model);
-                    }
-                    if let Some(effort) = &self.pending_effort {
-                        params["effort"] = json!(effort);
-                    }
-                    // Mode fields ride per-turn only when settings/update
-                    // proved unsupported (the extension's fallback path).
-                    if let Some(mode_fields) = &self.mode_per_turn {
-                        if let Some(fields) = mode_fields.as_object() {
-                            for (k, v) in fields {
-                                params[k] = v.clone();
-                            }
-                        }
-                    }
-                    self.pending_rpcs.insert(id, PendingRpc::TurnStart);
-                    step.outbound.push(json!({
-                        "id": id, "method": "turn/start", "params": params,
-                    }));
+                    self.emit_turn_start(input, client_msg_id, &mut step);
                 }
             }
             AgentCommand::Permission {
@@ -1674,6 +1655,24 @@ impl CodexMapper {
     }
 }
 
+/// Harness adapter: the inherent methods above ARE the state machine; these
+/// forward the harness's generic calls to them (inherent methods win in
+/// `self.x()` resolution, so there is no recursion).
+impl Mapper for CodexMapper {
+    fn init_event(&self) -> AgentEvent {
+        self.init_event()
+    }
+    fn on_frame(&mut self, frame: &Value) -> DriverStep {
+        self.on_frame(frame)
+    }
+    fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
+        self.on_command(cmd)
+    }
+    fn flush(&mut self) -> Option<AgentEvent> {
+        self.flush()
+    }
+}
+
 /// `commandActions[0].command` is the bare command; the raw `command` field
 /// carries the `/bin/zsh -lc '…'` wrapper.
 fn command_title(item: &Value) -> String {
@@ -1681,15 +1680,7 @@ fn command_title(item: &Value) -> String {
         .as_str()
         .or(item["command"].as_str())
         .unwrap_or("command");
-    const MAX: usize = 120;
-    if raw.len() <= MAX {
-        return raw.to_string();
-    }
-    let mut end = MAX;
-    while end > 0 && !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &raw[..end])
+    truncate_label(raw, 120)
 }
 
 /// The extension's exact steer-retry extraction: the live turn id sits in
@@ -1799,6 +1790,110 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-A");
         assert!(step.outbound[0]["params"]["clientUserMessageId"].is_string());
+    }
+
+    #[test]
+    fn send_during_start_window_buffers_then_steers_on_turn_started() {
+        let mut m = mapper();
+        // First send: no active turn → turn/start, and the start window opens.
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "one".into() }],
+        });
+        assert_eq!(step.outbound[0]["method"], "turn/start");
+        assert!(m.turn_pending);
+        // Second send arrives BEFORE turn/started: it must NOT fire a second
+        // turn/start (which the server rejects, losing the message) — it buffers.
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "two".into() }],
+        });
+        assert!(
+            step.outbound.is_empty(),
+            "second send buffers, no second turn/start: {:?}",
+            step.outbound
+        );
+        // turn/started lands: the buffered send flushes as a steer into it.
+        let step = m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-Z" } },
+        }));
+        assert!(!m.turn_pending);
+        let steer = step
+            .outbound
+            .iter()
+            .find(|f| f["method"] == "turn/steer")
+            .expect("buffered send steered");
+        assert_eq!(steer["params"]["expectedTurnId"], "turn-Z");
+    }
+
+    #[test]
+    fn file_change_patch_updated_retargets_locations() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        // item/started names one file…
+        m.on_frame(&json!({
+            "method": "item/started",
+            "params": { "item": { "id": "fc-1", "type": "fileChange",
+                "changes": [{ "path": "a.rs", "diff": "…", "kind": { "type": "update" } }] } },
+        }));
+        // …then a live patchUpdated wholesale-replaces it with two files.
+        let step = m.on_frame(&json!({
+            "method": "item/fileChange/patchUpdated",
+            "params": { "itemId": "fc-1", "changes": [
+                { "path": "a.rs", "diff": "…", "kind": { "type": "update" } },
+                { "path": "b.rs", "diff": "…", "kind": { "type": "add" } },
+            ]},
+        }));
+        match &step.events[0] {
+            AgentEvent::ToolCall {
+                id,
+                locations,
+                title,
+                ..
+            } => {
+                assert_eq!(id, "fc-1");
+                assert_eq!(locations.len(), 2);
+                assert_eq!(title, "2 files changed");
+            }
+            other => panic!("expected re-upserted ToolCall, got {other:?}"),
+        }
+        // An approval arriving after the patch now names both files.
+        let step = m.on_frame(&json!({
+            "id": 80,
+            "method": "item/fileChange/requestApproval",
+            "params": { "itemId": "fc-1" },
+        }));
+        match &step.events[0] {
+            AgentEvent::PermissionRequest { title, .. } => {
+                assert_eq!(title, "apply changes to 2 files");
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steer_reroutes_to_turn_start_when_turn_ended() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        // The turn ended between our send and the steer response.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        // A steer failure that is NOT a turn-id mismatch must re-drive the
+        // saved input as a fresh turn instead of dropping the user message.
+        let step = m.on_frame(&json!({
+            "id": id,
+            "error": { "message": "no active turn" },
+        }));
+        assert_eq!(
+            step.outbound[0]["method"], "turn/start",
+            "saved input re-driven as a new turn: {:?}",
+            step.outbound
+        );
     }
 
     #[test]

@@ -23,10 +23,10 @@
 
   interface Props {
     text: string;
-    /** How many trailing WORDS were just revealed (streaming): they get a
-     *  fade-in span. 0 = render statically. Re-renders wipe earlier spans,
-     *  which is correct — settled words must not re-animate. */
-    fadeWords?: number;
+    /** Live streaming block: reveal newly parsed words in fading batches
+     *  instead of showing the whole (chunky) text at once. Settled blocks pass
+     *  false and render statically. */
+    streaming?: boolean;
     /** Open a VALIDATED path the prose references — files land in a viewer
      *  pane, directories in the Finder. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
@@ -34,9 +34,12 @@
      *  link provider's mechanism): only real files/dirs get the click
      *  affordance. Returns canonical absolute path + kind per HIT. */
     resolvePaths?: ResolvePaths;
+    /** Fired after each streaming reveal batch — lets the host keep the
+     *  transcript pinned to the bottom as words grow between wire chunks. */
+    onReveal?: () => void;
   }
 
-  let { text, fadeWords = 0, onOpenPath, resolvePaths }: Props = $props();
+  let { text, streaming = false, onOpenPath, resolvePaths, onReveal }: Props = $props();
 
   /** candidate text → validated hit or "miss"; lives for the component so
    *  streaming re-renders re-stamp from cache instead of refetching. */
@@ -162,10 +165,36 @@
 
   let el = $state<HTMLElement | null>(null);
 
-  /** Wrap the last `count` words of the rendered tree in fade spans. Walks
-   *  text nodes from the END so only the tail is touched (cheap on long
-   *  messages); word fragments never cross element boundaries. */
-  function fadeTail(root: HTMLElement, count: number) {
+  // --- streaming reveal -------------------------------------------------------
+  // Wire chunks arrive coalesced (2 KiB / 100 ms); rendering them raw makes text
+  // land in ugly slabs. But re-slicing + re-parsing the whole message on a fast
+  // reveal ticker is O(n²). So we parse/sanitize ONCE per chunk (the `html`
+  // derived changes only when the full text does), wrap the rendered words in
+  // spans, and unhide them a batch at a time on a ~75 ms cadence — the same fade
+  // cascade, driven off the already-rendered DOM instead of a re-parse.
+  const REVEAL_TICK_MS = 75;
+  const reducedMotion =
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let words: HTMLElement[] = [];
+  /** Every element that CONTAINS words, with the index of its first word — so a
+   *  block whose words are all still hidden (a heading, an empty list bullet)
+   *  is hidden WHOLE, never flashing its margins/marker above the reveal. */
+  let containers: { el: HTMLElement; first: number }[] = [];
+  let revealed = 0;
+  let lastHtml = "";
+  let revealTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearReveal() {
+    if (revealTimer !== null) {
+      clearTimeout(revealTimer);
+      revealTimer = null;
+    }
+  }
+
+  /** Wrap every whitespace-delimited run in the tree in a `.rw` span, in
+   *  document order, and record the containing elements. Inline spans preserve
+   *  flow and whitespace, so a wrapped word is visually inert until hidden. */
+  function wrapWords(root: HTMLElement): void {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n) =>
         (n.textContent ?? "").trim().length > 0
@@ -174,37 +203,110 @@
     });
     const nodes: Text[] = [];
     while (walker.nextNode()) nodes.push(walker.currentNode as Text);
-    let remaining = count;
-    for (let i = nodes.length - 1; i >= 0 && remaining > 0; i--) {
-      const node = nodes[i];
-      const words = [...(node.textContent ?? "").matchAll(/\S+/g)];
-      if (words.length === 0) continue;
-      const take = Math.min(remaining, words.length);
-      const splitAt = words[words.length - take].index ?? 0;
-      const tail = node.splitText(splitAt);
-      const span = document.createElement("span");
-      span.className = "stream-fade";
-      tail.parentNode?.replaceChild(span, tail);
-      span.appendChild(tail);
-      remaining -= take;
+    const spans: HTMLElement[] = [];
+    for (const node of nodes) {
+      const matches = [...(node.textContent ?? "").matchAll(/\S+/g)];
+      const local: HTMLElement[] = [];
+      // Right-to-left so earlier match indices stay valid across splits.
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const start = matches[i].index ?? 0;
+        const tail = node.splitText(start);
+        tail.splitText(matches[i][0].length);
+        const span = document.createElement("span");
+        span.className = "rw";
+        tail.parentNode?.replaceChild(span, tail);
+        span.appendChild(tail);
+        local.push(span);
+      }
+      local.reverse();
+      spans.push(...local);
     }
+    words = spans;
+    // Walk each word's ancestors up to (not including) root; the first word to
+    // reach an ancestor stamps its index. Stop at an already-stamped ancestor —
+    // its parents were stamped by whatever word reached it first.
+    const firstOf = new Map<HTMLElement, number>();
+    words.forEach((span, i) => {
+      let a: HTMLElement | null = span.parentElement;
+      while (a !== null && a !== root && !firstOf.has(a)) {
+        firstOf.set(a, i);
+        a = a.parentElement;
+      }
+    });
+    containers = [...firstOf].map(([el2, first]) => ({ el: el2, first }));
   }
 
-  // Runs after each {@html} flush; only the freshly revealed batch animates
-  // and file-looking code spans get their click affordance re-stamped.
-  let fadedHtml = "";
-  $effect(() => {
-    const current = html;
-    if (el === null) return;
-    // fadeTail mutates the DOM in place and is NOT idempotent — only wrap when
-    // this exact html was just (re)flushed, never on a bare fadeWords change
-    // over an already-faded tree (which would nest stream-fade spans).
-    if (fadeWords > 0 && current !== fadedHtml) {
-      fadedHtml = current;
-      fadeTail(el, fadeWords);
+  /** Hide whole blocks that haven't started revealing (their first word is past
+   *  the cursor) so their chrome never shows above the reveal point. */
+  function syncContainers() {
+    for (const c of containers) c.el.classList.toggle("rw-hidden", c.first >= revealed);
+  }
+
+  function step() {
+    revealTimer = null;
+    const total = words.length;
+    if (revealed >= total) return; // caught up — the next chunk resumes us
+    const remaining = total - revealed;
+    // Advance a few words, more when the buffer runs ahead — the stream never
+    // lags visibly, it just breathes.
+    const take = Math.min(remaining, Math.max(2, Math.ceil(remaining / 6)));
+    for (let i = revealed; i < revealed + take && i < total; i++) {
+      words[i].classList.remove("rw-hidden");
+      words[i].classList.add("stream-fade");
     }
-    stampPaths(el);
+    revealed += take;
+    syncContainers();
+    onReveal?.();
+    if (revealed < total) revealTimer = setTimeout(step, REVEAL_TICK_MS);
+  }
+
+  // One effect drives both concerns off `html` (a re-parse — per chunk) and
+  // `streaming`. It runs post-DOM / pre-paint, so hiding the not-yet-revealed
+  // tail here never flashes the full text.
+  $effect(() => {
+    const current = html; // dep: re-parse only when the FULL text changes
+    const live = streaming && !reducedMotion; // dep
+    if (el === null) return;
+    if (current !== lastHtml) {
+      lastHtml = current;
+      // The {@html} flush rebuilt the subtree: (re)wrap words for a live block
+      // and re-stamp path affordances — both once per chunk, not per tick.
+      if (live) wrapWords(el);
+      else {
+        words = [];
+        containers = [];
+      }
+      stampPaths(el);
+    }
+    if (!live) {
+      // Settled (or reduced-motion): make sure nothing stays hidden from an
+      // earlier streaming pass, then idle.
+      clearReveal();
+      if (words.length > 0 || containers.length > 0) {
+        for (const w of words) w.classList.remove("rw-hidden");
+        for (const c of containers) c.el.classList.remove("rw-hidden");
+      } else {
+        el.querySelectorAll(".rw-hidden").forEach((n) => n.classList.remove("rw-hidden"));
+      }
+      words = [];
+      containers = [];
+      revealed = 0;
+      return;
+    }
+    // Show the settled prefix immediately (no fade), hide the rest until the
+    // ticker reaches it.
+    for (let i = 0; i < words.length; i++) {
+      words[i].classList.toggle("rw-hidden", i >= revealed);
+    }
+    syncContainers();
+    if (revealed < words.length && revealTimer === null) {
+      revealTimer = setTimeout(step, REVEAL_TICK_MS);
+    }
   });
+
+  // Stop the ticker when the component unmounts (a keyed message block can be
+  // torn down mid-stream).
+  $effect(() => () => clearReveal());
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -218,6 +320,12 @@
     line-height: 1.55;
     font-size: var(--text-md);
     word-break: break-word;
+  }
+  /* Streaming reveal: words are wrapped in .rw spans; the not-yet-revealed tail
+     is display:none (occupies no space, exactly like the old text slice), and
+     each freshly revealed batch fades in. */
+  .md :global(.rw-hidden) {
+    display: none;
   }
   .md :global(.stream-fade) {
     animation: stream-fade-in 0.32s ease-out both;

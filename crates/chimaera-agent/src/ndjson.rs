@@ -87,12 +87,14 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], max: usize, overflowed: &mut boo
     }
 }
 
-/// A spawned agent process speaking newline-delimited JSON on stdio.
+/// A spawned agent process speaking newline-delimited JSON on stdio. Holds
+/// its three independently-owned halves so framing, spawn, and shutdown have
+/// exactly one implementation, shared by the probe clients (which use the
+/// whole child) and the driver harness (which [`split`](Self::split)s it).
 pub struct JsonlChild {
-    child: Child,
-    stdin: ChildStdin,
-    lines: CappedLines<ChildStdout>,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    sink: JsonlSink,
+    stream: JsonlStream,
+    guard: ChildGuard,
 }
 
 impl JsonlChild {
@@ -146,85 +148,47 @@ impl JsonlChild {
         });
 
         Ok(Self {
-            child,
-            stdin,
-            lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
-            stderr_tail,
+            sink: JsonlSink { stdin },
+            stream: JsonlStream {
+                lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
+                stderr_tail: Arc::clone(&stderr_tail),
+            },
+            guard: ChildGuard { child, stderr_tail },
         })
     }
 
     /// Write one JSON value as a single line and flush it.
     pub async fn send(&mut self, value: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(value)?;
-        line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .await
-            .context("agent stdin write")?;
-        self.stdin.flush().await.context("agent stdin flush")?;
-        Ok(())
+        self.sink.send(value).await
     }
 
-    /// Next JSON line from stdout. `Ok(None)` means EOF (child closed stdout).
-    /// Non-JSON lines are skipped with a warning rather than failing the
-    /// session — one stray diagnostic line must not kill a conversation.
+    /// Next JSON line from stdout, bounded by `timeout`. `Ok(None)` means EOF
+    /// (child closed stdout). Non-JSON lines are skipped with a warning rather
+    /// than failing the session — one stray diagnostic line must not kill a
+    /// conversation.
     pub async fn recv(&mut self, timeout: Duration) -> Result<Option<Value>> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let line = tokio::time::timeout_at(deadline, self.lines.next_line())
-                .await
-                .context("timed out waiting for agent output")?
-                .context("agent stdout read")?;
-            let Some(line) = line else {
-                return Ok(None);
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(&line) {
-                Ok(value) => return Ok(Some(value)),
-                Err(err) => {
-                    tracing::warn!(%err, line = %truncate(&line, 200), "skipping non-JSON agent output line");
-                }
-            }
-        }
+        tokio::time::timeout(timeout, self.stream.next())
+            .await
+            .context("timed out waiting for agent output")?
     }
 
     /// Last stderr lines, for handshake-failure diagnostics.
     pub fn stderr_tail(&self) -> String {
-        let tail = self.stderr_tail.lock().expect("stderr tail lock");
-        tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        self.guard.stderr_tail()
     }
 
     /// Close stdin (the polite shutdown for both protocols), give the child a
     /// grace period to exit, then kill it.
-    pub async fn shutdown(mut self, grace: Duration) -> Result<Option<i32>> {
-        drop(self.stdin);
-        match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(status) => Ok(status.context("await agent exit")?.code()),
-            Err(_) => {
-                self.child.start_kill().ok();
-                let status = self.child.wait().await.context("await killed agent")?;
-                Ok(status.code())
-            }
-        }
+    pub async fn shutdown(self, grace: Duration) -> Result<Option<i32>> {
+        drop(self.sink);
+        Ok(self.guard.shutdown(grace).await)
     }
 
     /// Split into independently-owned halves so a driver can `select!` over
     /// inbound frames and outbound commands without fighting the borrow of a
     /// single struct.
     pub fn split(self) -> (JsonlSink, JsonlStream, ChildGuard) {
-        (
-            JsonlSink { stdin: self.stdin },
-            JsonlStream {
-                lines: self.lines,
-                stderr_tail: Arc::clone(&self.stderr_tail),
-            },
-            ChildGuard {
-                child: self.child,
-                stderr_tail: self.stderr_tail,
-            },
-        )
+        (self.sink, self.stream, self.guard)
     }
 }
 
@@ -279,14 +243,16 @@ impl JsonlStream {
     }
 }
 
-/// Owns the child for lifecycle: wait, kill, stderr diagnostics.
+/// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
     child: Child,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl ChildGuard {
-    /// Give the child a grace period after sinks were dropped, then kill.
+    /// Give the child a grace period after sinks were dropped, then kill. The
+    /// harness's only reap path — an unbounded wait can't leak a lingering
+    /// child (a normally-exiting one returns its status within the grace).
     pub async fn shutdown(mut self, grace: Duration) -> Option<i32> {
         match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(Ok(status)) => status.code(),
@@ -295,10 +261,6 @@ impl ChildGuard {
                 self.child.wait().await.ok().and_then(|s| s.code())
             }
         }
-    }
-
-    pub async fn wait(&mut self) -> Option<i32> {
-        self.child.wait().await.ok().and_then(|s| s.code())
     }
 
     pub fn stderr_tail(&self) -> String {

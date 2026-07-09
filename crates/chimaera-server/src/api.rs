@@ -225,12 +225,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
             );
             if let serde_json::Value::Object(map) = &mut row {
                 map.insert("ui".to_string(), json!("term"));
-                let chat_capable = agents.get(&info.id).is_some_and(|a| {
-                    matches!(
-                        a.kind,
-                        crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
-                    )
-                });
+                let chat_capable = agents.get(&info.id).is_some_and(|a| a.kind.chat_capable());
                 map.insert("chat_capable".to_string(), json!(chat_capable));
             }
             (info.created_at, row)
@@ -583,25 +578,15 @@ async fn spawn_chat_ui(
             }
         },
     };
-    // Only claude and codex speak a structured protocol today.
-    if !matches!(
-        agent_kind,
-        crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
-    ) {
+    // Only chat-capable agents (claude stream-json / codex app-server) reach
+    // the chat surface. Both support resume here — claude via its transcript
+    // store, codex in-protocol (thread/resume) — so no separate resume guard
+    // is needed past this point (gemini et al. are refused outright).
+    if !agent_kind.chat_capable() {
         return bad_request(format!(
             "chat view not yet available for {}",
             agent_kind.as_str()
         ));
-    }
-    // Resume: claude anywhere (transcript store); codex only through the chat
-    // driver (thread/resume is in-protocol). Gemini et al. can't resume here.
-    if body.resume.is_some()
-        && !matches!(
-            agent_kind,
-            crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
-        )
-    {
-        return bad_request("resume is not supported for this agent".to_string());
     }
     for (field, value) in [("model", &body.model), ("resume", &body.resume)] {
         if let Some(value) = value {

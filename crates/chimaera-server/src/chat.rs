@@ -51,14 +51,34 @@ pub(crate) struct ChatRecipe {
     pub(crate) theme: String,
 }
 
+/// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
+/// shared login node) so a stalled consumer can't grow memory without a
+/// ceiling. The two signal kinds get different backpressure treatment — see
+/// [`new_manager`].
+const CHAT_SIGNAL_CAPACITY: usize = 1024;
+
 /// Build the manager with hooks that forward into the signal channel.
 /// Returns the receiver for [`spawn_signal_task`] to consume.
+///
+/// The hooks run on the pump task and must stay cheap. The channel is
+/// **bounded**, and the two signal kinds are treated differently under
+/// backpressure:
+///
+/// - **Exit** is rare and MUST NOT be lost — a dropped Exit would strand a
+///   session in the registry forever (nothing else retires it). When the
+///   channel is full it is handed to a detached task that *awaits* capacity,
+///   preserving the signal without parking the pump.
+/// - **Event** only refreshes derived `AgentState` (the journal, not this
+///   channel, is authoritative — the client reads the truth from the journal
+///   on replay), so it sheds load: `try_send`, and on a full channel it is
+///   dropped with a counted, throttled log. Derived state self-heals on the
+///   next Event that gets through.
 pub(crate) fn new_manager(
     journal_dir: PathBuf,
-) -> (
-    Arc<ChatManager>,
-    tokio::sync::mpsc::UnboundedReceiver<ChatSignal>,
-) {
+) -> (Arc<ChatManager>, tokio::sync::mpsc::Receiver<ChatSignal>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc::error::TrySendError;
+
     if let Err(err) = chimaera_agent::journal::prune_dir(
         &journal_dir,
         chimaera_agent::journal::DIR_MAX_BYTES,
@@ -66,29 +86,45 @@ pub(crate) fn new_manager(
     ) {
         tracing::warn!(%err, "chat journal prune failed");
     }
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(CHAT_SIGNAL_CAPACITY);
     let event_tx = tx.clone();
+    let dropped = Arc::new(AtomicU64::new(0));
     let manager = Arc::new(ChatManager::new(
         journal_dir,
         Box::new(move |id, entry| {
-            let _ = event_tx.send(ChatSignal::Event(id.to_string(), Arc::clone(entry)));
+            match event_tx.try_send(ChatSignal::Event(id.to_string(), Arc::clone(entry))) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Throttle the log: derived state recovers on the next
+                    // delivered event and the journal is the client's source
+                    // of truth, so a burst of drops is degraded — not broken.
+                    if n == 1 || n.is_multiple_of(1000) {
+                        tracing::warn!(
+                            dropped = n,
+                            "chat signal channel full; dropping event signals \
+                             (derived agent state may lag; journal stays authoritative)"
+                        );
+                    }
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
         }),
         Box::new(move |id, exit| {
-            // DriverExit isn't Clone; re-materialize the parts the server
-            // acts on.
-            let owned = match exit {
-                DriverExit::Clean(status) => DriverExit::Clean(*status),
-                DriverExit::HandshakeFailed {
-                    reason,
-                    stderr_tail,
-                } => DriverExit::HandshakeFailed {
-                    reason: reason.clone(),
-                    stderr_tail: stderr_tail.clone(),
-                },
-                DriverExit::ProtocolError(msg) => DriverExit::ProtocolError(msg.clone()),
-                DriverExit::Killed => DriverExit::Killed,
-            };
-            let _ = tx.send(ChatSignal::Exit(id.to_string(), owned));
+            // DriverExit is Clone (chimaera-agent derives it), so the server
+            // takes an owned copy without re-materializing it arm by arm.
+            match tx.try_send(ChatSignal::Exit(id.to_string(), exit.clone())) {
+                Ok(()) => {}
+                // Exit must survive backpressure: awaiting capacity on a
+                // detached task loses neither the signal nor the pump.
+                Err(TrySendError::Full(signal)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(signal).await;
+                    });
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
         }),
     ));
     (manager, rx)
@@ -266,6 +302,25 @@ async fn degrade_to_pty(
             argv.push("resume".to_string());
             argv.push(resume.clone());
         }
+        // Parity with the TUI spawn path (spawn.rs): carry the scheme theme
+        // (`-c tui.theme=`, skipped when the user's own config.toml sets one)
+        // and the model the chat session was created with — the app-server
+        // chat driver drops both, so a degrade would otherwise land an
+        // un-themed, default-model TUI.
+        // NOTE(needs live confirmation): these flags TRAIL the `resume`
+        // subcommand; confirm codex accepts that argv order (chat-smoke / a
+        // real degrade spawn).
+        if !crate::runtimes::codex_user_theme_set(&state.codex_config_path) {
+            argv.push("-c".to_string());
+            argv.push(format!(
+                "tui.theme={}",
+                crate::runtimes::codex_theme_name(&recipe.theme)
+            ));
+        }
+        if let Some(model) = &recipe.model {
+            argv.push("--model".to_string());
+            argv.push(model.clone());
+        }
         argv
     } else {
         crate::launcher::build_agent_command(
@@ -277,6 +332,20 @@ async fn degrade_to_pty(
             None,
         )
     };
+    // A rewind that respawned as a conversation fork but failed its handshake
+    // must NOT silently become a full-history TUI resume (that undoes the
+    // rewind). Carry the fork flags onto the claude interactive resume so the
+    // degraded terminal opens at the same fork point.
+    // NOTE(needs live confirmation): --fork-session/--resume-session-at on the
+    // *interactive* resume path (verified for the chat driver; the TUI path
+    // needs a chat-smoke / live check).
+    if recipe.kind == AgentKind::Claude {
+        if let Some(fork_at) = &recipe.fork_at {
+            argv.push("--fork-session".to_string());
+            argv.push("--resume-session-at".to_string());
+            argv.push(fork_at.clone());
+        }
+    }
     if let Some(mcp) = &recipe.mcp_config {
         argv.push("--mcp-config".to_string());
         argv.push(mcp.to_string_lossy().into_owned());
@@ -363,19 +432,153 @@ pub(crate) fn chat_session_json(
     })
 }
 
-/// UUID v4 shaped from the daemon's own entropy source — claude's
-/// `--session-id` pins the native session id at spawn, so the resume handle
-/// exists before the first turn.
+/// UUID v4 for claude's `--session-id` (pins the native session id at spawn,
+/// so the resume handle exists before the first turn). Delegates to the agent
+/// crate's shared minter — same crate's drivers already stamp checkpoint keys
+/// with it — which sets the version (`4`) and variant (`8`-`b`) nibbles for a
+/// well-formed v4 rather than hand-slicing hex here.
 pub(crate) fn fresh_native_uuid() -> String {
-    let hex = chimaera_core::generate_token();
-    format!(
-        "{}-{}-4{}-8{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[13..16],
-        &hex[17..20],
-        &hex[20..32],
-    )
+    chimaera_agent::model::fresh_uuid()
+}
+
+/// Kill-then-respawn deadline: the old process must deregister before a
+/// same-id respawn can register (SessionManager/ChatManager unregister on
+/// reap), so we wait for the slot to free.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Poll `freed` until it returns true or the stop deadline elapses. The
+/// stop-wait semantics live here once — every respawn (view switch, rewind)
+/// shares them.
+async fn wait_until_freed(
+    mut freed: impl FnMut() -> bool,
+    timeout_msg: &'static str,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    while !freed() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_msg.to_string());
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    Ok(())
+}
+
+/// Stop the live process for `id` and wait for its registry slot to free so a
+/// same-id respawn can register. Shared by the view switch and rewind.
+///
+/// `currently_chat` selects which registry to stop: the chat driver, or the
+/// PTY session (a term→chat switch stops a PTY). A dead-but-registered chat
+/// entry (ProtocolError, kept visible) will never fire its exit hook again, so
+/// waiting on it would only spin to the deadline — remove it directly instead.
+async fn stop_for_respawn(
+    state: &Arc<AppState>,
+    id: &str,
+    currently_chat: bool,
+) -> Result<(), String> {
+    if currently_chat {
+        if state.chat.get(id).is_some_and(|i| i.alive) {
+            state.chat.kill(id);
+            wait_until_freed(
+                || !state.chat.contains(id),
+                "chat driver did not stop in time",
+            )
+            .await
+        } else {
+            state.chat.remove(id);
+            Ok(())
+        }
+    } else if state.sessions.get(id).is_some() {
+        let _ = state.sessions.kill(id);
+        wait_until_freed(
+            || state.sessions.get(id).is_none(),
+            "terminal session did not stop in time",
+        )
+        .await
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve every respawn precondition — the per-session settings/mcp files and
+/// the agent binary — BEFORE any kill. A failure here (binary not found on a
+/// cold NFS cache, or the per-session files scrubbed from the runtime dir)
+/// must abort with the session still alive: killing first and failing after
+/// would leave it in neither registry and the watcher would retire a live
+/// session. (`settings`/`mcp_config` are `None` when the file is absent.)
+async fn resolve_respawn_inputs(
+    state: &Arc<AppState>,
+    id: &str,
+    kind: AgentKind,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf), String> {
+    let runtime_dir = chimaera_core::runtime_dir().join("agents");
+    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
+    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
+    let bin = crate::launcher::detect(state, kind, false)
+        .await
+        .path
+        .map_err(|e| e.to_string())?;
+    Ok((settings, mcp_config, bin))
+}
+
+/// Truncate a rewound session's journal at the conversation-fork point.
+///
+/// A fork (`--fork-session --resume-session-at <preceding-uuid>`) EXCLUDES the
+/// selected user message and everything after it. Rewind reuses the SAME
+/// chimaera session id (and therefore the same journal file), so without this
+/// the rewound-away turns replay as live history forever and their now-dead
+/// checkpoint anchors keep offering rewind buttons.
+///
+/// `resume_at` is the uuid of the message PRECEDING the selected user message
+/// (the fork's resume point). We find the `Checkpoint` whose `preceding_uuid`
+/// is it and keep every journal line before the `UserMessage` that Checkpoint
+/// anchors (the pair is emitted UserMessage-then-Checkpoint). No anchor match
+/// ⇒ the file is left intact — history is never lost on a bad match. Returns
+/// whether anything was trimmed. Blocking fs: run under `spawn_blocking`, and
+/// only after the live driver has stopped (its `Journal` dropped) so the file
+/// is settled.
+fn truncate_journal_at_fork(path: &std::path::Path, resume_at: &str) -> std::io::Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let is_user_message = |line: &str| {
+        serde_json::from_str::<SeqEvent>(line)
+            .map(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
+            .unwrap_or(false)
+    };
+    let mut cut: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        if let AgentEvent::Checkpoint {
+            preceding_uuid: Some(preceding),
+            ..
+        } = &entry.ev
+        {
+            if preceding == resume_at {
+                cut = Some(if i > 0 && is_user_message(lines[i - 1]) {
+                    i - 1
+                } else {
+                    i
+                });
+                break;
+            }
+        }
+    }
+    let Some(cut) = cut.filter(|&c| c < lines.len()) else {
+        return Ok(false);
+    };
+    let mut kept = String::with_capacity(content.len());
+    for line in &lines[..cut] {
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    // Atomic rewrite (tmp + rename) — a crash mid-truncate must not leave a
+    // torn journal (the same discipline the journal writer uses).
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, kept.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
 }
 
 #[derive(Deserialize)]
@@ -417,7 +620,7 @@ pub(crate) async fn switch_view(
             "only agent sessions can switch views".to_string(),
         );
     };
-    if !matches!(record.kind, AgentKind::Claude | AgentKind::Codex) {
+    if !record.kind.chat_capable() {
         return err(
             StatusCode::BAD_REQUEST,
             format!("chat view not yet available for {}", record.kind.as_str()),
@@ -533,18 +736,9 @@ async fn perform_switch(
         }
     }
 
-    // Resolve every respawn precondition BEFORE killing the old process. A
-    // failure here (binary not found on a cold NFS cache, or the per-session
-    // settings file scrubbed from the runtime dir) must abort the switch with
-    // the session still alive — killing first and failing after would leave it
-    // in neither registry, and the agent watcher would retire a live session.
-    let runtime_dir = chimaera_core::runtime_dir().join("agents");
-    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
-    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
-    let bin = crate::launcher::detect(state, record.kind, false)
-        .await
-        .path
-        .map_err(|e| e.to_string())?;
+    // Resolve every respawn precondition BEFORE killing the old process (see
+    // `resolve_respawn_inputs`).
+    let (settings, mcp_config, bin) = resolve_respawn_inputs(state, id, record.kind).await?;
     // The claude chat driver needs both per-session files; fail now, not
     // after the kill (spawn_chat_session would otherwise bail post-kill).
     if target_chat
@@ -555,27 +749,8 @@ async fn perform_switch(
     }
     let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
 
-    // Stop the current process and wait for its slot to free (same-id
-    // respawn requires deregistration; SessionManager unregisters on reap).
-    if currently_chat {
-        state.chat.kill(id);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.chat.contains(id) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err("chat driver did not stop in time".to_string());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    } else if state.sessions.get(id).is_some() {
-        let _ = state.sessions.kill(id);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.sessions.get(id).is_some() {
-            if tokio::time::Instant::now() >= deadline {
-                return Err("terminal session did not stop in time".to_string());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
+    // Stop the current process and wait for its slot to free.
+    stop_for_respawn(state, id, currently_chat).await?;
 
     // Stamp the transition in the journal while no live Journal owns the
     // file: replayers then read "continued in terminal/chat" instead of a
@@ -668,6 +843,15 @@ pub(crate) async fn rewind_session(
             "session has no resume handle yet".to_string(),
         );
     };
+    // The fork anchor lands verbatim in the respawn argv — validate it the same
+    // way create_session validates model/resume (a flag-shaped or control-byte
+    // value has no business in `--resume-session-at`; uuids pass).
+    if !crate::launcher::safe_arg(&body.resume_at) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid resume_at {:?}", body.resume_at),
+        );
+    }
     let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
     let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
         crate::lock(&state.workspaces)
@@ -680,26 +864,47 @@ pub(crate) async fn rewind_session(
         );
     };
 
+    // Resolve every respawn precondition BEFORE the kill (same discipline as
+    // the view switch): a post-kill failure would strand the session. Rewind
+    // is claude-only, which needs both per-session files.
+    let (settings, mcp_config, bin) = match resolve_respawn_inputs(&state, &id, record.kind).await {
+        Ok(inputs) => inputs,
+        Err(msg) => return err(StatusCode::CONFLICT, msg),
+    };
+    if settings.is_none() || mcp_config.is_none() {
+        return err(
+            StatusCode::CONFLICT,
+            "chat session state files are missing (runtime dir scrubbed)".to_string(),
+        );
+    }
+
     // Same choreography as the view switch: flag the deliberate stop so the
     // exit path neither retires nor degrades, stop, respawn.
     crate::lock(&state.chat_switching).insert(id.clone(), "chat".to_string());
     let result = async {
-        // A dead-but-registered driver (ProtocolError, kept visible) will
-        // never fire its exit hook again, so kill+wait would spin to the 5s
-        // deadline and 500 — remove it directly. A live driver gets the polite
-        // stop and we wait for the slot to free.
-        if info.alive {
-            state.chat.kill(&id);
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            while state.chat.contains(&id) {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err("chat driver did not stop in time".to_string());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Stop the driver (a dead-but-registered ProtocolError entry is dropped
+        // directly rather than waited on — see `stop_for_respawn`).
+        stop_for_respawn(&state, &id, true).await?;
+
+        // Now that the live Journal is dropped, physically drop the rewound-away
+        // turns from the reused journal so they don't replay forever (sw-1). Off
+        // the reactor — the journal file can be MB-sized.
+        let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
+        let anchor = body.resume_at.clone();
+        match tokio::task::spawn_blocking(move || truncate_journal_at_fork(&jpath, &anchor)).await {
+            Ok(Ok(true)) => tracing::info!(%id, "truncated chat journal at rewind fork point"),
+            // No anchor match: the file is left whole (no history lost). The
+            // store then still shows the rewound-away blocks — a UI seam noted
+            // in the PR — but the conversation is never corrupted.
+            Ok(Ok(false)) => {
+                tracing::warn!(%id, "rewind fork anchor not found in journal; history left intact")
             }
-        } else {
-            state.chat.remove(&id);
+            Ok(Err(e)) => tracing::warn!(%id, %e, "failed to truncate journal at fork point"),
+            Err(e) => tracing::warn!(%id, %e, "journal truncation task panicked"),
         }
+
+        // Stamp the rewind after the truncation so the notice sits at the new
+        // journal tail (a replayer reads it right where history now ends).
         if let Err(e) = chimaera_agent::journal::append_marker(
             state.chat.journal_dir(),
             &id,
@@ -711,13 +916,6 @@ pub(crate) async fn rewind_session(
         {
             tracing::warn!(%id, %e, "failed to journal the rewind");
         }
-        let runtime_dir = chimaera_core::runtime_dir().join("agents");
-        let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
-        let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
-        let bin = crate::launcher::detect(&state, record.kind, false)
-            .await
-            .path
-            .map_err(|e| e.to_string())?;
         let recipe = ChatRecipe {
             workspace_root,
             kind: record.kind,
@@ -788,6 +986,15 @@ pub(crate) fn spawn_chat_session(
         AgentKind::Codex => {
             // The app-server resumes in-protocol (thread/resume keeps the
             // id), so the resume handle IS the pinned native id.
+            //
+            // TODO(seam): `recipe.model` is dropped here. The codex chat
+            // driver picks the model in-protocol — `thread/start` takes no
+            // model param (PROTOCOL.md: it's `{cwd, approvalPolicy?}`), and
+            // the model rides `turn/start` / `thread/settings/update` via a
+            // `SetModel` command. Honoring the create-time model for codex
+            // chat therefore needs a driver change (send `SetModel` right
+            // after Init, or thread/start growing a model field) in
+            // chimaera-agent — not something the argv can carry.
             (
                 vec![
                     recipe.bin.to_string_lossy().into_owned(),
@@ -847,4 +1054,116 @@ pub(crate) fn spawn_chat_session(
         crate::lock(&state.chat_recipes).remove(&id);
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seq_line(n: u64, ev: AgentEvent) -> String {
+        serde_json::to_string(&SeqEvent { seq: n, ts: 0, ev }).unwrap()
+    }
+
+    /// The rewind cut drops the SELECTED user message and everything after it,
+    /// keeping the fork's resume point (the preceding message) and all history
+    /// before it. A journal whose UserMessage/Checkpoint pairs mirror what the
+    /// claude driver emits.
+    #[test]
+    fn truncate_journal_drops_selected_message_and_after() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-fork-truncate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let lines = [
+            seq_line(
+                1,
+                AgentEvent::UserMessage {
+                    text: "first".into(),
+                    attachments: 0,
+                },
+            ),
+            seq_line(
+                2,
+                AgentEvent::Checkpoint {
+                    user_message_id: "m1".into(),
+                    preceding_uuid: None,
+                },
+            ),
+            seq_line(
+                3,
+                AgentEvent::MessageChunk {
+                    turn_id: "t1".into(),
+                    text: "reply one".into(),
+                },
+            ),
+            seq_line(
+                4,
+                AgentEvent::UserMessage {
+                    text: "second".into(),
+                    attachments: 0,
+                },
+            ),
+            seq_line(
+                5,
+                AgentEvent::Checkpoint {
+                    user_message_id: "m2".into(),
+                    preceding_uuid: Some("m1".into()),
+                },
+            ),
+            seq_line(
+                6,
+                AgentEvent::MessageChunk {
+                    turn_id: "t2".into(),
+                    text: "reply two".into(),
+                },
+            ),
+        ];
+        let body = lines.join("\n") + "\n";
+        std::fs::write(&path, &body).unwrap();
+
+        // Rewind to the second user message: resume_at is the preceding
+        // message's id ("m1"), whose Checkpoint (seq 5) has preceding_uuid
+        // "m1". The second UserMessage (seq 4) onward is dropped.
+        assert!(truncate_journal_at_fork(&path, "m1").unwrap());
+        let kept: Vec<u64> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<SeqEvent>(l).unwrap().seq)
+            .collect();
+        assert_eq!(kept, vec![1, 2, 3]);
+
+        // An anchor that matches nothing leaves the file whole (history is
+        // never lost on a bad match) and reports no trim.
+        std::fs::write(&path, &body).unwrap();
+        assert!(!truncate_journal_at_fork(&path, "does-not-exist").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chat_capable_is_claude_and_codex_only() {
+        assert!(AgentKind::Claude.chat_capable());
+        assert!(AgentKind::Codex.chat_capable());
+        assert!(!AgentKind::Gemini.chat_capable());
+        assert!(!AgentKind::Antigravity.chat_capable());
+    }
+
+    #[test]
+    fn fresh_native_uuid_has_v4_version_and_variant() {
+        let u = fresh_native_uuid();
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "{u}"
+        );
+        assert!(u.chars().all(|c| c == '-' || c.is_ascii_hexdigit()), "{u}");
+        // v4 version nibble, then a 10xx variant nibble (8..=b).
+        assert_eq!(parts[2].chars().next(), Some('4'), "{u}");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "{u}"
+        );
+    }
 }

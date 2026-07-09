@@ -12,7 +12,7 @@
    */
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "./sessions";
-  import { dotState, dotTitle } from "./sessions";
+  import { dotState, dotTitle, switchingViews } from "./sessions";
   import SessionGlyph from "./SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "./agentLinks";
@@ -117,6 +117,13 @@
     return activeSession.ui === "chat" ? ("term" as const) : ("chat" as const);
   });
 
+  /** A view switch for the active session is in flight (its POST hasn't
+   *  resolved): the toggle disables itself so a second click can't fire a
+   *  concurrent switch. */
+  const switchPending = $derived(
+    activeSession !== null && $switchingViews.has(activeSession.id),
+  );
+
   // --- "link to agent…" menu (parity path for the drag gesture) ------------
 
   let linkMenuOpen = $state(false);
@@ -211,7 +218,10 @@
   const fontTarget = $derived.by(() => {
     const t = node.tabs[node.active];
     if (t === undefined) return false;
-    if (t.surface === "terminal") return true;
+    // Chat panes have no font-sizable surface: ChatView never reads
+    // node.fontSize, and a chord writing it would surprise on toggle-to-
+    // terminal. Only real terminal surfaces and rendered markdown carry A−/A+.
+    if (t.surface === "terminal") return sessions.get(t.sessionId)?.ui !== "chat";
     return t.surface === "file" && viewKindFor(t.path) === "markdown";
   });
 
@@ -478,7 +488,13 @@
              resumes it in chat / as the real TUI (same session id). -->
         <button
           class="ctl"
-          title={viewToggle === "chat" ? "open as chat" : "open as terminal"}
+          class:pending={switchPending}
+          disabled={switchPending}
+          title={switchPending
+            ? "switching…"
+            : viewToggle === "chat"
+              ? "open as chat"
+              : "open as terminal"}
           aria-label={viewToggle === "chat" ? "open as chat" : "open as terminal"}
           onclick={() => ctrl.switchView(activeSession.id, viewToggle)}
         >
@@ -991,6 +1007,21 @@
   .ctl.on {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  /* A view switch is in flight: the toggle stands down quietly (no hover
+     affordance) until the POST resolves, so it can't fire a second switch. */
+  .ctl:disabled {
+    cursor: default;
+  }
+
+  .ctl.pending {
+    opacity: 0.5;
+  }
+
+  .ctl.pending:hover {
+    background: none;
+    color: var(--muted);
   }
 
   /* Context bridge: quiet selection-driven action in the bar (no hover

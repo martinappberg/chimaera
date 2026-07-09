@@ -76,6 +76,17 @@ impl AgentKind {
     pub(crate) fn parse(s: &str) -> Option<AgentKind> {
         AgentKind::ALL.into_iter().find(|k| k.as_str() == s)
     }
+
+    /// Whether this agent can run as a structured chat session — a driver over
+    /// stream-json (claude) / app-server (codex), not a PTY TUI. The single
+    /// predicate the whole server routes through, so adding the next
+    /// structured agent is a one-line change here rather than five scattered
+    /// `matches!` edits. (The client-facing `AgentInfo.chatCapable` the
+    /// launcher computes is this AND path-ok AND !outdated — a composite the
+    /// UI consumes; this is just the protocol-capability half.)
+    pub(crate) fn chat_capable(self) -> bool {
+        matches!(self, AgentKind::Claude | AgentKind::Codex)
+    }
 }
 
 /// Attention state of an agent session, derived from Claude Code hook events.
