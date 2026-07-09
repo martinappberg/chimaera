@@ -12,7 +12,7 @@
     setActiveWorkspaceId,
     unauthorized,
     type Health,
-  } from "./lib/api";
+  } from "./lib/net/api";
   import {
     createSession,
     deleteSession,
@@ -32,7 +32,7 @@
     type AgentSpawn,
     type Session,
     type Workspace,
-  } from "./lib/sessions";
+  } from "./lib/workspace/sessions";
   import {
     getAgentDefault,
     installAgent,
@@ -43,8 +43,8 @@
     type AgentInfo,
     type LaunchPick,
     type RecentConvo,
-  } from "./lib/launcher";
-  import { EventsSocket } from "./lib/events";
+  } from "./lib/workspace/launcher";
+  import { EventsSocket } from "./lib/net/events";
   import {
     agentHue,
     deleteLink,
@@ -53,9 +53,9 @@
     termReference,
     type Link,
     type LinkCtrl,
-  } from "./lib/agentLinks";
-  import { typeIntoDetachedSession } from "./lib/ws";
-  import { reconnectingSockets } from "./lib/reconnect";
+  } from "./lib/workspace/agentLinks";
+  import { typeIntoDetachedSession } from "./lib/terminal/ws";
+  import { reconnectingSockets } from "./lib/net/reconnect";
   import { insertIntoComposer } from "./lib/chat/composerBus";
   import { get } from "svelte/store";
   import {
@@ -70,8 +70,8 @@
     setReferenceHandler,
     setSelection,
     workspaceRelative,
-  } from "./lib/reference";
-  import { provenanceFor, rememberCopy } from "./lib/provenance";
+  } from "./lib/shared/reference";
+  import { provenanceFor, rememberCopy } from "./lib/shared/provenance";
   import {
     activateTab,
     adjacentPane,
@@ -114,10 +114,10 @@
     type Layout,
     type SplitDir,
     type Tab,
-  } from "./lib/layout";
-  import type { PathKind } from "./lib/links";
-  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/files";
-  import { dirtyFiles } from "./lib/editing";
+  } from "./lib/layout/layout";
+  import type { PathKind } from "./lib/terminal/links";
+  import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
+  import { dirtyFiles } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
     gitEnv,
@@ -126,7 +126,7 @@
     onGitNudge,
     workspacesChanged,
     type DiffMode,
-  } from "./lib/git";
+  } from "./lib/workspace/git";
   import {
     paneContentEl,
     paneRootEl,
@@ -137,9 +137,9 @@
     unregisterStage,
     type DropSpot,
     type LayoutCtrl,
-  } from "./lib/dnd";
-  import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/keys";
-  import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/keybindings";
+  } from "./lib/layout/dnd";
+  import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
+  import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
   import {
     askpassActive,
     closeThisWindow,
@@ -152,16 +152,16 @@
     reportWindowScope,
     setNativeWindowTitle,
     shellBuild,
-  } from "./lib/native";
-  import UpdateToast from "./lib/UpdateToast.svelte";
-  import { currentOffer, updateState } from "./lib/update.svelte";
-  import * as pool from "./lib/termPool";
+  } from "./lib/net/native";
+  import UpdateToast from "./lib/workspace/UpdateToast.svelte";
+  import { currentOffer, updateState } from "./lib/workspace/update.svelte";
+  import * as pool from "./lib/terminal/termPool";
   import {
     applyRemoteSettings,
     flushSettings,
     loadSettings,
   } from "./lib/settings/store.svelte";
-  import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/viewState";
+  import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
   import {
     FILES_FRAC_MAX,
     FILES_FRAC_MIN,
@@ -170,17 +170,17 @@
     RAIL_MIN,
     loadRailChrome,
     saveRailChrome,
-  } from "./lib/railState";
-  import { hintsActive, initChordHints } from "./lib/chordHints.svelte";
-  import FolderPicker from "./lib/FolderPicker.svelte";
-  import HomeScreen from "./lib/HomeScreen.svelte";
-  import AskpassModal from "./lib/AskpassModal.svelte";
-  import Launcher from "./lib/Launcher.svelte";
-  import SessionGlyph from "./lib/SessionGlyph.svelte";
-  import QuickOpen from "./lib/QuickOpen.svelte";
-  import FileTree from "./lib/FileTree.svelte";
-  import SplitTree from "./lib/SplitNode.svelte";
-  import Pane from "./lib/Pane.svelte";
+  } from "./lib/layout/railState";
+  import { hintsActive, initChordHints } from "./lib/shared/chordHints.svelte";
+  import FolderPicker from "./lib/workspace/FolderPicker.svelte";
+  import HomeScreen from "./lib/workspace/HomeScreen.svelte";
+  import AskpassModal from "./lib/workspace/AskpassModal.svelte";
+  import Launcher from "./lib/workspace/Launcher.svelte";
+  import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
+  import QuickOpen from "./lib/workspace/QuickOpen.svelte";
+  import FileTree from "./lib/workspace/FileTree.svelte";
+  import SplitTree from "./lib/layout/SplitNode.svelte";
+  import Pane from "./lib/layout/Pane.svelte";
 
   let health = $state<Health | null>(null);
   /** This app binary's build id (native only); vs health.build = skew. */

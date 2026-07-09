@@ -5,8 +5,8 @@
     fsTable,
     viewKindFor,
     type TablePage,
-  } from "../files";
-  import FileIcon from "../FileIcon.svelte";
+  } from "../previews/files";
+  import FileIcon from "../shared/FileIcon.svelte";
 
   /**
    * Inline artifact preview under a tool card: the output IS the point of

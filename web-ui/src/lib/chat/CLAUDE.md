@@ -34,7 +34,7 @@ hard-resets and rebuilds.
 | File | What it owns |
 |---|---|
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** |
-| `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Shares reconnect accounting with `../ws.ts`. |
+| `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `ChatView.svelte` | The host: wires the socket + store, renders the transcript, and hangs the header/composer/overlays/panels off itself. Still the big one — keep new chrome in child components, not inline. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |

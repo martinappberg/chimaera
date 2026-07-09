@@ -1,5 +1,5 @@
-import { getToken } from "../api";
-import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../reconnect";
+import { getToken } from "../net/api";
+import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
 
 /**
  * Normalized agent events from the daemon (chimaera-agent's AgentEvent,

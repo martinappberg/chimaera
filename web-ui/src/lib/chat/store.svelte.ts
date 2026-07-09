@@ -5,7 +5,7 @@
  * construction — there is no separate "catch up" code to get wrong.
  */
 
-import { canInlinePreview, isImagePath } from "../files";
+import { canInlinePreview, isImagePath } from "../previews/files";
 import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 
 /** The single leading notice a client-side transcript trim leaves behind. */
