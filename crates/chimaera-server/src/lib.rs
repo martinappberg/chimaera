@@ -297,6 +297,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/table", get(fs::table))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
+        .route("/fs/mkdir", post(fs::mkdir))
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route(
@@ -4773,6 +4774,53 @@ mod tests {
             json["path"].as_str().unwrap(),
             std::env::var("HOME").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_creates_nested_idempotently_and_rejects_empty() {
+        let state = test_state();
+        let root = test_dir("fs-mkdir");
+        let target = root.join("nested/newproj");
+        let target_str = target.to_string_lossy().into_owned();
+        assert!(!target.exists());
+
+        // Creates the path and any missing parents, returns the canonical path.
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/mkdir",
+            Some(serde_json::json!({ "path": target_str })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(target.is_dir());
+        assert_eq!(
+            json["path"].as_str().unwrap(),
+            std::fs::canonicalize(&target).unwrap().to_string_lossy()
+        );
+
+        // Idempotent: an existing directory is a success, not a conflict.
+        let (status, _) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/mkdir",
+            Some(serde_json::json!({ "path": target_str })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // An empty path is a 400, not a silent create of the cwd.
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/fs/mkdir",
+            Some(serde_json::json!({ "path": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("empty path"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

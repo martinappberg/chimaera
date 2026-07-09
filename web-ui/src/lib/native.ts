@@ -277,17 +277,6 @@ export async function reportWindowScope(
 }
 
 /**
- * Raise an already-open window showing `(alias, ws)`, other than this one.
- * Returns true when one was found and focused — the caller then skips opening
- * in place. Always false in a browser.
- */
-export async function focusWindow(alias: string | null, ws: string | null): Promise<boolean> {
-  const t = tauri();
-  if (t === null) return false;
-  return t.core.invoke<boolean>("focus_window", { alias, ws });
-}
-
-/**
  * An SSH auth prompt ssh raised while connecting (no tty in the app, so it
  * comes to us via SSH_ASKPASS). `prompt` is ssh's own text — a password ask,
  * or a keyboard-interactive challenge like a Duo passcode/option menu.

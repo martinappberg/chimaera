@@ -57,6 +57,15 @@
 
   const native = isNativeShell();
 
+  /** The daemon THIS home screen belongs to — null for the local daemon, the
+   *  host alias for a remote window. Opening one of this screen's own
+   *  workspaces in a new window must target this same daemon: a remote
+   *  window's home screen lists the REMOTE daemon's workspaces, so passing the
+   *  local `null` would open a local window carrying a remote workspace id the
+   *  local daemon doesn't have — which lands right back on the launcher (the
+   *  "can't open a second workspace on a remote" bug). */
+  const ownAlias = $derived(hostLabel === "local" ? null : hostLabel);
+
   const sorted = $derived(
     [...workspaces].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
   );
@@ -330,8 +339,9 @@
 
   function openRow(e: MouseEvent, w: Workspace): void {
     if (e.metaKey || e.ctrlKey) {
-      // Cmd/Ctrl-click is the explicit "give me another window" gesture.
-      void openWindow(null, w.id, true);
+      // Cmd/Ctrl-click is the explicit "give me another window" gesture — on
+      // THIS screen's own daemon (see ownAlias).
+      void openWindow(ownAlias, w.id, true);
     } else {
       onOpen(w);
     }
@@ -476,7 +486,7 @@
                 <button
                   class="side"
                   title="open in a new window"
-                  onclick={() => void openWindow(null, w.id, true)}>new window</button
+                  onclick={() => void openWindow(ownAlias, w.id, true)}>new window</button
                 >
                 <button
                   class="side x"

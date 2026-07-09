@@ -309,11 +309,19 @@ async fn do_connect(
         // without healing anything. An update never reuses — the old tunnel
         // points at the daemon being replaced.
         if !update_daemon {
-            let tunnels = state.tunnels.lock().await;
-            if let Some(t) = tunnels.get(&alias) {
-                if t.is_up().await {
-                    let entry = host_entry(&alias);
-                    return Ok(state_for(&entry, "connected", Some(t)));
+            // Probe liveness WITHOUT holding the tunnels lock: `is_up` is a
+            // ~2s HTTP round-trip, and holding the map locked across it would
+            // stall every other tunnel op (an `open_window`, another window's
+            // health check) behind it. Grab the port, drop the lock, probe,
+            // then re-lock only to build the reply.
+            let port = state.tunnels.lock().await.get(&alias).map(|t| t.local_port);
+            if let Some(port) = port {
+                if chimaera_remote::http_alive(port).await {
+                    let tunnels = state.tunnels.lock().await;
+                    if let Some(t) = tunnels.get(&alias) {
+                        let entry = host_entry(&alias);
+                        return Ok(state_for(&entry, "connected", Some(t)));
+                    }
                 }
             }
         }
@@ -790,25 +798,6 @@ async fn begin_update(app: AppHandle) -> Result<(), String> {
     }
 }
 
-/// Raise an existing window showing `(alias, ws)`, other than the caller.
-/// Returns whether one was found — the UI activates in-place only when false.
-#[tauri::command]
-fn focus_window(
-    app: AppHandle,
-    webview: tauri::WebviewWindow,
-    state: State<'_, Shell>,
-    alias: Option<String>,
-    ws: Option<String>,
-) -> bool {
-    match find_by_scope(&state.windows, &alias, &ws, Some(webview.label())) {
-        Some(label) => app
-            .get_webview_window(&label)
-            .map(|w| w.set_focus().is_ok())
-            .unwrap_or(false),
-        None => false,
-    }
-}
-
 fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
     HostsStore::load_default()
         .get(alias)
@@ -938,7 +927,6 @@ pub fn run() {
             answer_askpass,
             list_askpass,
             report_window_scope,
-            focus_window,
         ])
         .on_window_event(|window, event| {
             let Some(shell) = window.try_state::<Shell>() else {
