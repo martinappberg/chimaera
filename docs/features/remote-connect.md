@@ -125,3 +125,20 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
 - **Core vs addition.** The no-root ssh deployment is **core**; the exact policies above are
   deliberate and should hold, but like all additions can improve.
 - **Do not change:** SIGTERM-only remote stop; resolve-the-binary-before-stopping-any-daemon.
+
+### Dev connect (`--dev`) — why it exists
+_Captured 2026-07-09 (from the maintainer, in-session)._
+
+- **Problem it solves:** "This is just for local development, not a new feature" — developer
+  tooling so a checkout's build can be tested against a real host without endangering the real
+  daemon. Not user-facing capability (and gated out of release builds accordingly).
+- **How settled it is:** **all provisional** — only the *why* is settled. The mechanism
+  (`~/.chimaera-dev` layout, one dev home per host, the one-way persisted flag, the amber
+  styling) is how it works *for now*, free to change.
+- **Deliberate (confirmed):** the **dev-builds-only gate** (`is_dev_build`, the `0.0.1`
+  sentinel — production clients must never offer or perform dev connects), and **never deploy a
+  release binary as "dev"** (failing loudly without a local build beats silently testing the
+  wrong code).
+- **Do not change:** the isolation (a dev connect must never read, stop, or replace the real
+  `~/.chimaera` daemon) and the gate above. Everything else here is an **addition** — improvable
+  freely.
