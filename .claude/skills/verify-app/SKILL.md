@@ -34,8 +34,9 @@ Match the exercise to what you touched:
   no lost bytes. Reattach from a second tab at a **different window size**.
 - **Resize / resync** — change the divider drag or font size on the initiator:
   it must reflow natively with **no flicker or scroll reset**. A *foreign* client
-  repaints after a coalescing window. Read DESIGN.md `## Architecture` →
-  "Resize repaint refinement" for the invariants before trusting your eyes.
+  repaints after a coalescing window. Read the
+  [architecture guide](../../../docs/agent-guides/architecture.md) ("Resize repaint
+  refinement") for the invariants before trusting your eyes.
   (Known accepted gap: a resync while on the alternate screen can't restore the
   primary screen's scrollback.)
 - **Previews** — open the file types you touched (image, markdown, csv/tsv incl.
