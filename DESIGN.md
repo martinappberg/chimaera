@@ -127,9 +127,11 @@ No new listening ports, no relay, no inbound firewall asks — ever. The daemon 
 socket + localhost-only TCP with a per-daemon bearer token (localhost on a multi-user login
 node is not trusted alone).
 
-Reconnect semantics are Eternal-Terminal-style at the application layer: every event-bus frame
-carries a monotonic per-session sequence number backed by a bounded replay ring; a reconnecting
-client sends `{session_id, last_seq}` and receives only the gap.
+Reconnect semantics are Eternal-Terminal-style at the application layer: structured streams
+carry monotonic per-session sequence numbers backed by a bounded replay ring; a reconnecting
+client sends `{session_id, last_seq}` and receives only the gap. (Implemented for chat
+sessions — journal + ring in `chimaera-agent`; the session event bus itself stays
+full-snapshot by design.)
 
 **Critical correction from adversarial review:** raw byte replay is *not* sufficient for PTY
 panes — it breaks on resize and multi-attach at different dimensions. Terminal panes therefore
@@ -199,18 +201,23 @@ sessions get reliable needs-attention/finished/errored badges, and rich *read-on
 rendering comes from the `~/.claude` JSONL. This tier is billing-safe (see Risks),
 agent-agnostic, and survives any protocol churn.
 
-**Tier B — stream-json structured chat mode (v1, lands at M6).** Chimaerad spawns
-the native `claude` binary with `--input-format/--output-format stream-json` and speaks the
-NDJSON control protocol directly from Rust (no Node sidecar): Chimaera draws its own
-claude.ai-style chat UI with structured tool calls, permission prompts as native approve/deny
-buttons, `interrupt`, permission-mode switching, resume/fork, per-turn `total_cost_usd`,
-`maxBudgetUsd`. Caveats, verified: the protocol is semi-documented
-([claude-code#24594](https://github.com/anthropics/claude-code/issues/24594)) and actively
-churning (the `canUseTool` control-request path has already shifted toward `PreToolUse` hooks),
-and this headless surface is the one targeted by the paused billing split. So: pin CLI versions
-(`DISABLE_AUTOUPDATER`), key a compat shim on the `system/init` handshake, run a protocol
-smoke-test at daemon start that degrades to Tier A instead of crashing, and keep the whole
-driver behind a thin `AgentAdapter` trait (<~2k lines).
+**Tier B — structured chat mode (SHIPPED 2026-07-07; the default view for new
+claude/codex sessions).** Chimaerad drives the native binaries through their structured
+protocols directly from Rust (no Node sidecar) — `claude` over bidirectional stream-json
+(the same surface the official VS Code extension speaks), `codex` over `app-server`
+JSON-RPC — behind a thin `AgentAdapter` trait in `crates/chimaera-agent`. The chat surface
+covers tool cards with diffs, native permission cards (allow/always/deny), interrupt,
+model + permission-mode pickers, slash-command and `@`-mention popovers (incl. `@term:`
+linked-terminal grants), image paste, queued messages, markdown, plan panel, per-turn
+cost/usage. Every session journals a seq-numbered event stream (append-only capped JSONL
+under `~/.chimaera/chat/`, ring + gap-replay on reconnect), and the pane-bar toggle moves
+one conversation between chat and the real TUI via resume on the same session id. Risk
+posture, unchanged in spirit: the wire formats are unversioned, so drivers are pinned to
+live-verified CLI versions (`TESTED_*_VERSION` + `just chat-smoke`; facts ledger in
+`crates/chimaera-agent/PROTOCOL.md`), a per-spawn handshake watchdog degrades a failing
+driver to a Tier A PTY on the same session id, and Tier A remains fully supported — one
+settings default (`agents.defaultView`) flips the world back if the paused billing split
+ever lands.
 
 **Tier C — ACP client (other agents, post-v1).** `gemini --acp` natively; Codex via Zed's
 `codex-acp`; the ACP registry (40–50 agents) for the long tail. ACP's
@@ -1037,9 +1044,10 @@ After-1.0 (sequencing, not compromise — these need a working product to be des
    monthly credit pools billed at API rates, while interactive TUI keeps subscription limits
    ([support article](https://support.claude.com/en/articles/15036540),
    [Zed's response](https://zed.dev/blog/anthropic-subscription-changes)). Tier B is exactly
-   the usage class targeted. **Largely defused by the 2026-07-06 decision**: the primary mode
-   runs the interactive TUI (plugin-style, normal subscription billing); the structured chat
-   mode is a post-v1 enhancement that can absorb whatever billing shape lands.
+   the usage class targeted — and since 2026-07-07 it IS the default view (author decision,
+   accepting the exposure). Mitigation is structural: Tier A stays fully supported, every
+   chat session is one toggle from the TUI, and one settings default
+   (`agents.defaultView`) flips new sessions back to terminals if the change lands.
 2. **Protocol churn.** The stream-json control protocol is semi-documented and has already
    changed shape once this year. Mitigation: version pinning, handshake-keyed compat shim,
    startup smoke-test, thin adapter.
@@ -1070,7 +1078,7 @@ dev working with AI agents, part-time.
 | **M4 — Previews wave 2 + git** | Parquet paging, ipynb, PDF, JSON tree, large-file guards; git status/log/diff panel. | code-server, entirely | 3–4 wks |
 | **M4.5 — Linked terminals** | OSC 133 shell integration + per-session command journal, daemon HTTP MCP server (`run_in_terminal`/`read_terminal`/`list_terminals`), link UX (agent top-bar chips, reference-band drag, auto-link on `@term:` mention), sentinel fallback for remote shells. | agent↔shell copy-paste | 3–4 wks |
 | **M5 — HPC layer** | Slurm strip + job↔session links, `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. | — | 2–3 wks |
-| **M6 — Optimal-build completion → v1.0** | Tauri native shell (window per workspace, native notifications, menubar badge), Tier B structured chat mode, Tier C ACP agents (Gemini native, Codex via codex-acp). | Claude desktop app | 6–8 wks |
+| **M6 — Optimal-build completion → v1.0** | Tauri native shell (window per workspace, native notifications, menubar badge), Tier C ACP agents (Gemini native). ~~Tier B structured chat mode~~ (+ native codex app-server) delivered early, 2026-07-07. | Claude desktop app | 6–8 wks |
 | After 1.0 | Hub federation, sbatch-offloaded sessions, protocol publication, single-file editing. | | ongoing |
 
 Realistic wall-clock: "code-server uninstalled" at M4 (**~5–7 months part-time**); the full
@@ -1079,6 +1087,33 @@ which is the survival property that matters.
 
 ## Decisions log
 
+- **2026-07-08 — Full protocol coverage for the chat surface.** Everything the official
+  VS Code extensions drive is now mapped (or explicitly recorded as out of scope) in
+  `crates/chimaera-agent/PROTOCOL.md`: claude checkpoints/rewind (client-minted user-frame
+  uuids anchor `rewind_files`; the conversation forks via `--fork-session
+  --resume-session-at` through `POST /sessions/{id}/rewind`; needs
+  `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`), subagent task rows, the /mcp panel,
+  `generate_session_title` feeding the workbench naming chain (same ai-title slot the TUI's
+  transcript records land in), rate-limit telemetry (header chip + RateLimited rail state),
+  permission-destination cycler, native mid-turn queueing (NO client queue — the CLI queues
+  stdin writes; the extension's own model); codex `turn/steer` type-through with the
+  error-parse retry, the approval-mode table (read-only/auto/full-access/plan via
+  `thread/settings/update` + per-turn fallback; requires `capabilities:{experimentalApi}`
+  at initialize), per-model reasoning efforts from `model/list`, execpolicy/network-policy
+  amendment decisions, live `outputDelta` command streaming (capped at TOOL_OUTPUT_HEAD),
+  data-URL image input, and `thread/name/updated` → naming. State rule of thumb: hooks stay
+  authoritative for Tier A (TUI) sessions and keep working across CLI versions; chat mode is
+  protocol-authoritative because `UserPromptSubmit`/`Stop` don't fire under `-p` stream-json.
+- **2026-07-07 — Structured chat is the default agent view.** Supersedes the *default* half
+  of the 2026-07-06 "PTY/TUI primary" decision (the tier itself is not deprecated: Tier A
+  is the toggle target and the automatic handshake-failure fallback). New claude/codex
+  sessions open in the chat surface; `agents.defaultView` is the one-key flip-back lever
+  against the paused billing split. Toggle semantics: same chimaera session id, stop the
+  current process → resume in the other mode (`--resume <native-id>` / `thread/resume` /
+  `codex resume <uuid>`); a mid-task switch requires an explicit confirm. Chat journals:
+  seq-numbered append-only JSONL, 4→2 MiB turn-boundary compaction, 100 MiB/200-file dir
+  budget, gap-replay reconnects. Wire-format facts + extension-mined protocol inventory
+  live in `crates/chimaera-agent/PROTOCOL.md`.
 - **2026-07-06 — Frontend: Svelte 5** + TypeScript + Vite (author's call).
 - **2026-07-06 — Primary agent mode: PTY/TUI + hooks.** Claude Code runs inside Chimaera the
   way it runs in VS Code's integrated terminal — the real interactive TUI in a pane, normal

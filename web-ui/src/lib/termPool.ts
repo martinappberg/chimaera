@@ -517,6 +517,17 @@ export function syncSessions(liveIds: readonly string[]): void {
   }
 }
 
+/**
+ * Force-dispose one session's pooled terminal, visible or not. The
+ * chat⇄terminal toggle uses this: the PTY died on purpose, and a stale
+ * warm instance would replay the dead socket's exited screen into the
+ * session's next terminal view.
+ */
+export function disposeSession(id: string): void {
+  const entry = pool.get(id);
+  if (entry !== undefined) disposeEntry(entry);
+}
+
 /** The current grid size of a pooled session's terminal, if it is attached. */
 export function getSize(id: string): { cols: number; rows: number } | null {
   const entry = pool.get(id);

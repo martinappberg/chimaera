@@ -114,6 +114,87 @@
   box-sizing: border-box;
 }
 
+/* --- Chat surface shared chrome --------------------------------------------
+   Buttons, popovers, and the entrance animation shared by the structured-chat
+   cards/dialogs (web-ui/src/lib/chat). Factored here so the recipes can't
+   drift per-component and so light/dark both hold from the theme tokens.
+   Also adopted outside chat/ by PaneTabs' .link-menu. */
+
+/* Action buttons: permission options, dialog actions, the question submit.
+   Accent-tinted primary, muted quiet — one recipe. Accent TINT + --fg ink, not
+   an accent fill: no single fill ink survives both the light themes' dark
+   accents and the dark themes' bright ones. */
+.opt {
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 3px 12px;
+  border-radius: 5px;
+  border: 1px solid var(--edge);
+  background: none;
+  color: var(--fg);
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.opt.primary {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  color: var(--fg);
+}
+.opt.primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+.opt.quiet {
+  color: var(--muted);
+}
+.opt.quiet:hover {
+  color: var(--fg);
+}
+.opt:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Floating overlay surface (dropdown menus, the composer's mention/slash
+   popover). Callers add their own position offsets, min-width, and z-index. */
+.overlay-surface {
+  position: absolute;
+  padding: 4px;
+  background: var(--overlay-bg);
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+.overlay-row {
+  width: 100%;
+  padding: 5px 12px;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+.overlay-row:hover {
+  background: var(--row-hover);
+}
+
+/* Entrance animation shared by chat cards, notices, and dialogs (opacity + a
+   small rise). Each component keeps its own prefers-reduced-motion override,
+   which targets the specific animated element. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
 html,
 body {
   margin: 0;

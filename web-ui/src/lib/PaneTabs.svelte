@@ -12,7 +12,7 @@
    */
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "./sessions";
-  import { dotState, dotTitle } from "./sessions";
+  import { dotState, dotTitle, switchingViews } from "./sessions";
   import SessionGlyph from "./SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "./agentLinks";
@@ -23,7 +23,7 @@
   import { PINNED } from "./keys";
   import { keyHint } from "./keybindings";
   import { activeSelection, referenceTarget, requestReference } from "./reference";
-  import { workspaceRelative } from "./reference";
+  import { dismiss } from "./dismiss";
   import FileIcon from "./FileIcon.svelte";
   import FolderIcon from "./FolderIcon.svelte";
 
@@ -38,8 +38,6 @@
     /** terminal session id -> agent session id (the linked-terminal edges). */
     links: Map<string, string>;
     linkCtrl: LinkCtrl;
-    /** Active workspace root (touched-files paths relativize against it). */
-    wsRoot: string | null;
     dropSpot: DropSpot | null;
     ctrl: LayoutCtrl;
     /** Bound by Pane so the dnd hit-tester can target this bar. */
@@ -54,7 +52,6 @@
     fileNames,
     links,
     linkCtrl,
-    wsRoot,
     dropSpot,
     ctrl,
     el = $bindable(null),
@@ -113,10 +110,24 @@
     return `linked terminal · ${doing} — click to focus`;
   }
 
+  /** The chat⇄terminal toggle target for the active agent session, when the
+   *  agent supports the structured chat surface; null hides the control. */
+  const viewToggle = $derived.by(() => {
+    if (activeSession === null || activeSession.kind !== "agent") return null;
+    if (activeSession.chat_capable !== true) return null;
+    return activeSession.ui === "chat" ? ("term" as const) : ("chat" as const);
+  });
+
+  /** A view switch for the active session is in flight (its POST hasn't
+   *  resolved): the toggle disables itself so a second click can't fire a
+   *  concurrent switch. */
+  const switchPending = $derived(
+    activeSession !== null && $switchingViews.has(activeSession.id),
+  );
+
   // --- "link to agent…" menu (parity path for the drag gesture) ------------
 
   let linkMenuOpen = $state(false);
-  let barRightEl = $state<HTMLElement | null>(null);
 
   /** Live agents in this terminal's workspace, offered by the link menu. */
   const agentChoices = $derived.by(() => {
@@ -125,28 +136,6 @@
       (s) =>
         s.kind === "agent" && s.alive && s.workspace_id === activeSession.workspace_id,
     );
-  });
-
-  // Close the menu on any press outside the bar's right cluster or Escape.
-  $effect(() => {
-    if (!linkMenuOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (!(e.target instanceof Node) || barRightEl?.contains(e.target) !== true) {
-        linkMenuOpen = false;
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        linkMenuOpen = false;
-      }
-    };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey, true);
-    };
   });
 
   function chooseAgent(agentId: string): void {
@@ -189,6 +178,10 @@
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
+    if (tab.surface === "changes") {
+      const n = names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name;
+      return n !== undefined ? `Changes · ${n}` : "Changes";
+    }
     return fileNames.get(tab.path) ?? basename(tab.path);
   }
 
@@ -203,7 +196,10 @@
   const fontTarget = $derived.by(() => {
     const t = node.tabs[node.active];
     if (t === undefined) return false;
-    if (t.surface === "terminal") return true;
+    // Chat panes have no font-sizable surface: ChatView never reads
+    // node.fontSize, and a chord writing it would surprise on toggle-to-
+    // terminal. Only real terminal surfaces and rendered markdown carry A−/A+.
+    if (t.surface === "terminal") return sessions.get(t.sessionId)?.ui !== "chat";
     return t.surface === "file" && viewKindFor(t.path) === "markdown";
   });
 
@@ -220,40 +216,11 @@
     return files != null && files.length > 0 ? files : null;
   });
 
-  let touchedOpen = $state(false);
-  let touchedEl = $state<HTMLElement | null>(null);
-
-  // The popover closes on any outside press or Escape (overlay language).
-  $effect(() => {
-    if (!touchedOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (touchedEl !== null && e.target instanceof Node && !touchedEl.contains(e.target)) {
-        touchedOpen = false;
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        touchedOpen = false;
-      }
-    };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey, true);
-    };
-  });
-
-  /** Popover label: workspace-relative, middle-ellipsized (paths rule). */
-  function touchedLabel(path: string): string {
-    return midTruncate(wsRoot !== null ? workspaceRelative(path, wsRoot) : path, 44);
-  }
-
-  function openTouched(e: MouseEvent, path: string): void {
-    touchedOpen = false;
-    ctrl.openFileFrom(node.id, path, e.metaKey || e.ctrlKey);
+  /** The chip opens this session's changes review (its touched files, on the
+   *  git status/diff APIs) in a pane — Cmd/Ctrl forces a fresh split. */
+  function openChanges(e: MouseEvent): void {
+    if (activeTerminal === null) return;
+    ctrl.openChangesFrom(node.id, activeTerminal.sessionId, e.metaKey || e.ctrlKey);
   }
 
   /** Empty bar area drags the pane's ACTIVE tab (capture runs before the
@@ -356,6 +323,17 @@
             />
             <path d="M3.6 6.2h1.8M10.6 6.2h1.8M11.5 5.3v1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
           </svg>
+        {:else if tab.surface === "changes"}
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>changes</title>
+            <path
+              d="M4 2v5m0 0a2 2 0 1 0 0 4m0-4a2 2 0 1 1 0 4m0 0v3M12 14V9m0 0a2 2 0 1 0 0-4m0 4a2 2 0 1 1 0-4m0 0V2"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+            />
+          </svg>
         {:else if $dirtyFiles.has(tab.path)}
           <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->
           <span class="dirty-dot" title="unsaved changes"></span>
@@ -416,7 +394,10 @@
   <!-- Pane controls at the bar's right edge: the mouse path to every pane
        chord (tooltips teach the chords). Faded in on bar hover; the zoom
        badge stays persistent while zoomed. -->
-  <div class="bar-right" bind:this={barRightEl}>
+  <div
+    class="bar-right"
+    use:dismiss={{ enabled: linkMenuOpen, onDismiss: () => (linkMenuOpen = false) }}
+  >
     {#if hasTermSelection}
       <!-- Selection-driven, not hover-driven: visible exactly while the
            terminal holds a selection. Same handler as the chord. -->
@@ -440,37 +421,24 @@
       </button>
     {/if}
     {#if touched !== null}
-      <!-- Hook-derived "files touched": quiet chip, popover on click. Not
-           hover-gated — it is information, not chrome. -->
-      <div class="touched" bind:this={touchedEl}>
-        <button
-          class="touched-chip"
-          class:open={touchedOpen}
-          title="files this agent created or edited this session — click to view"
-          aria-haspopup="menu"
-          aria-expanded={touchedOpen}
-          onclick={(e) => {
-            e.stopPropagation();
-            touchedOpen = !touchedOpen;
-          }}
-        >
-          <svg class="touched-edit" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
-            <path d="M13.5 6.5l4 4" />
-          </svg>
-          {touched.length} file{touched.length === 1 ? "" : "s"} changed
-        </button>
-        {#if touchedOpen}
-          <div class="touched-pop" role="menu" aria-label="files touched">
-            {#each [...touched].reverse() as p (p)}
-              <button class="touched-row" role="menuitem" title={p} onclick={(e) => openTouched(e, p)}>
-                <span class="touched-glyph"><FileIcon path={p} size={13} /></span>
-                <span class="touched-name">{touchedLabel(p)}</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </div>
+      <!-- Hook-derived "files changed": a quiet chip that opens the session's
+           git-diff review in a pane. Not hover-gated — it is information. -->
+      <button
+        class="touched-chip"
+        title="review the {touched.length} file{touched.length === 1
+          ? ''
+          : 's'} this agent changed — opens a diff (⌘-click for a new split)"
+        onclick={(e) => {
+          e.stopPropagation();
+          openChanges(e);
+        }}
+      >
+        <svg class="touched-edit" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+          <path d="M13.5 6.5l4 4" />
+        </svg>
+        {touched.length} file{touched.length === 1 ? "" : "s"} changed
+      </button>
     {/if}
     {#if zoomed}
       <!-- Persistent while zoomed — the always-visible exit. Reads as an
@@ -496,6 +464,39 @@
       </button>
     {/if}
     <div class="controls">
+      {#if viewToggle !== null && activeSession !== null}
+        <!-- The same conversation, the other surface: stops the process and
+             resumes it in chat / as the real TUI (same session id). -->
+        <button
+          class="ctl"
+          class:pending={switchPending}
+          disabled={switchPending}
+          title={switchPending
+            ? "switching…"
+            : viewToggle === "chat"
+              ? "open as chat"
+              : "open as terminal"}
+          aria-label={viewToggle === "chat" ? "open as chat" : "open as terminal"}
+          onclick={() => ctrl.switchView(activeSession.id, viewToggle)}
+        >
+          {#if viewToggle === "chat"}
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M3 3.5h10a1 1 0 011 1v6a1 1 0 01-1 1H8l-3 2.5v-2.5H3a1 1 0 01-1-1v-6a1 1 0 011-1z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else}
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <rect x="2" y="3" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" />
+              <path d="M4.5 6.5l2 1.7-2 1.7M8 10.5h3.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          {/if}
+        </button>
+      {/if}
       {#if agentChoices.length > 0}
         <!-- The link icon is a drag handle: drag it onto an agent pane to
              link this terminal there (drop on the "link to this agent" band).
@@ -591,10 +592,10 @@
     </div>
 
     {#if linkMenuOpen}
-      <div class="link-menu" role="menu" aria-label="link to agent">
+      <div class="overlay-surface link-menu" role="menu" aria-label="link to agent">
         <div class="link-menu-title">link to agent</div>
         {#each agentChoices as a (a.id)}
-          <button class="link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
+          <button class="overlay-row link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
             <span class="chip-dot menu-dot" style:--hue={agentHue(a.id)}></span>
             <span class="link-menu-name">{sessionLabel(a.id)}</span>
             {#if linkedAgentId === a.id}
@@ -865,19 +866,15 @@
     color: var(--fg);
   }
 
-  /* --- link-to-agent menu ------------------------------------------------ */
+  /* --- link-to-agent menu ------------------------------------------------
+     .overlay-surface / .overlay-row live in app.css; these add only the bar
+     anchor (positioned in .bar-right) and the dot-row layout. */
 
   .link-menu {
-    position: absolute;
     top: 25px;
     right: 4px;
     z-index: 20;
     min-width: 180px;
-    padding: 4px;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 7px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
   }
 
   .link-menu-title {
@@ -889,25 +886,9 @@
   }
 
   .link-menu-item {
-    appearance: none;
-    border: none;
-    background: none;
     display: flex;
     align-items: center;
     gap: 7px;
-    width: 100%;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font: inherit;
-    font-size: var(--text-sm);
-    color: var(--fg);
-    cursor: pointer;
-    text-align: left;
-    transition: background-color 0.12s ease;
-  }
-
-  .link-menu-item:hover {
-    background: var(--row-hover);
   }
 
   .menu-dot {
@@ -989,6 +970,21 @@
     color: var(--fg);
   }
 
+  /* A view switch is in flight: the toggle stands down quietly (no hover
+     affordance) until the POST resolves, so it can't fire a second switch. */
+  .ctl:disabled {
+    cursor: default;
+  }
+
+  .ctl.pending {
+    opacity: 0.5;
+  }
+
+  .ctl.pending:hover {
+    background: none;
+    color: var(--muted);
+  }
+
   /* Context bridge: quiet selection-driven action in the bar (no hover
      gating — it appears exactly while the terminal holds a selection). */
   .ref-btn {
@@ -1048,13 +1044,7 @@
     color: var(--muted);
   }
 
-  /* --- touched-files chip + popover (overlay visual language) --- */
-
-  .touched {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
+  /* --- "N files changed" chip: opens the session's diff review --- */
 
   .touched-chip {
     appearance: none;
@@ -1082,75 +1072,9 @@
     opacity: 0.8;
   }
 
-  .touched-chip:hover,
-  .touched-chip.open {
+  .touched-chip:hover {
     background: color-mix(in srgb, var(--fg) 12%, transparent);
     color: var(--fg);
-  }
-
-  .touched-pop {
-    position: absolute;
-    top: 22px;
-    right: 0;
-    z-index: 40;
-    min-width: 180px;
-    max-width: 340px;
-    max-height: 280px;
-    overflow-y: auto;
-    padding: 4px;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 8px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.2);
-    animation: touchedfade 0.1s ease-out;
-  }
-
-  @keyframes touchedfade {
-    from {
-      opacity: 0;
-      transform: translateY(-2px);
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .touched-pop {
-      animation: none;
-    }
-  }
-
-  .touched-row {
-    appearance: none;
-    border: none;
-    background: none;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    width: 100%;
-    padding: 4px 7px;
-    border-radius: 5px;
-    font: inherit;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--fg);
-    text-align: left;
-    cursor: pointer;
-    transition: background-color 0.12s ease;
-  }
-
-  .touched-row:hover {
-    background: var(--row-hover);
-  }
-
-  .touched-glyph {
-    flex: none;
-    display: flex;
-    align-items: center;
-  }
-
-  .touched-name {
-    min-width: 0;
-    overflow: hidden;
-    white-space: nowrap;
   }
 
   /* Per-pane text size (parity with the chords); text glyphs, same cluster. */

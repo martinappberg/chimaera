@@ -142,20 +142,25 @@ export interface QuickOpenEntry {
   rel: string;
   name: string;
   mtime: number;
+  /** Absent on older daemons — treat as "file". */
+  kind?: "file" | "dir";
 }
 
 /**
  * Fuzzy file index for the quick-open palette. The daemon walks the workspace
  * root (ignoring .git/node_modules/target/…), subsequence-matches `q` against
  * the relative path, and returns up to `limit` ranked entries. An empty `q`
- * returns the most-recently-modified files.
+ * returns the most-recently-modified files. `dirs` admits directories too
+ * (chat @-mentions tag folders; the Cmd+P palette stays files-only).
  */
 export async function fsQuickOpen(
   workspaceId: string,
   q: string,
   limit = 50,
+  dirs = false,
 ): Promise<QuickOpenEntry[]> {
   const params = new URLSearchParams({ workspace_id: workspaceId, q, limit: String(limit) });
+  if (dirs) params.set("dirs", "true");
   const body = await json<{ entries: QuickOpenEntry[] }>(
     await api(`/fs/quickopen?${params.toString()}`),
   );
@@ -172,24 +177,41 @@ export interface ValidatedPath {
 /** Server cap on candidates per /fs/validate request. */
 export const VALIDATE_MAX = 50;
 
+/** Hard ceiling on candidates validated per call, across all batches — bounds
+ *  the daemon round-trips a single message can trigger (VALIDATE_CAP /
+ *  VALIDATE_MAX requests, currently 4). */
+export const VALIDATE_CAP = 200;
+
 /**
  * Batch existence check behind the terminal link provider, per the
  * /fs/validate contract: candidates resolve absolutely or against the
  * absolute `base`, `~` expands, and only hits come back (keyed by the
  * candidate as sent). Misses are simply absent — never errors.
+ *
+ * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
+ * list as resolved, so anything past that cap would otherwise stick as a
+ * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
+ * so every candidate is actually validated. Batches run sequentially to keep
+ * the daemon's concurrent load low.
  */
 export async function fsValidate(
   candidates: string[],
   base: string,
 ): Promise<Record<string, ValidatedPath>> {
-  const body = await json<{ valid: Record<string, ValidatedPath> }>(
-    await api("/fs/validate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ candidates: candidates.slice(0, VALIDATE_MAX), base }),
-    }),
-  );
-  return body.valid;
+  const capped = candidates.slice(0, VALIDATE_CAP);
+  const out: Record<string, ValidatedPath> = {};
+  for (let i = 0; i < capped.length; i += VALIDATE_MAX) {
+    const batch = capped.slice(i, i + VALIDATE_MAX);
+    const body = await json<{ valid: Record<string, ValidatedPath> }>(
+      await api("/fs/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candidates: batch, base }),
+      }),
+    );
+    Object.assign(out, body.valid);
+  }
+  return out;
 }
 
 export async function fsMarkdown(path: string): Promise<string> {
@@ -302,6 +324,11 @@ export type FileViewKind =
   | "text";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
+
+/** Whether a path renders as an image (chat cards inline-preview these). */
+export function isImagePath(path: string): boolean {
+  return IMAGE_EXTS.has(extension(path));
+}
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
 const TABLE_EXTS = new Set(["csv", "tsv"]);
@@ -344,6 +371,15 @@ export function viewKindFor(path: string): FileViewKind {
   if (ext === "pdf") return "pdf";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
+}
+
+/** View kinds the chat renders inline under tool cards (images, tabular
+ *  data, PDFs — the "job output" formats worth seeing without a click). */
+const INLINE_PREVIEW_KINDS = new Set<FileViewKind>(["image", "table", "pdf"]);
+
+/** True when the chat can inline-preview this path's kind. */
+export function canInlinePreview(path: string): boolean {
+  return INLINE_PREVIEW_KINDS.has(viewKindFor(path));
 }
 
 /** Largest file the daemon accepts for an in-place edit (PUT /fs/file). */

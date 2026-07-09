@@ -7,9 +7,11 @@
   import { activeModLabel, keyHint } from "./keybindings";
   import PaneTabs from "./PaneTabs.svelte";
   import TerminalView from "./Terminal.svelte";
+  import ChatView from "./chat/ChatView.svelte";
   import FileView from "./FileView.svelte";
   import DiffView from "./DiffView.svelte";
   import GitView from "./GitView.svelte";
+  import SessionChangesView from "./SessionChangesView.svelte";
   import SettingsView from "./SettingsView.svelte";
   import FinderView from "./FinderView.svelte";
 
@@ -122,7 +124,6 @@
     {fileNames}
     {links}
     {linkCtrl}
-    {wsRoot}
     {dropSpot}
     {ctrl}
     bind:el={tabbarEl}
@@ -130,7 +131,31 @@
   <div class="content" bind:this={contentEl}>
     {#if activeTab !== null}
       {#if activeTab.surface === "terminal"}
-        <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
+        <!-- The surface follows server truth: which process actually runs
+             behind the session id (a chat driver or a PTY). Same tab, same
+             identity — the view toggle just flips this field on the bus. -->
+        {#if sessions.get(activeTab.sessionId)?.ui === "chat"}
+          <!-- Keyed: a ChatView owns one socket+store for one session; tab
+               switches must remount, never rebind. -->
+          {#key activeTab.sessionId}
+            <ChatView
+              session={sessions.get(activeTab.sessionId)!}
+              {focused}
+              terminals={[...sessions.values()]
+                .filter(
+                  (s) =>
+                    s.kind === "shell" &&
+                    s.alive &&
+                    s.workspace_id === sessions.get(activeTab.sessionId)?.workspace_id,
+                )
+                .map((s) => ({ id: s.id, name: names.get(s.id) ?? s.name }))}
+              onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
+              onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
+            />
+          {/key}
+        {:else}
+          <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
+        {/if}
       {:else if activeTab.surface === "file"}
         <FileView path={activeTab.path} {wsRoot} fontSize={node.fontSize} />
       {:else if activeTab.surface === "finder"}
@@ -155,6 +180,17 @@
           {names}
           onOpenSession={ctrl.revealWorktreeSession}
         />
+      {:else if activeTab.surface === "changes"}
+        {#if sessions.get(activeTab.sessionId) !== undefined}
+          <SessionChangesView
+            session={sessions.get(activeTab.sessionId)!}
+            {wsRoot}
+            paneId={node.id}
+            {ctrl}
+          />
+        {:else}
+          <div class="hint"><span>session closed</span></div>
+        {/if}
       {:else}
         <SettingsView />
       {/if}

@@ -1,0 +1,1169 @@
+//! Server glue for structured chat sessions (Tier B).
+//!
+//! `chimaera-agent` owns the drivers, journal, and registry; this module
+//! wires them into the daemon: spawn recipes for the degrade-to-PTY path,
+//! AgentState derivation from protocol events, retire-on-exit, the synthetic
+//! session rows, and the view-switch endpoint.
+//!
+//! ChatManager hooks run on the pump task and must stay cheap, so they only
+//! push [`ChatSignal`]s onto a channel; [`spawn_signal_task`] consumes them
+//! with full async access to `AppState` (degrading a session respawns a PTY,
+//! which no sync hook could do).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+
+use chimaera_agent::driver::DriverExit;
+use chimaera_agent::journal::SeqEvent;
+use chimaera_agent::model::AgentEvent;
+use chimaera_agent::{ChatInfo, ChatManager};
+
+use crate::agents::{AgentKind, AgentState};
+use crate::AppState;
+
+/// What the ChatManager hooks emit; consumed by the signal task.
+pub(crate) enum ChatSignal {
+    Event(String, Arc<SeqEvent>),
+    Exit(String, DriverExit),
+}
+
+/// Everything needed to respawn a chat session as a PTY TUI (the
+/// handshake-failure degrade path and, later, the view toggle).
+#[derive(Clone)]
+pub(crate) struct ChatRecipe {
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) kind: AgentKind,
+    pub(crate) bin: PathBuf,
+    pub(crate) settings: Option<PathBuf>,
+    pub(crate) mcp_config: Option<PathBuf>,
+    pub(crate) model: Option<String>,
+    pub(crate) resume: Option<String>,
+    /// Rewind fork point: respawn with `--fork-session --resume-session-at
+    /// <uuid>` so the conversation truncates at that message (claude only).
+    pub(crate) fork_at: Option<String>,
+    pub(crate) theme: String,
+}
+
+/// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
+/// shared login node) so a stalled consumer can't grow memory without a
+/// ceiling. The two signal kinds get different backpressure treatment — see
+/// [`new_manager`].
+const CHAT_SIGNAL_CAPACITY: usize = 1024;
+
+/// Build the manager with hooks that forward into the signal channel.
+/// Returns the receiver for [`spawn_signal_task`] to consume.
+///
+/// The hooks run on the pump task and must stay cheap. The channel is
+/// **bounded**, and the two signal kinds are treated differently under
+/// backpressure:
+///
+/// - **Exit** is rare and MUST NOT be lost — a dropped Exit would strand a
+///   session in the registry forever (nothing else retires it). When the
+///   channel is full it is handed to a detached task that *awaits* capacity,
+///   preserving the signal without parking the pump.
+/// - **Event** only refreshes derived `AgentState` (the journal, not this
+///   channel, is authoritative — the client reads the truth from the journal
+///   on replay), so it sheds load: `try_send`, and on a full channel it is
+///   dropped with a counted, throttled log. Derived state self-heals on the
+///   next Event that gets through.
+pub(crate) fn new_manager(
+    journal_dir: PathBuf,
+) -> (Arc<ChatManager>, tokio::sync::mpsc::Receiver<ChatSignal>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc::error::TrySendError;
+
+    if let Err(err) = chimaera_agent::journal::prune_dir(
+        &journal_dir,
+        chimaera_agent::journal::DIR_MAX_BYTES,
+        chimaera_agent::journal::DIR_MAX_FILES,
+    ) {
+        tracing::warn!(%err, "chat journal prune failed");
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(CHAT_SIGNAL_CAPACITY);
+    let event_tx = tx.clone();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let manager = Arc::new(ChatManager::new(
+        journal_dir,
+        Box::new(move |id, entry| {
+            match event_tx.try_send(ChatSignal::Event(id.to_string(), Arc::clone(entry))) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Throttle the log: derived state recovers on the next
+                    // delivered event and the journal is the client's source
+                    // of truth, so a burst of drops is degraded — not broken.
+                    if n == 1 || n.is_multiple_of(1000) {
+                        tracing::warn!(
+                            dropped = n,
+                            "chat signal channel full; dropping event signals \
+                             (derived agent state may lag; journal stays authoritative)"
+                        );
+                    }
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
+        }),
+        Box::new(move |id, exit| {
+            // DriverExit is Clone (chimaera-agent derives it), so the server
+            // takes an owned copy without re-materializing it arm by arm.
+            match tx.try_send(ChatSignal::Exit(id.to_string(), exit.clone())) {
+                Ok(()) => {}
+                // Exit must survive backpressure: awaiting capacity on a
+                // detached task loses neither the signal nor the pump.
+                Err(TrySendError::Full(signal)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(signal).await;
+                    });
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
+        }),
+    ));
+    (manager, rx)
+}
+
+/// Consume chat signals for the daemon's lifetime. Called once from `app()`;
+/// the receiver is stashed in AppState so construction stays sync.
+pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
+    let Some(mut rx) = crate::lock(&state.chat_signals).take() else {
+        return; // already running (app() called twice only in tests)
+    };
+    tokio::spawn(async move {
+        while let Some(signal) = rx.recv().await {
+            match signal {
+                ChatSignal::Event(id, entry) => {
+                    apply_chat_event(&state, &id, &entry.ev);
+                    // @term: grants ride the protocol input in chat mode —
+                    // the UserPromptSubmit hook (the TUI's autolink path)
+                    // does not fire under -p stream-json. Runs outside
+                    // apply_chat_event: autolink takes the agents lock.
+                    if let AgentEvent::UserMessage { text, .. } = &entry.ev {
+                        let notes = crate::mcp::autolink_mentions(&state, &id, text);
+                        for note in notes {
+                            tracing::info!(%id, %note, "chat @term mention linked");
+                        }
+                    }
+                    state.changes.notify_waiters();
+                }
+                ChatSignal::Exit(id, exit) => {
+                    handle_chat_exit(&state, &id, exit).await;
+                    state.changes.notify_waiters();
+                }
+            }
+        }
+    });
+}
+
+/// Fold a protocol event into the AgentRecord state machine.
+///
+/// In chat mode the protocol is authoritative for the FULL lifecycle, for
+/// every agent kind: hooks are unreliable under `-p` stream-json (live-found:
+/// UserPromptSubmit never fires, and Stop misses too — a session sat
+/// "running" half an hour after its turn ended). Hook events that do arrive
+/// agree with these transitions, so order doesn't matter.
+fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
+    let mut agents = crate::lock(&state.agents);
+    let Some(record) = agents.get_mut(id) else {
+        return;
+    };
+    let next = match ev {
+        AgentEvent::PermissionRequest { .. } => Some(AgentState::NeedsPermission),
+        AgentEvent::PermissionResolved { .. } => Some(AgentState::Running),
+        AgentEvent::Error { fatal: true, .. } => Some(AgentState::Errored),
+        AgentEvent::TurnStarted { .. } => Some(AgentState::Running),
+        AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),
+        // A deliberate user interrupt (Stop/Esc) is not a failure: the rail
+        // should read idle, matching the chat surface's quiet "interrupted"
+        // notice. Only a genuine turn failure errors the row.
+        AgentEvent::TurnAborted { reason, .. } if reason == "interrupted" => {
+            Some(AgentState::Finished)
+        }
+        AgentEvent::TurnAborted { .. } => Some(AgentState::Errored),
+        // Telemetry says the account limit is actually blocking requests —
+        // the same rail state the TUI hooks derive from StopFailure.
+        AgentEvent::RateLimit {
+            limit_reached: true,
+            ..
+        } => Some(AgentState::RateLimited),
+        _ => None,
+    };
+    if let Some(next) = next {
+        record.state = next;
+    }
+    // First prompt from the protocol input: the UserPromptSubmit hook does
+    // not fire under -p stream-json, so this is the chat path for every
+    // agent (a hook duplicate would be a no-op — first write wins).
+    if record.first_prompt.is_none() {
+        if let AgentEvent::UserMessage { text, .. } = ev {
+            let text = text.trim();
+            if !text.is_empty() {
+                record.first_prompt = Some(text.to_string());
+            }
+        }
+    }
+    match ev {
+        // The agent named the conversation (claude generate_session_title,
+        // codex thread/name/updated): same slot the TUI's transcript
+        // ai-title records land in, so display_name resolution — custom >
+        // OSC > ai — is identical across surfaces.
+        AgentEvent::SessionTitle { title } => {
+            let title = title.trim();
+            if !title.is_empty() {
+                record.ai_title = Some(title.to_string());
+            }
+        }
+        // File tracking without hooks: codex chat sessions have no
+        // PostToolUse channel, so Edit-kind tool locations feed
+        // files_touched here (claude's hook writes dedup via touch_file).
+        AgentEvent::ToolCall {
+            kind: chimaera_agent::model::ToolKind::Edit,
+            locations,
+            ..
+        } => {
+            for path in locations {
+                record.touch_file(path);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Driver ended: degrade a failed handshake into a PTY TUI on the same
+/// session id (one attempt), otherwise retire the session like the PTY
+/// watcher would.
+async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
+    // A view switch kills the driver on purpose: free the registry slot for
+    // the respawn and keep the AgentRecord/workspace mapping intact. Drop the
+    // stale recipe too — perform_switch builds a fresh one; leaving it here
+    // leaks one ChatRecipe per toggled session for the daemon's lifetime.
+    if crate::lock(&state.chat_switching).contains_key(id) {
+        state.chat.remove(id);
+        crate::lock(&state.chat_recipes).remove(id);
+        return;
+    }
+    let recipe = crate::lock(&state.chat_recipes).remove(id);
+    match exit {
+        DriverExit::HandshakeFailed {
+            reason,
+            stderr_tail,
+        } => {
+            tracing::warn!(%id, %reason, %stderr_tail, "chat handshake failed; degrading to terminal");
+            state.chat.remove(id);
+            match recipe {
+                Some(recipe) => {
+                    // Carry any pinned name onto the fallback PTY (usually none
+                    // this early, but resurrection could have set one).
+                    let pinned = crate::lock(&state.agents)
+                        .get(id)
+                        .and_then(|r| r.custom_title.clone());
+                    degrade_to_pty(state, id, recipe, pinned).await
+                }
+                None => crate::recents::retire(state, id, None, None),
+            }
+        }
+        DriverExit::ProtocolError(reason) => {
+            // Mid-session breakage: no auto-restart (loop risk). The session
+            // stays in the registry, dead, so the chat surface can show the
+            // failure and offer resume choices.
+            tracing::warn!(%id, %reason, "chat driver protocol error");
+            if let Some(record) = crate::lock(&state.agents).get_mut(id) {
+                record.state = AgentState::Errored;
+            }
+        }
+        DriverExit::Clean(_) | DriverExit::Killed => {
+            state.chat.remove(id);
+            crate::recents::retire(state, id, None, None);
+        }
+    }
+}
+
+/// Respawn the session as a Tier A PTY TUI with the same identity: same
+/// session id, same AgentRecord (hooks/links/titles keep working), same
+/// settings/mcp files, original resume target.
+async fn degrade_to_pty(
+    state: &Arc<AppState>,
+    id: &str,
+    recipe: ChatRecipe,
+    pinned_name: Option<String>,
+) {
+    let mut argv = if recipe.kind == AgentKind::Codex {
+        // The codex TUI resumes via a subcommand (`codex resume <uuid>`),
+        // not a flag — build_agent_command's flag surface is claude-shaped.
+        let mut argv = vec![recipe.bin.to_string_lossy().into_owned()];
+        if let Some(resume) = &recipe.resume {
+            argv.push("resume".to_string());
+            argv.push(resume.clone());
+        }
+        // Parity with the TUI spawn path (spawn.rs): carry the scheme theme
+        // (`-c tui.theme=`, skipped when the user's own config.toml sets one)
+        // and the model the chat session was created with — the app-server
+        // chat driver drops both, so a degrade would otherwise land an
+        // un-themed, default-model TUI.
+        // NOTE(needs live confirmation): these flags TRAIL the `resume`
+        // subcommand; confirm codex accepts that argv order (chat-smoke / a
+        // real degrade spawn).
+        if !crate::runtimes::codex_user_theme_set(&state.codex_config_path) {
+            argv.push("-c".to_string());
+            argv.push(format!(
+                "tui.theme={}",
+                crate::runtimes::codex_theme_name(&recipe.theme)
+            ));
+        }
+        if let Some(model) = &recipe.model {
+            argv.push("--model".to_string());
+            argv.push(model.clone());
+        }
+        argv
+    } else {
+        crate::launcher::build_agent_command(
+            recipe.kind,
+            &recipe.bin,
+            recipe.settings.as_deref(),
+            recipe.model.as_deref(),
+            recipe.resume.as_deref(),
+            None,
+        )
+    };
+    // A rewind that respawned as a conversation fork but failed its handshake
+    // must NOT silently become a full-history TUI resume (that undoes the
+    // rewind). Carry the fork flags onto the claude interactive resume so the
+    // degraded terminal opens at the same fork point.
+    // NOTE(needs live confirmation): --fork-session/--resume-session-at on the
+    // *interactive* resume path (verified for the chat driver; the TUI path
+    // needs a chat-smoke / live check).
+    if recipe.kind == AgentKind::Claude {
+        if let Some(fork_at) = &recipe.fork_at {
+            argv.push("--fork-session".to_string());
+            argv.push("--resume-session-at".to_string());
+            argv.push(fork_at.clone());
+        }
+    }
+    if let Some(mcp) = &recipe.mcp_config {
+        argv.push("--mcp-config".to_string());
+        argv.push(mcp.to_string_lossy().into_owned());
+    }
+    let opts = chimaera_pty::SpawnOpts {
+        cwd: recipe.workspace_root,
+        // Carry the user's pinned name across the toggle so the PTY row keeps
+        // it (and reports `renamed` truthfully); None leaves it deriving.
+        name: pinned_name,
+        // The UI adopts real dims on first attach; these only cover the gap.
+        cols: 80,
+        rows: 24,
+        command: Some(crate::launcher::wrap_login_shell(
+            &crate::launcher::login_shell(),
+            argv,
+        )),
+        id: Some(id.to_string()),
+        env: crate::api::session_env(state, id, &recipe.theme),
+        env_remove: crate::api::launcher_context_env(),
+        scrollback: crate::lock(&state.settings).scrollback_lines(),
+    };
+    match state.sessions.spawn(opts) {
+        Ok(_) => {
+            tracing::info!(%id, "chat session degraded to PTY TUI");
+        }
+        Err(err) => {
+            tracing::error!(%id, %err, "degrade respawn failed");
+            crate::recents::retire(state, id, None, None);
+        }
+    }
+}
+
+/// Alive in EITHER registry — the PTY watcher's liveness check must not
+/// retire a session that lives as a chat driver (and vice versa during a
+/// view switch). Chat-registry *presence* counts even when the driver died:
+/// a ProtocolError session is deliberately kept visible so the chat surface
+/// can show the failure; closing it is the user's call (DELETE).
+pub(crate) fn session_alive(state: &AppState, id: &str) -> bool {
+    state.sessions.get(id).is_some()
+        || state.chat.contains(id)
+        || crate::lock(&state.chat_switching).contains_key(id)
+}
+
+/// Synthetic session row for a chat session — same shape as the PTY rows in
+/// `sessions_json` (the client's Session type is one interface), with
+/// `ui:"chat"` marking the surface.
+pub(crate) fn chat_session_json(
+    info: &ChatInfo,
+    workspace_id: Option<String>,
+    agent: Option<&crate::agents::AgentRecord>,
+) -> serde_json::Value {
+    let display_name = agent
+        .map(|a| a.display_name(None))
+        .unwrap_or_else(|| info.agent.clone());
+    json!({
+        "id": info.id,
+        "name": info.agent,
+        "cwd": info.cwd,
+        "cols": 0,
+        "rows": 0,
+        "created_at": info.created_at_ms / 1000,
+        "alive": info.alive,
+        "exit_status": info.exit_status,
+        "title": null,
+        "pid": null,
+        // A user-pinned customTitle marks the row as renamed (the rail shows
+        // the pin and stops deriving a name over it).
+        "renamed": agent.is_some_and(|a| a.custom_title.is_some()),
+        "phase": "unknown",
+        "cwd_current": info.cwd,
+        "exec_stage": null,
+        "workspace_id": workspace_id,
+        "kind": "agent",
+        "agent_kind": agent.map(|a| a.kind.as_str()),
+        "agent_state": agent.map(|a| a.state.as_str()),
+        "agent_title": agent.and_then(|a| a.title()),
+        "files_touched": agent.map(|a| &a.files_touched),
+        "display_name": display_name,
+        "ui": "chat",
+        "chat_capable": true,
+        "chat_model": info.model,
+        "chat_mode": info.current_mode,
+        "pending_permission": info.pending_permission,
+    })
+}
+
+/// UUID v4 for claude's `--session-id` (pins the native session id at spawn,
+/// so the resume handle exists before the first turn). Delegates to the agent
+/// crate's shared minter — same crate's drivers already stamp checkpoint keys
+/// with it — which sets the version (`4`) and variant (`8`-`b`) nibbles for a
+/// well-formed v4 rather than hand-slicing hex here.
+pub(crate) fn fresh_native_uuid() -> String {
+    chimaera_agent::model::fresh_uuid()
+}
+
+/// Kill-then-respawn deadline: the old process must deregister before a
+/// same-id respawn can register (SessionManager/ChatManager unregister on
+/// reap), so we wait for the slot to free.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Poll `freed` until it returns true or the stop deadline elapses. The
+/// stop-wait semantics live here once — every respawn (view switch, rewind)
+/// shares them.
+async fn wait_until_freed(
+    mut freed: impl FnMut() -> bool,
+    timeout_msg: &'static str,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + STOP_DEADLINE;
+    while !freed() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(timeout_msg.to_string());
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    Ok(())
+}
+
+/// Stop the live process for `id` and wait for its registry slot to free so a
+/// same-id respawn can register. Shared by the view switch and rewind.
+///
+/// `currently_chat` selects which registry to stop: the chat driver, or the
+/// PTY session (a term→chat switch stops a PTY). A dead-but-registered chat
+/// entry (ProtocolError, kept visible) will never fire its exit hook again, so
+/// waiting on it would only spin to the deadline — remove it directly instead.
+async fn stop_for_respawn(
+    state: &Arc<AppState>,
+    id: &str,
+    currently_chat: bool,
+) -> Result<(), String> {
+    if currently_chat {
+        if state.chat.get(id).is_some_and(|i| i.alive) {
+            state.chat.kill(id);
+            wait_until_freed(
+                || !state.chat.contains(id),
+                "chat driver did not stop in time",
+            )
+            .await
+        } else {
+            state.chat.remove(id);
+            Ok(())
+        }
+    } else if state.sessions.get(id).is_some() {
+        let _ = state.sessions.kill(id);
+        wait_until_freed(
+            || state.sessions.get(id).is_none(),
+            "terminal session did not stop in time",
+        )
+        .await
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve every respawn precondition — the per-session settings/mcp files and
+/// the agent binary — BEFORE any kill. A failure here (binary not found on a
+/// cold NFS cache, or the per-session files scrubbed from the runtime dir)
+/// must abort with the session still alive: killing first and failing after
+/// would leave it in neither registry and the watcher would retire a live
+/// session. (`settings`/`mcp_config` are `None` when the file is absent.)
+async fn resolve_respawn_inputs(
+    state: &Arc<AppState>,
+    id: &str,
+    kind: AgentKind,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf), String> {
+    let runtime_dir = chimaera_core::runtime_dir().join("agents");
+    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
+    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
+    let bin = crate::launcher::detect(state, kind, false)
+        .await
+        .path
+        .map_err(|e| e.to_string())?;
+    Ok((settings, mcp_config, bin))
+}
+
+/// Truncate a rewound session's journal at the conversation-fork point.
+///
+/// A fork (`--fork-session --resume-session-at <preceding-uuid>`) EXCLUDES the
+/// selected user message and everything after it. Rewind reuses the SAME
+/// chimaera session id (and therefore the same journal file), so without this
+/// the rewound-away turns replay as live history forever and their now-dead
+/// checkpoint anchors keep offering rewind buttons.
+///
+/// `resume_at` is the uuid of the message PRECEDING the selected user message
+/// (the fork's resume point). We find the `Checkpoint` whose `preceding_uuid`
+/// is it and keep every journal line before the `UserMessage` that Checkpoint
+/// anchors (the pair is emitted UserMessage-then-Checkpoint). No anchor match
+/// ⇒ the file is left intact — history is never lost on a bad match. Returns
+/// whether anything was trimmed. Blocking fs: run under `spawn_blocking`, and
+/// only after the live driver has stopped (its `Journal` dropped) so the file
+/// is settled.
+fn truncate_journal_at_fork(path: &std::path::Path, resume_at: &str) -> std::io::Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let is_user_message = |line: &str| {
+        serde_json::from_str::<SeqEvent>(line)
+            .map(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
+            .unwrap_or(false)
+    };
+    let mut cut: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        if let AgentEvent::Checkpoint {
+            preceding_uuid: Some(preceding),
+            ..
+        } = &entry.ev
+        {
+            if preceding == resume_at {
+                cut = Some(if i > 0 && is_user_message(lines[i - 1]) {
+                    i - 1
+                } else {
+                    i
+                });
+                break;
+            }
+        }
+    }
+    let Some(cut) = cut.filter(|&c| c < lines.len()) else {
+        return Ok(false);
+    };
+    let mut kept = String::with_capacity(content.len());
+    for line in &lines[..cut] {
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    // Atomic rewrite (tmp + rename) — a crash mid-truncate must not leave a
+    // torn journal (the same discipline the journal writer uses).
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, kept.as_bytes())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(true)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SwitchView {
+    ui: String,
+    #[serde(default)]
+    force: bool,
+}
+
+/// POST /api/v1/sessions/{id}/view — switch a session between the chat and
+/// terminal surfaces by stopping the current process and resuming the same
+/// conversation in the other mode (same chimaera session id throughout).
+pub(crate) async fn switch_view(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<SwitchView>,
+) -> Response {
+    let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    if body.ui != "chat" && body.ui != "term" {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid ui {:?} (expected chat or term)", body.ui),
+        );
+    }
+    let chat_info = state.chat.get(&id);
+    let currently_chat = chat_info.as_ref().is_some_and(|c| c.alive);
+    let pty_alive = state.sessions.get(&id).is_some();
+    if !currently_chat && !pty_alive && chat_info.is_none() {
+        return err(StatusCode::NOT_FOUND, format!("unknown session {id}"));
+    }
+    let target_chat = body.ui == "chat";
+    if target_chat == currently_chat && (currently_chat || pty_alive) {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let Some(record) = crate::lock(&state.agents).get(&id).cloned() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "only agent sessions can switch views".to_string(),
+        );
+    };
+    if !record.kind.chat_capable() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("chat view not yet available for {}", record.kind.as_str()),
+        );
+    }
+    // Busy guard: interrupting a mid-task agent is a user decision.
+    if record.state == AgentState::Running && !body.force {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "agent is mid-task", "busy": true})),
+        )
+            .into_response();
+    }
+
+    // The resume handle: chat side knows its native id from Init; TUI side
+    // from the transcript path hooks report. Missing handle = fresh start in
+    // the other mode (still the same chimaera session identity).
+    let resume = if currently_chat {
+        chat_info.as_ref().and_then(|c| c.native_session_id.clone())
+    } else {
+        record.resume_id()
+    };
+
+    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
+    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
+        crate::lock(&state.workspaces)
+            .get(wid)
+            .map(|w| w.root.clone())
+    }) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "session has no workspace".to_string(),
+        );
+    };
+
+    // Serialize per id: a concurrent toggle (double-click) that slipped past
+    // the guards above would race the non-atomic kill→respawn, and the first
+    // finisher's unconditional `remove` below would clear the second's marker —
+    // making its intentional kill look like a real exit that retires the
+    // session. Refuse the overlap instead. `busy` is absent so the client
+    // treats it as "try again", not the mid-task confirmation prompt.
+    {
+        use std::collections::hash_map::Entry;
+        let mut switching = crate::lock(&state.chat_switching);
+        match switching.entry(id.clone()) {
+            Entry::Occupied(_) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "a view switch is already in progress for this session".to_string(),
+                );
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(body.ui.clone());
+            }
+        }
+    }
+    // A ProtocolError-dead chat entry is kept in the registry so the surface
+    // can show the failure, but a switch must clear it first (resume handle is
+    // already captured above): otherwise a term target leaves two rows under
+    // one id, and a chat target 500s on the spawn's already-exists guard.
+    if chat_info.as_ref().is_some_and(|c| !c.alive) {
+        state.chat.remove(&id);
+    }
+    state.changes.notify_waiters();
+    let result = perform_switch(
+        &state,
+        &id,
+        target_chat,
+        currently_chat,
+        resume,
+        workspace_root,
+        &record,
+    )
+    .await;
+    crate::lock(&state.chat_switching).remove(&id);
+
+    match result {
+        Ok(()) => {
+            state.changes.notify_waiters();
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+async fn perform_switch(
+    state: &Arc<AppState>,
+    id: &str,
+    target_chat: bool,
+    currently_chat: bool,
+    resume: Option<String>,
+    workspace_root: PathBuf,
+    record: &crate::agents::AgentRecord,
+) -> Result<(), String> {
+    // A user-pinned name lives in different stores per surface: chat sessions
+    // pin it on the AgentRecord (customTitle), PTY sessions on SessionInfo.name
+    // (renamed). Capture it from whichever holds it NOW so the toggle carries
+    // it across — otherwise a rename made in one mode vanishes in the other.
+    let pinned_name = if currently_chat {
+        record.custom_title.clone()
+    } else {
+        state
+            .sessions
+            .get(id)
+            .filter(|i| i.renamed)
+            .map(|i| i.name.clone())
+    };
+    // Land it on the AgentRecord too, so the customTitle chain is the single
+    // authority the chat row and the (post-degrade) PTY row both read.
+    if let Some(name) = &pinned_name {
+        if let Some(rec) = crate::lock(&state.agents).get_mut(id) {
+            rec.custom_title = Some(name.clone());
+        }
+    }
+
+    // Resolve every respawn precondition BEFORE killing the old process (see
+    // `resolve_respawn_inputs`).
+    let (settings, mcp_config, bin) = resolve_respawn_inputs(state, id, record.kind).await?;
+    // The claude chat driver needs both per-session files; fail now, not
+    // after the kill (spawn_chat_session would otherwise bail post-kill).
+    if target_chat
+        && record.kind == AgentKind::Claude
+        && (settings.is_none() || mcp_config.is_none())
+    {
+        return Err("chat session state files are missing (runtime dir scrubbed)".to_string());
+    }
+    let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
+
+    // Stop the current process and wait for its slot to free.
+    stop_for_respawn(state, id, currently_chat).await?;
+
+    // Stamp the transition in the journal while no live Journal owns the
+    // file: replayers then read "continued in terminal/chat" instead of a
+    // bare process exit (and the chat store clears its exited banner).
+    if let Err(err) = chimaera_agent::journal::append_marker(
+        state.chat.journal_dir(),
+        id,
+        chimaera_agent::model::AgentEvent::ModeSwitch {
+            to: if target_chat {
+                chimaera_agent::model::SessionUi::Chat
+            } else {
+                chimaera_agent::model::SessionUi::Term
+            },
+        },
+    )
+    .await
+    {
+        tracing::warn!(%id, %err, "failed to journal the view switch");
+    }
+
+    if target_chat {
+        let recipe = ChatRecipe {
+            workspace_root: workspace_root.clone(),
+            kind: record.kind,
+            bin: bin.clone(),
+            settings: settings.clone(),
+            mcp_config: mcp_config.clone(),
+            model: None,
+            resume: resume.clone(),
+            fork_at: None,
+            theme: theme.clone(),
+        };
+        spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
+    } else {
+        let recipe = ChatRecipe {
+            workspace_root,
+            kind: record.kind,
+            bin,
+            settings,
+            mcp_config,
+            model: None,
+            resume,
+            fork_at: None,
+            theme,
+        };
+        degrade_to_pty(state, id, recipe, pinned_name).await;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RewindBody {
+    /// The message uuid the forked conversation resumes AT (the message
+    /// preceding the rewound-to user message — the client computes it from
+    /// its Checkpoint anchors).
+    resume_at: String,
+}
+
+/// POST /api/v1/sessions/{id}/rewind — fork the conversation at a checkpoint.
+///
+/// The file-restore half already happened through the chat socket
+/// (`Rewind { dry_run:false }` → the CLI's `rewind_files`); this endpoint
+/// does the conversation half: stop the driver and respawn the SAME chimaera
+/// session as `--resume <native> --fork-session --resume-session-at <uuid>`,
+/// which truncates the transcript at that message on a fresh native id.
+pub(crate) async fn rewind_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<RewindBody>,
+) -> Response {
+    let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    let Some(info) = state.chat.get(&id) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no chat session {id} (rewind is a chat-surface action)"),
+        );
+    };
+    let Some(record) = crate::lock(&state.agents).get(&id).cloned() else {
+        return err(StatusCode::BAD_REQUEST, "not an agent session".to_string());
+    };
+    if record.kind != AgentKind::Claude {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "checkpoint rewind is a claude feature".to_string(),
+        );
+    }
+    let Some(native) = info.native_session_id.clone() else {
+        return err(
+            StatusCode::CONFLICT,
+            "session has no resume handle yet".to_string(),
+        );
+    };
+    // The fork anchor lands verbatim in the respawn argv — validate it the same
+    // way create_session validates model/resume (a flag-shaped or control-byte
+    // value has no business in `--resume-session-at`; uuids pass).
+    if !crate::launcher::safe_arg(&body.resume_at) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("invalid resume_at {:?}", body.resume_at),
+        );
+    }
+    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
+    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
+        crate::lock(&state.workspaces)
+            .get(wid)
+            .map(|w| w.root.clone())
+    }) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "session has no workspace".to_string(),
+        );
+    };
+
+    // Resolve every respawn precondition BEFORE the kill (same discipline as
+    // the view switch): a post-kill failure would strand the session. Rewind
+    // is claude-only, which needs both per-session files.
+    let (settings, mcp_config, bin) = match resolve_respawn_inputs(&state, &id, record.kind).await {
+        Ok(inputs) => inputs,
+        Err(msg) => return err(StatusCode::CONFLICT, msg),
+    };
+    if settings.is_none() || mcp_config.is_none() {
+        return err(
+            StatusCode::CONFLICT,
+            "chat session state files are missing (runtime dir scrubbed)".to_string(),
+        );
+    }
+
+    // Same choreography as the view switch: flag the deliberate stop so the
+    // exit path neither retires nor degrades, stop, respawn.
+    crate::lock(&state.chat_switching).insert(id.clone(), "chat".to_string());
+    let result = async {
+        // Stop the driver (a dead-but-registered ProtocolError entry is dropped
+        // directly rather than waited on — see `stop_for_respawn`).
+        stop_for_respawn(&state, &id, true).await?;
+
+        // Now that the live Journal is dropped, physically drop the rewound-away
+        // turns from the reused journal so they don't replay forever (sw-1). Off
+        // the reactor — the journal file can be MB-sized.
+        let jpath = state.chat.journal_dir().join(format!("{id}.jsonl"));
+        let anchor = body.resume_at.clone();
+        match tokio::task::spawn_blocking(move || truncate_journal_at_fork(&jpath, &anchor)).await {
+            Ok(Ok(true)) => tracing::info!(%id, "truncated chat journal at rewind fork point"),
+            // No anchor match: the file is left whole (no history lost). The
+            // store then still shows the rewound-away blocks — a UI seam noted
+            // in the PR — but the conversation is never corrupted.
+            Ok(Ok(false)) => {
+                tracing::warn!(%id, "rewind fork anchor not found in journal; history left intact")
+            }
+            Ok(Err(e)) => tracing::warn!(%id, %e, "failed to truncate journal at fork point"),
+            Err(e) => tracing::warn!(%id, %e, "journal truncation task panicked"),
+        }
+
+        // Stamp the rewind after the truncation so the notice sits at the new
+        // journal tail (a replayer reads it right where history now ends).
+        if let Err(e) = chimaera_agent::journal::append_marker(
+            state.chat.journal_dir(),
+            &id,
+            chimaera_agent::model::AgentEvent::Notice {
+                text: "rewound to checkpoint".to_string(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(%id, %e, "failed to journal the rewind");
+        }
+        let recipe = ChatRecipe {
+            workspace_root,
+            kind: record.kind,
+            bin,
+            settings,
+            mcp_config,
+            model: None,
+            resume: Some(native),
+            fork_at: Some(body.resume_at.clone()),
+            theme: "dark".to_string(),
+        };
+        spawn_chat_session(&state, id.clone(), recipe, None).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+    crate::lock(&state.chat_switching).remove(&id);
+    state.changes.notify_waiters();
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+/// Spawn (or respawn) a chat driver for `id` from a recipe. Shared by
+/// create_session and the view switch. `pinned_override` lets create pass a
+/// fresh --session-id uuid; resumes leave it None (claude forks a new id).
+pub(crate) fn spawn_chat_session(
+    state: &Arc<AppState>,
+    id: String,
+    recipe: ChatRecipe,
+    pinned_override: Option<String>,
+) -> anyhow::Result<ChatInfo> {
+    // Re-enforce the journal-dir budget as sessions are created: the
+    // construction-time prune alone lets a weeks-long daemon accumulate one
+    // capped journal per session past the documented ceiling.
+    state.chat.prune_journal_dir();
+    let (argv, pinned): (Vec<String>, Option<String>) = match recipe.kind {
+        AgentKind::Claude => {
+            let (settings, mcp) = (
+                recipe
+                    .settings
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("chat session needs a settings file"))?,
+                recipe
+                    .mcp_config
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("chat session needs an mcp config"))?,
+            );
+            let pinned = match (&pinned_override, &recipe.resume) {
+                (Some(uuid), _) => Some(uuid.clone()),
+                // Resume forks a NEW native id; it arrives via system/init.
+                (None, Some(_)) => None,
+                (None, None) => Some(fresh_native_uuid()),
+            };
+            (
+                crate::launcher::build_chat_command(
+                    &recipe.bin,
+                    settings,
+                    mcp,
+                    recipe.model.as_deref(),
+                    recipe.resume.as_deref(),
+                    pinned.as_deref(),
+                    recipe.fork_at.as_deref(),
+                ),
+                pinned,
+            )
+        }
+        AgentKind::Codex => {
+            // The app-server resumes in-protocol (thread/resume keeps the
+            // id), so the resume handle IS the pinned native id.
+            //
+            // TODO(seam): `recipe.model` is dropped here. The codex chat
+            // driver picks the model in-protocol — `thread/start` takes no
+            // model param (PROTOCOL.md: it's `{cwd, approvalPolicy?}`), and
+            // the model rides `turn/start` / `thread/settings/update` via a
+            // `SetModel` command. Honoring the create-time model for codex
+            // chat therefore needs a driver change (send `SetModel` right
+            // after Init, or thread/start growing a model field) in
+            // chimaera-agent — not something the argv can carry.
+            (
+                vec![
+                    recipe.bin.to_string_lossy().into_owned(),
+                    "app-server".to_string(),
+                ],
+                recipe.resume.clone(),
+            )
+        }
+        other => anyhow::bail!("no chat driver for {}", other.as_str()),
+    };
+    let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
+    let mut spec =
+        chimaera_agent::driver::SpawnSpec::new(id.clone(), argv, recipe.workspace_root.clone());
+    spec.env = crate::api::session_env(state, &id, &recipe.theme);
+    // Strip the daemon's own launcher context (same set the PTY path removes)
+    // so a chimaera launched from inside an agent can't leak that context into
+    // the chat agent it spawns.
+    spec.env_remove = crate::api::launcher_context_env();
+    spec.pinned_native_id = pinned;
+
+    // Resuming a finished conversation mints a NEW chimaera session id, and
+    // the agents replay no history over the wire — seed the new journal
+    // from the previous life's (the native-id index knows which one).
+    // Journal::open continues sequence numbers from the copied file, so
+    // attach replays the whole conversation before the fresh Init.
+    if let Some(native) = &recipe.resume {
+        if let Some(old_id) = state.chat.index().lookup(native) {
+            let dir = state.chat.journal_dir();
+            let old_path = dir.join(format!("{old_id}.jsonl"));
+            let new_path = dir.join(format!("{id}.jsonl"));
+            // Never copy from a still-live session's journal: its writer thread
+            // may be mid-append, so the copy could split a line and the seeded
+            // tail would be lost on replay. Resume targets a finished
+            // conversation; a live source means the id was reused unexpectedly.
+            if old_id != id
+                && !state.chat.contains(&old_id)
+                && old_path.exists()
+                && !new_path.exists()
+            {
+                if let Err(err) = std::fs::copy(&old_path, &new_path) {
+                    tracing::warn!(%id, %old_id, %err, "journal seed copy failed");
+                } else {
+                    tracing::info!(%id, %old_id, "seeded chat journal from previous life");
+                }
+            }
+        }
+    }
+
+    crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());
+    let info = match recipe.kind {
+        AgentKind::Claude => state
+            .chat
+            .spawn(&chimaera_agent::claude::ClaudeAdapter, spec),
+        _ => state.chat.spawn(&chimaera_agent::codex::CodexAdapter, spec),
+    };
+    if info.is_err() {
+        crate::lock(&state.chat_recipes).remove(&id);
+    }
+    info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seq_line(n: u64, ev: AgentEvent) -> String {
+        serde_json::to_string(&SeqEvent { seq: n, ts: 0, ev }).unwrap()
+    }
+
+    /// The rewind cut drops the SELECTED user message and everything after it,
+    /// keeping the fork's resume point (the preceding message) and all history
+    /// before it. A journal whose UserMessage/Checkpoint pairs mirror what the
+    /// claude driver emits.
+    #[test]
+    fn truncate_journal_drops_selected_message_and_after() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-fork-truncate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let lines = [
+            seq_line(
+                1,
+                AgentEvent::UserMessage {
+                    text: "first".into(),
+                    attachments: 0,
+                },
+            ),
+            seq_line(
+                2,
+                AgentEvent::Checkpoint {
+                    user_message_id: "m1".into(),
+                    preceding_uuid: None,
+                },
+            ),
+            seq_line(
+                3,
+                AgentEvent::MessageChunk {
+                    turn_id: "t1".into(),
+                    text: "reply one".into(),
+                },
+            ),
+            seq_line(
+                4,
+                AgentEvent::UserMessage {
+                    text: "second".into(),
+                    attachments: 0,
+                },
+            ),
+            seq_line(
+                5,
+                AgentEvent::Checkpoint {
+                    user_message_id: "m2".into(),
+                    preceding_uuid: Some("m1".into()),
+                },
+            ),
+            seq_line(
+                6,
+                AgentEvent::MessageChunk {
+                    turn_id: "t2".into(),
+                    text: "reply two".into(),
+                },
+            ),
+        ];
+        let body = lines.join("\n") + "\n";
+        std::fs::write(&path, &body).unwrap();
+
+        // Rewind to the second user message: resume_at is the preceding
+        // message's id ("m1"), whose Checkpoint (seq 5) has preceding_uuid
+        // "m1". The second UserMessage (seq 4) onward is dropped.
+        assert!(truncate_journal_at_fork(&path, "m1").unwrap());
+        let kept: Vec<u64> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<SeqEvent>(l).unwrap().seq)
+            .collect();
+        assert_eq!(kept, vec![1, 2, 3]);
+
+        // An anchor that matches nothing leaves the file whole (history is
+        // never lost on a bad match) and reports no trim.
+        std::fs::write(&path, &body).unwrap();
+        assert!(!truncate_journal_at_fork(&path, "does-not-exist").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chat_capable_is_claude_and_codex_only() {
+        assert!(AgentKind::Claude.chat_capable());
+        assert!(AgentKind::Codex.chat_capable());
+        assert!(!AgentKind::Gemini.chat_capable());
+        assert!(!AgentKind::Antigravity.chat_capable());
+    }
+
+    #[test]
+    fn fresh_native_uuid_has_v4_version_and_variant() {
+        let u = fresh_native_uuid();
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12],
+            "{u}"
+        );
+        assert!(u.chars().all(|c| c == '-' || c.is_ascii_hexdigit()), "{u}");
+        // v4 version nibble, then a 10xx variant nibble (8..=b).
+        assert_eq!(parts[2].chars().next(), Some('4'), "{u}");
+        assert!(
+            matches!(parts[3].chars().next(), Some('8' | '9' | 'a' | 'b')),
+            "{u}"
+        );
+    }
+}

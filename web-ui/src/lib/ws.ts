@@ -1,11 +1,5 @@
-import { writable } from "svelte/store";
 import { getToken } from "./api";
-
-/**
- * Number of session sockets currently trying to reconnect. The daemon dot in
- * the rail pulses while this is non-zero.
- */
-export const reconnectingSockets = writable(0);
+import { Reconnector, UNKNOWN_SESSION_RETRIES } from "./reconnect";
 
 export interface SessionSocketHandlers {
   /** Raw PTY output (including the initial snapshot). Feed to term.write(). */
@@ -40,10 +34,8 @@ interface ServerTextFrame {
   rows?: number;
   status?: number | null;
   message?: string;
+  code?: string;
 }
-
-const INITIAL_BACKOFF_MS = 500;
-const MAX_BACKOFF_MS = 10_000;
 
 /**
  * One WebSocket per attached session, per the /ws/sessions/{id} contract:
@@ -57,9 +49,8 @@ export class SessionSocket {
   private fatal = false;
   private exited = false;
   private everReady = false;
-  private reconnecting = false;
-  private backoffMs = INITIAL_BACKOFF_MS;
-  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private unknownRetries = 0;
+  private readonly recon = new Reconnector(() => this.connect());
   private readonly encoder = new TextEncoder();
 
   constructor(
@@ -94,10 +85,10 @@ export class SessionSocket {
     ws.onclose = () => {
       if (this.ws === ws) this.ws = null;
       if (this.closed || this.fatal || this.exited) {
-        this.clearReconnecting();
+        this.recon.clear();
         return;
       }
-      this.scheduleReconnect();
+      this.recon.schedule();
     };
   }
 
@@ -110,8 +101,8 @@ export class SessionSocket {
     }
     switch (msg.type) {
       case "ready": {
-        this.backoffMs = INITIAL_BACKOFF_MS;
-        this.clearReconnecting();
+        this.recon.succeeded();
+        this.unknownRetries = 0;
         // On a reconnect the server re-sends a full snapshot; wipe the stale
         // screen so the snapshot reconstructs state exactly.
         if (this.everReady) this.handlers.onReset();
@@ -148,30 +139,17 @@ export class SessionSocket {
         this.handlers.onExited(msg.status ?? null);
         break;
       case "error":
+        // A missing session may just be mid view-switch: let the normal
+        // onclose reconnect path retry before giving up.
+        if (msg.code === "unknown_session" && this.unknownRetries < UNKNOWN_SESSION_RETRIES) {
+          this.unknownRetries += 1;
+          break;
+        }
         this.fatal = true;
         this.handlers.onError(msg.message ?? "unknown error");
         break;
       default:
         break;
-    }
-  }
-
-  private scheduleReconnect(): void {
-    if (!this.reconnecting) {
-      this.reconnecting = true;
-      reconnectingSockets.update((n) => n + 1);
-    }
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.connect();
-    }, this.backoffMs);
-    this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
-  }
-
-  private clearReconnecting(): void {
-    if (this.reconnecting) {
-      this.reconnecting = false;
-      reconnectingSockets.update((n) => Math.max(0, n - 1));
     }
   }
 
@@ -197,11 +175,8 @@ export class SessionSocket {
   /** Permanently close the socket (no reconnect). */
   close(): void {
     this.closed = true;
-    if (this.retryTimer !== null) {
-      clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-    }
-    this.clearReconnecting();
+    this.recon.cancel();
+    this.recon.clear();
     this.ws?.close();
     this.ws = null;
   }

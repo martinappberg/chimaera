@@ -117,7 +117,10 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             tracing::debug!(%id, %err, "ws attach failed");
             let _ = send_json(
                 &mut socket,
-                &json!({"type": "error", "message": format!("unknown session {id}")}),
+                // Retryable: mid view-switch the id exists but its process
+                // is being respawned; clients back off and re-attach.
+                &json!({"type": "error", "code": "unknown_session",
+                        "message": format!("unknown session {id}")}),
             )
             .await;
             return;
@@ -286,6 +289,198 @@ async fn resync(
             tracing::debug!(%id, %err, "resync attach failed");
             true
         }
+    }
+}
+
+/// GET /ws/chat/{id} — the structured chat bridge: JSON events out (seq-
+/// numbered, gap-replayed from the journal), AgentCommands in. The chat
+/// sibling of /ws/sessions/{id}; deliberately a separate endpoint — none of
+/// the PTY channel's byte-pipe semantics (binary frames, dims, resync)
+/// apply here.
+pub(crate) async fn chat_ws(
+    ws: WebSocketUpgrade,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_chat(socket, id, state))
+}
+
+/// Chat replay batch size: bounds per-frame size without flooding the socket
+/// with one frame per event on a cold attach.
+const CHAT_BATCH: usize = 128;
+
+async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
+    let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
+        let _ = send_json(
+            &mut socket,
+            &json!({"type": "error", "message": "unauthorized"}),
+        )
+        .await;
+        return;
+    };
+
+    // Replay may read the journal file — keep it off the reactor.
+    let attachment = {
+        let state = state.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || state.chat.attach(&id, last_seq)).await
+    };
+    let attachment = match attachment {
+        Ok(Ok(attachment)) => attachment,
+        _ => {
+            let _ = send_json(
+                &mut socket,
+                // Retryable: mid view-switch the driver may not be up yet.
+                &json!({"type": "error", "code": "unknown_session",
+                        "message": format!("unknown chat session {id}")}),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let ready = json!({
+        "type": "ready",
+        "session": attachment.info,
+        "replay_from": last_seq,
+        // The journal's highest seq now. A client whose own last_seq exceeds
+        // this is stale (the journal was recreated and numbering restarted);
+        // it hard-resets rather than silently dropping every replayed event.
+        "head": attachment.head_seq,
+    });
+    if send_json(&mut socket, &ready).await.is_err() {
+        return;
+    }
+
+    let mut sent_seq = last_seq;
+    if !send_chat_batches(&mut socket, &attachment.replay, &mut sent_seq).await {
+        return;
+    }
+
+    let mut live = attachment.live;
+    loop {
+        tokio::select! {
+            event = live.recv() => match event {
+                Ok(entry) => {
+                    // The replay tail can overlap the subscription start.
+                    if entry.seq <= sent_seq {
+                        continue;
+                    }
+                    let frame = json!({"type": "ev", "seq": entry.seq, "ts": entry.ts, "ev": entry.ev});
+                    if send_json(&mut socket, &frame).await.is_err() {
+                        return;
+                    }
+                    sent_seq = entry.seq;
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    // Slow client: re-replay the gap from the journal instead
+                    // of buffering (same philosophy as the PTY resync).
+                    tracing::debug!(%id, skipped, "chat ws lagged; replaying gap");
+                    let replayed = {
+                        let state = state.clone();
+                        let id = id.clone();
+                        let from = sent_seq;
+                        tokio::task::spawn_blocking(move || state.chat.attach(&id, from)).await
+                    };
+                    match replayed {
+                        Ok(Ok(fresh)) => {
+                            live = fresh.live;
+                            if !send_chat_batches(&mut socket, &fresh.replay, &mut sent_seq).await {
+                                return;
+                            }
+                        }
+                        _ => return,
+                    }
+                }
+                Err(RecvError::Closed) => {
+                    // Driver gone. Decide what to tell the client:
+                    // - mid view-switch (chat_switching holds the id): the
+                    //   respawn is in flight but not registered yet (journal
+                    //   append + launcher::detect take up to ~2s on a cold
+                    //   cache), so DON'T report "exited" — say "degraded" for a
+                    //   term target, or a retryable frame for a chat target.
+                    // - a PTY already under this id: it degraded/toggled to a
+                    //   terminal.
+                    // - otherwise: the session genuinely exited.
+                    let switching = crate::lock(&state.chat_switching).get(&id).cloned();
+                    let frame = match switching.as_deref() {
+                        Some("term") => json!({"type": "degraded"}),
+                        Some(_) => json!({"type": "error", "code": "unknown_session",
+                                          "message": "session switching"}),
+                        None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
+                        None => json!({"type": "exited",
+                                       "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
+                    };
+                    let _ = send_json(&mut socket, &frame).await;
+                    return;
+                }
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
+                        Ok(cmd) => {
+                            if let Err(err) = state.chat.command(&id, cmd).await {
+                                tracing::debug!(%id, %err, "chat command failed");
+                                let _ = send_json(
+                                    &mut socket,
+                                    &json!({"type": "error", "message": "agent unavailable"}),
+                                )
+                                .await;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(%id, %err, "unparseable chat frame");
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
+/// Ship replay entries in bounded batches, advancing `sent_seq`.
+async fn send_chat_batches(
+    socket: &mut WebSocket,
+    replay: &[Arc<chimaera_agent::journal::SeqEvent>],
+    sent_seq: &mut u64,
+) -> bool {
+    for chunk in replay.chunks(CHAT_BATCH) {
+        let events: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|e| json!({"seq": e.seq, "ts": e.ts, "ev": e.ev}))
+            .collect();
+        if send_json(socket, &json!({"type": "batch", "events": events}))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(last) = chunk.last() {
+            *sent_seq = last.seq;
+        }
+    }
+    true
+}
+
+/// First-frame auth for the chat channel: carries `last_seq` instead of grid
+/// dims. `None` = rejected.
+async fn chat_authenticate(socket: &mut WebSocket, state: &AppState) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct ChatAuth {
+        #[serde(rename = "type")]
+        kind: String,
+        token: String,
+        #[serde(default)]
+        last_seq: u64,
+    }
+    match tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ChatAuth>(&text) {
+            Ok(auth) if auth.kind == "auth" && auth.token == state.token => Some(auth.last_seq),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

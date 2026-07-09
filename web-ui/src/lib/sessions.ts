@@ -1,5 +1,7 @@
+import { writable } from "svelte/store";
+
 import { api, ApiError } from "./api";
-import { resolvedTheme } from "./settings/store.svelte";
+import { getSetting, resolvedTheme } from "./settings/store.svelte";
 
 export interface Workspace {
   id: string;
@@ -67,6 +69,14 @@ export interface Session {
   phase?: "unknown" | "ready" | "running";
   /** Stage of an in-flight agent exec against this terminal, else null. */
   exec_stage?: "queued" | "executing" | null;
+  /**
+   * Which surface the session's process runs behind: "chat" (structured
+   * stream-json driver) or "term" (a PTY). Server truth — the pane renders
+   * whichever the daemon says. Optional on old daemons (= "term").
+   */
+  ui?: "chat" | "term";
+  /** Whether this agent can run as a chat session (drives the toggle). */
+  chat_capable?: boolean;
 }
 
 /** The one display name for a session, used identically everywhere. */
@@ -88,9 +98,10 @@ export function agentKind(s: Session): string {
   return s.kind === "agent" ? (s.agent_kind ?? "claude") : "shell";
 }
 
-/** True for agents with no hook integration yet (state is honestly unknown). */
+/** True for agents with no hook integration yet (state is honestly unknown).
+ *  Chat sessions always have protocol-derived state, whatever the agent. */
 function unintegrated(s: Session): boolean {
-  return s.kind === "agent" && agentKind(s) !== "claude";
+  return s.kind === "agent" && agentKind(s) !== "claude" && s.ui !== "chat";
 }
 
 /**
@@ -231,6 +242,14 @@ export async function createSession(
   name: string | null = null,
   size: { cols: number; rows: number } | null = null,
   spawn: AgentSpawn = {},
+  /**
+   * Whether this agent can run as a structured chat session (AgentInfo.
+   * chatCapable, version-gated by the daemon). `false` routes a would-be chat
+   * spawn straight to the terminal instead of eating the 20s handshake
+   * watchdog before degrading; `undefined` (catalog not loaded) trusts the
+   * default view, as before.
+   */
+  chatCapable?: boolean,
 ): Promise<Session> {
   // Spawn at the destination pane's fitted size so TUIs never boot at a
   // wrong 80x24 and repaint on the first resize (server clamps identically).
@@ -245,6 +264,18 @@ export async function createSession(
   if (kind === "agent") {
     if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
+    // New agent sessions open in the structured chat view by default (the
+    // agents.defaultView setting); the terminal is one pane-bar toggle away,
+    // and the daemon degrades to a PTY on its own if the protocol handshake
+    // fails. An agent the catalog knows is NOT chat-capable (outdated CLI)
+    // skips chat entirely — it would only handshake-watchdog then degrade.
+    if (
+      ["claude", "codex"].includes(spawn.agent ?? "claude") &&
+      getSetting("agents.defaultView") === "chat" &&
+      chatCapable !== false
+    ) {
+      extras.ui = "chat";
+    }
   }
   // Every spawn (shell AND agent) carries the UI's current scheme: the
   // daemon's shims inject it so TUIs boot themed to match. The SETTINGS
@@ -263,6 +294,72 @@ export async function createSession(
 
 export async function deleteSession(id: string): Promise<void> {
   await json<void>(await api(`/sessions/${id}`, { method: "DELETE" }));
+}
+
+/**
+ * A 409 from POST /sessions/{id}/view. `busy` splits the two conflicts apart:
+ * `true` = the agent is mid-task (the caller confirms and retries with force);
+ * `false` = a switch for this session is already in flight (a duplicate the
+ * caller drops quietly — no toast, no confirm).
+ */
+export class ViewSwitchConflict extends ApiError {
+  readonly busy: boolean;
+  constructor(message: string, busy: boolean) {
+    super(409, message);
+    this.name = "ViewSwitchConflict";
+    this.busy = busy;
+  }
+}
+
+/** Session ids with a chat⇄terminal view-switch POST in flight. The pane bar's
+ *  toggle disables itself for these (App's switchView owns the set) so a second
+ *  click can't fire a concurrent switch the server would only 409. */
+export const switchingViews = writable<ReadonlySet<string>>(new Set());
+
+/**
+ * Switch a session between the chat and terminal surfaces. The daemon stops
+ * the current process and resumes the same conversation in the other mode
+ * (same session id). A 409 is raised as a ViewSwitchConflict whose `busy` tells
+ * mid-task (confirm + force) apart from an already-in-flight switch (drop it).
+ */
+export async function switchSessionView(
+  id: string,
+  ui: "chat" | "term",
+  force = false,
+): Promise<void> {
+  const res = await api(`/sessions/${id}/view`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // Carry the UI's scheme so the server respawns the process themed to match
+    // (same source createSession uses); harmless on servers that ignore it.
+    body: JSON.stringify({ ui, force, theme: resolvedTheme() }),
+  });
+  if (res.status === 409) {
+    let busy = false;
+    let message = "view switch conflict";
+    try {
+      const body = (await res.json()) as { error?: string; busy?: boolean };
+      if (typeof body.error === "string") message = body.error;
+      busy = body.busy === true;
+    } catch {
+      // non-JSON body; keep the defaults
+    }
+    throw new ViewSwitchConflict(message, busy);
+  }
+  await json<void>(res);
+}
+
+/** Fork the conversation at a checkpoint (claude chat sessions): the files
+ *  were already restored through the chat socket; this respawns the driver
+ *  with the transcript truncated at `resumeAt`. */
+export async function rewindSession(id: string, resumeAt: string): Promise<void> {
+  await json<void>(
+    await api(`/sessions/${id}/rewind`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resume_at: resumeAt }),
+    }),
+  );
 }
 
 /** Pin a user-chosen display name on a session (any kind — the app owns

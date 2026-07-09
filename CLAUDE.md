@@ -26,12 +26,27 @@ Rust workspace (the daemon) + a Svelte web UI it embeds + a separate Tauri app.
 | Path | What it is |
 |---|---|
 | `crates/chimaera` | The binary. CLI + daemon entrypoint: `serve`, `connect <host>`, `status`, `kill`, `doctor`. |
+| `crates/chimaera-agent` | The structured-agent engine (the chat surface's other half): drives `claude` over bidirectional stream-json and `codex` over app-server JSON-RPC behind an `AgentAdapter` trait, with a per-session seq-numbered event journal (gap-replay reconnects). The wire formats are unversioned — **read `crates/chimaera-agent/PROTOCOL.md` first, and run `just chat-smoke` (live, bills a few cents) whenever a driver or an agent CLI changes.** |
 | `crates/chimaera-core` | Shared types, version/build-id helpers, shell integration. |
 | `crates/chimaera-pty` | The persistent terminal engine. PTY sessions mirrored into a headless `alacritty_terminal` grid so full screen state survives with zero attached clients; `attach` returns a snapshot escape stream that rebuilds the terminal in a fresh xterm.js. |
 | `crates/chimaera-remote` | SSH orchestration for `connect`: host discovery, musl-binary install, daemon start, port-forward tunnels. Never reimplements the ssh client — inherits `~/.ssh/config` (ProxyJump, ControlMaster, 2FA). |
 | `crates/chimaera-server` | The daemon's HTTP/WS surface and all business logic: `workspaces`, `agents`, `launcher`, `runtimes`, `fs`/previews, `links` + `mcp` (linked terminals), `settings`, `quickopen`, `recents`, `naming`, `view_state`, `ws`, `api`, `assets`. Embeds `web-ui/dist`. |
 | `crates/chimaera-app` | The Tauri 2 native shell. **Its own standalone cargo workspace** — Tauri deliberately never enters the daemon workspace so musl/HPC builds stay lean. |
 | `web-ui/` | The client: Svelte 5 + Vite, xterm.js terminals, file previews (image/markdown/csv/pdf/html), the workbench layout. The daemon serves the built `dist/`. |
+
+### Nested CLAUDE.md maps (agent-first docs)
+
+Big or subtle subsystems carry their **own `CLAUDE.md`** — a short *map* (what's
+here, the file table, the invariants that bite, where to start a change), so a
+new agent can scope a feature with minimal context. Read the most specific one
+for the files you're touching; it wins over this root map on local detail. This
+is the pattern the repo is standardizing on — when you add a substantial
+subsystem, add its `CLAUDE.md` in the same style (map, not tutorial; link out to
+DESIGN.md/PROTOCOL.md for depth).
+
+- [`crates/chimaera-agent/CLAUDE.md`](crates/chimaera-agent/CLAUDE.md) — the structured-agent engine (drivers, journal, event model).
+- [`crates/chimaera-server/CLAUDE.md`](crates/chimaera-server/CLAUDE.md) — the daemon's routes + business logic + the chat-mode glue.
+- [`web-ui/src/lib/chat/CLAUDE.md`](web-ui/src/lib/chat/CLAUDE.md) — the structured chat UI (store reducer, socket, components).
 
 ## Build, test, run
 
@@ -99,6 +114,13 @@ See the **[develop](.claude/skills/develop/SKILL.md)** skill for the full loop.
   across the wire (the client is xterm.js, not Rust) — re-emit an escape-sequence
   snapshot on attach/resize. Resize/resync has subtle invariants; read DESIGN.md
   `## Architecture` → "Resize repaint refinement" before touching that path.
+- **Agent wire formats are pinned, not trusted.** The claude stream-json and
+  codex app-server protocols are unversioned; the drivers in `chimaera-agent`
+  are verified against pinned CLI versions (`TESTED_*_VERSION`). Touching a
+  driver — or updating an agent CLI — requires `just chat-smoke` (live suite,
+  bills a few cents); hermetic tests cannot catch upstream drift. Quirks and
+  wire facts live in `crates/chimaera-agent/PROTOCOL.md` — extend it when you
+  learn a new one the hard way.
 - **Comments state constraints and *why*, not narration.** Explain why the code
   must be this way ("BGZF is standard multi-member gzip"), never what the next
   line does. `cargo fmt` and `clippy -D warnings` must pass clean.
@@ -149,3 +171,4 @@ Under `.claude/skills/` — invoke with `/<name>`:
 - **develop** — run Chimaera locally and iterate (daemon + Vite dev loop, ports, auth, gotchas).
 - **verify-app** — drive a change end-to-end against the real daemon + UI + PTY.
 - **ship-pr** — open a PR here: CI gates, Conventional-Commit version bump, `[skip release]`.
+- **chat-mode** — work on structured chat mode (Tier B): drivers, journal/replay, server glue, chat UI; which verification level a change needs (hermetic vs live vs `just chat-smoke`).

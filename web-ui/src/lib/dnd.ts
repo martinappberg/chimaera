@@ -65,6 +65,18 @@ export interface LayoutCtrl {
    * has one pane / `newSplit` (Cmd/Ctrl) is set.
    */
   openFileFrom(paneId: string, path: string, newSplit: boolean): void;
+  /**
+   * Open a VALIDATED path from `paneId` by kind: files land in a viewer
+   * pane, directories open in the Finder and reveal in the file tree
+   * (chat prose links — the terminal-link semantics).
+   */
+  openPathFrom(paneId: string, path: string, kind: "file" | "dir", newSplit: boolean): void;
+  /**
+   * Open (or focus) the session-scoped CHANGES review (the files that session
+   * touched) FROM `paneId` — lands in the adjacent pane, or a fresh split when
+   * the window has one pane / `newSplit` (Cmd/Ctrl) is set.
+   */
+  openChangesFrom(paneId: string, sessionId: string, newSplit: boolean): void;
   /** Persist a Finder instance's current directory (its navigation state). */
   navigateFinder(id: string, path: string): void;
   /**
@@ -84,6 +96,11 @@ export interface LayoutCtrl {
    * default (`delta` 0). Same action as the Cmd/Ctrl +/−/0 chords.
    */
   adjustFont(paneId: string, delta: 1 | -1 | 0): void;
+  /**
+   * Switch an agent session between the chat and terminal surfaces (the
+   * pane-bar toggle). Confirms with the user when the agent is mid-task.
+   */
+  switchView(sessionId: string, target: "chat" | "term"): void;
 }
 
 interface PaneReg {
