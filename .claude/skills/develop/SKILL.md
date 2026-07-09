@@ -97,16 +97,25 @@ just app-build          # bundle the .app/.dmg
 released app) share `~/.chimaera` — a dev build would fight your real app over
 the manifest, port, saved hosts, and window registry. `app-dev-isolated` runs
 [`run-app-isolated.sh`](run-app-isolated.sh), which sets `CHIMAERA_HOME=
-<worktree>/.chimaera-dev-app` before launching the built binary. Because the app,
-the `--daemon` it spawns (a free port, THIS worktree's build), and the shells
-that daemon spawns all inherit `CHIMAERA_HOME`, the whole stack is isolated —
-nothing lands in the shared `~/.chimaera`. It opens on an empty home (no saved
-workspaces/hosts), which is how you tell it apart from your real window. Use it to
-exercise the full binary end to end — the native clipboard command, the reauth
-overlay, the daemon changes — which the browser preview can't reach. A debug
-daemon reads `web-ui/dist` from disk, so after a UI change rebuild the UI and
-reload the window; no app restart. (Verifying a REMOTE flow this way still targets
-the host's shared `~/.chimaera` over ssh — mind a running real session there.)
+~/.chimaera-dev-app/<worktree>` before launching the built binary. Because the
+app, the `--daemon` it spawns (a free port, THIS worktree's build), and the
+shells that daemon spawns all inherit `CHIMAERA_HOME`, the whole stack is isolated
+— nothing lands in the shared `~/.chimaera` — yet still per-worktree.
+
+**Why `~/…` and not `<worktree>/.chimaera-dev-app`:** the state dir holds unix
+sockets (the askpass relay, the ssh ControlMaster) whose *full path* must fit the
+~104-byte `sun_path` limit. A CHIMAERA_HOME inside the deep worktree path
+overshoots it — the socket binds fail (askpass can't reach the app, so ssh auth
+dies; ssh mux fails with "ControlPath too long"). Anchoring under a short `~`
+base keeps every socket path legal.
+
+It opens on an empty home (no saved workspaces/hosts), which is how you tell it
+apart from your real window. Use it to exercise the full binary end to end — the
+native clipboard command, the reauth overlay, the daemon changes — which the
+browser preview can't reach. A debug daemon reads `web-ui/dist` from disk, so
+after a UI change rebuild the UI and reload the window; no app restart.
+(Verifying a REMOTE flow this way still targets the host's shared `~/.chimaera`
+over ssh — mind a running real session there.)
 
 ## Remote (HPC / dev server)
 

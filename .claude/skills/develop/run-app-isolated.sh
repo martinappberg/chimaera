@@ -16,7 +16,12 @@
 set -euo pipefail
 
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-export CHIMAERA_HOME="$ROOT/.chimaera-dev-app"
+# The state dir MUST stay short: it holds unix sockets (the askpass relay, the
+# ssh ControlMaster) whose full path has to fit the ~104-byte `sun_path` limit.
+# A CHIMAERA_HOME *inside* the deep worktree path overshoots and the socket binds
+# fail (askpass can't reach the app → ssh auth dies; ssh mux fails). So anchor it
+# in $HOME under a per-worktree subdir: short base, still isolated per worktree.
+export CHIMAERA_HOME="$HOME/.chimaera-dev-app/$(basename "$ROOT")"
 mkdir -p "$CHIMAERA_HOME"
 
 BIN="$ROOT/crates/chimaera-app/target/debug/chimaera"
