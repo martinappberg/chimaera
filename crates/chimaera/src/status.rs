@@ -1,9 +1,17 @@
 use chimaera_core::Manifest;
+use chimaera_remote::RemoteHome;
 
-pub async fn run(host: Option<&str>) -> anyhow::Result<()> {
+pub async fn run(host: Option<&str>, dev: bool) -> anyhow::Result<()> {
     match host {
         None => local(),
-        Some(host) => remote(host).await,
+        Some(host) => {
+            let home = if dev {
+                RemoteHome::Dev
+            } else {
+                RemoteHome::Real
+            };
+            remote(host, home).await
+        }
     }
 }
 
@@ -16,8 +24,8 @@ fn local() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn remote(host: &str) -> anyhow::Result<()> {
-    let Some(manifest) = chimaera_remote::remote_manifest(host).await? else {
+async fn remote(host: &str, home: RemoteHome) -> anyhow::Result<()> {
+    let Some(manifest) = chimaera_remote::remote_manifest(host, home).await? else {
         println!("not running");
         return Ok(());
     };

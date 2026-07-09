@@ -13,9 +13,9 @@ same static binary is the daemon, the remote-connect client, and the operator's 
 | Command | Invocation | What it does |
 |---|---|---|
 | `serve` | `chimaera serve [--port N]` | Run the daemon in the foreground. **Load-bearing string** — `chimaera-remote` runs `…/chimaera serve` over ssh, so don't rename it. |
-| `status` | `chimaera status [host]` | Local: read the `Manifest`. Remote: go through `chimaera-remote`. Prints running / stale / not-running. |
+| `status` | `chimaera status [host] [--dev]` | Local: read the `Manifest`. Remote: go through `chimaera-remote`. `--dev` (requires a host) reads the isolated dev daemon's manifest instead. Prints running / stale / not-running. |
 | `kill` | `chimaera kill` | Stop a running local daemon. |
-| `connect` | `chimaera connect <host> [--local-port N] [--binary PATH] [--no-open] [--update-daemon]` | Stand up + tunnel to a remote daemon — see [remote-connect.md](remote-connect.md). |
+| `connect` | `chimaera connect <host> [--local-port N] [--binary PATH] [--no-open] [--update-daemon] [--dev]` | Stand up + tunnel to a remote daemon — see [remote-connect.md](remote-connect.md). `--dev` (dev builds only) targets the isolated `~/.chimaera-dev` daemon. |
 | `doctor` | `chimaera doctor` | Probe write access to the data/runtime dirs and whether `ssh` / `claude` are on PATH. |
 | `shell-integration` | `chimaera shell-integration` | Print the shell-integration snippet (for a remote host's rc file). |
 

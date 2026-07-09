@@ -22,6 +22,9 @@ pub struct LocalState {
     outdated: bool,
     build: Option<String>,
     live_sessions: Option<usize>,
+    /// This app is a dev build (never release-stamped) — the only kind that
+    /// may offer dev-daemon connections. Gates the add-host dev toggle.
+    dev_build: bool,
 }
 
 /// Payload of the `local-daemon-updated` broadcast: every window on the
@@ -69,14 +72,24 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         .collect())
 }
 
+/// `dev` saves the host as a dev-daemon connection (isolated
+/// `~/.chimaera-dev`, this machine's own build). One-way: re-adding an
+/// existing alias with `dev` upgrades it, and leaving dev mode is forget +
+/// re-add — see `HostEntry::dev`.
 #[tauri::command]
-pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
+pub(super) async fn add_host(alias: String, dev: Option<bool>) -> Result<HostState, String> {
     let alias = alias.trim().to_string();
     if alias.is_empty() || alias.starts_with('-') {
         return Err("that does not look like an ssh alias".to_string());
     }
+    let dev = dev.unwrap_or(false);
+    // The UI hides the toggle on a release build; this backstops anything
+    // that invokes the command directly. `connect` re-checks regardless.
+    if dev && !chimaera_core::is_dev_build() {
+        return Err("dev connections need a dev build of chimaera".to_string());
+    }
     let mut store = HostsStore::load_default();
-    let entry = store.add(&alias, None).map_err(|e| format!("{e:#}"))?;
+    let entry = store.add(&alias, None, dev).map_err(|e| format!("{e:#}"))?;
     Ok(state_for(&entry, "disconnected", None))
 }
 
@@ -177,6 +190,7 @@ pub(super) async fn local_state(state: State<'_, Shell>) -> Result<LocalState, S
         outdated: d.outdated,
         build: d.build,
         live_sessions: d.live_sessions,
+        dev_build: chimaera_core::is_dev_build(),
     })
 }
 

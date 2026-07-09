@@ -10,6 +10,8 @@ crates/chimaera-app/gen/
 .claude/scheduled_tasks.lock
 .claude/worktrees/
 # Isolated per-worktree daemon state (chimaerad-isolated / serve-isolated.sh).
+# The isolated app (app-dev-isolated) lives under ~/.chimaera-dev-app, out of the
+# repo — its sockets must stay under the ~104-byte sun_path limit (see the skill).
 .chimaera-dev/
 verify-tmp/
 .claude/settings.local.json

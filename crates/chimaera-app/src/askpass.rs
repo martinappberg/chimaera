@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -109,8 +109,43 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The leaf name of the askpass relay socket.
+const SOCK_LEAF: &str = "askpass.sock";
+
+/// The askpass socket DIRECTORY for a given runtime dir: the runtime dir
+/// itself normally, or a short `/tmp/chimaera-<home-hash>/run` when the full
+/// socket path would overshoot the ~104-byte unix-socket (`sun_path`) limit —
+/// a `CHIMAERA_HOME` deep in a worktree pushes `<home>/run/askpass.sock` past
+/// it and the bind fails, so ssh auth dies with no prompt. The twin of
+/// `control_dir` in chimaera-remote (same cap, same fallback shape, still
+/// distinct per home so a dev app's relay never collides with the real
+/// app's); keep the two in step. Pure so the length invariant is testable.
+fn socket_dir(runtime_dir: &Path) -> PathBuf {
+    /// Headroom under the ~104-byte `sun_path` cap.
+    const SUN_PATH_SAFE: usize = 100;
+
+    if runtime_dir.as_os_str().len() + 1 + SOCK_LEAF.len() <= SUN_PATH_SAFE {
+        return runtime_dir.to_path_buf();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    runtime_dir.hash(&mut h);
+    // Keep the `/run` tail so the socket shape (`…/run/askpass.sock`) is
+    // stable per home.
+    PathBuf::from(format!("/tmp/chimaera-{:08x}", h.finish() as u32)).join("run")
+}
+
 fn socket_path() -> PathBuf {
-    chimaera_core::runtime_dir().join("askpass.sock")
+    let dir = socket_dir(&chimaera_core::runtime_dir());
+    // The /tmp fallback dir is ours alone — same 0700 as the runtime dir it
+    // stands in for (the socket carries ssh secrets). Best-effort like the
+    // core dir resolvers: the bind reports the real failure.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    if let Err(e) = builder.create(&dir) {
+        tracing::warn!("failed to create askpass socket dir {}: {e}", dir.display());
+    }
+    dir.join(SOCK_LEAF)
 }
 
 fn shim_path() -> PathBuf {
@@ -246,6 +281,37 @@ fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    /// The askpass socket must always bind: a short runtime dir is used
+    /// as-is, while a deep isolated `CHIMAERA_HOME` (whose `<home>/run`
+    /// overshoots the ~104-byte `sun_path` cap) falls back to a short `/tmp`
+    /// dir keyed by the home — still ending in `/run`, still distinct per
+    /// home so a dev app's relay never answers the real app's ssh. Mirrors
+    /// `control_dir_stays_under_sun_path_for_a_deep_home` in chimaera-remote.
+    #[test]
+    fn socket_dir_stays_under_sun_path_for_a_deep_home() {
+        // Normal home: unchanged — the runtime dir itself.
+        let normal = socket_dir(Path::new("/Users/x/.chimaera-dev-app/worktree/run"));
+        assert_eq!(normal, Path::new("/Users/x/.chimaera-dev-app/worktree/run"));
+
+        // Deep isolated home (CHIMAERA_HOME inside a worktree) overshoots →
+        // /tmp fallback that keeps the full socket path legal.
+        let deep = socket_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/magical-colden-00b63c/.chimaera-dev/run",
+        ));
+        assert!(deep.starts_with("/tmp/"), "{}", deep.display());
+        assert!(deep.ends_with("run"), "{}", deep.display());
+        assert!(
+            deep.as_os_str().len() + 1 + SOCK_LEAF.len() <= 104,
+            "{}",
+            deep.display()
+        );
+        // A different deep home resolves to a different socket dir.
+        let other = socket_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev/run",
+        ));
+        assert_ne!(other, deep);
+    }
 
     /// The helper and server must agree on framing: the client half-closes to
     /// mark the prompt's end, the server replies with the secret + one newline

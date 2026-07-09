@@ -26,6 +26,9 @@ pub struct HostState {
     outdated: bool,
     remote_build: Option<String>,
     live_sessions: Option<usize>,
+    /// This host connects to its isolated dev daemon (`~/.chimaera-dev`,
+    /// this machine's own build) — the row wears the dev badge.
+    dev: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,6 +69,7 @@ pub(super) fn state_for(
         outdated: tunnel.is_some_and(|t| t.outdated),
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
+        dev: entry.dev,
     }
 }
 
@@ -83,6 +87,11 @@ async fn run_connect(
         local_port,
         binary: entry.binary.clone(),
         update_daemon,
+        // Dev-ness lives on the persisted entry, not on the call: every path
+        // into a connect — a row click, the health monitor's reconnect,
+        // launch-time window restore — must land on the same daemon, and a
+        // dev tunnel silently healing into the real one would be a bug.
+        dev: entry.dev,
     };
     let progress_app = app.clone();
     let progress_alias = alias.to_string();
@@ -241,8 +250,10 @@ async fn run_flight(
             None => None,
         }
     };
+    // `dev: false` here means "no opinion" — add() never downgrades an
+    // entry's persisted dev flag, so a reconnect stays in dev mode.
     let entry = HostsStore::load_default()
-        .add(alias, None)
+        .add(alias, None, false)
         .map_err(|e| format!("{e:#}"))?;
     let result = run_connect(app, alias, &entry, reuse_port, update_daemon).await;
     // The reused port was free a moment ago (we just cancelled the forward),
@@ -320,6 +331,7 @@ fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
         .unwrap_or(chimaera_remote::hosts::HostEntry {
             alias: alias.to_string(),
             binary: None,
+            dev: false,
             added_at: 0,
             last_connected_at: None,
         })

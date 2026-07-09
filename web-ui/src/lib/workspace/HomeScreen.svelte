@@ -97,6 +97,8 @@
   let hostErrors = $state<Map<string, string>>(new Map());
   let addOpen = $state(false);
   let addAlias = $state("");
+  /** Save the host as a dev-daemon connection (isolated ~/.chimaera-dev). */
+  let addDev = $state(false);
   let addError = $state<string | null>(null);
   let confirmForget = $state<string | null>(null);
   /** Host pending a "end all sessions" / "shut down" confirm (alias). */
@@ -145,10 +147,13 @@
   onMount(() => {
     if (!native) return;
     void refreshHosts();
-    // Only the local window asks about the local daemon's build parity.
+    // Every native window asks for the shell state: the outdated note renders
+    // only on the local window, but the dev-build flag gates the add-host dev
+    // toggle everywhere.
+    void localDaemonState().then((s) => (localState = s));
+    // Only the local window quietly asks GitHub whether a newer signed app
+    // build exists.
     if (hostLabel === "local") {
-      void localDaemonState().then((s) => (localState = s));
-      // Quietly ask GitHub whether a newer signed app build exists.
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
     const unlisteners: Array<() => void> = [];
@@ -265,8 +270,9 @@
     if (alias === "") return;
     addError = null;
     try {
-      await addHost(alias);
+      await addHost(alias, addDev);
       addAlias = "";
+      addDev = false;
       addOpen = false;
       await refreshHosts();
       void connect(alias);
@@ -543,6 +549,16 @@
                 }
               }}
             />
+            {#if localState?.dev_build}
+              <button
+                type="button"
+                class="dev-toggle"
+                class:on={addDev}
+                aria-pressed={addDev}
+                title="dev daemon: deploy this machine's own build (just dist) to an isolated ~/.chimaera-dev on the host — the real ~/.chimaera daemon is left untouched"
+                onclick={() => (addDev = !addDev)}>dev</button
+              >
+            {/if}
             <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
               >connect</button
             >
@@ -621,6 +637,13 @@
                           : "not connected"}
                     ></span>
                     <span class="name">{h.alias}</span>
+                    {#if h.dev}
+                      <span
+                        class="pill-dev"
+                        title="dev daemon — this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                        >dev</span
+                      >
+                    {/if}
                     {#if phase !== undefined}
                       <span class="phase">{phase}</span>
                     {:else if h.status === "connected"}
@@ -1265,6 +1288,42 @@
   .add-input::placeholder {
     color: var(--muted);
     opacity: 0.7;
+  }
+
+  /* Dev-daemon language: amber, the "this is special" register — a host
+     wired to the isolated dev daemon must never read like a normal one.
+     The add-form toggle and the row pill share it. */
+  .dev-toggle {
+    flex: none;
+    appearance: none;
+    background: none;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+
+  .dev-toggle:hover {
+    color: var(--fg);
+  }
+
+  .dev-toggle.on {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+  }
+
+  .pill-dev {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    border-radius: 999px;
+    padding: 1px 7px;
   }
 
   .err-line {

@@ -24,15 +24,46 @@ use tokio::process::{Child, Command};
 
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
 /// is ssh's own hash of (localhost, remotehost, port, user): unique per
-/// destination and short enough to stay under the ~104-char unix-socket path
-/// limit a full hostname would blow past. The parent dir is created on demand
-/// (ssh will not create it for the socket).
+/// destination and short. The parent dir is created on demand (ssh will not
+/// create it for the socket).
+///
+/// The WHOLE expanded socket path must stay under the ~104-byte unix-socket
+/// (`sun_path`) limit. `data_dir()/cm/%C` clears it comfortably for the normal
+/// `~/.chimaera` home, but an isolated `CHIMAERA_HOME` under a deep worktree
+/// path (the dev app) overshoots even though `%C` keeps the leaf short — ssh
+/// then fails every call with "ControlPath too long". So when the preferred
+/// path wouldn't fit, anchor the socket in a short `/tmp` dir keyed by a hash of
+/// the home: short enough for `sun_path`, yet still distinct per home so a dev
+/// app's master never collides with the real app's. A normal home is
+/// unaffected — it keeps `data_dir()/cm/%C`.
 fn control_path() -> String {
-    let dir = chimaera_core::data_dir().join("cm");
+    let dir = control_dir(&chimaera_core::data_dir());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
     }
     dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// The ControlMaster socket DIRECTORY for a given state dir: `<data_dir>/cm`
+/// normally, or a short `/tmp/chimaera-<home-hash>/cm` when that would push the
+/// expanded socket path past the `sun_path` limit (a deep isolated
+/// `CHIMAERA_HOME`). Pure so the length invariant can be tested without env.
+fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    /// `%C` expands to a 40-hex-char hash; reserve for it.
+    const C_LEAF: usize = 40;
+    /// Headroom under the ~104-byte `sun_path` cap.
+    const SUN_PATH_SAFE: usize = 100;
+
+    let preferred = data_dir.join("cm");
+    if preferred.as_os_str().len() + 1 + C_LEAF <= SUN_PATH_SAFE {
+        preferred
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data_dir.hash(&mut h);
+        // Keep the `/cm` tail so the socket shape (`…/cm/%C`) is stable per home.
+        std::path::PathBuf::from(format!("/tmp/chimaera-{:08x}", h.finish() as u32)).join("cm")
+    }
 }
 
 /// The `-o` options shared by every chimaera ssh/scp call to a host.
@@ -132,6 +163,104 @@ pub struct ConnectOpts {
     /// Replace an outdated remote daemon even when it has live sessions
     /// (they end with it). The stop is always graceful — SIGTERM, never -9.
     pub update_daemon: bool,
+    /// Target the host's isolated DEV home ([`RemoteHome::Dev`]) instead of
+    /// the real `~/.chimaera`: deploy a locally built binary there and run
+    /// its daemon under its own `CHIMAERA_HOME`, next to — never touching —
+    /// the real daemon. The end-user release-download path is disabled; a
+    /// dev connect that can't find a local build fails instead.
+    pub dev: bool,
+}
+
+/// Which per-user state root on the HOST a connect targets. Every remote
+/// side effect — the manifest probed, the binary installed, the daemon
+/// started (and that daemon's own state, via `CHIMAERA_HOME`), the
+/// reuse/update decision — derives from this one value, so the two roots are
+/// fully disjoint: a dev daemon runs NEXT TO the real one and a dev connect
+/// can never stop, replace, or even read the real daemon.
+///
+/// `Real` is the shared `~/.chimaera`, where the home IS the data dir
+/// (manifest at `~/.chimaera/manifest.json`). `Dev` runs the daemon under
+/// `CHIMAERA_HOME=~/.chimaera-dev`, which relocates its data dir to
+/// `<home>/data` — hence the asymmetric manifest/log paths. The dev home
+/// stays short and `$HOME`-anchored deliberately: the remote daemon's own
+/// runtime dir (`<home>/run`) is bound by the same ~104-byte `sun_path`
+/// limit as our local sockets (see [`control_dir`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RemoteHome {
+    /// The end-user daemon at `~/.chimaera` (release binaries).
+    #[default]
+    Real,
+    /// The isolated dev daemon at `~/.chimaera-dev` (locally built binaries).
+    Dev,
+}
+
+impl RemoteHome {
+    fn from_opts(opts: &ConnectOpts) -> Self {
+        if opts.dev {
+            RemoteHome::Dev
+        } else {
+            RemoteHome::Real
+        }
+    }
+
+    /// The state root as a `$HOME`-anchored fragment for remote shell
+    /// commands (expanded by the remote shell, never locally).
+    fn dir(self) -> &'static str {
+        match self {
+            RemoteHome::Real => "$HOME/.chimaera",
+            RemoteHome::Dev => "$HOME/.chimaera-dev",
+        }
+    }
+
+    /// The daemon's manifest path. Real: the home is the data dir. Dev:
+    /// `CHIMAERA_HOME` relocates data one level down, to `<home>/data`.
+    fn manifest_path(self) -> String {
+        match self {
+            RemoteHome::Real => format!("{}/manifest.json", self.dir()),
+            RemoteHome::Dev => format!("{}/data/manifest.json", self.dir()),
+        }
+    }
+
+    /// The directory the started daemon's stdout/stderr log lives in (same
+    /// data-dir split as [`Self::manifest_path`]).
+    fn log_dir(self) -> String {
+        match self {
+            RemoteHome::Real => format!("{}/logs", self.dir()),
+            RemoteHome::Dev => format!("{}/data/logs", self.dir()),
+        }
+    }
+
+    fn log_path(self) -> String {
+        format!("{}/serve.log", self.log_dir())
+    }
+
+    fn bin_dir(self) -> String {
+        format!("{}/bin", self.dir())
+    }
+
+    fn bin_path(self) -> String {
+        format!("{}/chimaera", self.bin_dir())
+    }
+
+    /// The staged-upload scp destination, relative to the remote `$HOME`
+    /// (scp has no remote shell to expand `$HOME` in).
+    fn scp_staged_bin(self) -> &'static str {
+        match self {
+            RemoteHome::Real => ".chimaera/bin/chimaera.new",
+            RemoteHome::Dev => ".chimaera-dev/bin/chimaera.new",
+        }
+    }
+
+    /// The env assignment that scopes the started daemon (and all the state
+    /// it writes) to this home — empty for the real home. An ENV PREFIX, not
+    /// a flag: `chimaera serve` is a load-bearing CLI string and must stay
+    /// exactly that.
+    fn serve_env(self) -> &'static str {
+        match self {
+            RemoteHome::Real => "",
+            RemoteHome::Dev => "CHIMAERA_HOME=$HOME/.chimaera-dev ",
+        }
+    }
 }
 
 /// What [`connect`] should do about a daemon already running on the host.
@@ -317,12 +446,16 @@ trait RemoteOps {
 }
 
 /// The production [`RemoteOps`]: every method is a one-line delegation to the
-/// existing free function, so behavior is preserved by construction.
-struct SshOps;
+/// existing free function, so behavior is preserved by construction. Carries
+/// the [`RemoteHome`] so the whole decision phase is scoped to one root — the
+/// policy in [`resolve_daemon`] never needs to know which.
+struct SshOps {
+    home: RemoteHome,
+}
 
 impl RemoteOps for SshOps {
     async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>> {
-        remote_manifest(host).await
+        remote_manifest(host, self.home).await
     }
     async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool> {
         remote_alive(host, pid).await
@@ -340,7 +473,7 @@ impl RemoteOps for SshOps {
         binary: Option<&Path>,
         progress: &impl Fn(Phase),
     ) -> anyhow::Result<PathBuf> {
-        resolve_local_binary(host, binary, &progress).await
+        resolve_local_binary(host, binary, self.home, &progress).await
     }
     async fn stop_remote(&self, host: &str, pid: u32) -> anyhow::Result<()> {
         stop_remote(host, pid).await
@@ -351,10 +484,10 @@ impl RemoteOps for SshOps {
         path: &Path,
         progress: &impl Fn(Phase),
     ) -> anyhow::Result<()> {
-        deploy_binary(host, path, &progress).await
+        deploy_binary(host, path, self.home, &progress).await
     }
     async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest> {
-        start_remote(host).await
+        start_remote(host, self.home).await
     }
     async fn ensure_remote_binary(
         &self,
@@ -362,7 +495,7 @@ impl RemoteOps for SshOps {
         binary: Option<&Path>,
         progress: &impl Fn(Phase),
     ) -> anyhow::Result<()> {
-        ensure_remote_binary(host, binary, &progress).await
+        ensure_remote_binary(host, binary, self.home, &progress).await
     }
 }
 
@@ -453,12 +586,27 @@ pub async fn connect(
     opts: ConnectOpts,
     progress: impl Fn(Phase),
 ) -> anyhow::Result<Tunnel> {
+    // The dev connect is a development tool, gated out of stamped releases at
+    // this single choke point so every caller (CLI flag, app host entry —
+    // including a dev-marked entry that leaked into a production app's hosts
+    // file) inherits it. A release client dev-connecting would also be
+    // nonsense operationally: it deploys "your build", and a release build
+    // has no checkout to have built one from.
+    if opts.dev && !chimaera_core::is_dev_build() {
+        bail!(
+            "dev connections need a dev build of chimaera (this is v{}) — \
+             run one from a checkout, or re-add the host without dev mode",
+            chimaera_core::VERSION,
+        );
+    }
     // Normalize whatever the caller has (saved entries predate validation;
     // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
     // so every ssh invocation below sees a real destination.
     let host = &hosts::normalize_alias(host)?;
-    let (manifest, outdated, live_sessions) =
-        resolve_daemon(&SshOps, host, &opts, &progress).await?;
+    let ops = SshOps {
+        home: RemoteHome::from_opts(&opts),
+    };
+    let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
 
     let local_port = pick_local_port(opts.local_port, manifest.port)?;
     progress(Phase::Tunneling { local_port });
@@ -481,10 +629,10 @@ pub async fn connect(
     })
 }
 
-/// Fetch and parse the remote manifest, if any.
-pub async fn remote_manifest(host: &str) -> anyhow::Result<Option<Manifest>> {
+/// Fetch and parse the remote manifest from `home`, if any.
+pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Option<Manifest>> {
     let output = ssh_cmd(host)
-        .arg("cat ~/.chimaera/manifest.json 2>/dev/null")
+        .arg(format!("cat {} 2>/dev/null", home.manifest_path()))
         .output()
         .await
         .context("failed to run ssh")?;
@@ -825,9 +973,17 @@ async fn sha256_file(file: &Path) -> anyhow::Result<String> {
 /// read-only `uname` over the shared connection) — callers resolve this
 /// *before* stopping a running daemon, so a failed fetch never strands a host
 /// with no daemon.
+///
+/// A DEV connect deploys YOUR build, so its source policy differs twice:
+/// no release fallback (a downloaded release masquerading as the dev daemon
+/// would silently test the wrong code — fail loudly instead), and the real
+/// `~/.chimaera/dist` stash is searched as well, because `just dist` writes
+/// there while an isolated app's `dist_dir()` (under `CHIMAERA_HOME`) no
+/// longer points at it.
 async fn resolve_local_binary(
     host: &str,
     binary: Option<&Path>,
+    home: RemoteHome,
     progress: &impl Fn(Phase),
 ) -> anyhow::Result<PathBuf> {
     if let Some(p) = binary {
@@ -837,12 +993,29 @@ async fn resolve_local_binary(
         return Ok(p.to_path_buf());
     }
     let (os, arch) = remote_target(host).await?;
+    let name = dist_name(&os, &arch);
     // Prefer a developer's local `just dist` stash if present, so a repo
     // checkout still overrides with its own build; otherwise auto-fetch the
     // matching daemon from our release (the end-user path — no repo, no stash).
-    let candidate = dist_dir().join(dist_name(&os, &arch));
+    let candidate = dist_dir().join(&name);
     if candidate.is_file() {
         return Ok(candidate);
+    }
+    if home == RemoteHome::Dev {
+        if let Some(stash) = dirs::home_dir().map(|h| h.join(".chimaera").join("dist").join(&name))
+        {
+            if stash.is_file() {
+                return Ok(stash);
+            }
+        }
+        bail!(
+            "no locally built daemon for {host} ({os}/{arch}) — a dev connect \
+             deploys YOUR build, never a release download.\n\
+             Build one with either:\n\
+             \x20 just dist                 (in the chimaera repo: builds musl \
+             binaries into ~/.chimaera/dist)\n\
+             \x20 chimaera connect {host} --dev --binary /path/to/chimaera-built-for-{host}"
+        );
     }
     fetch_release_binary(&os, &arch, progress)
         .await
@@ -858,18 +1031,23 @@ async fn resolve_local_binary(
         })
 }
 
-/// Copy `path` to `$HOME/.chimaera/bin/chimaera` on the host, staged +
-/// renamed so an interrupted copy never leaves a half-written executable and
-/// the old inode stays intact for anything still running it.
-async fn deploy_binary(host: &str, path: &Path, progress: &impl Fn(Phase)) -> anyhow::Result<()> {
+/// Copy `path` to `<home>/bin/chimaera` on the host, staged + renamed so an
+/// interrupted copy never leaves a half-written executable and the old inode
+/// stays intact for anything still running it.
+async fn deploy_binary(
+    host: &str,
+    path: &Path,
+    home: RemoteHome,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<()> {
     progress(Phase::Installing {
         binary: path.to_path_buf(),
     });
-    tracing::info!("installing {} on {host}", path.display());
-    ssh_run(host, "mkdir -p $HOME/.chimaera/bin").await?;
+    tracing::info!("installing {} on {host} ({})", path.display(), home.dir());
+    ssh_run(host, &format!("mkdir -p {}", home.bin_dir())).await?;
     let output = scp_cmd()
         .arg(path)
-        .arg(format!("{host}:.chimaera/bin/chimaera.new"))
+        .arg(format!("{host}:{}", home.scp_staged_bin()))
         .output()
         .await
         .context("failed to run scp")?;
@@ -881,8 +1059,10 @@ async fn deploy_binary(host: &str, path: &Path, progress: &impl Fn(Phase)) -> an
     }
     ssh_run(
         host,
-        "chmod +x $HOME/.chimaera/bin/chimaera.new && \
-         mv -f $HOME/.chimaera/bin/chimaera.new $HOME/.chimaera/bin/chimaera",
+        &format!(
+            "chmod +x {bin}.new && mv -f {bin}.new {bin}",
+            bin = home.bin_path()
+        ),
     )
     .await?;
     Ok(())
@@ -892,41 +1072,56 @@ async fn deploy_binary(host: &str, path: &Path, progress: &impl Fn(Phase)) -> an
 /// fresh-host path — an existing binary is left as-is). Replacing an outdated
 /// one is the caller's job: resolve + deploy around a graceful stop, in that
 /// order, so a failed fetch never kills a working daemon.
+///
+/// The DEV home always deploys, even over an existing binary: its whole point
+/// is running THIS build, and with no dev daemon alive there is nothing a
+/// redeploy could disturb — while a stale binary from last week would
+/// otherwise silently start in place of the code under test.
 async fn ensure_remote_binary(
     host: &str,
     binary: Option<&Path>,
+    home: RemoteHome,
     progress: &impl Fn(Phase),
 ) -> anyhow::Result<()> {
-    if ssh_check(host, "test -x $HOME/.chimaera/bin/chimaera").await? {
+    if home == RemoteHome::Real && ssh_check(host, &format!("test -x {}", home.bin_path())).await? {
         return Ok(());
     }
-    let path = resolve_local_binary(host, binary, progress).await?;
-    deploy_binary(host, &path, progress).await
+    let path = resolve_local_binary(host, binary, home, progress).await?;
+    deploy_binary(host, &path, home, progress).await
 }
 
 /// Start the daemon on the host and poll until its manifest reports alive.
-async fn start_remote(host: &str) -> anyhow::Result<Manifest> {
-    tracing::info!("starting chimaera daemon on {host}");
+async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> {
+    tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
     ssh_run(
         host,
         // `;` not `&&` before setsid: with `&&`, the trailing `&` backgrounds the whole
         // list and the daemon runs as the foreground child of a subshell whose
         // stdout/stderr are the ssh channel — sshd then never closes the session and
         // `connect` hangs forever. Found the hard way on a real cluster.
-        "mkdir -p $HOME/.chimaera/logs; \
-         setsid nohup $HOME/.chimaera/bin/chimaera serve \
-         >> $HOME/.chimaera/logs/serve.log 2>&1 < /dev/null & disown",
+        &format!(
+            "mkdir -p {log_dir}; \
+             {env}setsid nohup {bin} serve \
+             >> {log} 2>&1 < /dev/null & disown",
+            log_dir = home.log_dir(),
+            env = home.serve_env(),
+            bin = home.bin_path(),
+            log = home.log_path(),
+        ),
     )
     .await?;
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Some(m) = remote_manifest(host).await? {
+        if let Some(m) = remote_manifest(host, home).await? {
             if remote_alive(host, m.pid).await? {
                 return Ok(m);
             }
         }
     }
-    bail!("daemon on {host} did not start within 15s (check ~/.chimaera/logs/serve.log there)");
+    bail!(
+        "daemon on {host} did not start within 15s (check {} there)",
+        home.log_path()
+    );
 }
 
 /// Choose the local tunnel port: explicit flag, else the remote port if
@@ -1029,6 +1224,36 @@ mod tests {
     /// the trust-on-first-use host-key policy that lets a fresh install reach
     /// a never-seen host with no tty, and the liveness bounds that keep a
     /// dead link (laptop sleep) from leaving zombie masters and forwards.
+    /// A deep isolated CHIMAERA_HOME (the dev app) must not blow the ~104-byte
+    /// unix-socket path limit: the socket falls back to a short /tmp dir keyed
+    /// by the home, still ending in `/cm` (so `…/cm/%C` holds), and distinct
+    /// homes never collide (a dev master never rides the real app's).
+    #[test]
+    fn control_dir_stays_under_sun_path_for_a_deep_home() {
+        use std::path::Path;
+        // Normal home: unchanged — data_dir/cm.
+        let normal = control_dir(Path::new("/Users/x/.chimaera"));
+        assert!(
+            normal.to_string_lossy().ends_with("/.chimaera/cm"),
+            "{}",
+            normal.display()
+        );
+
+        // Deep isolated home (a worktree CHIMAERA_HOME) overshoots → /tmp fallback.
+        let deep = control_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/magical-colden-00b63c/.chimaera-dev-app/data",
+        ));
+        assert!(deep.starts_with("/tmp/"), "{}", deep.display());
+        assert!(deep.ends_with("cm"), "{}", deep.display());
+        // dir + '/' + the 40-char %C expansion must clear the ~104-byte cap.
+        assert!(deep.as_os_str().len() + 1 + 40 <= 104, "{}", deep.display());
+        // A different deep home resolves to a different socket dir.
+        let other = control_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev-app/data",
+        ));
+        assert_ne!(other, deep);
+    }
+
     #[test]
     fn ssh_opts_multiplex_and_accept_new_hosts() {
         let opts = ssh_opts();
@@ -1113,6 +1338,47 @@ mod tests {
         assert!(
             !http_alive(free_port).await,
             "closed port must read as down"
+        );
+    }
+
+    /// The remote-home fragments are load-bearing shell strings: every remote
+    /// side effect derives from them, so this pins both roots — especially the
+    /// dev asymmetry (`CHIMAERA_HOME` relocates the daemon's data to
+    /// `<home>/data`, so its manifest/log sit one level deeper than the real
+    /// home's) and that scoping rides an ENV PREFIX, never a flag on the
+    /// load-bearing `chimaera serve` string.
+    #[test]
+    fn remote_home_fragments_split_real_and_dev() {
+        use RemoteHome::{Dev, Real};
+        assert_eq!(Real.manifest_path(), "$HOME/.chimaera/manifest.json");
+        assert_eq!(
+            Dev.manifest_path(),
+            "$HOME/.chimaera-dev/data/manifest.json"
+        );
+        assert_eq!(Real.log_path(), "$HOME/.chimaera/logs/serve.log");
+        assert_eq!(Dev.log_path(), "$HOME/.chimaera-dev/data/logs/serve.log");
+        assert_eq!(Real.bin_path(), "$HOME/.chimaera/bin/chimaera");
+        assert_eq!(Dev.bin_path(), "$HOME/.chimaera-dev/bin/chimaera");
+        assert_eq!(Real.serve_env(), "");
+        assert_eq!(Dev.serve_env(), "CHIMAERA_HOME=$HOME/.chimaera-dev ");
+        // scp destinations are $HOME-relative: scp expands no shell variables.
+        assert!(!Real.scp_staged_bin().contains('$'));
+        assert!(!Dev.scp_staged_bin().contains('$'));
+        // The two roots must be disjoint — a dev path may never alias a real
+        // one (".chimaera-dev" starts with ".chimaera", so check the boundary).
+        assert!(!Dev.dir().starts_with(&format!("{}/", Real.dir())));
+        assert_ne!(Dev.dir(), Real.dir());
+        // The opts flag is the only selector.
+        assert_eq!(
+            RemoteHome::from_opts(&ConnectOpts::default()),
+            RemoteHome::Real
+        );
+        assert_eq!(
+            RemoteHome::from_opts(&ConnectOpts {
+                dev: true,
+                ..Default::default()
+            }),
+            RemoteHome::Dev
         );
     }
 

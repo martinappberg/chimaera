@@ -531,6 +531,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "chimaera-core",
+ "dirs",
  "serde",
  "serde_json",
  "tokio",
