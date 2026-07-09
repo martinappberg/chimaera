@@ -1,0 +1,17 @@
+mod agents;
+mod exec;
+mod fs;
+mod git;
+mod ledger;
+mod links;
+mod mcp;
+mod recents;
+mod resumables;
+mod router;
+mod sessions;
+mod settings;
+mod shell;
+mod support;
+mod view_state;
+mod workspaces;
+mod ws;

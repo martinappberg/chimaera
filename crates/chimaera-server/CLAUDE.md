@@ -12,15 +12,20 @@ the module you need and read its header doc.
 
 | Module | What it owns |
 |---|---|
-| `lib.rs` | `AppState` (every shared handle + lock), `app()` route table, the daemon `run()` lifecycle. |
+| `lib.rs` | Crate wiring only: `mod` tree + re-exports (`AppState`, `lock`, `app`, `run`) + `ServerConfig`. |
+| `state.rs` | `AppState` (every shared handle) + `lock()`. |
+| `router.rs` | `app()` — the axum route table. |
+| `lifecycle.rs` | The daemon `run()` lifecycle (bind/handoff/manifest/serve/graceful-shutdown) + the listener helpers. |
 | `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. (Note: chat sessions are not yet in the snapshot — see the chat-mode seam.) |
-| `api.rs` | REST: session create/delete, `session_env`, the agent/model catalog surface, view-switch entry, shutdown. |
+| `api/` | REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.rs` (auth+health+re-exports). |
+| `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |
 | `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe), **`/ws/chat/{id}`** (structured events), `/ws/events` (the session-list bus). |
 | `chat.rs` | **The chat-mode glue** (see below). |
 | `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers. |
-| `agents.rs` | `AgentKind`, `AgentRecord`, `AgentState`, title/file tracking, the agent watcher. |
+| `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
+| `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
-| `git.rs` | Read-only git: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
+| `git/` | Read-only git, split into `resolve`/`parse`/`service`/`worktree`/`http`: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
 | `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, ranged raw reads, atomic writes, `/raw` tickets). There is no separate `previews` module — previews live here. |
 | `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. |
