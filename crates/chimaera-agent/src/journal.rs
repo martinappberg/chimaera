@@ -564,6 +564,56 @@ pub async fn append_marker(dir: &Path, session_id: &str, ev: AgentEvent) -> Resu
     Ok(())
 }
 
+/// Seed a not-yet-live session's journal from a pre-built event history —
+/// used to import an agent's own transcript (a TUI-originated or pre-chimaera
+/// conversation the native-id index never saw) when a resume has no chimaera
+/// journal to copy. Writes valid `SeqEvent` JSONL with monotonic, gap-free seq
+/// from 1 (`seq` the first key), so the resumed driver's [`Journal::open`]
+/// resumes numbering after it and `attach` replays the whole conversation
+/// before the fresh `Init`. Blocking fs: call from a blocking context.
+///
+/// `create_new` refuses to clobber an existing journal — the caller owns the
+/// fresh-target guarantee, and never seeding over a live session's file is the
+/// same invariant the copy-seed path enforces. Oversized events are replaced
+/// with an `Error` marker, matching [`Journal::append`]'s cap so the ring and
+/// replay budgets downstream still hold.
+pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{session_id}.jsonl"));
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let ts = now_ms();
+    for (i, ev) in events.iter().enumerate() {
+        let seq = i as u64 + 1;
+        let mut entry = SeqEvent {
+            seq,
+            ts,
+            ev: ev.clone(),
+        };
+        let mut line = serde_json::to_vec(&entry)?;
+        if line.len() > MAX_ENTRY_BYTES {
+            entry.ev = AgentEvent::Error {
+                message: format!("event exceeded the {MAX_ENTRY_BYTES}-byte journal cap"),
+                fatal: false,
+            };
+            line = serde_json::to_vec(&entry)?;
+        }
+        line.push(b'\n');
+        debug_assert_eq!(
+            parse_seq(&line),
+            Some(seq),
+            "seq must be the first serialized key for the write-path scan"
+        );
+        writer.write_all(&line)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Enforce the chat-dir budget at daemon start: oldest-mtime journals go
 /// first. No live-session exclusions needed — chat sessions die with the
 /// daemon, so at startup every journal is history.
@@ -769,6 +819,51 @@ mod tests {
             }
             other => panic!("expected Error replacement, got {other:?}"),
         }
+    }
+
+    /// The transcript-import seam: a seeded file must carry monotonic, gap-free
+    /// seq from 1 (seq the first key), and a later `Journal::open` must resume
+    /// numbering after it so a resumed session's replay is continuous.
+    #[tokio::test]
+    async fn seed_journal_then_open_resumes_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeded = vec![
+            AgentEvent::UserMessage {
+                text: "hi".into(),
+                attachments: 0,
+            },
+            AgentEvent::TurnStarted {
+                turn_id: "t1".into(),
+            },
+            AgentEvent::MessageChunk {
+                turn_id: "t1".into(),
+                text: "hello".into(),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: Usage::default(),
+            },
+        ];
+        seed_journal(dir.path(), "s-seed", &seeded).unwrap();
+
+        // On-disk shape: seq 1..=N in order, `seq` the first serialized key.
+        let content = fs::read_to_string(dir.path().join("s-seed.jsonl")).unwrap();
+        for (i, line) in content.lines().enumerate() {
+            assert!(line.starts_with("{\"seq\":"), "seq must be first: {line}");
+            let entry: SeqEvent = serde_json::from_str(line).unwrap();
+            assert_eq!(entry.seq, i as u64 + 1, "monotonic, gap-free from 1");
+        }
+
+        // A live Journal continues after the seed rather than restarting.
+        let journal = Journal::open(dir.path(), "s-seed").unwrap();
+        let next = journal.append(msg("live-after-seed")).await;
+        assert_eq!(next.seq, seeded.len() as u64 + 1);
+        let all = blocking_replay(&journal, 0);
+        assert_eq!(all.len(), seeded.len() + 1);
+        assert_eq!(all[0].ev, seeded[0]);
+
+        // Never clobbers an existing journal.
+        assert!(seed_journal(dir.path(), "s-seed", &seeded).is_err());
     }
 
     #[test]

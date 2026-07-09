@@ -22,6 +22,7 @@ pub mod driver;
 pub mod journal;
 pub mod model;
 pub mod ndjson;
+pub mod transcript;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -355,6 +356,14 @@ impl ChatManager {
 
     pub fn journal_dir(&self) -> &PathBuf {
         &self.journal_dir
+    }
+
+    /// Seed a not-yet-spawned session's journal from a pre-built event history
+    /// (transcript import) — see [`journal::seed_journal`]. Blocking fs; the
+    /// caller must run it off the reactor and before spawning the session, so
+    /// [`Journal::open`] picks up the seeded seq tail.
+    pub fn seed_journal(&self, session_id: &str, events: &[AgentEvent]) -> Result<()> {
+        journal::seed_journal(&self.journal_dir, session_id, events)
     }
 
     fn get_session(&self, id: &str) -> Result<Arc<ChatSession>> {
