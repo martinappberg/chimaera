@@ -22,31 +22,35 @@ you opt out. So the PR *title* and *commit prefix* are load-bearing. See
 ## Choose the title deliberately — it becomes the squash commit
 
 On squash-merge the commit subject defaults to the **PR title**, and
-`release.yml` reads that subject to decide the version bump:
+`scripts/version-bump.sh` reads that **subject** (never the body) to decide the
+bump. Full rules + rationale: [docs/agent-guides/releases.md](../../../docs/agent-guides/releases.md).
 
-| PR title starts with | Version bump on merge |
+| PR title starts with | Result on merge |
 |---|---|
-| `feat: ...` | **minor** (0.1.0 → 0.2.0) |
-| `fix:` / `chore:` / `refactor:` / etc. | **patch** (0.1.0 → 0.1.1) |
-| anything with `BREAKING CHANGE` or `!:` | **major** (0.1.0 → 1.0.0) |
+| `feat:` | **minor** — a genuinely new user-facing capability |
+| `fix:` / `perf:` / `revert:` | **patch** |
+| any `!:` (e.g. `feat!:`) | **major** |
+| `refactor:` / `chore:` / `docs:` / `test:` / `ci:` / `build:` / `style:` | **no release** (rebuilds, ships no version) |
+| anything else / no prefix | **patch** (safe default) |
 
-So a user-facing feature must be `feat:` to release as a minor; don't mislabel.
+`feat` is reserved for new capability — mislabeling a fix or refactor as `feat` is
+what makes the minor version run away. Since `refactor:`/`chore:`/`docs:` now cut
+**no release** at all, you rarely need `[skip release]` for those.
 
-## Landing without a release — `[skip release]`
+## Landing without a release
 
-Docs, chores, tooling, CI tweaks — anything that shouldn't ship a new version:
-put **`[skip release]`** in the **PR title** (and optionally the body). The
-release workflow's `version` job is gated on
-`!contains(head_commit.message, '[skip release]')`, so the entire release is
-skipped. Example title:
+Two ways, both read from the **subject** (= PR title):
 
-```
-docs: add CLAUDE.md and dev skills [skip release]
-```
+- **Use a no-release type** — `refactor:` / `chore:` / `docs:` / `test:` / `ci:` /
+  `build:` / `style:`. These rebuild but ship no new version. Prefer this for docs,
+  chores, tooling, CI tweaks, and pure refactors.
+- **Add `[skip release]` to the PR title** when a normally-releasing type shouldn't
+  ship yet, e.g. `feat: experimental thing [skip release]`.
 
-Because the squash subject = PR title by default, tagging the title is the
-reliable way to make it stick — verify the marker survives into the squash
-message at merge time if the title was edited.
+Both are **subject-anchored**: a mention in the PR *body* no longer skips or flips a
+release (the old gate matched the whole folded message). So you can safely describe
+`[skip release]` or dangerous commands in the body. If the title was edited at merge
+time, verify the type/marker survived into the squash subject.
 
 ## Open it
 

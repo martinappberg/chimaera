@@ -140,9 +140,10 @@ just serve      # build the UI and run the daemon locally
 just dev-ui     # Vite dev server against a running daemon (develop on :5173)
 ```
 
-Every merge to `main` cuts a published release; the version is bumped from the squash-merge
-commit message (Conventional Commits). Put **`[skip release]`** in a PR title to land docs or
-chores without shipping a version.
+A releasing merge to `main` cuts a published release; the version is bumped from the
+squash-merge **subject** (Conventional Commits — `feat:` → minor, `fix:` → patch, `!` →
+major; `refactor:`/`chore:`/`docs:` and `[skip release]` ship nothing). Full rules:
+[docs/agent-guides/releases.md](docs/agent-guides/releases.md).
 
 ## License
 

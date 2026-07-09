@@ -62,18 +62,18 @@ should come with tests at that level.
 
 ## Releases and update signing
 
-**Every merge to `main` cuts a published release.** `.github/workflows/release.yml` derives
-the next version from the last git tag, bumped by the squash-merge commit message
-(Conventional Commits: `feat:` → minor, `BREAKING CHANGE`/`!:` → major, else patch), builds
-the static musl daemon binaries and the signed macOS app, and **publishes** (not drafts) the
-GitHub Release. Publishing directly is safe because branch protection already required CI
-green on the merge. Published releases carry a `latest.json` the installed app polls to
-auto-update itself; the download is verified against a minisign public key embedded in the
-app, so only a release signed with the matching private key can ever install.
+**A releasing merge to `main` cuts a published release.** `.github/workflows/release.yml`
+derives the next version from the last git tag, bumped from the squash-merge **subject**
+(`feat:` → minor, `fix:`/`perf:` → patch, `!` → major; `refactor:`/`chore:`/`docs:`/… and
+`[skip release]` cut **no** release), builds the static musl daemon binaries and the signed
+macOS app, and **publishes** (not drafts) the GitHub Release. Publishing directly is safe
+because branch protection already required CI green on the merge. Published releases carry a
+`latest.json` the installed app polls to auto-update itself; the download is verified against
+a minisign public key embedded in the app, so only a release signed with the matching private
+key can ever install.
 
-To land a PR **without** cutting a release — docs, chores, tooling — put `[skip release]` in
-the PR title (the squash subject defaults to the PR title, and the release job is gated on
-that string). See [CLAUDE.md](CLAUDE.md) for the full release/skip-release rules.
+The full version mapping and how to skip a release live in
+**[docs/agent-guides/releases.md](docs/agent-guides/releases.md)** (the single source).
 
 Two repo secrets sign updates:
 
