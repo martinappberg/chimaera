@@ -254,11 +254,6 @@ impl SessionManager {
         exec::exec(session.marks(), session.input(), session.exec_lock(), opts).await
     }
 
-    /// Input sender for a session (exec engine path; no snapshot render).
-    pub fn input(&self, id: &str) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
-        self.session(id).map(|s| s.input())
-    }
-
     /// Signal the session's child to terminate (SIGHUP); the wait thread
     /// reaps it and the session unregisters itself. Killing an unknown or
     /// already-exited session is a no-op, so deletes are idempotent.
