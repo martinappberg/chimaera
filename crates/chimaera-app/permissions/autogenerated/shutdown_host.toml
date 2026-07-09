@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shutdown-host"
+description = "Enables the shutdown_host command without any pre-configured scope."
+commands.allow = ["shutdown_host"]
+
+[[permission]]
+identifier = "deny-shutdown-host"
+description = "Denies the shutdown_host command without any pre-configured scope."
+commands.deny = ["shutdown_host"]
