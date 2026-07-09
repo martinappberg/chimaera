@@ -40,6 +40,13 @@ echo "  CHIMAERA_HOME = $CHIMAERA_HOME" >&2
 echo "  daemon log    = $CHIMAERA_HOME/data/logs/serve.log" >&2
 echo "  (a debug daemon reads web-ui/dist from disk — after a UI change, rebuild the UI and reload the window; no app restart)" >&2
 
+# Scrub nested-agent env: launched from inside a Claude Code session (a coding
+# agent driving this script), the app → daemon → spawned claudes would inherit
+# CLAUDECODE / ANTHROPIC_BASE_URL etc. and every agent session dies on startup.
+SCRUB=()
+while IFS= read -r var; do SCRUB+=(-u "$var"); done \
+  < <(env | grep -iE '^(CLAUDE|ANTHROPIC)[A-Z_]*=' | cut -d= -f1)
+
 # exec so a Ctrl-C / kill reaches the app directly. CHIMAERA_HOME is inherited by
 # the app, the daemon it spawns, and the shells that daemon spawns.
-exec "$BIN"
+exec env "${SCRUB[@]}" "$BIN"
