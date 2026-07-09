@@ -480,6 +480,67 @@ pub(crate) fn build_agent_command(
     cmd
 }
 
+/// Argv to resume a chat session as an *interactive* PTY TUI — the degrade
+/// (failed handshake) and toggle-to-terminal paths. Claude reuses
+/// [`build_agent_command`] (settings/model/`--resume`) and appends the
+/// checkpoint-fork flags; codex resumes via its `resume` subcommand (a
+/// flag-shaped builder can't express it) and trails the scheme theme + model.
+/// Both append `--mcp-config` when present. `codex_theme` is the resolved
+/// `tui.theme` name (None when the user's own config.toml already sets one, or
+/// for non-codex agents).
+///
+/// NOTE(needs live confirmation): the codex theme/model flags TRAIL the
+/// `resume` subcommand, and claude's `--fork-session`/`--resume-session-at`
+/// ride the *interactive* resume — both verified for the chat driver but not
+/// yet for this TUI path (`just chat-smoke` / a real degrade spawn).
+// One arg per optional flag, like the sibling argv builders; a params struct
+// would be more ceremony than the fields it wraps.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_agent_resume_command(
+    kind: AgentKind,
+    bin: &Path,
+    settings: Option<&Path>,
+    model: Option<&str>,
+    resume: Option<&str>,
+    fork_at: Option<&str>,
+    mcp_config: Option<&Path>,
+    codex_theme: Option<&str>,
+) -> Vec<String> {
+    let mut argv = if kind == AgentKind::Codex {
+        let mut argv = vec![bin.to_string_lossy().into_owned()];
+        if let Some(resume) = resume {
+            argv.push("resume".to_string());
+            argv.push(resume.to_string());
+        }
+        if let Some(theme) = codex_theme {
+            argv.push("-c".to_string());
+            argv.push(format!("tui.theme={theme}"));
+        }
+        if let Some(model) = model {
+            argv.push("--model".to_string());
+            argv.push(model.to_string());
+        }
+        argv
+    } else {
+        build_agent_command(kind, bin, settings, model, resume, None)
+    };
+    // Claude checkpoint-fork: a rewound session that degrades must keep opening
+    // at the fork point, not resume the full history (which would undo the
+    // rewind). Claude-only — codex has no equivalent on the resume subcommand.
+    if kind == AgentKind::Claude {
+        if let Some(fork_at) = fork_at {
+            argv.push("--fork-session".to_string());
+            argv.push("--resume-session-at".to_string());
+            argv.push(fork_at.to_string());
+        }
+    }
+    if let Some(mcp) = mcp_config {
+        argv.push("--mcp-config".to_string());
+        argv.push(mcp.to_string_lossy().into_owned());
+    }
+    argv
+}
+
 /// Argv for a structured chat session (claude stream-json driver): the
 /// protocol flags come from `chimaera_agent::claude::chat_args` (live-
 /// verified against the pinned CLI version there), plus the same per-session
@@ -919,6 +980,122 @@ mod tests {
                 "tui.theme=catppuccin-mocha",
                 "--model",
                 "o4-mini",
+            ]
+        );
+    }
+
+    // --- build_agent_resume_command: the degrade / toggle-to-TUI argv, moved
+    // out of chat.rs::degrade_to_pty. These pin the exact argv (and order) the
+    // old inline logic produced. Live acceptance of that order is chat-smoke's
+    // job; these guard the assembly.
+
+    #[test]
+    fn build_agent_resume_command_codex_resume_theme_model_mcp() {
+        // Codex resumes via the `resume` subcommand; theme + model trail it,
+        // then --mcp-config.
+        let argv = build_agent_resume_command(
+            AgentKind::Codex,
+            Path::new("/opt/bin/codex"),
+            None,
+            Some("o4-mini"),
+            Some("11111111-2222-3333-4444-555555555555"),
+            None,
+            Some(Path::new("/run/agents/s-1-mcp.json")),
+            Some("catppuccin-mocha"),
+        );
+        assert_eq!(
+            argv,
+            [
+                "/opt/bin/codex",
+                "resume",
+                "11111111-2222-3333-4444-555555555555",
+                "-c",
+                "tui.theme=catppuccin-mocha",
+                "--model",
+                "o4-mini",
+                "--mcp-config",
+                "/run/agents/s-1-mcp.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_resume_command_codex_drops_theme_and_fork() {
+        // No codex theme (user's config.toml sets one) → no `-c`; fork_at is
+        // claude-only and must be dropped for codex.
+        let argv = build_agent_resume_command(
+            AgentKind::Codex,
+            Path::new("/opt/bin/codex"),
+            None,
+            None,
+            Some("11111111-2222-3333-4444-555555555555"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            None,
+            None,
+        );
+        assert_eq!(
+            argv,
+            [
+                "/opt/bin/codex",
+                "resume",
+                "11111111-2222-3333-4444-555555555555",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_resume_command_claude_resume_fork_mcp() {
+        let argv = build_agent_resume_command(
+            AgentKind::Claude,
+            Path::new("/usr/local/bin/claude"),
+            Some(Path::new("/run/agents/s-1-settings.json")),
+            Some("opus"),
+            Some("5e0d64b2-abcd-abcd-abcd-000000000000"),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            Some(Path::new("/run/agents/s-1-mcp.json")),
+            None,
+        );
+        assert_eq!(
+            argv,
+            [
+                "/usr/local/bin/claude",
+                "--settings",
+                "/run/agents/s-1-settings.json",
+                "--model",
+                "opus",
+                "--resume",
+                "5e0d64b2-abcd-abcd-abcd-000000000000",
+                "--fork-session",
+                "--resume-session-at",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "--mcp-config",
+                "/run/agents/s-1-mcp.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_resume_command_claude_no_fork() {
+        let argv = build_agent_resume_command(
+            AgentKind::Claude,
+            Path::new("/usr/local/bin/claude"),
+            Some(Path::new("/run/s.json")),
+            None,
+            Some("5e0d64b2-abcd-abcd-abcd-000000000000"),
+            None,
+            Some(Path::new("/run/m.json")),
+            None,
+        );
+        assert_eq!(
+            argv,
+            [
+                "/usr/local/bin/claude",
+                "--settings",
+                "/run/s.json",
+                "--resume",
+                "5e0d64b2-abcd-abcd-abcd-000000000000",
+                "--mcp-config",
+                "/run/m.json",
             ]
         );
     }
