@@ -599,8 +599,22 @@ pub(crate) async fn switch_view(
     // The resume handle: chat side knows its native id from Init; TUI side
     // from the transcript path hooks report. Missing handle = fresh start in
     // the other mode (still the same chimaera session identity).
+    //
+    // A *resumed* claude chat is spawned with no pinned native id — its
+    // `native_session_id` stays None until the first turn emits `system/init`.
+    // Toggling chat→term before sending a message would otherwise respawn
+    // claude with no `--resume` (an empty conversation). Fall back to the
+    // handle this chat was itself resumed from (still the conversation tip
+    // while no turn has run), so the terminal reattaches to the same history.
     let resume = if currently_chat {
-        chat_info.as_ref().and_then(|c| c.native_session_id.clone())
+        chat_info
+            .as_ref()
+            .and_then(|c| c.native_session_id.clone())
+            .or_else(|| {
+                crate::lock(&state.chat_recipes)
+                    .get(&id)
+                    .and_then(|r| r.resume.clone())
+            })
     } else {
         record.resume_id()
     };

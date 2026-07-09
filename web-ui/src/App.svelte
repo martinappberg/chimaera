@@ -1174,17 +1174,18 @@
   }
 
   $effect(() => {
-    // A remote window wears its host so a wall of similar windows is legible:
-    //   "crc_finish • Sherlock — chimaera"  (remote, in a workspace)
-    //   "crc_finish — chimaera"             (local — the host is implicit)
+    // The workspace leads; a remote window wears its host so a wall of similar
+    // windows is legible:
+    //   "crc_finish •Sherlock | chimaera"  (remote, in a workspace)
+    //   "crc_finish | chimaera"            (local — the host is implicit)
     // Home (no workspace) drops the workspace but keeps the host when remote.
     const host = isRemoteWindow ? hostAlias : null;
     const scope = workspace
       ? host
-        ? `${workspace.name} • ${host}`
+        ? `${workspace.name} •${host}`
         : workspace.name
       : (host ?? "");
-    const base = scope ? `${scope} — chimaera` : "chimaera";
+    const base = scope ? `${scope} | chimaera` : "chimaera";
     const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
     document.title = title;
     // The native titlebar doesn't follow document.title — push it explicitly.
@@ -1757,11 +1758,16 @@
   });
 
   /** A Recents row: resume when the CLI supports it (claude), else an
-   *  honest fresh start of the same agent (the tooltip says which). */
+   *  honest fresh start of the same agent (the tooltip says which). The row's
+   *  title rides along so the restored conversation keeps its name instead of
+   *  showing a bare "claude" until a new turn regenerates one. */
   function openRecent(r: RecentConvo): void {
+    const titleHint = r.title !== "" ? r.title : undefined;
     void spawnSession(
       "agent",
-      r.resume !== null ? { agent: r.kind, resume: r.resume } : { agent: r.kind },
+      r.resume !== null
+        ? { agent: r.kind, resume: r.resume, titleHint }
+        : { agent: r.kind, titleHint },
     );
   }
 
@@ -2969,47 +2975,38 @@
   <UpdateToast offer={updateOffer} />
 {/if}
 
-{#if showReconnect}
-  <!-- A remote window's tunnel dropped: we re-run the SSH connect. While ssh
-       is asking for auth the modal above owns the interaction — this overlay
-       steps back to a quiet status line so the user never faces a spinner,
-       an error, AND a password field all claiming the same reconnect. A
-       same-port heal resumes this window in place; a moved daemon re-homes. -->
+{#if showReconnect && !$askpassActive}
+  <!-- A remote window's tunnel dropped: we re-run the SSH connect. While ssh is
+       asking for auth the askpass modal owns the interaction, so this overlay
+       stays hidden (`!$askpassActive`) — the user never faces a spinner, an
+       error, AND a password field all claiming the same reconnect, and the
+       modal's field is never trapped behind this scrim. When the prompt is
+       answered (or there is no prompt) the overlay returns to its quiet status
+       line. A same-port heal resumes this window in place; a moved daemon
+       re-homes. -->
   <div class="reconnect-overlay" role="alertdialog" aria-modal="true" aria-label="reconnecting">
     <div class="reconnect-panel">
       <div class="reconnect-head">
-        <span
-          class="reconnect-spinner"
-          class:spin={reconnecting || $askpassActive}
-          aria-hidden="true"
-        ></span>
+        <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
         <span class="reconnect-title">
-          {$askpassActive
-            ? `authenticating to ${hostAlias}…`
-            : reconnectError !== null
-              ? `can’t reach ${hostAlias}`
-              : `reconnecting to ${hostAlias}…`}
+          {reconnectError !== null ? `can’t reach ${hostAlias}` : `reconnecting to ${hostAlias}…`}
         </span>
       </div>
       <p class="reconnect-body">
-        {$askpassActive
-          ? "ssh needs your credentials — answer the prompt to resume this window."
-          : (reconnectError ??
-            "re-establishing the SSH tunnel — this window resumes where it left off.")}
+        {reconnectError ??
+          "re-establishing the SSH tunnel — this window resumes where it left off."}
       </p>
-      {#if !$askpassActive}
-        <div class="reconnect-actions">
-          <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
-          <button
-            class="reconnect-retry"
-            use:focusOnMount
-            disabled={reconnecting}
-            onclick={() => void attemptReconnect()}
-          >
-            {reconnecting ? "reconnecting…" : "retry"}
-          </button>
-        </div>
-      {/if}
+      <div class="reconnect-actions">
+        <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
+        <button
+          class="reconnect-retry"
+          use:focusOnMount
+          disabled={reconnecting}
+          onclick={() => void attemptReconnect()}
+        >
+          {reconnecting ? "reconnecting…" : "retry"}
+        </button>
+      </div>
     </div>
   </div>
 {/if}

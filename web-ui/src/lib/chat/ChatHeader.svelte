@@ -32,7 +32,7 @@
     effortHint: string;
     hasUltracode: boolean;
     hasThinking: boolean;
-    thinking: boolean | null;
+    thinking: boolean;
     onPickModel: (id: string) => void;
     onPickMode: (id: string) => void;
     onPickEffort: (id: string) => void;
@@ -163,22 +163,23 @@
   {#if hasUltracode}
     <button
       class="chip pick"
-      class:uc-on={store.ultracode}
+      class:on={store.ultracode}
       title="ultracode — xhigh effort + standing workflow orchestration, this session only"
       aria-pressed={store.ultracode}
       onclick={onToggleUltracode}
     >
-      ultracode{store.ultracode ? " on" : ""}
+      ultracode{store.ultracode ? " on" : " off"}
     </button>
   {/if}
   {#if hasThinking}
     <button
       class="chip pick"
-      title="extended thinking — toggles from the next message"
+      class:on={thinking === true}
+      title="extended thinking — applies from your next message"
       aria-pressed={thinking === true}
       onclick={onToggleThinking}
     >
-      thinking{thinking === null ? "" : thinking ? " on" : " off"}
+      thinking{thinking ? " on" : " off"}
     </button>
   {/if}
   <span class="spacer"></span>
@@ -266,7 +267,9 @@
     color: var(--fg);
     border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
   }
-  .chip.uc-on {
+  /* Shared "toggle is on" treatment for the ultracode + thinking chips: an
+     accent tint so an active toggle reads at a glance, not just from its label. */
+  .chip.on {
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
     background: color-mix(in srgb, var(--accent) 10%, transparent);

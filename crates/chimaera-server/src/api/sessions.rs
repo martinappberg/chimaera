@@ -45,6 +45,12 @@ pub(crate) struct CreateSession {
     /// GET /api/v1/agents/claude/sessions.
     #[serde(default)]
     resume: Option<String>,
+    /// A display title to seed a resumed conversation with — the recents row's
+    /// title, carried across the fresh session id an "open recent" mints. Seeds
+    /// the soft `ai_title` (a later `generate_session_title` can still refine
+    /// it), unlike `name`, which pins `custom_title`. Bounded server-side.
+    #[serde(default)]
+    title_hint: Option<String>,
     /// Initial PTY size, clamped to sane bounds. The UI passes the focused
     /// pane's fitted size so TUIs never boot at a wrong size (claude's boot
     /// banner rendered at 80x24 then reflowed was a real observed artifact).
@@ -167,7 +173,12 @@ pub(crate) async fn create_session(
         cols: body.cols,
         rows: body.rows,
         theme: theme.to_string(),
-        title_hint: None,
+        title_hint: body
+            .title_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(crate::agents::truncate_prompt),
         kind,
     };
     match crate::spawn::spawn_session(&state, spec).await {
@@ -279,6 +290,20 @@ async fn spawn_chat_ui(
         .filter(|n| !n.is_empty())
     {
         record.custom_title = Some(name.to_string());
+    }
+    // A resumed recent carries its rail title so the restored conversation is
+    // not a bare "claude" until a new turn regenerates one. Seed the soft
+    // ai_title (a later `generate_session_title` still refines it) unless the
+    // caller also pinned a name above, which outranks it.
+    if record.custom_title.is_none() {
+        if let Some(hint) = body
+            .title_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            record.ai_title = Some(crate::agents::truncate_prompt(hint));
+        }
     }
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());

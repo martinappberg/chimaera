@@ -373,13 +373,13 @@
     codex: "reasoning effort — applies from the next message",
   };
 
-  /** Extended-thinking toggle (claude). Client-held — the CLI has no
-   *  read-back; unknown state treats the first click as ENABLE (clicking a
-   *  bare "thinking" chip means "think more", not "stop"). */
-  let thinking = $state<boolean | null>(null);
+  /** Extended-thinking toggle (claude). Client-held — the CLI has no read-back,
+   *  so we track it locally and start from claude's unset default (off); the
+   *  chip shows an explicit on/off and tints when on, so its state is legible. */
+  let thinking = $state(false);
   const hasThinking = $derived(agentKind === "claude");
   function toggleThinking() {
-    thinking = !(thinking ?? false);
+    thinking = !thinking;
     socket.send({ type: "set_thinking", enabled: thinking });
   }
 

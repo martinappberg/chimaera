@@ -12,6 +12,7 @@
   import { getSetting } from "../settings/store.svelte";
   import CodeView from "./CodeView.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
+  import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
@@ -173,6 +174,8 @@
             <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
             {@html html}
           </article>
+        {:else}
+          <Spinner />
         {/if}
       </div>
     {/if}

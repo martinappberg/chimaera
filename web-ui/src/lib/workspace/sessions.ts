@@ -250,6 +250,10 @@ export interface AgentSpawn {
   agent?: string;
   /** Claude session id to resume (`claude --resume <id>`). */
   resume?: string;
+  /** A title to seed a resumed conversation with (a recents row's title),
+   *  carried across the fresh id an "open recent" mints. Seeds the soft
+   *  ai_title server-side — not a hard rename. */
+  titleHint?: string;
 }
 
 export async function createSession(
@@ -280,6 +284,7 @@ export async function createSession(
   if (kind === "agent") {
     if (spawn.agent !== undefined && spawn.agent !== "claude") extras.agent = spawn.agent;
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
+    if (spawn.titleHint !== undefined && spawn.titleHint !== "") extras.title_hint = spawn.titleHint;
     // New agent sessions open in the structured chat view by default (the
     // agents.defaultView setting); the terminal is one pane-bar toggle away,
     // and the daemon degrades to a PTY on its own if the protocol handshake

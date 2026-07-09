@@ -13,7 +13,7 @@
   import { onMount } from "svelte";
   import { listAgents, uninstallAgent, type AgentInfo } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import { flushSettings, getSetting, setSetting } from "./store.svelte";
+  import { flushSettings, getSetting, isModified, setSetting } from "./store.svelte";
 
   // The four per-agent path keys are all string-typed, so this cast is sound.
   type AgentPathKey =
@@ -104,7 +104,7 @@
 </script>
 
 <section class="agents">
-  <div class="head">
+  <div class="cat-row">
     <h2 class="cat">Agents</h2>
     <button class="recheck" title="re-check installed agents" onclick={() => void load()} disabled={loading}>
       {loading ? "checking…" : "re-check"}
@@ -123,33 +123,29 @@
 
   {#each agents as a (a.id)}
     {@const p = provenance(a)}
-    <div class="agent">
-      <div class="top">
-        <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={13} title={a.name} /></span>
-        <span class="name">{a.name}</span>
-        <span class="prov {p.cls}" title={p.title}>{p.label}</span>
-        {#if a.version}<span class="ver" title={a.version}>{versionNumber(a.version)}</span>{/if}
-        {#if a.outdated}<span class="prov outdated" title="installed but too old to run usefully">outdated</span>{/if}
-        <span class="spacer"></span>
-        {#if a.managed}
-          <button
-            class="uninstall"
-            disabled={removing[a.id]}
-            title="remove chimaera's managed copy (your own install is untouched)"
-            onclick={() => void uninstall(a)}
-          >
-            {removing[a.id] ? "removing…" : "uninstall"}
-          </button>
-        {/if}
+    {@const modified = isModified(pathKey(a.id))}
+    <div class="row" class:modified>
+      <div class="gutter" title={modified ? "path override set" : undefined}></div>
+      <div class="text">
+        <div class="head">
+          <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={13} title={a.name} /></span>
+          <span class="title">{a.name}</span>
+          <span class="badge {p.cls}" title={p.title}>{p.label}</span>
+          {#if a.version}<span class="ver" title={a.version}>{versionNumber(a.version)}</span>{/if}
+          {#if a.outdated}<span class="badge missing" title="installed but too old to run usefully">outdated</span>{/if}
+        </div>
+        <p class="desc" title={a.path ?? undefined}>
+          {a.path ?? "not on your PATH — set a path below, or install it and re-check"}
+        </p>
+        <code class="id" title="settings.json key">{pathKey(a.id)}</code>
+        {#if rowError[a.id]}<div class="err row-err" role="alert">{rowError[a.id]}</div>{/if}
       </div>
-      {#if a.path}
-        <div class="resolved" title={a.path}><span class="mono">{a.path}</span></div>
-      {/if}
-      <div class="form">
+
+      <div class="control">
         <input
-          class="path-input"
+          class="textbox"
           bind:value={inputs[a.id]}
-          placeholder="resolve from login shell / PATH"
+          placeholder="resolve from login shell"
           spellcheck="false"
           autocapitalize="off"
           autocorrect="off"
@@ -159,211 +155,268 @@
           }}
         />
         <button
-          class="save"
+          class="btn"
           disabled={saving[a.id] || (inputs[a.id] ?? "") === getSetting(pathKey(a.id))}
           onclick={() => void save(a.id)}
         >
           {saving[a.id] ? "saving…" : "save"}
         </button>
+        {#if a.managed}
+          <button
+            class="btn danger"
+            disabled={removing[a.id]}
+            title="remove chimaera's managed copy (your own install is untouched)"
+            onclick={() => void uninstall(a)}
+          >
+            {removing[a.id] ? "removing…" : "uninstall"}
+          </button>
+        {/if}
       </div>
-      <code class="id" title="settings.json key">{pathKey(a.id)}</code>
-      {#if rowError[a.id]}<div class="err row" role="alert">{rowError[a.id]}</div>{/if}
     </div>
   {/each}
 </section>
 
 <style>
+  /* Matches the shared settings grammar: an uppercase category header, then a
+     flat two-column row per agent (label + detail left, controls right) with
+     the modified-gutter, hover-revealed key, and container-query stacking —
+     the same recipe as SettingRow, so this section reads as one system. */
   .agents {
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
   }
-  .head {
+
+  .cat-row {
     display: flex;
     align-items: baseline;
-    gap: 0.6rem;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 18px 0 4px;
+    padding: 0 14px;
   }
   .cat {
     margin: 0;
-    font-size: 0.95rem;
+    font-size: var(--text-xs);
     font-weight: 600;
-    color: var(--fg);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
   }
   .recheck {
     appearance: none;
-    border: 1px solid var(--edge);
-    background: var(--term-bg);
-    color: var(--muted);
+    border: none;
+    background: none;
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
+    color: var(--muted);
     cursor: pointer;
-    padding: 0.1rem 0.45rem;
-    border-radius: 5px;
+    padding: 0 4px;
+    border-radius: 4px;
+    transition: color 0.12s ease;
   }
   .recheck:hover:not(:disabled) {
     color: var(--fg);
-    background: var(--row-hover);
   }
   .recheck:disabled {
     opacity: 0.6;
     cursor: default;
   }
   .intro {
-    margin: 0 0 0.2rem;
-    font-size: 0.74rem;
-    line-height: 1.5;
+    margin: 0 0 6px;
+    padding: 0 14px;
+    font-size: var(--text-sm);
+    line-height: 1.45;
     color: var(--muted);
+    max-width: 60ch;
   }
 
-  .agent {
+  /* --- one agent, as a SettingRow-shaped row --- */
+  .row {
+    position: relative;
     display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-    padding: 0.6rem 0.7rem;
-    border: 1px solid var(--edge);
+    align-items: flex-start;
+    gap: 24px;
+    padding: 14px 18px 14px 41px;
     border-radius: 8px;
-    background: var(--term-bg);
+    transition: background-color 0.12s ease;
   }
-  .top {
+  .row:hover {
+    background: color-mix(in srgb, var(--fg) 3%, transparent);
+  }
+
+  .gutter {
+    position: absolute;
+    left: 14px;
+    top: 14px;
+    bottom: 14px;
+    width: 3px;
+    border-radius: 2px;
+    background: transparent;
+  }
+  .row.modified .gutter {
+    background: color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+
+  .text {
+    flex: 1;
+    min-width: 0;
+  }
+  .head {
     display: flex;
-    align-items: center;
-    gap: 0.45rem;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
   }
   .glyph {
+    align-self: center;
     display: flex;
-    align-items: center;
     color: var(--muted);
   }
-  .name {
-    font-size: 0.82rem;
+  .title {
+    font-size: var(--text-md);
     font-weight: 600;
     color: var(--fg);
   }
-  .spacer {
-    flex: 1;
-  }
 
-  .prov {
-    font-size: 0.6rem;
+  /* Provenance / outdated badges: the quiet bordered-mono idiom of the shared
+     "daemon" scope tag, tinted by state (accent = resolvable, warn = not). */
+  .badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    padding: 0.05rem 0.35rem;
-    border-radius: 4px;
     color: var(--muted);
-    background: var(--row-hover);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0 5px;
   }
-  .prov.yours {
+  .badge.yours,
+  .badge.managed,
+  .badge.set {
     color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
-  .prov.managed {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .prov.set {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .prov.missing,
-  .prov.outdated {
+  .badge.missing {
     color: var(--warn);
-    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
   }
 
   .ver {
     font-family: var(--mono);
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
 
-  .uninstall {
-    appearance: none;
-    border: 1px solid var(--edge);
-    background: var(--term-bg);
-    color: var(--muted);
-    font: inherit;
-    font-size: 0.68rem;
-    cursor: pointer;
-    padding: 0.12rem 0.5rem;
-    border-radius: 5px;
-  }
-  .uninstall:hover:not(:disabled) {
-    color: var(--git-deleted, var(--warn));
-    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
-    background: var(--row-hover);
-  }
-  .uninstall:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-
-  .resolved {
-    min-width: 0;
-  }
-  .resolved .mono {
+  .desc {
+    margin: 3px 0 0;
     font-family: var(--mono);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
+    line-height: 1.45;
     color: var(--muted);
     overflow-wrap: anywhere;
   }
 
-  .form {
-    display: flex;
-    gap: 0.4rem;
-  }
-  .path-input {
-    flex: 1;
-    min-width: 0;
-    appearance: none;
-    background: var(--code-bg, var(--term-bg));
-    border: 1px solid var(--edge);
-    border-radius: 6px;
-    padding: 0.22rem 0.45rem;
-    font-family: var(--mono);
-    font-size: 0.72rem;
-    color: var(--fg);
-  }
-  .path-input:focus {
-    outline: none;
-    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .save {
-    appearance: none;
-    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
-    background: var(--term-bg);
-    color: var(--accent);
-    font: inherit;
-    font-size: 0.7rem;
-    cursor: pointer;
-    padding: 0.12rem 0.6rem;
-    border-radius: 6px;
-  }
-  .save:hover:not(:disabled) {
-    background: var(--row-hover);
-  }
-  .save:disabled {
-    opacity: 0.5;
-    cursor: default;
-    color: var(--muted);
-    border-color: var(--edge);
-  }
-
   .id {
+    display: inline-block;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    margin-top: 5px;
     font-family: var(--mono);
-    font-size: 0.62rem;
+    font-size: 10px;
     color: var(--muted);
+    opacity: 0;
+    transition: opacity 0.12s ease;
+    user-select: all;
+  }
+  .row:hover .id {
     opacity: 0.75;
   }
 
+  .control {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 24px;
+    padding-top: 2px;
+  }
+
+  .textbox {
+    width: 200px;
+    min-width: 0;
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 3px 8px;
+  }
+  .textbox:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  .btn {
+    appearance: none;
+    flex: none;
+    border: 1px solid var(--edge);
+    background: var(--term-bg);
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+    padding: 3px 9px;
+    border-radius: 6px;
+    transition:
+      color 0.12s ease,
+      border-color 0.12s ease,
+      background-color 0.12s ease;
+  }
+  .btn:hover:not(:disabled) {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--fg) 3%, transparent);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .btn.danger:hover:not(:disabled) {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+  }
+
   .err {
-    font-size: 0.7rem;
-    color: var(--git-deleted, var(--warn));
+    margin: 4px 14px;
+    font-size: var(--text-sm);
+    color: var(--warn);
     background: color-mix(in srgb, var(--warn) 10%, transparent);
-    padding: 0.25rem 0.45rem;
+    padding: 4px 8px;
     border-radius: 5px;
   }
-  .err.row {
-    margin-top: 0.1rem;
+  .err.row-err {
+    margin: 5px 0 0;
+  }
+
+  /* Narrow pane: stack the controls under the label, matching SettingRow. */
+  @container settings (max-width: 640px) {
+    .row {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 10px;
+      padding-left: 22px;
+      padding-right: 14px;
+    }
+    .control {
+      padding-top: 0;
+      min-height: 0;
+    }
+    .textbox {
+      flex: 1;
+      width: auto;
+    }
   }
 </style>
