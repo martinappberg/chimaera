@@ -23,6 +23,7 @@
   import { PINNED } from "./keys";
   import { keyHint } from "./keybindings";
   import { activeSelection, referenceTarget, requestReference } from "./reference";
+  import { dismiss } from "./dismiss";
   import FileIcon from "./FileIcon.svelte";
   import FolderIcon from "./FolderIcon.svelte";
 
@@ -127,7 +128,6 @@
   // --- "link to agent…" menu (parity path for the drag gesture) ------------
 
   let linkMenuOpen = $state(false);
-  let barRightEl = $state<HTMLElement | null>(null);
 
   /** Live agents in this terminal's workspace, offered by the link menu. */
   const agentChoices = $derived.by(() => {
@@ -136,28 +136,6 @@
       (s) =>
         s.kind === "agent" && s.alive && s.workspace_id === activeSession.workspace_id,
     );
-  });
-
-  // Close the menu on any press outside the bar's right cluster or Escape.
-  $effect(() => {
-    if (!linkMenuOpen) return;
-    const onDown = (e: PointerEvent) => {
-      if (!(e.target instanceof Node) || barRightEl?.contains(e.target) !== true) {
-        linkMenuOpen = false;
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        linkMenuOpen = false;
-      }
-    };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey, true);
-    return () => {
-      window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey, true);
-    };
   });
 
   function chooseAgent(agentId: string): void {
@@ -416,7 +394,10 @@
   <!-- Pane controls at the bar's right edge: the mouse path to every pane
        chord (tooltips teach the chords). Faded in on bar hover; the zoom
        badge stays persistent while zoomed. -->
-  <div class="bar-right" bind:this={barRightEl}>
+  <div
+    class="bar-right"
+    use:dismiss={{ enabled: linkMenuOpen, onDismiss: () => (linkMenuOpen = false) }}
+  >
     {#if hasTermSelection}
       <!-- Selection-driven, not hover-driven: visible exactly while the
            terminal holds a selection. Same handler as the chord. -->
@@ -611,10 +592,10 @@
     </div>
 
     {#if linkMenuOpen}
-      <div class="link-menu" role="menu" aria-label="link to agent">
+      <div class="overlay-surface link-menu" role="menu" aria-label="link to agent">
         <div class="link-menu-title">link to agent</div>
         {#each agentChoices as a (a.id)}
-          <button class="link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
+          <button class="overlay-row link-menu-item" role="menuitem" onclick={() => chooseAgent(a.id)}>
             <span class="chip-dot menu-dot" style:--hue={agentHue(a.id)}></span>
             <span class="link-menu-name">{sessionLabel(a.id)}</span>
             {#if linkedAgentId === a.id}
@@ -885,19 +866,15 @@
     color: var(--fg);
   }
 
-  /* --- link-to-agent menu ------------------------------------------------ */
+  /* --- link-to-agent menu ------------------------------------------------
+     .overlay-surface / .overlay-row live in app.css; these add only the bar
+     anchor (positioned in .bar-right) and the dot-row layout. */
 
   .link-menu {
-    position: absolute;
     top: 25px;
     right: 4px;
     z-index: 20;
     min-width: 180px;
-    padding: 4px;
-    background: var(--overlay-bg);
-    border: 1px solid var(--edge);
-    border-radius: 7px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
   }
 
   .link-menu-title {
@@ -909,25 +886,9 @@
   }
 
   .link-menu-item {
-    appearance: none;
-    border: none;
-    background: none;
     display: flex;
     align-items: center;
     gap: 7px;
-    width: 100%;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font: inherit;
-    font-size: var(--text-sm);
-    color: var(--fg);
-    cursor: pointer;
-    text-align: left;
-    transition: background-color 0.12s ease;
-  }
-
-  .link-menu-item:hover {
-    background: var(--row-hover);
   }
 
   .menu-dot {

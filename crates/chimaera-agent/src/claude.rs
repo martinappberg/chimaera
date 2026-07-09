@@ -1045,22 +1045,7 @@ impl ClaudeMapper {
                                 id: q["question"].as_str()?.to_string(),
                                 header: q["header"].as_str().unwrap_or_default().to_string(),
                                 question: q["question"].as_str()?.to_string(),
-                                options: q["options"]
-                                    .as_array()
-                                    .map(|opts| {
-                                        opts.iter()
-                                            .filter_map(|o| {
-                                                Some(crate::model::QuestionOption {
-                                                    label: o["label"].as_str()?.to_string(),
-                                                    description: o["description"]
-                                                        .as_str()
-                                                        .unwrap_or_default()
-                                                        .to_string(),
-                                                })
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
+                                options: crate::model::question_options(q),
                                 multi_select: q["multiSelect"] == json!(true),
                             })
                         })
@@ -1460,14 +1445,7 @@ impl ClaudeMapper {
         let mut step = DriverStep::default();
         match cmd {
             AgentCommand::Send { blocks } => {
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text = crate::model::blocks_text(&blocks);
                 let attachments = blocks
                     .iter()
                     .filter(|b| matches!(b, ContentBlock::Image { .. }))

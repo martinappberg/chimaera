@@ -150,6 +150,16 @@ Deny → `{behavior:"deny", message, interrupt}` with the directive constant
 `interrupt:false`. Plan approvals: "Yes, and auto-accept" / "No, keep
 planning"; plan comments ride `updatedInput.{userFeedback,userComments}`.
 
+> **Deny → abort (needs live re-verify in chat-smoke).** Because the standard
+> deny carries `interrupt:true`, the CLI ABORTS the turn — it emits an
+> `is_error:true` result (→ `TurnAborted`), NOT a success result. `fake-claude`
+> now mirrors this. UNVERIFIED: `on_result` zeroing `queued_sends` on any
+> `is_error` result assumes the CLI drops its native stdin queue with the
+> aborted turn; the driver now also defensively opens an implicit turn if a
+> stream/assistant/tool frame arrives with `turn_active == false`, so a wrong
+> assumption degrades to a correct boundary instead of a phantom turn. Confirm
+> the real queue-after-abort behavior and delete this note.
+
 ### Claude: checkpoints / rewind (superseded by pass 4 — now built)
 
 Checkpoint key = the USER MESSAGE UUID. Control request
@@ -205,8 +215,11 @@ against the already-streamed fileChange item.
 changes:[{path, diff, kind:{type: add|delete|update, move_path?}}]}` —
 `diff` is FULL CONTENT for add/delete, unified hunks for update
 (`move_path` = rename). Live patches stream via `item/fileChange/patchUpdated`
-`{itemId, changes}` (wholesale replace). Reasoning deltas stream via
-`item/reasoning/textDelta` and `item/reasoning/summaryTextDelta`.
+`{itemId, changes}` (wholesale replace) — **ADOPTED**: the driver re-runs the
+fileChange upsert on each patchUpdated so `item_locations` and the Edit card
+stay current, and an approval arriving after it names the right files.
+Reasoning deltas stream via `item/reasoning/textDelta` and
+`item/reasoning/summaryTextDelta`.
 
 ### Codex: notification inventory beyond ours
 

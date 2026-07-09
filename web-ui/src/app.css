@@ -118,7 +118,7 @@
    Buttons, popovers, and the entrance animation shared by the structured-chat
    cards/dialogs (web-ui/src/lib/chat). Factored here so the recipes can't
    drift per-component and so light/dark both hold from the theme tokens.
-   PaneTabs' .link-menu is a near-twin of .overlay-surface and could adopt it. */
+   Also adopted outside chat/ by PaneTabs' .link-menu. */
 
 /* Action buttons: permission options, dialog actions, the question submit.
    Accent-tinted primary, muted quiet — one recipe. Accent TINT + --fg ink, not

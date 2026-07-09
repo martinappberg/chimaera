@@ -151,7 +151,6 @@ impl JsonlChild {
             sink: JsonlSink { stdin },
             stream: JsonlStream {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
-                stderr_tail: Arc::clone(&stderr_tail),
             },
             guard: ChildGuard { child, stderr_tail },
         })
@@ -210,10 +209,10 @@ impl JsonlSink {
     }
 }
 
-/// Read half of a split [`JsonlChild`].
+/// Read half of a split [`JsonlChild`]. stderr diagnostics stay with the
+/// [`ChildGuard`] half, so the split read loop carries only stdout framing.
 pub struct JsonlStream {
     lines: CappedLines<ChildStdout>,
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl JsonlStream {
@@ -235,11 +234,6 @@ impl JsonlStream {
                 }
             }
         }
-    }
-
-    pub fn stderr_tail(&self) -> String {
-        let tail = self.stderr_tail.lock().expect("stderr tail lock");
-        tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
 }
 

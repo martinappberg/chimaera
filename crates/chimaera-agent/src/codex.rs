@@ -106,11 +106,6 @@ impl CodexChat {
         self.io.recv(timeout).await
     }
 
-    /// Answer a server-initiated request (approvals) by its JSON-RPC id.
-    pub async fn respond(&mut self, id: &Value, result: Value) -> Result<()> {
-        self.io.send(&json!({ "id": id, "result": result })).await
-    }
-
     /// Arbitrary request; returns the raw response FRAME (result or error) so
     /// probes can feature-detect optional methods without bailing.
     pub async fn request_raw(
@@ -1227,22 +1222,7 @@ impl CodexMapper {
                                 id: q["id"].as_str()?.to_string(),
                                 header: q["header"].as_str().unwrap_or_default().to_string(),
                                 question: q["question"].as_str()?.to_string(),
-                                options: q["options"]
-                                    .as_array()
-                                    .map(|opts| {
-                                        opts.iter()
-                                            .filter_map(|o| {
-                                                Some(crate::model::QuestionOption {
-                                                    label: o["label"].as_str()?.to_string(),
-                                                    description: o["description"]
-                                                        .as_str()
-                                                        .unwrap_or_default()
-                                                        .to_string(),
-                                                })
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
+                                options: crate::model::question_options(q),
                                 multi_select: false,
                             })
                         })
@@ -1505,14 +1485,7 @@ impl CodexMapper {
         let mut step = DriverStep::default();
         match cmd {
             AgentCommand::Send { blocks } => {
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text = crate::model::blocks_text(&blocks);
                 // Images ride the input array as data URLs (the extension's
                 // non-local-path form; local paths need a shared fs).
                 let mut input: Vec<Value> = Vec::new();

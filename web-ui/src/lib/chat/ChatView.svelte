@@ -7,7 +7,7 @@
   import { insertIntoComposer } from "./composerBus";
   import { ChatSocket } from "./chatWs";
   import { ChatStore } from "./store.svelte";
-  import { dismiss } from "./dismiss";
+  import { dismiss } from "../dismiss";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";

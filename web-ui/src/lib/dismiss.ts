@@ -1,15 +1,13 @@
 /**
  * Shared "close on outside pointerdown or Escape" behavior — the window-listener
- * idiom that ChatView's menus and PaneTabs' link-menu each hand-rolled. A Svelte
- * action so the listeners are torn down with the node.
+ * idiom that ChatView's menus and PaneTabs' link-menu both used to hand-roll. A
+ * Svelte action so the listeners are torn down with the node.
  *
  * Two inside-tests, matching the two call sites:
  *   - default: a pointerdown inside the HOST node (node.contains) is kept open;
  *   - `keepOpenWithin` set: inside = the target's closest(selector) — use when
  *     the dismissable surfaces live in SIBLING nodes (e.g. several `.menu-host`
  *     chips plus a detached overlay), not inside one host subtree.
- *
- * PaneTabs owns its own copy today; it could adopt this later.
  */
 import type { Action } from "svelte/action";
 

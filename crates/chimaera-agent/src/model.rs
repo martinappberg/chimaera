@@ -334,6 +334,20 @@ pub enum ContentBlock {
     },
 }
 
+/// The text of a user message: its text blocks joined, image blocks dropped —
+/// the prompt string both drivers hand their child. Shared so the two `Send`
+/// handlers can't drift.
+pub fn blocks_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionUi {
@@ -386,6 +400,26 @@ pub struct QuestionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+}
+
+/// Parse the `options` array of a driver's raw question value into normalized
+/// [`QuestionOption`]s. Shared by both question mappers (claude
+/// `AskUserQuestion`, codex `item/tool/requestUserInput`) — the option shape is
+/// identical even though the enclosing `Question` fields differ.
+pub fn question_options(q: &Value) -> Vec<QuestionOption> {
+    q["options"]
+        .as_array()
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    Some(QuestionOption {
+                        label: o["label"].as_str()?.to_string(),
+                        description: o["description"].as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One MCP server row in the /mcp panel.
