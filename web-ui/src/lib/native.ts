@@ -152,17 +152,6 @@ export async function checkAppUpdate(): Promise<string | null> {
 }
 
 /**
- * Download, verify (against the embedded pubkey), and install the pending
- * app update, then relaunch. The call does not return on success — the
- * process restarts into the new build.
- */
-export async function installAppUpdate(): Promise<void> {
-  const t = tauri();
-  if (t === null) throw new Error("not running in the native shell");
-  await t.core.invoke<void>("install_app_update");
-}
-
-/**
  * The one-click update chain: install the signed app update and relaunch;
  * the new process finishes by updating the local daemon (sessions resurrect
  * via the daemon's ledger, windows reopen from the shell's registry). Does
