@@ -32,6 +32,7 @@ use crate::model::{
     cap_head_tail, cap_output, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
     ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand,
     ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, COALESCE_INTERVAL_MS, DIFF_FILE_BUDGET,
+    DIFF_TURN_BUDGET,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -1198,14 +1199,19 @@ impl Mapper {
             .or(request["tool_name"].as_str())
             .unwrap_or("tool")
             .to_string();
+        // The verbatim input stays in pending_permissions (the allow response
+        // must echo updatedInput exactly); the PREVIEW is capped so a
+        // multi-megabyte Write `content` can't bloat the journaled/replayed
+        // event (caps-at-event-construction).
+        let input_preview = cap_preview(&input);
         self.pending_permissions
-            .insert(request_id.clone(), (input.clone(), suggestions));
+            .insert(request_id.clone(), (input, suggestions));
         step.events.push(AgentEvent::PermissionRequest {
             request_id,
             tool_call_id: tool_use_id,
             title,
             options,
-            input_preview: input,
+            input_preview,
         });
     }
 
@@ -1962,19 +1968,34 @@ fn edit_diff_content(name: &str, input: &Value) -> Option<ToolContent> {
         }
         "MultiEdit" => {
             let edits = input["edits"].as_array()?;
-            let diffs: Vec<ToolContent> = edits
-                .iter()
-                .filter_map(|e| {
-                    let (new_text, truncated) = cap_diff(e["new_string"].as_str()?);
-                    let (old_text, old_truncated) = cap_diff(e["old_string"].as_str()?);
-                    Some(ToolContent::Diff {
-                        path: path.clone(),
-                        old_text: Some(old_text),
-                        new_text,
-                        truncated: truncated || old_truncated,
-                    })
-                })
-                .collect();
+            // A MultiEdit can carry an unbounded number of edits, each up to the
+            // per-file cap — enforce the per-turn diff budget so one tool call
+            // can't produce a tens-of-megabytes event.
+            let mut diffs: Vec<ToolContent> = Vec::new();
+            let mut used = 0usize;
+            for e in edits {
+                let (Some(new_str), Some(old_str)) =
+                    (e["new_string"].as_str(), e["old_string"].as_str())
+                else {
+                    continue;
+                };
+                if used + new_str.len() + old_str.len() > DIFF_TURN_BUDGET && !diffs.is_empty() {
+                    // Mark the batch as truncated via the last kept diff.
+                    if let Some(ToolContent::Diff { truncated, .. }) = diffs.last_mut() {
+                        *truncated = true;
+                    }
+                    break;
+                }
+                let (new_text, truncated) = cap_diff(new_str);
+                let (old_text, old_truncated) = cap_diff(old_str);
+                used += new_text.len() + old_text.len();
+                diffs.push(ToolContent::Diff {
+                    path: path.clone(),
+                    old_text: Some(old_text),
+                    new_text,
+                    truncated: truncated || old_truncated,
+                });
+            }
             if diffs.is_empty() {
                 None
             } else {
@@ -2001,7 +2022,27 @@ fn tool_result_text(block: &Value) -> String {
             .filter_map(|p| p["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n"),
+        // Absent content (`content` omitted → Null) is empty output, not the
+        // literal string "null"; other structured values stringify as-is.
+        Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+/// Cap every string leaf of a permission input so a giant Write/Edit payload
+/// can't bloat the journaled/replayed event. Structure is preserved (the UI
+/// renders specific fields); only oversized leaves are head/tail-truncated.
+/// The verbatim input is kept separately for the allow-response echo.
+fn cap_preview(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(crate::model::cap_output(s).0),
+        Value::Array(arr) => Value::Array(arr.iter().map(cap_preview).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), cap_preview(v)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 

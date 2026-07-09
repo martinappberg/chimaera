@@ -796,9 +796,7 @@ impl CodexMapper {
                     step.events
                         .push(AgentEvent::TurnCompleted { turn_id, usage });
                 }
-                self.streamed.clear();
-                self.out_streamed.clear();
-                self.safety_notified = false;
+                self.reset_turn_state();
                 // Refresh rate-limit telemetry once per turn (account/read
                 // is the extension's source; tolerated if absent).
                 let id = self.rpc_id();
@@ -821,10 +819,25 @@ impl CodexMapper {
                         .unwrap_or("turn failed")
                         .to_string(),
                 });
+                // A failed turn must reset per-turn state exactly like a
+                // completed one — else the safety notice stays suppressed and
+                // stream/location maps leak into the next turn.
+                self.reset_turn_state();
             }
             _ => {}
         }
         step
+    }
+
+    /// Clear everything scoped to a single turn. Called at every turn end
+    /// (completed OR failed) so nothing leaks across the turn boundary.
+    fn reset_turn_state(&mut self) {
+        self.streamed.clear();
+        self.out_streamed.clear();
+        self.safety_notified = false;
+        // Approvals only ever reference items of the current turn; keeping
+        // these forever is unbounded growth over a long session.
+        self.item_locations.clear();
     }
 
     /// A response to one of our client→server requests.
@@ -1156,9 +1169,17 @@ impl CodexMapper {
                         status: ToolStatus::InProgress,
                     });
                 } else {
+                    // Honor the item status like every other item type — a
+                    // failed search must not render as a successful one.
+                    let failed =
+                        matches!(item["status"].as_str(), Some("failed") | Some("declined"));
                     step.events.push(AgentEvent::ToolCallUpdate {
                         id,
-                        status: ToolStatus::Completed,
+                        status: if failed {
+                            ToolStatus::Failed
+                        } else {
+                            ToolStatus::Completed
+                        },
                         content: None,
                     });
                 }
@@ -1346,7 +1367,7 @@ impl CodexMapper {
                 title = format!("network access to {host}");
                 input_preview = json!({
                     "host": host,
-                    "command": params["command"],
+                    "command": cap_output(params["command"].as_str().unwrap_or_default()).0,
                 });
                 opt(
                     &mut options,
@@ -1386,13 +1407,17 @@ impl CodexMapper {
                 }
             }
             _ => {
-                title = params["commandActions"][0]["command"]
+                // Cap both the title and the previewed command: an approval
+                // request can carry a multi-megabyte inline script, and every
+                // byte here is journaled, ring-held, and replayed to clients
+                // (the caps-at-event-construction invariant).
+                let raw_title = params["commandActions"][0]["command"]
                     .as_str()
                     .or(params["command"].as_str())
-                    .unwrap_or("codex action")
-                    .to_string();
+                    .unwrap_or("codex action");
+                title = crate::model::cap_head_tail(raw_title, 120, 0).0;
                 input_preview = json!({
-                    "command": params["command"],
+                    "command": cap_output(params["command"].as_str().unwrap_or_default()).0,
                     "cwd": params["cwd"],
                     "reason": params["reason"],
                 });
