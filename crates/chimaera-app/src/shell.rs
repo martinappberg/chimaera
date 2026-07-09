@@ -89,7 +89,6 @@ pub fn run() {
             commands::remote_workspaces,
             commands::open_window,
             commands::check_app_update,
-            commands::install_app_update,
             commands::begin_update,
             commands::shell_build,
             commands::answer_askpass,

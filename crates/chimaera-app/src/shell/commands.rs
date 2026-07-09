@@ -289,27 +289,6 @@ pub(super) async fn check_app_update(app: AppHandle) -> Result<Option<String>, S
     }
 }
 
-/// Download, verify, and install the pending app update, then relaunch into
-/// it. Diverges on success (the process restarts); returns `Err` only when
-/// the download or signature check fails.
-#[tauri::command]
-pub(super) async fn install_app_update(app: AppHandle) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no update available".to_string())?;
-    tracing::info!("installing app update {}", update.version);
-    update
-        .download_and_install(|_downloaded, _total| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
-    // Bundle swapped and verified; relaunch into the new build (diverges).
-    app.restart();
-}
-
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
 /// the user cancelled, which lets the waiting ssh fail cleanly. The done
 /// broadcast dismisses the prompt in every other window showing it.
