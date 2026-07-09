@@ -11,6 +11,23 @@ use serde::{Deserialize, Serialize};
 /// Version of the chimaera workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Whether this binary is a DEV build (built from a checkout) rather than a
+/// stamped release. Rides the release convention: every `Cargo.toml` in the
+/// repo holds the literal `0.0.1` sentinel, and the release workflow seds it
+/// to the real version at build time — so `0.0.1` at runtime means "never
+/// release-stamped". Gates developer-only capability (the isolated dev
+/// connect) out of production builds.
+pub fn is_dev_build() -> bool {
+    version_is_dev(VERSION)
+}
+
+/// The pure predicate behind [`is_dev_build`] — `VERSION` is fixed at compile
+/// time (always the sentinel under `cargo test`), so the release case is only
+/// testable through this.
+pub fn version_is_dev(version: &str) -> bool {
+    version == "0.0.1"
+}
+
 /// The project's repository URL (from `Cargo.toml`), e.g.
 /// `https://github.com/<owner>/<repo>`. Used to locate the GitHub release a
 /// build came from when auto-fetching the matching daemon for a remote host.
@@ -331,6 +348,18 @@ pub fn release_is_newer(current: &str, latest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dev-build gate rides the release stamping convention: the literal
+    /// `0.0.1` sentinel means never-release-stamped; anything else is a
+    /// shipped version. `cargo test` always runs on the sentinel, so
+    /// `is_dev_build` itself must read true here.
+    #[test]
+    fn dev_build_is_the_unstamped_sentinel() {
+        assert!(version_is_dev("0.0.1"));
+        assert!(!version_is_dev("0.15.1"));
+        assert!(!version_is_dev("1.0.0"));
+        assert!(is_dev_build(), "tests always run on the 0.0.1 sentinel");
+    }
 
     #[test]
     fn login_shell_prefers_real_shell_then_passwd() {

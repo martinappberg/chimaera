@@ -19,9 +19,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **What & when.** Connect to (and stand up a daemon on) a remote host, then open a tunnelled
   window onto it.
 - **How it's used (CLI).** `chimaera connect <host> [--local-port N] [--binary PATH] [--no-open]
-  [--update-daemon]`. Progress phases (probing / updating / downloading / installing / starting /
-  tunneling) stream to the UI. In the native app, "add a host…" on the home screen does the same
-  and lists that host's workspaces inline.
+  [--update-daemon] [--dev]`. Progress phases (probing / updating / downloading / installing /
+  starting / tunneling) stream to the UI. In the native app, "add a host…" on the home screen does
+  the same and lists that host's workspaces inline.
 - **Where it lives.** `chimaera-remote/src/lib.rs` (`connect`, `resolve_daemon`, `Tunnel`,
   `deploy_binary`, `start_remote`, `fetch_release_binary`, `spawn_tunnel`), `hosts.rs`
   (`HostsStore`, `normalize_alias`).
@@ -55,6 +55,34 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   hold sessions that mustn't be torn out — it errors honestly). `TunnelPhaseError` is
   downcast-distinguished so the app retries *only* tunnel-phase failures on a fresh port (re-running
   connect on an auth failure would re-prompt 2FA). Fetched daemons are cached per triple-and-version.
+
+## Dev connect (`--dev`) — the isolated dev daemon on a host
+
+- **What & when.** Test THIS checkout's daemon against a real host without touching the daemon
+  real users (or your other self) depend on: `connect --dev` runs everything against a parallel
+  `~/.chimaera-dev` on the host, next to — never instead of — the real `~/.chimaera` daemon.
+- **How it's used.** CLI: `chimaera connect <host> --dev` (+ `status <host> --dev`). App: the
+  amber **dev** toggle in the add-host form; the row wears a `dev` pill. Pair with the isolated
+  local app (`just app-dev-isolated`) for the full dev-app ↔ dev-daemon rig — see the
+  [develop skill](../../.claude/skills/develop/SKILL.md).
+- **Where it lives.** `chimaera-remote/src/lib.rs` (`RemoteHome` — every remote path/command
+  derives from it; `ConnectOpts.dev`), `hosts.rs` (`HostEntry.dev`, persisted),
+  `chimaera-core::is_dev_build` (the gate).
+- **Key behaviors.**
+  - **Total scoping.** The probed manifest (`~/.chimaera-dev/data/manifest.json` —
+    `CHIMAERA_HOME` relocates the data dir), the installed binary (`~/.chimaera-dev/bin/`), the
+    started daemon (`CHIMAERA_HOME=$HOME/.chimaera-dev` env prefix — `chimaera serve` stays a
+    literal string), and the reuse/update decision all key off `RemoteHome::Dev`. The real daemon
+    is never probed, stopped, or replaced.
+  - **Never a release binary.** Dev mode deploys your build only: explicit `--binary`, else the
+    `just dist` stash (also found at the real `~/.chimaera/dist` when the client runs isolated),
+    else a hard error. Fresh starts always redeploy so a stale dev binary can't impersonate the
+    build under test.
+  - **Dev builds only.** Gated on `is_dev_build()` (the never-release-stamped `0.0.1` sentinel)
+    at the library choke point, in `add_host`, and in the UI (toggle hidden) — a production app
+    cannot create or connect dev hosts, even from a leaked `"dev": true` hosts entry.
+  - **Dev-ness persists on the host entry** (one-way; leave by forget + re-add), so the app's
+    auto-reconnect and window restore can never silently heal a dev tunnel into the real daemon.
 
 ## Remote host management (native app)
 

@@ -157,6 +157,10 @@ from a remote TUI or the reauth overlay on a tunnel drop.
 
 Gotchas:
 
+- **Dev builds only.** `connect --dev` (and the app's dev toggle) exist only
+  on a never-release-stamped build (`chimaera_core::is_dev_build()`, the
+  `0.0.1` version sentinel) — a stamped release refuses, so this tooling can't
+  leak into production. `cargo run` / the isolated app qualify.
 - **Same-commit rebuilds look identical**: build ids compare the git hash, so
   a rebuilt (even dirty) tree won't auto-replace a running dev daemon. Force it
   with `--update-daemon` / the row's "update" action.

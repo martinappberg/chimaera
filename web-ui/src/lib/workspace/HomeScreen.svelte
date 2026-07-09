@@ -147,10 +147,13 @@
   onMount(() => {
     if (!native) return;
     void refreshHosts();
-    // Only the local window asks about the local daemon's build parity.
+    // Every native window asks for the shell state: the outdated note renders
+    // only on the local window, but the dev-build flag gates the add-host dev
+    // toggle everywhere.
+    void localDaemonState().then((s) => (localState = s));
+    // Only the local window quietly asks GitHub whether a newer signed app
+    // build exists.
     if (hostLabel === "local") {
-      void localDaemonState().then((s) => (localState = s));
-      // Quietly ask GitHub whether a newer signed app build exists.
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
     const unlisteners: Array<() => void> = [];
@@ -546,14 +549,16 @@
                 }
               }}
             />
-            <button
-              type="button"
-              class="dev-toggle"
-              class:on={addDev}
-              aria-pressed={addDev}
-              title="dev daemon: deploy this machine's own build (just dist) to an isolated ~/.chimaera-dev on the host — the real ~/.chimaera daemon is left untouched"
-              onclick={() => (addDev = !addDev)}>dev</button
-            >
+            {#if localState?.dev_build}
+              <button
+                type="button"
+                class="dev-toggle"
+                class:on={addDev}
+                aria-pressed={addDev}
+                title="dev daemon: deploy this machine's own build (just dist) to an isolated ~/.chimaera-dev on the host — the real ~/.chimaera daemon is left untouched"
+                onclick={() => (addDev = !addDev)}>dev</button
+              >
+            {/if}
             <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
               >connect</button
             >

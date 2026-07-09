@@ -586,6 +586,19 @@ pub async fn connect(
     opts: ConnectOpts,
     progress: impl Fn(Phase),
 ) -> anyhow::Result<Tunnel> {
+    // The dev connect is a development tool, gated out of stamped releases at
+    // this single choke point so every caller (CLI flag, app host entry —
+    // including a dev-marked entry that leaked into a production app's hosts
+    // file) inherits it. A release client dev-connecting would also be
+    // nonsense operationally: it deploys "your build", and a release build
+    // has no checkout to have built one from.
+    if opts.dev && !chimaera_core::is_dev_build() {
+        bail!(
+            "dev connections need a dev build of chimaera (this is v{}) — \
+             run one from a checkout, or re-add the host without dev mode",
+            chimaera_core::VERSION,
+        );
+    }
     // Normalize whatever the caller has (saved entries predate validation;
     // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
     // so every ssh invocation below sees a real destination.

@@ -83,6 +83,11 @@ export interface LocalDaemonState {
   outdated: boolean;
   build: string | null;
   live_sessions: number | null;
+  /**
+   * The shell is a dev build (never release-stamped). Only a dev build may
+   * offer dev-daemon connections — the add-host dev toggle hides otherwise.
+   */
+  dev_build: boolean;
 }
 
 export async function listHosts(): Promise<HostState[]> {

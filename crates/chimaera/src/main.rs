@@ -59,7 +59,8 @@ enum Command {
         /// Run against an isolated DEV daemon in ~/.chimaera-dev on the host:
         /// deploys your locally built binary (`just dist`) and starts it
         /// under its own CHIMAERA_HOME, next to — never touching — the real
-        /// ~/.chimaera daemon. Never downloads a release.
+        /// ~/.chimaera daemon. Never downloads a release. Dev builds only —
+        /// a release-stamped chimaera refuses.
         #[arg(long)]
         dev: bool,
     },
