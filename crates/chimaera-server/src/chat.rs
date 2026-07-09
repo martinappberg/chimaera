@@ -25,7 +25,7 @@ use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::AgentEvent;
 use chimaera_agent::{ChatInfo, ChatManager};
 
-use crate::agents::{AgentKind, AgentState};
+use crate::agent_state::{AgentKind, AgentState};
 use crate::AppState;
 
 /// What the ChatManager hooks emit; consumed by the signal task.
@@ -395,7 +395,7 @@ pub(crate) fn session_alive(state: &AppState, id: &str) -> bool {
 pub(crate) fn chat_session_json(
     info: &ChatInfo,
     workspace_id: Option<String>,
-    agent: Option<&crate::agents::AgentRecord>,
+    agent: Option<&crate::agent_state::AgentRecord>,
 ) -> serde_json::Value {
     let display_name = agent
         .map(|a| a.display_name(None))
@@ -713,7 +713,7 @@ async fn perform_switch(
     currently_chat: bool,
     resume: Option<String>,
     workspace_root: PathBuf,
-    record: &crate::agents::AgentRecord,
+    record: &crate::agent_state::AgentRecord,
 ) -> Result<(), String> {
     // A user-pinned name lives in different stores per surface: chat sessions
     // pin it on the AgentRecord (customTitle), PTY sessions on SessionInfo.name
