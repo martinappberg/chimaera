@@ -408,3 +408,56 @@ async fn git_status_on_a_non_repo_says_so() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["repo"], false);
 }
+
+/// `mark_path_dirty` canonicalizes before the `starts_with(ws.root)` prefix
+/// check, so a path that reaches the workspace through a symlink (sharing no
+/// component prefix with the canonical root) still bumps the git epoch. Before
+/// the fix that path failed the prefix test and a real change went unannounced.
+#[tokio::test]
+async fn mark_path_dirty_canonicalizes_symlinked_paths() {
+    let root = test_dir("git-dirty");
+    let sub = root.join("subdir");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("file.rs"), "x").unwrap();
+
+    let state = test_state();
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+    let canonical_root = std::path::PathBuf::from(ws["root"].as_str().unwrap());
+
+    // A symlink into the workspace: `<link>/subdir/file.rs` shares no component
+    // prefix with the canonical root, but canonicalizes to inside it.
+    let link_home = test_dir("git-link");
+    let link = link_home.join("ws-link");
+    std::os::unix::fs::symlink(&canonical_root, &link).unwrap();
+    let via_link = link.join("subdir").join("file.rs");
+    assert!(
+        !via_link.starts_with(&canonical_root),
+        "precondition: the symlinked path must not prefix-match the root"
+    );
+
+    let before = state
+        .git
+        .epochs_snapshot()
+        .get(&ws_id)
+        .copied()
+        .unwrap_or(0);
+    crate::git::mark_path_dirty(&state, &via_link.to_string_lossy()).await;
+    let after = state
+        .git
+        .epochs_snapshot()
+        .get(&ws_id)
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        after > before,
+        "a symlinked in-workspace path must bump the epoch after canonicalize (before={before}, after={after})"
+    );
+}

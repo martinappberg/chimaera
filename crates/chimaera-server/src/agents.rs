@@ -151,66 +151,73 @@ pub(crate) async fn ingest(
     Query(query): Query<IngestQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
-    let mut agents = crate::lock(&state.agents);
-    let Some(record) = agents.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("unknown agent session {id}")})),
-        )
-            .into_response();
-    };
-    if record.key != query.key {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
-    }
-
-    let mut changed = false;
-
-    // Every hook payload carries the current transcript_path (verified against
-    // claude 2.1.196), so capture it from any event — SessionStart does not
-    // reliably fire for hooks injected via --settings.
-    if let Some(path) = payload.get("transcript_path").and_then(|p| p.as_str()) {
-        let path = PathBuf::from(path);
-        if record.transcript_path.as_ref() != Some(&path) {
-            record.transcript_path = Some(path);
-            changed = true;
-        }
-    }
-
+    // `event` comes from the payload, not the record — compute it before the
+    // lock so the guard's block below stays tight.
     let event = payload
         .get("hook_event_name")
         .and_then(|e| e.as_str())
         .unwrap_or("");
 
-    // The first prompt becomes the provisional display name (it loses to any
-    // customTitle/aiTitle transcript record; see AgentRecord::display_name).
-    if event == "UserPromptSubmit" && record.first_prompt.is_none() {
-        if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-            let prompt = prompt.trim();
-            if !prompt.is_empty() {
-                record.first_prompt = Some(prompt.to_string());
+    let mut changed = false;
+    let mut touched_path: Option<String> = None;
+    // Mutate the AgentRecord under the agents lock in a block that ENDS —
+    // dropping the guard — before the `.await` below. A `std::sync` guard must
+    // never be live across an await (the future would be !Send), and an
+    // explicit `drop` isn't enough here: the `let-else` borrow keeps the guard
+    // in the async state machine, so it must go out of scope lexically.
+    {
+        let mut agents = crate::lock(&state.agents);
+        let Some(record) = agents.get_mut(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("unknown agent session {id}")})),
+            )
+                .into_response();
+        };
+        if record.key != query.key {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
+        }
+
+        // Every hook payload carries the current transcript_path (verified against
+        // claude 2.1.196), so capture it from any event — SessionStart does not
+        // reliably fire for hooks injected via --settings.
+        if let Some(path) = payload.get("transcript_path").and_then(|p| p.as_str()) {
+            let path = PathBuf::from(path);
+            if record.transcript_path.as_ref() != Some(&path) {
+                record.transcript_path = Some(path);
+                changed = true;
+            }
+        }
+
+        // The first prompt becomes the provisional display name (it loses to any
+        // customTitle/aiTitle transcript record; see AgentRecord::display_name).
+        if event == "UserPromptSubmit" && record.first_prompt.is_none() {
+            if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+                let prompt = prompt.trim();
+                if !prompt.is_empty() {
+                    record.first_prompt = Some(prompt.to_string());
+                    changed = true;
+                }
+            }
+        }
+
+        // File-writing tools feed the touched-files list (clickable "N files"
+        // chips in the UI). Real payloads verified against claude 2.1.196: the
+        // path lives in tool_input.file_path (notebook_path for NotebookEdit).
+        if event == "PostToolUse" {
+            if let Some(path) = touched_file(&payload) {
+                changed |= record.touch_file(path);
+                touched_path = Some(path.to_string());
+            }
+        }
+
+        if let Some(next) = map_event(event, &payload) {
+            if record.state != next {
+                record.state = next;
                 changed = true;
             }
         }
     }
-
-    // File-writing tools feed the touched-files list (clickable "N files"
-    // chips in the UI). Real payloads verified against claude 2.1.196: the
-    // path lives in tool_input.file_path (notebook_path for NotebookEdit).
-    let mut touched_path: Option<String> = None;
-    if event == "PostToolUse" {
-        if let Some(path) = touched_file(&payload) {
-            changed |= record.touch_file(path);
-            touched_path = Some(path.to_string());
-        }
-    }
-
-    if let Some(next) = map_event(event, &payload) {
-        if record.state != next {
-            record.state = next;
-            changed = true;
-        }
-    }
-    drop(agents);
 
     if changed {
         state.changes.notify_waiters();
@@ -219,7 +226,7 @@ pub(crate) async fn ingest(
     // An agent writing a file is the signature git refresh trigger: the hook we
     // already ingest IS the mechanism — no polling, no terminal-text parsing.
     if let Some(path) = touched_path {
-        crate::git::mark_path_dirty(&state, &path);
+        crate::git::mark_path_dirty(&state, &path).await;
     }
 
     // `@term:` mentions in the user's prompt auto-link those terminals to
