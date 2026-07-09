@@ -350,7 +350,7 @@ async fn run_in_terminal(state: &Arc<AppState>, agent_id: &str, args: &Value) ->
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
     let queue_timeout_ms = args.get("queue_timeout_ms").and_then(|v| v.as_u64());
 
-    match crate::api::run_exec(
+    match crate::exec::run_exec(
         state,
         &id,
         command.to_string(),
