@@ -44,6 +44,10 @@ Each area carries its own `CLAUDE.md` map (file table + the invariants that bite
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/CLAUDE.md) |
 | `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/CLAUDE.md) · [settings](web-ui/src/lib/settings/CLAUDE.md) |
 
+The maps above tell you how the code is *structured*. For what the app **does** — feature
+by feature, with how each is used and where it's wired — see the **[feature catalog](docs/features/README.md)**
+(an index → lean per-feature pages; read the one you're touching, don't front-load them).
+
 Deep docs, read on demand: the **[architecture guide](docs/agent-guides/architecture.md)**
 (the source of truth for how it's built and why), the design spine
 [DESIGN.md](DESIGN.md), and the dated [field notes](docs/history/field-notes.md).
@@ -105,13 +109,17 @@ version mapping and the no-release path.
 1. `just check` green (+ `app.yml` if you touched `web-ui/**` or the app).
 2. Verified live, not just tests — note what you ran and observed.
 3. Right Conventional-Commit prefix for the version bump, or `[skip release]`.
-4. First-time contributors: CLA sign-off ([CONTRIBUTING.md](CONTRIBUTING.md)).
+4. Shipping a `feat:`? Update its [feature-catalog](docs/features/README.md) page
+   (**document-feature**) and capture the human's *why* (**capture-feature-intent**).
+5. First-time contributors: CLA sign-off ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## Skills, rules, subagents, hooks
 
 - **Skills** (`/name`): **develop** (run + iterate), **verify-app** (drive a change
   live), **debug-live-app** (read daemon/UI logs, reproduce, common failure modes),
-  **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack).
+  **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack),
+  **document-feature** (add/update a docs/features page), **capture-feature-intent**
+  (the `feat:`-gated intent questionnaire).
 - **Rules**: path-scoped constraints in `.claude/rules/` load with matching files.
 - **Subagents**: `.claude/agents/` — `area-implementer` (scoped edits + live verify)
   and `diff-reviewer` (read-only invariant check vs `upstream/main`).

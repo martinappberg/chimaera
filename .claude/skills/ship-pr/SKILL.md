@@ -18,6 +18,11 @@ you opt out. So the PR *title* and *commit prefix* are load-bearing. See
    bundle on the PR — make sure the UI builds (`npm --prefix web-ui run check`).
 3. **Verified live**, not just tested (see the **verify-app** skill). The PR body
    should say what you ran and observed.
+4. **Shipping a `feat:`? It carries its docs.** A new user-facing capability must update
+   its [feature-catalog](../../../docs/features/README.md) page — the **document-feature**
+   skill — and capture the human's *why* via the **capture-feature-intent** skill. Only
+   `feat:` triggers the intent questionnaire (never `fix:`/`refactor:`/`chore:`/`docs:`);
+   "feature" is defined once, in [`scripts/version-bump.sh`](../../../scripts/version-bump.sh).
 
 ## Choose the title deliberately — it becomes the squash commit
 

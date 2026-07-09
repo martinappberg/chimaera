@@ -27,6 +27,15 @@ PR title). The build + publish jobs run only when a release is actually due; a
 `feat` is reserved for new capability. Don't label a fix, a refactor, or a chore as
 `feat` — that's how the minor version runs away (the drift this policy fixes).
 
+**A `feat:` carries its docs.** Because `feat:` *is* the definition of "new user-facing
+capability" (this table is the single place that defines it), a `feat:` PR must also:
+update the capability's [feature-catalog](../features/README.md) page (the
+[document-feature](../../.claude/skills/document-feature/SKILL.md) skill), and record the
+human's *why* via the [capture-feature-intent](../../.claude/skills/capture-feature-intent/SKILL.md)
+skill. `fix:` / `refactor:` / `chore:` / `docs:` never trigger the intent questionnaire — that
+gate is what keeps the Intent sections free of patch-level noise. The
+[ship-pr](../../.claude/skills/ship-pr/SKILL.md) flow checks for the doc update.
+
 ## Subject-anchored, on purpose
 
 The decision reads only the **subject** (`git log -1 --pretty=%s`), never the body.
