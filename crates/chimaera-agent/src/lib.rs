@@ -73,17 +73,20 @@ struct ChatSession {
 
 /// What a WS bridge gets on attach. `replay` covers everything after the
 /// client's `last_seq`; `live` may overlap its tail — consumers drop live
-/// events whose seq is ≤ the last replayed one.
+/// events whose seq is ≤ the last replayed one. `head_seq` is the journal's
+/// highest seq at attach time: a client whose own `last_seq` exceeds it is
+/// stale (its journal was recreated) and must hard-reset.
 pub struct ChatAttachment {
     pub info: ChatInfo,
     pub replay: Vec<Arc<SeqEvent>>,
     pub live: broadcast::Receiver<Arc<SeqEvent>>,
+    pub head_seq: u64,
 }
 
 pub struct ChatManager {
     sessions: Mutex<HashMap<String, Arc<ChatSession>>>,
     journal_dir: PathBuf,
-    index: JournalIndex,
+    index: Arc<JournalIndex>,
     on_event: EventHook,
     on_exit: ExitHook,
 }
@@ -92,7 +95,7 @@ impl ChatManager {
     pub fn new(journal_dir: PathBuf, on_event: EventHook, on_exit: ExitHook) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            index: JournalIndex::load(&journal_dir),
+            index: Arc::new(JournalIndex::load(&journal_dir)),
             journal_dir,
             on_event,
             on_exit,
@@ -152,17 +155,37 @@ impl ChatManager {
             )
             .context("spawn agent driver")?;
 
-        self.sessions
-            .lock()
-            .expect("sessions lock")
-            .insert(id.clone(), Arc::clone(&session));
+        // Authoritative uniqueness check: the early `ensure!` is only a
+        // fast-path guard, so re-validate at insert time. A concurrent spawn
+        // of the same id that slipped past the first check would otherwise
+        // orphan this just-spawned driver (its Arc dropped from the registry
+        // while the child keeps running). On a lost race, signal the driver to
+        // shut down and bail — no unkillable orphan.
+        {
+            use std::collections::hash_map::Entry;
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            match sessions.entry(id.clone()) {
+                Entry::Occupied(_) => {
+                    let _ = session.kill_tx.send(true);
+                    anyhow::bail!("chat session {id} already exists");
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(Arc::clone(&session));
+                }
+            }
+        }
 
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(ev) = ev_rx.recv().await {
-                manager.absorb(&id, &session, ev);
+                manager.absorb(&id, &session, ev).await;
             }
-            // Driver dropped its event sender: classify the exit.
+            // Driver dropped its event sender. Drain the journal writer before
+            // announcing the exit, so the registry slot only frees once the
+            // file is settled — otherwise a view toggle's append_marker could
+            // reopen it while the writer is still flushing and collide seqs.
+            session.journal.sync_async().await;
+            // Classify the exit.
             let exit = match handle.await {
                 Ok(exit) => exit,
                 Err(err) => DriverExit::ProtocolError(format!("driver task panicked: {err}")),
@@ -181,7 +204,13 @@ impl ChatManager {
     }
 
     /// Journal + broadcast one event and fold it into the session info.
-    fn absorb(&self, id: &str, session: &ChatSession, ev: AgentEvent) {
+    async fn absorb(&self, id: &str, session: &ChatSession, ev: AgentEvent) {
+        // Native id to record in the resume index, captured under the info
+        // lock but recorded AFTER it drops: index.record does a blocking
+        // atomic write on possibly-NFS `~/.chimaera`, and holding the info
+        // lock across it would let a slow write freeze the whole manager
+        // (list() takes info locks under the sessions lock).
+        let mut native_to_index: Option<String> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             match &ev {
@@ -193,7 +222,7 @@ impl ChatManager {
                 } => {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
-                        self.index.record(native_session_id, id);
+                        native_to_index = Some(native_session_id.clone());
                     }
                     if model.is_some() {
                         info.model = model.clone();
@@ -217,7 +246,13 @@ impl ChatManager {
                 _ => {}
             }
         }
-        let entry = session.journal.append(ev);
+        if let Some(native) = native_to_index {
+            let index = Arc::clone(&self.index);
+            let session_id = id.to_string();
+            // Off the pump's worker (blocking fs), off every lock.
+            let _ = tokio::task::spawn_blocking(move || index.record(&native, &session_id)).await;
+        }
+        let entry = session.journal.append(ev).await;
         let _ = session.events_tx.send(Arc::clone(&entry));
         (self.on_event)(id, &entry);
     }
@@ -228,9 +263,20 @@ impl ChatManager {
     pub fn attach(&self, id: &str, last_seq: u64) -> Result<ChatAttachment> {
         let session = self.get_session(id)?;
         let live = session.events_tx.subscribe();
-        let replay = session.journal.replay_from(last_seq)?;
+        let head_seq = session.journal.last_seq();
+        // A client claiming a seq beyond the journal's head is stale: its
+        // journal was pruned/recreated and numbering restarted lower. Replay
+        // from 0 (it hard-resets on head_seq < its last_seq) rather than
+        // silently dropping every "already seen" event and freezing the pane.
+        let from = if last_seq > head_seq { 0 } else { last_seq };
+        let replay = session.journal.replay_from(from)?;
         let info = session.info.lock().expect("info lock").clone();
-        Ok(ChatAttachment { info, replay, live })
+        Ok(ChatAttachment {
+            info,
+            replay,
+            live,
+            head_seq,
+        })
     }
 
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
@@ -287,6 +333,19 @@ impl ChatManager {
     /// The native-session-id → chimaera-session index (resume seeding).
     pub fn index(&self) -> &JournalIndex {
         &self.index
+    }
+
+    /// The chat journal directory. Enforce its byte/file budget with
+    /// [`journal::prune_dir`]; safe to call periodically since dead sessions'
+    /// journals stay on disk to seed resumes.
+    pub fn prune_journal_dir(&self) {
+        if let Err(err) = journal::prune_dir(
+            &self.journal_dir,
+            journal::DIR_MAX_BYTES,
+            journal::DIR_MAX_FILES,
+        ) {
+            tracing::warn!(%err, "chat journal prune failed");
+        }
     }
 
     pub fn journal_dir(&self) -> &PathBuf {

@@ -343,6 +343,10 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         "type": "ready",
         "session": attachment.info,
         "replay_from": last_seq,
+        // The journal's highest seq now. A client whose own last_seq exceeds
+        // this is stale (the journal was recreated and numbering restarted);
+        // it hard-resets rather than silently dropping every replayed event.
+        "head": attachment.head_seq,
     });
     if send_json(&mut socket, &ready).await.is_err() {
         return;
@@ -389,14 +393,23 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                     }
                 }
                 Err(RecvError::Closed) => {
-                    // Driver gone. A PTY under the same id means the session
-                    // degraded (or toggled) to a terminal; tell the client
-                    // which so it can swap surfaces without guessing.
-                    let frame = if state.sessions.get(&id).is_some() {
-                        json!({"type": "degraded"})
-                    } else {
-                        json!({"type": "exited",
-                               "status": state.chat.get(&id).and_then(|c| c.exit_status)})
+                    // Driver gone. Decide what to tell the client:
+                    // - mid view-switch (chat_switching holds the id): the
+                    //   respawn is in flight but not registered yet (journal
+                    //   append + launcher::detect take up to ~2s on a cold
+                    //   cache), so DON'T report "exited" — say "degraded" for a
+                    //   term target, or a retryable frame for a chat target.
+                    // - a PTY already under this id: it degraded/toggled to a
+                    //   terminal.
+                    // - otherwise: the session genuinely exited.
+                    let switching = crate::lock(&state.chat_switching).get(&id).cloned();
+                    let frame = match switching.as_deref() {
+                        Some("term") => json!({"type": "degraded"}),
+                        Some(_) => json!({"type": "error", "code": "unknown_session",
+                                          "message": "session switching"}),
+                        None if state.sessions.get(&id).is_some() => json!({"type": "degraded"}),
+                        None => json!({"type": "exited",
+                                       "status": state.chat.get(&id).and_then(|c| c.exit_status)}),
                     };
                     let _ = send_json(&mut socket, &frame).await;
                     return;

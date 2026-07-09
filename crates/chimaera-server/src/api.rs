@@ -640,6 +640,17 @@ async fn spawn_chat_ui(
 
     let mut record = crate::agents::AgentRecord::new(key, agent_kind);
     record.resumed_from = body.resume.clone();
+    // A name supplied at creation pins the row (customTitle authority), the
+    // same as the TUI path's SpawnOpts.name — otherwise it is silently dropped
+    // for chat sessions.
+    if let Some(name) = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        record.custom_title = Some(name.to_string());
+    }
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     let recipe = crate::chat::ChatRecipe {
@@ -759,11 +770,32 @@ pub(crate) async fn delete_session(
     }
 }
 
+/// Stop every structured chat driver too — [`SessionManager::kill_all`] only
+/// covers PTY sessions, so "close all" and shutdown would otherwise leave chat
+/// agents running (and billing) and uncounted. Alive drivers get the polite
+/// stop (the exit path retires them); dead-but-registered ones are retired
+/// directly. Returns how many rows were ended.
+fn kill_all_chat(state: &Arc<AppState>) -> usize {
+    let mut killed = 0;
+    for info in state.chat.list() {
+        if info.alive {
+            if state.chat.kill(&info.id) {
+                killed += 1;
+            }
+        } else {
+            state.chat.remove(&info.id);
+            crate::recents::retire(state, &info.id, None, None);
+            killed += 1;
+        }
+    }
+    killed
+}
+
 /// DELETE /api/v1/sessions — end every live session; the daemon stays up.
 /// This is "kill everything here" without the teardown: the caller can start
 /// fresh work immediately, no reconnect. Returns how many were ended.
 pub(crate) async fn delete_all_sessions(State(state): State<Arc<AppState>>) -> Response {
-    let killed = state.sessions.kill_all();
+    let killed = state.sessions.kill_all() + kill_all_chat(&state);
     if killed > 0 {
         state.changes.notify_waiters();
     }
@@ -779,7 +811,7 @@ pub(crate) async fn delete_all_sessions(State(state): State<Arc<AppState>>) -> R
 /// about to drop with the daemon), and let a background task outlast the
 /// escalation grace before tripping the graceful-shutdown future.
 pub(crate) async fn shutdown(State(state): State<Arc<AppState>>) -> Response {
-    let killed = state.sessions.kill_all();
+    let killed = state.sessions.kill_all() + kill_all_chat(&state);
     if killed > 0 {
         state.changes.notify_waiters();
     }

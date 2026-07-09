@@ -144,6 +144,12 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         AgentEvent::Error { fatal: true, .. } => Some(AgentState::Errored),
         AgentEvent::TurnStarted { .. } => Some(AgentState::Running),
         AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),
+        // A deliberate user interrupt (Stop/Esc) is not a failure: the rail
+        // should read idle, matching the chat surface's quiet "interrupted"
+        // notice. Only a genuine turn failure errors the row.
+        AgentEvent::TurnAborted { reason, .. } if reason == "interrupted" => {
+            Some(AgentState::Finished)
+        }
         AgentEvent::TurnAborted { .. } => Some(AgentState::Errored),
         // Telemetry says the account limit is actually blocking requests —
         // the same rail state the TUI hooks derive from StopFailure.
@@ -199,9 +205,12 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
 /// watcher would.
 async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
     // A view switch kills the driver on purpose: free the registry slot for
-    // the respawn and keep the AgentRecord/workspace mapping intact.
+    // the respawn and keep the AgentRecord/workspace mapping intact. Drop the
+    // stale recipe too — perform_switch builds a fresh one; leaving it here
+    // leaks one ChatRecipe per toggled session for the daemon's lifetime.
     if crate::lock(&state.chat_switching).contains_key(id) {
         state.chat.remove(id);
+        crate::lock(&state.chat_recipes).remove(id);
         return;
     }
     let recipe = crate::lock(&state.chat_recipes).remove(id);
@@ -444,8 +453,34 @@ pub(crate) async fn switch_view(
         );
     };
 
-    // Mark the switch so the exit path neither retires nor degrades it.
-    crate::lock(&state.chat_switching).insert(id.clone(), body.ui.clone());
+    // Serialize per id: a concurrent toggle (double-click) that slipped past
+    // the guards above would race the non-atomic kill→respawn, and the first
+    // finisher's unconditional `remove` below would clear the second's marker —
+    // making its intentional kill look like a real exit that retires the
+    // session. Refuse the overlap instead. `busy` is absent so the client
+    // treats it as "try again", not the mid-task confirmation prompt.
+    {
+        use std::collections::hash_map::Entry;
+        let mut switching = crate::lock(&state.chat_switching);
+        match switching.entry(id.clone()) {
+            Entry::Occupied(_) => {
+                return err(
+                    StatusCode::CONFLICT,
+                    "a view switch is already in progress for this session".to_string(),
+                );
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(body.ui.clone());
+            }
+        }
+    }
+    // A ProtocolError-dead chat entry is kept in the registry so the surface
+    // can show the failure, but a switch must clear it first (resume handle is
+    // already captured above): otherwise a term target leaves two rows under
+    // one id, and a chat target 500s on the spawn's already-exists guard.
+    if chat_info.as_ref().is_some_and(|c| !c.alive) {
+        state.chat.remove(&id);
+    }
     state.changes.notify_waiters();
     let result = perform_switch(
         &state,
@@ -498,6 +533,28 @@ async fn perform_switch(
         }
     }
 
+    // Resolve every respawn precondition BEFORE killing the old process. A
+    // failure here (binary not found on a cold NFS cache, or the per-session
+    // settings file scrubbed from the runtime dir) must abort the switch with
+    // the session still alive — killing first and failing after would leave it
+    // in neither registry, and the agent watcher would retire a live session.
+    let runtime_dir = chimaera_core::runtime_dir().join("agents");
+    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
+    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
+    let bin = crate::launcher::detect(state, record.kind, false)
+        .await
+        .path
+        .map_err(|e| e.to_string())?;
+    // The claude chat driver needs both per-session files; fail now, not
+    // after the kill (spawn_chat_session would otherwise bail post-kill).
+    if target_chat
+        && record.kind == AgentKind::Claude
+        && (settings.is_none() || mcp_config.is_none())
+    {
+        return Err("chat session state files are missing (runtime dir scrubbed)".to_string());
+    }
+    let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
+
     // Stop the current process and wait for its slot to free (same-id
     // respawn requires deregistration; SessionManager unregisters on reap).
     if currently_chat {
@@ -533,19 +590,11 @@ async fn perform_switch(
                 chimaera_agent::model::SessionUi::Term
             },
         },
-    ) {
+    )
+    .await
+    {
         tracing::warn!(%id, %err, "failed to journal the view switch");
     }
-
-    // Existing per-session files still on disk carry the same hook key.
-    let runtime_dir = chimaera_core::runtime_dir().join("agents");
-    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
-    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
-    let bin = crate::launcher::detect(state, record.kind, false)
-        .await
-        .path
-        .map_err(|e| e.to_string())?;
-    let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
 
     if target_chat {
         let recipe = ChatRecipe {
@@ -635,13 +684,21 @@ pub(crate) async fn rewind_session(
     // exit path neither retires nor degrades, stop, respawn.
     crate::lock(&state.chat_switching).insert(id.clone(), "chat".to_string());
     let result = async {
-        state.chat.kill(&id);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.chat.contains(&id) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err("chat driver did not stop in time".to_string());
+        // A dead-but-registered driver (ProtocolError, kept visible) will
+        // never fire its exit hook again, so kill+wait would spin to the 5s
+        // deadline and 500 — remove it directly. A live driver gets the polite
+        // stop and we wait for the slot to free.
+        if info.alive {
+            state.chat.kill(&id);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.chat.contains(&id) {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("chat driver did not stop in time".to_string());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } else {
+            state.chat.remove(&id);
         }
         if let Err(e) = chimaera_agent::journal::append_marker(
             state.chat.journal_dir(),
@@ -649,7 +706,9 @@ pub(crate) async fn rewind_session(
             chimaera_agent::model::AgentEvent::Notice {
                 text: "rewound to checkpoint".to_string(),
             },
-        ) {
+        )
+        .await
+        {
             tracing::warn!(%id, %e, "failed to journal the rewind");
         }
         let runtime_dir = chimaera_core::runtime_dir().join("agents");
@@ -691,6 +750,10 @@ pub(crate) fn spawn_chat_session(
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
+    // Re-enforce the journal-dir budget as sessions are created: the
+    // construction-time prune alone lets a weeks-long daemon accumulate one
+    // capped journal per session past the documented ceiling.
+    state.chat.prune_journal_dir();
     let (argv, pinned): (Vec<String>, Option<String>) = match recipe.kind {
         AgentKind::Claude => {
             let (settings, mcp) = (
@@ -755,7 +818,15 @@ pub(crate) fn spawn_chat_session(
             let dir = state.chat.journal_dir();
             let old_path = dir.join(format!("{old_id}.jsonl"));
             let new_path = dir.join(format!("{id}.jsonl"));
-            if old_id != id && old_path.exists() && !new_path.exists() {
+            // Never copy from a still-live session's journal: its writer thread
+            // may be mid-append, so the copy could split a line and the seeded
+            // tail would be lost on replay. Resume targets a finished
+            // conversation; a live source means the id was reused unexpectedly.
+            if old_id != id
+                && !state.chat.contains(&old_id)
+                && old_path.exists()
+                && !new_path.exists()
+            {
                 if let Err(err) = std::fs::copy(&old_path, &new_path) {
                     tracing::warn!(%id, %old_id, %err, "journal seed copy failed");
                 } else {

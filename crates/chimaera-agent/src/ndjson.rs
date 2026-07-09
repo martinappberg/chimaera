@@ -13,17 +13,85 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// stderr kept for diagnostics only — a runaway child must not grow memory.
 const STDERR_TAIL_BUDGET: usize = 8 * 1024;
+/// Hard ceiling on a single stdout line. A real stream-json / app-server frame
+/// (diffs, small inline images) fits well under this; a child that emits bytes
+/// without a newline (binary garbage, a wedged CLI) must never grow the read
+/// buffer without bound on a shared login node — the overflow is discarded.
+const MAX_STDOUT_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// stderr is diagnostics only; a much tighter per-line cap suffices.
+const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
+
+/// A length-capped async line reader. Unlike [`tokio::io::Lines`], the buffer
+/// for one line can never exceed `max`: once a line reaches the cap the reader
+/// keeps consuming (and discarding) input until the next newline, so a child
+/// that never emits `\n` cannot blow the daemon's RSS budget.
+struct CappedLines<R> {
+    reader: BufReader<R>,
+    max: usize,
+}
+
+impl<R: AsyncRead + Unpin> CappedLines<R> {
+    fn new(inner: R, max: usize) -> Self {
+        Self {
+            reader: BufReader::new(inner),
+            max,
+        }
+    }
+
+    /// Next line without its trailing `\n`. `Ok(None)` = EOF. Invalid UTF-8 is
+    /// replaced lossily rather than failing the session.
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut overflowed = false;
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if buf.is_empty() && !overflowed {
+                    return Ok(None);
+                }
+                break;
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    push_capped(&mut buf, &available[..pos], self.max, &mut overflowed);
+                    self.reader.consume(pos + 1);
+                    break;
+                }
+                None => {
+                    let len = available.len();
+                    push_capped(&mut buf, available, self.max, &mut overflowed);
+                    self.reader.consume(len);
+                }
+            }
+        }
+        if overflowed {
+            tracing::warn!(cap = self.max, "agent output line exceeded cap; truncated");
+        }
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    }
+}
+
+/// Append `chunk` to `buf` but never past `max`; flag once truncation begins.
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], max: usize, overflowed: &mut bool) {
+    let room = max.saturating_sub(buf.len());
+    if chunk.len() > room {
+        buf.extend_from_slice(&chunk[..room]);
+        *overflowed = true;
+    } else {
+        buf.extend_from_slice(chunk);
+    }
+}
 
 /// A spawned agent process speaking newline-delimited JSON on stdio.
 pub struct JsonlChild {
     child: Child,
     stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: CappedLines<ChildStdout>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -63,7 +131,7 @@ impl JsonlChild {
         let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::default();
         let tail = Arc::clone(&stderr_tail);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
+            let mut lines = CappedLines::new(stderr, MAX_STDERR_LINE_BYTES);
             while let Ok(Some(line)) = lines.next_line().await {
                 let mut tail = tail.lock().expect("stderr tail lock");
                 tail.push_back(line);
@@ -80,7 +148,7 @@ impl JsonlChild {
         Ok(Self {
             child,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             stderr_tail,
         })
     }
@@ -180,7 +248,7 @@ impl JsonlSink {
 
 /// Read half of a split [`JsonlChild`].
 pub struct JsonlStream {
-    lines: Lines<BufReader<ChildStdout>>,
+    lines: CappedLines<ChildStdout>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 

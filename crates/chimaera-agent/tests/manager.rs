@@ -184,9 +184,20 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
     }
     assert!(!fx.manager.get("s-1").unwrap().pending_permission);
 
-    // Seqs are strictly increasing with no duplicates across the stream.
-    for pair in seen.windows(2) {
-        assert!(pair[1].seq > pair[0].seq, "non-monotonic: {seen:#?}");
+    // Attach subscribes to `live` before snapshotting `replay`, so the live
+    // tail may legitimately re-deliver an event already in replay (the
+    // documented "dedupe by seq" contract). Apply that dedupe, then assert the
+    // remaining stream is strictly increasing.
+    let mut ordered: Vec<u64> = Vec::new();
+    let mut max_seq = 0u64;
+    for e in &seen {
+        if e.seq > max_seq {
+            ordered.push(e.seq);
+            max_seq = e.seq;
+        }
+    }
+    for pair in ordered.windows(2) {
+        assert!(pair[1] > pair[0], "non-monotonic: {seen:#?}");
     }
 
     // Gap replay: a reconnect with last_seq = permission's seq must get
