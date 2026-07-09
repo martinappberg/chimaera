@@ -1,9 +1,9 @@
-// Generate src/lib/icons.ts from a curated subset of Tabler Icons (MIT).
+// Generate src/lib/shared/icons.ts from a curated subset of Tabler Icons (MIT).
 //
 // Tabler icons are 24x24 outline glyphs drawn with a single stroke; we strip
 // the boilerplate <svg> wrapper and the leading transparent background rect,
 // keeping just the stroked <path d="…"> commands. The runtime component
-// (FileIcon.svelte) re-wraps them at 14–16px with our muted tints and the same
+// (shared/FileIcon.svelte) re-wraps them at 14–16px with our muted tints and the same
 // stroke language as the hand-made session glyphs, so the whole set reads as
 // one family.
 //
@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ICON_DIR = join(here, "..", "node_modules", "@tabler", "icons", "icons", "outline");
-const OUT = join(here, "..", "src", "lib", "icons.ts");
+const OUT = join(here, "..", "src", "lib", "shared", "icons.ts");
 
 // glyph name -> tabler icon file (without .svg). One glyph can back many
 // extensions; the extension/filename maps below point at these names.
