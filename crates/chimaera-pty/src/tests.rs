@@ -348,6 +348,19 @@ async fn snapshot_replay_matches_live_grid() {
     wait_gone(&mgr, &info.id).await;
 }
 
+/// spawn refuses a 0-dimension viewport — the same input `resize` already
+/// rejects, so a session can't be born in a state `resize` would refuse.
+#[test]
+fn spawn_rejects_zero_dims() {
+    let mgr = SessionManager::new();
+    let mut zero_cols = opts(bash());
+    zero_cols.cols = 0;
+    assert!(mgr.spawn(zero_cols).is_err(), "0 columns must be rejected");
+    let mut zero_rows = opts(bash());
+    zero_rows.rows = 0;
+    assert!(mgr.spawn(zero_rows).is_err(), "0 rows must be rejected");
+}
+
 /// (d) resize() changes the child's winsize (visible via `stty size`) and
 /// broadcasts a Resized event.
 #[tokio::test]
