@@ -209,11 +209,17 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
         .iter()
         .any(|e| matches!(e.ev, AgentEvent::TurnCompleted { .. })));
 
-    // Native id landed in the resume index.
-    assert_eq!(
-        fx.manager.index().lookup("fake-native-1").as_deref(),
-        Some("s-1")
-    );
+    // Native id landed in the resume index. The write is fire-and-forget (it
+    // must never stall the pump), so poll for it rather than assume it's synchronous.
+    let mut recorded = None;
+    for _ in 0..100 {
+        recorded = fx.manager.index().lookup("fake-native-1");
+        if recorded.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(recorded.as_deref(), Some("s-1"));
 }
 
 #[tokio::test]
