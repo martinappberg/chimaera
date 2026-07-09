@@ -130,7 +130,9 @@ standalone Tauri app (`crates/chimaera-app`). Start here:
 - **[CLAUDE.md](CLAUDE.md)** — the fast orientation map: repo layout, the dev loop, working
   rules, and how releases work. Read it first, whether you're a person or an agent.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — dev setup, code style, verification culture, the CLA.
-- **[DESIGN.md](DESIGN.md)** — the full architecture and rationale (the source of truth).
+- **[DESIGN.md](DESIGN.md)** — the design spine: problem, product model, scope, roadmap,
+  decisions log. It links to the deep **[architecture guide](docs/agent-guides/architecture.md)**
+  (the source of truth for how it's built and why).
 
 ```sh
 just check      # fmt + clippy + test — the same gate CI runs

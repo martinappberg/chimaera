@@ -3,7 +3,7 @@
 Orientation for coding agents. This crate is the daemon: every HTTP route, every
 WebSocket, and the logic behind them. It embeds `web-ui/dist` and serves it.
 Parent map: repo-root [CLAUDE.md](../../CLAUDE.md). Architecture + rationale:
-[DESIGN.md](../../DESIGN.md) `## Architecture`.
+the [architecture guide](../../docs/agent-guides/architecture.md).
 
 This file is a **module map + the seams that bite**. It is not exhaustive — open
 the module you need and read its header doc.
