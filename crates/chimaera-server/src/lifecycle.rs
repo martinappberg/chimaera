@@ -20,14 +20,17 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
         Some(handoff) => match rebind(handoff.port).await {
             Some(listener) => (listener, handoff.token),
             None => {
+                // `rebind` already exhausted the handoff port for ~5s. An
+                // explicit `--port` that EQUALS that (still-busy) port must not
+                // be retried here — `fresh_listener(cfg.port)` would bind the
+                // same busy port, fail, and take the daemon down. Bind an
+                // OS-assigned port so the daemon stays up (the manifest carries
+                // the new port); staying up beats dying on a transient clash.
                 tracing::warn!(
                     port = handoff.port,
-                    "handoff port still busy; starting fresh"
+                    "handoff port still busy; starting fresh on an OS-assigned port"
                 );
-                (
-                    fresh_listener(cfg.port).await?,
-                    chimaera_core::generate_token(),
-                )
+                (fresh_listener(None).await?, chimaera_core::generate_token())
             }
         },
         None => (
@@ -171,4 +174,28 @@ async fn shutdown_signal(state: Arc<AppState>) {
         _ = state.shutdown.notified() => {},
     }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The handoff-rebind-failure fallback binds an OS-assigned port (`None`),
+    /// not `cfg.port`. When an explicit `--port` equals the still-busy handoff
+    /// port, binding it again fails and would take the daemon down; binding a
+    /// fresh port keeps it up. This pins the two building blocks that decision
+    /// relies on.
+    #[tokio::test]
+    async fn fresh_listener_falls_back_to_an_os_port_when_asked_port_is_busy() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let busy_port = occupied.local_addr().unwrap().port();
+
+        // The old fallback (`fresh_listener(cfg.port)` with cfg.port == the busy
+        // handoff port) errors — that's the startup failure.
+        assert!(fresh_listener(Some(busy_port)).await.is_err());
+
+        // The fix (`fresh_listener(None)`) always binds, on a different port.
+        let fresh = fresh_listener(None).await.expect("fresh OS port");
+        assert_ne!(fresh.local_addr().unwrap().port(), busy_port);
+    }
 }
