@@ -91,6 +91,17 @@ app-build` (never the root `cargo`).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ Open question for a future
-capture: the intended default user mental model for `disconnect` vs `end sessions` vs `shut down`
-on a remote host (the behaviors are code-clear; which one is the "safe default" is a product call).
+### Why the native app behaves this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** The Claude-desktop-app replacement — real windows per workspace, native
+  notifications, a menubar badge — with the daemon binary doubling as the app, spawned detached so
+  quitting kills nothing.
+- **Deliberate.** **disconnect ≠ shutdown** (2026-07-08): disconnect is non-destructive (the
+  survive-disconnect promise); *end sessions* and *shut down* are explicit, user-confirmed teardown.
+  "Never *silently* kill sessions" — accidental loss is forbidden, confirmed teardown is a feature.
+  Window host labels must be human (raw hostnames confused the maintainer day one).
+- **Core vs addition.** The never-silently-kill / survive-disconnect promise is **core**; the app
+  itself and its teardown UX are additions that can be improved.
+- **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
+  outlives the app; human host labels.

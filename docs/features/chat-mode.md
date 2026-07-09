@@ -156,6 +156,15 @@ TUI (see [view switch](#view-switch-and-rewind)).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ Rich territory for a future
-capture: why chat mode exists alongside the TUI at all (the two-tier model), and the intended
-meaning of "ultracode".
+### Why chat mode exists
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** The rich Tier-B surface that replaces the Claude desktop app. It became the
+  *default* agent view on 2026-07-07, deliberately accepting the billing exposure (Tier B is exactly
+  the usage class Anthropic's paused change targets).
+- **Core vs addition.** Chat mode is an **addition** — improvable — but two things in it are
+  load-bearing and shouldn't be casually undone: `agents.defaultView` as the one-key flip back to
+  the billing-safe TUI, and the **protocol-authoritative** state rule (hooks don't fire under
+  `-p stream-json`, so state is derived from events, not hooks).
+- **Do not change (without care):** the `agents.defaultView` lever and the protocol-authoritative
+  rule.

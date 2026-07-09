@@ -140,6 +140,15 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ Open questions a future
-capture should answer: which agents are first-class vs "phase 2" and why; how/when the
-curated per-agent model lists are refreshed; the scope of what chimaera will manage-install.
+### Why agents are launched this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** Workspace-scoped agent sessions with attention state, replacing scattered
+  agent chats — the workbench's reason for being.
+- **Core.** The two-tier model with **Tier A (the real TUI) always fully supported and one toggle
+  away**, plus `agents.defaultView` as the flip-back lever, is a **deliberate structural hedge**
+  against the paused-billing risk — not an accident of history. Keep it.
+- **Improvable (additions).** Which agents are first-class (gemini/antigravity today are sequencing,
+  not a boundary), attention-state coverage, and the managed-install scope are additions that can
+  grow.
+- **Do not change:** Tier A staying fully supported and one toggle from chat.

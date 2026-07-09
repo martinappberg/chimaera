@@ -40,4 +40,14 @@ same static binary is the daemon, the remote-connect client, and the operator's 
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._
+### Why the CLI is shaped this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** One static binary is the daemon, the connect-client, and the operator
+  surface — the no-root deployment toolkit. The point is you can **run it from anywhere** — a login
+  node, a dev box, even a Slurm compute node.
+- **Deliberate.** `chimaera serve` is a load-bearing string (remote drives it over ssh); the manifest
+  is the single source of truth for "is a daemon running"; `kill` never SIGKILLs and never removes a
+  live daemon's manifest; `doctor` diagnoses the HPC "policy roulette" (some sites simply won't allow
+  it).
+- **Do not change:** the `serve` string; `kill`'s SIGTERM-only + remove-manifest-only-when-dead.

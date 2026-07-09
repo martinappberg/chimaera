@@ -74,9 +74,16 @@ also used to pressure-test the questionnaire in the [capture-feature-intent](../
   only** and dropped with the session/daemon, the `@term:` mention as the consent, the accent-hue
   coloring — are how it works **for now**, not a promise. Treat them as the current implementation,
   not a contract.
-- **Deliberately open / where it may go.** Nothing here is fixed. A direction the maintainer named:
-  starting agents *and* terminals with **linked environments / configs** from the outset — the leash
-  growing from an ad-hoc grant into a way to launch paired agent+terminal contexts. *"We'll see."*
+- **The security shape (deliberate, from the design).** DESIGN.md's decision log frames a few
+  stances as intentional: **the user grants links, agents cannot self-link**; a linked agent's tools
+  see **exactly** its links and nothing else; approvals stay Claude Code's own. Per the maintainer's
+  "additions to the core can improve — don't be too strict" rule these are *deliberate today, not
+  immutable*, but the grant-by-user-only / linked-only-scope shape is the part to be most careful
+  about rather than casually widening.
+- **Deliberately open / where it may go.** Nothing else here is fixed. A direction the maintainer
+  named: starting agents *and* terminals with **linked environments / configs** from the outset — the
+  leash growing from an ad-hoc grant into a way to launch paired agent+terminal contexts. *"We'll
+  see."*
 - **Do not change:** nothing is off-limits — this is explicitly an area open to change. A future
   agent should preserve the **purpose** (an agent operating through the user's own live shell
   context) but is free to rework the grant model, the in-memory persistence, or the scope if there's

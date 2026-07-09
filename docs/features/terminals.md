@@ -145,7 +145,16 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ One known open question
-for a future capture: the terminal **bell** is currently ignored (`session.rs` says
-"intentionally ignored for now") — whether an attention signal is planned is not derivable
-from code.
+### Why terminals work this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** Replace tmux/zellij nested inside code-server. Server-side terminal state
+  with instant lossless reattach is *the* fix for code-server's terminals-die-on-reload; plain
+  persistent shells are first-class workspace sessions, so this replaces tmux itself, not just the
+  agent chats.
+- **Core.** This is core — server-side terminal state (never serialize the grid), daemon-owned
+  persistence, and exited-shells-vanish (tmux semantics: no gray corpse rows) are load-bearing bets,
+  not conveniences.
+- **Do not change:** server-side terminal state and the vanish-on-exit semantic.
+- **Incidental (not intent).** The bell being ignored is an implementation detail, not a decision —
+  don't treat it as a promise either way.

@@ -86,6 +86,15 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ Open question for a future
-capture: the preview-type curation — why markdown + CSV + gzip + PDF but (currently) no notebook
-renderer — is a product-roadmap choice not derivable from code.
+### Why previews (and lightweight editing) are shaped this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** Previews are the durable **moat** — the part Anthropic won't build —
+  because the deliverable of an agent session (especially in bioinformatics) is usually *files*
+  (plots, MultiQC reports, tables, PDFs), not the conversation.
+- **Core value, will extend.** The preview layer is core value and **will be extended** (more
+  formats over time). Lightweight single-file editing is deliberately in scope; the firm **non-goal**
+  is a real editor — no LSP, completions, multi-file refactor, or debugger (serious editing lives in
+  real editors; agents write most code).
+- **Do not change:** the no-IDE-editor boundary, and streaming (never whole-file loads). The set of
+  preview formats is expected to grow.

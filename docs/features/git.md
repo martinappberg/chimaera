@@ -102,7 +102,14 @@ create/remove, `resolve.rs`, `service.rs`, `parse.rs`). Wire: `GET /api/v1/git/s
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ A pointed open question for a
-future capture: whether UI-side **staging / committing** is a deliberate non-goal (an
-agent-workbench where commits happen in the agent/terminal) or simply not built yet — the code
-only shows it's absent, not why.
+### Why git is read-only-first
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **The stance.** Replace code-server's git panel. Read-only-first is a **deliberate** choice —
+  "stage/commit stay in a terminal for now" (decision 2026-07-07) — not an unbuilt gap. A git
+  worktree is treated as a *dimension of one workspace*, not a peer; refresh is event-driven, never a
+  status poll; tree status is a client overlay, not baked into `fs::list`.
+- **Core vs addition.** This is an **addition to the core**, so the read-only stance **can change if
+  there's a clear improvement** — the maintainer's rule: don't be too strict about additions.
+- **Do not change casually:** event-driven refresh (never poll); worktree-as-dimension. The
+  read-only boundary itself is open to revisit if committing from the UI earns its keep.

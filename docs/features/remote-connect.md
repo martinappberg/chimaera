@@ -84,7 +84,16 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ Open question for a future
-capture: the reuse / update / attach-outdated policy encodes real judgment about when it's safe to
-replace a *colleague's* running daemon on a shared login node — the code documents *what* it does,
-not the *why* behind the exact safety threshold.
+### Why connect works this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** The no-root, single-static-binary, ssh-only deployment *is* the moat —
+  stood up like code-server (claude + chimaerad user-side, authenticate once).
+- **Deliberate (confirmed).** Reuse the user's own ssh client, never reimplement it; never
+  force-kill a remote daemon (SIGTERM-only — it may hold sessions); HTTP-probe liveness, not TCP
+  (survives laptop sleep); TOFU host keys for a tty-less app. Replacing a running daemon (possibly a
+  colleague's, on a shared node) happens **only when it's provably idle, or explicitly forced** —
+  this should stay in place. No E2E relay service (free-ride ssh).
+- **Core vs addition.** The no-root ssh deployment is **core**; the exact policies above are
+  deliberate and should hold, but like all additions can improve.
+- **Do not change:** SIGTERM-only remote stop; resolve-the-binary-before-stopping-any-daemon.

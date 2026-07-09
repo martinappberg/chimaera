@@ -120,4 +120,15 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._
+### Why the workbench is shaped this way
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** Workspace-first, chat-many — the deliberate inversion of the Claude
+  desktop app's chat-first / workspace-weak model. The folder *is* the window (file tree, previews,
+  git, and N sessions all scoped to it), not an attribute of a chat.
+- **Core vs addition.** The workspace-first model is a **core bet** — don't undo it. Split panes,
+  focus mode, and the DnD/keyboard details are **additions**: deliberate (panes exist to put an
+  agent and its outputs side by side, superseding the earlier "no tiling WM" non-goal) but
+  improvable, not sacred.
+- **Do not change:** the workspace-first inversion. Everything else in the workbench can change if
+  it's a clear improvement.

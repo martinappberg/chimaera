@@ -29,8 +29,13 @@ Every page separates two kinds of knowledge, and the split is load-bearing:
   **Never auto-generated or inferred from code.** Each page carries an `## Intent`
   section at the end; until a `feat:` in that area records it, entries read *pending*.
 
-A future agent must treat the Intent section as a set of constraints, not suggestions:
-it names decisions that are deliberate and must not be "helpfully" changed.
+A future agent must treat the Intent section as constraints, not suggestions — but read the
+*grade* of each one. Intent distinguishes **core bets** (a handful of load-bearing product
+decisions — workspace-first, daemon-owns-everything / nothing-dies, never-silently-kill,
+server-side terminal state, no-root ssh deployment — that are genuinely don't-change) from
+**additions to the core** (git, previews, chat specifics, linked terminals, the native-app
+teardown UX, …) which are *deliberate for now but improvable*. Reserve "must not change" for the
+core; an addition can change when there's a clear improvement. Don't be too strict about additions.
 
 ## The pages
 

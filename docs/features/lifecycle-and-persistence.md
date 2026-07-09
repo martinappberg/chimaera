@@ -87,4 +87,17 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._
+### Why persistence is the central bet
+_Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
+
+- **Problem it solves.** "Close the laptop, nothing dies" — tmux's ownership model, the exact inverse
+  of code-server's failure. The daemon owns everything; windows are just views.
+- **Core.** This is *the* core bet, and several mechanics are load-bearing, not conveniences: session
+  ids are preserved across a restart so layout/links rebind with no migration; graceful shutdown
+  **force-kills sessions first, then waits the SIGKILL grace** (a HUP-ignoring agent would otherwise
+  reparent to init and survive); the ledger stores no argv (it rebuilds via the normal spawn path so
+  the new daemon's hooks/shims/themes match).
+- **Improvable.** Chat-session resurrection across a restart is a known follow-up (`sv-11`;
+  retire-to-Recents for now).
+- **Do not change:** never-silently-kill; daemon-owns-everything / windows-are-views; the
+  force-kill-then-grace shutdown mechanism.

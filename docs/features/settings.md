@@ -44,4 +44,14 @@ a `settings` frame on `/ws/events`. Map: [settings/CLAUDE.md](../../web-ui/src/l
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._
+### Why settings exist
+_Captured 2026-07-09 — drafted from context, reframed by the maintainer._
+
+- **The vision (this is the intent).** Settings isn't really a design *choice* so much as a standing
+  vision: **everything should be customizable.** The store is the ground-truth expression of that —
+  the UI and a hand-editor (vim over ssh) are both first-class against it because you often reach the
+  daemon only over ssh.
+- **Incidental (not intent).** The mechanics — which keys the daemon consumes, hand-edit re-stat +
+  broadcast, never-brick-on-corrupt, defaults living in the web-ui schema — are how it's implemented
+  today, not the point.
+- **Do not change:** the direction — that more of the app becomes user-customizable over time.

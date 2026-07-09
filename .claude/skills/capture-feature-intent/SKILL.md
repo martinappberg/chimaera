@@ -47,9 +47,19 @@ a floor, not a cage.
 *why* is settled" is a valid and valuable answer, not a non-answer. Capture it plainly: a future
 agent needs to know what is **not** a locked contract just as much as what is. Questions 2–4 are
 worded to welcome that — never push the human to invent firm promises or must-not-touch rules that
-don't exist yet. (This wording is the result of pressure-testing the questions live on a real
-feature; the original phrasing assumed more certainty than early features have. See the worked
-example in [docs/features/linked-terminals.md](../../../docs/features/linked-terminals.md).)
+don't exist yet.
+
+**Grade the intent: core bet vs addition.** A handful of decisions are genuine **core bets**
+(don't-change). Most features are **additions to the core** — deliberate today but improvable, and
+the maintainer's standing rule is *"don't be too strict about additions; they can change if
+improved."* When you write the Intent, say which grade each point is, and reserve "do not change"
+for the core. Over-freezing an addition is as harmful as under-recording a core bet.
+
+(This wording is the result of pressure-testing the questions live on real features; the original
+phrasing assumed more certainty than early features have, and lacked the core-vs-addition grade. See
+the worked examples — [linked-terminals.md](../../../docs/features/linked-terminals.md) and the other
+[feature pages](../../../docs/features/README.md) — and the "how to read Intent" note in the catalog
+index.)
 
 ## Writing the answers
 
