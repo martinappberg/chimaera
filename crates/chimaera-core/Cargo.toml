@@ -12,5 +12,4 @@ serde_json.workspace = true
 tracing.workspace = true
 rand.workspace = true
 dirs.workspace = true
-hostname.workspace = true
 nix = { workspace = true, features = ["user"] }

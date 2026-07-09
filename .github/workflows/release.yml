@@ -1,14 +1,13 @@
 name: release
 
-# Every merge to main cuts a release. The version is derived from the last
-# git tag and bumped by the squashed PR's commit message (Conventional
-# Commits): `feat:` -> minor, `BREAKING CHANGE`/`!:` -> major, else patch.
-# A single workflow does version + build + publish: a tag pushed by
-# GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be
-# split across two. Put `[skip release]` in the squash message to skip.
-# NOTE: the skip check matches the ENTIRE squash message, including the PR
-# description that GitHub folds into it, so never write that token in a PR
-# body unless you actually intend to skip the release.
+# NOT every merge cuts a release. scripts/version-bump.sh decides from the squash
+# SUBJECT (Conventional Commits): feat -> minor, fix|perf|revert -> patch, `!` ->
+# major, and refactor|chore|docs|test|ci|build|style (and [skip release]) -> NO
+# release. Subject-anchored on purpose, so a folded PR body can't flip the bump or
+# skip a release. Full policy + rationale: docs/agent-guides/releases.md (the single
+# source); the bump logic is characterization-tested by scripts/version-bump.test.sh
+# in ci.yml. A single workflow does version + build + publish: a tag pushed by
+# GITHUB_TOKEN cannot trigger a second workflow, so the release cannot be split.
 #
 # Releases are PUBLISHED (not draft) so the installed app auto-updates; the
 # required-CI branch protection on main is the safety gate that a merge is
@@ -27,8 +26,11 @@ concurrency: release
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip release]')"
+    # No job-level skip gate: the script owns the decision (incl. [skip release]
+    # and the no-release types) and emits `release=false`; downstream build/publish
+    # jobs are gated on `needs.version.outputs.release == 'true'`.
     outputs:
+      release: ${{ steps.bump.outputs.release }}
       version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -37,25 +39,20 @@ jobs:
       - id: bump
         run: |
           latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
-          msg=$(git log -1 --pretty=%B)
-          if [ -z "$latest" ]; then
-            version="0.1.0"
+          subject=$(git log -1 --pretty=%s)
+          result=$(bash scripts/version-bump.sh "$latest" "$subject")
+          if [ "$result" = "skip" ]; then
+            echo "no release for: $subject"
+            echo "release=false" >> "$GITHUB_OUTPUT"
           else
-            IFS=. read -r ma mi pa <<< "${latest#v}"
-            if echo "$msg" | grep -qiE 'BREAKING CHANGE|!:'; then
-              ma=$((ma + 1)); mi=0; pa=0
-            elif echo "$msg" | grep -qiE '^feat'; then
-              mi=$((mi + 1)); pa=0
-            else
-              pa=$((pa + 1))
-            fi
-            version="$ma.$mi.$pa"
+            echo "releasing v$result (from: $subject)"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "version=$result" >> "$GITHUB_OUTPUT"
           fi
-          echo "releasing v$version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   daemon:
     needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -84,6 +81,7 @@ jobs:
 
   daemon-macos:
     needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -108,6 +106,7 @@ jobs:
   # it, and emits latest.json because the app config sets createUpdaterArtifacts).
   app:
     needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +147,7 @@ jobs:
   # Attach the daemon binaries to the release tauri-action published.
   attach-daemons:
     needs: [version, app, daemon, daemon-macos]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

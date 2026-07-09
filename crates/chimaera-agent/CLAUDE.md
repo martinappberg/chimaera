@@ -5,7 +5,8 @@ it drives coding-agent CLIs through their *structured* protocols (not a PTY) and
 turns them into one normalized, seq-numbered, replayable event stream. Read this
 before touching the crate; read [`PROTOCOL.md`](PROTOCOL.md) before touching a
 driver. The parent map is the repo-root [CLAUDE.md](../../CLAUDE.md); deep
-rationale is in [DESIGN.md](../../DESIGN.md) `## Architecture`.
+rationale is in the [architecture guide](../../docs/agent-guides/architecture.md)
+(`### Agent integration`).
 
 ## What this crate is (and is NOT)
 

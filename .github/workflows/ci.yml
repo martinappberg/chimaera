@@ -31,12 +31,28 @@ jobs:
         working-directory: web-ui
       - run: npm run check
         working-directory: web-ui
+      - run: npm run test
+        working-directory: web-ui
       - run: npm run build
         working-directory: web-ui
       - uses: actions/upload-artifact@v4
         with:
           name: web-ui-dist
           path: web-ui/dist
+
+  # Fast repo-hygiene checks, no build needed: the release semver decision
+  # (the most behavior-critical release piece), the destructive-command guard,
+  # and every markdown link/anchor. jq is preinstalled on ubuntu-latest.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: bash scripts/version-bump.test.sh
+      - run: bash .claude/hooks/guard-bash.test.sh
+      - run: node scripts/check-doc-links.mjs
 
   rust:
     needs: ui

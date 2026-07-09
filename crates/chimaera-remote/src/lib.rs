@@ -220,12 +220,6 @@ impl Tunnel {
         self.child.wait().await
     }
 
-    /// Whether the daemon behind the forward actually answers. See
-    /// [`http_alive`] for why a bare TCP connect would not do.
-    pub async fn is_up(&self) -> bool {
-        http_alive(self.local_port).await
-    }
-
     /// Kill the tunnel child and cancel any master-held forward so local
     /// ports don't leak past the session that opened them. Only the forward
     /// is cancelled — the ControlMaster stays (ControlPersist), so reconnects
