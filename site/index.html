@@ -3,27 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>chimaera: an agent workbench, not an IDE</title>
+    <title>chimaera — your agent workbench</title>
     <meta
       name="description"
-      content="chimaera runs Claude Code, Codex, and other coding agents as persistent sessions on the machine your code lives on, from a laptop to an HPC login node. Sessions survive disconnect, and their plots and reports render right beside them. One static Rust binary, no root, no containers."
+      content="chimaera is an agent workbench: it runs Claude Code, Codex, and other coding agents as persistent sessions on the machine your code already lives on, from a laptop to an HPC login node. Run several in parallel, drive them from a rich chat UI or their real TUI, and see the files they produce right beside them. Sessions survive disconnect. One static Rust binary, no root, no containers."
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/css/styles.css" />
 
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="chimaera: an agent workbench, not an IDE" />
+    <meta property="og:title" content="chimaera — your agent workbench" />
     <meta
       property="og:description"
-      content="Persistent coding-agent sessions on the machine your code lives on, from a laptop to an HPC login node. Sessions survive disconnect, and their plots and reports render right beside them. One static Rust binary, no root."
+      content="An agent workbench: persistent coding-agent sessions on the machine your code lives on, from a laptop to an HPC login node. A rich chat UI or the real TUI, run in parallel, with the files they produce rendered right beside them. Sessions survive disconnect. One static Rust binary, no root."
     />
     <meta property="og:image" content="https://martinappberg.github.io/chimaera/assets/img/og.png" />
     <meta property="og:url" content="https://martinappberg.github.io/chimaera/" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="chimaera: an agent workbench, not an IDE" />
+    <meta name="twitter:title" content="chimaera — your agent workbench" />
     <meta
       name="twitter:description"
-      content="Persistent, daemon-owned agent sessions on whatever host owns the work. One static Rust binary. Sessions survive disconnect."
+      content="An agent workbench: persistent coding-agent sessions on whatever host owns the work, in a rich chat UI or the real TUI. One static Rust binary. Sessions survive disconnect."
     />
     <meta name="twitter:image" content="https://martinappberg.github.io/chimaera/assets/img/og.png" />
 
@@ -98,16 +98,15 @@
       <section class="hero">
         <div class="wrap">
           <div class="hero__head">
-            <h1>An agent workbench, not an IDE.</h1>
+            <h1>Your agent workbench.</h1>
             <p class="hero__sub">
-              chimaera runs Claude Code, Codex, and other coding agents as
-              persistent sessions on the machine your code already lives on,
-              from your laptop to an HPC login node. A closed window or a
-              dropped SSH connection never interrupts a run; reconnect and every
-              session is exactly where you left it. Plots, reports, and
-              notebooks render right beside the agent that made them, so one
-              window does the job of your editor, your terminal multiplexer, and
-              your file browser.
+              chimaera keeps Claude Code, Codex, and other coding agents running
+              as persistent sessions on the machine your code already lives on,
+              from your laptop to an HPC login node. Run several in parallel and
+              it tells you which one needs you; drive each from a rich chat UI or
+              its real terminal, with the files they produce rendered right
+              beside them. Close your laptop mid-run and nothing dies — reconnect
+              and every session is exactly where you left it.
             </p>
             <div class="hero__cta">
               <a class="btn btn--primary" href="#download">
@@ -303,12 +302,15 @@
             </article>
 
             <article class="feature">
-              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M7 9l2.5 2L7 13M13 13h4"/></svg></div>
-              <h3>The real agent TUIs</h3>
+              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/><path d="M8 9.5h8M8 12.5h5"/></svg></div>
+              <h3>Chat mode or the real TUI</h3>
               <div class="feature__body"><p>
-                Agents run as the actual <code>claude</code> TUI in a
-                daemon-owned PTY, so they look, behave, and bill exactly like
-                they do in your terminal. Hooks surface which one needs you.
+                Every agent runs two ways on one session, a toggle apart. Chat
+                mode, the default, is a rich structured UI: tool cards,
+                permission prompts, rewind, and inline previews of what each
+                turn made. Flip to the real <code>claude</code> or
+                <code>codex</code> TUI and it looks, behaves, and bills exactly
+                like your terminal.
               </p></div>
             </article>
 
@@ -320,6 +322,17 @@
                 sandboxed HTML reports, the MultiQC and FastQC class of output.
                 The server extracts and the client renders, so whole files never
                 load.
+              </p></div>
+            </article>
+
+            <article class="feature">
+              <div class="feature__mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.2"/><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="8.5" r="2.2"/><path d="M6 7.2v9.6M18 10.7a6 6 0 0 1-6 6H8.2"/></svg></div>
+              <h3>Git, built in</h3>
+              <div class="feature__body"><p>
+                A source-control panel with side-by-side diffs, worktree create
+                and remove, a branch per agent, and a session-scoped view of
+                exactly what an agent changed. The review side of git, without
+                leaving the workbench.
               </p></div>
             </article>
 
@@ -525,8 +538,8 @@
           </div>
           <div class="faq">
             <details class="qa">
-              <summary>Does it change how my agents run or bill?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
-              <div class="qa__body">No. Agents run as their real TUIs in a normal PTY, spawned through your login shell with your environment and credentials. <code>claude</code> behaves and bills exactly as it does in any terminal. chimaera just owns the process and gives you a window onto it.</div>
+              <summary>How do my agents run and bill?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
+              <div class="qa__body">Two ways, a toggle apart. In the <strong>real TUI</strong>, an agent runs as the actual <code>claude</code> or <code>codex</code> terminal in a normal PTY, spawned through your login shell with your environment, so it behaves and bills exactly as it does in any terminal. In <strong>chat mode</strong> (the default), chimaera drives the same CLI over its structured JSON protocol to render the rich chat UI; that path bills like the CLI's structured/headless mode rather than the interactive TUI. Either way, chimaera never touches your credentials, it just owns the process. One setting (<code>agents.defaultView</code>) picks which mode new sessions open in, and any session flips between the two.</div>
             </details>
             <details class="qa">
               <summary>Do my credentials go through chimaera?<svg class="plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></summary>
@@ -558,7 +571,7 @@
               <svg class="hexmark" width="24" height="24" viewBox="0 0 240 240" aria-hidden="true"><g fill="none" stroke="var(--bm-1)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"><path d="M120 46 L186 84 L186 156 L120 194 L54 156 L54 84 Z"/><path d="M151.4 154.9 A 47 47 0 1 1 151.4 85.1"/></g></svg>
               <span class="wordmark" style="font-size: 16px">chimaera</span>
             </a>
-            <p>An agent workbench, not an IDE. Persistent sessions and their outputs, on whatever host owns the work.</p>
+            <p>Your agent workbench — persistent coding-agent sessions and their outputs, on whatever host owns the work.</p>
           </div>
           <div class="footer__cols">
             <div class="footer__col">
