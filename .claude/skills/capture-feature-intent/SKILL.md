@@ -32,13 +32,24 @@ Ask these directly, in the session, of the person who built or is shipping the f
 these — short is the point. Use their words; do not answer on their behalf or infer from code.
 
 1. **Why does this feature exist — what problem does it solve for the user?**
-2. **What's the intended behavior, and what's incidental?** (What's a promise you'll keep vs an
-   implementation detail that could change without anyone minding.)
-3. **What non-obvious decision or constraint shaped it, and what did you deliberately leave out?**
-4. **Is there anything a future agent must NOT "helpfully" change because it's intentional?**
+2. **How settled is it — what's a real promise you intend to keep, versus "this is just how it works
+   for now" and free to change?**
+3. **What non-obvious decision or constraint shaped it, and what did you deliberately leave out or
+   leave open for later?**
+4. **Is there anything a future agent must NOT change because it's intentional — or is this area
+   open to change?**
 
 Four questions. If an answer makes another redundant, fold them — don't pad to four. If the human
-volunteers something outside these, keep it; the questions are a floor, not a cage.
+volunteers something outside these (e.g. where the feature might go next), keep it; the questions are
+a floor, not a cage.
+
+**Don't assume the feature is mature.** "It's provisional — most of this could change; only the
+*why* is settled" is a valid and valuable answer, not a non-answer. Capture it plainly: a future
+agent needs to know what is **not** a locked contract just as much as what is. Questions 2–4 are
+worded to welcome that — never push the human to invent firm promises or must-not-touch rules that
+don't exist yet. (This wording is the result of pressure-testing the questions live on a real
+feature; the original phrasing assumed more certainty than early features have. See the worked
+example in [docs/features/linked-terminals.md](../../../docs/features/linked-terminals.md).)
 
 ## Writing the answers
 
@@ -48,13 +59,16 @@ sub-heading naming the specific capability and a capture date, then the answers.
 
 ```markdown
 ### <Feature> — why it exists
-_Captured 2026-07-09 (from <who>, or "the maintainer")._
+_Captured <YYYY-MM-DD> (from <who>, or "the maintainer")._
 
 - **Problem it solves:** …their answer…
-- **Intended vs incidental:** …
-- **Deliberate decisions / left out:** …
-- **Do not change:** …
+- **How settled it is (intended vs provisional):** …what's a promise vs "for now"…
+- **Deliberately open / where it may go:** …left out, left open, future direction…
+- **Do not change (or: open to change):** …what's load-bearing, or plainly that it's open…
 ```
+
+For a filled-in example, see the first entry in
+[docs/features/linked-terminals.md](../../../docs/features/linked-terminals.md).
 
 Leave the "_No intent captured yet — pending…_" placeholder in place until you actually have
 answers; replace it only with real ones.

@@ -60,7 +60,24 @@ leash-drawing in `web-ui/src/App.svelte`; the drag band that arms a link is in
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_No intent captured yet — pending the next `feat:` in this area._ This is a strong candidate for
-the first intent capture: the *why* of the leash (why an agent should reach a user's live shell
-rather than spawn its own), and what about the "the mention is the consent" grant model is a
-deliberate security stance vs an implementation detail, are not derivable from code.
+### The leash — why it exists
+_Captured 2026-07-09 (from the maintainer). This is the catalog's first worked intent entry —
+also used to pressure-test the questionnaire in the [capture-feature-intent](../../.claude/skills/capture-feature-intent/SKILL.md) skill._
+
+- **Problem it solves.** Give an agent reach into the shell *you're actually working in*, instead
+  of a fresh one it spawns cold. Concretely: you've set up particular conda environments; you're
+  mid-task in a live shell and want the agent to read and act from exactly where you are; you've
+  `ssh`'d somewhere you can't (or won't) expose to the agent directly and want it to work through
+  that session. The leash is how the agent borrows your already-set-up context.
+- **How settled it is (intended vs provisional).** Provisional — *"it's just a link."* The **why**
+  above is the stable part. The current mechanics — one agent per terminal, links held **in memory
+  only** and dropped with the session/daemon, the `@term:` mention as the consent, the accent-hue
+  coloring — are how it works **for now**, not a promise. Treat them as the current implementation,
+  not a contract.
+- **Deliberately open / where it may go.** Nothing here is fixed. A direction the maintainer named:
+  starting agents *and* terminals with **linked environments / configs** from the outset — the leash
+  growing from an ad-hoc grant into a way to launch paired agent+terminal contexts. *"We'll see."*
+- **Do not change:** nothing is off-limits — this is explicitly an area open to change. A future
+  agent should preserve the **purpose** (an agent operating through the user's own live shell
+  context) but is free to rework the grant model, the in-memory persistence, or the scope if there's
+  a good reason. Don't treat the current mechanics as invariants.
