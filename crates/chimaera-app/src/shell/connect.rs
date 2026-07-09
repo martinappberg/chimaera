@@ -314,7 +314,7 @@ fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     }
 }
 
-pub(super) fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
+fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
     HostsStore::load_default()
         .get(alias)
         .unwrap_or(chimaera_remote::hosts::HostEntry {
