@@ -249,6 +249,19 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
         crate::lock(&state.chat_recipes).remove(id);
         return;
     }
+    // The reap can also land AFTER the switch handler already removed the
+    // marker: a slow-exiting driver (claude ≥2.1.205 takes ~1s on SIGTERM)
+    // drains its exit later than the respawn completes. A live successor
+    // surface under the same id means this exit WAS that deliberate kill —
+    // retiring here would tear down the fresh session (and dropping the
+    // recipe would break its next toggle's resume fallback). Leave both.
+    let successor_chat = state.chat.get(id).is_some_and(|c| c.alive);
+    if successor_chat || state.sessions.get(id).is_some() {
+        if !successor_chat {
+            state.chat.remove(id);
+        }
+        return;
+    }
     let recipe = crate::lock(&state.chat_recipes).remove(id);
     match exit {
         DriverExit::HandshakeFailed {
@@ -596,6 +609,18 @@ pub(crate) async fn switch_view(
             .into_response();
     }
 
+    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
+    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
+        crate::lock(&state.workspaces)
+            .get(wid)
+            .map(|w| w.root.clone())
+    }) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "session has no workspace".to_string(),
+        );
+    };
+
     // The resume handle: chat side knows its native id from Init; TUI side
     // from the transcript path hooks report. Missing handle = fresh start in
     // the other mode (still the same chimaera session identity).
@@ -618,17 +643,23 @@ pub(crate) async fn switch_view(
     } else {
         record.resume_id()
     };
-
-    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
-    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
-        crate::lock(&state.workspaces)
-            .get(wid)
-            .map(|w| w.root.clone())
-    }) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            "session has no workspace".to_string(),
-        );
+    // A handle is only resumable once a turn has landed a transcript on disk.
+    // A fresh chat PINS its uuid at spawn (`--session-id`), so the handle
+    // exists with zero turns — and claude exits(1) on `--resume` of an id with
+    // no transcript (verified 2.1.204/2.1.205), killing the toggled session.
+    // Validate against the project store; no transcript = fresh start.
+    let resume = match resume {
+        Some(uuid) if record.kind == AgentKind::Claude => {
+            let path = state
+                .claude_projects_dir
+                .join(crate::launcher::encode_cwd(&workspace_root))
+                .join(format!("{uuid}.jsonl"));
+            tokio::fs::try_exists(&path)
+                .await
+                .unwrap_or(false)
+                .then_some(uuid)
+        }
+        other => other,
     };
 
     // Serialize per id: a concurrent toggle (double-click) that slipped past
