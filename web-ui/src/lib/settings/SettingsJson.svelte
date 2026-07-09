@@ -23,7 +23,7 @@
   import { tags as t } from "@lezer/highlight";
   import { expectedType, sanitize, settingDef, SETTINGS } from "./schema";
   import { getSetting, rawUserSettings, replaceSettings } from "./store.svelte";
-  import { isMac } from "../keys";
+  import { isMac } from "../shared/keys";
 
   const SAVE_HINT = isMac ? "⌘S to save" : "Ctrl+S to save";
 

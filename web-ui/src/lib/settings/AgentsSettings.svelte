@@ -11,8 +11,8 @@
    * JSON editor and the store stay in sync); only the presentation is custom.
    */
   import { onMount } from "svelte";
-  import { listAgents, uninstallAgent, type AgentInfo } from "../launcher";
-  import SessionGlyph from "../SessionGlyph.svelte";
+  import { listAgents, uninstallAgent, type AgentInfo } from "../workspace/launcher";
+  import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, setSetting } from "./store.svelte";
 
   // The four per-agent path keys are all string-typed, so this cast is sound.

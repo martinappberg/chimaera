@@ -505,7 +505,7 @@ pub(crate) async fn put_file(
         Ok(WriteOutcome::Written(mtime)) => {
             // A save is a git-relevant change: nudge the workspace(s) holding
             // this path so the tree/panel refetch without any polling.
-            crate::git::mark_path_dirty(&state, &query.path);
+            crate::git::mark_path_dirty(&state, &query.path).await;
             let mut response = StatusCode::NO_CONTENT.into_response();
             response.headers_mut().insert(
                 HeaderName::from_static("x-mtime"),

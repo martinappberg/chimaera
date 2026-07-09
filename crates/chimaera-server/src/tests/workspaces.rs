@@ -76,6 +76,31 @@ async fn workspaces_post_get_round_trip() {
     assert!(err["error"].is_string());
 }
 
+/// A path that exists but is a FILE (not a directory) is a 400. The `is_dir`
+/// check now runs off the reactor (spawn_blocking), but still validates.
+#[tokio::test]
+async fn create_workspace_rejects_a_file_root() {
+    let state = test_state();
+    let dir = test_dir("ws-file");
+    let file = dir.join("not-a-dir.txt");
+    std::fs::write(&file, b"x").unwrap();
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": file.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is not a directory"),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn workspaces_open_and_delete() {
     let state = test_state();

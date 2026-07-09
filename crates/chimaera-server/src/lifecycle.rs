@@ -17,17 +17,14 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     let (listener, token) = match chimaera_core::Handoff::consume()
         .filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
     {
-        Some(handoff) => match rebind(handoff.port).await {
-            Some(listener) => (listener, handoff.token),
-            None => {
+        Some(handoff) => match listener_after_handoff(handoff.port).await? {
+            (listener, true) => (listener, handoff.token),
+            (listener, false) => {
                 tracing::warn!(
                     port = handoff.port,
-                    "handoff port still busy; starting fresh"
+                    "handoff port still busy; started fresh on an OS-assigned port"
                 );
-                (
-                    fresh_listener(cfg.port).await?,
-                    chimaera_core::generate_token(),
-                )
+                (listener, chimaera_core::generate_token())
             }
         },
         None => (
@@ -127,6 +124,21 @@ async fn fresh_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
         .context("failed to bind 127.0.0.1")
 }
 
+/// Acquire the startup listener when a handoff was consumed: rebind the
+/// handoff port, or — if it's STILL busy after `rebind`'s ~5s — an OS-assigned
+/// port. Returns `(listener, reused)`; `reused` = keep the handoff token.
+///
+/// Never retries the requested port in the fallback: `rebind` already spent
+/// its budget on it, so re-binding it would just fail and take the daemon
+/// down. This is why the fallback binds `None`, not the requested port —
+/// staying up on a fresh port beats dying on a transient clash.
+async fn listener_after_handoff(handoff_port: u16) -> anyhow::Result<(TcpListener, bool)> {
+    match rebind(handoff_port).await {
+        Some(listener) => Ok((listener, true)),
+        None => Ok((fresh_listener(None).await?, false)),
+    }
+}
+
 /// Try the handoff port for ~5s: the predecessor releases it at exit, but
 /// its teardown can lag the successor's start.
 async fn rebind(port: u16) -> Option<TcpListener> {
@@ -171,4 +183,42 @@ async fn shutdown_signal(state: Arc<AppState>) {
         _ = state.shutdown.notified() => {},
     }
     tracing::info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When the handoff port stays busy through `rebind`, the fallback must
+    /// bind an OS-assigned port and report `reused=false` — NOT retry the busy
+    /// port (the old `fresh_listener(cfg.port)` bug, which took the daemon
+    /// down when an explicit `--port` equalled the handoff port). ~5s: `rebind`
+    /// exhausts its retry budget against the occupied port first.
+    #[tokio::test]
+    async fn handoff_falls_back_to_a_fresh_port_when_the_port_stays_busy() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let busy_port = occupied.local_addr().unwrap().port();
+
+        let (listener, reused) = listener_after_handoff(busy_port)
+            .await
+            .expect("must stay up on a fresh port, not error");
+        assert!(!reused, "a busy handoff port cannot be reused");
+        assert_ne!(
+            listener.local_addr().unwrap().port(),
+            busy_port,
+            "must fall back to a different (OS-assigned) port"
+        );
+    }
+
+    /// A free handoff port is rebound and its token reused.
+    #[tokio::test]
+    async fn handoff_reuses_a_free_port() {
+        let free = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free); // release it so rebind can take it
+
+        let (listener, reused) = listener_after_handoff(port).await.expect("rebind");
+        assert!(reused, "a free handoff port is reused");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
 }

@@ -276,29 +276,120 @@ pub async fn http_alive(port: u16) -> bool {
         .is_some()
 }
 
-/// Connect to the daemon on `host`, installing and starting it if needed,
-/// and bring up a local port-forward. `progress` fires as phases begin.
-pub async fn connect(
+/// The side-effecting host operations the [`connect`] decision phase drives,
+/// behind a trait so [`resolve_daemon`]'s policy is unit-testable with a fake
+/// (this crate can't be live-verified — no remote host in CI). The production
+/// impl ([`SshOps`]) delegates each method VERBATIM to the free function of the
+/// same name, so the seam can never drift from real behavior. The three
+/// binary/deploy methods take `progress` as `&impl Fn(Phase)` (NOT `&dyn`): a
+/// bare `dyn Fn` erases the closure's auto-traits, which would make the whole
+/// `connect` future `!Send` and break the Tauri app's `spawn` of it — keeping
+/// the concrete closure type lets `Send` flow through exactly as it did before
+/// this seam existed.
+trait RemoteOps {
+    async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>>;
+    async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool>;
+    async fn remote_sessions_count(
+        &self,
+        host: &str,
+        manifest: &Manifest,
+    ) -> anyhow::Result<Option<usize>>;
+    async fn resolve_local_binary(
+        &self,
+        host: &str,
+        binary: Option<&Path>,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<PathBuf>;
+    async fn stop_remote(&self, host: &str, pid: u32) -> anyhow::Result<()>;
+    async fn deploy_binary(
+        &self,
+        host: &str,
+        path: &Path,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<()>;
+    async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest>;
+    async fn ensure_remote_binary(
+        &self,
+        host: &str,
+        binary: Option<&Path>,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<()>;
+}
+
+/// The production [`RemoteOps`]: every method is a one-line delegation to the
+/// existing free function, so behavior is preserved by construction.
+struct SshOps;
+
+impl RemoteOps for SshOps {
+    async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>> {
+        remote_manifest(host).await
+    }
+    async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool> {
+        remote_alive(host, pid).await
+    }
+    async fn remote_sessions_count(
+        &self,
+        host: &str,
+        manifest: &Manifest,
+    ) -> anyhow::Result<Option<usize>> {
+        remote_sessions_count(host, manifest).await
+    }
+    async fn resolve_local_binary(
+        &self,
+        host: &str,
+        binary: Option<&Path>,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<PathBuf> {
+        resolve_local_binary(host, binary, &progress).await
+    }
+    async fn stop_remote(&self, host: &str, pid: u32) -> anyhow::Result<()> {
+        stop_remote(host, pid).await
+    }
+    async fn deploy_binary(
+        &self,
+        host: &str,
+        path: &Path,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<()> {
+        deploy_binary(host, path, &progress).await
+    }
+    async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest> {
+        start_remote(host).await
+    }
+    async fn ensure_remote_binary(
+        &self,
+        host: &str,
+        binary: Option<&Path>,
+        progress: &impl Fn(Phase),
+    ) -> anyhow::Result<()> {
+        ensure_remote_binary(host, binary, &progress).await
+    }
+}
+
+/// The DECISION phase of [`connect`]: probe the host's daemon and decide
+/// whether to reuse, replace, attach-outdated, or fresh-start it — returning
+/// `(manifest, outdated, live_sessions)` for the tunnel-attach phase to forward
+/// against. Split out behind [`RemoteOps`] so the policy is exercisable without
+/// ssh, including the resolve-binary-BEFORE-stop ordering in the Update arm
+/// (the past bug: a failed download once stranded a stopped daemon).
+async fn resolve_daemon(
+    ops: &impl RemoteOps,
     host: &str,
-    opts: ConnectOpts,
-    progress: impl Fn(Phase),
-) -> anyhow::Result<Tunnel> {
-    // Normalize whatever the caller has (saved entries predate validation;
-    // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
-    // so every ssh invocation below sees a real destination.
-    let host = &hosts::normalize_alias(host)?;
+    opts: &ConnectOpts,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<(Manifest, bool, Option<usize>)> {
     progress(Phase::Probing);
     let local_build = chimaera_core::BUILD_ID;
     let mut outdated = false;
     let mut live_sessions = None;
-    let manifest = match remote_manifest(host).await? {
-        Some(m) if remote_alive(host, m.pid).await? => {
+    let manifest = match ops.remote_manifest(host).await? {
+        Some(m) if ops.remote_alive(host, m.pid).await? => {
             // Only pay for the session-count round trip when it can change
             // the decision (build mismatch, or an explicit update request).
             let sessions = if opts.update_daemon
                 || !chimaera_core::builds_match(local_build, m.build.as_deref())
             {
-                remote_sessions_count(host, &m).await?
+                ops.remote_sessions_count(host, &m).await?
             } else {
                 None
             };
@@ -323,11 +414,13 @@ pub async fn connect(
                     // running daemon: a failed download/build must never leave
                     // the host with nothing running (the bug that stranded a
                     // stopped daemon when a dev build 404'd on download).
-                    let bin = resolve_local_binary(host, opts.binary.as_deref(), &progress).await?;
-                    stop_remote(host, m.pid).await?;
-                    deploy_binary(host, &bin, &progress).await?;
+                    let bin = ops
+                        .resolve_local_binary(host, opts.binary.as_deref(), progress)
+                        .await?;
+                    ops.stop_remote(host, m.pid).await?;
+                    ops.deploy_binary(host, &bin, progress).await?;
                     progress(Phase::Starting);
-                    start_remote(host).await?
+                    ops.start_remote(host).await?
                 }
                 Decision::ConnectOutdated => {
                     tracing::info!(
@@ -344,11 +437,28 @@ pub async fn connect(
             }
         }
         _ => {
-            ensure_remote_binary(host, opts.binary.as_deref(), &progress).await?;
+            ops.ensure_remote_binary(host, opts.binary.as_deref(), progress)
+                .await?;
             progress(Phase::Starting);
-            start_remote(host).await?
+            ops.start_remote(host).await?
         }
     };
+    Ok((manifest, outdated, live_sessions))
+}
+
+/// Connect to the daemon on `host`, installing and starting it if needed,
+/// and bring up a local port-forward. `progress` fires as phases begin.
+pub async fn connect(
+    host: &str,
+    opts: ConnectOpts,
+    progress: impl Fn(Phase),
+) -> anyhow::Result<Tunnel> {
+    // Normalize whatever the caller has (saved entries predate validation;
+    // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
+    // so every ssh invocation below sees a real destination.
+    let host = &hosts::normalize_alias(host)?;
+    let (manifest, outdated, live_sessions) =
+        resolve_daemon(&SshOps, host, &opts, &progress).await?;
 
     let local_port = pick_local_port(opts.local_port, manifest.port)?;
     progress(Phase::Tunneling { local_port });
@@ -1138,5 +1248,312 @@ mod tests {
         assert_eq!(count_alive_sessions(""), None);
         assert_eq!(count_alive_sessions("unauthorized"), None);
         assert_eq!(count_alive_sessions(r#"{"error": "no"}"#), None);
+    }
+
+    // --- resolve_daemon characterization (fake side effects) ----------------
+    //
+    // The crate can't be live-verified (no remote host in CI), so these pin
+    // the connect DECISION phase against a fake RemoteOps: the ordered call log
+    // proves which side effects fire (and their order — the Update arm's
+    // resolve-before-stop guard), and a phase-label capture proves the progress
+    // emits. SshOps delegates verbatim, so what holds for the fake holds live.
+
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    /// One recorded [`RemoteOps`] call, in order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Call {
+        RemoteManifest,
+        RemoteAlive,
+        RemoteSessionsCount,
+        ResolveLocalBinary,
+        StopRemote,
+        DeployBinary,
+        StartRemote,
+        EnsureRemoteBinary,
+    }
+
+    /// A scripted [`RemoteOps`] that records its ordered call log and returns
+    /// canned outcomes — no ssh, no host, no real binary.
+    struct FakeOps {
+        calls: RefCell<Vec<Call>>,
+        probe_manifest: Option<Manifest>,
+        alive: bool,
+        sessions: Option<usize>,
+        resolved_bin: PathBuf,
+        start_manifest: Manifest,
+    }
+
+    impl FakeOps {
+        fn log(&self, c: Call) {
+            self.calls.borrow_mut().push(c);
+        }
+    }
+
+    impl RemoteOps for FakeOps {
+        async fn remote_manifest(&self, _host: &str) -> anyhow::Result<Option<Manifest>> {
+            self.log(Call::RemoteManifest);
+            Ok(self.probe_manifest.clone())
+        }
+        async fn remote_alive(&self, _host: &str, _pid: u32) -> anyhow::Result<bool> {
+            self.log(Call::RemoteAlive);
+            Ok(self.alive)
+        }
+        async fn remote_sessions_count(
+            &self,
+            _host: &str,
+            _manifest: &Manifest,
+        ) -> anyhow::Result<Option<usize>> {
+            self.log(Call::RemoteSessionsCount);
+            Ok(self.sessions)
+        }
+        async fn resolve_local_binary(
+            &self,
+            _host: &str,
+            _binary: Option<&Path>,
+            _progress: &impl Fn(Phase),
+        ) -> anyhow::Result<PathBuf> {
+            self.log(Call::ResolveLocalBinary);
+            Ok(self.resolved_bin.clone())
+        }
+        async fn stop_remote(&self, _host: &str, _pid: u32) -> anyhow::Result<()> {
+            self.log(Call::StopRemote);
+            Ok(())
+        }
+        async fn deploy_binary(
+            &self,
+            _host: &str,
+            _path: &Path,
+            _progress: &impl Fn(Phase),
+        ) -> anyhow::Result<()> {
+            self.log(Call::DeployBinary);
+            Ok(())
+        }
+        async fn start_remote(&self, _host: &str) -> anyhow::Result<Manifest> {
+            self.log(Call::StartRemote);
+            Ok(self.start_manifest.clone())
+        }
+        async fn ensure_remote_binary(
+            &self,
+            _host: &str,
+            _binary: Option<&Path>,
+            _progress: &impl Fn(Phase),
+        ) -> anyhow::Result<()> {
+            self.log(Call::EnsureRemoteBinary);
+            Ok(())
+        }
+    }
+
+    fn fake_manifest(build: Option<&str>, pid: u32) -> Manifest {
+        Manifest {
+            hostname: "host".into(),
+            port: 4600,
+            token: "token".into(),
+            pid,
+            version: "0.0.1".into(),
+            started_at: 0,
+            build: build.map(str::to_string),
+        }
+    }
+
+    /// Drive `resolve_daemon` against `fake`, returning its result and the
+    /// ordered list of phase labels emitted via the progress sink.
+    async fn run_resolve(
+        fake: &FakeOps,
+        update_daemon: bool,
+    ) -> ((Manifest, bool, Option<usize>), Vec<&'static str>) {
+        let phases = RefCell::new(Vec::<&'static str>::new());
+        let progress = |p: Phase| {
+            phases.borrow_mut().push(match p {
+                Phase::Probing => "probing",
+                Phase::Updating => "updating",
+                Phase::Downloading { .. } => "downloading",
+                Phase::Installing { .. } => "installing",
+                Phase::Starting => "starting",
+                Phase::Tunneling { .. } => "tunneling",
+            });
+        };
+        let opts = ConnectOpts {
+            update_daemon,
+            ..Default::default()
+        };
+        let out = resolve_daemon(fake, "host", &opts, &progress)
+            .await
+            .expect("resolve_daemon");
+        (out, phases.into_inner())
+    }
+
+    /// Reuse: a matching build with no forced update attaches to the running
+    /// daemon as-is — the session count is skipped (it can't change the
+    /// decision), nothing is stopped/deployed/started, and the only phase is
+    /// the initial probe.
+    #[tokio::test]
+    async fn resolve_daemon_reuses_matching_build() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
+            alive: true,
+            sessions: Some(3),
+            resolved_bin: PathBuf::from("/unused"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42, "returns the probed daemon");
+        assert!(!outdated);
+        assert_eq!(live, None);
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![Call::RemoteManifest, Call::RemoteAlive]
+        );
+        assert_eq!(phases, vec!["probing"]);
+    }
+
+    /// Update: a build mismatch with a provably idle daemon (sessions == 0)
+    /// replaces it — and CRITICALLY resolves the replacement binary BEFORE
+    /// stopping the old daemon, so a failed fetch never strands the host.
+    /// Returns the freshly started daemon's manifest, not outdated.
+    #[tokio::test]
+    async fn resolve_daemon_update_resolves_binary_before_stop() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            // No build id = ancient = mismatch against any real BUILD_ID.
+            probe_manifest: Some(fake_manifest(None, 42)),
+            alive: true,
+            sessions: Some(0),
+            resolved_bin: PathBuf::from("/tmp/chimaera"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999, "returns the freshly started daemon");
+        assert!(!outdated);
+        assert_eq!(live, None);
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![
+                Call::RemoteManifest,
+                Call::RemoteAlive,
+                Call::RemoteSessionsCount,
+                Call::ResolveLocalBinary,
+                Call::StopRemote,
+                Call::DeployBinary,
+                Call::StartRemote,
+            ],
+            "resolve-local-binary must precede stop-remote"
+        );
+        assert_eq!(phases, vec!["probing", "updating", "starting"]);
+    }
+
+    /// Update via `--update-daemon`: force replaces even a matching build with
+    /// live sessions, still fetching the count first (for the log line). Same
+    /// resolve-before-stop ordering as the mismatch path.
+    #[tokio::test]
+    async fn resolve_daemon_force_update_ignores_live_sessions() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
+            alive: true,
+            sessions: Some(5),
+            resolved_bin: PathBuf::from("/tmp/chimaera"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, outdated, _live), phases) = run_resolve(&fake, true).await;
+        assert_eq!(manifest.pid, 999);
+        assert!(!outdated);
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![
+                Call::RemoteManifest,
+                Call::RemoteAlive,
+                Call::RemoteSessionsCount,
+                Call::ResolveLocalBinary,
+                Call::StopRemote,
+                Call::DeployBinary,
+                Call::StartRemote,
+            ]
+        );
+        assert_eq!(phases, vec!["probing", "updating", "starting"]);
+    }
+
+    /// ConnectOutdated: a build mismatch with live sessions and no forced
+    /// update attaches to the old daemon as-is — surfacing the mismatch and the
+    /// live count, with no stop/deploy/start and only the probe phase.
+    #[tokio::test]
+    async fn resolve_daemon_connects_outdated_with_live_sessions() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: Some(fake_manifest(None, 42)),
+            alive: true,
+            sessions: Some(2),
+            resolved_bin: PathBuf::from("/unused"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 42, "attaches to the old daemon");
+        assert!(outdated);
+        assert_eq!(live, Some(2));
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![
+                Call::RemoteManifest,
+                Call::RemoteAlive,
+                Call::RemoteSessionsCount
+            ]
+        );
+        assert_eq!(phases, vec!["probing"]);
+    }
+
+    /// Fresh start (no manifest): ensure-binary then start a new daemon; the
+    /// liveness probe is skipped (there is no pid to check).
+    #[tokio::test]
+    async fn resolve_daemon_fresh_start_when_no_manifest() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: None,
+            alive: false,
+            sessions: None,
+            resolved_bin: PathBuf::from("/unused"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, outdated, live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        assert!(!outdated);
+        assert_eq!(live, None);
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![
+                Call::RemoteManifest,
+                Call::EnsureRemoteBinary,
+                Call::StartRemote
+            ]
+        );
+        assert_eq!(phases, vec!["probing", "starting"]);
+    }
+
+    /// Fresh start (stale manifest, dead pid): a manifest whose daemon is not
+    /// alive falls through to the same fresh-start path — after the liveness
+    /// probe that reveals the pid is gone.
+    #[tokio::test]
+    async fn resolve_daemon_fresh_start_when_manifest_pid_dead() {
+        let fake = FakeOps {
+            calls: RefCell::new(Vec::new()),
+            probe_manifest: Some(fake_manifest(Some(chimaera_core::BUILD_ID), 42)),
+            alive: false,
+            sessions: None,
+            resolved_bin: PathBuf::from("/unused"),
+            start_manifest: fake_manifest(Some("fresh.1"), 999),
+        };
+        let ((manifest, _outdated, _live), phases) = run_resolve(&fake, false).await;
+        assert_eq!(manifest.pid, 999);
+        assert_eq!(
+            *fake.calls.borrow(),
+            vec![
+                Call::RemoteManifest,
+                Call::RemoteAlive,
+                Call::EnsureRemoteBinary,
+                Call::StartRemote,
+            ]
+        );
+        assert_eq!(phases, vec!["probing", "starting"]);
     }
 }

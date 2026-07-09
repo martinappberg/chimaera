@@ -123,6 +123,13 @@ impl Session {
         opts: &SpawnOpts,
         on_exit: Box<dyn FnOnce() + Send + 'static>,
     ) -> anyhow::Result<Arc<Session>> {
+        // A 0-dimension PTY is invalid: openpty yields a nonsensical winsize
+        // and the headless Term's grid math would operate on a zero axis.
+        // `resize` already rejects this; spawn must too, so a session can't be
+        // born in a state `resize` would refuse.
+        if opts.cols == 0 || opts.rows == 0 {
+            anyhow::bail!("invalid size {}x{}", opts.cols, opts.rows);
+        }
         let cwd = opts.cwd.clone();
         let explicit_name = opts.name.clone().filter(|n| !n.is_empty());
         let renamed = explicit_name.is_some();
@@ -435,18 +442,20 @@ impl Session {
                 return Ok(());
             }
         }
-        {
-            let mut term = lock_unpoisoned(&self.term);
-            term.resize(TermDimensions { cols, rows });
-            lock_unpoisoned(&self.master)
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .context("failed to resize pty")?;
-        }
+        // Resize the real PTY first — it's the only fallible step. Only once
+        // it succeeds do we commit the headless Term and the stored dims, so a
+        // failed winch leaves all three (pty, Term, `state`) at the old size
+        // instead of diverging (previously the Term was resized first, so a
+        // master-resize error left `info()` reporting dims the grid didn't have).
+        lock_unpoisoned(&self.master)
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("failed to resize pty")?;
+        lock_unpoisoned(&self.term).resize(TermDimensions { cols, rows });
         {
             let mut state = lock_unpoisoned(&self.state);
             state.cols = cols;

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { fsQuickOpen, parentName, type QuickOpenEntry } from "../files";
-  import FileIcon from "../FileIcon.svelte";
-  import FolderIcon from "../FolderIcon.svelte";
+  import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
+  import FileIcon from "../shared/FileIcon.svelte";
+  import FolderIcon from "../shared/FolderIcon.svelte";
   import { registerComposer } from "./composerBus";
   import type { SlashCommand } from "./store.svelte";
 

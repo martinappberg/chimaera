@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -181,10 +180,6 @@ impl RecentsStore {
 
     /// Atomically persist the map (tmp file + rename).
     fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let map: serde_json::Map<String, serde_json::Value> = self
             .items
             .iter()
@@ -195,12 +190,7 @@ impl RecentsStore {
                 )
             })
             .collect();
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&map)?)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("failed to rename into {}", self.path.display()))?;
-        Ok(())
+        crate::persist::atomic_write_json(&self.path, serde_json::to_vec(&map)?)
     }
 }
 

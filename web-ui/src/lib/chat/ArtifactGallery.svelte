@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { basename } from "../files";
+  import { basename } from "../previews/files";
   import InlinePreview from "./InlinePreview.svelte";
 
   /**
