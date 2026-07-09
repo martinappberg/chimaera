@@ -23,7 +23,10 @@ auto-updater). Parent map: repo-root [CLAUDE.md](../../CLAUDE.md).
 | File | What it owns |
 |---|---|
 | `main.rs` | The 3-role argv dispatch (order is load-bearing). |
-| `shell.rs` | IPC commands (`generate_handler!`), the `connect` flight state machine, the health monitor + window-restore, and the Tauri `Builder` assembly. The big one. |
+| `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
+| `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
+| `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host) + the host-row wire vocabulary (`HostState`/`HostStatus`). |
+| `shell/restore.rs` | `open_ui_window`, the tunnel health monitor, and launch-time window restore. |
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy. |
 | `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
