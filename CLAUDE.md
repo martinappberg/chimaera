@@ -34,6 +34,20 @@ Rust workspace (the daemon) + a Svelte web UI it embeds + a separate Tauri app.
 | `crates/chimaera-app` | The Tauri 2 native shell. **Its own standalone cargo workspace** — Tauri deliberately never enters the daemon workspace so musl/HPC builds stay lean. |
 | `web-ui/` | The client: Svelte 5 + Vite, xterm.js terminals, file previews (image/markdown/csv/pdf/html), the workbench layout. The daemon serves the built `dist/`. |
 
+### Nested CLAUDE.md maps (agent-first docs)
+
+Big or subtle subsystems carry their **own `CLAUDE.md`** — a short *map* (what's
+here, the file table, the invariants that bite, where to start a change), so a
+new agent can scope a feature with minimal context. Read the most specific one
+for the files you're touching; it wins over this root map on local detail. This
+is the pattern the repo is standardizing on — when you add a substantial
+subsystem, add its `CLAUDE.md` in the same style (map, not tutorial; link out to
+DESIGN.md/PROTOCOL.md for depth).
+
+- [`crates/chimaera-agent/CLAUDE.md`](crates/chimaera-agent/CLAUDE.md) — the structured-agent engine (drivers, journal, event model).
+- [`crates/chimaera-server/CLAUDE.md`](crates/chimaera-server/CLAUDE.md) — the daemon's routes + business logic + the chat-mode glue.
+- [`web-ui/src/lib/chat/CLAUDE.md`](web-ui/src/lib/chat/CLAUDE.md) — the structured chat UI (store reducer, socket, components).
+
 ## Build, test, run
 
 `rust-toolchain.toml` pins the compiler channel and musl targets; `.nvmrc` pins
@@ -157,3 +171,4 @@ Under `.claude/skills/` — invoke with `/<name>`:
 - **develop** — run Chimaera locally and iterate (daemon + Vite dev loop, ports, auth, gotchas).
 - **verify-app** — drive a change end-to-end against the real daemon + UI + PTY.
 - **ship-pr** — open a PR here: CI gates, Conventional-Commit version bump, `[skip release]`.
+- **chat-mode** — work on structured chat mode (Tier B): drivers, journal/replay, server glue, chat UI; which verification level a change needs (hermetic vs live vs `just chat-smoke`).
