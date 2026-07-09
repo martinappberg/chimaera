@@ -24,15 +24,46 @@ use tokio::process::{Child, Command};
 
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
 /// is ssh's own hash of (localhost, remotehost, port, user): unique per
-/// destination and short enough to stay under the ~104-char unix-socket path
-/// limit a full hostname would blow past. The parent dir is created on demand
-/// (ssh will not create it for the socket).
+/// destination and short. The parent dir is created on demand (ssh will not
+/// create it for the socket).
+///
+/// The WHOLE expanded socket path must stay under the ~104-byte unix-socket
+/// (`sun_path`) limit. `data_dir()/cm/%C` clears it comfortably for the normal
+/// `~/.chimaera` home, but an isolated `CHIMAERA_HOME` under a deep worktree
+/// path (the dev app) overshoots even though `%C` keeps the leaf short — ssh
+/// then fails every call with "ControlPath too long". So when the preferred
+/// path wouldn't fit, anchor the socket in a short `/tmp` dir keyed by a hash of
+/// the home: short enough for `sun_path`, yet still distinct per home so a dev
+/// app's master never collides with the real app's. A normal home is
+/// unaffected — it keeps `data_dir()/cm/%C`.
 fn control_path() -> String {
-    let dir = chimaera_core::data_dir().join("cm");
+    let dir = control_dir(&chimaera_core::data_dir());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
     }
     dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// The ControlMaster socket DIRECTORY for a given state dir: `<data_dir>/cm`
+/// normally, or a short `/tmp/chimaera-<home-hash>/cm` when that would push the
+/// expanded socket path past the `sun_path` limit (a deep isolated
+/// `CHIMAERA_HOME`). Pure so the length invariant can be tested without env.
+fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    /// `%C` expands to a 40-hex-char hash; reserve for it.
+    const C_LEAF: usize = 40;
+    /// Headroom under the ~104-byte `sun_path` cap.
+    const SUN_PATH_SAFE: usize = 100;
+
+    let preferred = data_dir.join("cm");
+    if preferred.as_os_str().len() + 1 + C_LEAF <= SUN_PATH_SAFE {
+        preferred
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data_dir.hash(&mut h);
+        // Keep the `/cm` tail so the socket shape (`…/cm/%C`) is stable per home.
+        std::path::PathBuf::from(format!("/tmp/chimaera-{:08x}", h.finish() as u32)).join("cm")
+    }
 }
 
 /// The `-o` options shared by every chimaera ssh/scp call to a host.
@@ -1029,6 +1060,36 @@ mod tests {
     /// the trust-on-first-use host-key policy that lets a fresh install reach
     /// a never-seen host with no tty, and the liveness bounds that keep a
     /// dead link (laptop sleep) from leaving zombie masters and forwards.
+    /// A deep isolated CHIMAERA_HOME (the dev app) must not blow the ~104-byte
+    /// unix-socket path limit: the socket falls back to a short /tmp dir keyed
+    /// by the home, still ending in `/cm` (so `…/cm/%C` holds), and distinct
+    /// homes never collide (a dev master never rides the real app's).
+    #[test]
+    fn control_dir_stays_under_sun_path_for_a_deep_home() {
+        use std::path::Path;
+        // Normal home: unchanged — data_dir/cm.
+        let normal = control_dir(Path::new("/Users/x/.chimaera"));
+        assert!(
+            normal.to_string_lossy().ends_with("/.chimaera/cm"),
+            "{}",
+            normal.display()
+        );
+
+        // Deep isolated home (a worktree CHIMAERA_HOME) overshoots → /tmp fallback.
+        let deep = control_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/magical-colden-00b63c/.chimaera-dev-app/data",
+        ));
+        assert!(deep.starts_with("/tmp/"), "{}", deep.display());
+        assert!(deep.ends_with("cm"), "{}", deep.display());
+        // dir + '/' + the 40-char %C expansion must clear the ~104-byte cap.
+        assert!(deep.as_os_str().len() + 1 + 40 <= 104, "{}", deep.display());
+        // A different deep home resolves to a different socket dir.
+        let other = control_dir(Path::new(
+            "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev-app/data",
+        ));
+        assert_ne!(other, deep);
+    }
+
     #[test]
     fn ssh_opts_multiplex_and_accept_new_hosts() {
         let opts = ssh_opts();
