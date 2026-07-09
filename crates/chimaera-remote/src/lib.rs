@@ -281,8 +281,11 @@ pub async fn http_alive(port: u16) -> bool {
 /// (this crate can't be live-verified — no remote host in CI). The production
 /// impl ([`SshOps`]) delegates each method VERBATIM to the free function of the
 /// same name, so the seam can never drift from real behavior. The three
-/// binary/deploy methods take `&dyn Fn(Phase)` for the progress sink; the free
-/// fns want `&impl Fn(Phase)`, which `&dyn Fn(Phase)` satisfies when reborrowed.
+/// binary/deploy methods take `progress` as `&impl Fn(Phase)` (NOT `&dyn`): a
+/// bare `dyn Fn` erases the closure's auto-traits, which would make the whole
+/// `connect` future `!Send` and break the Tauri app's `spawn` of it — keeping
+/// the concrete closure type lets `Send` flow through exactly as it did before
+/// this seam existed.
 trait RemoteOps {
     async fn remote_manifest(&self, host: &str) -> anyhow::Result<Option<Manifest>>;
     async fn remote_alive(&self, host: &str, pid: u32) -> anyhow::Result<bool>;
@@ -295,21 +298,21 @@ trait RemoteOps {
         &self,
         host: &str,
         binary: Option<&Path>,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<PathBuf>;
     async fn stop_remote(&self, host: &str, pid: u32) -> anyhow::Result<()>;
     async fn deploy_binary(
         &self,
         host: &str,
         path: &Path,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<()>;
     async fn start_remote(&self, host: &str) -> anyhow::Result<Manifest>;
     async fn ensure_remote_binary(
         &self,
         host: &str,
         binary: Option<&Path>,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<()>;
 }
 
@@ -335,7 +338,7 @@ impl RemoteOps for SshOps {
         &self,
         host: &str,
         binary: Option<&Path>,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<PathBuf> {
         resolve_local_binary(host, binary, &progress).await
     }
@@ -346,7 +349,7 @@ impl RemoteOps for SshOps {
         &self,
         host: &str,
         path: &Path,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<()> {
         deploy_binary(host, path, &progress).await
     }
@@ -357,7 +360,7 @@ impl RemoteOps for SshOps {
         &self,
         host: &str,
         binary: Option<&Path>,
-        progress: &dyn Fn(Phase),
+        progress: &impl Fn(Phase),
     ) -> anyhow::Result<()> {
         ensure_remote_binary(host, binary, &progress).await
     }
@@ -1309,7 +1312,7 @@ mod tests {
             &self,
             _host: &str,
             _binary: Option<&Path>,
-            _progress: &dyn Fn(Phase),
+            _progress: &impl Fn(Phase),
         ) -> anyhow::Result<PathBuf> {
             self.log(Call::ResolveLocalBinary);
             Ok(self.resolved_bin.clone())
@@ -1322,7 +1325,7 @@ mod tests {
             &self,
             _host: &str,
             _path: &Path,
-            _progress: &dyn Fn(Phase),
+            _progress: &impl Fn(Phase),
         ) -> anyhow::Result<()> {
             self.log(Call::DeployBinary);
             Ok(())
@@ -1335,7 +1338,7 @@ mod tests {
             &self,
             _host: &str,
             _binary: Option<&Path>,
-            _progress: &dyn Fn(Phase),
+            _progress: &impl Fn(Phase),
         ) -> anyhow::Result<()> {
             self.log(Call::EnsureRemoteBinary);
             Ok(())
