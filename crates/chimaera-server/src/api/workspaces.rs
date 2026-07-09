@@ -26,23 +26,33 @@ pub(crate) async fn create_workspace(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorkspace>,
 ) -> Response {
-    let root = match std::fs::canonicalize(PathBuf::from(&body.root)) {
-        Ok(root) => root,
-        Err(err) => {
+    // `canonicalize` and `is_dir` are blocking fs syscalls on a user-supplied
+    // path — a slow or dead NFS mount would otherwise stall the async reactor.
+    // Validate off the reactor; the error strings are unchanged.
+    let input = body.root.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        let root = std::fs::canonicalize(PathBuf::from(&input))
+            .map_err(|err| format!("{input}: {err}"))?;
+        if !root.is_dir() {
+            return Err(format!("{} is not a directory", root.display()));
+        }
+        Ok::<PathBuf, String>(root)
+    })
+    .await;
+    let root = match validated {
+        Ok(Ok(root)) => root,
+        Ok(Err(msg)) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+        }
+        Err(join_err) => {
+            tracing::error!(%join_err, "workspace validation task failed");
             return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("{}: {err}", body.root)})),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal error"})),
             )
                 .into_response();
         }
     };
-    if !root.is_dir() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("{} is not a directory", root.display())})),
-        )
-            .into_response();
-    }
     match crate::lock(&state.workspaces).add(root) {
         Ok(workspace) => Json(workspace).into_response(),
         Err(err) => {
