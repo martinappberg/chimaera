@@ -1,5 +1,4 @@
 use super::support::*;
-use crate::*;
 
 /// End-to-end against a REAL repo: status must resolve the branch and
 /// classify a modified tracked file vs an untracked one. A directory that
