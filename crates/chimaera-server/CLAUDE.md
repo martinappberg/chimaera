@@ -20,7 +20,10 @@ the module you need and read its header doc.
 | `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers. |
 | `agents.rs` | `AgentKind`, `AgentRecord`, `AgentState`, title/file tracking, the agent watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
-| `workspaces` / `fs` / `previews` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The workbench: roots, file previews, linked terminals, settings, palette, history. |
+| `git.rs` | Read-only git: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
+| `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, ranged raw reads, atomic writes, `/raw` tickets). There is no separate `previews` module — previews live here. |
+| `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |
+| `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. |
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 
