@@ -76,6 +76,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_hosts,
             commands::add_host,
@@ -91,6 +92,7 @@ pub fn run() {
             commands::check_app_update,
             commands::begin_update,
             commands::shell_build,
+            commands::write_clipboard,
             commands::answer_askpass,
             commands::list_askpass,
             commands::report_window_scope,

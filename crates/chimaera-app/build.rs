@@ -22,6 +22,7 @@ fn main() {
             "check_app_update",
             "begin_update",
             "shell_build",
+            "write_clipboard",
             "answer_askpass",
             "list_askpass",
         ]),

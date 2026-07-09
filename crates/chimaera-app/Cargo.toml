@@ -30,6 +30,10 @@ tauri = { version = "2", features = [] }
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().
 tauri-plugin-updater = "2"
+# OS clipboard backend for the `write_clipboard` command: WKWebView rejects a
+# non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so
+# those writes run in the Rust process instead, where there is no gesture gate.
+tauri-plugin-clipboard-manager = "2"
 ureq = "2"
 urlencoding = "2"
 nix = { version = "0.29", features = ["signal"] }

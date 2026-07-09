@@ -24,6 +24,7 @@
     "allow-check-app-update",
     "allow-begin-update",
     "allow-shell-build",
+    "allow-write-clipboard",
     "allow-answer-askpass",
     "allow-list-askpass"
   ]

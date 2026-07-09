@@ -368,6 +368,20 @@ pub(super) fn shell_build() -> String {
     chimaera_core::BUILD_ID.to_string()
 }
 
+/// Write text to the OS clipboard from the Rust process. The daemon-served UI
+/// calls this for agent-initiated OSC 52 and copy-on-select: WKWebView rejects
+/// `navigator.clipboard.writeText` from a non-gesture callback (a socket
+/// message, a selection change) with NotAllowedError, so on a remote (app-only)
+/// window those writes silently failed — "copy from the TUI doesn't reach the
+/// clipboard". Running the write here has no transient-activation gate. Only
+/// writes are exposed (OSC 52 reads are refused UI-side), so an agent can set
+/// the clipboard but never read it back over the PTY.
+#[tauri::command]
+pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
+}
+
 /// The one-click update chain, step one: record the user's consent (the
 /// intent file), then download, verify, and install the app bundle and
 /// relaunch into it. Step two — replacing the local daemon — happens in the

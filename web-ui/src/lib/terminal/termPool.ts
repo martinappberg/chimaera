@@ -17,6 +17,7 @@ import { SessionSocket } from "./ws";
 import { registerPathLinks, type LinkContext, type PathKind } from "./links";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
 import { isMac } from "../shared/keys";
+import { writeClipboard } from "../net/native";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
@@ -209,6 +210,23 @@ function scheduleFit(entry: PoolEntry): void {
  * browser's native copy grabs nothing. copyOnSelect is the separate
  * as-you-select convenience; this is the explicit-chord path.
  */
+/**
+ * Copy to the OS clipboard, native-shell first. WKWebView rejects
+ * `navigator.clipboard.writeText` from a NON-gesture callback (an agent's OSC 52,
+ * a selection change) with NotAllowedError — so on a remote window (app-only)
+ * those copies silently failed. `writeClipboard` routes through the Rust process
+ * (no gesture gate) inside the shell, and returns false in a plain browser, where
+ * we fall back to `navigator.clipboard` (Chromium allows a focused-document write).
+ */
+async function copyText(text: string): Promise<void> {
+  if (await writeClipboard(text)) return;
+  try {
+    await navigator.clipboard?.writeText(text);
+  } catch {
+    // clipboard unavailable (denied, or no gesture in a plain browser) — nothing more to do
+  }
+}
+
 function registerTerminalClipboard(term: Terminal): void {
   term.parser.registerOscHandler(52, (data) => {
     const semi = data.indexOf(";");
@@ -221,9 +239,7 @@ function registerTerminalClipboard(term: Terminal): void {
     } catch {
       return true; // not valid base64: swallow, like a native terminal
     }
-    void navigator.clipboard?.writeText(text).catch(() => {
-      // clipboard permission denied; nothing more we can do
-    });
+    void copyText(text);
     return true;
   });
 
@@ -235,7 +251,7 @@ function registerTerminalClipboard(term: Terminal): void {
     if (!copyChord) return true;
     const selection = term.getSelection();
     if (selection === "") return true; // nothing selected: let the chord fall through
-    void navigator.clipboard?.writeText(selection).catch(() => {});
+    void copyText(selection);
     e.preventDefault();
     e.stopPropagation();
     return false;
@@ -331,9 +347,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     const text = term.getSelection();
     handlers?.onSelection(id, text);
     if (text.length > 0 && getSetting("terminal.copyOnSelect")) {
-      void navigator.clipboard?.writeText(text).catch(() => {
-        // clipboard permission denied; selection still works normally
-      });
+      void copyText(text);
     }
   });
   // Copy provenance: surface pastes so agent composers can be source-tagged.

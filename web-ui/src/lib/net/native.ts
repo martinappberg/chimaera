@@ -188,6 +188,26 @@ export async function shellBuild(): Promise<string | null> {
 }
 
 /**
+ * Write text to the OS clipboard through the native shell. WKWebView rejects
+ * `navigator.clipboard.writeText` from a non-gesture callback (an agent's OSC 52,
+ * copy-on-select) with NotAllowedError, so on a remote (app-only) window those
+ * writes silently failed; the shell writes from the Rust process, which has no
+ * transient-activation gate. Returns true when the native write happened; false
+ * in a plain browser (or on shell error) so the caller can fall back to
+ * `navigator.clipboard`.
+ */
+export async function writeClipboard(text: string): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  try {
+    await t.core.invoke<void>("write_clipboard", { text });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * A newer signed app build exists (the shell's periodic updater check).
  * Broadcast to every window; presentation and snoozing are the UI's job.
  */
