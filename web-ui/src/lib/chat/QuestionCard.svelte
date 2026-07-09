@@ -14,53 +14,54 @@
 
   let { request, onAnswer }: Props = $props();
 
-  /** question id → chosen labels (free text rides as a label). */
-  let picked = $state<Record<string, string[]>>({});
-  let other = $state<Record<string, string>>({});
+  // Keyed by question/option INDEX, not by the model-authored id/label — those
+  // are untrusted and may collide (two options both "Yes"), which would break
+  // a keyed {#each} and make selection track duplicates as one. Labels are
+  // rejoined only when building the wire answer.
+  let picked = $state<Record<number, number[]>>({});
+  let other = $state<Record<number, string>>({});
 
-  function toggle(qid: string, label: string, multi: boolean) {
-    const current = picked[qid] ?? [];
+  function toggle(qi: number, oi: number, multi: boolean) {
+    const current = picked[qi] ?? [];
     if (multi) {
-      picked[qid] = current.includes(label)
-        ? current.filter((l) => l !== label)
-        : [...current, label];
+      picked[qi] = current.includes(oi) ? current.filter((i) => i !== oi) : [...current, oi];
     } else {
-      picked[qid] = [label];
+      picked[qi] = [oi];
     }
   }
 
   const complete = $derived(
     request.questions.every(
-      (q) => (picked[q.id] ?? []).length > 0 || (other[q.id] ?? "").trim().length > 0,
+      (_q, qi) => (picked[qi] ?? []).length > 0 || (other[qi] ?? "").trim().length > 0,
     ),
   );
 
   function submit() {
     const answers: Record<string, string[]> = {};
-    for (const q of request.questions) {
-      const own = picked[q.id] ?? [];
-      const free = (other[q.id] ?? "").trim();
+    request.questions.forEach((q, qi) => {
+      const own = (picked[qi] ?? []).map((oi) => q.options[oi]?.label).filter((l) => l != null);
+      const free = (other[qi] ?? "").trim();
       answers[q.id] = free.length > 0 ? [...own, free] : own;
-    }
+    });
     onAnswer(answers);
   }
 </script>
 
 <div class="question" role="group" aria-label="the agent has a question">
-  {#each request.questions as q (q.id)}
+  {#each request.questions as q, qi (qi)}
     <div class="q">
       {#if q.header.length > 0}
         <span class="q-header">{q.header}</span>
       {/if}
       <div class="q-text">{q.question}</div>
       <div class="q-options">
-        {#each q.options as opt (opt.label)}
+        {#each q.options as opt, oi (oi)}
           <button
             class="q-opt"
-            class:on={(picked[q.id] ?? []).includes(opt.label)}
+            class:on={(picked[qi] ?? []).includes(oi)}
             title={opt.description}
-            aria-pressed={(picked[q.id] ?? []).includes(opt.label)}
-            onclick={() => toggle(q.id, opt.label, q.multiSelect)}
+            aria-pressed={(picked[qi] ?? []).includes(oi)}
+            onclick={() => toggle(qi, oi, q.multiSelect)}
           >
             {opt.label}
           </button>
@@ -69,7 +70,7 @@
       <input
         class="q-other"
         placeholder="other…"
-        bind:value={other[q.id]}
+        bind:value={other[qi]}
         onkeydown={(e) => {
           if (e.key === "Enter" && complete) {
             e.preventDefault();

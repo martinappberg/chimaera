@@ -30,7 +30,9 @@
      *  grants — the daemon's UserPromptSubmit hook resolves them). */
     terminals: TerminalOption[];
     focused: boolean;
-    onSubmit(text: string, images: ImageAttachment[]): void;
+    /** Returns whether the message was accepted (false during reconnect, so
+     *  the composer keeps the draft instead of losing it). */
+    onSubmit(text: string, images: ImageAttachment[]): boolean;
     onInterrupt(): void;
     /** Intercept a dialog-only slash command with native UI. True = handled. */
     onSlash(name: string, args?: string): boolean;
@@ -132,6 +134,14 @@
         })
         .catch(() => (fileMatches = []));
     }, 150);
+    // Cancel a pending lookup on teardown (keystroke or unmount) so it can't
+    // fire a stray request and write state after the component is destroyed.
+    return () => {
+      if (quickOpenTimer !== null) {
+        clearTimeout(quickOpenTimer);
+        quickOpenTimer = null;
+      }
+    };
   });
 
   /** @term: mentions — Chimaera's linked-terminal grants. */
@@ -151,8 +161,14 @@
           ? "file"
           : null,
   );
+  // Reset the highlighted row whenever the popover kind OR its contents change
+  // (a narrowing match list can leave `selected` past the end, and Enter would
+  // then index undefined).
   $effect(() => {
     void popover;
+    void slashMatches.length;
+    void termMatches.length;
+    void fileMatches.length;
     selected = 0;
   });
 
@@ -202,9 +218,13 @@
         return;
       }
     }
-    onSubmit(text, images);
-    draft = "";
-    images = [];
+    // Only clear the draft if the send was actually accepted — during a
+    // reconnect window the socket is not OPEN and the message would otherwise
+    // vanish silently.
+    if (onSubmit(text, images)) {
+      draft = "";
+      images = [];
+    }
   }
 
   function onKeydown(e: KeyboardEvent) {

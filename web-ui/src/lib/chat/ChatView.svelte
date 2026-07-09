@@ -34,11 +34,12 @@
   // session, one socket — the initial capture is the contract.
   // svelte-ignore state_referenced_locally
   const socket = new ChatSocket(session.id, {
-    onReady: (info, replayFrom) => store.onReady(info, replayFrom),
+    onReady: (info, replayFrom, head) => store.onReady(info, replayFrom, head),
     onEvent: (entry) => store.apply(entry),
     onDegraded: () => (store.degraded = true),
     onExited: (status) => (store.exited = { status }),
     onError: (message) => (store.fatalError = message),
+    onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });
   onDestroy(() => socket.close());
@@ -128,20 +129,21 @@
     });
   });
 
-  function sendNow(text: string, images: ImageAttachment[]) {
+  function sendNow(text: string, images: ImageAttachment[]): boolean {
     const blocks: Record<string, unknown>[] = [];
     if (text.length > 0) blocks.push({ type: "text", text });
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
-    socket.send({ type: "send", blocks });
+    return socket.send({ type: "send", blocks });
   }
 
-  function onSubmit(text: string, images: ImageAttachment[]) {
+  function onSubmit(text: string, images: ImageAttachment[]): boolean {
     // Type-through, official-client semantics: mid-turn sends go straight to
     // the agent — claude's CLI queues them natively, codex steers them into
-    // the running turn. No client-side queue to manage or lose.
-    sendNow(text, images);
+    // the running turn. No client-side queue to manage or lose. Returns false
+    // when the socket isn't open so the composer keeps the draft.
+    return sendNow(text, images);
   }
 
   function decide(requestId: string, optionId: string, destination?: string) {

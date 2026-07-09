@@ -195,13 +195,34 @@ export class ChatStore {
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
 
-  onReady(session: ChatSessionInfo, _replayFrom: number): void {
+  onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
+    // The journal's head is below our own lastSeq: it was pruned/recreated and
+    // numbering restarted, so every replayed and live event would be dropped by
+    // the seq-dedupe guard, freezing the pane. Rebuild from the new journal.
+    if (head !== undefined && head < this.lastSeq) {
+      this.resetTranscript();
+    }
     if (session.model !== null) this.model = session.model;
     if (session.current_mode !== null) this.currentMode = session.current_mode;
     if (!session.alive && this.exited === null) {
       this.exited = { status: session.exit_status };
     }
+  }
+
+  /** The socket dropped; we are no longer live until the next `ready`. */
+  onDisconnected(): void {
+    this.connected = false;
+  }
+
+  /** Drop the rendered transcript and seq cursor so a fresh replay rebuilds it
+   *  (a server-side journal reset — see {@link onReady}). */
+  private resetTranscript(): void {
+    this.blocks = [];
+    this.toolIndex.clear();
+    this.lastSeq = 0;
+    this.exited = null;
+    this.degraded = false;
   }
 
   apply(entry: SeqEvent): void {

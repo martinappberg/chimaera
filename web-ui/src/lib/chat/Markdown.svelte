@@ -1,6 +1,24 @@
+<script module lang="ts">
+  import DOMPurify from "dompurify";
+
+  // Agent markdown is untrusted model output rendered into the workbench DOM.
+  // External links are a phishing / navigate-the-SPA-away vector, so force
+  // every http(s) anchor to open in a new tab with no opener handle. Registered
+  // once per module (the hook is global to DOMPurify); the per-call config
+  // below forbids style tags so injected CSS can't restyle the whole workbench
+  // (spoofing permission prompts, hiding controls).
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node instanceof Element && node.tagName === "A" && node.hasAttribute("href")) {
+      if (/^https?:/i.test(node.getAttribute("href") ?? "")) {
+        node.setAttribute("target", "_blank");
+        node.setAttribute("rel", "noopener noreferrer");
+      }
+    }
+  });
+</script>
+
 <script lang="ts">
   import { marked } from "marked";
-  import DOMPurify from "dompurify";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
 
   interface Props {
@@ -132,9 +150,14 @@
   }
 
   // Agent prose is untrusted model output rendered into the workbench DOM:
-  // sanitize EVERYTHING marked emits, always.
+  // sanitize EVERYTHING marked emits, always. The style tag is on DOMPurify's
+  // default allowlist, so forbid it explicitly (and the style attribute) —
+  // otherwise injected CSS applies document-wide.
   const html = $derived(
-    DOMPurify.sanitize(marked.parse(text, { async: false, breaks: true }) as string),
+    DOMPurify.sanitize(marked.parse(text, { async: false, breaks: true }) as string, {
+      FORBID_TAGS: ["style"],
+      FORBID_ATTR: ["style"],
+    }),
   );
 
   let el = $state<HTMLElement | null>(null);

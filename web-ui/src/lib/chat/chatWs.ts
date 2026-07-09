@@ -31,13 +31,17 @@ export interface ChatSessionInfo {
 }
 
 export interface ChatSocketHandlers {
-  onReady(session: ChatSessionInfo, replayFrom: number): void;
+  /** `head` is the journal's highest seq now; when it is below our own
+   *  lastSeq the journal was recreated (seq reset) and we must hard-reset. */
+  onReady(session: ChatSessionInfo, replayFrom: number, head: number | undefined): void;
   onEvent(entry: SeqEvent): void;
   /** The session degraded (or toggled) to a terminal under the same id. */
   onDegraded(): void;
   onExited(status: number | null): void;
   /** Fatal server-side error; the socket will not reconnect. */
   onError(message: string): void;
+  /** The socket dropped and is reconnecting; the UI is no longer live. */
+  onDisconnected(): void;
   /** Highest seq applied so far — sent with auth so reconnects replay only the gap. */
   lastSeq(): number;
 }
@@ -100,15 +104,19 @@ export class ChatSocket {
           this.handlers.onReady(
             msg.session as ChatSessionInfo,
             (msg.replay_from as number) ?? 0,
+            msg.head as number | undefined,
           );
           break;
         case "batch":
+          // One malformed event (unversioned wire / old journal) must cost one
+          // event, not the rest of the batch: lastSeq already advanced, so an
+          // uncaught throw here would strand the tail forever.
           for (const entry of (msg.events as SeqEvent[]) ?? []) {
-            this.handlers.onEvent(entry);
+            this.safeEvent(entry);
           }
           break;
         case "ev":
-          this.handlers.onEvent({
+          this.safeEvent({
             seq: msg.seq as number,
             ts: msg.ts as number,
             ev: msg.ev as AgentEvent,
@@ -146,8 +154,20 @@ export class ChatSocket {
         this.clearReconnecting();
         return;
       }
+      // Live no longer: the composer must stop claiming the agent hears us and
+      // stop clearing drafts into a closed socket until we reconnect.
+      this.handlers.onDisconnected();
       this.scheduleReconnect();
     };
+  }
+
+  /** Apply one event, isolating a reducer throw so it can't strand the batch. */
+  private safeEvent(entry: SeqEvent): void {
+    try {
+      this.handlers.onEvent(entry);
+    } catch (err) {
+      console.warn(`chat: dropping unapplyable event seq=${entry.seq}`, err);
+    }
   }
 
   private scheduleReconnect(): void {
