@@ -40,6 +40,26 @@ pub(crate) fn fresh_agent_key() -> String {
     chimaera_core::generate_token()[..32].to_string()
 }
 
+/// The runtime directory holding per-agent `--settings` / `--mcp-config`
+/// files. Hot state (scrubbed from `$XDG_RUNTIME_DIR`); reconstructed on
+/// respawn when absent.
+fn agents_runtime_dir() -> PathBuf {
+    chimaera_core::runtime_dir().join("agents")
+}
+
+/// Path to a session's generated `--settings` file. The single source for the
+/// `{id}-settings.json` convention — the writer ([`write_settings`]) and the
+/// respawn reader (`chat::resolve_respawn_inputs`) must agree.
+pub(crate) fn settings_path(session_id: &str) -> PathBuf {
+    agents_runtime_dir().join(format!("{session_id}-settings.json"))
+}
+
+/// Path to a session's generated `--mcp-config` file. The single source for
+/// the `{id}-mcp.json` convention (see [`write_mcp_config`]).
+pub(crate) fn mcp_config_path(session_id: &str) -> PathBuf {
+    agents_runtime_dir().join(format!("{session_id}-mcp.json"))
+}
+
 /// Hook events wired into the generated settings file. Everything the state
 /// machine consumes, plus PostToolUse so long tool-free stretches still
 /// refresh "running".
@@ -81,9 +101,11 @@ pub(crate) fn write_settings(
         settings["theme"] = json!(theme);
     }
 
-    let dir = chimaera_core::runtime_dir().join("agents");
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(format!("{session_id}-settings.json"));
+    let path = settings_path(session_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
     std::fs::write(&path, serde_json::to_vec_pretty(&settings)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
@@ -101,9 +123,11 @@ pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow
     let config = json!({
         "mcpServers": { "chimaera": { "type": "http", "url": url } }
     });
-    let dir = chimaera_core::runtime_dir().join("agents");
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(format!("{session_id}-mcp.json"));
+    let path = mcp_config_path(session_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("failed to write {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))

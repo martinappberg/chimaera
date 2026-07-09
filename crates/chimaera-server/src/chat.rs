@@ -511,9 +511,8 @@ async fn resolve_respawn_inputs(
     id: &str,
     kind: AgentKind,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf), String> {
-    let runtime_dir = chimaera_core::runtime_dir().join("agents");
-    let settings = Some(runtime_dir.join(format!("{id}-settings.json"))).filter(|p| p.exists());
-    let mcp_config = Some(runtime_dir.join(format!("{id}-mcp.json"))).filter(|p| p.exists());
+    let settings = Some(crate::agents::settings_path(id)).filter(|p| p.exists());
+    let mcp_config = Some(crate::agents::mcp_config_path(id)).filter(|p| p.exists());
     let bin = crate::launcher::detect(state, kind, false)
         .await
         .path
