@@ -200,6 +200,22 @@ export async function fsDirs(path: string, hidden = false): Promise<DirListing> 
   return json(await api(`/fs/dirs?${q.toString()}`));
 }
 
+/**
+ * Create `path` (and any missing parents) on the daemon and return its
+ * canonical path. The daemon expands a leading "~"; 400 with a message if the
+ * directory cannot be created. Idempotent for an existing directory.
+ */
+export async function fsMkdir(path: string): Promise<string> {
+  const body = await json<{ path: string }>(
+    await api("/fs/mkdir", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  );
+  return body.path;
+}
+
 export async function listWorkspaces(): Promise<Workspace[]> {
   return json(await api("/workspaces"));
 }

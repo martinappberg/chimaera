@@ -122,6 +122,46 @@ pub fn runtime_dir() -> PathBuf {
     dir
 }
 
+/// The user's real login shell.
+///
+/// `$SHELL` is authoritative when a terminal set it, but a daemon launched
+/// from Finder/Dock/launchd (the packaged app, not a terminal) frequently has
+/// no `$SHELL` at all — or a bare `/bin/sh` from a minimal launchd
+/// environment — and `/bin/sh` never sources the user's zsh/bash rc where
+/// PATH additions like `~/.local/bin` (where `claude.ai/install.sh` lands)
+/// live. So an unusable `$SHELL` falls back to the passwd database: the shell
+/// the OS itself starts for this user (exactly what Terminal.app reads),
+/// then `/bin/sh` as a last resort.
+pub fn login_shell() -> String {
+    let passwd_shell = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .ok()
+        .flatten()
+        .map(|u| u.shell.to_string_lossy().into_owned());
+    resolve_login_shell(std::env::var("SHELL").ok(), passwd_shell, |p| {
+        Path::new(p).is_file()
+    })
+}
+
+/// Pure core of [`login_shell`] (env + passwd threaded in for testability).
+/// `$SHELL` wins when it names an existing shell that isn't the launchd-
+/// minimal `/bin/sh`; otherwise the passwd shell; otherwise `/bin/sh`.
+fn resolve_login_shell(
+    shell_env: Option<String>,
+    passwd_shell: Option<String>,
+    is_file: impl Fn(&str) -> bool,
+) -> String {
+    if let Some(shell) = shell_env {
+        // A launchd-minimal `SHELL=/bin/sh` is not a real user choice — prefer
+        // the passwd entry, which names the actual interactive shell.
+        if !shell.is_empty() && shell != "/bin/sh" && is_file(&shell) {
+            return shell;
+        }
+    }
+    passwd_shell
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
 /// Generate an auth token: 32 random bytes as lowercase hex (64 chars).
 pub fn generate_token() -> String {
     use rand::RngCore;
@@ -291,6 +331,47 @@ pub fn release_is_newer(current: &str, latest: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_shell_prefers_real_shell_then_passwd() {
+        let exists = |_: &str| true;
+        let missing = |_: &str| false;
+
+        // A terminal-set $SHELL that exists wins.
+        assert_eq!(
+            resolve_login_shell(Some("/bin/zsh".into()), Some("/bin/bash".into()), exists),
+            "/bin/zsh"
+        );
+        // A launchd-minimal `/bin/sh` is ignored in favour of the passwd shell
+        // (the "claude vanishes when launched from Finder" fix).
+        assert_eq!(
+            resolve_login_shell(Some("/bin/sh".into()), Some("/bin/zsh".into()), exists),
+            "/bin/zsh"
+        );
+        // No $SHELL at all (stripped GUI env): passwd shell.
+        assert_eq!(
+            resolve_login_shell(None, Some("/usr/bin/fish".into()), exists),
+            "/usr/bin/fish"
+        );
+        // A $SHELL that doesn't point at a real file: passwd shell.
+        assert_eq!(
+            resolve_login_shell(Some("/nope/zsh".into()), Some("/bin/zsh".into()), missing),
+            "/bin/zsh"
+        );
+        // Nothing usable anywhere: /bin/sh, never empty.
+        assert_eq!(resolve_login_shell(None, None, exists), "/bin/sh");
+        assert_eq!(
+            resolve_login_shell(Some(String::new()), Some(String::new()), exists),
+            "/bin/sh"
+        );
+    }
+
+    #[test]
+    fn login_shell_resolves_to_a_real_shell() {
+        // On the host, it must name a non-empty absolute path (never a panic).
+        let shell = login_shell();
+        assert!(shell.starts_with('/'), "{shell}");
+    }
 
     #[test]
     fn token_is_64_lowercase_hex_chars() {

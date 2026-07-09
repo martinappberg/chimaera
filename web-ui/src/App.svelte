@@ -144,7 +144,6 @@
     askpassActive,
     closeThisWindow,
     connectHost,
-    focusWindow,
     isNativeShell,
     onAppUpdate,
     onHostStatus,
@@ -1286,13 +1285,16 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
-  /** Scope this window to `w` (open in THIS window) — unless it's already
-   *  open in another window, in which case raise that one instead. */
+  /** Open workspace `w` in THIS window — the launcher click, the folder
+   *  picker's "open here", and worktree-session reveal all mean "here". A
+   *  workspace already open in another window is deliberately NOT diverted to:
+   *  the daemon owns the sessions, so a second view onto the same workspace is
+   *  cheap and independent (each window keys its own view state), and
+   *  diverting a "new window, then pick a workspace" to some *other* window —
+   *  leaving the fresh one blank on the launcher — was the reported bug.
+   *  "New window" and Cmd/Ctrl-click stay the explicit "another window"
+   *  gestures. */
   async function activateWorkspace(w: Workspace): Promise<void> {
-    if (isNativeShell() && (await focusWindow(scopeAlias, w.id))) {
-      closePicker();
-      return;
-    }
     workspaces = workspaces.some((x) => x.id === w.id)
       ? workspaces.map((x) => (x.id === w.id ? w : x))
       : [w, ...workspaces];

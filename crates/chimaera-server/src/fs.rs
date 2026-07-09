@@ -866,6 +866,45 @@ pub(crate) async fn validate(Json(body): Json<ValidateRequest>) -> Response {
     Json(json!({"valid": valid})).into_response()
 }
 
+#[derive(Deserialize)]
+pub(crate) struct MkdirRequest {
+    path: String,
+}
+
+/// POST /api/v1/fs/mkdir {path} — create a directory (with any missing
+/// parents) and return its canonical path. The daemon runs as the user, so
+/// this is scoped to their own filesystem permissions — the same trust model
+/// as writing a file via PUT /fs/file. Idempotent: an already-existing
+/// directory is a success. Backs the folder picker's "create folder" action,
+/// so a workspace can be opened on a path that does not exist yet.
+pub(crate) async fn mkdir(Json(body): Json<MkdirRequest>) -> Response {
+    let work = move || -> anyhow::Result<serde_json::Value> {
+        let expanded = expand_tilde(&body.path)?;
+        if expanded.as_os_str().is_empty() {
+            anyhow::bail!("empty path");
+        }
+        std::fs::create_dir_all(&expanded)
+            .with_context(|| format!("{}: failed to create directory", expanded.display()))?;
+        // Canonicalize what we just made so the caller opens the resolved path
+        // (symlinks/`..` collapsed), matching create_workspace's own view.
+        let path =
+            std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
+        if !path.is_dir() {
+            anyhow::bail!("{} is not a directory", path.display());
+        }
+        Ok(json!({ "path": path.to_string_lossy() }))
+    };
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(err)) => bad_request(&err),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("mkdir task failed: {join}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to
 /// one canonical file path and expires after [`TICKET_TTL`]; expired entries
 /// are purged on every create/lookup.

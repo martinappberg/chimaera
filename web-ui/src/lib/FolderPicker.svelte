@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { ApiError } from "./api";
+  import { ApiError, getHostLabel } from "./api";
   import { openWindow } from "./native";
   import {
     createWorkspace,
     fsDirs,
     fsHome,
+    fsMkdir,
     type DirEntry,
     type DirListing,
     type Workspace,
@@ -57,6 +58,9 @@
   let pathBase = $state("");
   /** The typed path's directory was capped by the daemon. */
   let pathTruncated = $state(false);
+  /** Whether the typed path's directory (`pathBase`) was listed successfully —
+   *  false means it doesn't exist yet, which drives the "create folder" offer. */
+  let pathBaseExists = $state(false);
   /** Monotonic guard so a slow listing can't clobber a newer one. */
   let pathSeq = 0;
 
@@ -87,6 +91,20 @@
   /** The navigable dirs under the "open this folder" row, in whichever mode is
    *  active (typed-path completion vs. filtering the browsed directory). */
   const browseDirs = $derived(typedPath !== null ? pathMatches : filtered);
+
+  /** The typed path doesn't exist yet — the top row becomes "create folder"
+   *  instead of "open this folder". Judged from the parent listing (which the
+   *  completion effect already fetches): once it has settled for this path's
+   *  directory, the path is missing when a trailing segment matches no child,
+   *  or — for a path ending in "/" — when the directory itself couldn't be
+   *  listed. Unknown (still fetching) reads as present, so no premature offer. */
+  const typedPathMissing = $derived.by((): boolean => {
+    if (typedPath === null) return false;
+    const { dir, tail } = splitTyped(typedPath);
+    if (pathBase !== dir) return false; // parent listing not settled yet
+    if (tail === "") return !pathBaseExists; // "…/": the dir itself is the target
+    return !pathDirs.some((d) => d.name === tail);
+  });
 
   /** The active directory was capped by the daemon (very large folder). */
   const listTruncated = $derived(typedPath !== null ? pathTruncated : (listing?.truncated ?? false));
@@ -185,13 +203,35 @@
     }
   }
 
+  /** Create a not-yet-existing folder (and any missing parents), then open it
+   *  as a workspace in THIS window — the "create folder" affordance for a
+   *  typed path that doesn't exist. */
+  async function createFolder(path: string | null): Promise<void> {
+    if (path === null || busy) return;
+    busy = true;
+    try {
+      onOpened(await createWorkspace(await fsMkdir(path)));
+    } catch (e) {
+      error = e instanceof ApiError ? e.message : "could not create folder";
+    } finally {
+      busy = false;
+    }
+  }
+
   async function openNewWindow(path: string | null): Promise<void> {
     if (path === null || busy) return;
     busy = true;
     try {
       const w = await createWorkspace(path);
-      // A real native window in the shell, a new tab in the browser.
-      await openWindow(null, w.id);
+      // A real native window in the shell, a new tab in the browser. Force a
+      // new window (newWindow=true): this is the explicit "new window" action,
+      // so it must never be diverted to raise an already-open one. Target THIS
+      // window's own daemon — `createWorkspace` made the folder on the daemon
+      // serving this window (remote when this picker runs in a remote window),
+      // so a hardcoded local `null` would open a local window for a workspace
+      // the local daemon doesn't have and bounce to the launcher.
+      const alias = getHostLabel() === "local" ? null : getHostLabel();
+      await openWindow(alias, w.id, true);
       onClose();
     } catch (e) {
       error = e instanceof ApiError ? e.message : "could not open folder";
@@ -217,16 +257,21 @@
     } else if (e.key === "Enter") {
       e.preventDefault();
       const row = rows[highlight];
-      // Cmd/Ctrl+Enter always opens the highlighted target as a workspace.
+      // Cmd/Ctrl+Enter always opens the highlighted target as a workspace —
+      // creating the folder first when the typed path doesn't exist yet.
       if (e.metaKey || e.ctrlKey) {
-        void openHere(rowPath(row));
+        if (row?.kind === "here" && typedPathMissing) void createFolder(row.path);
+        else void openHere(rowPath(row));
         return;
       }
       // Follow the highlight: a directory descends (this is how a typed path
-      // is entered — its matching completion is highlighted), "open this
-      // folder" opens the current/typed path as a workspace.
+      // is entered — its matching completion is highlighted); the top row
+      // opens the current/typed path as a workspace, or creates it first when
+      // it doesn't exist.
       if (row?.kind === "dir") {
         void navigate(row.dir.path);
+      } else if (row?.kind === "here" && typedPathMissing) {
+        void createFolder(row.path);
       } else if (row !== undefined) {
         void openHere(rowPath(row));
       }
@@ -283,15 +328,19 @@
           if (seq !== pathSeq) return;
           pathDirs = l.dirs;
           pathTruncated = l.truncated ?? false;
+          pathBaseExists = true;
           pathBase = dir;
           resetHighlight();
         })
         .catch(() => {
           if (seq !== pathSeq) return;
-          // Parent doesn't exist yet: no completions, just "open this folder".
+          // Parent doesn't exist yet: no completions — the top row offers to
+          // create the typed path instead of opening it.
           pathDirs = [];
           pathTruncated = false;
+          pathBaseExists = false;
           pathBase = dir;
+          resetHighlight();
         });
     }, 120);
     return () => clearTimeout(timer);
@@ -391,16 +440,21 @@
             <button
               class="row"
               tabindex="-1"
-              title={herePath}
+              title={typedPathMissing ? `create ${herePath}` : herePath}
               onmousedown={keepFocus}
-              onclick={() => void openHere(herePath)}
+              onclick={() =>
+                typedPathMissing ? void createFolder(herePath) : void openHere(herePath)}
             >
-              <span class="name here-label">open this folder</span>
+              <span class="name here-label" class:create={typedPathMissing}>
+                {typedPathMissing ? "create folder" : "open this folder"}
+              </span>
               {#if typedPath !== null}
                 <span class="here-path">{typedPath}</span>
               {/if}
             </button>
-            {@render newWindow(herePath)}
+            {#if !typedPathMissing}
+              {@render newWindow(herePath)}
+            {/if}
           </div>
         {/if}
         {#each browseDirs as dir, j (dir.path)}
@@ -593,6 +647,12 @@
 
   .name.here-label {
     flex: none;
+  }
+
+  /* "create folder" — distinguish the make-a-new-directory action from the
+     plain "open this folder" so it's clearly not just opening what you typed. */
+  .name.here-label.create {
+    color: var(--accent);
   }
 
   .here-path {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-end-host-sessions"
+description = "Enables the end_host_sessions command without any pre-configured scope."
+commands.allow = ["end_host_sessions"]
+
+[[permission]]
+identifier = "deny-end-host-sessions"
+description = "Denies the end_host_sessions command without any pre-configured scope."
+commands.deny = ["end_host_sessions"]

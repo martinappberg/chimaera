@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-report-window-scope"
+description = "Enables the report_window_scope command without any pre-configured scope."
+commands.allow = ["report_window_scope"]
+
+[[permission]]
+identifier = "deny-report-window-scope"
+description = "Denies the report_window_scope command without any pre-configured scope."
+commands.deny = ["report_window_scope"]
