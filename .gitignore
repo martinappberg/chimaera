@@ -9,7 +9,9 @@ crates/chimaera-app/gen/
 .DS_Store
 .claude/scheduled_tasks.lock
 .claude/worktrees/
-# Isolated per-worktree daemon state (chimaerad-isolated / serve-isolated.sh).
+# Isolated per-worktree state: the bare daemon (chimaerad-isolated /
+# serve-isolated.sh) and the full app (app-dev-isolated / run-app-isolated.sh).
 .chimaera-dev/
+.chimaera-dev-app/
 verify-tmp/
 .claude/settings.local.json
