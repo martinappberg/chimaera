@@ -12,3 +12,4 @@ crates/chimaera-app/gen/
 # Isolated per-worktree daemon state (chimaerad-isolated / serve-isolated.sh).
 .chimaera-dev/
 verify-tmp/
+.claude/settings.local.json
