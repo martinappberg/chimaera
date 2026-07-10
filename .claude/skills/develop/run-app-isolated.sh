@@ -49,4 +49,6 @@ while IFS= read -r var; do SCRUB+=(-u "$var"); done \
 
 # exec so a Ctrl-C / kill reaches the app directly. CHIMAERA_HOME is inherited by
 # the app, the daemon it spawns, and the shells that daemon spawns.
-exec env "${SCRUB[@]}" "$BIN"
+# ${SCRUB[@]+…}: macOS ships bash 3.2, where "${SCRUB[@]}" under `set -u`
+# dies on an empty array — the normal case for a HUMAN running this script.
+exec env ${SCRUB[@]+"${SCRUB[@]}"} "$BIN"

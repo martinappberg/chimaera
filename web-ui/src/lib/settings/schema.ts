@@ -173,7 +173,7 @@ const DEFS = {
     title: "New Agent Sessions",
     category: "Agents",
     description:
-      "How new Claude sessions open: the structured chat view, or the agent's own terminal UI. Every session can be switched either way from the pane bar; if the chat protocol ever fails to start, the session falls back to a terminal on its own.",
+      "How the + new agent button's instant spawn opens: the structured chat view, or the agent's own terminal UI. The launcher popover chooses explicitly per spawn (open = chat, the terminal button = TUI). Every session can be switched either way from the pane bar; if the chat protocol ever fails to start, the session falls back to a terminal on its own.",
     type: "enum",
     default: "chat",
     options: [
