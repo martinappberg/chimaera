@@ -427,6 +427,14 @@
     const items: RenderItem[] = [];
     let group: Extract<RenderItem, { t: "group" }> | null = null;
     store.blocks.forEach((block, i) => {
+      // Queued/undelivered user messages live in the bottom pending stack
+      // (rendered above the composer), not inline in history — a queued
+      // message is one still waiting to send. Once delivery flips it to
+      // `sent` it re-enters here in place (it was appended last).
+      if (block.kind === "user" && (block.state === "queued" || block.state === "dropped")) {
+        group = null;
+        return;
+      }
       if (block.kind === "tool") {
         if (group === null) {
           group = { t: "group", key: `g-${block.id}`, tools: [] };
@@ -439,6 +447,19 @@
       }
     });
     return items;
+  });
+
+  /** Index of the last block rendered INLINE (a pending user block, held in
+   *  the bottom stack, is skipped). The streaming reveal keys off this rather
+   *  than `blocks.length - 1`, so a queued send appended after the streaming
+   *  message doesn't stop the reveal. */
+  const lastInlineIndex = $derived.by(() => {
+    for (let i = store.blocks.length - 1; i >= 0; i--) {
+      const b = store.blocks[i];
+      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) continue;
+      return i;
+    }
+    return -1;
   });
 </script>
 
@@ -502,11 +523,9 @@
         <ToolGroup tools={item.tools} {onOpenFile} />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
-        <div
-          class="msg user"
-          class:queued={block.state === "queued"}
-          class:dropped={block.state === "dropped"}
-        >
+        <!-- Only delivered (sent) user messages render inline; queued/dropped
+             ones live in the pending stack above the composer. -->
+        <div class="msg user">
           <div class="bubble-row">
             {#if agentKind === "claude" && block.checkpoint !== null}
               <button
@@ -525,11 +544,6 @@
               />
             </div>
           </div>
-          {#if block.state === "queued"}
-            <span class="delivery">queued</span>
-          {:else if block.state === "dropped"}
-            <span class="delivery dropped">not delivered</span>
-          {/if}
           {#if block.attachments > 0}
             <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
           {/if}
@@ -538,7 +552,7 @@
         <div class="msg agent">
           <Markdown
             text={item.block.text}
-            streaming={store.running && item.index === store.blocks.length - 1}
+            streaming={store.running && item.index === lastInlineIndex}
             onOpenPath={openProsePath}
             resolvePaths={resolveProsePaths}
             onReveal={() => {
@@ -669,6 +683,34 @@
     </div>
   {/if}
 
+  <!-- Pending stack: messages typed and waiting to send, held at the send
+       point (right above the composer) rather than inline in history. On
+       delivery the block leaves this stack and re-enters the transcript as
+       the newest turn; a dropped one stays here, marked "not delivered". -->
+  {#if store.pendingUserBlocks.length > 0}
+    <div class="pending" aria-label="queued messages">
+      {#each store.pendingUserBlocks as block, i (block.id ?? `p-${i}`)}
+        <div class="msg user pending-msg" class:dropped={block.state === "dropped"}>
+          <div class="bubble-row">
+            <div class="bubble">
+              <UserText
+                text={block.text}
+                onOpenPath={openProsePath}
+                resolvePaths={resolveProsePaths}
+              />
+            </div>
+          </div>
+          <span class="delivery" class:dropped={block.state === "dropped"}>
+            {block.state === "dropped" ? "not delivered" : "queued"}
+          </span>
+          {#if block.attachments > 0}
+            <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
   <Composer
     sessionId={session.id}
     running={store.running}
@@ -732,6 +774,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
+  .chat > .pending,
   .chat > .plan {
     width: 100%;
     max-width: calc(var(--chat-measure) + 36px);
@@ -789,19 +832,39 @@
     font-size: var(--text-sm);
     margin-top: 2px;
   }
-  /* Delivery states: a queued send hasn't been consumed by the agent yet
-     (claude's native mid-turn queue / a codex steer in flight) — it renders
-     half-present until its update lands. A dropped one never will: the fade
-     stays and an honest "not delivered" mark appears (the text is kept
-     readable — no strikethrough — so it can be copied and re-sent). */
-  .msg.user.queued .bubble,
-  .msg.user.dropped .bubble {
-    opacity: 0.55;
+  /* The pending stack sits between the transcript and the composer, holding
+     messages typed and waiting to send. It reads as attached to the input:
+     same 18px side padding as the composer (the selector group above), a hair
+     of vertical breathing room, and a hairline top edge tying it to the
+     composer below. Collapses to nothing when empty (the {#if} guard). */
+  .pending {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-top: 8px;
+    padding-bottom: 6px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
   }
-  .msg.user.queued .bubble {
+  /* A pending bubble is half-present — not in the conversation yet (claude's
+     native mid-turn queue / a codex steer in flight). Reuses .msg.user's
+     right-alignment so the queued→sent transition is visually continuous:
+     the same bubble un-fades and moves up into the transcript on delivery.
+     Tighter margins than an inline turn (the stack sets its own gap). */
+  .pending-msg {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+  .pending-msg .bubble {
+    opacity: 0.55;
     /* Outline, not border: follows the radius with zero layout shift. */
     outline: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
     outline-offset: -1px;
+  }
+  /* Dropped (e.g. claude dropped its queue on interrupt): the text stays
+     readable — no strikethrough — so it can be copied and re-sent by hand. */
+  .pending-msg.dropped .bubble {
+    outline-style: solid;
+    outline-color: color-mix(in srgb, var(--err) 45%, transparent);
   }
   .delivery {
     color: var(--muted);

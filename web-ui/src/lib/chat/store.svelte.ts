@@ -197,6 +197,19 @@ export class ChatStore {
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
 
+  /** Queued/undelivered user messages, in order — rendered in a holding
+   *  stack pinned above the composer (the send point), NOT inline in
+   *  history: a queued message is one you've typed and are waiting to send.
+   *  Derived from the single `blocks` source, so when a `user_message_update`
+   *  flips a block to `sent` it drops out of here and appears inline in the
+   *  transcript, chronologically in place (queued blocks are appended last). */
+  pendingUserBlocks = $derived(
+    this.blocks.filter(
+      (b): b is Extract<ChatBlock, { kind: "user" }> =>
+        b.kind === "user" && (b.state === "queued" || b.state === "dropped"),
+    ),
+  );
+
   /** Highest seq applied; the reconnect auth carries it for gap replay.
    *  Reactive so views can track "any event applied" (in-place chunk appends
    *  and tool patches change no collection lengths). */

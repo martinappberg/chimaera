@@ -25,12 +25,16 @@ TUI (see [view switch](#view-switch-and-rewind)).
   natively, codex steers the running turn. `socket.send` returns `false` when the socket isn't
   OPEN, so the draft is only cleared on an accepted send — a message during a reconnect window is
   preserved, not lost (no client-side queue; reconnect replays the gap).
-- **Delivery honesty.** A mid-turn send renders *queued* (faded bubble, dashed outline, a small
-  "queued" mark) until the agent actually consumes it — claude dequeues one per finished turn,
-  codex on the steer ack — then it settles solid. If the turn aborts first (claude drops its
-  native queue on interrupt; a codex steer fails for good), the bubble stays faded and is marked
-  **"not delivered"** — journaled via `user_message` `id`/`queued` + `user_message_update`, so
-  replay shows the same truth (see PROTOCOL.md pass 8).
+- **Delivery honesty + pending stack.** A mid-turn send doesn't drop into history — it waits in a
+  **pending stack pinned just above the composer** (the send point), faded, with a small "queued"
+  mark. When the agent actually consumes it (claude dequeues one per finished turn, codex on the
+  steer ack) the block leaves the stack and enters the transcript proper as the newest user turn,
+  solid. If the turn aborts first (claude drops its native queue on interrupt; a codex steer fails
+  for good) the message stays in the stack marked **"not delivered"** (text kept readable/copyable,
+  never auto-dumped back into a draft you may have started). Driven entirely off the single `blocks`
+  reducer — a derived `store.pendingUserBlocks` splits queued/dropped out of the inline render — and
+  journaled via `user_message` `id`/`queued` + `user_message_update`, so replay shows the same truth
+  (see PROTOCOL.md pass 8).
 - **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
   1568px max dim, 2 MiB post-encode cap (oversized silently dropped); the journal stores a
   placeholder, never the bytes.
