@@ -19,7 +19,28 @@
   const running = $derived(
     tools.some((t) => t.status === "in_progress" || t.status === "pending"),
   );
-  const failed = $derived(tools.some((t) => t.status === "failed" || t.denied));
+  /** A failure is RECOVERED when a later call of the same tool against the
+   *  same target completed (the read-before-write dance, a retried command) —
+   *  a net-success run shouldn't wear the hard red badge. Presentation only:
+   *  the failed row inside still shows its own error. Denials never recover
+   *  (the user said no); a failure with no matching later success stays hard. */
+  const failed = $derived.by(() =>
+    tools.some((t, i) => {
+      if (t.denied) return true;
+      if (t.status !== "failed") return false;
+      const sameTarget = (s: (typeof tools)[number]) =>
+        s.tool === t.tool &&
+        (t.locations.length > 0
+          ? s.locations.some((l) => t.locations.includes(l))
+          : s.title === t.title);
+      return !tools.some(
+        (s, j) => j > i && s.status === "completed" && !s.denied && sameTarget(s),
+      );
+    }),
+  );
+  const recovered = $derived(
+    !failed && tools.some((t) => t.status === "failed" || t.denied),
+  );
 
   /** null = follow the auto rule; a bool = the user's explicit choice. */
   let userOpen = $state<boolean | null>(null);
@@ -74,6 +95,8 @@
       <span class="badge bad">failed</span>
     {:else if running}
       <span class="badge run">running…</span>
+    {:else if recovered}
+      <span class="badge soft">recovered</span>
     {/if}
   </button>
   {#if open}
@@ -153,6 +176,11 @@
   .badge.run {
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  /* Recovered: worth a glance, not an alarm. */
+  .badge.soft {
+    color: var(--muted);
+    background: color-mix(in srgb, var(--fg) 7%, transparent);
   }
   .rows {
     border-top: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
