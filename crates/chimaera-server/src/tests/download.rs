@@ -123,6 +123,9 @@ async fn download_dir_zips_recursively_skipping_symlinks() {
         .last_modification_date()
         .year();
     assert!(year >= 2026, "zip entry stamped {year}");
+    // And real unix modes — unstamped attribute bits extract as mode-000.
+    let mode = reader.file().entries()[index].unix_permissions();
+    assert_eq!(mode.map(|m| m & 0o777), Some(0o644), "{mode:?}");
 
     std::fs::remove_dir_all(&base).ok();
 }

@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
+use async_zip::{
+    AttributeCompatibility, Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder,
+};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -60,12 +62,13 @@ pub(crate) async fn download(
     if meta.is_dir() {
         let (writer, reader) = tokio::io::duplex(PIPE_CAPACITY);
         let root = path.clone();
+        let utc_offset = local_utc_offset().await;
         tokio::spawn(async move {
             // A failure mid-walk drops the writer: the client sees a
             // truncated/failed download, never an incomplete archive
             // presented as success. A client disconnect closes the read
             // half, the next write errors, and the task exits.
-            if let Err(err) = zip_dir(root.clone(), writer).await {
+            if let Err(err) = zip_dir(root.clone(), writer, utc_offset).await {
                 tracing::warn!(path = %root.display(), %err, "folder download aborted");
             }
         });
@@ -116,7 +119,7 @@ pub(crate) async fn download(
 /// Every directory gets an explicit `name/` entry so empty ones survive
 /// extraction; entry names are rooted at the folder's own name, so unzipping
 /// yields a single top-level folder.
-async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
+async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::Result<()> {
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let root_name = root
@@ -137,14 +140,13 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
         } else {
             format!("{root_name}/{rel}/")
         };
-        let dir_mtime = tokio::fs::metadata(&dir)
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let dir_meta = tokio::fs::metadata(&dir).await.ok();
         zip.write_entry_whole(
-            with_mtime(
+            stamp(
                 ZipEntryBuilder::new(dir_entry.into(), Compression::Stored),
-                dir_mtime,
+                dir_meta.as_ref(),
+                utc_offset,
+                0o040_755, // drwxr-xr-x
             ),
             &[],
         )
@@ -179,10 +181,12 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
                     .unwrap_or(&entry.path())
                     .to_string_lossy()
             );
-            let mtime = file.metadata().await.ok().and_then(|m| m.modified().ok());
-            let builder = with_mtime(
+            let meta = file.metadata().await.ok();
+            let builder = stamp(
                 ZipEntryBuilder::new(name.into(), Compression::Deflate),
-                mtime,
+                meta.as_ref(),
+                utc_offset,
+                0o100_644, // -rw-r--r--
             );
             let mut entry_writer = zip.write_entry_stream(builder).await?;
             futures::io::copy(&mut file.compat(), &mut entry_writer).await?;
@@ -194,27 +198,78 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stamp a zip entry with a file's mtime, when one is readable. Left
-/// unstamped, the writer's default is the DOS epoch and every extracted
-/// file reads as 1980.
-fn with_mtime(builder: ZipEntryBuilder, mtime: Option<SystemTime>) -> ZipEntryBuilder {
-    match mtime {
-        Some(mtime) => builder.last_modification_date(zip_datetime(mtime)),
+/// The daemon host's current UTC offset in seconds, via `date +%z` (POSIX;
+/// prints e.g. `-0700`). std exposes no timezone and the workspace stays
+/// unsafe-free, so a subprocess it is — one per folder download, noise next
+/// to streaming the archive. Falls back to UTC (0) if `date` misbehaves.
+async fn local_utc_offset() -> i64 {
+    match tokio::process::Command::new("date")
+        .arg("+%z")
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            parse_utc_offset(String::from_utf8_lossy(&out.stdout).trim())
+        }
+        _ => 0,
+    }
+}
+
+/// Parse a `[+-]HHMM` (or `[+-]HH:MM`) UTC offset into seconds; 0 on
+/// anything unexpected.
+fn parse_utc_offset(s: &str) -> i64 {
+    let (sign, rest) = match s.as_bytes().first() {
+        Some(b'+') => (1, &s[1..]),
+        Some(b'-') => (-1, &s[1..]),
+        _ => return 0,
+    };
+    let digits = rest.replace(':', "");
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let hours: i64 = digits[..2].parse().unwrap_or(0);
+    let minutes: i64 = digits[2..].parse().unwrap_or(0);
+    sign * (hours * 3600 + minutes * 60)
+}
+
+/// Stamp a zip entry with its file's mtime and unix mode. Left unstamped,
+/// the writer's defaults extract as 1980-dated, mode-000 files (Info-ZIP
+/// applies the zeroed attribute bits verbatim). The full st_mode goes in —
+/// type bits like Info-ZIP writes them, so the executable bit survives on
+/// scripts; `fallback` covers an unreadable metadata.
+fn stamp(
+    builder: ZipEntryBuilder,
+    meta: Option<&std::fs::Metadata>,
+    utc_offset: i64,
+    fallback: u32,
+) -> ZipEntryBuilder {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.map(|m| m.permissions().mode()).unwrap_or(fallback);
+    let builder = builder
+        .attribute_compatibility(AttributeCompatibility::Unix)
+        .unix_permissions((mode & 0xFFFF) as u16);
+    match meta.and_then(|m| m.modified().ok()) {
+        Some(mtime) => builder.last_modification_date(zip_datetime(mtime, utc_offset)),
         None => builder,
     }
 }
 
-/// A file mtime as a zip DOS datetime, in UTC (the format carries no
-/// timezone; a fixed zone beats an unstamped 1980). DOS dates span
-/// 1980–2107 at 2-second granularity — out-of-range mtimes clamp, and the
-/// builder itself masks the seconds' low bit.
-fn zip_datetime(mtime: SystemTime) -> ZipDateTime {
+/// A file mtime as a zip DOS datetime in the daemon host's local time
+/// (`utc_offset` seconds east of UTC): zip carries no timezone, and local
+/// wall-clock is the format's convention, so extraction shows the time the
+/// user saw on the file. One offset per archive, captured at download time —
+/// entries last touched in a different DST phase skew by the DST hour (the
+/// standard zip caveat), and a remote daemon stamps ITS host's local time.
+/// DOS dates span 1980–2107 at 2-second granularity — out-of-range mtimes
+/// clamp, and the builder itself masks the seconds' low bit.
+fn zip_datetime(mtime: SystemTime, utc_offset: i64) -> ZipDateTime {
     let secs = mtime
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
-    let rem = secs % 86_400;
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + utc_offset;
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
     let (hour, minute, second) = (
         (rem / 3600) as u32,
         (rem % 3600 / 60) as u32,
@@ -346,7 +401,7 @@ mod tests {
         // 2024-03-01T04:05:06Z.
         let mtime =
             UNIX_EPOCH + std::time::Duration::from_secs(19_783 * 86_400 + 4 * 3600 + 5 * 60 + 6);
-        let dt = zip_datetime(mtime);
+        let dt = zip_datetime(mtime, 0);
         assert_eq!(
             (
                 dt.year(),
@@ -358,9 +413,31 @@ mod tests {
             ),
             (2024, 3, 1, 4, 5, 6), // even second survives DOS 2s granularity
         );
+        // A negative UTC offset shifts across midnight into the previous
+        // local day (04:05:06Z at UTC-7 is 21:05:06 the day before).
+        let dt = zip_datetime(mtime, -7 * 3600);
+        assert_eq!(
+            (dt.year(), dt.month(), dt.day(), dt.hour()),
+            (2024, 2, 29, 21),
+        );
         // Pre-1980 mtimes clamp to the DOS floor instead of panicking the
         // builder (its year field is `year - 1980` in a u16).
-        let dt = zip_datetime(UNIX_EPOCH);
+        let dt = zip_datetime(UNIX_EPOCH, 0);
         assert_eq!((dt.year(), dt.month(), dt.day()), (1980, 1, 1));
+        // ... even when the offset would push the wall clock below 1970.
+        let dt = zip_datetime(UNIX_EPOCH, -7 * 3600);
+        assert_eq!((dt.year(), dt.month(), dt.day()), (1980, 1, 1));
+    }
+
+    #[test]
+    fn parse_utc_offset_handles_common_forms() {
+        assert_eq!(parse_utc_offset("-0700"), -7 * 3600);
+        assert_eq!(parse_utc_offset("+0200"), 2 * 3600);
+        assert_eq!(parse_utc_offset("+05:30"), 5 * 3600 + 30 * 60);
+        assert_eq!(parse_utc_offset("+0000"), 0);
+        // Garbage (an empty or word answer) falls back to UTC.
+        assert_eq!(parse_utc_offset(""), 0);
+        assert_eq!(parse_utc_offset("UTC"), 0);
+        assert_eq!(parse_utc_offset("+07"), 0);
     }
 }
