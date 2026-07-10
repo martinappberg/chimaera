@@ -298,6 +298,10 @@ struct ClaudeDriver;
 impl Driver for ClaudeDriver {
     type Mapper = ClaudeMapper;
 
+    fn kind(&self) -> &'static str {
+        "claude"
+    }
+
     fn env_extra(&self) -> Vec<(String, String)> {
         vec![
             ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),

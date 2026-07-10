@@ -314,6 +314,103 @@ async fn spawn_crash_reports_handshake_failure_with_stderr() {
     );
 }
 
+/// The journaled face of a startup failure: a fatal `Error` (with the reason)
+/// followed by `Exited`. Returns the Error message for content asserts.
+fn journaled_startup_failure(replay: &[Arc<SeqEvent>]) -> String {
+    let error_at = replay
+        .iter()
+        .position(|e| matches!(&e.ev, AgentEvent::Error { fatal: true, .. }))
+        .unwrap_or_else(|| panic!("no fatal Error journaled; got {replay:#?}"));
+    assert!(
+        replay[error_at + 1..]
+            .iter()
+            .any(|e| matches!(e.ev, AgentEvent::Exited { .. })),
+        "no Exited after the fatal Error; got {replay:#?}"
+    );
+    match &replay[error_at].ev {
+        AgentEvent::Error { message, .. } => message.clone(),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn handshake_death_journals_a_visible_startup_failure() {
+    // `die` exits before answering the handshake — previously nothing reached
+    // the journal and an attached pane just showed "agent exited".
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-6", &fx.cwd, "die"))
+        .expect("spawn");
+    let exit = tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    assert!(exit.starts_with("s-6:HandshakeFailed"), "got {exit}");
+
+    // The failure is journaled, so replay (a reattach) renders it.
+    let att = fx.manager.attach("s-6", 0).expect("attach");
+    let message = journaled_startup_failure(&att.replay);
+    assert!(
+        message.contains("claude failed to start"),
+        "message names the agent and the failure: {message}"
+    );
+}
+
+#[tokio::test]
+async fn spawn_failure_journals_a_visible_startup_failure() {
+    // argv[0] does not exist: the earliest possible death (JsonlChild::spawn
+    // errors before there is a child at all).
+    let mut fx = fixture();
+    fx.manager
+        .spawn(
+            &ClaudeAdapter,
+            SpawnSpec::new(
+                "s-7",
+                vec!["/nonexistent/chimaera-fake-agent".to_string()],
+                fx.cwd.clone(),
+            ),
+        )
+        .expect("spawn");
+    let exit = tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    assert!(exit.starts_with("s-7:HandshakeFailed"), "got {exit}");
+
+    let att = fx.manager.attach("s-7", 0).expect("attach");
+    let message = journaled_startup_failure(&att.replay);
+    assert!(message.contains("spawn failed"), "got {message}");
+}
+
+#[tokio::test]
+async fn exit_right_after_handshake_is_failure_at_birth_with_stderr() {
+    // Handshake succeeds, then the child dies (the post-update codex mode).
+    // Previously classified Clean and silently retired, stderr discarded.
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-8", &fx.cwd, "die-after-handshake"))
+        .expect("spawn");
+    let exit = tokio::time::timeout(WAIT, fx.exits.recv())
+        .await
+        .expect("exit hook fired")
+        .expect("channel open");
+    assert!(
+        exit.starts_with("s-8:HandshakeFailed"),
+        "an exit-at-birth must classify as a startup failure, got {exit}"
+    );
+    assert!(
+        exit.contains("kaboom"),
+        "the stderr diagnostic must be preserved on the exit: {exit}"
+    );
+
+    let att = fx.manager.attach("s-8", 0).expect("attach");
+    let message = journaled_startup_failure(&att.replay);
+    assert!(
+        message.contains("kaboom"),
+        "the stderr diagnostic must reach the journal: {message}"
+    );
+}
+
 #[tokio::test]
 async fn kill_ends_driver_and_emits_exited() {
     let mut fx = fixture();

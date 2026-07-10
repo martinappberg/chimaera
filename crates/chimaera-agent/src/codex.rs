@@ -210,6 +210,10 @@ struct CodexDriver;
 impl Driver for CodexDriver {
     type Mapper = CodexMapper;
 
+    fn kind(&self) -> &'static str {
+        "codex"
+    }
+
     // Handshake covers initialize AND thread start/resume — a driver that
     // cannot open a thread is as dead as one that cannot speak at all.
     async fn handshake<'a>(

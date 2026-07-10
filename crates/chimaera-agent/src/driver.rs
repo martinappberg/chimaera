@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::model::{AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
+use crate::model::{cap_output, AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// Cold NFS caches make agent CLIs slow to first output; `--version` alone
@@ -126,6 +126,11 @@ pub struct Handshake<M> {
 pub trait Driver: Send {
     type Mapper: Mapper;
 
+    /// The agent kind ("claude"/"codex") — names the agent in the
+    /// harness-emitted startup-failure and version-drift events. No default:
+    /// the compiler enforces both drivers carry it.
+    fn kind(&self) -> &'static str;
+
     /// Env vars appended to the spawn (claude pins the auto-updater off and
     /// enables SDK file checkpointing; codex needs none).
     fn env_extra(&self) -> Vec<(String, String)> {
@@ -179,6 +184,51 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
     Delivery::Ok
 }
 
+/// Journal + broadcast the client-visible face of a startup failure, then the
+/// terminal `Exited`. The handshake-failure exit paths previously returned
+/// before any event reached the pump: the reason and stderr tail went only to
+/// the daemon log and the chat pane just showed a bare "agent exited" — the
+/// reported post-update failure mode. `fatal:true` renders as the chat
+/// surface's error banner (and errors the rail row); a later reattach replays
+/// it from the journal.
+async fn report_startup_failure(
+    io: &DriverIo,
+    kind: &str,
+    reason: &str,
+    stderr_tail: &str,
+    status: Option<i32>,
+) {
+    // The stderr ring is already bounded (ndjson), but run it through the
+    // shared cap so this event obeys caps-at-construction even if that
+    // budget ever grows.
+    let (tail, _) = cap_output(stderr_tail);
+    let tail = tail.trim();
+    let mut message = format!("{kind} failed to start: {reason}");
+    if !tail.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(tail);
+    }
+    message.push_str(&format!(
+        "\n\nIf {kind} was just updated, its chat protocol may have changed — \
+         reopen this session as a terminal, or check that `{kind}` still runs in one."
+    ));
+    let _ = io
+        .events
+        .send(AgentEvent::Error {
+            message,
+            fatal: true,
+        })
+        .await;
+    let _ = io.events.send(AgentEvent::Exited { status }).await;
+}
+
+/// An agent that handshakes and then exits almost immediately never served a
+/// conversation — that exit is a startup failure (the plausible post-update
+/// crash mode), not an end-of-life, and its stderr is the only diagnostic.
+/// Time-based because neither protocol has a "goodbye" frame: generous enough
+/// for slow first traffic, far shorter than any real session.
+pub const FAILURE_AT_BIRTH_WINDOW: Duration = Duration::from_secs(10);
+
 /// The shared driver harness: spawn the child, run the driver's handshake
 /// under the watchdog, then pump frames/commands/kills through the mapper
 /// until the child, the client, or a kill signal ends the session. Every exit
@@ -195,10 +245,12 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     ) {
         Ok(child) => child,
         Err(err) => {
+            let reason = format!("spawn failed: {err:#}");
+            report_startup_failure(&io, driver.kind(), &reason, "", None).await;
             return DriverExit::HandshakeFailed {
-                reason: format!("spawn failed: {err:#}"),
+                reason,
                 stderr_tail: String::new(),
-            }
+            };
         }
     };
     let (mut sink, mut stream, guard) = child.split();
@@ -216,18 +268,19 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     } = match handshake {
         Ok(Ok(hs)) => hs,
         Ok(Err(reason)) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
+            let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
             return DriverExit::HandshakeFailed {
                 reason,
                 stderr_tail: tail,
             };
         }
         Err(_) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
+            let reason = format!("no handshake within {:?}", spec.handshake_timeout);
+            let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
             return DriverExit::HandshakeFailed {
-                reason: format!("no handshake within {:?}", spec.handshake_timeout),
+                reason,
                 stderr_tail: tail,
             };
         }
@@ -237,14 +290,33 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         guard.shutdown(Duration::ZERO).await;
         return DriverExit::Killed;
     }
-    // Post-handshake seeding/replay. A failure here means no client is left or
-    // the child's stdin already broke — either way, tear down immediately.
+    // Post-handshake seeding/replay. A write failing THIS early means the
+    // child died right after answering the handshake (the post-update crash
+    // mode) — surface it as the startup failure it is, not a silent teardown;
+    // a gone receiver means the session itself was torn down.
     for step in initial {
-        if !matches!(deliver(&mut sink, &io, step).await, Delivery::Ok) {
-            guard.shutdown(Duration::ZERO).await;
-            return DriverExit::Killed;
+        match deliver(&mut sink, &io, step).await {
+            Delivery::Ok => {}
+            Delivery::WriteFailed(err) => {
+                let reason = format!("agent exited during startup ({err})");
+                let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+                report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
+                return DriverExit::HandshakeFailed {
+                    reason,
+                    stderr_tail: tail,
+                };
+            }
+            Delivery::ReceiverGone => {
+                guard.shutdown(Duration::ZERO).await;
+                return DriverExit::Killed;
+            }
         }
     }
+
+    // Failure-at-birth clock: starts once the handshake has proven the wire,
+    // so the epilogue can tell end-of-life from a binary that handshakes and
+    // then crashes (see FAILURE_AT_BIRTH_WINDOW).
+    let born = tokio::time::Instant::now();
 
     let mut tick = tokio::time::interval(Duration::from_millis(COALESCE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -288,6 +360,9 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         }
     };
 
+    // Age measured at loop exit (before the reap's grace wait), so the
+    // failure-at-birth window is about the child's behavior, not ours.
+    let age_at_exit = born.elapsed();
     if let Some(ev) = mapper.flush() {
         let _ = io.events.send(ev).await;
     }
@@ -295,7 +370,25 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     // on read wakes, then reap with a bounded wait. A normally-exiting child
     // returns its real status at once; a lingerer is SIGKILLed after the grace.
     drop(sink);
-    let status = guard.shutdown(KILL_GRACE).await;
+    let (status, stderr_tail) = guard.shutdown_with_stderr(KILL_GRACE).await;
+    // Exit-at-birth reclassification: a bare "Clean" here would conflate
+    // end-of-life with failure-at-birth and discard the stderr diagnostic
+    // that HandshakeFailed preserves. A genuine 0 exit is respected.
+    if matches!(exit, DriverExit::Clean(_))
+        && age_at_exit < FAILURE_AT_BIRTH_WINDOW
+        && status != Some(0)
+    {
+        let reason = format!(
+            "exited {}s after startup (status {})",
+            age_at_exit.as_secs(),
+            status.map_or_else(|| "unknown".to_string(), |s| s.to_string()),
+        );
+        report_startup_failure(&io, driver.kind(), &reason, &stderr_tail, status).await;
+        return DriverExit::HandshakeFailed {
+            reason,
+            stderr_tail,
+        };
+    }
     let _ = io.events.send(AgentEvent::Exited { status }).await;
     match exit {
         DriverExit::Clean(_) => DriverExit::Clean(status),
