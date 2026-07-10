@@ -984,14 +984,13 @@ async fn resolve_local_binary(
     }
     let (os, arch) = remote_target(host).await?;
     let name = dist_name(&os, &arch);
-    // Prefer a developer's local `just dist` stash if present, so a repo
-    // checkout still overrides with its own build; otherwise auto-fetch the
-    // matching daemon from our release (the end-user path — no repo, no stash).
-    let candidate = dist_dir().join(&name);
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
     if home == RemoteHome::Dev {
+        // A dev connect deploys YOUR build: the (possibly isolated) dist dir
+        // first, then the real `~/.chimaera/dist` stash `just dist` writes to.
+        let candidate = dist_dir().join(&name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
         if let Some(stash) = dirs::home_dir().map(|h| h.join(".chimaera").join("dist").join(&name))
         {
             if stash.is_file() {
@@ -1007,6 +1006,14 @@ async fn resolve_local_binary(
              \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
         );
     }
+    // The REAL home runs release binaries ONLY — the `just dist` stash is
+    // never a source here. A stash build carries the unstamped 0.0.1 sentinel,
+    // and a dev binary started in the real home relocates its state to
+    // `~/.chimaera-dev` (dev is dev, on both ends): the connect polling
+    // `~/.chimaera/manifest.json` never sees it come up, and every retry
+    // piles another daemon onto the host. Testing your own build against a
+    // host is what the dev connect is for; `--binary` stays as the explicit
+    // override.
     fetch_release_binary(&os, &arch, progress)
         .await
         .map_err(|e| {
@@ -1073,11 +1080,53 @@ async fn ensure_remote_binary(
     home: RemoteHome,
     progress: &impl Fn(Phase),
 ) -> anyhow::Result<()> {
-    if home == RemoteHome::Real && ssh_check(host, &format!("test -x {}", home.bin_path())).await? {
-        return Ok(());
+    if home == RemoteHome::Real {
+        // Reuse the existing binary only if it can actually SERVE this home:
+        // executability is not enough. A dev (0.0.1-sentinel) binary stranded
+        // in the real home — deployed there by a pre-fix release that trusted
+        // the dist stash — starts fine but relocates its state to
+        // `~/.chimaera-dev`, so the manifest this connect polls never
+        // appears. Probe the version and replace anything that is not a
+        // stamped release.
+        match remote_binary_version(host, home).await? {
+            Some(v) if !chimaera_core::version_is_dev(&v) => return Ok(()),
+            Some(v) => tracing::info!(
+                "replacing the dev build ({v}) stranded at {} — it cannot serve the real home",
+                home.bin_path()
+            ),
+            None => {}
+        }
     }
     let path = resolve_local_binary(host, binary, home, progress).await?;
     deploy_binary(host, &path, home, progress).await
+}
+
+/// The version the binary installed in `home` reports (`chimaera X.Y.Z` →
+/// `X.Y.Z`), or `None` when it is missing, not executable, or prints
+/// something unrecognizable — all "not usable, redeploy" to the caller.
+async fn remote_binary_version(host: &str, home: RemoteHome) -> anyhow::Result<Option<String>> {
+    let output = ssh_cmd(host)
+        .arg(format!("{} --version 2>/dev/null", home.bin_path()))
+        .output()
+        .await
+        .context("failed to run ssh")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_cli_version(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Parse clap's `--version` line (`chimaera X.Y.Z`) to `X.Y.Z`. The name
+/// check guards against stray shell noise on stdout being read as a version.
+fn parse_cli_version(text: &str) -> Option<String> {
+    let mut words = text
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .split_whitespace();
+    if words.next()? != "chimaera" {
+        return None;
+    }
+    words.next().map(str::to_string)
 }
 
 /// Start the daemon on the host and poll until its manifest reports alive.
@@ -1497,6 +1546,19 @@ mod tests {
         assert_eq!(count_alive_sessions(""), None);
         assert_eq!(count_alive_sessions("unauthorized"), None);
         assert_eq!(count_alive_sessions(r#"{"error": "no"}"#), None);
+    }
+
+    /// The real-home reuse check keys on this parse: a dev (0.0.1) version
+    /// must be recognized so a stranded dev binary gets replaced, and shell
+    /// noise must never read as a version (that would wrongly skip a deploy).
+    #[test]
+    fn cli_version_parses_only_the_expected_shape() {
+        assert_eq!(parse_cli_version("chimaera 0.1.7\n"), Some("0.1.7".into()));
+        assert_eq!(parse_cli_version("\nchimaera 0.0.1"), Some("0.0.1".into()));
+        assert!(chimaera_core::version_is_dev("0.0.1"));
+        assert_eq!(parse_cli_version("bash: chimaera: command not found"), None);
+        assert_eq!(parse_cli_version("chimaera"), None);
+        assert_eq!(parse_cli_version(""), None);
     }
 
     // --- resolve_daemon characterization (fake side effects) ----------------

@@ -21,6 +21,10 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   snapshot; chat rebuilds by replaying the journal gap. Chat sessions survive a *disconnect* but **die
   with the daemon** (they're live drivers) — their journal + native-id index preserve the conversation
   for a manual resume.
+- **One daemon per state dir.** `serve` refuses to start when the manifest's daemon is provably
+  alive (live pid **and** an HTTP answer on its port — a crash leftover or recycled pid doesn't
+  block startup): a second daemon over the same ledger would respawn every session again as
+  duplicate agent processes. Parallel daemons are sanctioned only via distinct `CHIMAERA_HOME`s.
 
 ## Session ledger + restart handoff
 
