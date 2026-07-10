@@ -4,15 +4,39 @@
    * codex requestUserInput) — option buttons per question, multi-select
    * toggles, and a free-text "other" per question. One normalized card for
    * every driver.
+   *
+   * Two faces: interactive (`answered` null — the pending overlay) and
+   * read-only history (`answered` set — the transcript's answered card,
+   * chosen labels highlighted, no controls), so an answered question stays
+   * visible instead of vanishing.
    */
   import type { PendingQuestion } from "./store.svelte";
 
   interface Props {
     request: PendingQuestion;
-    onAnswer: (answers: Record<string, string[]>) => void;
+    onAnswer?: (answers: Record<string, string[]>) => void;
+    /** Chosen labels per question id; non-null renders the read-only
+     *  answered card. Empty object = resolved without an answer. */
+    answered?: Record<string, string[]> | null;
   }
 
-  let { request, onAnswer }: Props = $props();
+  let { request, onAnswer, answered = null }: Props = $props();
+
+  const readOnly = $derived(answered !== null);
+  /** Resolved with no recorded choice (expired ask, or a journal from
+   *  before answers were recorded). */
+  const unanswered = $derived(
+    answered !== null && request.questions.every((q) => (answered[q.id] ?? []).length === 0),
+  );
+  function chosen(qid: string): string[] {
+    return answered?.[qid] ?? [];
+  }
+  /** Free-text answers ride as labels; anything chosen that is not one of
+   *  the offered options renders as its own chip. */
+  function freeText(qid: string, options: { label: string }[]): string[] {
+    const offered = new Set(options.map((o) => o.label));
+    return chosen(qid).filter((label) => !offered.has(label));
+  }
 
   // Keyed by question/option INDEX, not by the model-authored id/label — those
   // are untrusted and may collide (two options both "Yes"), which would break
@@ -43,46 +67,72 @@
       const free = (other[qi] ?? "").trim();
       answers[q.id] = free.length > 0 ? [...own, free] : own;
     });
-    onAnswer(answers);
+    onAnswer?.(answers);
   }
 </script>
 
-<div class="question" role="group" aria-label="the agent has a question">
+<div
+  class="question"
+  class:answered={readOnly}
+  role="group"
+  aria-label={readOnly ? "answered question" : "the agent has a question"}
+>
   {#each request.questions as q, qi (qi)}
     <div class="q">
       {#if q.header.length > 0}
         <span class="q-header">{q.header}</span>
       {/if}
       <div class="q-text">{q.question}</div>
-      <div class="q-options">
-        {#each q.options as opt, oi (oi)}
-          <button
-            class="q-opt"
-            class:on={(picked[qi] ?? []).includes(oi)}
-            title={opt.description}
-            aria-pressed={(picked[qi] ?? []).includes(oi)}
-            onclick={() => toggle(qi, oi, q.multiSelect)}
-          >
-            {opt.label}
-          </button>
-        {/each}
-      </div>
-      <input
-        class="q-other"
-        placeholder="other…"
-        bind:value={other[qi]}
-        onkeydown={(e) => {
-          if (e.key === "Enter" && complete) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-      />
+      {#if readOnly}
+        <!-- History face: the chosen labels stay lit, the road not taken
+             dims; free-text answers get their own chip. -->
+        <div class="q-options">
+          {#each q.options as opt, oi (oi)}
+            <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)}>
+              {opt.label}
+            </span>
+          {/each}
+          {#each freeText(q.id, q.options) as free (free)}
+            <span class="q-opt static on">{free}</span>
+          {/each}
+        </div>
+      {:else}
+        <div class="q-options">
+          {#each q.options as opt, oi (oi)}
+            <button
+              class="q-opt"
+              class:on={(picked[qi] ?? []).includes(oi)}
+              title={opt.description}
+              aria-pressed={(picked[qi] ?? []).includes(oi)}
+              onclick={() => toggle(qi, oi, q.multiSelect)}
+            >
+              {opt.label}
+            </button>
+          {/each}
+        </div>
+        <input
+          class="q-other"
+          placeholder="other…"
+          bind:value={other[qi]}
+          onkeydown={(e) => {
+            if (e.key === "Enter" && complete) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+      {/if}
     </div>
   {/each}
-  <div class="q-actions">
-    <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
-  </div>
+  {#if readOnly}
+    {#if unanswered}
+      <div class="q-note">no longer active — not answered</div>
+    {/if}
+  {:else}
+    <div class="q-actions">
+      <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -93,6 +143,12 @@
     padding: 10px 12px;
     margin: 6px 0;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
+  }
+  /* History face: quiet — the accent tint belongs to the live ask only. */
+  .question.answered {
+    border-color: var(--edge);
+    background: color-mix(in srgb, var(--fg) 2%, transparent);
+    animation: none;
   }
   @media (prefers-reduced-motion: reduce) {
     .question {
@@ -142,6 +198,20 @@
   .q-opt.on {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
+  }
+  /* Read-only chips: same shapes, no affordance; unchosen options dim. */
+  .q-opt.static {
+    cursor: default;
+    display: inline-block;
+  }
+  .q-opt.static:not(.on) {
+    color: var(--muted);
+    border-color: color-mix(in srgb, var(--edge) 60%, transparent);
+  }
+  .q-note {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: var(--text-sm);
   }
   .q-other {
     margin-top: 8px;
