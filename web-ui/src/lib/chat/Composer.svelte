@@ -3,6 +3,7 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { registerComposer } from "./composerBus";
+  import { loadDraft, saveDraft } from "./drafts";
   import type { SlashCommand } from "./store.svelte";
 
   export interface ImageAttachment {
@@ -53,8 +54,25 @@
 
   const uid = $props.id();
 
-  let draft = $state("");
-  let images = $state<ImageAttachment[]>([]);
+  // The parent {#key}s ChatView (and so this composer) per session — one
+  // instance, one session — and remounts it on every tab switch, so the
+  // draft must live in the session-keyed module store, not the component.
+  // svelte-ignore state_referenced_locally
+  const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
+  let draft = $state(savedDraft.text);
+  let images = $state<ImageAttachment[]>(savedDraft.images);
+
+  // Write-through persistence: every draft/attachment change (typing, paste,
+  // popover picks, the post-send clear) lands in the session's draft slot.
+  // snapshot, not the proxy: it tracks in-place pushes (onPaste mutates) and
+  // stores plain data. Reads $state, writes the module map — no read+write
+  // loop, no timer.
+  $effect(() => {
+    const text = draft;
+    const imgs = $state.snapshot(images);
+    if (sessionId === null) return;
+    saveDraft(sessionId, text, imgs);
+  });
   let el = $state<HTMLTextAreaElement | null>(null);
   let selected = $state(0);
   let fileMatches = $state<QuickOpenEntry[]>([]);
