@@ -93,6 +93,28 @@ old to have the toast. Home screen's version mark now says `daemon dev·<ref>` f
 builds instead of posing as an ordinary `v0.0.1` (field confusion: an app reinstall
 attached to a still-running dev daemon and nothing on screen said so).
 
+## Field notes: dev binary stranded in the real home bricked release connect (2026-07-09)
+
+The day after `connect --dev` shipped (dev-is-dev on both ends: a `0.0.1` build defaults its
+state to `~/.chimaera-dev`), the RELEASE connect to the cluster broke: "daemon did not start
+within 15s", with daemons piling up on the login node. Chain of causes, and the invariants
+they forced:
+
+- **The real home's binary resolution still trusted the `just dist` stash.** The release
+  app's update path deployed `~/.chimaera/dist/chimaera-x86_64-linux-musl` — a `0.0.1` dev
+  build — into `~/.chimaera/bin/`. Started there with no `CHIMAERA_HOME`, it relocated its
+  state to `~/.chimaera-dev` and wrote its manifest THERE, while connect polled
+  `~/.chimaera/manifest.json` forever. Invariant: **the real home runs release binaries
+  only** — the stash feeds dev connects; `--binary` is the explicit override.
+- **"Executable" was the only reuse check on a fresh start**, so once poisoned, the host
+  stayed poisoned: every connect reused the stranded dev binary. Invariant: a fresh start
+  **version-probes the installed binary** and replaces the `0.0.1` sentinel in the real home.
+- **The daemon happily double-started over one state dir.** Each failed-connect retry ran
+  another `chimaera serve`, and each one respawned the SAME ledger sessions — triplicate
+  claude processes on a shared login node. Invariant: **one daemon per state dir** — `serve`
+  refuses to start when the manifest's daemon is provably alive (live pid + an HTTP answer
+  on its port; a crash leftover or recycled pid must not block startup).
+
 ## Field notes: laptop-sleep reconnect (2026-07-08)
 
 The first real close-the-laptop-overnight cycle against the cluster broke reconnect in
