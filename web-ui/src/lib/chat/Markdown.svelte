@@ -62,25 +62,24 @@
 
   /** Give every fenced block a copy affordance. The {@html} flush rebuilds the
    *  whole subtree per streaming chunk, so this re-runs from the same per-chunk
-   *  hook as stampPaths — fresh DOM each pass, nothing leaks. The wrapper (not
-   *  the pre) anchors the button: the pre scrolls horizontally, so an absolute
-   *  child inside it would ride away with the content. Runs BEFORE wrapWords so
-   *  the reveal bookkeeping stamps the wrapper as the pre's container and the
-   *  button stays hidden until the block starts revealing. */
+   *  hook as stampPaths — fresh DOM each pass, nothing leaks. APPEND-only, no
+   *  reparenting: Svelte tears {@html} content down by walking the live sibling
+   *  chain between its tracked first/last nodes, so wrapping a TOP-LEVEL pre
+   *  in a new div would strand the walk inside the wrapper and leak/duplicate
+   *  DOM every chunk. Instead the button lives inside the pre and the CODE
+   *  child is made the horizontal scroller, so the pre stays a non-scrolling
+   *  anchor the button can pin to. Runs BEFORE wrapWords so the reveal
+   *  bookkeeping hides the button with its still-unrevealed block. */
   function decorateCodeBlocks(root: HTMLElement) {
     for (const pre of root.querySelectorAll("pre")) {
-      if (pre.parentElement?.classList.contains("md-pre")) continue;
-      const wrap = document.createElement("div");
-      wrap.className = "md-pre";
-      pre.replaceWith(wrap);
-      wrap.appendChild(pre);
+      if (pre.querySelector(":scope > button.md-copy") !== null) continue;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "md-copy";
       btn.setAttribute("aria-label", "copy code");
       btn.title = "copy";
       btn.innerHTML = COPY_BUTTON_SVG;
-      wrap.appendChild(btn);
+      pre.appendChild(btn);
     }
   }
 
@@ -216,9 +215,12 @@
     // into the payload; innerText copies exactly what is rendered.
     const copyBtn = target?.closest?.("button.md-copy");
     if (copyBtn instanceof HTMLElement) {
-      const pre = copyBtn.closest(".md-pre")?.querySelector("pre");
-      // marked ends every fence with one newline the author never typed.
-      const code = (pre?.innerText ?? "").replace(/\n$/, "");
+      const pre = copyBtn.closest("pre");
+      // Fences render as pre>code (the button is code's sibling); a raw-HTML
+      // bare pre falls back to the whole pre (the SVG-only button adds no
+      // text). marked ends every fence with a newline the author never typed.
+      const src = pre?.querySelector("code") ?? pre;
+      const code = (src?.innerText ?? "").replace(/\n+$/, "");
       if (code.length > 0) {
         void copyText(code).then((ok) => {
           if (ok && copyBtn.isConnected) showCopied(copyBtn);
@@ -477,6 +479,7 @@
     background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .md :global(pre) {
+    position: relative; /* the copy button's anchor */
     background: color-mix(in srgb, var(--fg) 5%, transparent);
     border: 1px solid var(--edge);
     border-radius: 6px;
@@ -484,18 +487,19 @@
     overflow-x: auto;
     margin: 0.4em 0;
   }
+  /* The CODE child is the horizontal scroller (not the pre), so the pinned
+     copy button never rides away with scrolled content; a bare raw-HTML pre
+     (no code child) still scrolls itself and only loses the pinning. */
   .md :global(pre code) {
+    display: block;
+    overflow-x: auto;
     background: none;
     padding: 0;
     font-size: var(--text-sm);
   }
   /* Fenced-block copy chrome: hover-reveal (the .rewind-btn language). The
-     wrapper is the non-scrolling anchor; the pre's own margins collapse
-     through it, so layout is unchanged. The scrim keeps the icon legible
-     over code scrolled beneath it — token-only, so both themes hold. */
-  .md :global(.md-pre) {
-    position: relative;
-  }
+     scrim keeps the icon legible over code beneath it — token-only, so both
+     themes hold. */
   .md :global(.md-copy) {
     position: absolute;
     top: 5px;
@@ -514,7 +518,7 @@
       opacity 0.12s ease,
       color 0.12s ease;
   }
-  .md :global(.md-pre:hover .md-copy),
+  .md :global(pre:hover .md-copy),
   .md :global(.md-copy:focus-visible),
   .md :global(.md-copy.copied) {
     opacity: 1;
