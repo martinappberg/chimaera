@@ -97,8 +97,10 @@
     openSettings,
     paneForTab,
     panes as panesOf,
+    pruneDeletedPath,
     pruneFiles,
     pruneSessions,
+    rewriteTabPaths,
     serializeLayout,
     sessionPaneId,
     setPaneFont,
@@ -174,6 +176,8 @@
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
+  import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
+  import { fsDeleteOp, lastFsMutation, pendingDelete } from "./lib/workspace/fsEvents";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
@@ -315,6 +319,11 @@
   /** Rail row currently in inline rename (double-click or F2). */
   let renamingId = $state<string | null>(null);
   let renameDraft = $state("");
+  /** Inline-create request for the file tree (rail-header buttons). */
+  let treeCreate = $state<{ kind: "file" | "dir"; nonce: number } | null>(null);
+  let treeCreateNonce = 0;
+  /** A failed delete's message; keeps the confirm dialog open. */
+  let deleteError = $state<string | null>(null);
   /** Element that held focus when the picker opened; restored on close. */
   let pickerRestoreEl: HTMLElement | null = null;
 
@@ -1819,6 +1828,42 @@
     });
   }
 
+  /** Rail-header "new file"/"new folder": an inline-create row in the tree,
+   *  targeting the workspace root. */
+  function requestTreeCreate(kind: "file" | "dir"): void {
+    filesOpen = true;
+    treeCreateNonce += 1;
+    treeCreate = { kind, nonce: treeCreateNonce };
+  }
+
+  /** The confirmed file-manager delete: on failure the dialog stays open
+   *  with the error inline; on success fsEvents refreshes every surface and
+   *  the mutation subscription below closes tabs under the path. */
+  function confirmDelete(): void {
+    const pending = $pendingDelete;
+    if (pending === null) return;
+    deleteError = null;
+    fsDeleteOp(pending.path)
+      .then(() => pendingDelete.set(null))
+      .catch((err) => {
+        deleteError = err instanceof Error ? err.message : "delete failed";
+      });
+  }
+
+  // Keep open tabs coherent with fs mutations from ANY surface (tree, Finder,
+  // tab rename): a rename rewrites file/diff/finder tab paths, a delete
+  // closes tabs under the path (finders retarget to the parent).
+  let lastFsMutationSeq = 0;
+  $effect(() => {
+    const m = $lastFsMutation;
+    untrack(() => {
+      if (m === null || m.seq === lastFsMutationSeq) return;
+      lastFsMutationSeq = m.seq;
+      if (m.kind === "rename") layout = rewriteTabPaths(layout, m.from, m.to);
+      else if (m.kind === "delete") layout = pruneDeletedPath(layout, m.path);
+    });
+  });
+
   /** The × on a rail row: live sessions get an inline confirm first. */
   function requestKill(s: Session): void {
     if (s.alive) {
@@ -2678,6 +2723,33 @@
             </button>
             <button
               class="files-finder"
+              title="new file in the workspace root"
+              aria-label="new file"
+              onclick={() => requestTreeCreate("file")}
+            >
+              <!-- A file glyph with a plus. -->
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path d="M9.5 2H4.5A1.2 1.2 0 0 0 3.3 3.2v9.6A1.2 1.2 0 0 0 4.5 14H8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                <path d="M9.5 2 12.7 5.2V8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+                <line x1="11.8" y1="10.2" x2="11.8" y2="14.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                <line x1="9.8" y1="12.2" x2="13.8" y2="12.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button
+              class="files-finder"
+              title="new folder in the workspace root"
+              aria-label="new folder"
+              onclick={() => requestTreeCreate("dir")}
+            >
+              <!-- A folder glyph with a plus. -->
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <path d="M2.3 4.2A1.2 1.2 0 0 1 3.5 3h2.6l1.4 1.5h4.9a1.2 1.2 0 0 1 1.2 1.2V7.5M2.3 4.2v7.6A1.2 1.2 0 0 0 3.5 13H8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                <line x1="11.8" y1="9.7" x2="11.8" y2="13.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                <line x1="9.8" y1="11.7" x2="13.8" y2="11.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button
+              class="files-finder"
               title="new finder"
               aria-label="new finder"
               onclick={openFinderSurface}
@@ -2698,6 +2770,7 @@
                 onDragStart={onTreeEntryDown}
                 activePath={focusedFilePath}
                 reveal={treeReveal}
+                createRequest={treeCreate}
               />
             </div>
           {/if}
@@ -2978,6 +3051,25 @@
 <!-- The right-click context-menu singleton (rail rows, file tree, Finder,
      pane tabs all open it via contextMenu.openAt). Self-gating. -->
 <ContextMenuHost />
+
+<!-- File-manager delete confirmation: permanent (no server-side trash), so
+     always an explicit modal. A failure keeps it open with the error. -->
+{#if $pendingDelete !== null}
+  <ConfirmDialog
+    title={$pendingDelete.kind === "dir" ? "Delete folder" : "Delete file"}
+    body={`Permanently delete “${basename($pendingDelete.path)}”${
+      $pendingDelete.kind === "dir" ? " and everything inside it" : ""
+    }? This cannot be undone.`}
+    confirmLabel="delete"
+    danger
+    error={deleteError}
+    onConfirm={confirmDelete}
+    onCancel={() => {
+      pendingDelete.set(null);
+      deleteError = null;
+    }}
+  />
+{/if}
 
 <!-- Ambient update offer (small, snoozable): a newer release, or a daemon
      older than this app. One per window; dismissals are origin-wide. -->
