@@ -502,7 +502,11 @@
         <ToolGroup tools={item.tools} {onOpenFile} />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
-        <div class="msg user">
+        <div
+          class="msg user"
+          class:queued={block.state === "queued"}
+          class:dropped={block.state === "dropped"}
+        >
           <div class="bubble-row">
             {#if agentKind === "claude" && block.checkpoint !== null}
               <button
@@ -521,6 +525,11 @@
               />
             </div>
           </div>
+          {#if block.state === "queued"}
+            <span class="delivery">queued</span>
+          {:else if block.state === "dropped"}
+            <span class="delivery dropped">not delivered</span>
+          {/if}
           {#if block.attachments > 0}
             <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
           {/if}
@@ -779,6 +788,28 @@
     color: var(--muted);
     font-size: var(--text-sm);
     margin-top: 2px;
+  }
+  /* Delivery states: a queued send hasn't been consumed by the agent yet
+     (claude's native mid-turn queue / a codex steer in flight) — it renders
+     half-present until its update lands. A dropped one never will: the fade
+     stays and an honest "not delivered" mark appears (the text is kept
+     readable — no strikethrough — so it can be copied and re-sent). */
+  .msg.user.queued .bubble,
+  .msg.user.dropped .bubble {
+    opacity: 0.55;
+  }
+  .msg.user.queued .bubble {
+    /* Outline, not border: follows the radius with zero layout shift. */
+    outline: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+    outline-offset: -1px;
+  }
+  .delivery {
+    color: var(--muted);
+    font-size: var(--text-xs);
+    margin-top: 2px;
+  }
+  .delivery.dropped {
+    color: var(--err);
   }
   .msg.agent {
     padding: 2px 0;

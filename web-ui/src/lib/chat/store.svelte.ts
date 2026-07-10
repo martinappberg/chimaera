@@ -66,7 +66,19 @@ export interface CheckpointRef {
 }
 
 export type ChatBlock =
-  | { kind: "user"; text: string; attachments: number; checkpoint: CheckpointRef | null }
+  | {
+      kind: "user";
+      text: string;
+      attachments: number;
+      checkpoint: CheckpointRef | null;
+      /** Delivery key (the wire's client-minted uuid); null on old journals
+       *  and transcript-seeded messages — those are sent by definition. */
+      id: string | null;
+      /** queued = the agent hasn't consumed it yet (claude's native mid-turn
+       *  queue / a codex steer in flight); dropped = it never will (claude's
+       *  queue dies with an aborted turn; a codex steer failed for good). */
+      state: "sent" | "queued" | "dropped";
+    }
   | { kind: "message"; text: string; turnId: string }
   | { kind: "thought"; text: string; turnId: string }
   | {
@@ -191,6 +203,8 @@ export class ChatStore {
   lastSeq = $state(0);
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
+  /** user-message delivery id -> index into blocks (user_message_update). */
+  private userIndex = new Map<string, number>();
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
@@ -217,6 +231,7 @@ export class ChatStore {
   private resetTranscript(): void {
     this.blocks = [];
     this.toolIndex.clear();
+    this.userIndex.clear();
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
@@ -250,15 +265,30 @@ export class ChatStore {
         }
         break;
       }
-      case "user_message":
+      case "user_message": {
+        const id = (ev.id as string) ?? null;
         this.blocks.push({
           kind: "user",
           text: ev.text as string,
           attachments: (ev.attachments as number) ?? 0,
           checkpoint: null,
+          id,
+          state: ev.queued === true ? "queued" : "sent",
         });
+        if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         this.promptSuggestion = null;
         break;
+      }
+      case "user_message_update": {
+        // Delivery resolution for a queued bubble — patched in place, so a
+        // queued-then-sent message renders exactly once on live AND replay.
+        const idx = this.userIndex.get(ev.id as string);
+        if (idx === undefined) break;
+        const block = this.blocks[idx];
+        if (block.kind !== "user") break;
+        block.state = ev.state === "dropped" ? "dropped" : "sent";
+        break;
+      }
       case "prompt_suggestion":
         this.promptSuggestion = ev.text as string;
         break;
@@ -485,14 +515,16 @@ export class ChatStore {
       case "turn_aborted": {
         this.running = false;
         this.activity = null;
-        // A deliberate stop (Esc / stop button) is not an error state: codex
-        // reports reason "interrupted", claude's result string contains
-        // "interrupted by user" — render those quiet, keep --err for real
-        // failures. Both drivers' fallback reason is literally "turn failed",
-        // so don't prefix it into "turn stopped: turn failed".
+        // A deliberate stop (Esc / stop chip) is not an error state: the
+        // wire's `interrupted` flag is the drivers' structural signal
+        // (claude's free-text result string never reliably said so); the
+        // reason regex survives only for pre-flag journal replays. Render a
+        // calm muted "stopped", keep --err for real failures. Both drivers'
+        // fallback reason is literally "turn failed", so don't prefix it
+        // into "turn failed: turn failed".
         const reason = ev.reason as string;
-        if (/interrupt/i.test(reason)) {
-          this.notice("interrupted", "info");
+        if (ev.interrupted === true || /interrupt/i.test(reason)) {
+          this.notice("stopped", "info");
         } else {
           this.notice(reason === "turn failed" ? "turn failed" : `turn failed: ${reason}`, "error");
         }
@@ -539,10 +571,12 @@ export class ChatStore {
     const drop = this.blocks.length - cap + 1;
     const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
     this.blocks.splice(0, drop, notice);
-    // The front-splice invalidated every toolIndex position — rebuild it.
+    // The front-splice invalidated every id→index position — rebuild both.
     this.toolIndex.clear();
+    this.userIndex.clear();
     this.blocks.forEach((b, i) => {
       if (b.kind === "tool") this.toolIndex.set(b.id, i);
+      if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
     });
   }
 
