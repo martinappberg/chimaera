@@ -10,7 +10,7 @@
 //! `debug_assert` that otherwise guards it).
 
 use chimaera_agent::journal::SeqEvent;
-use chimaera_agent::model::AgentEvent;
+use chimaera_agent::model::{AgentEvent, UserMessageState};
 use serde_json::json;
 
 #[test]
@@ -66,5 +66,99 @@ fn agent_event_wire_shapes() {
     assert_eq!(
         serde_json::to_value(AgentEvent::ThinkingTokens { tokens: 128 }).unwrap(),
         json!({ "type": "thinking_tokens", "tokens": 128 })
+    );
+}
+
+/// The delivery fields are strictly additive: defaults serialize to nothing
+/// (a plain send is byte-identical to the pre-upgrade wire) and pre-upgrade
+/// journal lines deserialize with the defaults.
+#[test]
+fn user_message_delivery_fields_are_additive() {
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 0,
+            id: None,
+            queued: false,
+        })
+        .unwrap(),
+        json!({ "type": "user_message", "text": "hi" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 0,
+            id: Some("u1".into()),
+            queued: true,
+        })
+        .unwrap(),
+        json!({ "type": "user_message", "text": "hi", "id": "u1", "queued": true })
+    );
+    // An old journal line (no id/queued) still parses.
+    let old: AgentEvent =
+        serde_json::from_value(json!({ "type": "user_message", "text": "hi" })).unwrap();
+    assert_eq!(
+        old,
+        AgentEvent::UserMessage {
+            text: "hi".into(),
+            attachments: 0,
+            id: None,
+            queued: false,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessageUpdate {
+            id: "u1".into(),
+            state: UserMessageState::Sent,
+        })
+        .unwrap(),
+        json!({ "type": "user_message_update", "id": "u1", "state": "sent" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessageUpdate {
+            id: "u1".into(),
+            state: UserMessageState::Dropped,
+        })
+        .unwrap(),
+        json!({ "type": "user_message_update", "id": "u1", "state": "dropped" })
+    );
+}
+
+/// `interrupted` is additive the same way: false vanishes from the wire, old
+/// lines deserialize false, and only a deliberate user stop sets it.
+#[test]
+fn turn_aborted_interrupted_flag_is_additive() {
+    assert_eq!(
+        serde_json::to_value(AgentEvent::TurnAborted {
+            turn_id: "t1".into(),
+            reason: "boom".into(),
+            interrupted: false,
+        })
+        .unwrap(),
+        json!({ "type": "turn_aborted", "turn_id": "t1", "reason": "boom" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::TurnAborted {
+            turn_id: "t1".into(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        })
+        .unwrap(),
+        json!({
+            "type": "turn_aborted", "turn_id": "t1",
+            "reason": "interrupted", "interrupted": true
+        })
+    );
+    let old: AgentEvent = serde_json::from_value(
+        json!({ "type": "turn_aborted", "turn_id": "t1", "reason": "boom" }),
+    )
+    .unwrap();
+    assert_eq!(
+        old,
+        AgentEvent::TurnAborted {
+            turn_id: "t1".into(),
+            reason: "boom".into(),
+            interrupted: false,
+        }
     );
 }

@@ -831,6 +831,8 @@ mod tests {
             AgentEvent::UserMessage {
                 text: "hi".into(),
                 attachments: 0,
+                id: None,
+                queued: false,
             },
             AgentEvent::TurnStarted {
                 turn_id: "t1".into(),

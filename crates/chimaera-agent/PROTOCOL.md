@@ -153,9 +153,11 @@ planning"; plan comments ride `updatedInput.{userFeedback,userComments}`.
 > **Deny → abort (needs live re-verify in chat-smoke).** Because the standard
 > deny carries `interrupt:true`, the CLI ABORTS the turn — it emits an
 > `is_error:true` result (→ `TurnAborted`), NOT a success result. `fake-claude`
-> now mirrors this. UNVERIFIED: `on_result` zeroing `queued_sends` on any
-> `is_error` result assumes the CLI drops its native stdin queue with the
-> aborted turn; the driver now also defensively opens an implicit turn if a
+> now mirrors this. UNVERIFIED: `on_result` clearing the `queued_sends` FIFO
+> on any `is_error` result assumes the CLI drops its native stdin queue with
+> the aborted turn (each cleared uuid now also emits
+> `UserMessageUpdate{dropped}` — see pass 8 — so the journal records the
+> drop); the driver also defensively opens an implicit turn if a
 > stream/assistant/tool frame arrives with `turn_active == false`, so a wrong
 > assumption degrades to a correct boundary instead of a phantom turn. Confirm
 > the real queue-after-abort behavior and delete this note.
@@ -557,3 +559,65 @@ that can change the serving model mid-conversation:
   timedOut|aborted, riskLevel?, rationale?}}` — the guardian reviewer's
   verdicts; not yet rendered (we don't offer guardian mode).
 - item/mcpToolCall/progress: confirmed ignored by the official client too.
+
+## Pass 8 (2026-07-10 — normalized-wire additions): delivery + user-stop
+
+Additive fields/events on OUR normalized model (`model.rs`), pinned in
+`tests/wire_contract.rs`; all defaults serialize to nothing, so pre-upgrade
+journals replay and failure aborts stay byte-identical on the wire.
+
+### UserMessage delivery: `id` + `queued` + `user_message_update`
+
+`UserMessage` now carries the client-minted uuid the driver already stamps
+on the outbound frame (`id` = claude's checkpoint uuid / codex's
+`clientUserMessageId`) plus `queued: bool` — true when the agent has NOT
+consumed the message at echo time. A later
+`{"type":"user_message_update","id","state":"sent"|"dropped"}` resolves it.
+Replay is self-correcting: the journal carries the queued echo and the
+update through the same reducer, so queued-then-sent renders exactly once
+and queued-never-sent replays dropped.
+
+Emission points, per driver:
+
+- **claude** — a mid-turn send echoes `queued:true` and its uuid joins a
+  FIFO (`queued_sends`); the CLI queues the stdin frame natively. When the
+  running turn's result lands, the oldest uuid resolves `sent` alongside
+  the synthetic `TurnStarted` that opens its turn. An `is_error` result
+  drops the CLI's queue with the turn: every queued uuid resolves
+  `dropped` before the `TurnAborted`. (`cancel_async_message` un-queueing
+  remains unadopted — same as the official extension.)
+- **codex** — a steered send (`turn/steer`, incl. sends buffered during
+  the turn/start window and flushed on `turn/started`) echoes
+  `queued:true` and resolves `sent` when the steer RPC succeeds (steering
+  has no follow-up item we consume — the echoed `userMessage` item is
+  deliberately ignored). A steer that fails for good (after the one
+  expectedTurnId retry, while a turn is still active) resolves `dropped`
+  next to the Error notice. A steer/buffered send re-driven as a fresh
+  `turn/start` (the turn ended under it) resolves `sent` at the re-drive —
+  it has the same standing as a fresh send from there on.
+- Fresh-turn sends on both drivers echo `queued:false` (field omitted) and
+  never get an update. Transcript-seeded UserMessages carry no `id`.
+
+### TurnAborted `interrupted: bool` — the structural user-stop signal
+
+`TurnAborted` gains `interrupted: true` when the driver positively knows
+the abort was user-initiated; consumers (the session-rail state machine in
+chimaera-server `chat.rs`, the chat UI notice) render those as a quiet
+"interrupted" instead of an error, keying on the flag — the old
+reason-string matching survives only for pre-upgrade events.
+
+- **claude** — the CLI's `is_error` result carries a free-text (often
+  absent) `result` string that NEVER reliably says "interrupt", so the
+  driver records the one deterministic fact it has: it sent the
+  `interrupt` control request. The flag arms on `AgentCommand::Interrupt`
+  and is consumed at EVERY result (and cleared on opening a fresh turn),
+  so a raced/stale interrupt cannot mislabel the next turn's genuine
+  failure. When armed and the result string is absent, the reason falls
+  back to "interrupted" (not "turn failed"). The deny-with-`interrupt:true`
+  permission path deliberately does NOT set the flag — whether a directive
+  deny should read as a quiet stop is a rail-semantics call for the
+  maintainer.
+- **codex** — `turn/completed` with `status:"interrupted"` (which only
+  follows a `turn/interrupt` RPC) maps to `interrupted: true`, reason
+  stays codex's own word "interrupted"; `turn/failed` stays
+  `interrupted: false`.

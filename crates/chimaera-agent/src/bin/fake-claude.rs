@@ -3,6 +3,9 @@
 //! billing). It speaks just enough of the live-verified protocol: the
 //! initialize handshake, one canned turn with streaming deltas + a Bash
 //! tool_use, a can_use_tool permission round-trip, and result frames.
+//! Mid-turn user frames queue natively (one success result each, after the
+//! running turn's) and an interrupt ends the turn with an is_error result
+//! that drops the queue — mirroring the real CLI's queueing semantics.
 //!
 //! Modes (argv[1]): `normal` (default), `silent` (never answers — handshake
 //! watchdog tests), `die` (exit 3 immediately — spawn-crash tests).
@@ -32,6 +35,12 @@ fn main() {
         _ => {}
     }
 
+    // The real CLI's queueing state: mid-turn user frames wait their turn
+    // (one result each after the running turn's), and an aborted turn drops
+    // the queue with it.
+    let mut turn_active = false;
+    let mut queued = 0u32;
+
     let stdin = std::io::stdin().lock();
     for line in stdin.lines() {
         let Ok(line) = line else { break };
@@ -51,7 +60,12 @@ fn main() {
                 },
             }));
         } else if frame["type"] == "user" {
-            run_canned_turn();
+            if turn_active {
+                queued += 1;
+            } else {
+                turn_active = true;
+                run_canned_turn();
+            }
         } else if frame["type"] == "control_response" {
             // Only the scripted permission round-trip (req-1) drives the turn;
             // ignore any other control_response so a future non-permission
@@ -59,9 +73,44 @@ fn main() {
             if frame["response"]["request_id"] == "req-1" {
                 let allowed = frame["response"]["response"]["behavior"] == "allow";
                 finish_turn(allowed);
+                turn_active = false;
+                if allowed {
+                    // Each queued message runs as its own (trivial) turn.
+                    while queued > 0 {
+                        queued -= 1;
+                        emit_success_result();
+                    }
+                } else {
+                    // The deny's interrupt:true aborted the turn — the CLI's
+                    // native queue dies with it.
+                    queued = 0;
+                }
+            }
+        } else if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
+            emit(json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": frame["request_id"],
+                    "response": {},
+                },
+            }));
+            if turn_active {
+                // The real CLI ends the interrupted turn with an is_error
+                // result whose `result` string is free text — omitted here so
+                // tests exercise the driver's structural classification, not
+                // a string heuristic. The queue drops with the turn.
+                turn_active = false;
+                queued = 0;
+                emit(json!({
+                    "type": "result", "subtype": "error_during_execution",
+                    "is_error": true, "session_id": "fake-native-1",
+                    "duration_ms": 7,
+                    "usage": { "input_tokens": 10, "output_tokens": 2 },
+                }));
             }
         } else if frame["type"] == "control_request" {
-            // interrupt / set_permission_mode / set_model: acknowledge.
+            // set_permission_mode / set_model / …: acknowledge.
             emit(json!({
                 "type": "control_response",
                 "response": {
@@ -72,6 +121,18 @@ fn main() {
             }));
         }
     }
+}
+
+/// The success result a dequeued (previously mid-turn) message's turn ends
+/// with — the driver opens that turn boundary itself when the previous
+/// result lands, so the fake only needs to close it.
+fn emit_success_result() {
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "done", "session_id": "fake-native-1",
+        "total_cost_usd": 0.005, "duration_ms": 21,
+        "usage": { "input_tokens": 4, "output_tokens": 2 },
+    }));
 }
 
 fn run_canned_turn() {

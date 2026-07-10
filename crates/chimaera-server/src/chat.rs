@@ -182,10 +182,15 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),
         // A deliberate user interrupt (Stop/Esc) is not a failure: the rail
         // should read idle, matching the chat surface's quiet "interrupted"
-        // notice. Only a genuine turn failure errors the row.
-        AgentEvent::TurnAborted { reason, .. } if reason == "interrupted" => {
-            Some(AgentState::Finished)
-        }
+        // notice. The wire's `interrupted` flag is the drivers' structural
+        // signal (claude's result string is free text and never carried it);
+        // the reason match is kept for events from pre-flag drivers. Only a
+        // genuine turn failure errors the row.
+        AgentEvent::TurnAborted {
+            interrupted,
+            reason,
+            ..
+        } if *interrupted || reason == "interrupted" => Some(AgentState::Finished),
         AgentEvent::TurnAborted { .. } => Some(AgentState::Errored),
         // Telemetry says the account limit is actually blocking requests —
         // the same rail state the TUI hooks derive from StopFailure.
@@ -1152,6 +1157,8 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "first".into(),
                     attachments: 0,
+                    id: None,
+                    queued: false,
                 },
             ),
             seq_line(
@@ -1173,6 +1180,8 @@ mod tests {
                 AgentEvent::UserMessage {
                     text: "second".into(),
                     attachments: 0,
+                    id: None,
+                    queued: false,
                 },
             ),
             seq_line(

@@ -69,6 +69,16 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         attachments: u32,
+        /// Client-minted delivery key (claude checkpoint uuid / codex
+        /// clientUserMessageId) — what a later `UserMessageUpdate` resolves.
+        /// Absent on pre-upgrade journals and transcript-seeded messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// The agent has NOT consumed this message yet (claude queues
+        /// mid-turn stdin frames; codex steers/buffers into a running turn).
+        /// Resolved by a `UserMessageUpdate`; default false = delivered.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queued: bool,
     },
     ToolCall {
         id: String,
@@ -136,6 +146,13 @@ pub enum AgentEvent {
     TurnAborted {
         turn_id: String,
         reason: String,
+        /// The abort was a deliberate user stop (the interrupt command), a
+        /// fact the driver knows structurally — consumers render it quiet
+        /// (idle rail, muted notice), never as a failure. Optional-with-
+        /// default so pre-upgrade journals deserialize (false) and failure
+        /// aborts serialize byte-identically to before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interrupted: bool,
     },
     /// Context-window occupancy after a turn (claude: get_context_usage;
     /// codex: tokenUsage vs modelContextWindow).
@@ -233,6 +250,29 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<i32>,
     },
+    /// Delivery resolution for a `queued` UserMessage, matched by `id`:
+    /// claude dequeues one message per finished turn (and an aborted turn
+    /// drops the whole native queue); codex resolves on the steer RPC
+    /// answer. Replay is self-correcting — the journal carries the queued
+    /// echo and this update through the same reducer, so a queued-then-sent
+    /// message renders exactly once and a queued-never-sent one replays in
+    /// its final dropped state.
+    UserMessageUpdate {
+        id: String,
+        state: UserMessageState,
+    },
+}
+
+/// Final delivery state of a queued user message.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageState {
+    /// The agent consumed it (claude ran it as the next turn; codex steered
+    /// it into the running turn).
+    Sent,
+    /// The agent never saw it (claude's queue dies with an aborted turn;
+    /// a codex steer failed for good).
+    Dropped,
 }
 
 /// Commands a client sends into a chat session (WS frames deserialize

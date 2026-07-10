@@ -219,7 +219,14 @@ impl Translator {
             .as_array()
             .map(|blocks| blocks.iter().filter(|b| b["type"] == "image").count() as u32)
             .unwrap_or(0);
-        out.push(AgentEvent::UserMessage { text, attachments });
+        // Seeded history is already-delivered by definition: no delivery id,
+        // never queued.
+        out.push(AgentEvent::UserMessage {
+            text,
+            attachments,
+            id: None,
+            queued: false,
+        });
     }
 
     fn on_assistant(&mut self, message: &Value, out: &mut Vec<AgentEvent>) {
@@ -428,7 +435,9 @@ mod tests {
             events[0],
             AgentEvent::UserMessage {
                 text: "fix the bug".into(),
-                attachments: 0
+                attachments: 0,
+                id: None,
+                queued: false,
             }
         );
         assert!(matches!(&events[1], AgentEvent::TurnStarted { turn_id } if turn_id == "t1"));
