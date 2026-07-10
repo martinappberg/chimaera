@@ -103,6 +103,11 @@ pub enum AgentEvent {
         options: Vec<PermissionOption>,
         /// Raw tool input for the expandable detail view.
         input_preview: Value,
+        /// Plan markdown when this request is a plan approval (claude
+        /// ExitPlanMode) — present ⇒ the client renders a plan-approval card
+        /// instead of the generic permission card. Capped at construction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
     },
     PermissionResolved {
         request_id: String,
@@ -251,6 +256,13 @@ pub enum AgentCommand {
         /// None = the agent's suggested default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
+        /// Free text riding the decision. On a deny: the user's reason
+        /// (claude: appended to the deny message with interrupt:false;
+        /// codex: steered into the running turn after the decline). On a
+        /// plan approval: comments (claude: updatedInput.userFeedback/
+        /// userComments). Empty/None = the bare decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
     },
     Interrupt,
     SetMode {
@@ -710,6 +722,8 @@ mod tests {
 
     #[test]
     fn command_deserializes_from_ws_frame_shape() {
+        // The optional fields are strictly additive: an old client's bare
+        // frame must keep deserializing (the wire is a public contract).
         let cmd: AgentCommand = serde_json::from_str(
             r#"{"type":"permission","request_id":"r1","option_id":"allow_once"}"#,
         )
@@ -720,6 +734,21 @@ mod tests {
                 request_id: "r1".into(),
                 option_id: "allow_once".into(),
                 destination: None,
+                feedback: None,
+            }
+        );
+
+        let cmd: AgentCommand = serde_json::from_str(
+            r#"{"type":"permission","request_id":"r1","option_id":"reject_once","feedback":"use rg"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            AgentCommand::Permission {
+                request_id: "r1".into(),
+                option_id: "reject_once".into(),
+                destination: None,
+                feedback: Some("use rg".into()),
             }
         );
     }

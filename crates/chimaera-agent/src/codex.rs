@@ -1416,6 +1416,7 @@ impl CodexMapper {
             title,
             options,
             input_preview,
+            plan: None,
         });
     }
 
@@ -1481,6 +1482,24 @@ impl CodexMapper {
         }
     }
 
+    /// Route an input into the conversation whatever the turn state: steer
+    /// the running turn, buffer through an unidentified start window, or open
+    /// a fresh turn. Shared by Send and the decline-feedback delivery.
+    fn dispatch_input(&mut self, input: Value, step: &mut DriverStep) {
+        let client_msg_id = crate::model::fresh_uuid();
+        if self.turn_active && !self.turn_id.is_empty() {
+            // Type-through: inject into the RUNNING turn (steer).
+            self.emit_steer(input, client_msg_id, step);
+        } else if self.turn_pending {
+            // A turn/start is in flight but unidentified: buffer to steer
+            // once turn/started lands, so we don't race a second turn/start
+            // (rejected) and lose the echoed message.
+            self.buffered_sends.push((input, client_msg_id));
+        } else {
+            self.emit_turn_start(input, client_msg_id, step);
+        }
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
@@ -1506,23 +1525,12 @@ impl CodexMapper {
                     text: text.clone(),
                     attachments,
                 });
-                let input = json!(input);
-                let client_msg_id = crate::model::fresh_uuid();
-                if self.turn_active && !self.turn_id.is_empty() {
-                    // Type-through: inject into the RUNNING turn (steer).
-                    self.emit_steer(input, client_msg_id, &mut step);
-                } else if self.turn_pending {
-                    // A turn/start is in flight but unidentified: buffer to
-                    // steer once turn/started lands, so we don't race a second
-                    // turn/start (rejected) and lose the echoed message.
-                    self.buffered_sends.push((input, client_msg_id));
-                } else {
-                    self.emit_turn_start(input, client_msg_id, &mut step);
-                }
+                self.dispatch_input(json!(input), &mut step);
             }
             AgentCommand::Permission {
                 request_id,
                 option_id,
+                feedback,
                 ..
             } => {
                 let Some((rpc_id, decisions)) = self.pending_approvals.remove(&request_id) else {
@@ -1534,12 +1542,29 @@ impl CodexMapper {
                     .get(&option_id)
                     .cloned()
                     .unwrap_or_else(|| json!({ "decision": "decline" }));
+                let declined = result["decision"] == json!("decline");
                 step.outbound
                     .push(json!({ "id": rpc_id, "result": result }));
                 step.events.push(AgentEvent::PermissionResolved {
                     request_id,
                     option_id,
                 });
+                // Deny feedback: the app-server decline carries no message
+                // field, so the reason follows the decline as user input into
+                // the (still running) turn — the protocol's equivalent of
+                // claude's feedback-denial.
+                if declined {
+                    if let Some(fb) = feedback
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                    {
+                        step.events.push(AgentEvent::UserMessage {
+                            text: fb.clone(),
+                            attachments: 0,
+                        });
+                        self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
+                    }
+                }
             }
             AgentCommand::Interrupt => {
                 let id = self.rpc_id();
@@ -1999,6 +2024,7 @@ mod tests {
             request_id,
             option_id: amendment_opt,
             destination: None,
+            feedback: None,
         });
         assert_eq!(step.outbound[0]["id"], 77);
         assert_eq!(
@@ -2035,10 +2061,65 @@ mod tests {
             request_id: "codex-78".into(),
             option_id: "allowHostAlways".into(),
             destination: None,
+            feedback: None,
         });
         let amendment = &step.outbound[0]["result"]["decision"]["applyNetworkPolicyAmendment"]
             ["network_policy_amendment"];
         assert_eq!(amendment["action"], "allow");
+    }
+
+    #[test]
+    fn decline_with_feedback_steers_the_reason_into_the_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&json!({
+            "id": 80,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "itemId": "item-3",
+                "command": "rm -rf build",
+                "commandActions": [{ "type": "run", "command": "rm -rf build" }],
+            },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-80".into(),
+            option_id: "decline".into(),
+            destination: None,
+            feedback: Some("  use `just clean` instead  ".into()),
+        });
+        // The decline answers the rpc first; the reason then steers into the
+        // still-running turn as user input.
+        assert_eq!(step.outbound[0]["id"], 80);
+        assert_eq!(step.outbound[0]["result"]["decision"], "decline");
+        assert_eq!(step.outbound[1]["method"], "turn/steer");
+        assert_eq!(
+            step.outbound[1]["params"]["input"][0]["text"],
+            "use `just clean` instead"
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { option_id, .. } if option_id == "decline"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::UserMessage { text, .. } if text == "use `just clean` instead"
+        ));
+
+        // Feedback on an ACCEPT is never delivered (nothing to steer).
+        m.on_frame(&json!({
+            "id": 81,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "itemId": "item-4", "command": "ls",
+                        "commandActions": [{ "type": "run", "command": "ls" }] },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-81".into(),
+            option_id: "accept".into(),
+            destination: None,
+            feedback: Some("stray text".into()),
+        });
+        assert_eq!(step.outbound.len(), 1, "accept sends only the decision");
+        assert_eq!(step.events.len(), 1, "no user echo on accept");
     }
 
     #[test]

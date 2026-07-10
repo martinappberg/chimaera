@@ -57,8 +57,16 @@ fn main() {
             // ignore any other control_response so a future non-permission
             // answer (get_settings, title, …) can't corrupt this state machine.
             if frame["response"]["request_id"] == "req-1" {
-                let allowed = frame["response"]["response"]["behavior"] == "allow";
-                finish_turn(allowed);
+                let response = &frame["response"]["response"];
+                if response["behavior"] == "allow" {
+                    finish_turn(true);
+                } else if response["interrupt"] == json!(false) {
+                    // Feedback-denial (live-verified): the tool errors but the
+                    // turn keeps running and ends with a SUCCESS result.
+                    finish_feedback_denial();
+                } else {
+                    finish_turn(false);
+                }
             }
         } else if frame["type"] == "control_request" {
             // interrupt / set_permission_mode / set_model: acknowledge.
@@ -114,6 +122,30 @@ fn run_canned_turn() {
                   "behavior": "allow", "destination": "localSettings" },
             ],
         },
+    }));
+}
+
+/// An interrupt:false denial errors the tool, then the model reacts to the
+/// feedback and the turn completes normally (NOT the TurnAborted path).
+fn finish_feedback_denial() {
+    emit(json!({
+        "type": "user",
+        "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "tu-1",
+              "content": "User rejected this action", "is_error": true },
+        ]},
+    }));
+    emit(json!({
+        "type": "assistant",
+        "message": { "id": "m2", "content": [
+            { "type": "text", "text": "understood" },
+        ]},
+    }));
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "understood", "session_id": "fake-native-1",
+        "total_cost_usd": 0.01, "duration_ms": 42,
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
     }));
 }
 

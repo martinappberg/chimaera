@@ -155,6 +155,7 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
                 },
                 option_id: "allow_once".into(),
                 destination: None,
+                feedback: None,
             },
         )
         .await
@@ -255,6 +256,7 @@ async fn permission_deny_marks_tool_failed() {
                 },
                 option_id: "reject_once".into(),
                 destination: None,
+                feedback: None,
             },
         )
         .await
@@ -277,6 +279,78 @@ async fn permission_deny_marks_tool_failed() {
         matches!(ev, AgentEvent::TurnAborted { .. })
     })
     .await;
+}
+
+#[tokio::test]
+async fn permission_deny_with_feedback_continues_turn() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-2f", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-2f", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    fx.manager
+        .command(
+            "s-2f",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "go".into() }],
+            },
+        )
+        .await
+        .expect("send");
+    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    fx.manager
+        .command(
+            "s-2f",
+            AgentCommand::Permission {
+                request_id: match &permission.ev {
+                    AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+                    _ => unreachable!(),
+                },
+                option_id: "reject_once".into(),
+                destination: None,
+                feedback: Some("try a dry run first".into()),
+            },
+        )
+        .await
+        .expect("deny with feedback");
+
+    // The reason the model received is journaled as a user message…
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessage feedback",
+        |ev| matches!(ev, AgentEvent::UserMessage { text, .. } if text == "try a dry run first"),
+    )
+    .await;
+    wait_for(&mut rx, &mut seen, "ToolCallUpdate failed", |ev| {
+        matches!(
+            ev,
+            AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Failed,
+                ..
+            }
+        )
+    })
+    .await;
+    // …and interrupt:false keeps the turn alive to a normal completion
+    // (the bare deny's TurnAborted path must NOT fire).
+    let completed = wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e.ev, AgentEvent::TurnAborted { .. })),
+        "feedback denial must not abort: {seen:#?}"
+    );
+    assert!(completed.seq > permission.seq);
 }
 
 #[tokio::test]

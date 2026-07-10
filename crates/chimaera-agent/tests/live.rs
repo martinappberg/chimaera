@@ -187,6 +187,7 @@ async fn claude_permission_roundtrip_allow_then_deny() {
                 &frame["request_id"],
                 PermissionDecision::Deny {
                     message: "User rejected this action".into(),
+                    interrupt: true,
                 },
             )
             .await
@@ -210,6 +211,154 @@ async fn claude_permission_roundtrip_allow_then_deny() {
     assert!(
         !deny_dir.path().join("probe.txt").exists(),
         "denied tool must not run"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Feedback-denial semantics: `{behavior:"deny", message, interrupt:false}`
+/// must error the tool WITHOUT aborting the turn — the model reads the
+/// reason from the tool error and the turn runs on to a SUCCESS result.
+/// (The bare deny's `interrupt:true` aborts with an is_error result — the
+/// TurnAborted path; that contrast is what this pins.)
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn"]
+async fn claude_feedback_denial_keeps_turn_alive() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Create a file named probe.txt containing exactly hello, using the Bash tool.",
+    )
+    .await
+    .expect("send");
+
+    let mut denied_tool_result = false;
+    let result = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            // Deny every attempt with a reason, interrupt:false (the
+            // driver's feedback-denial shape).
+            chat.respond_permission(
+                &frame["request_id"],
+                PermissionDecision::Deny {
+                    message:
+                        "The user doesn't want to proceed with this tool use. \
+                        The user's feedback: do NOT create any file; reply with exactly: understood"
+                            .into(),
+                    interrupt: false,
+                },
+            )
+            .await
+            .expect("respond deny with feedback");
+        } else if frame["type"] == "user" {
+            if let Some(blocks) = frame["message"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"] == "tool_result" && block["is_error"] == json!(true) {
+                        denied_tool_result = true;
+                    }
+                }
+            }
+        } else if frame["type"] == "result" {
+            break frame;
+        }
+    };
+    assert!(
+        denied_tool_result,
+        "denial surfaced as an error tool_result"
+    );
+    assert_eq!(
+        result["is_error"],
+        json!(false),
+        "interrupt:false denial must NOT abort the turn: {result}"
+    );
+    assert_eq!(result["subtype"], "success");
+    assert!(
+        !dir.path().join("probe.txt").exists(),
+        "denied tool must not run"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Plan approval: in plan mode the CLI proposes its plan via an ExitPlanMode
+/// `can_use_tool` whose input carries the plan markdown; an allow whose
+/// updatedInput adds userFeedback/userComments (the extension's comment
+/// fields) is accepted and the turn completes.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one planning turn"]
+async fn claude_exit_plan_mode_approval_roundtrip() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+
+    let ctl = chat
+        .send_control(json!({ "subtype": "set_permission_mode", "mode": "plan" }))
+        .await
+        .expect("set plan mode");
+    await_control_response(&mut chat, &ctl).await;
+
+    chat.send_user_text(
+        "Plan how you would create a file named plan-probe.txt containing hello. \
+         Keep the plan to two short steps, then present it.",
+    )
+    .await
+    .expect("send");
+
+    let mut plan_seen = false;
+    let result = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            let request = &frame["request"];
+            if request["tool_name"] == "ExitPlanMode" {
+                plan_seen = true;
+                let plan = request["input"]["plan"]
+                    .as_str()
+                    .expect("ExitPlanMode input carries the plan markdown");
+                assert!(!plan.is_empty());
+                // Approve with comments riding updatedInput (the driver's
+                // plan-approval shape).
+                let mut updated = request["input"].clone();
+                updated["userFeedback"] = json!("looks good");
+                updated["userComments"] = json!("looks good");
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: updated,
+                    },
+                )
+                .await
+                .expect("approve plan");
+            } else {
+                // Anything else in plan mode (read-only probes): allow as-is.
+                let input = request["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("allow");
+            }
+        } else if frame["type"] == "result" {
+            break frame;
+        }
+    };
+    assert!(plan_seen, "an ExitPlanMode can_use_tool was routed to us");
+    assert_eq!(
+        result["subtype"], "success",
+        "plan approval with comment fields completes the turn: {result}"
     );
     chat.shutdown(Duration::from_secs(5))
         .await
