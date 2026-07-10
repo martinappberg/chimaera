@@ -14,6 +14,7 @@
   import TableView from "./TableView.svelte";
   import BinaryView from "./BinaryView.svelte";
   import PdfView from "./PdfView.svelte";
+  import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
@@ -103,11 +104,15 @@
       {:else if probe.state === "text"}
         {#if CodeView !== null}
           <CodeView {path} first={probe.chunk} />
+        {:else}
+          <Spinner />
         {/if}
       {:else if probe.state === "binary"}
         <BinaryView {path} knownSize={probe.size} />
       {:else if probe.state === "error"}
         <div class="file-error">{probe.message}</div>
+      {:else if probe.state === "loading"}
+        <Spinner />
       {/if}
     </div>
   </div>

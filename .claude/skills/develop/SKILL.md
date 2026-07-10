@@ -126,48 +126,50 @@ cargo run -p chimaera -- connect <host>   # install-if-missing, start-or-attach,
 
 `connect` shells out to system `ssh`, inheriting `~/.ssh/config`.
 
-## Remote isolated dev daemon (`connect --dev`)
+## Remote isolated dev daemon (dev is dev — no toggle)
 
-A plain `connect` targets the host's shared `~/.chimaera`: it installs a
-RELEASE binary, and an idle real daemon of a different build gets REPLACED. To
-test YOUR build against a real host without touching any of that, connect in
-dev mode:
+Dev-ness is the BUILD's property: a dev build (never release-stamped —
+`chimaera_core::is_dev_build()`, the `0.0.1` sentinel) targets
+`~/.chimaera-dev` on BOTH ends, always. Locally, a dev build with no
+`CHIMAERA_HOME` defaults its own state to `~/.chimaera-dev` (the isolated-rig
+script still overrides with its per-worktree home); remotely, every `connect`
+from a dev build runs against the host's `~/.chimaera-dev`. A release always
+targets `~/.chimaera`. There is no flag, no per-host toggle — neither world
+can reach the other's daemon:
 
 ```sh
-just dist                                        # musl-build THIS worktree into ~/.chimaera/dist
-cargo run -p chimaera -- connect <host> --dev    # deploy + start under ~/.chimaera-dev
-cargo run -p chimaera -- status <host> --dev     # its manifest, port, pid, build
+just dist                                  # musl-build THIS worktree into ~/.chimaera/dist
+cargo run -p chimaera -- connect <host>    # dev build ⇒ deploy + start under ~/.chimaera-dev
+cargo run -p chimaera -- status <host>     # dev build ⇒ the dev daemon's manifest/port/pid/build
 ```
 
-Dev mode scopes EVERY remote side effect to `~/.chimaera-dev` on the host: the
+The whole remote side effect is scoped to `~/.chimaera-dev` on the host: the
 binary (`~/.chimaera-dev/bin/chimaera`), the daemon (started under
 `CHIMAERA_HOME=~/.chimaera-dev`, so its manifest and state live in
 `~/.chimaera-dev/data/`), and the probe/reuse/replace decision. The real daemon
-is never probed, stopped, or replaced — the two run side by side. Dev mode
+is never probed, stopped, or replaced — the two run side by side. A dev connect
 never downloads a release: no local build (`just dist` stash or `--binary`) is
-a hard error, so a release binary can't silently impersonate your build.
+a hard error, so a release binary can't silently impersonate your build. The
+same principle runs the other way: a dev app never OFFERS a release update
+(`check_app_update` reports none) — an "update" would swap the build under
+test.
 
-In the native app, add the host with the amber **dev** toggle in the add-host
-form; the row wears a `dev` pill. The flag persists on the saved host so
-reconnects and window restore stay in dev; to leave dev mode, forget the host
-and re-add it. The isolated app (`just app-dev-isolated`) + a dev host is the
-full end-to-end rig — your app build tunneling to your daemon build on a real
-cluster — which is how you exercise remote-only paths like OSC 52 clipboard
-from a remote TUI or the reauth overlay on a tunnel drop.
+In the native app every host row wears the amber `dev` pill (the build is dev,
+so every connection is). The isolated app (`just app-dev-isolated`) + any host
+is the full end-to-end rig — your app build tunneling to your daemon build on
+a real cluster — which is how you exercise remote-only paths like OSC 52
+clipboard from a remote TUI or the reauth overlay on a tunnel drop.
 
 Gotchas:
 
-- **Dev builds only.** `connect --dev` (and the app's dev toggle) exist only
-  on a never-release-stamped build (`chimaera_core::is_dev_build()`, the
-  `0.0.1` version sentinel) — a stamped release refuses, so this tooling can't
-  leak into production. `cargo run` / the isolated app qualify.
 - **Same-commit rebuilds look identical**: build ids compare the git hash, so
   a rebuilt (even dirty) tree won't auto-replace a running dev daemon. Force it
   with `--update-daemon` / the row's "update" action.
-- **A dev BUILD doing a NORMAL connect still targets the real `~/.chimaera`**
-  and would replace an idle real daemon with your dev build. If you must
-  attach a dev build to the real daemon, keep a session live on it so connect
-  attaches "outdated" instead of replacing.
+- **A dev build cannot attach to the real `~/.chimaera` daemon at all** (and a
+  release can't attach to a dev one). To exercise the real daemon, use a
+  release build.
+- **Old hosts.json entries with a `"dev"` key** (from the toggle era) still
+  parse; the key is ignored.
 
 ## Which build is actually running? (debug workflow)
 
@@ -177,7 +179,7 @@ Gotchas:
   `curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:$PORT/api/v1/health`.
   Its `build` must match your HEAD (`git rev-parse --short HEAD`, `-dirty` if
   the tree is). Run the same check against the app's TUNNEL port to verify a
-  remote dev daemon end to end; `chimaera status <host> --dev` asks the host
+  remote dev daemon end to end; `chimaera status <host>` (from the dev build) asks the host
   directly.
 - **Logs.** The app logs to the terminal that launched it; its local daemon to
   `$CHIMAERA_HOME/data/logs/serve.log`; a remote dev daemon to

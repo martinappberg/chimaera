@@ -45,6 +45,12 @@ pub(crate) struct CreateSession {
     /// GET /api/v1/agents/claude/sessions.
     #[serde(default)]
     resume: Option<String>,
+    /// A display title to seed a resumed conversation with — the recents row's
+    /// title, carried across the fresh session id an "open recent" mints. Seeds
+    /// the soft `ai_title` (a later `generate_session_title` can still refine
+    /// it), unlike `name`, which pins `custom_title`. Bounded server-side.
+    #[serde(default)]
+    title_hint: Option<String>,
     /// Initial PTY size, clamped to sane bounds. The UI passes the focused
     /// pane's fitted size so TUIs never boot at a wrong size (claude's boot
     /// banner rendered at 80x24 then reflowed was a real observed artifact).
@@ -167,7 +173,12 @@ pub(crate) async fn create_session(
         cols: body.cols,
         rows: body.rows,
         theme: theme.to_string(),
-        title_hint: None,
+        title_hint: body
+            .title_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(crate::agents::truncate_prompt),
         kind,
     };
     match crate::spawn::spawn_session(&state, spec).await {
@@ -280,6 +291,20 @@ async fn spawn_chat_ui(
     {
         record.custom_title = Some(name.to_string());
     }
+    // A resumed recent carries its rail title so the restored conversation is
+    // not a bare "claude" until a new turn regenerates one. Seed the soft
+    // ai_title (a later `generate_session_title` still refines it) unless the
+    // caller also pinned a name above, which outranks it.
+    if record.custom_title.is_none() {
+        if let Some(hint) = body
+            .title_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            record.ai_title = Some(crate::agents::truncate_prompt(hint));
+        }
+    }
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     let recipe = crate::chat::ChatRecipe {
@@ -293,6 +318,55 @@ async fn spawn_chat_ui(
         fork_at: None,
         theme: theme.to_string(),
     };
+
+    // A resumed recent replays no history over the wire — seed the new journal
+    // now (copy a prior chimaera journal, or reconstruct claude's own transcript)
+    // so the chat can replay it. If a CLAUDE recent has nothing we can put in the
+    // chat surface (transcript gone / unreadable / too old), open it in the
+    // TERMINAL instead of a blank chat — claude's own TUI renders the resumed
+    // conversation natively. codex resumes in-protocol, so it always chats.
+    let seeded =
+        tokio::task::block_in_place(|| crate::chat::seed_resumed_journal(state, &id, &recipe));
+    if agent_kind == crate::agents::AgentKind::Claude && recipe.resume.is_some() && !seeded {
+        tracing::info!(%id, "resumed claude recent has no chat history to render; opening in the terminal");
+        crate::lock(&state.agents).remove(&id);
+        crate::lock(&state.session_workspaces).remove(&id);
+        // Discard the chat-only scaffolding (the temp settings/mcp for the id we drop).
+        for path in [recipe.settings.as_deref(), recipe.mcp_config.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        let spec = crate::spawn::SpawnSpec {
+            workspace,
+            id: None,
+            name: body.name,
+            cwd: None,
+            cols: body.cols,
+            rows: body.rows,
+            theme: theme.to_string(),
+            title_hint: body
+                .title_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(crate::agents::truncate_prompt),
+            kind: crate::spawn::SpawnKind::Agent {
+                kind: agent_kind,
+                model: body.model,
+                resume: body.resume,
+            },
+        };
+        return match crate::spawn::spawn_session(state, spec).await {
+            Ok(session) => Json(session).into_response(),
+            Err(crate::spawn::SpawnFailure::AgentUnavailable(msg)) => {
+                (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+            }
+            Err(crate::spawn::SpawnFailure::Internal(err)) => internal(err),
+        };
+    }
+
     match crate::chat::spawn_chat_session(state, id.clone(), recipe, None) {
         Ok(info) => {
             crate::agents::spawn_agent_watch(state.clone(), id.clone());

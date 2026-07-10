@@ -19,7 +19,7 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **What & when.** Connect to (and stand up a daemon on) a remote host, then open a tunnelled
   window onto it.
 - **How it's used (CLI).** `chimaera connect <host> [--local-port N] [--binary PATH] [--no-open]
-  [--update-daemon] [--dev]`. Progress phases (probing / updating / downloading / installing /
+  [--update-daemon]`. Progress phases (probing / updating / downloading / installing /
   starting / tunneling) stream to the UI. In the native app, "add a host…" on the home screen does
   the same and lists that host's workspaces inline.
 - **Where it lives.** `chimaera-remote/src/lib.rs` (`connect`, `resolve_daemon`, `Tunnel`,
@@ -56,33 +56,36 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   downcast-distinguished so the app retries *only* tunnel-phase failures on a fresh port (re-running
   connect on an auth failure would re-prompt 2FA). Fetched daemons are cached per triple-and-version.
 
-## Dev connect (`--dev`) — the isolated dev daemon on a host
+## Dev builds — the isolated dev daemon on a host
 
 - **What & when.** Test THIS checkout's daemon against a real host without touching the daemon
-  real users (or your other self) depend on: `connect --dev` runs everything against a parallel
-  `~/.chimaera-dev` on the host, next to — never instead of — the real `~/.chimaera` daemon.
-- **How it's used.** CLI: `chimaera connect <host> --dev` (+ `status <host> --dev`). App: the
-  amber **dev** toggle in the add-host form; the row wears a `dev` pill. Pair with the isolated
-  local app (`just app-dev-isolated`) for the full dev-app ↔ dev-daemon rig — see the
-  [develop skill](../../.claude/skills/develop/SKILL.md).
-- **Where it lives.** `chimaera-remote/src/lib.rs` (`RemoteHome` — every remote path/command
-  derives from it; `ConnectOpts.dev`), `hosts.rs` (`HostEntry.dev`, persisted),
-  `chimaera-core::is_dev_build` (the gate).
+  real users (or your other self) depend on. **Dev is dev, no toggle**: a dev build (the
+  never-release-stamped `0.0.1` sentinel, `chimaera_core::is_dev_build`) *always* runs against a
+  parallel `~/.chimaera-dev` — on the host (`RemoteHome::current()`) AND locally (a dev build
+  with no `CHIMAERA_HOME` defaults its own state to `~/.chimaera-dev`). A release always targets
+  `~/.chimaera`. Neither can reach the other's home.
+- **How it's used.** Nothing to opt into: run a dev build (`just app-dev-isolated`, or the bare
+  CLI) and `connect <host>` / `status <host>` operate on the dev homes; every host row in a dev
+  app wears the amber `dev` pill. See the [develop skill](../../.claude/skills/develop/SKILL.md).
+- **Where it lives.** `chimaera-remote/src/lib.rs` (`RemoteHome::current` — every remote
+  path/command derives from it), `chimaera-core::is_dev_build` + `state_home` (the local
+  default).
 - **Key behaviors.**
   - **Total scoping.** The probed manifest (`~/.chimaera-dev/data/manifest.json` —
     `CHIMAERA_HOME` relocates the data dir), the installed binary (`~/.chimaera-dev/bin/`), the
     started daemon (`CHIMAERA_HOME=$HOME/.chimaera-dev` env prefix — `chimaera serve` stays a
-    literal string), and the reuse/update decision all key off `RemoteHome::Dev`. The real daemon
-    is never probed, stopped, or replaced.
-  - **Never a release binary.** Dev mode deploys your build only: explicit `--binary`, else the
-    `just dist` stash (also found at the real `~/.chimaera/dist` when the client runs isolated),
-    else a hard error. Fresh starts always redeploy so a stale dev binary can't impersonate the
-    build under test.
-  - **Dev builds only.** Gated on `is_dev_build()` (the never-release-stamped `0.0.1` sentinel)
-    at the library choke point, in `add_host`, and in the UI (toggle hidden) — a production app
-    cannot create or connect dev hosts, even from a leaked `"dev": true` hosts entry.
-  - **Dev-ness persists on the host entry** (one-way; leave by forget + re-add), so the app's
-    auto-reconnect and window restore can never silently heal a dev tunnel into the real daemon.
+    literal string), and the reuse/update decision all key off `RemoteHome`. The real daemon is
+    never probed, stopped, or replaced.
+  - **Never a release binary.** A dev connect deploys your build only: explicit `--binary`, else
+    the `just dist` stash (also found at the real `~/.chimaera/dist` when the client runs
+    isolated), else a hard error. Fresh starts always redeploy so a stale dev binary can't
+    impersonate the build under test. Symmetrically, a dev app never offers release updates
+    (`check_app_update` returns none) — an "update" would swap the build under test.
+  - **No per-host or per-connect selector exists.** Dev-ness is the build's property, so
+    auto-reconnect, window restore, and row clicks land on the same daemon by construction — a
+    dev tunnel can never silently heal into the real daemon (this used to be a persisted
+    `HostEntry.dev` flag + add-form toggle; leftover `"dev"` keys in hosts.json parse and are
+    ignored).
 
 ## Remote host management (native app)
 
@@ -126,15 +129,17 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   deliberate and should hold, but like all additions can improve.
 - **Do not change:** SIGTERM-only remote stop; resolve-the-binary-before-stopping-any-daemon.
 
-### Dev connect (`--dev`) — why it exists
+### Dev builds — why it exists
 _Captured 2026-07-09 (from the maintainer, in-session)._
 
 - **Problem it solves:** "This is just for local development, not a new feature" — developer
   tooling so a checkout's build can be tested against a real host without endangering the real
   daemon. Not user-facing capability (and gated out of release builds accordingly).
-- **How settled it is:** **all provisional** — only the *why* is settled. The mechanism
-  (`~/.chimaera-dev` layout, one dev home per host, the one-way persisted flag, the amber
-  styling) is how it works *for now*, free to change.
+- **How settled it is:** the *why* is settled, and so is **no togglability** (maintainer,
+  same-day follow-up: "when you run a dev version it will always be the .chimaera-dev on both
+  ends" — the per-host flag/toggle was removed for exactly this). The mechanism
+  (`~/.chimaera-dev` layout, one dev home per host, the amber styling) is how it works *for
+  now*, free to change.
 - **Deliberate (confirmed):** the **dev-builds-only gate** (`is_dev_build`, the `0.0.1`
   sentinel — production clients must never offer or perform dev connects), and **never deploy a
   release binary as "dev"** (failing loudly without a local build beats silently testing the

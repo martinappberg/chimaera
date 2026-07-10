@@ -130,6 +130,9 @@ export async function uninstallAgent(agentId: string): Promise<boolean> {
 export interface LaunchPick {
   agent: string;
   resume?: string;
+  /** Which surface the user explicitly chose in the launcher — "open" (chat)
+   *  vs the terminal button. Omitted = the agents.defaultView setting. */
+  ui?: "chat" | "term";
 }
 
 // --- the rail Recents section ------------------------------------------------

@@ -22,8 +22,9 @@ pub struct LocalState {
     outdated: bool,
     build: Option<String>,
     live_sessions: Option<usize>,
-    /// This app is a dev build (never release-stamped) — the only kind that
-    /// may offer dev-daemon connections. Gates the add-host dev toggle.
+    /// This app is a dev build (never release-stamped): every connection it
+    /// makes targets the isolated `~/.chimaera-dev` homes (both ends), so
+    /// the UI badges hosts and hides release-update affordances.
     dev_build: bool,
 }
 
@@ -72,24 +73,17 @@ pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>
         .collect())
 }
 
-/// `dev` saves the host as a dev-daemon connection (isolated
-/// `~/.chimaera-dev`, this machine's own build). One-way: re-adding an
-/// existing alias with `dev` upgrades it, and leaving dev mode is forget +
-/// re-add — see `HostEntry::dev`.
+/// Which home a connect targets is the BUILD's property (a dev build always
+/// talks to `~/.chimaera-dev` on both ends — see `RemoteHome::current`), so
+/// there is nothing dev-related to save per host.
 #[tauri::command]
-pub(super) async fn add_host(alias: String, dev: Option<bool>) -> Result<HostState, String> {
+pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
     let alias = alias.trim().to_string();
     if alias.is_empty() || alias.starts_with('-') {
         return Err("that does not look like an ssh alias".to_string());
     }
-    let dev = dev.unwrap_or(false);
-    // The UI hides the toggle on a release build; this backstops anything
-    // that invokes the command directly. `connect` re-checks regardless.
-    if dev && !chimaera_core::is_dev_build() {
-        return Err("dev connections need a dev build of chimaera".to_string());
-    }
     let mut store = HostsStore::load_default();
-    let entry = store.add(&alias, None, dev).map_err(|e| format!("{e:#}"))?;
+    let entry = store.add(&alias, None).map_err(|e| format!("{e:#}"))?;
     Ok(state_for(&entry, "disconnected", None))
 }
 
@@ -290,6 +284,12 @@ pub(super) async fn open_window(
 #[tauri::command]
 pub(super) async fn check_app_update(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_updater::UpdaterExt;
+    // Dev is dev: offering a release to a dev build would swap the build
+    // under test (and the daemon it spawns) for a download — never an
+    // "update". The signed-release channel is for stamped builds only.
+    if chimaera_core::is_dev_build() {
+        return Ok(None);
+    }
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await {
         Ok(Some(update)) => Ok(Some(update.version)),
@@ -366,6 +366,20 @@ pub(super) fn report_window_scope(
 #[tauri::command]
 pub(super) fn shell_build() -> String {
     chimaera_core::BUILD_ID.to_string()
+}
+
+/// Write text to the OS clipboard from the Rust process. The daemon-served UI
+/// calls this for agent-initiated OSC 52 and copy-on-select: WKWebView rejects
+/// `navigator.clipboard.writeText` from a non-gesture callback (a socket
+/// message, a selection change) with NotAllowedError, so on a remote (app-only)
+/// window those writes silently failed — "copy from the TUI doesn't reach the
+/// clipboard". Running the write here has no transient-activation gate. Only
+/// writes are exposed (OSC 52 reads are refused UI-side), so an agent can set
+/// the clipboard but never read it back over the PTY.
+#[tauri::command]
+pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
 }
 
 /// The one-click update chain, step one: record the user's consent (the

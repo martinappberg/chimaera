@@ -1796,7 +1796,11 @@ fn claude_modes() -> Vec<ModeInfo> {
     ]
 }
 
-fn tool_kind(name: &str) -> ToolKind {
+// The tool-block translators below are `pub(crate)` because the offline
+// transcript importer (`transcript.rs`) reuses them verbatim: history imported
+// from claude's own transcript must render identically to a live session and
+// stay correct as this mapping evolves.
+pub(crate) fn tool_kind(name: &str) -> ToolKind {
     match name {
         "Bash" | "BashOutput" | "KillShell" => ToolKind::Execute,
         "Read" => ToolKind::Read,
@@ -1808,7 +1812,7 @@ fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
-fn tool_title(name: &str, input: &Value) -> String {
+pub(crate) fn tool_title(name: &str, input: &Value) -> String {
     let detail = match name {
         "Bash" => input["command"].as_str(),
         "Read" | "Edit" | "Write" | "MultiEdit" => input["file_path"].as_str(),
@@ -1825,7 +1829,7 @@ fn tool_title(name: &str, input: &Value) -> String {
     }
 }
 
-fn tool_locations(input: &Value) -> Vec<String> {
+pub(crate) fn tool_locations(input: &Value) -> Vec<String> {
     ["file_path", "path", "notebook_path"]
         .iter()
         .filter_map(|key| input[key].as_str())
@@ -1835,7 +1839,7 @@ fn tool_locations(input: &Value) -> Vec<String> {
 
 /// Edit-family inputs carry the change itself — surface it as diff content
 /// without waiting for the (uninformative) tool result.
-fn edit_diff_content(name: &str, input: &Value) -> Option<ToolContent> {
+pub(crate) fn edit_diff_content(name: &str, input: &Value) -> Option<ToolContent> {
     let path = input["file_path"].as_str()?.to_string();
     match name {
         "Write" => {
@@ -1905,7 +1909,7 @@ fn cap_diff(text: &str) -> (String, bool) {
     }
 }
 
-fn tool_result_text(block: &Value) -> String {
+pub(crate) fn tool_result_text(block: &Value) -> String {
     match &block["content"] {
         Value::String(s) => s.clone(),
         Value::Array(parts) => parts

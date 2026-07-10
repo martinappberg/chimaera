@@ -66,9 +66,17 @@ pub fn builds_match(local: &str, remote: Option<&str>) -> bool {
 /// instance) never clobber each other's manifest. Only the daemon's own
 /// bookkeeping moves; spawned shells and agents keep the real `$HOME`
 /// (dotfiles, `~/.claude` auth). Empty means unset.
+///
+/// Dev is dev, on both ends: a dev build ([`is_dev_build`]) with no explicit
+/// `CHIMAERA_HOME` defaults to `~/.chimaera-dev` — the same home `connect`
+/// gives a dev daemon on a remote host — so a bare `cargo run -- serve` (or
+/// a dev app launched outside the isolated-rig script) can never adopt,
+/// update, or clobber the real `~/.chimaera` daemon's state. Release builds
+/// are unaffected.
 fn state_home() -> Option<PathBuf> {
     match std::env::var_os("CHIMAERA_HOME") {
         Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ if is_dev_build() => dirs::home_dir().map(|h| h.join(".chimaera-dev")),
         _ => None,
     }
 }

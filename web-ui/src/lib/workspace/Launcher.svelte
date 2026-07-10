@@ -26,6 +26,7 @@
    */
   import { onMount } from "svelte";
   import { getAgentDefault, listAgents, type AgentInfo, type LaunchPick } from "./launcher";
+  import { isMac } from "../shared/keys";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
 
   interface Props {
@@ -37,9 +38,13 @@
     /** Report the freshly-probed catalog up so the split button reflects it
      *  (this popover always re-detects on open). */
     onAgents?: (agents: AgentInfo[]) => void;
+    /** The window's last-known catalog (App keeps it from boot + installs).
+     *  Rows paint from it INSTANTLY — no "checking…" flash on every open —
+     *  and the background re-detect swaps in the truth. */
+    initial?: AgentInfo[] | null;
   }
 
-  let { anchor, onPick, onInstall, onClose, onAgents }: Props = $props();
+  let { anchor, onPick, onInstall, onClose, onAgents, initial = null }: Props = $props();
 
   let agents = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
@@ -68,19 +73,31 @@
 
   onMount(() => {
     const def = getAgentDefault();
+    // The window's last-known catalog paints the rows synchronously; only a
+    // cold window (boot probe never landed) fetches before first paint.
+    if (initial !== null && initial.length > 0) {
+      agents = initial;
+      hl = Math.max(
+        0,
+        initial.findIndex((x) => x.id === def.agent),
+      );
+    }
     const loadTimer = setTimeout(() => (showLoading = true), 150);
-    void listAgents()
+    // The detection cache is daemon-lifetime, so an install/update made
+    // since (field report: codex updated, chip still said "update") would
+    // never surface. Whatever painted first — the prop or the daemon's
+    // cached rows — a background re-detect swaps in the truth.
+    const first = agents !== null ? Promise.resolve(agents) : listAgents();
+    void first
       .then((a) => {
-        agents = a;
-        onAgents?.(a);
-        hl = Math.max(
-          0,
-          a.findIndex((x) => x.id === def.agent),
-        );
-        // The detection cache is daemon-lifetime, so an install/update made
-        // since (field report: codex updated, chip still said "update")
-        // would never surface. Show the cached rows instantly, then
-        // re-detect in the background and swap in the truth.
+        if (agents === null) {
+          agents = a;
+          onAgents?.(a);
+          hl = Math.max(
+            0,
+            a.findIndex((x) => x.id === def.agent),
+          );
+        }
         return listAgents(true).then((fresh) => {
           if (fresh.length > 0) {
             agents = fresh;
@@ -92,7 +109,7 @@
         if (agents === null) {
           loadError = e instanceof Error ? e.message : "failed to load agents";
         }
-        // refresh failures keep the cached rows — never blank a shown list
+        // refresh failures keep the shown rows — never blank a shown list
       })
       .finally(() => clearTimeout(loadTimer));
 
@@ -117,14 +134,18 @@
   const pos = $derived.by(() => {
     const viewW = window.innerWidth || document.documentElement.clientWidth || 1280;
     const viewH = window.innerHeight || document.documentElement.clientHeight || 800;
-    const width = 308;
+    const width = 326;
     const left = Math.max(8, Math.min(anchor.left, viewW - width - 8));
     const top = anchor.bottom + 6;
     const maxH = Math.max(180, viewH - top - 12);
     return { left, top, width, maxH };
   });
 
-  function activate(i: number): void {
+  /** Spawn (or install). The default surface is the structured chat UI —
+   *  the row press, "open", and Enter all mean chat; the terminal button
+   *  (or ⌘↵) is the one explicit TUI path. Agents with no chat view open
+   *  their TUI either way. */
+  function activate(i: number, ui?: "chat" | "term"): void {
     const a = agents?.[i];
     if (a === undefined) return;
     if (!a.installed) {
@@ -133,7 +154,7 @@
       if (a.managedInstall) onInstall(a);
       return;
     }
-    onPick({ agent: a.id });
+    onPick({ agent: a.id, ui: ui ?? (a.chatCapable ? "chat" : "term") });
   }
 
   function move(delta: number): void {
@@ -161,7 +182,7 @@
     }
     if (e.key === "Enter") {
       e.preventDefault();
-      activate(hl);
+      activate(hl, e.metaKey || e.ctrlKey ? "term" : undefined);
     }
   }
 </script>
@@ -207,24 +228,38 @@
             if (e.key === "Enter") {
               e.preventDefault();
               e.stopPropagation();
-              activate(i);
+              activate(i, e.metaKey || e.ctrlKey ? "term" : undefined);
             }
           }}
         >
           <span class="gslot"><SessionGlyph kind="agent" agentKind={a.id} size={13} /></span>
-          <span class="aname">{a.name}</span>
-          {#if a.installUrl !== null}
-            <!-- Official docs, in the browser — quiet until the row is hot. -->
-            <a
-              class="adocs"
-              href={a.installUrl}
-              target="_blank"
-              rel="noreferrer"
-              title="open the official docs"
-              tabindex="-1"
-              onclick={(e) => e.stopPropagation()}>docs&thinsp;↗</a
-            >
-          {/if}
+          <!-- Name over a quiet subheader: provenance ("chimaera" = a build
+               chimaera installed itself, "yours" = your own on PATH — the
+               answer to "whose claude runs?"), the version, and the docs
+               link. The tooltip carries the resolved path. -->
+          <span class="acol">
+            <span class="aname">{a.name}</span>
+            <span class="asub">
+              {#if a.installed && !a.outdated}
+                <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
+                  <span class="prov">{a.managed ? "chimaera" : "yours"}</span>
+                  {#if a.version !== null}<span class="num">{versionNumber(a.version)}</span>{/if}
+                </span>
+              {/if}
+              {#if a.installUrl !== null}
+                <!-- Official docs, in the browser — quiet until the row is hot. -->
+                <a
+                  class="adocs"
+                  href={a.installUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  title="open the official docs"
+                  tabindex="-1"
+                  onclick={(e) => e.stopPropagation()}>docs&thinsp;↗</a
+                >
+              {/if}
+            </span>
+          </span>
           {#if !a.installed && a.managedInstall}
             <button
               class="achip"
@@ -250,15 +285,59 @@
               update
             </button>
           {:else if a.installed}
-            <!-- Provenance in words, not just a color: "chimaera" = a build
-                 chimaera installed itself (~/.chimaera/agents), "yours" = your
-                 own on PATH — the launcher's answer to "whose claude runs?".
-                 The version number follows when the probe caught it; the
-                 tooltip carries the resolved path. -->
-            <span class="aver" class:managed={a.managed} title={whereTitle(a)}>
-              <span class="prov">{a.managed ? "chimaera" : "yours"}</span>
-              {#if a.version !== null}<span class="num">{versionNumber(a.version)}</span>{/if}
-            </span>
+            <!-- The two ways in: "open" (and the whole row, and ↵) is the
+                 structured chat UI — the default; the terminal button (⌘↵)
+                 is the explicit TUI path. No chat view → one "open", the TUI. -->
+            {#if a.chatCapable}
+              <!-- Icon-only, so it explains itself: a custom tooltip on a
+                   ~0.5s delay (the native title's is longer and easy to
+                   miss). data-tip is the ::after content. -->
+              <button
+                class="tbtn"
+                tabindex="-1"
+                aria-label="open in the terminal"
+                data-tip="open in the terminal · {isMac ? '⌘' : 'ctrl'}↵"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  activate(i, "term");
+                }}
+              >
+                <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                  <rect
+                    x="1.5"
+                    y="2.5"
+                    width="13"
+                    height="11"
+                    rx="2"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.2"
+                  />
+                  <path
+                    d="M4.2 6l2.4 2-2.4 2"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                  <path d="M8.4 10.6h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </button>
+            {/if}
+            <button
+              class="obtn"
+              tabindex="-1"
+              title={a.chatCapable
+                ? "open in the chat view (↵)"
+                : `opens in the terminal — ${a.name} has no chat view`}
+              onclick={(e) => {
+                e.stopPropagation();
+                activate(i, a.chatCapable ? "chat" : "term");
+              }}
+            >
+              open
+            </button>
           {/if}
         </div>
       {/each}
@@ -266,7 +345,8 @@
 
     <div class="foot">
       <span><kbd>↑↓</kbd> choose</span>
-      <span><kbd>↵</kbd> start</span>
+      <span><kbd>↵</kbd> open</span>
+      <span><kbd>{isMac ? "⌘" : "ctrl"}↵</kbd> terminal</span>
       <span><kbd>esc</kbd> close</span>
     </div>
   {/if}
@@ -341,7 +421,7 @@
     display: flex;
     align-items: center;
     gap: 9px;
-    padding: 7px 9px;
+    padding: 6px 9px;
     border-radius: 6px;
     font-size: var(--text-md);
     cursor: pointer;
@@ -361,8 +441,16 @@
     justify-content: center;
   }
 
-  .aname {
+  /* Name over its subheader — the two-line left column. */
+  .acol {
     flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .aname {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -370,10 +458,23 @@
     font-weight: 500;
   }
 
+  /* The subheader: provenance · version · docs, one quiet line. Reserves its
+     line even when empty (uninstalled rows) so names align across rows. */
+  .asub {
+    min-width: 0;
+    min-height: 0.9rem;
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
   /* Official-docs link: invisible weight until the row is hot. */
   .adocs {
     flex: none;
-    font-size: var(--text-xs);
     color: var(--muted);
     text-decoration: none;
     opacity: 0;
@@ -398,12 +499,10 @@
     display: inline-flex;
     align-items: baseline;
     gap: 5px;
-    max-width: 150px;
+    max-width: 170px;
     overflow: hidden;
     white-space: nowrap;
     font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
 
@@ -473,6 +572,92 @@
   .achip:focus-visible {
     outline: 2px solid var(--focus-ring);
     outline-offset: 1px;
+  }
+
+  /* The two ways in, quiet until the row is hot: "open" (the default — the
+     chat view) and the terminal-icon button (the agent's own TUI). */
+  .obtn,
+  .tbtn {
+    appearance: none;
+    background: none;
+    font: inherit;
+    flex: none;
+    border: 1px solid var(--edge);
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease,
+      border-color 0.12s ease,
+      transform 0.08s ease;
+  }
+
+  .arow.hl .obtn,
+  .arow:hover .obtn,
+  .arow.hl .tbtn,
+  .arow:hover .tbtn {
+    opacity: 1;
+  }
+
+  .obtn {
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: var(--text-xs);
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--fg) 25%, transparent);
+  }
+
+  .obtn:hover {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+
+  .tbtn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+  }
+
+  .tbtn:hover {
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  }
+
+  /* The delayed tooltip: nothing on a pass-through hover, fades in after
+     ~0.5s of intent. Pure CSS off data-tip; pointer-events off so it never
+     steals the hover it explains. */
+  .tbtn::after {
+    content: attr(data-tip);
+    position: absolute;
+    top: calc(100% + 7px);
+    right: -2px;
+    z-index: 5;
+    padding: 3px 9px;
+    white-space: nowrap;
+    font-size: var(--text-xs);
+    color: var(--fg);
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+  }
+
+  .tbtn:hover::after {
+    opacity: 1;
+    transition-delay: 0.5s;
+  }
+
+  .obtn:active,
+  .tbtn:active {
+    transform: translateY(0.5px);
   }
 
   .foot {

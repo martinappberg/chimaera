@@ -249,6 +249,19 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
         crate::lock(&state.chat_recipes).remove(id);
         return;
     }
+    // The reap can also land AFTER the switch handler already removed the
+    // marker: a slow-exiting driver (claude ≥2.1.205 takes ~1s on SIGTERM)
+    // drains its exit later than the respawn completes. A live successor
+    // surface under the same id means this exit WAS that deliberate kill —
+    // retiring here would tear down the fresh session (and dropping the
+    // recipe would break its next toggle's resume fallback). Leave both.
+    let successor_chat = state.chat.get(id).is_some_and(|c| c.alive);
+    if successor_chat || state.sessions.get(id).is_some() {
+        if !successor_chat {
+            state.chat.remove(id);
+        }
+        return;
+    }
     let recipe = crate::lock(&state.chat_recipes).remove(id);
     match exit {
         DriverExit::HandshakeFailed {
@@ -596,15 +609,6 @@ pub(crate) async fn switch_view(
             .into_response();
     }
 
-    // The resume handle: chat side knows its native id from Init; TUI side
-    // from the transcript path hooks report. Missing handle = fresh start in
-    // the other mode (still the same chimaera session identity).
-    let resume = if currently_chat {
-        chat_info.as_ref().and_then(|c| c.native_session_id.clone())
-    } else {
-        record.resume_id()
-    };
-
     let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
     let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
         crate::lock(&state.workspaces)
@@ -615,6 +619,47 @@ pub(crate) async fn switch_view(
             StatusCode::NOT_FOUND,
             "session has no workspace".to_string(),
         );
+    };
+
+    // The resume handle: chat side knows its native id from Init; TUI side
+    // from the transcript path hooks report. Missing handle = fresh start in
+    // the other mode (still the same chimaera session identity).
+    //
+    // A *resumed* claude chat is spawned with no pinned native id — its
+    // `native_session_id` stays None until the first turn emits `system/init`.
+    // Toggling chat→term before sending a message would otherwise respawn
+    // claude with no `--resume` (an empty conversation). Fall back to the
+    // handle this chat was itself resumed from (still the conversation tip
+    // while no turn has run), so the terminal reattaches to the same history.
+    let resume = if currently_chat {
+        chat_info
+            .as_ref()
+            .and_then(|c| c.native_session_id.clone())
+            .or_else(|| {
+                crate::lock(&state.chat_recipes)
+                    .get(&id)
+                    .and_then(|r| r.resume.clone())
+            })
+    } else {
+        record.resume_id()
+    };
+    // A handle is only resumable once a turn has landed a transcript on disk.
+    // A fresh chat PINS its uuid at spawn (`--session-id`), so the handle
+    // exists with zero turns — and claude exits(1) on `--resume` of an id with
+    // no transcript (verified 2.1.204/2.1.205), killing the toggled session.
+    // Validate against the project store; no transcript = fresh start.
+    let resume = match resume {
+        Some(uuid) if record.kind == AgentKind::Claude => {
+            let path = state
+                .claude_projects_dir
+                .join(crate::launcher::encode_cwd(&workspace_root))
+                .join(format!("{uuid}.jsonl"));
+            tokio::fs::try_exists(&path)
+                .await
+                .unwrap_or(false)
+                .then_some(uuid)
+        }
+        other => other,
     };
 
     // Serialize per id: a concurrent toggle (double-click) that slipped past
@@ -903,6 +948,85 @@ pub(crate) async fn rewind_session(
 /// Spawn (or respawn) a chat driver for `id` from a recipe. Shared by
 /// create_session and the view switch. `pinned_override` lets create pass a
 /// fresh --session-id uuid; resumes leave it None (claude forks a new id).
+/// Seed a resumed session's fresh journal so `attach` replays the whole
+/// conversation before the live `Init` (the agents replay nothing over the
+/// wire). Two sources, in preference order:
+///
+/// - **(a) a previous chimaera journal** for this native id — an exact copy of
+///   our own event stream (a chat conversation we owned).
+/// - **(b) claude's OWN transcript** — a TUI-originated or pre-chimaera
+///   conversation the native-id index never saw; translated into the same
+///   event stream a live session would have produced (`chimaera_agent::transcript`).
+///
+/// Returns whether the resumed session has chat-renderable history — seeded now
+/// (copied / imported) or already present. `false` means a resume with nothing
+/// we could put in the chat surface (or no resume at all); an opened recent uses
+/// that to fall back to the TUI rather than a blank chat. Best-effort: a seed
+/// failure just means the session starts without history, never a spawn failure.
+/// Never clobbers an existing journal (the live-source guard the copy path
+/// always enforced). Blocking fs — the caller runs it off the reactor.
+pub(crate) fn seed_resumed_journal(state: &Arc<AppState>, id: &str, recipe: &ChatRecipe) -> bool {
+    let Some(native) = recipe.resume.as_deref() else {
+        return false;
+    };
+    let dir = state.chat.journal_dir();
+    let new_path = dir.join(format!("{id}.jsonl"));
+    if new_path.exists() {
+        return true; // already seeded — history is present, never clobber
+    }
+
+    // (a) A chimaera journal already holds this conversation: copy it.
+    if let Some(old_id) = state.chat.index().lookup(native) {
+        // A still-live source (the conversation is open in another pane) must
+        // not be seeded from at all — not a mid-append copy (its writer could
+        // split a line and lose the seeded tail), and not a transcript import
+        // of a conversation still being written.
+        if state.chat.contains(&old_id) {
+            return false;
+        }
+        let old_path = dir.join(format!("{old_id}.jsonl"));
+        if old_id != id && old_path.exists() {
+            match std::fs::copy(&old_path, &new_path) {
+                Ok(_) => {
+                    tracing::info!(%id, %old_id, "seeded chat journal from previous life");
+                    return true;
+                }
+                // Fall through to the transcript import on a copy failure.
+                Err(err) => tracing::warn!(%id, %old_id, %err, "journal seed copy failed"),
+            }
+        }
+    }
+
+    // (b) No chimaera journal for this native id (a TUI/pre-chimaera
+    // conversation): import claude's own transcript. Only claude keeps this
+    // transcript format.
+    if recipe.kind != AgentKind::Claude {
+        return false;
+    }
+    let transcript = state
+        .claude_projects_dir
+        .join(crate::launcher::encode_cwd(&recipe.workspace_root))
+        .join(format!("{native}.jsonl"));
+    if !transcript.exists() {
+        return false;
+    }
+    let events = chimaera_agent::transcript::import_transcript(&transcript);
+    if events.is_empty() {
+        return false;
+    }
+    let count = events.len();
+    match state.chat.seed_journal(id, &events) {
+        Ok(()) => {
+            tracing::info!(%id, %native, count, "seeded chat journal from claude transcript");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(%id, %native, %err, "journal seed from transcript failed");
+            false
+        }
+    }
+}
+
 pub(crate) fn spawn_chat_session(
     state: &Arc<AppState>,
     id: String,
@@ -976,32 +1100,19 @@ pub(crate) fn spawn_chat_session(
     spec.env_remove = crate::api::launcher_context_env();
     spec.pinned_native_id = pinned;
 
-    // Resuming a finished conversation mints a NEW chimaera session id, and
-    // the agents replay no history over the wire — seed the new journal
-    // from the previous life's (the native-id index knows which one).
-    // Journal::open continues sequence numbers from the copied file, so
-    // attach replays the whole conversation before the fresh Init.
-    if let Some(native) = &recipe.resume {
-        if let Some(old_id) = state.chat.index().lookup(native) {
-            let dir = state.chat.journal_dir();
-            let old_path = dir.join(format!("{old_id}.jsonl"));
-            let new_path = dir.join(format!("{id}.jsonl"));
-            // Never copy from a still-live session's journal: its writer thread
-            // may be mid-append, so the copy could split a line and the seeded
-            // tail would be lost on replay. Resume targets a finished
-            // conversation; a live source means the id was reused unexpectedly.
-            if old_id != id
-                && !state.chat.contains(&old_id)
-                && old_path.exists()
-                && !new_path.exists()
-            {
-                if let Err(err) = std::fs::copy(&old_path, &new_path) {
-                    tracing::warn!(%id, %old_id, %err, "journal seed copy failed");
-                } else {
-                    tracing::info!(%id, %old_id, "seeded chat journal from previous life");
-                }
-            }
-        }
+    // Resuming a finished conversation mints a NEW chimaera session id, and the
+    // agents replay no history over the wire — seed the new journal so attach
+    // replays the whole conversation before the fresh Init. Seeding does
+    // blocking fs (copy / transcript read+parse / journal write) on a
+    // possibly-NFS dir; spawn_chat_session runs on the async reactor, so move it
+    // off with block_in_place (all callers are daemon reactor handlers on the
+    // multi-thread runtime). It must finish before the spawn below, since
+    // Journal::open picks up the seeded seq tail.
+    if recipe.resume.is_some() {
+        // Return value (whether history was seeded) matters only to the
+        // create-from-recent path, which pre-seeds and inspects it there; here
+        // (view-switch / rewind) the session always stays in chat.
+        let _ = tokio::task::block_in_place(|| seed_resumed_journal(state, &id, &recipe));
     }
 
     crate::lock(&state.chat_recipes).insert(id.clone(), recipe.clone());

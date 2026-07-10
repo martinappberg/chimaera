@@ -9,6 +9,7 @@
   "permissions": [
     "core:default",
     "core:window:allow-close",
+    "core:window:allow-set-title",
     "allow-list-hosts",
     "allow-add-host",
     "allow-remove-host",
@@ -24,6 +25,7 @@
     "allow-check-app-update",
     "allow-begin-update",
     "allow-shell-build",
+    "allow-write-clipboard",
     "allow-answer-askpass",
     "allow-list-askpass"
   ]

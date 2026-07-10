@@ -209,6 +209,11 @@ pub(crate) fn retire(
         return;
     };
     let workspace_id = crate::lock(&state.session_workspaces).remove(session_id);
+    // The session's identity ends here, so its respawn recipe must too: a
+    // chat toggled to the terminal keeps its ChatRecipe (the view-switch
+    // exit paths deliberately preserve it for the successor), and the PTY
+    // retire paths — the watcher, DELETE, close-all — never cleared it.
+    crate::lock(&state.chat_recipes).remove(session_id);
 
     let title = pinned
         .map(str::to_string)

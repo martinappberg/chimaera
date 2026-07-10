@@ -12,6 +12,7 @@
 
 <script lang="ts">
   import { fsRawUrl, innerExtension } from "./files";
+  import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
@@ -256,6 +257,8 @@
           style:background-size={`${gridStep}px ${gridStep}px`}
         ></div>
       {/if}
+    {:else}
+      <Spinner />
     {/if}
   </div>
 </div>

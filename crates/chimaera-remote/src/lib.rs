@@ -163,12 +163,6 @@ pub struct ConnectOpts {
     /// Replace an outdated remote daemon even when it has live sessions
     /// (they end with it). The stop is always graceful — SIGTERM, never -9.
     pub update_daemon: bool,
-    /// Target the host's isolated DEV home ([`RemoteHome::Dev`]) instead of
-    /// the real `~/.chimaera`: deploy a locally built binary there and run
-    /// its daemon under its own `CHIMAERA_HOME`, next to — never touching —
-    /// the real daemon. The end-user release-download path is disabled; a
-    /// dev connect that can't find a local build fails instead.
-    pub dev: bool,
 }
 
 /// Which per-user state root on the HOST a connect targets. Every remote
@@ -195,8 +189,13 @@ pub enum RemoteHome {
 }
 
 impl RemoteHome {
-    fn from_opts(opts: &ConnectOpts) -> Self {
-        if opts.dev {
+    /// Which home THIS build targets — the build's property, never a
+    /// per-host or per-connect choice: a dev build (the unstamped `0.0.1`
+    /// sentinel) always talks to `~/.chimaera-dev` on both ends, a release
+    /// always to `~/.chimaera`. No toggle exists, so a dev tunnel can never
+    /// heal into the real daemon (or vice versa) across reconnects.
+    pub fn current() -> Self {
+        if chimaera_core::is_dev_build() {
             RemoteHome::Dev
         } else {
             RemoteHome::Real
@@ -586,25 +585,16 @@ pub async fn connect(
     opts: ConnectOpts,
     progress: impl Fn(Phase),
 ) -> anyhow::Result<Tunnel> {
-    // The dev connect is a development tool, gated out of stamped releases at
-    // this single choke point so every caller (CLI flag, app host entry —
-    // including a dev-marked entry that leaked into a production app's hosts
-    // file) inherits it. A release client dev-connecting would also be
-    // nonsense operationally: it deploys "your build", and a release build
-    // has no checkout to have built one from.
-    if opts.dev && !chimaera_core::is_dev_build() {
-        bail!(
-            "dev connections need a dev build of chimaera (this is v{}) — \
-             run one from a checkout, or re-add the host without dev mode",
-            chimaera_core::VERSION,
-        );
-    }
     // Normalize whatever the caller has (saved entries predate validation;
     // "ssh cluster" typed verbatim reached ssh as one hostname in the field)
     // so every ssh invocation below sees a real destination.
     let host = &hosts::normalize_alias(host)?;
+    // Dev-ness is the build's property (see `RemoteHome::current`): a dev
+    // build ALWAYS targets `~/.chimaera-dev`, a release always `~/.chimaera`.
+    // There is no per-connect override, so a release client can never touch
+    // a dev home and a dev client can never stop or replace the real daemon.
     let ops = SshOps {
-        home: RemoteHome::from_opts(&opts),
+        home: RemoteHome::current(),
     };
     let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
 
@@ -1014,7 +1004,7 @@ async fn resolve_local_binary(
              Build one with either:\n\
              \x20 just dist                 (in the chimaera repo: builds musl \
              binaries into ~/.chimaera/dist)\n\
-             \x20 chimaera connect {host} --dev --binary /path/to/chimaera-built-for-{host}"
+             \x20 chimaera connect {host} --binary /path/to/chimaera-built-for-{host}"
         );
     }
     fetch_release_binary(&os, &arch, progress)
@@ -1368,18 +1358,11 @@ mod tests {
         // one (".chimaera-dev" starts with ".chimaera", so check the boundary).
         assert!(!Dev.dir().starts_with(&format!("{}/", Real.dir())));
         assert_ne!(Dev.dir(), Real.dir());
-        // The opts flag is the only selector.
-        assert_eq!(
-            RemoteHome::from_opts(&ConnectOpts::default()),
-            RemoteHome::Real
-        );
-        assert_eq!(
-            RemoteHome::from_opts(&ConnectOpts {
-                dev: true,
-                ..Default::default()
-            }),
-            RemoteHome::Dev
-        );
+        // The build is the only selector: tests run on the unstamped 0.0.1
+        // sentinel, so `current()` must resolve Dev here — a release build
+        // (stamped version) resolves Real by the same predicate.
+        assert!(chimaera_core::is_dev_build());
+        assert_eq!(RemoteHome::current(), RemoteHome::Dev);
     }
 
     #[test]

@@ -9,6 +9,7 @@
    */
   import { fsRawUrl, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
   import CodeView from "./CodeView.svelte";
+  import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
@@ -104,6 +105,8 @@
       <div class="file-error">{error}</div>
     {:else if url !== null}
       <iframe src={url} title={path} sandbox="allow-scripts"></iframe>
+    {:else}
+      <Spinner />
     {/if}
   </div>
 </div>

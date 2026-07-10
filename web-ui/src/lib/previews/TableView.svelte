@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fsTable, type TablePage } from "./files";
   import { getSetting } from "../settings/store.svelte";
+  import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
@@ -301,6 +302,8 @@
 <div class="table-view">
   {#if error !== null && rows.length === 0}
     <div class="file-error">{error}</div>
+  {:else if loading && rows.length === 0}
+    <Spinner />
   {:else}
     <div
       class="scroll"

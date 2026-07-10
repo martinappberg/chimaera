@@ -12,6 +12,7 @@
   import { decoFor, dirColor } from "./gitDeco";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
+  import Spinner from "../previews/Spinner.svelte";
 
   interface Props {
     /** Workspace root on the daemon's filesystem. */
@@ -299,6 +300,10 @@
   >
   {#if rootError !== null}
     <div class="tree-error">{rootError}</div>
+  {:else if listings.get(root) === undefined}
+    <!-- First listing still in flight (a big dir over ssh takes a while) —
+         the delayed spinner keeps fast local opens flicker-free. -->
+    <div class="tree-loading"><Spinner label="listing files…" /></div>
   {:else if listings.get(root)?.length === 0}
     <div class="tree-empty">empty</div>
   {:else if filterQuery !== "" && rows.length === 0}
@@ -514,8 +519,33 @@
     transform: rotate(90deg);
   }
 
+  /* A dir whose listing is in flight: nothing for the first beat (fast local
+     expands never flicker), then a soft pulse for slow (remote) ones. */
   .chev.busy {
-    opacity: 0.4;
+    animation: chev-wait 1.1s ease-in-out 0.25s infinite;
+  }
+
+  @keyframes chev-wait {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chev.busy {
+      animation: none;
+      opacity: 0.4;
+    }
+  }
+
+  .tree-loading {
+    position: relative;
+    min-height: 96px;
+    flex: none;
   }
 
   /* Blank disclosure slot for files, so their folder/file glyph aligns under
