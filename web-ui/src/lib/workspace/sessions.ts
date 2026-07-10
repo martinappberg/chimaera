@@ -254,6 +254,9 @@ export interface AgentSpawn {
    *  carried across the fresh id an "open recent" mints. Seeds the soft
    *  ai_title server-side — not a hard rename. */
   titleHint?: string;
+  /** Explicit surface choice (the launcher's "open" vs its terminal button).
+   *  Omitted = the agents.defaultView setting decides. */
+  ui?: "chat" | "term";
 }
 
 export async function createSession(
@@ -286,15 +289,15 @@ export async function createSession(
     if (spawn.resume !== undefined) extras.resume = spawn.resume;
     if (spawn.titleHint !== undefined && spawn.titleHint !== "") extras.title_hint = spawn.titleHint;
     // New agent sessions open in the structured chat view by default (the
-    // agents.defaultView setting); the terminal is one pane-bar toggle away,
-    // and the daemon degrades to a PTY on its own if the protocol handshake
-    // fails. An agent the catalog knows is NOT chat-capable (outdated CLI)
-    // skips chat entirely — it would only handshake-watchdog then degrade.
-    if (
-      ["claude", "codex"].includes(spawn.agent ?? "claude") &&
-      getSetting("agents.defaultView") === "chat" &&
-      chatCapable !== false
-    ) {
+    // agents.defaultView setting); an explicit launcher choice (its terminal
+    // button vs "open") overrides the setting for that one spawn. The
+    // terminal is one pane-bar toggle away either way, and the daemon
+    // degrades to a PTY on its own if the protocol handshake fails. An agent
+    // the catalog knows is NOT chat-capable (outdated CLI) skips chat
+    // entirely — it would only handshake-watchdog then degrade.
+    const wantChat =
+      spawn.ui !== undefined ? spawn.ui === "chat" : getSetting("agents.defaultView") === "chat";
+    if (["claude", "codex"].includes(spawn.agent ?? "claude") && wantChat && chatCapable !== false) {
       extras.ui = "chat";
     }
   }
