@@ -65,7 +65,85 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
         crate::lock(&state.agents).contains_key(&id),
         "agent record survives the degrade"
     );
+
+    // The journal must tell the story a reattach replays: the startup failure
+    // (fatal Error, from the driver harness), then the degrade stamped as a
+    // ModeSwitch(term) — not a bare fatal tail. The stamp lands right after
+    // the PTY registers, so poll briefly.
+    let journal = state.chat.journal_dir().join(format!("{id}.jsonl"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let content = std::fs::read_to_string(&journal).unwrap_or_default();
+        if content.contains(r#""type":"mode_switch""#) {
+            assert!(
+                content.contains(r#""fatal":true"#) && content.contains("failed to start"),
+                "startup failure must be journaled before the switch: {content}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "degrade never journaled a mode_switch; journal: {}",
+            std::fs::read_to_string(&journal).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The degrade-in-progress marker (the WS "degraded" classification) is
+    // cleaned up once the successor exists.
+    assert!(
+        crate::lock(&state.chat_switching).is_empty(),
+        "degrade marker must not outlive the degrade"
+    );
     let _ = state.sessions.kill(&id);
+}
+
+/// A handshake failure with NO respawn recipe must not silently retire the
+/// session: it stays registered (dead) with the record Errored — the same
+/// keep-visible contract as ProtocolError — so the rail shows the failure
+/// and the journaled diagnostic is reachable.
+#[tokio::test]
+async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
+    let state = test_state();
+    chat::spawn_signal_task(state.clone());
+
+    let dir = test_dir("chat-norecipe");
+    let id = "s-norecipe".to_string();
+    crate::lock(&state.agents).insert(
+        id.clone(),
+        agents::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+    );
+
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        id.clone(),
+        vec!["/bin/cat".to_string()],
+        dir.clone(),
+    );
+    spec.handshake_timeout = std::time::Duration::from_millis(300);
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let errored = crate::lock(&state.agents)
+            .get(&id)
+            .is_some_and(|r| r.state == agent_state::AgentState::Errored);
+        if errored {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "record never turned Errored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let info = state.chat.get(&id).expect("session stays registered, dead");
+    assert!(!info.alive);
+    assert!(
+        state.sessions.get(&id).is_none(),
+        "no PTY successor without a recipe"
+    );
 }
 
 #[tokio::test]

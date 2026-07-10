@@ -164,8 +164,9 @@ pub(crate) fn managed_fallback(bin: &str, managed_bin: &Path) -> Option<PathBuf>
 }
 
 /// Whether `path` is a regular executable file (symlinks followed — a
-/// versioned `~/.local/bin/claude` symlink counts).
-fn is_executable(path: &Path) -> bool {
+/// versioned `~/.local/bin/claude` symlink counts). One stat: cheap enough
+/// for spawn-time re-validation (the degrade path checks its recipe bin).
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
