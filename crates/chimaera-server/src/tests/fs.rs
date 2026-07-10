@@ -1374,21 +1374,18 @@ async fn fs_ticket_mints_and_raw_serves_without_auth() {
     let (status, _, _) = request_bytes(&state, Method::GET, &uri, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Minting for a directory or a missing file is a 400.
-    for bad in [
-        root.to_string_lossy().into_owned(),
-        "/no/such/pic.png".into(),
-    ] {
-        let (status, err) = request(
-            &state,
-            Method::POST,
-            "/api/v1/fs/ticket",
-            Some(serde_json::json!({"path": bad})),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].is_string());
-    }
+    // Minting for a missing path is a 400. (Directories mint fine now —
+    // folder downloads — but /raw itself stays file-only; see the
+    // download tests.)
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/ticket",
+        Some(serde_json::json!({"path": "/no/such/pic.png"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(err["error"].is_string());
 }
 
 #[tokio::test]

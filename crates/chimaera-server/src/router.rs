@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, assets, chat, fs, git, launcher, links, mcp, quickopen, recents, runtimes,
-    settings, update, view_state, ws,
+    agents, api, assets, chat, download, fs, git, launcher, links, mcp, quickopen, recents,
+    runtimes, settings, update, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -95,11 +95,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // /raw/{ticket} is also unauthenticated: iframes and img tags cannot send
     // Authorization headers, so a short-lived single-path ticket (minted via
     // the bearer-authed POST /api/v1/fs/ticket) authorizes each fetch instead.
+    // /download/{ticket} rides the same ticket story: an <a href> download
+    // navigation cannot send headers either.
     let ws = Router::new()
         .route("/ws/sessions/{id}", get(ws::session_ws))
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
+        .route("/download/{ticket}", get(download::download))
         .with_state(state);
 
     Router::new()

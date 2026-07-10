@@ -1163,7 +1163,8 @@ impl TicketStore {
     }
 
     /// The path bound to `ticket`, if it exists and has not expired.
-    fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
+    /// Shared with the download module — same store, same capability model.
+    pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
         self.purge();
         self.tickets.get(ticket).map(|t| t.path.clone())
     }
@@ -1187,15 +1188,17 @@ pub(crate) struct TicketRequest {
     path: String,
 }
 
-/// POST /api/v1/fs/ticket {path} — mint a 10-minute raw-access ticket for a
-/// file, so iframes and img tags (which cannot send Authorization headers)
-/// can fetch it via GET /raw/{ticket}. The bearer token never appears in a
-/// URL.
+/// POST /api/v1/fs/ticket {path} — mint a 10-minute access ticket for a file
+/// or directory, so iframes, img tags, and <a href> download navigations
+/// (none of which can send Authorization headers) can fetch it via GET
+/// /raw/{ticket} (files only) or GET /download/{ticket}. The bearer token
+/// never appears in a URL. A ticket is a per-path snapshot: renaming the
+/// path afterwards makes the fetch 404, deliberately.
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
-    let path = match canonical_file(&body.path) {
+    let path = match canonical(&body.path) {
         Ok(path) => path,
         Err(err) => return bad_request(&err),
     };
@@ -1259,7 +1262,10 @@ pub(crate) async fn raw(
         }
     };
     let total = match file.metadata().await {
-        Ok(meta) => meta.len(),
+        // Tickets may now name directories (folder downloads); /raw itself
+        // stays file-only — a dir ticket here is a 404, not a listing.
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return not_found(),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
             return not_found();
