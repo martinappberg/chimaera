@@ -1,10 +1,11 @@
 # Files & previews
 
-Browsing the workspace and viewing its files. The file tree lists and opens (it doesn't
-create/rename/delete); the preview service streams file bytes and renders them as code,
-markdown, tables, PDFs, images, sandboxed HTML, or a hex/binary summary — plus a light
-single-file editor. Everything streams (never whole-file loads) to hold the daemon's
-~150 MB RSS budget on shared login nodes.
+Browsing and managing the workspace's files. The file tree and the Finder browse, open,
+and — via their right-click context menus — create, rename, delete, and download files
+and folders; the preview service streams file bytes and renders them as code, markdown,
+tables, PDFs, images, sandboxed HTML, or a hex/binary summary — plus a light single-file
+editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
+budget on shared login nodes.
 
 **Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders, `CodeView`,
 `MarkdownView`, `TableView`, `PdfView`, `ImageView`, `HtmlView`, `BinaryView`, `FinderView`,
@@ -25,10 +26,43 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `GET /api/v1/fs/list?path=&hidden=` (server `fs.rs`).
 - **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`), not recursive
   components. Respects `files.showHidden`. Re-lists the root + every expanded dir when the
-  workspace's git **epoch** bumps (a new untracked file gets a row to carry its status badge).
-  Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!) and a recolored name; a
-  collapsed dir containing changes shows a rollup dot. **The tree is read-only** — create/rename/
-  delete aren't here (create-folder lives in the folder picker, see [workbench.md](workbench.md)).
+  workspace's git **epoch** bumps (a new untracked file gets a row to carry its status badge)
+  and when the client **fs epoch** bumps (any create/rename/delete from any surface — see
+  "File management" below). Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!)
+  and a recolored name; a collapsed dir containing changes shows a rollup dot.
+
+## File management (create / rename / delete / download)
+
+- **What & when.** Right-click anywhere files show — tree rows, the tree background, Finder
+  entries, Finder column backgrounds, file-backed pane tabs — for New File…/New Folder…,
+  Rename…, Download, Copy Path, and Delete…. The FILES section header also carries
+  new-file/new-folder buttons targeting the workspace root.
+- **How it's used.** Creates are **inline**, VS Code-style: an editable row appears in place;
+  the typed name may nest (`a/b/c.txt` creates the intermediate folders). A created file opens
+  immediately. Rename swaps the row (or tab label) for an input with the stem preselected;
+  renaming a *terminal/chat tab* pins the session name instead (the "master name" pattern —
+  see [workbench.md](workbench.md)). Delete always confirms in a modal (permanent — no
+  server-side trash). Download streams a single file as-is, a folder as `<name>.zip`; it works
+  identically against a remote daemon (the window's origin *is* the ssh tunnel).
+- **Where it lives.** UI: `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one
+  right-click menu), `shared/ConfirmDialog.svelte`, `shared/fsNames.ts` (name validation +
+  stem preselect), `workspace/fsEvents.ts` (the mutation bus). Daemon: `fs.rs` handlers
+  `create`/`rename`/`delete` + `crates/chimaera-server/src/download.rs`.
+- **Routes.** `POST /api/v1/fs/create {path, kind:"file"|"dir"}` (makes parents; 409 if the
+  target exists), `POST /api/v1/fs/rename {from, to}` (409 on existing target; symlink-safe —
+  parents are canonicalized, the leaf never resolved; case-only renames allowed; cross-device
+  moves refused), `POST /api/v1/fs/delete {path}` (recursive; refuses `/` and `$HOME`), all
+  bearer-authed. Downloads ride the ticket pattern: `POST /api/v1/fs/ticket` now accepts
+  directories too, and the unauthenticated `GET /download/{ticket}` streams a file (with
+  `Content-Disposition: attachment`, RFC 5987 unicode names) or a zip built on the fly
+  (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool; symlinks never
+  followed; 250k-entry ceiling aborts loudly). `/raw/{ticket}` stays file-only.
+- **Key behaviors.** Every mutation bumps the client `fsEpoch` (tree + Finder re-list from any
+  surface's change) and nudges `git::mark_path_dirty`. App subscribes to `lastFsMutation`:
+  a rename **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
+  `rewriteTabPaths` in `layout/layout.ts`); a delete closes tabs under the path and retargets
+  Finders to the parent (`pruneDeletedPath`). A file tab's Rename is disabled while the file
+  has unsaved edits. Escape cancels any inline input; blur commits a non-empty valid name.
 
 ## Raw reads & lightweight editing
 
