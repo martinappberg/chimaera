@@ -19,6 +19,7 @@
 
 <script lang="ts">
   import { marked } from "marked";
+  import { copyText } from "../shared/clipboard";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
 
   interface Props {
@@ -45,6 +46,73 @@
    *  streaming re-renders re-stamp from cache instead of refetching. */
   const resolved = new Map<string, PathHit | "miss">();
   const inflight = new Set<string>();
+
+  // Copy-button chrome, injected post-sanitize (DOMPurify never sees it, and
+  // it is built from these literals only — never from agent-derived strings).
+  // SVG-only content: wrapWords wraps text nodes, so an icon-only button can
+  // never have its label word-wrapped or reveal-hidden piecemeal.
+  const COPY_BUTTON_SVG =
+    '<svg class="ic-copy" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+    '<rect x="6" y="6" width="7.5" height="7.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>' +
+    '<path d="M4 10h-.5A1.5 1.5 0 0 1 2 8.5v-5A1.5 1.5 0 0 1 3.5 2h5A1.5 1.5 0 0 1 10 3.5V4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>' +
+    "</svg>" +
+    '<svg class="ic-check" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+    '<path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>' +
+    "</svg>";
+
+  /** Give every fenced block a copy affordance. The {@html} flush rebuilds the
+   *  whole subtree per streaming chunk, so this re-runs from the same per-chunk
+   *  hook as stampPaths — fresh DOM each pass, nothing leaks. The wrapper (not
+   *  the pre) anchors the button: the pre scrolls horizontally, so an absolute
+   *  child inside it would ride away with the content. Runs BEFORE wrapWords so
+   *  the reveal bookkeeping stamps the wrapper as the pre's container and the
+   *  button stays hidden until the block starts revealing. */
+  function decorateCodeBlocks(root: HTMLElement) {
+    for (const pre of root.querySelectorAll("pre")) {
+      if (pre.parentElement?.classList.contains("md-pre")) continue;
+      const wrap = document.createElement("div");
+      wrap.className = "md-pre";
+      pre.replaceWith(wrap);
+      wrap.appendChild(pre);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "md-copy";
+      btn.setAttribute("aria-label", "copy code");
+      btn.title = "copy";
+      btn.innerHTML = COPY_BUTTON_SVG;
+      wrap.appendChild(btn);
+    }
+  }
+
+  // Copied feedback: one button at a time; a streaming rebuild mid-feedback
+  // simply drops the state with the old DOM (the next chunk replaces it).
+  let copiedBtn: HTMLElement | null = null;
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearCopied() {
+    if (copiedTimer !== null) {
+      clearTimeout(copiedTimer);
+      copiedTimer = null;
+    }
+    if (copiedBtn !== null && copiedBtn.isConnected) {
+      copiedBtn.classList.remove("copied");
+      copiedBtn.setAttribute("aria-label", "copy code");
+      copiedBtn.title = "copy";
+    }
+    copiedBtn = null;
+  }
+
+  function showCopied(btn: HTMLElement) {
+    clearCopied();
+    copiedBtn = btn;
+    btn.classList.add("copied");
+    btn.setAttribute("aria-label", "copied");
+    btn.title = "copied";
+    copiedTimer = setTimeout(() => {
+      copiedTimer = null;
+      clearCopied();
+    }, 1400);
+  }
 
   function markPath(node: Element, label: string, hit: PathHit) {
     node.classList.add("md-path");
@@ -137,6 +205,27 @@
 
   function onClick(e: MouseEvent) {
     const target = e.target as Element | null;
+    // Copy affordance — delegated, so it survives the per-chunk subtree
+    // rebuild. SECURITY: the payload is resolved from the live DOM at click
+    // time (the sibling pre's innerText), never from an attribute. Sanitized
+    // agent HTML may forge the classes (DOMPurify allows <button class=…>),
+    // but a forged button can only ever copy its own visible code block —
+    // which is the feature. innerText, not textContent: DOMPurify's default
+    // allowlist keeps the `hidden` attribute (and class names like our own
+    // .rw-hidden are forgeable), so textContent could smuggle invisible text
+    // into the payload; innerText copies exactly what is rendered.
+    const copyBtn = target?.closest?.("button.md-copy");
+    if (copyBtn instanceof HTMLElement) {
+      const pre = copyBtn.closest(".md-pre")?.querySelector("pre");
+      // marked ends every fence with one newline the author never typed.
+      const code = (pre?.innerText ?? "").replace(/\n$/, "");
+      if (code.length > 0) {
+        void copyText(code).then((ok) => {
+          if (ok && copyBtn.isConnected) showCopied(copyBtn);
+        });
+      }
+      return;
+    }
     const node = target?.closest?.(".md-path");
     if (node !== null && node !== undefined && onOpenPath !== undefined) {
       // An anchor would navigate the SPA away; a validated path opens a pane.
@@ -269,8 +358,10 @@
     if (el === null) return;
     if (current !== lastHtml) {
       lastHtml = current;
-      // The {@html} flush rebuilt the subtree: (re)wrap words for a live block
-      // and re-stamp path affordances — both once per chunk, not per tick.
+      // The {@html} flush rebuilt the subtree: re-inject the code-block copy
+      // chrome, (re)wrap words for a live block and re-stamp path affordances
+      // — all once per chunk, not per tick.
+      decorateCodeBlocks(el);
       if (live) wrapWords(el);
       else {
         words = [];
@@ -304,9 +395,12 @@
     }
   });
 
-  // Stop the ticker when the component unmounts (a keyed message block can be
-  // torn down mid-stream).
-  $effect(() => () => clearReveal());
+  // Stop the ticker and the copied-feedback timer when the component unmounts
+  // (a keyed message block can be torn down mid-stream).
+  $effect(() => () => {
+    clearReveal();
+    clearCopied();
+  });
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
@@ -394,6 +488,47 @@
     background: none;
     padding: 0;
     font-size: var(--text-sm);
+  }
+  /* Fenced-block copy chrome: hover-reveal (the .rewind-btn language). The
+     wrapper is the non-scrolling anchor; the pre's own margins collapse
+     through it, so layout is unchanged. The scrim keeps the icon legible
+     over code scrolled beneath it — token-only, so both themes hold. */
+  .md :global(.md-pre) {
+    position: relative;
+  }
+  .md :global(.md-copy) {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .md :global(.md-pre:hover .md-copy),
+  .md :global(.md-copy:focus-visible),
+  .md :global(.md-copy.copied) {
+    opacity: 1;
+  }
+  .md :global(.md-copy:hover),
+  .md :global(.md-copy.copied) {
+    color: var(--accent);
+  }
+  .md :global(.md-copy .ic-check),
+  .md :global(.md-copy.copied .ic-copy) {
+    display: none;
+  }
+  .md :global(.md-copy.copied .ic-check) {
+    display: block;
   }
   .md :global(blockquote) {
     margin: 0.4em 0;
