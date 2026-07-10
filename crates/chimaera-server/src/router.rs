@@ -68,6 +68,9 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
         .route("/fs/mkdir", post(fs::mkdir))
+        .route("/fs/create", post(fs::create))
+        .route("/fs/rename", post(fs::rename))
+        .route("/fs/delete", post(fs::delete))
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route(

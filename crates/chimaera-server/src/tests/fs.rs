@@ -59,6 +59,189 @@ async fn fs_mkdir_creates_nested_idempotently_and_rejects_empty() {
 }
 
 #[tokio::test]
+async fn fs_create_makes_parents_and_conflicts_on_existing() {
+    let state = test_state();
+    let root = test_dir("fs-create");
+
+    // A nested file name creates the intermediate directories (the inline
+    // "new file" input accepts a/b/c.txt), echoing the canonical path.
+    let file = root.join("a/b/c.txt");
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/create",
+        Some(serde_json::json!({ "path": file.to_string_lossy(), "kind": "file" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(file.is_file());
+    assert_eq!(
+        json["path"].as_str().unwrap(),
+        std::fs::canonicalize(&file).unwrap().to_string_lossy()
+    );
+
+    // An explicit New File on an existing path is a conflict, never a
+    // silent truncate-or-succeed.
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/create",
+        Some(serde_json::json!({ "path": file.to_string_lossy(), "kind": "file" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(json["error"].as_str().unwrap().contains("already exists"));
+
+    // Directories: nested create works, an existing one conflicts (unlike
+    // the idempotent /fs/mkdir — this is an explicit New Folder).
+    let dir = root.join("x/y");
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/create",
+        Some(serde_json::json!({ "path": dir.to_string_lossy(), "kind": "dir" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dir.is_dir());
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/create",
+        Some(serde_json::json!({ "path": dir.to_string_lossy(), "kind": "dir" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Empty path is a 400.
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/create",
+        Some(serde_json::json!({ "path": "", "kind": "file" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn fs_rename_moves_files_dirs_symlinks_and_guards() {
+    let state = test_state();
+    let root = test_dir("fs-rename");
+    let rename = |from: &std::path::Path, to: &std::path::Path| {
+        let body = serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy(),
+        });
+        let state = state.clone();
+        async move { request(&state, Method::POST, "/api/v1/fs/rename", Some(body)).await }
+    };
+
+    // File rename: old gone, new exists, canonical path echoed.
+    let old = root.join("old.txt");
+    let new = root.join("new.txt");
+    std::fs::write(&old, "data").unwrap();
+    let (status, json) = rename(&old, &new).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(!old.exists());
+    assert_eq!(std::fs::read_to_string(&new).unwrap(), "data");
+    // The echoed path is parent-canonical (on macOS /var resolves to
+    // /private/var), so canonicalize the expectation too.
+    assert_eq!(
+        json["path"].as_str().unwrap(),
+        std::fs::canonicalize(&new).unwrap().to_string_lossy()
+    );
+
+    // Dir rename carries children along.
+    let dir = root.join("proj");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/f.txt"), "x").unwrap();
+    let moved = root.join("renamed-proj");
+    let (status, _) = rename(&dir, &moved).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(moved.join("sub/f.txt")).unwrap(),
+        "x"
+    );
+
+    // Renaming onto an existing path is a conflict.
+    let other = root.join("other.txt");
+    std::fs::write(&other, "keep").unwrap();
+    let (status, json) = rename(&new, &other).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(json["error"].as_str().unwrap().contains("already exists"));
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep");
+
+    // A symlink renames as itself; its target stays put.
+    let target = root.join("target.txt");
+    std::fs::write(&target, "t").unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let moved_link = root.join("moved-link");
+    let (status, _) = rename(&link, &moved_link).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(target.is_file());
+    assert!(moved_link.symlink_metadata().unwrap().is_symlink());
+    assert!(!link.exists());
+
+    // Missing source and missing destination parent are 400s.
+    let (status, _) = rename(&root.join("nope.txt"), &root.join("x.txt")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = rename(&new, &root.join("no-such-dir/x.txt")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn fs_delete_removes_files_dirs_symlinks_and_refuses_home() {
+    let state = test_state();
+    let root = test_dir("fs-delete");
+    let del = |path: &std::path::Path| {
+        let body = serde_json::json!({ "path": path.to_string_lossy() });
+        let state = state.clone();
+        async move { request(&state, Method::POST, "/api/v1/fs/delete", Some(body)).await }
+    };
+
+    // File: 204 and gone.
+    let file = root.join("f.txt");
+    std::fs::write(&file, "x").unwrap();
+    let (status, _) = del(&file).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!file.exists());
+
+    // Dir: recursive.
+    let dir = root.join("proj");
+    std::fs::create_dir_all(dir.join("deep/deeper")).unwrap();
+    std::fs::write(dir.join("deep/deeper/f.txt"), "x").unwrap();
+    let (status, _) = del(&dir).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!dir.exists());
+
+    // Symlink: the link is unlinked, the target survives.
+    let target = root.join("target.txt");
+    std::fs::write(&target, "t").unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (status, _) = del(&link).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(target.is_file());
+    assert!(std::fs::symlink_metadata(&link).is_err());
+
+    // Guards: the home directory is refused; a missing path is a plain 400.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let (status, json) = del(&home).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("refusing"));
+    let (status, _) = del(&root.join("nope")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn fs_dirs_lists_only_directories_sorted() {
     let state = test_state();
     let root = test_dir("fs-list");
@@ -168,6 +351,9 @@ async fn fs_endpoints_without_token_are_401() {
             "/api/v1/fs/validate",
             r#"{"candidates":["hosts"],"base":"/etc"}"#,
         ),
+        ("/api/v1/fs/create", r#"{"path":"/tmp/x","kind":"file"}"#),
+        ("/api/v1/fs/rename", r#"{"from":"/tmp/x","to":"/tmp/y"}"#),
+        ("/api/v1/fs/delete", r#"{"path":"/tmp/x"}"#),
     ] {
         let res = app(test_state())
             .oneshot(
