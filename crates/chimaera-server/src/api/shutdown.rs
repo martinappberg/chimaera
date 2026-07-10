@@ -33,6 +33,9 @@ fn kill_all_chat(state: &Arc<AppState>) -> usize {
 /// fresh work immediately, no reconnect. Returns how many were ended.
 pub(crate) async fn delete_all_sessions(State(state): State<Arc<AppState>>) -> Response {
     let killed = state.sessions.kill_all() + kill_all_chat(&state);
+    // Everything is ending, so everything uploaded goes too (kill_all skips
+    // the per-session retire hook for plain shells).
+    crate::upload::prune_all_uploads(&state);
     if killed > 0 {
         state.changes.notify_waiters();
     }
@@ -49,6 +52,7 @@ pub(crate) async fn delete_all_sessions(State(state): State<Arc<AppState>>) -> R
 /// escalation grace before tripping the graceful-shutdown future.
 pub(crate) async fn shutdown(State(state): State<Arc<AppState>>) -> Response {
     let killed = state.sessions.kill_all() + kill_all_chat(&state);
+    crate::upload::prune_all_uploads(&state);
     if killed > 0 {
         state.changes.notify_waiters();
     }
