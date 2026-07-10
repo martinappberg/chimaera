@@ -175,8 +175,14 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
         return;
     };
     let next = match ev {
-        AgentEvent::PermissionRequest { .. } => Some(AgentState::NeedsPermission),
-        AgentEvent::PermissionResolved { .. } => Some(AgentState::Running),
+        // Structured questions block the turn on a human exactly like
+        // permission prompts — the rail badges both the same way.
+        AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
+            Some(AgentState::NeedsPermission)
+        }
+        AgentEvent::PermissionResolved { .. } | AgentEvent::QuestionResolved { .. } => {
+            Some(AgentState::Running)
+        }
         AgentEvent::Error { fatal: true, .. } => Some(AgentState::Errored),
         AgentEvent::TurnStarted { .. } => Some(AgentState::Running),
         AgentEvent::TurnCompleted { .. } => Some(AgentState::Finished),

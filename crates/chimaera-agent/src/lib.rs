@@ -235,8 +235,14 @@ impl ChatManager {
                 AgentEvent::ModeChanged { mode_id } => {
                     info.current_mode = Some(mode_id.clone());
                 }
-                AgentEvent::PermissionRequest { .. } => info.pending_permission = true,
+                // "Pending permission" really means "waiting on a human
+                // decision" — structured questions block the turn exactly
+                // like permission prompts, so they set the same flag.
+                AgentEvent::PermissionRequest { .. } | AgentEvent::QuestionRequest { .. } => {
+                    info.pending_permission = true
+                }
                 AgentEvent::PermissionResolved { .. }
+                | AgentEvent::QuestionResolved { .. }
                 | AgentEvent::TurnStarted { .. }
                 | AgentEvent::TurnCompleted { .. }
                 | AgentEvent::TurnAborted { .. } => info.pending_permission = false,

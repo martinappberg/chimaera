@@ -117,6 +117,13 @@ pub enum AgentEvent {
     },
     QuestionResolved {
         request_id: String,
+        /// The user's chosen labels per question id — journaled so history
+        /// (and every replay) can show the question WITH its answer. Empty =
+        /// resolved without one (cancelled, expired, or a pre-answers
+        /// journal). Additive optional field: old journals deserialize to
+        /// empty, old clients ignore it.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        answers: std::collections::HashMap<String, Vec<String>>,
     },
     ModeChanged {
         mode_id: String,
