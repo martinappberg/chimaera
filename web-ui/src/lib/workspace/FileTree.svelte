@@ -6,10 +6,14 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { fsList, type FsEntry } from "../previews/files";
+  import { fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
   import { gitIndex, gitStatus } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
+  import { fsCreateOp, fsEpoch, fsRenameOp, requestDelete } from "./fsEvents";
+  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
@@ -29,9 +33,21 @@
      * `path` and scroll it into view. The nonce distinguishes repeats.
      */
     reveal?: { path: string; nonce: number } | null;
+    /**
+     * Inline-create request from the rail-section header buttons (targets the
+     * workspace root). The nonce distinguishes repeats.
+     */
+    createRequest?: { kind: "file" | "dir"; nonce: number } | null;
   }
 
-  let { root, onOpen, onDragStart, activePath, reveal = null }: Props = $props();
+  let {
+    root,
+    onOpen,
+    onDragStart,
+    activePath,
+    reveal = null,
+    createRequest = null,
+  }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
   let listings = $state<Map<string, FsEntry[]>>(new Map());
@@ -256,12 +272,165 @@
   }
 
   function onRowKey(e: KeyboardEvent, entry: FsEntry): void {
+    if (edit?.mode === "rename" && edit.path === entry.path) return; // the input owns keys
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       if (entry.kind === "dir") toggle(entry.path);
       else onOpen(entry.path);
+    } else if (e.key === "F2") {
+      e.preventDefault();
+      beginRename(entry);
     }
   }
+
+  // --- inline create/rename + the context menu -------------------------------
+
+  /** The one in-flight inline edit (create under a dir, or rename a row). */
+  let edit = $state<
+    | { mode: "create"; kind: "file" | "dir"; parent: string }
+    | { mode: "rename"; path: string; name: string; kind: "file" | "dir" }
+    | null
+  >(null);
+  let editDraft = $state("");
+  let editError = $state<string | null>(null);
+
+  /** Where the create row renders: after this row index; -1 = top (root). */
+  const createAfterIndex = $derived.by(() => {
+    if (edit?.mode !== "create" || edit.parent === root) return -1;
+    const parent = edit.parent;
+    return rows.findIndex((r) => r.entry.path === parent);
+  });
+
+  function beginCreate(kind: "file" | "dir", parent: string): void {
+    closeFilter();
+    if (parent !== root && !expanded.has(parent)) {
+      expanded = new Set(expanded).add(parent);
+      void load(parent);
+    }
+    edit = { mode: "create", kind, parent };
+    editDraft = "";
+    editError = null;
+  }
+
+  function beginRename(entry: FsEntry): void {
+    closeFilter();
+    edit = { mode: "rename", path: entry.path, name: entry.name, kind: entry.kind };
+    editDraft = entry.name;
+    editError = null;
+  }
+
+  function cancelEdit(): void {
+    edit = null;
+    editDraft = "";
+    editError = null;
+  }
+
+  /** Focus the fresh inline input; renames preselect the stem. */
+  function editFocus(node: HTMLInputElement, selectStem: boolean): void {
+    node.focus();
+    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
+  }
+
+  /** Commit the inline edit. `viaBlur` demotes a validation error to a
+   *  cancel — never a floating error beside an unfocused ghost input. */
+  async function commitEdit(viaBlur = false): Promise<void> {
+    const cur = edit;
+    if (cur === null) return;
+    const name = editDraft.trim();
+    if (name === "") {
+      cancelEdit();
+      return;
+    }
+    const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+    if (invalid !== null) {
+      if (viaBlur) cancelEdit();
+      else editError = invalid;
+      return;
+    }
+    try {
+      if (cur.mode === "create") {
+        const base = cur.parent === "/" ? "" : cur.parent;
+        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        cancelEdit();
+        // doReveal refreshes every ancestor listing (nested a/b/c names just
+        // work), expands the chain, scrolls + flashes the new row.
+        await doReveal(created);
+        if (cur.kind === "file") onOpen(created);
+      } else {
+        if (name === cur.name) {
+          cancelEdit();
+          return;
+        }
+        const parent = parentOf(cur.path);
+        await fsRenameOp(cur.path, `${parent === "/" ? "" : parent}/${name}`);
+        cancelEdit(); // the fsEpoch bump re-lists; App rewrites open tabs
+      }
+    } catch (err) {
+      editError = err instanceof Error ? err.message : "failed";
+    }
+  }
+
+  function onEditKeydown(e: KeyboardEvent): void {
+    e.stopPropagation(); // keep row/tree handlers and app chords away
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitEdit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit(); // nulling first makes the following blur a no-op
+    }
+  }
+
+  async function copyPath(path: string): Promise<void> {
+    if (await writeClipboard(path)) return;
+    try {
+      await navigator.clipboard.writeText(path);
+    } catch {
+      // clipboard unavailable — quiet, like the terminal's copy path
+    }
+  }
+
+  function menuFor(entry: FsEntry): ContextMenuEntry[] {
+    const dirTarget = entry.kind === "dir" ? entry.path : parentOf(entry.path);
+    return [
+      { label: "New File…", onSelect: () => beginCreate("file", dirTarget) },
+      { label: "New Folder…", onSelect: () => beginCreate("dir", dirTarget) },
+      "separator",
+      { label: "Rename…", onSelect: () => beginRename(entry) },
+      "separator",
+      { label: "Download", onSelect: () => void fsDownload(entry.path) },
+      { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      "separator",
+      {
+        label: "Delete…",
+        danger: true,
+        onSelect: () => requestDelete(entry.path, entry.kind),
+      },
+    ];
+  }
+
+  // Header-button create requests target the workspace root.
+  $effect(() => {
+    const req = createRequest;
+    if (req == null) return;
+    void req.nonce; // track repeats
+    untrack(() => beginCreate(req.kind, root));
+  });
+
+  // Any fs mutation (this tree, the Finder, a tab rename) re-lists every
+  // visible dir — same shape as the git-epoch refresh above, and the only
+  // channel for paths outside a git repo.
+  let lastFsEpoch = 0;
+  $effect(() => {
+    const epoch = $fsEpoch;
+    untrack(() => {
+      if (epoch === lastFsEpoch) return;
+      lastFsEpoch = epoch;
+      if (epoch === 0) return;
+      void load(root);
+      for (const dir of expanded) void load(dir);
+    });
+  });
 </script>
 
 <div class="tree-wrap">
@@ -297,6 +466,11 @@
     tabindex="-1"
     bind:this={treeEl}
     onkeydown={onTreeKeydown}
+    oncontextmenu={(e) =>
+      contextMenu.openAt(e, [
+        { label: "New File…", onSelect: () => beginCreate("file", root) },
+        { label: "New Folder…", onSelect: () => beginCreate("dir", root) },
+      ])}
   >
   {#if rootError !== null}
     <div class="tree-error">{rootError}</div>
@@ -304,12 +478,45 @@
     <!-- First listing still in flight (a big dir over ssh takes a while) —
          the delayed spinner keeps fast local opens flicker-free. -->
     <div class="tree-loading"><Spinner label="listing files…" /></div>
-  {:else if listings.get(root)?.length === 0}
+  {:else if listings.get(root)?.length === 0 && edit === null}
     <div class="tree-empty">empty</div>
   {:else if filterQuery !== "" && rows.length === 0}
     <div class="tree-empty">no matches</div>
   {/if}
-  {#each rows as { entry, depth } (entry.path)}
+  {#snippet createRow(depth: number)}
+    {#if edit?.mode === "create"}
+      <div class="node edit-node" style:padding-left={`${8 + depth * 13}px`}>
+        <span class="chev-spacer" aria-hidden="true"></span>
+        <span class="row-glyph">
+          {#if edit.kind === "dir"}
+            <FolderIcon open={false} size={14} />
+          {:else}
+            <FileIcon path={editDraft} size={14} />
+          {/if}
+        </span>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          class="edit-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label={edit.kind === "dir" ? "new folder name" : "new file name"}
+          placeholder={edit.kind === "dir" ? "folder name" : "name.ext — a/b nests"}
+          bind:value={editDraft}
+          use:editFocus={false}
+          onkeydown={onEditKeydown}
+          onblur={() => void commitEdit(true)}
+        />
+      </div>
+      {#if editError !== null}
+        <div class="edit-error" style:padding-left={`${8 + depth * 13}px`}>{editError}</div>
+      {/if}
+    {/if}
+  {/snippet}
+  {#if edit?.mode === "create" && createAfterIndex === -1}
+    {@render createRow(0)}
+  {/if}
+  {#each rows as { entry, depth }, i (entry.path)}
     {@const gEntry = entry.kind === "file" ? $gitIndex.files.get(entry.path) : undefined}
     {@const gDeco = gEntry ? decoFor(gEntry) : null}
     {@const gDir = entry.kind === "dir" ? $gitIndex.dirs.get(entry.path) : undefined}
@@ -327,12 +534,16 @@
       onclick={() => {
         // Files open via the drag's sub-threshold click path (below), so a
         // completed drag never ALSO opens the file in the focused pane.
+        if (edit?.mode === "rename" && edit.path === entry.path) return;
         if (entry.kind === "dir") toggle(entry.path);
       }}
       onpointerdowncapture={(e) => {
+        // The rename input stays a plain interactive target (rail-row idiom).
+        if (e.target instanceof Element && e.target.closest(".edit-input")) return;
         if (entry.kind === "file") onDragStart(e, entry.path);
       }}
       onkeydown={(e) => onRowKey(e, entry)}
+      oncontextmenu={(e) => contextMenu.openAt(e, menuFor(entry))}
     >
       {#if entry.kind === "dir"}
         <svg
@@ -363,22 +574,43 @@
           <FileIcon path={entry.path} size={14} />
         {/if}
       </span>
-      <span
-        class="node-name"
-        class:dir={entry.kind === "dir"}
-        style:color={gDeco ? gDeco.color : undefined}>{entry.name}</span>
-      {#if gDeco}
-        <span class="git-badge" style:color={gDeco.color} title={gDeco.label}
-          >{gDeco.letter}</span>
-      {:else if gDir}
+      {#if edit?.mode === "rename" && edit.path === entry.path}
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          class="edit-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          aria-label="rename to"
+          bind:value={editDraft}
+          use:editFocus={true}
+          onkeydown={onEditKeydown}
+          onblur={() => void commitEdit(true)}
+        />
+      {:else}
         <span
-          class="git-dot"
-          style:background={dirColor(gDir)}
-          title="contains changes"
-          aria-hidden="true"
-        ></span>
+          class="node-name"
+          class:dir={entry.kind === "dir"}
+          style:color={gDeco ? gDeco.color : undefined}>{entry.name}</span>
+        {#if gDeco}
+          <span class="git-badge" style:color={gDeco.color} title={gDeco.label}
+            >{gDeco.letter}</span>
+        {:else if gDir}
+          <span
+            class="git-dot"
+            style:background={dirColor(gDir)}
+            title="contains changes"
+            aria-hidden="true"
+          ></span>
+        {/if}
       {/if}
     </div>
+    {#if edit?.mode === "rename" && edit.path === entry.path && editError !== null}
+      <div class="edit-error" style:padding-left={`${8 + depth * 13}px`}>{editError}</div>
+    {/if}
+    {#if edit?.mode === "create" && createAfterIndex === i}
+      {@render createRow(depth + 1)}
+    {/if}
   {/each}
   </div>
 </div>
@@ -571,6 +803,40 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+  }
+
+  /* Inline create/rename input, sized like the name it replaces. */
+  .edit-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 0.74rem;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 3px;
+    padding: 0 4px;
+    height: 18px;
+    outline: none;
+  }
+
+  .edit-input::placeholder {
+    color: var(--muted);
+    opacity: 0.6;
+  }
+
+  .edit-node {
+    cursor: default;
+  }
+
+  .edit-error {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    color: var(--err);
+    padding-top: 1px;
+    padding-bottom: 2px;
+    white-space: normal;
+    word-break: break-word;
   }
 
   .node-name.dir {

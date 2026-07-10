@@ -1,9 +1,10 @@
 //! Filesystem endpoints: the folder picker (home + directories-only listing),
 //! and the file service backing file tabs — full directory listings, ranged
-//! raw reads, atomic single-file writes (lightweight editing), server-rendered
-//! markdown, paged CSV/TSV tables (with a transparent gzip tier for .gz/.bgz),
-//! and short-lived tickets that let iframes/img tags fetch bytes without a
-//! bearer header.
+//! raw reads, atomic single-file writes (lightweight editing), file management
+//! (create/rename/delete behind the file-manager context menus), server-
+//! rendered markdown, paged CSV/TSV tables (with a transparent gzip tier for
+//! .gz/.bgz), and short-lived tickets that let iframes/img tags fetch bytes
+//! without a bearer header.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -75,6 +76,25 @@ fn expand_tilde(raw: &str) -> anyhow::Result<PathBuf> {
 fn canonical(raw: &str) -> anyhow::Result<PathBuf> {
     let expanded = expand_tilde(raw)?;
     std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())
+}
+
+/// Resolve `raw` WITHOUT following a final symlink: `~` expanded, the parent
+/// canonicalized (it must exist), the leaf name kept as given. This is the
+/// resolution rename/delete need — `canonical()` would resolve a symlink to
+/// its target, and deleting a symlink must never delete what it points at.
+/// The leaf itself may or may not exist; callers check.
+fn canonical_parent_join(raw: &str) -> anyhow::Result<PathBuf> {
+    let expanded = expand_tilde(raw)?;
+    let name = expanded
+        .file_name()
+        .map(|n| n.to_os_string())
+        .with_context(|| format!("{} has no file name", expanded.display()))?;
+    let parent = match expanded.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => anyhow::bail!("{} has no parent directory", expanded.display()),
+    };
+    let parent = std::fs::canonicalize(parent).with_context(|| parent.display().to_string())?;
+    Ok(parent.join(name))
 }
 
 /// Canonicalize `raw` and require a regular file (not a directory).
@@ -905,6 +925,215 @@ pub(crate) async fn mkdir(Json(body): Json<MkdirRequest>) -> Response {
     }
 }
 
+/// Outcome of a create/rename/delete mutation: done (with the response
+/// body), or a name conflict the UI surfaces as an inline error (409).
+enum MutateOutcome {
+    Done(serde_json::Value),
+    Conflict(String),
+}
+
+/// Run a blocking filesystem mutation and map its outcome onto the shared
+/// response shape (200 Json / 409 conflict / 400 error). On success the
+/// touched paths nudge the git watcher (same reason as `put_file`: the
+/// tree/panel refetch without polling).
+async fn run_mutation<F>(state: &AppState, work: F, dirty: &[&str]) -> Response
+where
+    F: FnOnce() -> anyhow::Result<MutateOutcome> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(MutateOutcome::Done(body))) => {
+            for path in dirty {
+                crate::git::mark_path_dirty(state, path).await;
+            }
+            if body.is_null() {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                Json(body).into_response()
+            }
+        }
+        Ok(Ok(MutateOutcome::Conflict(msg))) => {
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+        }
+        Ok(Err(err)) => bad_request(&err),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("fs task failed: {join}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CreateKind {
+    File,
+    Dir,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateRequest {
+    path: String,
+    kind: CreateKind,
+}
+
+/// POST /api/v1/fs/create {path, kind:"file"|"dir"} — create an empty file or
+/// directory, making any missing parent directories (the inline "new file"
+/// input accepts nested `a/b/c.txt` names). Unlike `mkdir` this is an explicit
+/// user "New File/Folder", so an already-existing target is a 409 conflict,
+/// never a silent success. Returns the canonical created path. Same trust
+/// model as PUT /fs/file: the daemon runs as the user.
+pub(crate) async fn create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateRequest>,
+) -> Response {
+    let raw = body.path.clone();
+    let work = move || -> anyhow::Result<MutateOutcome> {
+        let expanded = expand_tilde(&body.path)?;
+        if expanded.as_os_str().is_empty() {
+            anyhow::bail!("empty path");
+        }
+        if let Some(parent) = expanded.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("{}: failed to create parent", parent.display()))?;
+        }
+        let conflict = || MutateOutcome::Conflict(format!("{} already exists", expanded.display()));
+        match body.kind {
+            CreateKind::File => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&expanded)
+                {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(conflict());
+                    }
+                    Err(err) => {
+                        return Err(anyhow::Error::new(err)
+                            .context(format!("{}: failed to create file", expanded.display())));
+                    }
+                }
+            }
+            CreateKind::Dir => match std::fs::create_dir(&expanded) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(conflict());
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "{}: failed to create directory",
+                        expanded.display()
+                    )));
+                }
+            },
+        }
+        let path =
+            std::fs::canonicalize(&expanded).with_context(|| expanded.display().to_string())?;
+        Ok(MutateOutcome::Done(
+            json!({ "path": path.to_string_lossy() }),
+        ))
+    };
+    run_mutation(&state, work, &[&raw]).await
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RenameRequest {
+    from: String,
+    to: String,
+}
+
+/// POST /api/v1/fs/rename {from, to} — rename (or move) a file or directory.
+/// `to` is a full path whose parent must already exist; an existing target is
+/// a 409 (except a case-only rename of the same file on a case-insensitive
+/// filesystem, which must go through). Symlinks are renamed as themselves,
+/// never their targets. Cross-filesystem moves are refused with a friendly
+/// error rather than silently degrading to copy+delete. Returns the canonical
+/// new path.
+pub(crate) async fn rename(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RenameRequest>,
+) -> Response {
+    let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
+    let work = move || -> anyhow::Result<MutateOutcome> {
+        let from = canonical_parent_join(&body.from)?;
+        if std::fs::symlink_metadata(&from).is_err() {
+            anyhow::bail!("{}: No such file or directory", from.display());
+        }
+        let to = canonical_parent_join(&body.to)?;
+        if std::fs::symlink_metadata(&to).is_ok() {
+            // canonicalize sees through case-insensitive filesystems: when the
+            // "existing" target is the source itself, this is a case-only
+            // rename (foo.txt -> Foo.txt) and must proceed.
+            let same = std::fs::canonicalize(&to)
+                .is_ok_and(|resolved| std::fs::canonicalize(&from).is_ok_and(|f| f == resolved));
+            if !same {
+                return Ok(MutateOutcome::Conflict(format!(
+                    "{} already exists",
+                    to.display()
+                )));
+            }
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                anyhow::bail!(
+                    "{} → {}: cannot move across filesystems — copy instead",
+                    from.display(),
+                    to.display()
+                );
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to rename {} to {}",
+                    from.display(),
+                    to.display()
+                )));
+            }
+        }
+        // Return the parent-resolved path as-is: canonicalizing now would
+        // resolve a renamed symlink to its target.
+        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+    };
+    run_mutation(&state, work, &[&raw_from, &raw_to]).await
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DeleteRequest {
+    path: String,
+}
+
+/// POST /api/v1/fs/delete {path} — permanently delete a file, symlink (the
+/// link itself, never its target), or directory (recursively). There is no
+/// server-side trash; the UI fronts this with an explicit confirmation.
+/// Refuses `/` (structurally: it has no file name) and the user's home
+/// directory. 204 on success.
+pub(crate) async fn delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DeleteRequest>,
+) -> Response {
+    let raw = body.path.clone();
+    let work = move || -> anyhow::Result<MutateOutcome> {
+        let target = canonical_parent_join(&body.path)?;
+        let home = home_dir()
+            .and_then(|h| std::fs::canonicalize(&h).with_context(|| h.display().to_string()));
+        if home.is_ok_and(|h| h == target) {
+            anyhow::bail!("refusing to delete your home directory");
+        }
+        let meta = std::fs::symlink_metadata(&target)
+            .with_context(|| format!("{}: No such file or directory", target.display()))?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&target)
+                .with_context(|| format!("{}: failed to delete directory", target.display()))?;
+        } else {
+            // Regular files AND symlinks (remove_file unlinks the link itself).
+            std::fs::remove_file(&target)
+                .with_context(|| format!("{}: failed to delete", target.display()))?;
+        }
+        Ok(MutateOutcome::Done(serde_json::Value::Null))
+    };
+    run_mutation(&state, work, &[&raw]).await
+}
+
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to
 /// one canonical file path and expires after [`TICKET_TTL`]; expired entries
 /// are purged on every create/lookup.
@@ -934,7 +1163,8 @@ impl TicketStore {
     }
 
     /// The path bound to `ticket`, if it exists and has not expired.
-    fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
+    /// Shared with the download module — same store, same capability model.
+    pub(crate) fn lookup(&mut self, ticket: &str) -> Option<PathBuf> {
         self.purge();
         self.tickets.get(ticket).map(|t| t.path.clone())
     }
@@ -958,15 +1188,17 @@ pub(crate) struct TicketRequest {
     path: String,
 }
 
-/// POST /api/v1/fs/ticket {path} — mint a 10-minute raw-access ticket for a
-/// file, so iframes and img tags (which cannot send Authorization headers)
-/// can fetch it via GET /raw/{ticket}. The bearer token never appears in a
-/// URL.
+/// POST /api/v1/fs/ticket {path} — mint a 10-minute access ticket for a file
+/// or directory, so iframes, img tags, and <a href> download navigations
+/// (none of which can send Authorization headers) can fetch it via GET
+/// /raw/{ticket} (files only) or GET /download/{ticket}. The bearer token
+/// never appears in a URL. A ticket is a per-path snapshot: renaming the
+/// path afterwards makes the fetch 404, deliberately.
 pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
-    let path = match canonical_file(&body.path) {
+    let path = match canonical(&body.path) {
         Ok(path) => path,
         Err(err) => return bad_request(&err),
     };
@@ -1030,7 +1262,10 @@ pub(crate) async fn raw(
         }
     };
     let total = match file.metadata().await {
-        Ok(meta) => meta.len(),
+        // Tickets may now name directories (folder downloads); /raw itself
+        // stays file-only — a dir ticket here is a 404, not a listing.
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return not_found(),
         Err(err) => {
             tracing::warn!(path = %path.display(), %err, "ticketed file unstattable");
             return not_found();

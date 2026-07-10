@@ -14,10 +14,20 @@
    * `onOpenFile` — every file viewer is reused unchanged.
    */
   import { untrack } from "svelte";
-  import { fsList, type FsEntry, humanSize } from "./files";
+  import { fsDownload, fsList, type FsEntry, humanSize } from "./files";
   import { fsHome } from "../workspace/sessions";
   import { getSetting } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
+  import {
+    fsCreateOp,
+    fsEpoch,
+    fsRenameOp,
+    lastFsMutation,
+    requestDelete,
+  } from "../workspace/fsEvents";
+  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
 
@@ -227,6 +237,169 @@
     }
   }
 
+  // --- inline create/rename + the context menu -------------------------------
+
+  /** The one in-flight inline edit (create at the top of a column, or a
+   *  rename replacing an entry row). */
+  let edit = $state<
+    | { mode: "create"; kind: "file" | "dir"; colIndex: number; dir: string }
+    | { mode: "rename"; colIndex: number; path: string; name: string; kind: "dir" | "file" }
+    | null
+  >(null);
+  let editDraft = $state("");
+  let editError = $state<string | null>(null);
+
+  function beginCreate(kind: "file" | "dir", colIndex: number, dir: string): void {
+    edit = { mode: "create", kind, colIndex, dir };
+    editDraft = "";
+    editError = null;
+  }
+
+  /** Create INSIDE a dir entry: open its column first, then edit there. */
+  async function beginCreateInside(kind: "file" | "dir", colIndex: number, entry: FsEntry): Promise<void> {
+    await openDir(colIndex, entry);
+    beginCreate(kind, colIndex + 1, entry.path);
+  }
+
+  function beginRename(colIndex: number, entry: FsEntry): void {
+    edit = { mode: "rename", colIndex, path: entry.path, name: entry.name, kind: entry.kind };
+    editDraft = entry.name;
+    editError = null;
+  }
+
+  function cancelEdit(): void {
+    edit = null;
+    editDraft = "";
+    editError = null;
+  }
+
+  /** Focus the fresh inline input; renames preselect the stem. */
+  function editFocus(node: HTMLInputElement, selectStem: boolean): void {
+    node.focus();
+    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
+  }
+
+  async function commitEdit(viaBlur = false): Promise<void> {
+    const cur = edit;
+    if (cur === null) return;
+    const name = editDraft.trim();
+    if (name === "") {
+      cancelEdit();
+      return;
+    }
+    const invalid = validateEntryName(name, { allowSlashes: cur.mode === "create" });
+    if (invalid !== null) {
+      if (viaBlur) cancelEdit();
+      else editError = invalid;
+      return;
+    }
+    try {
+      if (cur.mode === "create") {
+        const base = cur.dir === "/" ? "" : cur.dir;
+        const created = await fsCreateOp(`${base}/${name}`, cur.kind);
+        cancelEdit();
+        if (cur.kind === "file") onOpenFile(created, false);
+        // The fsEpoch rebuild below refreshes the columns.
+      } else {
+        if (name === cur.name) {
+          cancelEdit();
+          return;
+        }
+        const i = cur.path.lastIndexOf("/");
+        const parent = i > 0 ? cur.path.slice(0, i) : "";
+        await fsRenameOp(cur.path, `${parent}/${name}`);
+        cancelEdit();
+      }
+    } catch (e) {
+      editError = message(e);
+    }
+  }
+
+  function onEditKeydown(e: KeyboardEvent): void {
+    e.stopPropagation(); // the cols container owns arrows/Enter otherwise
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitEdit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit(); // nulling first makes the following blur a no-op
+    }
+  }
+
+  async function copyPath(p: string): Promise<void> {
+    if (await writeClipboard(p)) return;
+    try {
+      await navigator.clipboard.writeText(p);
+    } catch {
+      // clipboard unavailable — quiet
+    }
+  }
+
+  function menuFor(colIndex: number, entry: FsEntry): ContextMenuEntry[] {
+    const col = columns[colIndex];
+    const open: ContextMenuEntry =
+      entry.kind === "dir"
+        ? { label: "Open", onSelect: () => void openDir(colIndex, entry) }
+        : { label: "Open", onSelect: () => openFile(colIndex, entry, false) };
+    const createTarget: ContextMenuEntry[] =
+      entry.kind === "dir"
+        ? [
+            { label: "New File…", onSelect: () => void beginCreateInside("file", colIndex, entry) },
+            { label: "New Folder…", onSelect: () => void beginCreateInside("dir", colIndex, entry) },
+          ]
+        : [
+            { label: "New File…", onSelect: () => beginCreate("file", colIndex, col.dir) },
+            { label: "New Folder…", onSelect: () => beginCreate("dir", colIndex, col.dir) },
+          ];
+    return [
+      open,
+      "separator",
+      ...createTarget,
+      "separator",
+      { label: "Rename…", onSelect: () => beginRename(colIndex, entry) },
+      "separator",
+      { label: "Download", onSelect: () => void fsDownload(entry.path) },
+      { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+      "separator",
+      {
+        label: "Delete…",
+        danger: true,
+        onSelect: () => requestDelete(entry.path, entry.kind),
+      },
+    ];
+  }
+
+  function columnMenu(colIndex: number): ContextMenuEntry[] {
+    const dir = columns[colIndex]?.dir;
+    if (dir === undefined) return [];
+    return [
+      { label: "New File…", onSelect: () => beginCreate("file", colIndex, dir) },
+      { label: "New Folder…", onSelect: () => beginCreate("dir", colIndex, dir) },
+    ];
+  }
+
+  // Any fs mutation (this Finder, the tree, a tab rename) rebuilds the whole
+  // visible chain. When the mutation moved or removed the current location
+  // itself, follow it — the App-side tab rewrite then matches and no-ops.
+  let lastEpoch = 0;
+  $effect(() => {
+    const epoch = $fsEpoch;
+    const m = $lastFsMutation;
+    untrack(() => {
+      if (epoch === lastEpoch) return;
+      lastEpoch = epoch;
+      if (epoch === 0 || location === "") return;
+      let target = location;
+      if (m?.kind === "rename" && (location === m.from || location.startsWith(`${m.from}/`))) {
+        target = m.to + location.slice(m.from.length);
+      } else if (m?.kind === "delete" && (location === m.path || location.startsWith(`${m.path}/`))) {
+        const i = m.path.lastIndexOf("/");
+        target = i > 0 ? m.path.slice(0, i) : "/";
+      }
+      void navigateTo(target);
+    });
+  });
+
   // --- external nav reconcile ------------------------------------------------
 
   // Seed on mount and follow external `path` changes (a dir-link redirecting
@@ -311,40 +484,101 @@
       </div>
     {/if}
     {#each columns as col, ci (col.dir)}
-      <div class="col" class:active={ci === activeCol}>
-        {#if col.entries.length === 0}
+      <div
+        class="col"
+        class:active={ci === activeCol}
+        role="group"
+        aria-label={col.dir}
+        oncontextmenu={(e) => contextMenu.openAt(e, columnMenu(ci))}
+      >
+        {#if edit?.mode === "create" && edit.colIndex === ci}
+          <div class="row editing">
+            <span class="glyph">
+              {#if edit.kind === "dir"}
+                <FolderIcon size={14} />
+              {:else}
+                <FileIcon path={editDraft} size={14} />
+              {/if}
+            </span>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              class="edit-input"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              aria-label={edit.kind === "dir" ? "new folder name" : "new file name"}
+              placeholder={edit.kind === "dir" ? "folder name" : "name.ext — a/b nests"}
+              bind:value={editDraft}
+              use:editFocus={false}
+              onkeydown={onEditKeydown}
+              onblur={() => void commitEdit(true)}
+            />
+          </div>
+          {#if editError !== null}
+            <div class="edit-error">{editError}</div>
+          {/if}
+        {/if}
+        {#if col.entries.length === 0 && !(edit?.mode === "create" && edit.colIndex === ci)}
           <div class="empty">empty</div>
         {/if}
         {#each col.entries as entry (entry.path)}
-          <button
-            class="row"
-            class:sel={entry.path === col.selected}
-            title={entry.path}
-            onclick={(e) => onRowClick(ci, entry, e)}
-          >
-            <span class="glyph">
-              {#if entry.kind === "dir"}
-                <FolderIcon size={14} />
-              {:else}
-                <FileIcon path={entry.path} size={14} />
-              {/if}
-            </span>
-            <span class="name">{entry.name}</span>
-            {#if entry.kind === "dir"}
-              <svg class="chev" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
-                <path
-                  d="M6 4l4 4-4 4"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.6"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                />
-              </svg>
-            {:else}
-              <span class="meta">{humanSize(entry.size)}</span>
+          {#if edit?.mode === "rename" && edit.path === entry.path}
+            <div class="row editing">
+              <span class="glyph">
+                {#if entry.kind === "dir"}
+                  <FolderIcon size={14} />
+                {:else}
+                  <FileIcon path={entry.path} size={14} />
+                {/if}
+              </span>
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="edit-input"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                aria-label="rename to"
+                bind:value={editDraft}
+                use:editFocus={true}
+                onkeydown={onEditKeydown}
+                onblur={() => void commitEdit(true)}
+              />
+            </div>
+            {#if editError !== null}
+              <div class="edit-error">{editError}</div>
             {/if}
-          </button>
+          {:else}
+            <button
+              class="row"
+              class:sel={entry.path === col.selected}
+              title={entry.path}
+              onclick={(e) => onRowClick(ci, entry, e)}
+              oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
+            >
+              <span class="glyph">
+                {#if entry.kind === "dir"}
+                  <FolderIcon size={14} />
+                {:else}
+                  <FileIcon path={entry.path} size={14} />
+                {/if}
+              </span>
+              <span class="name">{entry.name}</span>
+              {#if entry.kind === "dir"}
+                <svg class="chev" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
+                  <path
+                    d="M6 4l4 4-4 4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              {:else}
+                <span class="meta">{humanSize(entry.size)}</span>
+              {/if}
+            </button>
+          {/if}
         {/each}
       </div>
     {/each}
@@ -547,6 +781,37 @@
     font-size: var(--text-xs);
     color: var(--muted);
     opacity: 0.75;
+  }
+
+  .row.editing {
+    cursor: default;
+  }
+
+  .edit-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 4px;
+    padding: 1px 5px;
+    outline: none;
+  }
+
+  .edit-input::placeholder {
+    color: var(--muted);
+    opacity: 0.6;
+  }
+
+  .edit-error {
+    padding: 1px 6px 3px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--err);
+    white-space: normal;
+    word-break: break-word;
   }
 
   .empty {
