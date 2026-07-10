@@ -816,10 +816,20 @@
   // --- clickable paths: the bridge's return direction ------------------------
 
   /** Resolution context for a session's terminal link provider. */
-  function linkContext(id: string): { cwd: string | null; root: string | null } {
+  function linkContext(id: string): {
+    cwd: string | null;
+    root: string | null;
+    workspaceId: string | null;
+  } {
     const s = sessionsById.get(id);
-    const root = workspaces.find((w) => w.id === s?.workspace_id)?.root ?? workspace?.root ?? null;
-    return { cwd: s?.cwd_current ?? s?.cwd ?? null, root };
+    // The session's own workspace, else the active one — the same preference
+    // order the root fallback uses, so root and workspaceId stay in step.
+    const ws = workspaces.find((w) => w.id === s?.workspace_id) ?? workspace;
+    return {
+      cwd: s?.cwd_current ?? s?.cwd ?? null,
+      root: ws?.root ?? null,
+      workspaceId: ws?.id ?? null,
+    };
   }
 
   /** A confirmed terminal path link was activated. */

@@ -188,6 +188,11 @@ export const VALIDATE_CAP = 200;
  * absolute `base`, `~` expands, and only hits come back (keyed by the
  * candidate as sent). Misses are simply absent — never errors.
  *
+ * `workspaceId` (additive — older daemons ignore it) enables the daemon's
+ * bare-basename fallback: a slash-less `name.ext` candidate that misses the
+ * base also resolves when exactly ONE file in that workspace's index bears
+ * the name ("FIGURE_PLAN.md" mentioned bare, living at paper/FIGURE_PLAN.md).
+ *
  * The server caps each request at VALIDATE_MAX; callers cache the FULL sent
  * list as resolved, so anything past that cap would otherwise stick as a
  * permanent miss. Loop in VALIDATE_MAX-sized batches (bounded by VALIDATE_CAP)
@@ -197,6 +202,7 @@ export const VALIDATE_CAP = 200;
 export async function fsValidate(
   candidates: string[],
   base: string,
+  workspaceId: string | null = null,
 ): Promise<Record<string, ValidatedPath>> {
   const capped = candidates.slice(0, VALIDATE_CAP);
   const out: Record<string, ValidatedPath> = {};
@@ -206,7 +212,11 @@ export async function fsValidate(
       await api("/fs/validate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ candidates: batch, base }),
+        body: JSON.stringify({
+          candidates: batch,
+          base,
+          ...(workspaceId !== null ? { workspace_id: workspaceId } : {}),
+        }),
       }),
     );
     Object.assign(out, body.valid);

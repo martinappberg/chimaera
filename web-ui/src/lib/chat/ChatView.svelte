@@ -257,13 +257,15 @@
 
   /** Prose path candidates validate against the daemon relative to the
    *  session cwd (the terminal-link mechanism) — only real paths become
-   *  clickable, and dirs route to the Finder. */
+   *  clickable, and dirs route to the Finder. The workspace id enables the
+   *  daemon's unique-basename fallback, keeping chat links and terminal
+   *  links in parity for a bare "FIGURE_PLAN.md" living in a subdirectory. */
   async function resolveProsePaths(
     candidates: string[],
   ): Promise<Map<string, { path: string; kind: "file" | "dir" }>> {
     const out = new Map<string, { path: string; kind: "file" | "dir" }>();
     try {
-      const valid = await fsValidate(candidates, session.cwd);
+      const valid = await fsValidate(candidates, session.cwd, session.workspace_id ?? null);
       for (const [cand, hit] of Object.entries(valid)) {
         out.set(cand, { path: hit.path, kind: hit.kind });
       }

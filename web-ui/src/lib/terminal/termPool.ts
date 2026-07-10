@@ -306,7 +306,8 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     fontOverride,
     // Clickable paths work in EVERY session — agents and shells alike.
     disposeLinks: registerPathLinks(term, id, {
-      context: (sid) => handlers?.linkContext(sid) ?? { cwd: null, root: null },
+      context: (sid) =>
+        handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
       open: (sid, path, kind, newSplit) => handlers?.onOpenPath(sid, path, kind, newSplit),
     }),
   };
