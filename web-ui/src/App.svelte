@@ -172,6 +172,8 @@
   import FolderPicker from "./lib/workspace/FolderPicker.svelte";
   import HomeScreen from "./lib/workspace/HomeScreen.svelte";
   import AskpassModal from "./lib/workspace/AskpassModal.svelte";
+  import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
+  import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
@@ -2478,6 +2480,10 @@
                   startRename(s);
                 }
               }}
+              oncontextmenu={(e) =>
+                contextMenu.openAt(e, [
+                  { label: "Rename…", onSelect: () => startRename(s) },
+                ])}
             >
               <!-- Session-type glyph carrying the state color — the same
                    mark as the pane tab (surface parity, rail included). -->
@@ -2969,6 +2975,9 @@
 <!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
      the workbench can prompt just like the home screen. Self-gating. -->
 <AskpassModal />
+<!-- The right-click context-menu singleton (rail rows, file tree, Finder,
+     pane tabs all open it via contextMenu.openAt). Self-gating. -->
+<ContextMenuHost />
 
 <!-- Ambient update offer (small, snoozable): a newer release, or a daemon
      older than this app. One per window; dismissals are origin-wide. -->
