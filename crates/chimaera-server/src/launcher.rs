@@ -104,17 +104,70 @@ pub(crate) struct AgentDetection {
     /// (a runnable one) — surfaced so the launcher can label provenance as the
     /// path you set, distinct from "yours" (PATH) or "chimaera" (managed).
     pub(crate) explicit: bool,
+    /// The binary's mtime when it was detected — the cache-staleness stamp
+    /// (see [`validate_cache_hit`]). `None` = stat failed at detection time
+    /// (or a test preset): the entry is trusted as before.
+    pub(crate) mtime: Option<std::time::SystemTime>,
+}
+
+/// Cache-hit staleness verdict (see [`detect`]).
+enum CacheHit {
+    /// Path still executes with the recorded mtime — trust the entry.
+    Fresh,
+    /// Path executes but the binary changed in place (an update): keep the
+    /// path, re-probe the version.
+    Changed(std::time::SystemTime),
+    /// Path no longer executes (the update moved/removed it): drop the
+    /// entry and re-resolve from scratch.
+    Gone,
+}
+
+/// Validate a cached detection before serving it. One stat — negligible next
+/// to a spawn — and what keeps "cached for the daemon's lifetime" honest
+/// across agent updates: an agent updated through its own TUI never tells the
+/// daemon, and a stale hit would feed a dangling path to every chat spawn AND
+/// its degrade-to-PTY fallback until a daemon restart.
+fn validate_cache_hit(hit: &AgentDetection) -> CacheHit {
+    let (Ok(path), Some(recorded)) = (&hit.path, hit.mtime) else {
+        return CacheHit::Fresh;
+    };
+    match exec_mtime(path) {
+        None => CacheHit::Gone,
+        Some(mtime) if mtime != recorded => CacheHit::Changed(mtime),
+        Some(_) => CacheHit::Fresh,
+    }
 }
 
 /// Detect one agent binary, served from the daemon-lifetime cache unless
 /// `refresh` bypasses it (the launcher refreshes after an install). The
 /// user's own PATH install wins; the managed bin dir is the fallback when
 /// the login shell misses — so spawns prefer the user's binary and pick up
-/// a managed install the moment it lands.
+/// a managed install the moment it lands. Cache hits are stat-validated so
+/// an update that replaced or moved the binary is noticed at the next spawn
+/// (without re-running the 6s login-shell probe the cache exists to avoid).
 pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> AgentDetection {
     if !refresh {
-        if let Some(hit) = crate::lock(&state.agent_bins).get(&kind) {
-            return hit.clone();
+        let hit = crate::lock(&state.agent_bins).get(&kind).cloned();
+        if let Some(hit) = hit {
+            match validate_cache_hit(&hit) {
+                CacheHit::Fresh => return hit,
+                CacheHit::Changed(mtime) => {
+                    // In-place update: the path still serves, but the cached
+                    // version is stale news — is_outdated/chat_capable and the
+                    // chat drift notice must see the new binary. 2s budget,
+                    // paid only on an actual mtime change.
+                    let mut fresh = hit;
+                    if let Ok(bin) = &fresh.path {
+                        fresh.version = probe_version(bin).await;
+                    }
+                    fresh.mtime = Some(mtime);
+                    crate::lock(&state.agent_bins).insert(kind, fresh.clone());
+                    return fresh;
+                }
+                CacheHit::Gone => {
+                    crate::lock(&state.agent_bins).remove(&kind);
+                }
+            }
         }
     }
     let explicit = crate::lock(&state.settings).agent_path(kind);
@@ -137,11 +190,13 @@ pub(crate) async fn detect(state: &AppState, kind: AgentKind, refresh: bool) -> 
         path.as_ref()
             .is_ok_and(|p| p.as_os_str() == std::ffi::OsStr::new(e))
     });
+    let mtime = path.as_ref().ok().and_then(|p| exec_mtime(p));
     let detection = AgentDetection {
         path,
         version,
         managed,
         explicit: used_explicit,
+        mtime,
     };
     // Cache only a positive result for the daemon's lifetime. A miss is often
     // transient — the daemon started before the login environment was ready,
@@ -171,6 +226,18 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// The mtime of `path` when it is a regular executable (symlinks followed) —
+/// the cache-validation stamp. `None` = missing, not executable, or the fs
+/// reports no mtime.
+fn exec_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+    meta.modified().ok()
 }
 
 /// Concrete locations an agent binary lands in, checked when the login-shell
@@ -1172,6 +1239,73 @@ mod tests {
                 PathBuf::from("/usr/local/bin/claude"),
             ]
         );
+    }
+
+    /// The daemon-lifetime detection cache must notice agent updates: a hit
+    /// whose path still executes with the recorded mtime is trusted; an
+    /// in-place replacement re-probes the version; a moved/removed binary
+    /// invalidates the entry. `mtime: None` (stat failed at detection, or a
+    /// test preset) is trusted as before — never a fall-through to the real
+    /// login shell.
+    #[test]
+    fn cache_hits_are_validated_against_the_binary_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-cache-validate-{}-{}",
+            std::process::id(),
+            &chimaera_core::generate_token()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let detection = |mtime: Option<std::time::SystemTime>| AgentDetection {
+            path: Ok(bin.clone()),
+            version: Some("2.1.204 (Claude Code)".into()),
+            managed: false,
+            explicit: false,
+            mtime,
+        };
+        let recorded = exec_mtime(&bin).expect("stamp");
+
+        assert!(matches!(
+            validate_cache_hit(&detection(Some(recorded))),
+            CacheHit::Fresh
+        ));
+        assert!(matches!(
+            validate_cache_hit(&detection(None)),
+            CacheHit::Fresh
+        ));
+
+        // In-place update: same path, a different mtime → version re-probe.
+        let stale_stamp = recorded - Duration::from_secs(100);
+        match validate_cache_hit(&detection(Some(stale_stamp))) {
+            CacheHit::Changed(fresh) => assert_eq!(fresh, recorded),
+            _ => panic!("an mtime change must re-probe the version"),
+        }
+
+        // The update moved/removed the binary → drop the entry, re-resolve.
+        std::fs::remove_file(&bin).unwrap();
+        assert!(matches!(
+            validate_cache_hit(&detection(Some(recorded))),
+            CacheHit::Gone
+        ));
+
+        // Negative entries carry nothing to validate.
+        assert!(matches!(
+            validate_cache_hit(&AgentDetection {
+                path: Err("not found".into()),
+                version: None,
+                managed: false,
+                explicit: false,
+                mtime: None,
+            }),
+            CacheHit::Fresh
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `is_executable` follows symlinks (a versioned `~/.local/bin/claude`

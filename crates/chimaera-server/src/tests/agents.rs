@@ -146,6 +146,50 @@ async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
     );
 }
 
+/// An agent updated IN PLACE (same path, new binary) must be noticed by the
+/// next spawn-time detect: the cached version is re-probed from the new
+/// binary without a full re-resolution — the login shell is never consulted,
+/// because the path still executes.
+#[tokio::test]
+async fn detect_reprobes_version_when_binary_changes_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = test_state();
+    let dir = test_dir("detect-reprobe");
+    let bin = dir.join("claude");
+    std::fs::write(&bin, "#!/bin/sh\necho '9.9.9 (Updated Code)'\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The cache as the daemon left it BEFORE the update: same path, the old
+    // version, an mtime stamp that no longer matches the file.
+    lock(&state.agent_bins).insert(
+        agents::AgentKind::Claude,
+        launcher::AgentDetection {
+            path: Ok(bin.clone()),
+            version: Some("2.1.204 (Claude Code)".into()),
+            managed: false,
+            explicit: false,
+            mtime: Some(std::time::UNIX_EPOCH),
+        },
+    );
+
+    let detection = launcher::detect(&state, agents::AgentKind::Claude, false).await;
+    assert_eq!(detection.path.unwrap(), bin);
+    assert_eq!(
+        detection.version.as_deref(),
+        Some("9.9.9 (Updated Code)"),
+        "the in-place update's version must be re-probed"
+    );
+    // The refreshed entry (new version + current stamp) is what the cache
+    // serves from now on.
+    let cached = lock(&state.agent_bins)
+        .get(&agents::AgentKind::Claude)
+        .cloned()
+        .unwrap();
+    assert_eq!(cached.version.as_deref(), Some("9.9.9 (Updated Code)"));
+    assert!(cached.mtime.is_some_and(|m| m != std::time::UNIX_EPOCH));
+}
+
 #[tokio::test]
 async fn create_agent_without_claude_is_409_with_hint() {
     let state = test_state();
