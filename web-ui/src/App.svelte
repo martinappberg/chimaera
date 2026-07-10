@@ -1929,6 +1929,9 @@
     openChangesFrom(paneId, sessionId, newSplit) {
       openChangesFromPane(paneId, sessionId, newSplit);
     },
+    revealPathInTree(path) {
+      revealInTree(path);
+    },
     navigateFinder(id, path) {
       layout = setFinderPath(layout, id, path);
     },

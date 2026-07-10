@@ -12,11 +12,15 @@
    */
   import { tabKey, type PaneNode, type Tab } from "./layout";
   import type { Session } from "../workspace/sessions";
-  import { dotState, dotTitle, switchingViews } from "../workspace/sessions";
+  import { dotState, dotTitle, renameSession, switchingViews } from "../workspace/sessions";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
-  import { basename, midTruncate, viewKindFor } from "../previews/files";
+  import { basename, fsDownload, midTruncate, viewKindFor } from "../previews/files";
+  import { fsRenameOp } from "../workspace/fsEvents";
+  import { stemLength, validateEntryName } from "../shared/fsNames";
+  import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
+  import { writeClipboard } from "../net/native";
   import { dirtyFiles } from "../shared/editing";
   import { gitIndex } from "../workspace/git";
   import { decoFor } from "../workspace/gitDeco";
@@ -231,6 +235,124 @@
     const active = node.tabs[node.active];
     if (active !== undefined) ctrl.dragTab(e, node.id, node.active, active);
   }
+
+  // --- tab context menu + inline rename --------------------------------------
+  //
+  // The "master name" pattern: renaming a terminal/chat tab pins the SESSION
+  // name (the same PATCH the rail rows and /rename use); renaming a file tab
+  // renames the file ON DISK (open tabs follow via App's mutation
+  // subscription). The tab label is never an independent alias.
+
+  /** tabKey of the tab being renamed inline, if any. */
+  let renamingTab = $state<string | null>(null);
+  let renameDraft = $state("");
+  let renameError = $state<string | null>(null);
+
+  function beginTabRename(tab: Tab): void {
+    renamingTab = tabKey(tab);
+    renameDraft = tab.surface === "file" ? basename(tab.path) : label(tab);
+    renameError = null;
+  }
+
+  function cancelTabRename(): void {
+    renamingTab = null;
+    renameDraft = "";
+    renameError = null;
+  }
+
+  /** Focus the rename input; file names preselect the stem. */
+  function renameFocus(node: HTMLInputElement, selectStem: boolean): void {
+    node.focus();
+    if (selectStem) node.setSelectionRange(0, stemLength(node.value));
+  }
+
+  async function commitTabRename(tab: Tab, viaBlur = false): Promise<void> {
+    if (renamingTab !== tabKey(tab)) return;
+    const name = renameDraft.trim();
+    if (name === "") {
+      cancelTabRename();
+      return;
+    }
+    if (tab.surface === "terminal") {
+      cancelTabRename();
+      if (name !== label(tab)) {
+        renameSession(tab.sessionId, name).catch(() => {
+          // next sessions snapshot restores the truth (rail-rename semantics)
+        });
+      }
+      return;
+    }
+    if (tab.surface !== "file") {
+      cancelTabRename();
+      return;
+    }
+    if (name === basename(tab.path)) {
+      cancelTabRename();
+      return;
+    }
+    const invalid = validateEntryName(name, { allowSlashes: false });
+    if (invalid !== null) {
+      if (viaBlur) cancelTabRename();
+      else renameError = invalid;
+      return;
+    }
+    try {
+      const i = tab.path.lastIndexOf("/");
+      const parent = i > 0 ? tab.path.slice(0, i) : "";
+      await fsRenameOp(tab.path, `${parent}/${name}`);
+      cancelTabRename(); // App's mutation subscription rewrites this tab
+    } catch (e) {
+      renameError = e instanceof Error ? e.message : "rename failed";
+    }
+  }
+
+  function onRenameKeydown(e: KeyboardEvent, tab: Tab): void {
+    e.stopPropagation(); // chords and terminal keys stay out
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitTabRename(tab);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelTabRename(); // nulled before blur fires, so blur no-ops
+    }
+  }
+
+  async function copyPath(p: string): Promise<void> {
+    if (await writeClipboard(p)) return;
+    try {
+      await navigator.clipboard.writeText(p);
+    } catch {
+      // clipboard unavailable — quiet
+    }
+  }
+
+  function tabMenu(tab: Tab, i: number): ContextMenuEntry[] {
+    const close: ContextMenuEntry = {
+      label: "Close",
+      onSelect: () => ctrl.closeTab(node.id, i),
+    };
+    if (tab.surface === "terminal") {
+      return [{ label: "Rename…", onSelect: () => beginTabRename(tab) }, "separator", close];
+    }
+    if (tab.surface === "file") {
+      const dirty = $dirtyFiles.has(tab.path);
+      return [
+        {
+          label: "Rename…",
+          disabled: dirty,
+          hint: dirty ? "save the file first — renaming would drop unsaved edits" : undefined,
+          onSelect: () => beginTabRename(tab),
+        },
+        { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
+        "separator",
+        { label: "Download", onSelect: () => void fsDownload(tab.path) },
+        { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
+        "separator",
+        close,
+      ];
+    }
+    return [close];
+  }
 </script>
 
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
@@ -258,18 +380,25 @@
           : label(tab)}
         onpointerdowncapture={(e) => {
           // Capture-phase (directly attached, not delegated); ignore presses
-          // on the close button so it stays a plain click.
-          if (e.target instanceof Element && e.target.closest(".tab-close")) return;
+          // on the close button and the rename input so they stay plain
+          // interactive targets.
+          if (e.target instanceof Element && e.target.closest(".tab-close, .tab-rename-input"))
+            return;
           ctrl.dragTab(e, node.id, i, tab);
         }}
         onauxclick={(e) => {
           // Middle-click closes the tab (detaches the view, never the session).
+          if (renamingTab === tabKey(tab)) return;
           if (e.button === 1) {
             e.preventDefault();
             ctrl.closeTab(node.id, i);
           }
         }}
-        ondblclick={() => ctrl.zoomPane(node.id)}
+        ondblclick={() => {
+          if (renamingTab === tabKey(tab)) return;
+          ctrl.zoomPane(node.id);
+        }}
+        oncontextmenu={(e) => contextMenu.openAt(e, tabMenu(tab, i))}
       >
         {#if tab.surface === "terminal"}
           {@const s = sessions.get(tab.sessionId)}
@@ -342,7 +471,24 @@
             <FileIcon path={tab.path} size={13} plain={i === node.active} />
           </span>
         {/if}
-        <span class="tab-name" style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span>
+        {#if renamingTab === tabKey(tab)}
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            class="tab-rename-input"
+            class:invalid={renameError !== null}
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            aria-label="rename"
+            title={renameError ?? undefined}
+            bind:value={renameDraft}
+            use:renameFocus={tab.surface === "file"}
+            onkeydown={(e) => onRenameKeydown(e, tab)}
+            onblur={() => void commitTabRename(tab, true)}
+          />
+        {:else}
+          <span class="tab-name" style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span>
+        {/if}
         <button
           class="tab-close"
           aria-label="close tab"
@@ -712,6 +858,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Inline tab rename, sized like the name it replaces. */
+  .tab-rename-input {
+    min-width: 0;
+    width: 12ch;
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 3px;
+    padding: 0 4px;
+    outline: none;
+  }
+
+  .tab-rename-input.invalid {
+    border-color: var(--err);
   }
 
   .tab-close {
