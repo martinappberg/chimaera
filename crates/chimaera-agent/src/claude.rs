@@ -39,8 +39,8 @@ use crate::model::{
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-07-07).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.204";
+/// CLI version these frame shapes were verified against (2026-07-10).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.206";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
