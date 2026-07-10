@@ -222,6 +222,15 @@
         // the same data from account/read.
         socket.send({ type: "get_usage" });
         return true;
+      case "compact":
+        // Codex has no slash catalog; thread/compact/start is the native
+        // path (the compaction turn's notice confirms completion). Claude's
+        // own /compact rides its catalog — fall through to the CLI send.
+        if (agentKind !== "codex") return false;
+        if (socket.send({ type: "compact" })) {
+          store.notice("compacting context…", "info");
+        }
+        return true;
       case "mcp":
         if (agentKind === "claude") {
           store.mcpServers = null;
@@ -300,19 +309,25 @@
     if (agentKind === "claude") {
       native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
     }
+    if (agentKind === "codex") {
+      native.push({ name: "compact", description: "compact conversation context" });
+    }
     const nativeNames = new Set(native.map((n) => n.name));
     return [...native, ...store.slashCommands.filter((c) => !nativeNames.has(c.name))];
   });
 
-  // --- checkpoint rewind (claude) -------------------------------------------
-  // Click "rewind" on a user message → dry-run report → confirm dialog →
-  // restore files (rewind_files) → optionally fork the conversation there.
+  // --- checkpoint rewind ------------------------------------------------------
+  // Claude: click "rewind" on a user message → dry-run report (rewind_files) →
+  // confirm dialog → restore files → optionally fork the conversation there.
+  // Codex: no file restore exists — the dialog is a plain confirmation and the
+  // rewind is conversation-only (the daemon rolls the thread back in place).
   // The intent flag keeps replayed RewindResult events from reopening UI.
+  const conversationOnlyRewind = agentKind !== "claude";
   let rewindIntent = $state<null | {
     id: string;
     preceding: string | null;
     fork: boolean;
-    stage: "dry" | "applying";
+    stage: "dry" | "confirm" | "applying";
   }>(null);
   const rewindReport = $derived(
     rewindIntent !== null && store.rewind?.userMessageId === rewindIntent.id
@@ -322,12 +337,33 @@
 
   function askRewind(checkpoint: { id: string; preceding: string | null }) {
     store.rewind = null;
-    rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
-    socket.send({ type: "rewind", user_message_id: checkpoint.id, dry_run: true });
+    if (conversationOnlyRewind) {
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm" };
+    } else {
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
+      socket.send({ type: "rewind", user_message_id: checkpoint.id, dry_run: true });
+    }
   }
 
   function confirmRewind(fork: boolean) {
     if (rewindIntent === null) return;
+    if (conversationOnlyRewind) {
+      const preceding = rewindIntent.preceding;
+      if (preceding === null) {
+        rewindIntent = null;
+        return;
+      }
+      rewindIntent = { ...rewindIntent, stage: "applying" };
+      void rewindSession(session.id, preceding)
+        .then(() => {
+          rewindIntent = null;
+        })
+        .catch((e: unknown) => {
+          rewindIntent = null;
+          store.notice(`rewind failed: ${String(e)}`, "error");
+        });
+      return;
+    }
     rewindIntent = { ...rewindIntent, fork, stage: "applying" };
     store.rewind = null;
     socket.send({ type: "rewind", user_message_id: rewindIntent.id, dry_run: false });
@@ -499,15 +535,29 @@
     {/if}
     {#each renderItems as item (item.key)}
       {#if item.t === "group"}
-        <ToolGroup tools={item.tools} {onOpenFile} />
+        <ToolGroup
+          tools={item.tools}
+          {onOpenFile}
+          onBackground={agentKind === "claude"
+            ? (id) => socket.send({ type: "background_tool", tool_call_id: id })
+            : undefined}
+          onStopTask={agentKind === "claude"
+            ? (id) => socket.send({ type: "stop_task", task_id: id })
+            : undefined}
+        />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <div class="msg user">
           <div class="bubble-row">
-            {#if agentKind === "claude" && block.checkpoint !== null}
+            <!-- Codex rewinds whole turns from a preceding anchor, so its
+                 first message (nothing precedes it) offers no button; claude
+                 can still restore files there. -->
+            {#if block.checkpoint !== null && (agentKind === "claude" || block.checkpoint.preceding !== null)}
               <button
                 class="rewind-btn"
-                title="rewind to before this message (restores files; optionally forks the conversation)"
+                title={agentKind === "claude"
+                  ? "rewind to before this message (restores files; optionally forks the conversation)"
+                  : "rewind the conversation to before this message"}
                 onclick={() => askRewind(block.checkpoint!)}
               >
                 ↺
@@ -623,6 +673,7 @@
     <RewindDialog
       intent={rewindIntent}
       report={rewindReport}
+      conversationOnly={conversationOnlyRewind}
       onCancel={() => (rewindIntent = null)}
       onConfirm={confirmRewind}
       {onOpenFile}

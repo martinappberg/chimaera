@@ -635,6 +635,127 @@ async fn codex_steer_settings_and_account_surface() {
         .expect("shutdown");
 }
 
+/// The codex rewind/compact surface (PROTOCOL.md pass 8): thread/rollback
+/// drops trailing turns in place (result = the updated thread), works right
+/// after thread/resume (the rewind-respawn path), and thread/compact/start
+/// acks then runs the compaction as its own turn with a contextCompaction
+/// item (no thread/compacted notification on the pinned version).
+#[tokio::test]
+#[ignore = "live: spawns real codex twice, needs auth, bills two tiny turns"]
+async fn codex_rollback_and_compact_surface() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let thread_id = chat
+        .thread_start(dir.path(), HANDSHAKE)
+        .await
+        .expect("thread/start");
+
+    // Two turns of history to roll back / compact.
+    for word in ["one", "two"] {
+        chat.turn_start(&thread_id, &format!("Reply with exactly: {word}"))
+            .await
+            .expect("turn/start");
+        loop {
+            let frame = chat
+                .recv(TURN)
+                .await
+                .expect("recv")
+                .expect("codex exited mid-turn");
+            if frame["method"] == "turn/completed" {
+                break;
+            }
+        }
+    }
+
+    // Rollback drops the last turn in place; the result is the thread object.
+    let rollback = chat
+        .request_raw(
+            "thread/rollback",
+            json!({ "threadId": thread_id, "numTurns": 1 }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/rollback answered");
+    assert!(
+        rollback.get("error").is_none(),
+        "rollback failed: {rollback}"
+    );
+    assert_eq!(
+        rollback["result"]["thread"]["id"].as_str(),
+        Some(thread_id.as_str()),
+        "rollback returns the updated thread: {rollback}"
+    );
+
+    // Compact acks empty, then runs as its own turn with a contextCompaction
+    // item — the driver's "context compacted" notice source.
+    let compact = chat
+        .request_raw(
+            "thread/compact/start",
+            json!({ "threadId": thread_id }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/compact/start answered");
+    assert!(compact.get("error").is_none(), "compact failed: {compact}");
+    let mut saw_compaction_item = false;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("codex exited mid-compaction");
+        match frame["method"].as_str() {
+            Some("item/completed") if frame["params"]["item"]["type"] == "contextCompaction" => {
+                saw_compaction_item = true;
+            }
+            Some("turn/completed") => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_compaction_item,
+        "compaction runs as a turn with a contextCompaction item"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+
+    // The rewind-respawn path: a fresh process resumes the thread and rolls
+    // back immediately, exactly like the driver's handshake does.
+    let mut resumed = CodexChat::spawn("codex", dir.path()).expect("respawn codex");
+    resumed.initialize(HANDSHAKE).await.expect("initialize");
+    let resume = resumed
+        .request_raw(
+            "thread/resume",
+            json!({ "threadId": thread_id, "cwd": dir.path() }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/resume answered");
+    assert_eq!(
+        resume["result"]["thread"]["id"].as_str(),
+        Some(thread_id.as_str()),
+        "resume keeps the thread id: {resume}"
+    );
+    let rollback = resumed
+        .request_raw(
+            "thread/rollback",
+            json!({ "threadId": thread_id, "numTurns": 1 }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("post-resume rollback answered");
+    assert!(
+        rollback.get("error").is_none(),
+        "rollback after resume failed: {rollback}"
+    );
+    resumed
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// The production path end-to-end: ChatManager + ClaudeAdapter driver against
 /// the real CLI — pinned --session-id, handshake Init, mapped events, journal
 /// replay. This is what a chat session actually runs as.

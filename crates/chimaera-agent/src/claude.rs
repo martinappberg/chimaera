@@ -1683,14 +1683,29 @@ impl ClaudeMapper {
                 ));
             }
             AgentCommand::StopTask { task_id } => {
+                // The client sends the transcript ROW id (all it ever sees).
+                // Resolve it to the native task key: task_rows maps task_id →
+                // row for both synthesized ("task:{id}") and Task-tool-card
+                // rows; the prefix strip covers a row whose map entry is gone.
+                let native = self
+                    .task_rows
+                    .iter()
+                    .find(|(_, row)| **row == task_id)
+                    .map(|(key, _)| key.clone())
+                    .or_else(|| task_id.strip_prefix("task:").map(String::from))
+                    .unwrap_or(task_id);
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::StopTask);
                 step.outbound.push(control_request_frame(
                     &id,
-                    json!({ "subtype": "stop_task", "task_id": task_id }),
+                    json!({ "subtype": "stop_task", "task_id": native }),
                 ));
             }
+            // Compact rides claude's own slash catalog: the composer sends
+            // "/compact" as prompt text, so the control channel has nothing
+            // to do (this command is the codex path).
+            AgentCommand::Compact => {}
             AgentCommand::Rewind {
                 user_message_id,
                 dry_run,

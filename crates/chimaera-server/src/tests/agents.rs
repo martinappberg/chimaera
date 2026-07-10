@@ -37,6 +37,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             model: None,
             resume: None,
             fork_at: None,
+            rollback_turns: None,
             theme: "dark".into(),
         },
     );

@@ -40,6 +40,10 @@ pub struct SpawnSpec {
     /// The agent's native session handle when known at spawn (claude
     /// `--session-id`/`--resume` value, codex thread id to resume).
     pub pinned_native_id: Option<String>,
+    /// Conversation-rewind respawn (codex): drop this many trailing turns via
+    /// `thread/rollback` right after `thread/resume`. Claude ignores it — its
+    /// fork rides argv (`--fork-session --resume-session-at`).
+    pub rollback_turns: Option<u32>,
     pub handshake_timeout: Duration,
 }
 
@@ -52,6 +56,7 @@ impl SpawnSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             pinned_native_id: None,
+            rollback_turns: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
@@ -100,6 +105,12 @@ pub trait Mapper: Send {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep;
     /// Emit any buffered coalesced text (the harness's timer tick + teardown).
     fn flush(&mut self) -> Option<AgentEvent>;
+    /// Time-driven work on the harness's ~100ms tick (codex auto-resolves
+    /// expired questions here; claude's question timeouts are CLI-side —
+    /// askUserQuestionTimeout — so it keeps the empty default).
+    fn tick(&mut self) -> DriverStep {
+        DriverStep::default()
+    }
 }
 
 /// A mapper's output for one input: outbound frames to write to the child,
@@ -283,6 +294,11 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
                     if io.events.send(ev).await.is_err() {
                         break DriverExit::Killed;
                     }
+                }
+                match deliver(&mut sink, &io, mapper.tick()).await {
+                    Delivery::Ok => {}
+                    Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
+                    Delivery::ReceiverGone => break DriverExit::Killed,
                 }
             }
         }

@@ -5,9 +5,16 @@
     block: Extract<ChatBlock, { kind: "tool" }>;
     /** Open a touched file in an adjacent pane (existing path-click flow). */
     onOpenFile?: (path: string) => void;
+    /** Move this running tool to the background (claude background_tasks —
+     *  the TUI's Ctrl-B). Provided only when the agent supports it. */
+    onBackground?: () => void;
+    /** Stop this running subagent (claude stop_task). */
+    onStop?: () => void;
   }
 
-  let { block, onOpenFile }: Props = $props();
+  let { block, onOpenFile, onBackground, onStop }: Props = $props();
+
+  const running = $derived(block.status === "in_progress" || block.status === "pending");
 
   /** Rows start COLLAPSED — the title carries the what, the dot the state;
    *  output is one click away. Failures auto-expand (the error is the
@@ -80,6 +87,29 @@
       <span class="glyph">{glyph}</span>
       <span class="title">{block.title}</span>
     </button>
+    {#if running && block.tool !== "agent" && onBackground !== undefined}
+      <!-- Ctrl-B parity: the tool keeps running while the agent moves on;
+           an honest "could not be backgrounded" notice covers refusals. -->
+      <button class="act" title="continue in the background — the agent moves on" onclick={onBackground}>
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M8 3v6M5 6.5L8 9.5l3-3M4 12.5h8"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+    {/if}
+    {#if running && block.tool === "agent" && onStop !== undefined}
+      <button class="act" title="stop this subagent" onclick={onStop}>
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <rect x="4.5" y="4.5" width="7" height="7" rx="1" fill="currentColor" />
+        </svg>
+      </button>
+    {/if}
     {#if block.locations.length > 0 && onOpenFile !== undefined}
       <!-- The workbench is right there: every located tool opens its file
            (image/markdown/csv/pdf land in their native previews). -->
@@ -179,7 +209,8 @@
   .expand.inert {
     cursor: default;
   }
-  .loc {
+  .loc,
+  .act {
     flex: none;
     display: inline-flex;
     background: none;
@@ -189,7 +220,8 @@
     cursor: pointer;
     transition: color 0.12s ease;
   }
-  .loc:hover {
+  .loc:hover,
+  .act:hover {
     color: var(--accent);
   }
   .glyph {

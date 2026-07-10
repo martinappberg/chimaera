@@ -218,19 +218,43 @@ impl Driver for CodexDriver {
         stream: &'a mut JsonlStream,
         spec: &'a SpawnSpec,
     ) -> std::result::Result<Handshake<CodexMapper>, String> {
-        let (thread_id, models) = codex_handshake(sink, stream, spec).await?;
+        let hs = codex_handshake(sink, stream, spec).await?;
+        // A failed conversation rewind degrades to a notice, not a dead pane:
+        // the thread resumed whole, only the rollback was refused/ignored.
+        let initial = hs
+            .rollback_error
+            .into_iter()
+            .map(|err| DriverStep {
+                events: vec![AgentEvent::Notice {
+                    text: format!(
+                        "conversation rewind failed: {err} (the agent may still see the rewound turns)"
+                    ),
+                }],
+                outbound: Vec::new(),
+            })
+            .collect();
         Ok(Handshake {
-            mapper: CodexMapper::new(thread_id, models),
-            initial: Vec::new(),
+            mapper: CodexMapper::new(hs.thread_id, hs.models, hs.next_id),
+            initial,
         })
     }
+}
+
+/// What the codex handshake hands the driver: the opened thread, the model
+/// catalog, the next free JSON-RPC id, and whether a requested
+/// conversation rollback failed (surfaced as a notice, never a dead pane).
+struct CodexHandshake {
+    thread_id: String,
+    models: Vec<crate::model::ModelInfo>,
+    next_id: u64,
+    rollback_error: Option<String>,
 }
 
 async fn codex_handshake(
     sink: &mut JsonlSink,
     stream: &mut JsonlStream,
     spec: &SpawnSpec,
-) -> std::result::Result<(String, Vec<crate::model::ModelInfo>), String> {
+) -> std::result::Result<CodexHandshake, String> {
     if sink.send(&initialize_request(0)).await.is_err() {
         return Err("initialize write failed".into());
     }
@@ -261,13 +285,51 @@ async fn codex_handshake(
         .as_str()
         .map(String::from)
         .ok_or_else(|| format!("thread open result missing thread.id: {result}"))?;
+    let mut next_id = 2u64;
+
+    // Conversation rewind: drop the trailing turns right after the resume,
+    // while the exchange is still lock-step (live-verified: thread/rollback
+    // works immediately after thread/resume; an overcount clamps silently,
+    // so the count must be exact — the server derives it from the journal).
+    let mut rollback_error = None;
+    if let (Some(_), Some(turns)) = (
+        &spec.pinned_native_id,
+        spec.rollback_turns.filter(|n| *n > 0),
+    ) {
+        let id = next_id;
+        next_id += 1;
+        if sink
+            .send(&json!({
+                "id": id, "method": "thread/rollback",
+                "params": { "threadId": thread_id, "numTurns": turns },
+            }))
+            .await
+            .is_err()
+        {
+            return Err("thread/rollback write failed".into());
+        }
+        // Bounded like model/list: a binary that silently drops the method
+        // must not wedge the handshake until the watchdog fires.
+        rollback_error = match tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rpc_result(stream, id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => Some(err),
+            Err(_) => Some("no response to thread/rollback (unsupported binary?)".into()),
+        };
+    }
 
     // The agent's own catalog beats any curated list; absence (older
     // binaries) is not a handshake failure.
+    let list_id = next_id;
+    next_id += 1;
     let mut models = Vec::new();
     if sink
         .send(&json!({
-            "id": 2, "method": "model/list",
+            "id": list_id, "method": "model/list",
             "params": { "includeHidden": false, "cursor": null, "limit": 100 },
         }))
         .await
@@ -277,7 +339,7 @@ async fn codex_handshake(
         // can't wedge the whole handshake until the 20s watchdog fires — the
         // model catalog is optional, so a timeout is just an empty catalog.
         let listed =
-            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, 2)).await;
+            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, list_id)).await;
         if let Ok(Ok(list)) = listed {
             for m in list["data"].as_array().unwrap_or(&Vec::new()) {
                 if let Some(id) = m["model"].as_str() {
@@ -304,7 +366,12 @@ async fn codex_handshake(
             }
         }
     }
-    Ok((thread_id, models))
+    Ok(CodexHandshake {
+        thread_id,
+        models,
+        next_id,
+        rollback_error,
+    })
 }
 
 async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Result<Value, String> {
@@ -345,6 +412,19 @@ enum PendingRpc {
     AccountRead {
         report: bool,
     },
+    /// thread/compact/start ack; the compaction itself runs as its own turn
+    /// whose contextCompaction item lands the "context compacted" notice.
+    Compact,
+}
+
+/// An outstanding item/tool/requestUserInput prompt.
+struct PendingQuestion {
+    /// The server request's JSON-RPC id (the answer goes back by it).
+    rpc_id: Value,
+    /// Auto-skip deadline (the request's `autoResolutionMs`): the official
+    /// client sends empty answers when it fires; ours does too, from the
+    /// harness tick.
+    deadline: Option<std::time::Instant>,
 }
 
 /// Protocol → normalized-model translator for the app-server stream. Pure
@@ -378,9 +458,9 @@ struct CodexMapper {
     /// Outstanding server approval requests: our request_id →
     /// (JSON-RPC id, option_id → prebuilt decision payload).
     pending_approvals: HashMap<String, (Value, HashMap<String, Value>)>,
-    /// Outstanding item/tool/requestUserInput prompts: request_id → rpc id.
+    /// Outstanding item/tool/requestUserInput prompts by request_id.
     /// Answers go back as {answers:{questionId:{answers:[label,…]}}}.
-    pending_questions: HashMap<String, Value>,
+    pending_questions: HashMap<String, PendingQuestion>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
@@ -391,6 +471,10 @@ struct CodexMapper {
     out_streamed: HashMap<String, usize>,
     /// Latest cumulative token usage (turn/completed carries none here).
     last_usage: Usage,
+    /// The last turn-OPENING send's minted uuid — the fork anchor chain for
+    /// Checkpoint events. Steered/buffered sends join a running turn, and
+    /// thread/rollback drops whole turns, so only turn openers anchor.
+    last_checkpoint: Option<String>,
     next_id: u64,
 }
 
@@ -408,7 +492,7 @@ fn codex_modes() -> Vec<crate::model::ModeInfo> {
 }
 
 impl CodexMapper {
-    fn new(thread_id: String, models: Vec<crate::model::ModelInfo>) -> Self {
+    fn new(thread_id: String, models: Vec<crate::model::ModelInfo>, next_id: u64) -> Self {
         Self {
             thread_id,
             models,
@@ -432,7 +516,10 @@ impl CodexMapper {
             item_locations: HashMap::new(),
             out_streamed: HashMap::new(),
             last_usage: Usage::default(),
-            next_id: 3, // 0/1/2 spent by the handshake (init, thread, model/list)
+            last_checkpoint: None,
+            // The handshake minted 0..next_id (init, thread open, optional
+            // rollback, model/list) and hands over the next free id.
+            next_id,
         }
     }
 
@@ -864,6 +951,12 @@ impl CodexMapper {
             (PendingRpc::AccountRead { .. }, Some(_)) => {
                 // Absent on older binaries; the chip just stays empty.
             }
+            (PendingRpc::Compact, Some(err)) => {
+                step.events.push(AgentEvent::Error {
+                    message: format!("compact failed: {}", err["message"]),
+                    fatal: false,
+                });
+            }
             (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
                 self.current_mode = mode_id.clone();
                 step.events.push(AgentEvent::ModeChanged { mode_id });
@@ -871,7 +964,15 @@ impl CodexMapper {
             (PendingRpc::AccountRead { report }, None) => {
                 self.on_account(&frame["result"], report, step);
             }
-            (PendingRpc::TurnStart | PendingRpc::Steer { .. } | PendingRpc::Interrupt, None) => {}
+            // Compact's ack is an empty result; the compaction turn's
+            // contextCompaction item carries the visible notice.
+            (
+                PendingRpc::TurnStart
+                | PendingRpc::Steer { .. }
+                | PendingRpc::Interrupt
+                | PendingRpc::Compact,
+                None,
+            ) => {}
         }
     }
 
@@ -1230,7 +1331,14 @@ impl CodexMapper {
                 })
                 .unwrap_or_default();
             if !questions.is_empty() {
-                self.pending_questions.insert(request_id.clone(), rpc_id);
+                // autoResolutionMs: the server wants this prompt auto-skipped
+                // after the timeout (the official client's behavior) — the
+                // harness tick expires it with empty answers + a notice.
+                let deadline = params["autoResolutionMs"]
+                    .as_u64()
+                    .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+                self.pending_questions
+                    .insert(request_id.clone(), PendingQuestion { rpc_id, deadline });
                 step.events.push(AgentEvent::QuestionRequest {
                     request_id,
                     questions,
@@ -1517,6 +1625,16 @@ impl CodexMapper {
                     // turn/start (rejected) and lose the echoed message.
                     self.buffered_sends.push((input, client_msg_id));
                 } else {
+                    // Only a turn-OPENING send anchors a checkpoint: rewind
+                    // rolls back whole turns (thread/rollback numTurns), so a
+                    // steered message — joining a running turn — is not a
+                    // rewindable boundary. Emitted right after UserMessage
+                    // (the journal-truncation cut relies on the adjacency).
+                    let preceding = self.last_checkpoint.replace(client_msg_id.clone());
+                    step.events.push(AgentEvent::Checkpoint {
+                        user_message_id: client_msg_id.clone(),
+                        preceding_uuid: preceding,
+                    });
                     self.emit_turn_start(input, client_msg_id, &mut step);
                 }
             }
@@ -1602,7 +1720,7 @@ impl CodexMapper {
                 request_id,
                 answers,
             } => {
-                let Some(rpc_id) = self.pending_questions.remove(&request_id) else {
+                let Some(question) = self.pending_questions.remove(&request_id) else {
                     return step;
                 };
                 let mut map = serde_json::Map::new();
@@ -1610,11 +1728,26 @@ impl CodexMapper {
                     map.insert(qid.clone(), json!({ "answers": labels }));
                 }
                 step.outbound
-                    .push(json!({ "id": rpc_id, "result": { "answers": map } }));
+                    .push(json!({ "id": question.rpc_id, "result": { "answers": map } }));
                 step.events
                     .push(AgentEvent::QuestionResolved { request_id });
             }
-            // No codex equivalents on this surface.
+            AgentCommand::Compact => {
+                // Live-verified: the ack is an empty result; the compaction
+                // then runs as its own turn whose contextCompaction item maps
+                // to the "context compacted" notice (no thread/compacted
+                // notification on the pinned version).
+                let id = self.rpc_id();
+                self.pending_rpcs.insert(id, PendingRpc::Compact);
+                step.outbound.push(json!({
+                    "id": id, "method": "thread/compact/start",
+                    "params": { "threadId": self.thread_id },
+                }));
+            }
+            // No codex equivalents on this surface. Rewind is not a driver
+            // command here: the conversation rewind is the server's respawn
+            // recipe (thread/resume + thread/rollback at handshake), and
+            // codex has no rewind_files-style file restore to answer with.
             AgentCommand::SetThinking { .. }
             | AgentCommand::SetUltracode { .. }
             | AgentCommand::BackgroundTool { .. }
@@ -1623,6 +1756,33 @@ impl CodexMapper {
             | AgentCommand::GetMcp
             | AgentCommand::SetMcpEnabled { .. }
             | AgentCommand::ReconnectMcp { .. } => {}
+        }
+        step
+    }
+
+    /// Auto-skip questions whose `autoResolutionMs` deadline passed: empty
+    /// answers back to the server (the official client's behavior), the card
+    /// withdrawn, and a visible note in the transcript. Split from [`tick`]
+    /// so tests can drive the clock.
+    fn expire_questions(&mut self, now: std::time::Instant) -> DriverStep {
+        let mut step = DriverStep::default();
+        let expired: Vec<String> = self
+            .pending_questions
+            .iter()
+            .filter(|(_, q)| q.deadline.is_some_and(|d| d <= now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in expired {
+            let Some(question) = self.pending_questions.remove(&request_id) else {
+                continue;
+            };
+            step.outbound
+                .push(json!({ "id": question.rpc_id, "result": { "answers": {} } }));
+            step.events
+                .push(AgentEvent::QuestionResolved { request_id });
+            step.events.push(AgentEvent::Notice {
+                text: "question timed out unanswered — skipped (codex auto-resolution)".into(),
+            });
         }
         step
     }
@@ -1643,6 +1803,9 @@ impl Mapper for CodexMapper {
     }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
+    }
+    fn tick(&mut self) -> DriverStep {
+        self.expire_questions(std::time::Instant::now())
     }
 }
 
@@ -1741,7 +1904,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new())
+        CodexMapper::new("thr-1".into(), Vec::new(), 3)
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -2212,6 +2375,122 @@ mod tests {
             &step.events[0],
             AgentEvent::QuestionResolved { request_id } if request_id == "codex-92"
         ));
+    }
+
+    #[test]
+    fn turn_opening_send_anchors_checkpoint_but_steer_does_not() {
+        let mut m = mapper();
+        // First turn-opening send: checkpoint with nothing preceding.
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "one".into() }],
+        });
+        let first_id = match (&step.events[0], &step.events[1]) {
+            (
+                AgentEvent::UserMessage { .. },
+                AgentEvent::Checkpoint {
+                    user_message_id,
+                    preceding_uuid,
+                },
+            ) => {
+                assert!(preceding_uuid.is_none(), "nothing precedes the first send");
+                user_message_id.clone()
+            }
+            other => panic!("expected UserMessage+Checkpoint, got {other:?}"),
+        };
+        // A steered mid-turn send joins the running turn: no checkpoint (the
+        // rewind rolls back whole turns, so a steer is not a boundary).
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-A" } },
+        }));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "also".into(),
+            }],
+        });
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Checkpoint { .. })),
+            "steered sends must not anchor checkpoints"
+        );
+        // The next turn-opening send chains its preceding uuid.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "two".into() }],
+        });
+        match &step.events[1] {
+            AgentEvent::Checkpoint { preceding_uuid, .. } => {
+                assert_eq!(preceding_uuid.as_deref(), Some(first_id.as_str()));
+            }
+            other => panic!("expected Checkpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_command_sends_thread_compact_start_and_error_surfaces() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Compact);
+        assert_eq!(step.outbound[0]["method"], "thread/compact/start");
+        assert_eq!(step.outbound[0]["params"]["threadId"], "thr-1");
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        // The ack is an empty result — nothing to render (the compaction
+        // turn's contextCompaction item is the visible notice).
+        let step = m.on_frame(&json!({ "id": id, "result": {} }));
+        assert!(step.events.is_empty());
+        // A refusal surfaces as a non-fatal error.
+        let step = m.on_command(AgentCommand::Compact);
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id,
+            "error": { "message": "not now" },
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Error { fatal: false, message } if message.contains("not now")
+        ));
+    }
+
+    #[test]
+    fn auto_resolution_deadline_skips_question_with_empty_answers() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "id": 93,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "questions": [{ "id": "q1", "question": "Proceed?" }],
+                "autoResolutionMs": 50,
+            },
+        }));
+        // Before the deadline: nothing expires.
+        let step = m.expire_questions(std::time::Instant::now());
+        assert!(step.outbound.is_empty() && step.events.is_empty());
+        // Past the deadline: empty answers + withdrawal + a visible note.
+        let later = std::time::Instant::now() + Duration::from_millis(60);
+        let step = m.expire_questions(later);
+        assert_eq!(step.outbound[0]["id"], 93);
+        assert_eq!(step.outbound[0]["result"]["answers"], json!({}));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id } if request_id == "codex-93"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("auto-resolution")
+        ));
+        // A question without the field never expires.
+        m.on_frame(&json!({
+            "id": 94,
+            "method": "item/tool/requestUserInput",
+            "params": { "questions": [{ "id": "q2", "question": "Still there?" }] },
+        }));
+        let far = std::time::Instant::now() + Duration::from_secs(3600);
+        let step = m.expire_questions(far);
+        assert!(step.outbound.is_empty(), "no deadline, no auto-skip");
     }
 
     #[test]

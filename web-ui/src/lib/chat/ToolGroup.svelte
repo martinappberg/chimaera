@@ -12,9 +12,13 @@
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
     onOpenFile?: (path: string) => void;
+    /** Background/stop a running row (claude only — the host omits these
+     *  for agents without the capability). Called with the tool row id. */
+    onBackground?: (id: string) => void;
+    onStopTask?: (id: string) => void;
   }
 
-  let { tools, onOpenFile }: Props = $props();
+  let { tools, onOpenFile, onBackground, onStopTask }: Props = $props();
 
   const running = $derived(
     tools.some((t) => t.status === "in_progress" || t.status === "pending"),
@@ -79,7 +83,12 @@
   {#if open}
     <div class="rows">
       {#each tools as tool (tool.id)}
-        <ToolCallCard block={tool} {onOpenFile} />
+        <ToolCallCard
+          block={tool}
+          {onOpenFile}
+          onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
+          onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
+        />
       {/each}
     </div>
   {/if}
