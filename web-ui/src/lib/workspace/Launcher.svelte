@@ -38,9 +38,13 @@
     /** Report the freshly-probed catalog up so the split button reflects it
      *  (this popover always re-detects on open). */
     onAgents?: (agents: AgentInfo[]) => void;
+    /** The window's last-known catalog (App keeps it from boot + installs).
+     *  Rows paint from it INSTANTLY — no "checking…" flash on every open —
+     *  and the background re-detect swaps in the truth. */
+    initial?: AgentInfo[] | null;
   }
 
-  let { anchor, onPick, onInstall, onClose, onAgents }: Props = $props();
+  let { anchor, onPick, onInstall, onClose, onAgents, initial = null }: Props = $props();
 
   let agents = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
@@ -69,19 +73,31 @@
 
   onMount(() => {
     const def = getAgentDefault();
+    // The window's last-known catalog paints the rows synchronously; only a
+    // cold window (boot probe never landed) fetches before first paint.
+    if (initial !== null && initial.length > 0) {
+      agents = initial;
+      hl = Math.max(
+        0,
+        initial.findIndex((x) => x.id === def.agent),
+      );
+    }
     const loadTimer = setTimeout(() => (showLoading = true), 150);
-    void listAgents()
+    // The detection cache is daemon-lifetime, so an install/update made
+    // since (field report: codex updated, chip still said "update") would
+    // never surface. Whatever painted first — the prop or the daemon's
+    // cached rows — a background re-detect swaps in the truth.
+    const first = agents !== null ? Promise.resolve(agents) : listAgents();
+    void first
       .then((a) => {
-        agents = a;
-        onAgents?.(a);
-        hl = Math.max(
-          0,
-          a.findIndex((x) => x.id === def.agent),
-        );
-        // The detection cache is daemon-lifetime, so an install/update made
-        // since (field report: codex updated, chip still said "update")
-        // would never surface. Show the cached rows instantly, then
-        // re-detect in the background and swap in the truth.
+        if (agents === null) {
+          agents = a;
+          onAgents?.(a);
+          hl = Math.max(
+            0,
+            a.findIndex((x) => x.id === def.agent),
+          );
+        }
         return listAgents(true).then((fresh) => {
           if (fresh.length > 0) {
             agents = fresh;
@@ -93,7 +109,7 @@
         if (agents === null) {
           loadError = e instanceof Error ? e.message : "failed to load agents";
         }
-        // refresh failures keep the cached rows — never blank a shown list
+        // refresh failures keep the shown rows — never blank a shown list
       })
       .finally(() => clearTimeout(loadTimer));
 
@@ -273,11 +289,14 @@
                  structured chat UI — the default; the terminal button (⌘↵)
                  is the explicit TUI path. No chat view → one "open", the TUI. -->
             {#if a.chatCapable}
+              <!-- Icon-only, so it explains itself: a custom tooltip on a
+                   ~0.5s delay (the native title's is longer and easy to
+                   miss). data-tip is the ::after content. -->
               <button
                 class="tbtn"
                 tabindex="-1"
                 aria-label="open in the terminal"
-                title="open in the terminal ({isMac ? '⌘' : 'ctrl'}↵)"
+                data-tip="open in the terminal · {isMac ? '⌘' : 'ctrl'}↵"
                 onclick={(e) => {
                   e.stopPropagation();
                   activate(i, "term");
@@ -595,6 +614,7 @@
   }
 
   .tbtn {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -606,6 +626,33 @@
   .tbtn:hover {
     color: var(--fg);
     border-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  }
+
+  /* The delayed tooltip: nothing on a pass-through hover, fades in after
+     ~0.5s of intent. Pure CSS off data-tip; pointer-events off so it never
+     steals the hover it explains. */
+  .tbtn::after {
+    content: attr(data-tip);
+    position: absolute;
+    top: calc(100% + 7px);
+    right: -2px;
+    z-index: 5;
+    padding: 3px 9px;
+    white-space: nowrap;
+    font-size: var(--text-xs);
+    color: var(--fg);
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease;
+  }
+
+  .tbtn:hover::after {
+    opacity: 1;
+    transition-delay: 0.5s;
   }
 
   .obtn:active,

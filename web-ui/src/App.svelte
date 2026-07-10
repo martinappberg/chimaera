@@ -2939,6 +2939,7 @@
 {#if launcherOpen && activeWsId !== null && launcherAnchor !== null}
   <Launcher
     anchor={launcherAnchor}
+    initial={agents}
     onPick={launcherPick}
     onInstall={launcherInstall}
     onClose={closeLauncher}
