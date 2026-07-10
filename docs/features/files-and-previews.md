@@ -132,3 +132,17 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   real editors; agents write most code).
 - **Do not change:** the no-IDE-editor boundary, and streaming (never whole-file loads). The set of
   preview formats is expected to grow.
+
+### File management (context menus, create/rename/delete, downloads) — why it exists
+_Captured 2026-07-10 (from the maintainer)._
+
+- **Problem it solves:** downloads are the heart of it — *"when on a remote it is nice to get the
+  files to your local desktop."* The shaping constraint: *"you don't have local files on your
+  remote"* — a remote workflow strands your outputs on the cluster, and the download menu brings
+  them home. The rest (create/rename/delete, the context menus, the master-name rename) rounds out
+  the file surfaces around that.
+- **How settled it is:** the maintainer intends to keep the current behavior but explicitly did not
+  want hard promises (*"I intend to keep this but could change"*). Grade: everything here is an
+  **addition**, not a core bet — improve freely if a better shape appears.
+- **Do not change (or: open to change):** open to change (*"can change"*). Nothing in this
+  capability is frozen; only the remote→local retrieval *why* is settled.
