@@ -8,8 +8,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_zip::{Compression, ZipEntryBuilder};
+use async_zip::{Compression, ZipDateTime, ZipDateTimeBuilder, ZipEntryBuilder};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -36,9 +37,9 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 /// streams verbatim (Content-Length included, so the browser shows progress);
 /// a directory streams as `<name>.zip`. Renaming or deleting the path after
 /// minting simply 404s (the ticket is a per-path snapshot); a walk already in
-/// flight finishes on whatever it can still read. Entry mtimes are not
-/// carried into the zip (the writer's default DOS date) — a deliberate
-/// omission, not worth a date dependency.
+/// flight finishes on whatever it can still read. Entry mtimes ride into the
+/// zip as DOS datetimes in UTC (zip carries no timezone; without them every
+/// extracted file would read as 1980, the DOS epoch).
 pub(crate) async fn download(
     State(state): State<Arc<AppState>>,
     Path(ticket): Path<String>,
@@ -136,8 +137,15 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
         } else {
             format!("{root_name}/{rel}/")
         };
+        let dir_mtime = tokio::fs::metadata(&dir)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
         zip.write_entry_whole(
-            ZipEntryBuilder::new(dir_entry.into(), Compression::Stored),
+            with_mtime(
+                ZipEntryBuilder::new(dir_entry.into(), Compression::Stored),
+                dir_mtime,
+            ),
             &[],
         )
         .await?;
@@ -171,7 +179,11 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
                     .unwrap_or(&entry.path())
                     .to_string_lossy()
             );
-            let builder = ZipEntryBuilder::new(name.into(), Compression::Deflate);
+            let mtime = file.metadata().await.ok().and_then(|m| m.modified().ok());
+            let builder = with_mtime(
+                ZipEntryBuilder::new(name.into(), Compression::Deflate),
+                mtime,
+            );
             let mut entry_writer = zip.write_entry_stream(builder).await?;
             futures::io::copy(&mut file.compat(), &mut entry_writer).await?;
             entry_writer.close().await?;
@@ -180,6 +192,69 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream) -> anyhow::Result<()> {
     }
     zip.close().await?;
     Ok(())
+}
+
+/// Stamp a zip entry with a file's mtime, when one is readable. Left
+/// unstamped, the writer's default is the DOS epoch and every extracted
+/// file reads as 1980.
+fn with_mtime(builder: ZipEntryBuilder, mtime: Option<SystemTime>) -> ZipEntryBuilder {
+    match mtime {
+        Some(mtime) => builder.last_modification_date(zip_datetime(mtime)),
+        None => builder,
+    }
+}
+
+/// A file mtime as a zip DOS datetime, in UTC (the format carries no
+/// timezone; a fixed zone beats an unstamped 1980). DOS dates span
+/// 1980–2107 at 2-second granularity — out-of-range mtimes clamp, and the
+/// builder itself masks the seconds' low bit.
+fn zip_datetime(mtime: SystemTime) -> ZipDateTime {
+    let secs = mtime
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (
+        (rem / 3600) as u32,
+        (rem % 3600 / 60) as u32,
+        (rem % 60) as u32,
+    );
+    let clamped = if year < 1980 {
+        (1980, 1, 1, 0, 0, 0)
+    } else if year > 2107 {
+        (2107, 12, 31, 23, 59, 58)
+    } else {
+        (year, month, day, hour, minute, second)
+    };
+    ZipDateTimeBuilder::new()
+        .year(clamped.0)
+        .month(clamped.1)
+        .day(clamped.2)
+        .hour(clamped.3)
+        .minute(clamped.4)
+        .second(clamped.5)
+        .build()
+}
+
+/// Proleptic-Gregorian civil date from days since 1970-01-01 — Howard
+/// Hinnant's `civil_from_days`, the standard allocation-free algorithm
+/// (keeps a date dependency out of the daemon).
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (
+        (if month <= 2 { year + 1 } else { year }) as i32,
+        month,
+        day,
+    )
 }
 
 /// RFC 6266 attachment disposition: a sanitized ASCII `filename` fallback
@@ -257,5 +332,35 @@ mod tests {
             value.contains("filename*=UTF-8''%C3%A5%20plot.png"),
             "{value}"
         );
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29)); // leap day
+    }
+
+    #[test]
+    fn zip_datetime_carries_mtime_and_clamps_the_dos_floor() {
+        // 2024-03-01T04:05:06Z.
+        let mtime =
+            UNIX_EPOCH + std::time::Duration::from_secs(19_783 * 86_400 + 4 * 3600 + 5 * 60 + 6);
+        let dt = zip_datetime(mtime);
+        assert_eq!(
+            (
+                dt.year(),
+                dt.month(),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second()
+            ),
+            (2024, 3, 1, 4, 5, 6), // even second survives DOS 2s granularity
+        );
+        // Pre-1980 mtimes clamp to the DOS floor instead of panicking the
+        // builder (its year field is `year - 1980` in a u16).
+        let dt = zip_datetime(UNIX_EPOCH);
+        assert_eq!((dt.year(), dt.month(), dt.day()), (1980, 1, 1));
     }
 }

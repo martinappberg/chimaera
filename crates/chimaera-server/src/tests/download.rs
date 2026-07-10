@@ -117,6 +117,13 @@ async fn download_dir_zips_recursively_skipping_symlinks() {
     entry.read_to_end_checked(&mut content).await.unwrap();
     assert_eq!(&content[..], b"round trip me");
 
+    // Real mtimes ride into the archive — an extracted file must never read
+    // as 1980 (the unstamped DOS epoch).
+    let year = reader.file().entries()[index]
+        .last_modification_date()
+        .year();
+    assert!(year >= 2026, "zip entry stamped {year}");
+
     std::fs::remove_dir_all(&base).ok();
 }
 
