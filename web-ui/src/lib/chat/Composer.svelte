@@ -2,15 +2,9 @@
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
-  import { registerComposer } from "./composerBus";
+  import { registerComposer, registerComposerAttach } from "./composerBus";
+  import { imageToAttachment, type ImageAttachment } from "./images";
   import type { SlashCommand } from "./store.svelte";
-
-  export interface ImageAttachment {
-    media_type: string;
-    data: string;
-    /** Display label, e.g. "screenshot 412×280". */
-    label: string;
-  }
 
   export interface TerminalOption {
     id: string;
@@ -84,6 +78,16 @@
     if (sessionId === null) return;
     return registerComposer(sessionId, (text) => {
       draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
+      el?.focus();
+    });
+  });
+
+  // Workbench attach flow (an image dropped from the OS desktop onto this
+  // chat pane): rides the same attachment state as clipboard paste.
+  $effect(() => {
+    if (sessionId === null) return;
+    return registerComposerAttach(sessionId, (image) => {
+      images.push(image);
       el?.focus();
     });
   });
@@ -268,11 +272,6 @@
     }
   }
 
-  /** Downscale cap matching the API's optimal image size. */
-  const IMAGE_MAX_DIM = 1568;
-  /** Post-encode payload cap; journal stores a placeholder anyway. */
-  const IMAGE_MAX_BASE64 = 2 * 1024 * 1024;
-
   async function onPaste(e: ClipboardEvent) {
     const items = [...(e.clipboardData?.items ?? [])].filter((i) =>
       i.type.startsWith("image/"),
@@ -282,24 +281,9 @@
     for (const item of items) {
       const file = item.getAsFile();
       if (file === null) continue;
-      try {
-        const bitmap = await createImageBitmap(file);
-        const scale = Math.min(1, IMAGE_MAX_DIM / Math.max(bitmap.width, bitmap.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.round(bitmap.width * scale);
-        canvas.height = Math.round(bitmap.height * scale);
-        canvas.getContext("2d")?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        const url = canvas.toDataURL("image/png");
-        const data = url.slice(url.indexOf(",") + 1);
-        if (data.length > IMAGE_MAX_BASE64) continue;
-        images.push({
-          media_type: "image/png",
-          data,
-          label: `image ${canvas.width}×${canvas.height}`,
-        });
-      } catch {
-        // Unreadable clipboard image: nothing to attach.
-      }
+      // Unreadable/oversized clipboard images resolve null: nothing to attach.
+      const attachment = await imageToAttachment(file);
+      if (attachment !== null) images.push(attachment);
     }
   }
 </script>

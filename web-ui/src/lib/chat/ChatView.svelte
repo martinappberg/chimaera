@@ -18,7 +18,8 @@
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
-  import Composer, { type ImageAttachment } from "./Composer.svelte";
+  import Composer from "./Composer.svelte";
+  import type { ImageAttachment } from "./images";
   import type { ChatBlock } from "./store.svelte";
 
   interface Props {
