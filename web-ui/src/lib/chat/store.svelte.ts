@@ -640,14 +640,7 @@ export class ChatStore {
     const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
     this.blocks.splice(0, drop, notice);
     // The front-splice invalidated every id→index position — rebuild them all.
-    this.toolIndex.clear();
-    this.userIndex.clear();
-    this.questionIndex.clear();
-    this.blocks.forEach((b, i) => {
-      if (b.kind === "tool") this.toolIndex.set(b.id, i);
-      if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
-      if (b.kind === "question") this.questionIndex.set(b.id, i);
-    });
+    this.rebuildIndexes();
   }
 
   private appendText(kind: "message" | "thought", ev: AgentEvent): void {
@@ -695,6 +688,9 @@ export class ChatStore {
     const seen = new Set<string>();
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
+      // A queued/dropped user bubble sits at the tail DURING a turn — it is
+      // not the turn boundary, so skip past it to reach this turn's tools.
+      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) continue;
       if (b.kind === "user" || b.kind === "turn_end") break;
       if (b.kind !== "tool" || b.status !== "completed" || b.denied) continue;
       for (const loc of b.locations) {
@@ -709,16 +705,44 @@ export class ChatStore {
     return out.slice(0, 8);
   }
 
+  /** Rebuild every id→index map from `blocks` after a non-tail splice
+   *  invalidated positions. */
+  private rebuildIndexes(): void {
+    this.toolIndex.clear();
+    this.userIndex.clear();
+    this.questionIndex.clear();
+    this.blocks.forEach((b, i) => {
+      if (b.kind === "tool") this.toolIndex.set(b.id, i);
+      if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
+      if (b.kind === "question") this.questionIndex.set(b.id, i);
+    });
+  }
+
   /** Withdraw the current turn's trailing agent prose (refusal retries and
-   *  superseding messages REPLACE it). Tool cards and user messages stay;
-   *  removal is tail-only so toolIndex positions remain valid. */
+   *  superseding messages REPLACE it). Tool cards and user messages stay.
+   *  Queued/dropped user bubbles append to the tail DURING a turn, so they sit
+   *  AFTER this turn's prose — skip past them and drop the prose run beneath,
+   *  leaving the bubbles in place (a plain tail splice would stop at a bubble
+   *  and never retract the prose). A non-tail splice → rebuild the indexes. */
   private dropTrailingProse(): void {
     let end = this.blocks.length;
     while (end > 0) {
-      const kind = this.blocks[end - 1].kind;
-      if (kind !== "message" && kind !== "thought") break;
-      end--;
+      const b = this.blocks[end - 1];
+      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) {
+        end--;
+        continue;
+      }
+      break;
     }
-    if (end < this.blocks.length) this.blocks.splice(end);
+    let start = end;
+    while (start > 0) {
+      const kind = this.blocks[start - 1].kind;
+      if (kind !== "message" && kind !== "thought") break;
+      start--;
+    }
+    if (start < end) {
+      this.blocks.splice(start, end - start);
+      if (end < this.blocks.length) this.rebuildIndexes();
+    }
   }
 }

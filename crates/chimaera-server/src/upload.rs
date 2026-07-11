@@ -27,6 +27,10 @@ pub(crate) const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 /// Hard cap on a session's whole uploads dir — the bounded-state rule: a
 /// session cannot grow `~/.chimaera` without limit by receiving drops.
 pub(crate) const MAX_SESSION_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
+/// Hard cap on the file COUNT in a session's uploads dir. Bounds inode use and
+/// keeps the per-upload `dir_usage` rescan cheap (it walks every entry), so a
+/// flood of tiny drops can't turn each new upload into an ever-slower scan.
+pub(crate) const MAX_SESSION_UPLOAD_FILES: usize = 256;
 
 #[derive(Deserialize)]
 pub(crate) struct UploadQuery {
@@ -49,21 +53,23 @@ fn sanitize_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Total bytes currently in a session's uploads dir (flat — uploads are never
-/// nested). Missing dir reads as 0.
-async fn dir_size(dir: &Path) -> u64 {
+/// Current (bytes, file-count) in a session's uploads dir (flat — uploads are
+/// never nested). Missing dir reads as (0, 0). One scan feeds both caps.
+async fn dir_usage(dir: &Path) -> (u64, usize) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return 0;
+        return (0, 0);
     };
     let mut total = 0u64;
+    let mut count = 0usize;
     while let Ok(Some(entry)) = entries.next_entry().await {
         if let Ok(meta) = entry.metadata().await {
             if meta.is_file() {
                 total += meta.len();
+                count += 1;
             }
         }
     }
-    total
+    (total, count)
 }
 
 /// POST /api/v1/sessions/{id}/upload?name= — stream the raw request body into
@@ -103,7 +109,18 @@ pub(crate) async fn upload(
     if let Err(err) = tokio::fs::create_dir_all(&dir).await {
         return internal(&dir, "failed to create uploads dir", &err.into());
     }
-    let existing = dir_size(&dir).await;
+    let (existing, existing_count) = dir_usage(&dir).await;
+    if existing_count >= MAX_SESSION_UPLOAD_FILES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!(
+                    "session upload file limit ({MAX_SESSION_UPLOAD_FILES} files) reached"
+                )
+            })),
+        )
+            .into_response();
+    }
 
     // Stream to a hidden tmp sibling, then rename — a partial upload is never
     // visible under its final name (an agent could read it mid-write).

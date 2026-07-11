@@ -25,6 +25,10 @@ const MAX_STORED_TEXT = 64 * 1024;
 /** Bound the key count so long-lived tabs touching many sessions can't
  *  accumulate storage without end. */
 const MAX_STORED_KEYS = 24;
+/** Same bound for the in-memory map — image attachments (up to ~2 MB base64
+ *  each) live only here, so an unbounded map is a real memory leak over a
+ *  long-lived tab that visits many sessions. */
+const MAX_MEMORY_DRAFTS = 24;
 
 function storedKeys(): string[] {
   const keys: string[] = [];
@@ -76,6 +80,17 @@ export function saveDraft(sessionId: string, text: string, images: ImageAttachme
     drafts.delete(sessionId);
   } else {
     drafts.set(sessionId, { text, images });
+    // Over budget: Map keeps insertion order, so shed the oldest OTHER draft
+    // (the active session is the one that matters). Add-one-evict-one keeps
+    // the map bounded at MAX_MEMORY_DRAFTS.
+    if (drafts.size > MAX_MEMORY_DRAFTS) {
+      for (const k of drafts.keys()) {
+        if (k !== sessionId) {
+          drafts.delete(k);
+          break;
+        }
+      }
+    }
   }
   storeText(sessionId, text);
 }

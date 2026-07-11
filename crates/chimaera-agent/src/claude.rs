@@ -1100,7 +1100,13 @@ impl ClaudeMapper {
             // agent's later "I was blocked" prose must not be the only trace
             // the ask existed. One notice per subtype, not per frame.
             let subtype = request["subtype"].as_str().unwrap_or("unknown");
-            if self.noticed_controls.insert(subtype.to_string()) {
+            // `subtype` is agent-influenced; bound the once-per-subtype dedupe
+            // set (real streams carry a handful of distinct control subtypes)
+            // so a buggy/hostile stream can't grow it without end.
+            const MAX_NOTICED_CONTROLS: usize = 64;
+            let fresh = self.noticed_controls.len() < MAX_NOTICED_CONTROLS
+                && self.noticed_controls.insert(subtype.to_string());
+            if fresh {
                 step.events.push(AgentEvent::Notice {
                     text: format!(
                         "claude sent a request chimaera doesn't handle yet ({subtype}) — \
@@ -2029,6 +2035,15 @@ impl ClaudeMapper {
             events.push(AgentEvent::PermissionResolved {
                 request_id,
                 option_id: "expired".into(),
+            });
+        }
+        // A hard kill mid-queue must not strand a queued message as "queued"
+        // forever on replay — drop (FIFO) what the CLI never got to run, the
+        // same resolution an interrupt's is_error result would have produced.
+        for id in std::mem::take(&mut self.queued_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Dropped,
             });
         }
         events

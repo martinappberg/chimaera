@@ -240,3 +240,41 @@ fn permission_request_wire_shape_is_additive() {
         json!("## Plan")
     );
 }
+
+/// `Init.agent_version` is additive: absent by default (old clients/journals
+/// never saw it), present only when the launcher probed a version.
+#[test]
+fn init_agent_version_is_additive_on_the_wire() {
+    let base = AgentEvent::Init {
+        native_session_id: "s1".into(),
+        model: None,
+        modes: vec![],
+        current_mode: None,
+        slash_commands: vec![],
+        models: vec![],
+        agent_version: None,
+    };
+    // No version → the key is omitted (byte-identical to the pre-upgrade wire).
+    assert_eq!(
+        serde_json::to_value(&base).unwrap(),
+        json!({ "type": "init", "native_session_id": "s1" })
+    );
+    // An old journal line lacking agent_version still deserializes (to None).
+    let old: AgentEvent =
+        serde_json::from_value(json!({ "type": "init", "native_session_id": "s1" })).unwrap();
+    assert_eq!(old, base);
+    // Present only when probed.
+    assert_eq!(
+        serde_json::to_value(AgentEvent::Init {
+            native_session_id: "s1".into(),
+            model: None,
+            modes: vec![],
+            current_mode: None,
+            slash_commands: vec![],
+            models: vec![],
+            agent_version: Some("2.1.206 (Claude Code)".into()),
+        })
+        .unwrap()["agent_version"],
+        json!("2.1.206 (Claude Code)")
+    );
+}

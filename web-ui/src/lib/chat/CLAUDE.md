@@ -41,13 +41,19 @@ hard-resets and rebuilds.
 | `Composer.svelte` | Input: draft, images, `@`-mention + `/`-slash popovers, submit/interrupt. |
 | `Markdown.svelte` | Renders agent prose. **Sanitizes untrusted model output** (marked → DOMPurify, `<style>` forbidden, external links `noopener`); stamps validated file paths as clickable. |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). |
-| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`). |
-| `RewindDialog.svelte` | The rewind/fork-point confirmation overlay. |
+| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field). |
+| `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
+| `RewindDialog.svelte` | The rewind/fork-point confirmation overlay (claude fork + codex `thread/rollback`). |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
 | `UserText.svelte` | User-message bubble. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
-| `composerBus.ts` | Cross-component channel to insert text into the active composer (e.g. `@term:` grants, references). |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |
+| `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. |
+| `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type); size-bounded. |
+
+The transcript's copy affordances reuse `../shared/clipboard.ts` (the native-first
+clipboard writer lifted out of the terminal pool) — see the shared/ area.
 
 ## Invariants / gotchas
 

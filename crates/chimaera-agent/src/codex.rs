@@ -817,6 +817,10 @@ impl CodexMapper {
                         reason: "interrupted".into(),
                         interrupted: true,
                     });
+                    // The user stopped: drop everything queued behind this turn
+                    // (mirrors claude's is_error queue drop) so a late steer
+                    // can't resurrect a queued message as a fresh turn.
+                    step.events.extend(self.drain_queued_sends());
                 } else {
                     step.events
                         .push(AgentEvent::TurnCompleted { turn_id, usage });
@@ -845,6 +849,8 @@ impl CodexMapper {
                         .to_string(),
                     interrupted: false,
                 });
+                // The turn died: its queue dies with it (claude parity).
+                step.events.extend(self.drain_queued_sends());
                 // A failed turn must reset per-turn state exactly like a
                 // completed one — else the safety notice stays suppressed and
                 // stream/location maps leak into the next turn.
@@ -1380,6 +1386,38 @@ impl CodexMapper {
     /// process's JSON-RPC channel, so the journal must not outlive it with
     /// the ask dangling (a replay would strand the card forever — see the
     /// harness's drain call in `run_driver`).
+    /// Drop every user message still queued behind the current turn — the
+    /// not-yet-sent `buffered_sends` and any in-flight `Steer` RPC. Mirrors
+    /// claude dropping its native queue when a turn aborts (interrupt or
+    /// failure): those messages were never consumed, so replay must show them
+    /// not-delivered, and — critically — removing the pending steer here stops
+    /// a late steer-error from resurrecting a queued message as a fresh turn
+    /// AFTER the user hit stop (the two-driver-symmetry bug).
+    fn drain_queued_sends(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for (_input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id: client_msg_id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        let steer_ids: Vec<u64> = self
+            .pending_rpcs
+            .iter()
+            .filter(|(_, p)| matches!(p, PendingRpc::Steer { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in steer_ids {
+            if let Some(PendingRpc::Steer { client_msg_id, .. }) = self.pending_rpcs.remove(&id) {
+                events.push(AgentEvent::UserMessageUpdate {
+                    id: client_msg_id,
+                    state: UserMessageState::Dropped,
+                });
+            }
+        }
+        events
+    }
+
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
@@ -1394,6 +1432,9 @@ impl CodexMapper {
                 option_id: "expired".into(),
             });
         }
+        // A hard kill mid-queue must not strand a queued message as "queued"
+        // forever on replay — resolve them dropped, like a turn abort would.
+        events.extend(self.drain_queued_sends());
         events
     }
 
@@ -1704,9 +1745,11 @@ impl CodexMapper {
         self.emit_turn_start(input, client_msg_id, step);
     }
 
-    /// Route an input into the conversation whatever the turn state: steer
-    /// the running turn, buffer through an unidentified start window, or open
-    /// a fresh turn. Shared by Send and the decline-feedback delivery.
+    /// Route the decline-feedback reason into the conversation whatever the
+    /// turn state: steer the running turn, buffer through an unidentified
+    /// start window, or open a fresh turn. (Send does its own dispatch inline
+    /// so it can thread the delivery-tracking `client_msg_id`; this mints its
+    /// own untracked id since the feedback text is not a queued user bubble.)
     fn dispatch_input(&mut self, input: Value, step: &mut DriverStep) {
         let client_msg_id = crate::model::fresh_uuid();
         if self.turn_active && !self.turn_id.is_empty() {
@@ -2305,6 +2348,52 @@ mod tests {
         assert_eq!(
             step.outbound[0]["method"], "turn/start",
             "saved input re-driven as a new turn: {:?}",
+            step.outbound
+        );
+    }
+
+    #[test]
+    fn user_interrupt_drops_queued_steer_instead_of_redriving() {
+        // Two-driver symmetry with claude: a message queued while a turn runs
+        // must DROP when the user stops that turn, not be resurrected as a
+        // fresh turn (which would undo the stop and bill unwanted work).
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "B".into() }],
+        });
+        let steer_id = step.outbound[0]["id"].as_u64().unwrap();
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // User hits stop; the turn then ends interrupted.
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped }
+                    if id == &queued_id
+            )),
+            "queued message must drop on interrupt: {:?}",
+            step.events
+        );
+        // The now-stale steer response must NOT re-drive B as a fresh turn.
+        let step = m.on_frame(&json!({
+            "id": steer_id,
+            "error": { "message": "no active turn" },
+        }));
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "must not redrive a queued message after a user stop: {:?}",
             step.outbound
         );
     }

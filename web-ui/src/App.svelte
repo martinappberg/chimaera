@@ -894,10 +894,13 @@
   }
 
   function onWindowDragOver(e: DragEvent): void {
-    // ALWAYS claim the drag: the browser's default for an unhandled file
-    // drop is to NAVIGATE AWAY from the app entirely.
-    e.preventDefault();
+    // Claim only FILE drags: the browser's default for an unhandled file drop
+    // is to NAVIGATE AWAY from the app. A native text/URL drag must keep its
+    // default drop into an input, so gate BEFORE preventDefault (matching
+    // onWindowDragEnter/Leave — an unconditional preventDefault here silently
+    // breaks text/URL drop into the composer and every other input).
     if (!isOsFileDrag(e)) return;
+    e.preventDefault();
     const paneId = paneIdAt(e.clientX, e.clientY);
     const ok = paneId !== null && osDropSession(paneId) !== null;
     if (e.dataTransfer !== null) e.dataTransfer.dropEffect = ok ? "copy" : "none";
@@ -913,7 +916,9 @@
   }
 
   function onWindowDrop(e: DragEvent): void {
-    // preventDefault unconditionally — see onWindowDragOver.
+    // Only claim FILE drops — see onWindowDragOver. A text/URL drop into an
+    // input must keep its native behavior, so gate before preventDefault.
+    if (!isOsFileDrag(e)) return;
     e.preventDefault();
     osDragDepth = 0;
     if (dropSpot?.kind === "upload") dropSpot = null;
