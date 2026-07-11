@@ -77,6 +77,12 @@
   interface Row {
     entry: FsEntry;
     depth: number;
+    /** Tree-position key, unique even when two rows share a path — a symlinked
+     *  dir's children come back with the target's CANONICAL paths, so the same
+     *  `entry.path` can appear under both the real dir and the symlink. Keying
+     *  the `{#each}` on this (parent-scoped) avoids the duplicate-key breakage
+     *  that stranded the "listing…" row and made rows jump. */
+    key: string;
   }
 
   // Quiet client-side filter over the LOADED tree: narrows visible entries by
@@ -92,33 +98,35 @@
     const q = filterQuery;
     const out: Row[] = [];
     // Returns true when this subtree contributed at least one visible row.
-    const walk = (dir: string, depth: number): boolean => {
+    // `keyPrefix` scopes each row's key by its tree position (see Row.key).
+    const walk = (dir: string, depth: number, keyPrefix: string): boolean => {
       const entries = listings.get(dir);
       if (entries === undefined) return false;
       let any = false;
       for (const e of entries) {
+        const key = `${keyPrefix}/${e.name}`;
         const selfMatch = q === "" || e.name.toLowerCase().includes(q);
         if (e.kind === "dir") {
           // A filtered dir is shown when it (or a loaded descendant) matches;
           // expand into it while filtering even if collapsed, so matches surface.
           const descend = q !== "" || expanded.has(e.path);
-          const marker: Row = { entry: e, depth };
+          const marker: Row = { entry: e, depth, key };
           const before = out.length;
           out.push(marker);
-          const childMatched = descend ? walk(e.path, depth + 1) : false;
+          const childMatched = descend ? walk(e.path, depth + 1, key) : false;
           if (q !== "" && !selfMatch && !childMatched) {
             out.length = before; // prune a dir with no matches under it
           } else {
             any = true;
           }
         } else if (selfMatch) {
-          out.push({ entry: e, depth });
+          out.push({ entry: e, depth, key });
           any = true;
         }
       }
       return any;
     };
-    walk(root, 0);
+    walk(root, 0, "");
     return out;
   });
 
@@ -598,7 +606,7 @@
   {#if edit?.mode === "create" && createAfterIndex === -1}
     {@render createRow(0)}
   {/if}
-  {#each rows as { entry, depth }, i (entry.path)}
+  {#each rows as { entry, depth, key }, i (key)}
     {@const gEntry = entry.kind === "file" ? $gitIndex.files.get(entry.path) : undefined}
     {@const gDeco = gEntry ? decoFor(gEntry) : null}
     {@const gDir = entry.kind === "dir" ? $gitIndex.dirs.get(entry.path) : undefined}
