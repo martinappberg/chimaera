@@ -277,13 +277,33 @@ pub fn install(app: &AppHandle) -> Result<()> {
 }
 
 /// One relay request: first line is the auth token, the rest (to the
-/// client's half-close) is the prompt; reply secret + newline.
+/// client's half-close) is the prompt; reply secret + newline. The read is
+/// SIZE-CAPPED and TIMED: unlike the unix socket (gated by a 0700 dir), any
+/// local process can connect to this loopback port — without bounds one
+/// could stream gigabytes into this String or hold a task open forever.
+/// The token protects secrecy; these bounds protect availability.
 #[cfg(windows)]
 async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token: String) {
+    /// Token line + a generous ceiling for any real ssh prompt.
+    const MAX_REQUEST: u64 = 64 * 1024;
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
     let mut input = String::new();
-    if let Err(e) = stream.read_to_string(&mut input).await {
-        tracing::warn!("askpass: could not read relay request: {e}");
-        return;
+    let read = tokio::time::timeout(
+        READ_TIMEOUT,
+        (&mut stream).take(MAX_REQUEST).read_to_string(&mut input),
+    )
+    .await;
+    match read {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("askpass: could not read relay request: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("askpass: relay request timed out");
+            return;
+        }
     }
     let Some((client_token, prompt)) = input.split_once('\n') else {
         tracing::warn!("askpass: malformed relay request");

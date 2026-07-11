@@ -72,21 +72,88 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
+/// the wizard's finishing command must be excluded while another invocation
+/// is mid-flight (provisioning runs minutes, and a webview reload re-enables
+/// its button), and a finish that failed AFTER manage(Shell) must stay
+/// retryable — Shell existing does not mean startup completed.
+pub(crate) enum StartupClaim {
+    Claimed,
+    InFlight,
+    Done,
+}
+
+static STARTUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static STARTUP_DONE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn claim_startup() -> StartupClaim {
+    if STARTUP_DONE.load(Ordering::SeqCst) {
+        return StartupClaim::Done;
+    }
+    if STARTUP_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        StartupClaim::Claimed
+    } else {
+        StartupClaim::InFlight
+    }
+}
+
+pub(crate) fn release_startup(success: bool) {
+    if success {
+        STARTUP_DONE.store(true, Ordering::SeqCst);
+    }
+    STARTUP_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
+/// Post-completion self-heal: if startup finished but no real (non-wizard)
+/// window survived — a partial finish, or every window closed while a stale
+/// wizard lingered — open the home window so retiring the wizard can never
+/// leave the app window-less (last-window-closed would exit it).
+pub(crate) fn recover_windows(handle: &tauri::AppHandle) {
+    let Some(shell) = handle.try_state::<Shell>() else {
+        return;
+    };
+    let has_real = handle
+        .webview_windows()
+        .keys()
+        .any(|l| !l.starts_with("wsl-setup"));
+    if has_real {
+        return;
+    }
+    let (port, token) = {
+        let local = lock(&shell.local);
+        (local.port, local.token.clone())
+    };
+    if let Err(e) = open_ui_window(handle, port, &token, &WindowRecord::new(None, None)) {
+        tracing::error!("could not recover a home window: {e}");
+    }
+}
+
 /// Complete startup once a local daemon exists: manage `Shell` (BEFORE any
 /// window opens, so each registers its scope), reopen the persisted window
 /// set or the home window, and start the monitors. Two callers: `setup()` on
 /// the normal path, and the WSL wizard's finishing command on a Windows
 /// first run — where setup() deliberately returned early with no daemon.
+/// Re-entrant for the retry-after-partial-failure case: an already-managed
+/// Shell keeps its state (monitors are NOT spawned twice); only the daemon
+/// handle is refreshed and the windows re-attempted.
 pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> tauri::Result<()> {
     let (port, token) = (local.port, local.token.clone());
-    handle.manage(Shell {
-        local: Mutex::new(local),
-        tunnels: tokio::sync::Mutex::new(HashMap::new()),
-        connecting: Mutex::new(HashMap::new()),
-        windows: Mutex::new(HashMap::new()),
-        registry: Mutex::new(WindowRegistry::load_default()),
-        quitting: AtomicBool::new(false),
-    });
+    let fresh = handle.try_state::<Shell>().is_none();
+    if fresh {
+        handle.manage(Shell {
+            local: Mutex::new(local),
+            tunnels: tokio::sync::Mutex::new(HashMap::new()),
+            connecting: Mutex::new(HashMap::new()),
+            windows: Mutex::new(HashMap::new()),
+            registry: Mutex::new(WindowRegistry::load_default()),
+            quitting: AtomicBool::new(false),
+        });
+    } else {
+        *lock(&handle.state::<Shell>().local) = local;
+    }
     // Reopen last session's windows; first launch (or an all-remote set that
     // is still connecting) gets the home window so the app never comes up
     // invisible.
@@ -94,19 +161,21 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         open_ui_window(handle, port, &token, &WindowRecord::new(None, None))?;
         tracing::info!("home window open on 127.0.0.1:{port}");
     }
-    restore::spawn_health_monitor(handle.clone());
-    crate::update::spawn_update_watch(handle.clone());
-    // Slow flush for the geometry dirty flag (window drags).
-    let flush = handle.clone();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let Some(shell) = flush.try_state::<Shell>() else {
-                break;
-            };
-            lock(&shell.registry).save_if_dirty();
-        }
-    });
+    if fresh {
+        restore::spawn_health_monitor(handle.clone());
+        crate::update::spawn_update_watch(handle.clone());
+        // Slow flush for the geometry dirty flag (window drags).
+        let flush = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(shell) = flush.try_state::<Shell>() else {
+                    break;
+                };
+                lock(&shell.registry).save_if_dirty();
+            }
+        });
+    }
     Ok(())
 }
 
@@ -152,6 +221,7 @@ pub fn run() {
             commands::report_window_scope,
             commands::wsl_status,
             commands::wsl_install,
+            commands::wsl_update,
             commands::wsl_install_distro,
             commands::wsl_setup_daemon,
         ])
@@ -216,12 +286,18 @@ pub fn run() {
             let mut local =
                 match tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon()) {
                     Ok(local) => local,
-                    // Windows first run: no WSL / no distro yet, so there is no
-                    // daemon origin to load — open the shell-local setup wizard
-                    // instead of failing; its finishing command (wsl_setup_daemon)
-                    // completes the startup this path skips.
+                    // Windows: anything that needs provisioning — no WSL, no
+                    // distro, no (current) daemon — goes through the wizard,
+                    // which shows the work; startup itself never downloads or
+                    // installs invisibly. Its finishing command
+                    // (wsl_setup_daemon) completes the startup this skips.
                     Err(e) if e.downcast_ref::<crate::wsl::WslNotReady>().is_some() => {
-                        tracing::info!("WSL not ready — opening the setup wizard");
+                        tracing::info!("WSL daemon not adoptable — opening the setup wizard");
+                        // Any pending update intent is moot on this path: the
+                        // wizard's ensure replaces an old-build daemon anyway,
+                        // and a stale intent must not fire on a LATER launch
+                        // detached from the click that authorized it.
+                        crate::update::clear_intent();
                         open_setup_window(&handle)?;
                         return Ok(());
                     }
@@ -245,7 +321,13 @@ pub fn run() {
                     Err(e) => tracing::warn!("daemon update after app update failed: {e:#}"),
                 }
             }
-            finish_startup(&handle, local)?;
+            // Uncontended here (no windows exist yet), but the gate must
+            // still be claimed so a stale wizard invocation later reads
+            // "done" instead of racing a second startup.
+            let _ = claim_startup();
+            let finished = finish_startup(&handle, local);
+            release_startup(finished.is_ok());
+            finished?;
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -144,22 +144,33 @@ jobs:
           releaseDraft: false
           includeUpdaterJson: true
 
-  # Linux + Windows app bundles join the SAME release. Deliberately
-  # serialized (app -> app-linux -> app-windows): every tauri-action job does
-  # a read-modify-write on the shared latest.json updater manifest, and
-  # concurrent jobs have a documented race (tauri-action #409/#927/#1270)
-  # that silently ships a latest.json missing a platform — which breaks that
-  # platform's auto-update invisibly. Slower, always correct.
-  app-linux:
+  # Linux + Windows app bundles join the SAME release, as ONE matrix so the
+  # recipe cannot drift per-OS. Deliberately serialized (app -> linux ->
+  # windows via max-parallel): every tauri-action run does a read-modify-write
+  # on the shared latest.json updater manifest, and concurrent jobs have a
+  # documented race (tauri-action #409/#927/#1270) that silently ships a
+  # latest.json missing a platform — which breaks that platform's auto-update
+  # invisibly. Slower, always correct.
+  app-bundles:
     needs: [version, app]
     if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-22.04
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # GNU sed + one quoting dialect everywhere (Git-for-Windows bash).
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - run: |
+      - if: runner.os == 'Linux'
+        run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
@@ -167,48 +178,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/chimaera-app
-          # Writer for the Linux app cache app.yml's `linux` job restores
+          # Writer for the per-OS app caches app.yml's bundle matrix restores
           # (rust-cache keys include the OS; same pairing as the macOS `app`
           # job above).
           shared-key: app
       - run: npm install
         working-directory: crates/chimaera-app
-      # GNU sed (no BSD `-i ""`), same three stamps as the macOS app job.
+      # Same three stamps as the macOS app job (GNU sed, no BSD -i "").
       - run: |
-          sed -i "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
-          sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
-          sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml
-      - uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: crates/chimaera-app
-          tagName: v${{ needs.version.outputs.version }}
-          releaseName: "chimaera v${{ needs.version.outputs.version }}"
-          releaseDraft: false
-          includeUpdaterJson: true
-
-  app-windows:
-    needs: [version, app-linux]
-    if: needs.version.outputs.release == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/chimaera-app
-          shared-key: app
-      - run: npm install
-        working-directory: crates/chimaera-app
-      # Git-for-Windows bash gives us the same GNU sed stamping verbatim.
-      - shell: bash
-        run: |
           sed -i "s/\"version\": \"0.0.1\"/\"version\": \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/tauri.conf.json
           sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" crates/chimaera-app/Cargo.toml
           sed -i "s/^version = \"0.0.1\"/version = \"${{ needs.version.outputs.version }}\"/" Cargo.toml

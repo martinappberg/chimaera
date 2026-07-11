@@ -27,10 +27,6 @@
     "allow-shell-build",
     "allow-write-clipboard",
     "allow-answer-askpass",
-    "allow-list-askpass",
-    "allow-wsl-status",
-    "allow-wsl-install",
-    "allow-wsl-install-distro",
-    "allow-wsl-setup-daemon"
+    "allow-list-askpass"
   ]
 }

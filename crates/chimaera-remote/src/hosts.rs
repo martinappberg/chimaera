@@ -1,7 +1,13 @@
 //! Saved remote hosts: the ssh aliases this machine has connected to (or the
 //! user has added), stored as JSON at `~/.chimaera/hosts.json`. This is
-//! client-side state — aliases resolve through the user's `~/.ssh/config`,
-//! never through anything chimaera stores.
+//! client-side state — aliases resolve through the ssh config of WHEREVER
+//! ssh runs, never through anything chimaera stores. On unix that is the
+//! user's `~/.ssh/config`; on Windows ssh runs INSIDE the WSL distro (the
+//! transport — Win32-OpenSSH has no ControlMaster), so aliases and keys
+//! resolve against the DISTRO's `~/.ssh`, not `C:\Users\...\.ssh`. A
+//! wizard-fresh distro has neither — user-facing copy must say which file
+//! counts, or every first Windows connect fails "could not resolve
+//! hostname" against a config that looks correct in their terminal.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -28,13 +34,27 @@ pub fn normalize_alias(input: &str) -> anyhow::Result<String> {
         || alias.chars().any(char::is_whitespace)
         || alias.starts_with('-')
     {
+        let config = ssh_config_hint();
         anyhow::bail!(
-            "\"{input}\" isn't an ssh destination — use the alias from your \
-             ~/.ssh/config or user@host (e.g. \"cluster\" or \"jane@login.example.edu\"); \
-             ssh options belong in ~/.ssh/config"
+            "\"{input}\" isn't an ssh destination — use the alias from {config} \
+             or user@host (e.g. \"cluster\" or \"jane@login.example.edu\"); \
+             ssh options belong in {config}"
         );
     }
     Ok(alias.to_string())
+}
+
+/// Which ssh config file the user must edit — the one ssh actually reads.
+/// On Windows ssh runs inside the WSL distro, so pointing at
+/// `C:\Users\...\.ssh\config` (which their terminal uses) would send them
+/// to a file chimaera never consults.
+fn ssh_config_hint() -> &'static str {
+    if cfg!(windows) {
+        "~/.ssh/config INSIDE your WSL distro (keys go there too — the \
+         Windows-side ~/.ssh is not used)"
+    } else {
+        "your ~/.ssh/config"
+    }
 }
 
 /// A remembered remote host.

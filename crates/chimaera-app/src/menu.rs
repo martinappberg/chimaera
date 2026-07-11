@@ -77,11 +77,19 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::maximize(handle, None)?)
         .build()?;
 
+    // macOS carries About in the application submenu; Windows/Linux lost it
+    // with that submenu, so give them the conventional Help menu — About is
+    // the only in-app version display, which bug triage depends on.
+    #[cfg(not(target_os = "macos"))]
+    let help = SubmenuBuilder::new(handle, "Help")
+        .item(&PredefinedMenuItem::about(handle, None, None)?)
+        .build()?;
+
     let menu = MenuBuilder::new(handle);
     #[cfg(target_os = "macos")]
     let menu = menu.items(&[&app_menu, &file, &edit, &view, &window]);
     #[cfg(not(target_os = "macos"))]
-    let menu = menu.items(&[&file, &edit, &view, &window]);
+    let menu = menu.items(&[&file, &edit, &view, &window, &help]);
     let menu = menu.build()?;
     app.set_menu(menu)?;
 

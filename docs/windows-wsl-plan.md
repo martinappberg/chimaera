@@ -10,8 +10,12 @@ is a thin launch-and-transport layer in the shell.
 > **Status: M0 (portability gates, three-platform CI, Linux bundles), M1
 > (the WSL engine + first-run wizard + the wsl-smoke live gate) and M2
 > (connect's ssh-in-WSL transport + the interop askpass relay) are
-> implemented on this branch. The site holds back the Windows download until
-> a real-hardware pass over the wizard + askpass chain.**
+> implemented on this branch, plus a full post-review hardening pass
+> (persisted distro+pinned-user target, user creation for wizard-installed
+> Ubuntu, the 2.1.1 version gate, fetch-before-stop updates, wizard-visible
+> provisioning, bounded transport/relay I/O, wizard-scoped capability). The
+> site holds back the Windows download until a real-hardware pass over the
+> wizard + askpass chain.**
 > Every claim below was researched 2026-07-10
 > against official sources (Microsoft Learn, the open-sourced `microsoft/WSL`
 > repo — including its shipping source code — OpenSSH sources, Tauri docs,

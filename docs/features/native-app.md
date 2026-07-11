@@ -82,10 +82,14 @@ app-build` (never the root `cargo`).
 
 - **What & when.** On Windows the local daemon is **never the app exe** — it is the same Linux
   musl release binary, provisioned into and spawned inside the user's WSL2 distro; the UI
-  reaches it over WSL's NAT localhost forwarding, so windows/tokens/health work unchanged. On a
-  machine without WSL (or a distro), startup opens a shell-local **first-run wizard**
-  (`assets/setup.html` — there is no daemon origin to serve the real UI yet) that walks
-  enable-WSL2 → install-Ubuntu → install-daemon, then finishes normal startup.
+  reaches it over WSL's NAT localhost forwarding, so windows/tokens/health work unchanged.
+  Startup only ever **adopts** a healthy daemon; anything needing provisioning (no WSL, no
+  distro, WSL older than the 2.1.1 gate, no/stale daemon) routes through the shell-local
+  **wizard** (`assets/setup.html` — no daemon origin exists to serve the real UI yet), which
+  shows every download/install phase and auto-starts when there is nothing to choose. The
+  distro + a **pinned user** are persisted (`wsl.json`); a wizard-installed Ubuntu gets a real
+  account created up front (with `--no-launch` OOBE never runs, so it would otherwise be
+  root-owned and orphaned when OOBE later flips the default user).
 - **Where it lives.** `wsl.rs` (registry-first detection, hardened `wsl.exe` spawns, provision/
   spawn/probe/stop — module header documents the researched constraints), `daemon.rs` (windows
   half of `ensure_local_daemon`), `shell.rs::finish_startup` (the startup the wizard resumes),
@@ -100,7 +104,11 @@ app-build` (never the root `cargo`).
   the distro (`chimaera_remote::WslTransport` — Linux OpenSSH has the ControlMaster mux
   Win32-OpenSSH lacks), and password/2FA prompts ride a distro-side `SSH_ASKPASS` wrapper →
   WSL interop → `chimaera.exe --askpass` → a token-gated loopback TCP relay back to the shell
-  (`wsl::wire_connect` installs all of it on every successful daemon ensure). The interop
+  (`wsl::wire_connect` installs all of it on every successful adopt/ensure; a wiring failure
+  degrades like unix — key hosts work, password hosts fail cleanly — and `connect_host`
+  refuses with the real reason if the transport is absent). **Gotcha that needs UX copy
+  wherever hosts surface:** ssh runs in the distro, so aliases/keys resolve against the
+  DISTRO's `~/.ssh`, not the Windows-side config the user's terminal uses. The interop
   prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
   Windows download until then.
 

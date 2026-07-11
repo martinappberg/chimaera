@@ -1,15 +1,17 @@
 name: app
 
-# PR build-check for the native-shell bundle (Tauri). It lives in its own
-# cargo workspace, so ci.yml's root-workspace clippy never touches it — this
-# catches app breakage before merge. macOS runners are expensive, so it only
-# runs on PRs that change the app or the UI it embeds (release.yml builds and
-# publishes the app on merge, so no main-push trigger here).
+# PR build-check for the native-shell bundle (Tauri) on all three desktop
+# platforms — one matrix so the build recipe can never drift per-OS. It lives
+# in its own cargo workspace, so ci.yml's root-workspace clippy never touches
+# it — this catches app breakage before merge. The windows leg is the ONLY
+# compile gate for the app's cfg(windows) code paths (macOS dev machines
+# cannot cross-check them: dependency C builds need the Windows SDK).
+# release.yml builds and publishes on merge, so no main-push trigger here.
 #
 # `ready_for_review` is in `types` (which overrides the default set, so the
-# defaults are respelled) purely so promoting a draft re-triggers the build the
-# draft guard below skipped. Without it, a draft PR marked ready would never
-# build the app until its next push.
+# defaults are respelled) purely so promoting a draft re-triggers the build
+# the draft guard below skipped. Without it, a draft PR marked ready would
+# never build the app until its next push.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -26,28 +28,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  macos:
-    # Don't spend a macOS bundle on a draft. Safe *only* because `macos` is not
-    # a required status check — a required check that never reports would block
-    # the PR forever on "Expected — waiting for status".
+  bundle:
+    # Don't spend runners on a draft. Safe *only* because these are not
+    # required status checks — a required check that never reports would
+    # block the PR forever on "Expected — waiting for status".
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: chimaera-macos-arm64.dmg
+            bundle: crates/chimaera-app/target/release/bundle/dmg/*.dmg
+          # ubuntu-22.04 on purpose: AppImages inherit the build host's glibc
+          # floor, and release.yml builds on 22.04 — checking on a newer
+          # image could go green while the release build (or an older user
+          # distro) fails.
+          - os: ubuntu-22.04
+            artifact: chimaera-linux-x86_64.AppImage
+            bundle: crates/chimaera-app/target/release/bundle/appimage/*.AppImage
+          - os: windows-latest
+            artifact: chimaera-windows-x64-setup.exe
+            bundle: crates/chimaera-app/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # One shell everywhere; on Windows this also sidesteps pwsh quoting
+        # for the JSON --config argument.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      # Tauri v2's documented webkit2gtk-4.1 prerequisite set.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/chimaera-app
-          # rust-cache keys on job name unless overridden, so this job (`macos`)
-          # could never restore the ~460 MB app cache that release.yml's `app`
-          # job writes on main — every PR compiled the app's deps cold. The
-          # shared-key replaces only that job-name slot, so `app` reproduces the
-          # exact key release.yml already writes (`v0-rust-app-<os>-<arch>-…`)
-          # and hits main's existing entry. release.yml pins the same value
-          # explicitly, so renaming its job can't silently break this.
+          # rust-cache keys include the OS, so "app" pairs each leg with the
+          # per-OS cache release.yml's app jobs write on main.
           shared-key: app
           # Main saves, PRs restore. A PR-scoped cache is unreadable by every
           # other PR yet still burns the repo's 10 GiB LRU quota.
@@ -56,84 +81,24 @@ jobs:
         working-directory: crates/chimaera-app
       # tauri's beforeBuildCommand builds web-ui (npm install + vite build);
       # setup-node above guarantees it sees a modern node — the UI build
-      # needs >= 18 (styleText), which is why .nvmrc exists.
+      # needs >= 18 (styleText), which is why .nvmrc exists. The windows
+      # overlay SKIPS that command: nothing in the Windows bundle consumes
+      # web-ui/dist (chimaera-server, its only consumer, is cfg(unix)).
       #
       # createUpdaterArtifacts is forced off here: this check only proves the
-      # app compiles and bundles. The signed `.app.tar.gz` updater artifact
-      # needs TAURI_SIGNING_PRIVATE_KEY, which is a release-only concern
-      # (release.yml on main) — a PR must not require it. The .dmg still builds.
+      # app compiles and bundles. The signed updater artifact needs
+      # TAURI_SIGNING_PRIVATE_KEY, which is a release-only concern
+      # (release.yml on main) — a PR must not require it.
       - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
         working-directory: crates/chimaera-app
-      # The .dmg is the shippable artifact; the raw .app is a directory with
-      # symlinks that artifact-zipping would flatten.
+      # The bundle is the shippable artifact; the raw .app is a directory
+      # with symlinks that artifact-zipping would flatten.
       #
-      # Unsigned until Apple signing lands: to sign + notarize, add
+      # macOS is unsigned until Apple signing lands: to sign + notarize, add
       # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
       # / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID as repo secrets and export
       # them on the build step (tauri picks them up).
       - uses: actions/upload-artifact@v4
         with:
-          name: chimaera-macos-arm64.dmg
-          path: crates/chimaera-app/target/release/bundle/dmg/*.dmg
-
-  # Same build-check for the Linux bundle (AppImage/deb/rpm via
-  # tauri.linux.conf.json). ubuntu-22.04 on purpose: AppImages inherit the
-  # build host's glibc floor, and release.yml builds on 22.04 — checking on a
-  # newer image could go green while the release build (or an older user
-  # distro) fails.
-  linux:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      # Tauri v2's documented webkit2gtk-4.1 prerequisite set.
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/chimaera-app
-          # rust-cache keys include the OS, so "app" here maps to the Linux
-          # cache release.yml's app-linux job writes on main — same pairing
-          # as the macos job above.
-          shared-key: app
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: npm install
-        working-directory: crates/chimaera-app
-      - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
-        working-directory: crates/chimaera-app
-      - uses: actions/upload-artifact@v4
-        with:
-          name: chimaera-linux-x86_64.AppImage
-          path: crates/chimaera-app/target/release/bundle/appimage/*.AppImage
-
-  # And the Windows bundle (NSIS via tauri.windows.conf.json). This is the
-  # only compile gate for the app's cfg(windows) code paths — macOS dev
-  # machines cannot cross-check them (C build scripts need the Windows SDK).
-  windows:
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/chimaera-app
-          shared-key: app
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: npm install
-        working-directory: crates/chimaera-app
-      - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
-        working-directory: crates/chimaera-app
-      - uses: actions/upload-artifact@v4
-        with:
-          name: chimaera-windows-x64-setup.exe
-          path: crates/chimaera-app/target/release/bundle/nsis/*.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.bundle }}

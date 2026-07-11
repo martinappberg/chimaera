@@ -2,8 +2,10 @@
 <!-- The Windows first-run wizard. Served from the shell's own assets because
      on a fresh machine there is NO daemon origin to load yet — the daemon is
      the Linux binary this wizard installs into WSL2. Driven entirely by the
-     wsl_* IPC commands (withGlobalTauri); closes itself via wsl_setup_daemon
-     once the real home window is up. -->
+     wsl_* IPC commands (withGlobalTauri; granted by the wsl-setup capability,
+     never to daemon-served pages); closes itself via wsl_setup_daemon once
+     the real home window is up. Startup also routes here whenever the daemon
+     needs provisioning, so downloads/installs are never invisible. -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -141,7 +143,6 @@
         margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line);
         color: var(--muted); font-size: 12px; display: flex; justify-content: space-between;
       }
-      .foot a { color: var(--muted); }
     </style>
   </head>
   <body>
@@ -164,11 +165,11 @@
           <div class="dot">1</div>
           <div class="rail"></div>
           <div class="body">
-            <div class="title">Enable WSL2</div>
+            <div class="title" id="wsl-title">Enable WSL2</div>
             <div class="desc" id="wsl-desc">Checking…</div>
             <div class="controls" id="wsl-controls" hidden>
               <button id="btn-wsl">Enable WSL2</button>
-              <span class="progress" id="wsl-progress"><span class="spinner"></span><span>waiting for Windows (approve the admin prompt)…</span></span>
+              <span class="progress" id="wsl-progress" aria-live="polite"><span class="spinner"></span><span id="wsl-progress-text">waiting for Windows (approve the admin prompt)…</span></span>
             </div>
           </div>
         </div>
@@ -181,7 +182,7 @@
             <div class="desc" id="distro-desc">Waiting for step 1.</div>
             <div class="controls" id="distro-controls" hidden>
               <button id="btn-distro">Install Ubuntu</button>
-              <span class="progress" id="distro-progress"><span class="spinner"></span><span>downloading Ubuntu — this can take a few minutes…</span></span>
+              <span class="progress" id="distro-progress" aria-live="polite"><span class="spinner"></span><span>downloading Ubuntu — this can take a few minutes…</span></span>
             </div>
           </div>
         </div>
@@ -189,7 +190,7 @@
         <div class="step" id="step-daemon">
           <div class="dot">3</div>
           <div class="body">
-            <div class="title">Install the chimaera daemon</div>
+            <div class="title">Start the chimaera daemon</div>
             <div class="desc" id="daemon-desc">Waiting for a WSL2 distribution.</div>
             <div class="controls" id="daemon-controls" hidden>
               <select id="distro-pick" aria-label="Linux distribution"></select>
@@ -197,16 +198,16 @@
                 <input type="checkbox" id="showall" /> show utility distros
               </label>
               <button id="btn-daemon">Set up chimaera</button>
-              <span class="progress" id="daemon-progress"><span class="spinner"></span><span id="daemon-phase">starting…</span></span>
+              <span class="progress" id="daemon-progress" aria-live="polite"><span class="spinner"></span><span id="daemon-phase">starting…</span></span>
             </div>
           </div>
         </div>
       </div>
 
-      <div class="error" id="error"></div>
+      <div class="error" id="error" role="alert"></div>
 
       <div class="foot">
-        <span id="foot-note">Nothing leaves your machine — the daemon binds to 127.0.0.1.</span>
+        <span>Nothing leaves your machine — the daemon binds to 127.0.0.1.</span>
         <span>WSL2 · Windows 11</span>
       </div>
     </main>
@@ -226,8 +227,11 @@
       const $ = (id) => document.getElementById(id);
       const errBox = $("error");
       let report = null;
-      let busy = false; // a daemon setup is running: don't reshuffle the UI under it
+      // A daemon setup is in flight: freeze the UI under it (the poll keeps
+      // running but must neither re-render nor re-invoke).
+      let busy = false;
       let rebootHinted = false;
+      let autoTried = false;
 
       function showError(msg) {
         errBox.textContent = msg;
@@ -240,7 +244,11 @@
       function stepState(el, state) {
         el.classList.toggle("done", state === "done");
         el.classList.toggle("active", state === "active");
-        if (state === "done") el.querySelector(".dot").textContent = "✓";
+        const dot = el.querySelector(".dot");
+        // Remember the step number so a state REGRESSION (distro removed,
+        // wsl --shutdown mid-wizard) never leaves a stale checkmark.
+        if (!dot.dataset.n) dot.dataset.n = dot.textContent;
+        dot.textContent = state === "done" ? "✓" : dot.dataset.n;
       }
 
       const PHASES = {
@@ -254,65 +262,105 @@
         $("daemon-phase").textContent = PHASES[e.payload] || e.payload;
       });
 
+      // The visible WSL2 candidates for the picker (hidden = utility distros
+      // like docker-desktop unless the toggle is on).
+      function candidates() {
+        const showAll = $("showall").checked;
+        return report.distros.filter((d) => d.version === 2 && (showAll || !d.hidden));
+      }
+
       function fillPicker() {
         const pick = $("distro-pick");
-        const showAll = $("showall").checked;
-        const hiddenCount = report.distros.filter((d) => d.hidden).length;
-        $("showall-wrap").hidden = hiddenCount === 0;
+        const list = candidates();
+        $("showall-wrap").hidden = !report.distros.some((d) => d.hidden);
+        // Never clobber the user's selection on a poll tick: skip identical
+        // rebuilds entirely, and re-apply the previous choice otherwise.
+        const names = list.map((d) => d.name).join("\n");
+        if (pick.dataset.names === names) return;
+        const previous = pick.value;
+        pick.dataset.names = names;
         pick.innerHTML = "";
-        for (const d of report.distros) {
-          if (d.version !== 2) continue;
-          if (d.hidden && !showAll) continue;
+        for (const d of list) {
           const opt = document.createElement("option");
           opt.value = d.name;
           opt.textContent = d.name + (d.isDefault ? "  (default)" : "");
-          if (d.name === report.defaultDistro) opt.selected = true;
           pick.appendChild(opt);
         }
+        if (list.some((d) => d.name === previous)) {
+          pick.value = previous;
+        } else if (report.defaultDistro && list.some((d) => d.name === report.defaultDistro)) {
+          pick.value = report.defaultDistro;
+        }
+      }
+
+      /// Reset every step to its base "waiting" shape, then let the active
+      /// branch override only what it owns — a missed field can then never
+      /// leak stale text from the previous state.
+      function resetSteps() {
+        stepState($("step-wsl"), "");
+        stepState($("step-distro"), "");
+        stepState($("step-daemon"), "");
+        $("wsl-title").textContent = "Enable WSL2";
+        $("wsl-desc").textContent = "Checking…";
+        $("wsl-controls").hidden = true;
+        $("btn-wsl").textContent = "Enable WSL2";
+        $("distro-desc").textContent = "Waiting for step 1.";
+        $("distro-controls").hidden = true;
+        $("daemon-desc").textContent = "Waiting for a WSL2 distribution.";
+        $("daemon-controls").hidden = true;
       }
 
       function render() {
         if (busy) return;
+        resetSteps();
         const s = report.state;
-        const wsl = $("step-wsl"), distro = $("step-distro"), daemon = $("step-daemon");
-
         if (s === "not-installed") {
-          stepState(wsl, "active"); stepState(distro, ""); stepState(daemon, "");
+          stepState($("step-wsl"), "active");
           $("wsl-desc").innerHTML = rebootHinted
             ? "If WSL was just enabled, <strong>restart Windows</strong>, then reopen chimaera."
             : "One-time Windows feature. Needs an admin approval and usually a restart.";
           $("wsl-controls").hidden = false;
-          $("distro-desc").textContent = "Waiting for step 1.";
-          $("distro-controls").hidden = true;
-          $("daemon-desc").textContent = "Waiting for a WSL2 distribution.";
-          $("daemon-controls").hidden = true;
+        } else if (s === "needs-update") {
+          stepState($("step-wsl"), "active");
+          $("wsl-title").textContent = "Update WSL";
+          $("wsl-desc").textContent =
+            "Your WSL is older than 2.1.1, which breaks background daemons after sleep. One command fixes it.";
+          $("btn-wsl").textContent = "Update WSL";
+          $("wsl-controls").hidden = false;
         } else if (s === "no-distro" || s === "wsl1-only") {
-          stepState(wsl, "done"); stepState(distro, "active"); stepState(daemon, "");
+          stepState($("step-wsl"), "done");
+          stepState($("step-distro"), "active");
           $("wsl-desc").textContent = "WSL2 is enabled.";
-          $("wsl-controls").hidden = true;
           $("distro-desc").innerHTML =
             s === "wsl1-only"
               ? "Your distros are WSL1. Convert one with <code>wsl --set-version &lt;name&gt; 2</code>, or install a fresh Ubuntu."
               : "Your shells, agents, and files will live here.";
           $("distro-controls").hidden = false;
-          $("daemon-desc").textContent = "Waiting for a WSL2 distribution.";
-          $("daemon-controls").hidden = true;
         } else if (s === "ready") {
-          stepState(wsl, "done"); stepState(distro, "done"); stepState(daemon, "active");
+          stepState($("step-wsl"), "done");
+          stepState($("step-distro"), "done");
+          stepState($("step-daemon"), "active");
           $("wsl-desc").textContent = "WSL2 is enabled.";
-          $("wsl-controls").hidden = true;
           $("distro-desc").textContent = "Found a WSL2 distribution.";
-          $("distro-controls").hidden = true;
           $("daemon-desc").textContent =
             "Installs the chimaera daemon into the distro and starts it. Sessions keep running when you close the app.";
           $("daemon-controls").hidden = false;
           fillPicker();
+          // One distro and nothing to choose: start without a click (this is
+          // also the recovery path after `wsl --shutdown` or a reboot, where
+          // the wizard exists purely to SHOW the restart progress). Never
+          // auto-retry after a failure — that needs a human.
+          if (!autoTried && candidates().length === 1) {
+            autoTried = true;
+            $("btn-daemon").click();
+          }
         } else {
           showError("Unexpected WSL state: " + s);
         }
       }
 
       async function refresh() {
+        if (busy) return; // don't stack invokes under a running setup
         try {
           report = await invoke("wsl_status");
           render();
@@ -321,13 +369,18 @@
         }
       }
 
+      // Step 1 doubles as enable-WSL2 and update-WSL depending on state.
       $("btn-wsl").addEventListener("click", async () => {
         clearError();
+        const updating = report && report.state === "needs-update";
         $("btn-wsl").disabled = true;
+        $("wsl-progress-text").textContent = updating
+          ? "updating WSL…"
+          : "waiting for Windows (approve the admin prompt)…";
         $("wsl-progress").classList.add("on");
         try {
-          await invoke("wsl_install");
-          rebootHinted = true;
+          await invoke(updating ? "wsl_update" : "wsl_install");
+          if (!updating) rebootHinted = true;
         } catch (e) {
           showError(String(e));
         } finally {
@@ -343,8 +396,8 @@
         $("distro-progress").classList.add("on");
         try {
           await invoke("wsl_install_distro");
-          // The install runs minutes; the 3s poll below picks the distro up
-          // when it registers, which re-renders and re-enables things.
+          // The install runs minutes; the poll below picks the distro up
+          // when it registers, which re-renders into the ready state.
         } catch (e) {
           showError(String(e));
           $("btn-distro").disabled = false;
@@ -370,7 +423,10 @@
         }
       });
 
-      $("showall").addEventListener("change", fillPicker);
+      $("showall").addEventListener("change", () => {
+        $("distro-pick").dataset.names = ""; // force one rebuild
+        fillPicker();
+      });
 
       refresh();
       setInterval(refresh, 3000);

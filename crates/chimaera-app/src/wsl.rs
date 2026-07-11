@@ -54,6 +54,11 @@ pub enum WslState {
     NoDistro,
     /// Distros exist but every visible one is WSL1 (needs `--set-version 2`).
     Wsl1Only,
+    /// WSL is older than the floor we gate on (`wsl --update` fixes it).
+    /// Pre-2.1.1 WSL kills daemonized processes with clock skew after
+    /// sleep/resume — the exact failure the version gate exists to prevent
+    /// (Docker gates on 2.1.5 the same way).
+    NeedsUpdate,
     /// At least one WSL2 distro is ready to host the daemon.
     Ready,
 }
@@ -201,12 +206,16 @@ mod script {
 
     pub const READ_MANIFEST: &str = "cat \"$HOME/.chimaera/manifest.json\" 2>/dev/null";
 
-    pub fn alive(pid: u32) -> String {
-        format!("kill -0 {pid} 2>/dev/null")
-    }
-
-    pub fn stop(pid: u32) -> String {
-        format!("kill -TERM {pid}")
+    /// Graceful stop as ONE in-distro invocation (each wsl.exe spawn costs
+    /// hundreds of ms, so polling from the host would stretch the deadline
+    /// several-fold): TERM, then wait up to ~15s, never KILL. Exit 3 =
+    /// still alive.
+    pub fn stop_and_wait(pid: u32) -> String {
+        format!(
+            "kill -TERM {pid} 2>/dev/null; i=0; \
+             while kill -0 {pid} 2>/dev/null; do \
+             i=$((i+1)); [ $i -ge 150 ] && exit 3; sleep 0.1; done"
+        )
     }
 }
 
@@ -216,42 +225,101 @@ mod script {
 
 #[cfg(windows)]
 mod imp {
+    use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::Duration;
 
     use anyhow::{bail, Context};
     use chimaera_core::Manifest;
     use chimaera_remote::Decision;
+    use serde::{Deserialize, Serialize};
     use tokio::io::AsyncWriteExt;
 
     use super::*;
 
-    /// CREATE_NO_WINDOW: a windowless GUI parent otherwise flashes a console
-    /// per spawned wsl.exe.
-    const NO_WINDOW: u32 = 0x0800_0000;
-
     const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
     const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The single-invocation stop script waits up to ~15s in-distro.
+    const STOP_TIMEOUT: Duration = Duration::from_secs(25);
     /// Streaming ~25 MB into the distro + chmod can take a moment.
     const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// The WSL floor: pre-2.1.1 kills daemonized processes with clock skew
+    /// after sleep/resume (fixed by the ICTIMESYNCFLAG_SYNC patch).
+    const MIN_WSL: (u64, u64, u64) = (2, 1, 1);
+
+    /// The resolved place the daemon lives: distro + PINNED user + $HOME.
+    /// The user is pinned because the distro's default can change under us
+    /// (Ubuntu's OOBE flips it on first interactive launch) — every spawn
+    /// passes `-u` so the daemon's home never silently moves.
+    #[derive(Clone, Debug)]
+    pub struct Target {
+        pub distro: String,
+        pub user: String,
+        pub home: String,
+    }
+
+    /// What survives restarts (wsl.json next to the manifest): which distro/
+    /// user the wizard chose, and whether OUR wizard installed a distro whose
+    /// first-run user we still owe (Ubuntu with --no-launch registers as
+    /// root — OOBE never ran).
+    #[derive(Serialize, Deserialize, Default, Clone)]
+    struct Persisted {
+        #[serde(default)]
+        distro: Option<String>,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        pending_first_setup: Option<String>,
+    }
+
+    fn persisted_path() -> PathBuf {
+        chimaera_core::data_dir().join("wsl.json")
+    }
+
+    fn load_persisted() -> Persisted {
+        std::fs::read_to_string(persisted_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_persisted(p: &Persisted) {
+        let path = persisted_path();
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(bytes) = serde_json::to_vec_pretty(p) {
+            let _ = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
+        }
+    }
 
     fn wsl_command() -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("wsl.exe");
         // Covers current WSL's own messages; distro output is UTF-8 anyway.
         // Legacy inbox WSL ignores it — decode_wsl_output sniffs for that.
         cmd.env("WSL_UTF8", "1");
-        cmd.creation_flags(NO_WINDOW);
+        cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
         cmd.kill_on_drop(true);
         cmd
     }
 
-    /// Spawn with hard timeout; stdin is nulled unless bytes are supplied.
+    /// What run() feeds the child's stdin: small generated scripts as bytes,
+    /// the daemon binary streamed from disk (never a whole-file buffer).
+    pub(super) enum Stdin {
+        Bytes(Vec<u8>),
+        File(PathBuf),
+    }
+
+    /// Spawn with a hard deadline over the ENTIRE exchange — including the
+    /// stdin streaming, which can wedge exactly like the wait can (a stalled
+    /// distro-side reader blocks write_all once the pipe fills). Output is
+    /// collected concurrently with the write so a chatty child can't
+    /// deadlock the pipe either.
     async fn run(
         mut cmd: tokio::process::Command,
-        stdin_bytes: Option<Vec<u8>>,
+        stdin: Option<Stdin>,
         timeout: Duration,
     ) -> anyhow::Result<std::process::Output> {
-        cmd.stdin(if stdin_bytes.is_some() {
+        cmd.stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -259,84 +327,181 @@ mod imp {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         let mut child = cmd.spawn().context("failed to spawn wsl.exe")?;
-        if let Some(bytes) = stdin_bytes {
-            let mut stdin = child.stdin.take().expect("piped stdin");
-            stdin.write_all(&bytes).await?;
-            // Close so the distro-side `cat` sees EOF.
-            drop(stdin);
-        }
-        tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .context("wsl.exe timed out")?
-            .context("failed to collect wsl.exe output")
+        let mut child_stdin = child.stdin.take();
+        let write = async {
+            match stdin {
+                Some(Stdin::Bytes(bytes)) => {
+                    if let Some(mut s) = child_stdin.take() {
+                        s.write_all(&bytes).await?;
+                    }
+                }
+                Some(Stdin::File(path)) => {
+                    if let Some(mut s) = child_stdin.take() {
+                        let mut f = tokio::fs::File::open(&path)
+                            .await
+                            .with_context(|| format!("open {}", path.display()))?;
+                        tokio::io::copy(&mut f, &mut s).await?;
+                    }
+                }
+                None => {}
+            }
+            // Drop closes the pipe so the distro-side `cat` sees EOF.
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout(timeout, async {
+            let (wrote, out) = tokio::join!(write, child.wait_with_output());
+            wrote?;
+            out.context("failed to collect wsl.exe output")
+        })
+        .await
+        .context("wsl.exe timed out")?
     }
 
-    /// `wsl -d <distro> --exec /bin/sh -c <script>` — POSIX sh, never the
-    /// user's login shell. `pub(super)` for the e2e smoke's assertions.
+    /// `wsl -d <distro> [-u <user>] --exec /bin/sh -c <script>` — POSIX sh,
+    /// never the user's login shell. `user: None` = the distro default (only
+    /// used before a target's user is pinned). `pub(super)` for the e2e
+    /// smoke's assertions.
     pub(super) async fn run_script(
         distro: &str,
+        user: Option<&str>,
         script: &str,
-        stdin_bytes: Option<Vec<u8>>,
+        stdin: Option<Stdin>,
         timeout: Duration,
     ) -> anyhow::Result<std::process::Output> {
         let mut cmd = wsl_command();
-        cmd.args(["-d", distro, "--exec", "/bin/sh", "-c", script]);
-        run(cmd, stdin_bytes, timeout).await
+        cmd.args(["-d", distro]);
+        if let Some(u) = user {
+            cmd.args(["-u", u]);
+        }
+        cmd.args(["--exec", "/bin/sh", "-c", script]);
+        run(cmd, stdin, timeout).await
+    }
+
+    async fn target_script(
+        t: &Target,
+        script: &str,
+        stdin: Option<Stdin>,
+        timeout: Duration,
+    ) -> anyhow::Result<std::process::Output> {
+        run_script(&t.distro, Some(&t.user), script, stdin, timeout).await
     }
 
     /// Registry-first detection: never pokes wsl.exe, so it cannot hit the
-    /// 24H2 interactive-install stub or a hung service.
+    /// 24H2 interactive-install stub or a hung service. Read errors are
+    /// logged and treated as absence — but never silently, so a
+    /// wizard-over-a-live-daemon misdetection is at least diagnosable.
     pub fn detect() -> WslReport {
         use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
         use winreg::RegKey;
 
         const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
 
-        let package_installed = RegKey::predef(HKEY_LOCAL_MACHINE)
+        let package_installed = match RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey(format!(r"{LXSS}\Msi"))
             .and_then(|k| k.get_value::<String, _>("InstallLocation"))
-            .is_ok();
+        {
+            Ok(_) => true,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("WSL package registry read failed (treating as absent): {e}");
+                }
+                false
+            }
+        };
 
         let mut raw = Vec::new();
-        if let Ok(lxss) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(LXSS) {
-            let default_guid: Option<String> = lxss.get_value("DefaultDistribution").ok();
-            for guid in lxss.enum_keys().flatten() {
-                let Ok(k) = lxss.open_subkey(&guid) else {
-                    continue;
-                };
-                let Ok(name) = k.get_value::<String, _>("DistributionName") else {
-                    continue;
-                };
-                let version: u32 = k.get_value("Version").unwrap_or(2);
-                // Missing State predates the value; treat as ready.
-                let state: u32 = k.get_value("State").unwrap_or(1);
-                raw.push(RawDistro {
-                    name,
-                    version,
-                    ready: state == 1,
-                    is_default: default_guid.as_deref() == Some(guid.as_str()),
-                });
+        match RegKey::predef(HKEY_CURRENT_USER).open_subkey(LXSS) {
+            Ok(lxss) => {
+                let default_guid: Option<String> = lxss.get_value("DefaultDistribution").ok();
+                for guid in lxss.enum_keys().flatten() {
+                    let Ok(k) = lxss.open_subkey(&guid) else {
+                        tracing::warn!("could not open distro registry key {guid}");
+                        continue;
+                    };
+                    let Ok(name) = k.get_value::<String, _>("DistributionName") else {
+                        continue;
+                    };
+                    let version: u32 = k.get_value("Version").unwrap_or(2);
+                    // Missing State predates the value; treat as ready.
+                    let state: u32 = k.get_value("State").unwrap_or(1);
+                    raw.push(RawDistro {
+                        name,
+                        version,
+                        ready: state == 1,
+                        is_default: default_guid.as_deref() == Some(guid.as_str()),
+                    });
+                }
             }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("WSL distro registry read failed (treating as none): {e}");
+            }
+            Err(_) => {}
         }
         build_report(package_installed, raw)
     }
 
-    /// One-time WSL enablement. wsl.exe self-elevates for the component
-    /// install, but launching it via an elevated PowerShell keeps the UAC
-    /// prompt attributed to a console the user can read, and `--install`
-    /// without a distro never silently reboots. A reboot is usually still
-    /// REQUIRED afterwards — the wizard says so; there is no headless
-    /// no-admin path by design (Docker documents the same).
+    /// detect() plus the async WSL version gate. Only this may flip a Ready
+    /// report to NeedsUpdate — the version probe spawns wsl.exe, which is
+    /// safe here because the registry already confirmed the package (the
+    /// 24H2 stub only bites when WSL is absent).
+    pub async fn full_report() -> WslReport {
+        let mut report = detect();
+        if report.state == WslState::Ready && !wsl_version_ok().await {
+            report.state = WslState::NeedsUpdate;
+        }
+        report
+    }
+
+    /// Parse `wsl --version`'s first line (labels are localized; the last
+    /// token is the version number). Unparseable or erroring — the legacy
+    /// inbox WSL has no --version at all — means "too old".
+    async fn wsl_version_ok() -> bool {
+        let mut cmd = wsl_command();
+        cmd.arg("--version");
+        let Ok(out) = run(cmd, None, STATUS_TIMEOUT).await else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let text = decode_wsl_output(&out.stdout);
+        let Some(v) = text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .and_then(|l| l.split_whitespace().last())
+        else {
+            return false;
+        };
+        let mut nums = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        let got = (
+            nums.next().unwrap_or(0),
+            nums.next().unwrap_or(0),
+            nums.next().unwrap_or(0),
+        );
+        if got < MIN_WSL {
+            tracing::warn!("WSL {v} is below the {MIN_WSL:?} floor — offering wsl --update");
+            return false;
+        }
+        true
+    }
+
+    /// One-time WSL enablement. `-PassThru; exit $p.ExitCode` because
+    /// Start-Process -Wait alone returns nothing — powershell would exit 0
+    /// even when the ELEVATED wsl.exe failed (virtualization disabled, WSL
+    /// servicing errors), looping the user through pointless reboots. A UAC
+    /// decline throws and surfaces on stderr. The elevated console's own
+    /// stderr is not capturable from an unelevated parent; the exit code is.
     pub async fn launch_wsl_install() -> anyhow::Result<()> {
         let mut cmd = tokio::process::Command::new("powershell.exe");
         cmd.args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Start-Process -FilePath wsl.exe -ArgumentList \
-             '--install','--no-distribution','--no-launch' -Verb RunAs -Wait",
+            "$p = Start-Process -FilePath wsl.exe -ArgumentList \
+             '--install','--no-distribution','--no-launch' -Verb RunAs -Wait -PassThru; \
+             exit $p.ExitCode",
         ]);
-        cmd.creation_flags(NO_WINDOW);
+        cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
         cmd.kill_on_drop(true);
         cmd.stdin(Stdio::null());
         let out = tokio::time::timeout(Duration::from_secs(600), cmd.output())
@@ -344,7 +509,23 @@ mod imp {
             .context("wsl --install timed out")??;
         if !out.status.success() {
             bail!(
-                "wsl --install failed: {}",
+                "wsl --install failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// `wsl --update` for the NeedsUpdate wizard state.
+    pub async fn launch_wsl_update() -> anyhow::Result<()> {
+        let mut cmd = wsl_command();
+        cmd.arg("--update");
+        cmd.stdin(Stdio::null());
+        let out = run(cmd, None, Duration::from_secs(600)).await?;
+        if !out.status.success() {
+            bail!(
+                "wsl --update failed: {}",
                 decode_wsl_output(&out.stderr).trim()
             );
         }
@@ -352,266 +533,441 @@ mod imp {
     }
 
     /// Install the default distro (Ubuntu). No elevation needed once the WSL
-    /// package exists. Fire-and-forget: the image download runs minutes; the
-    /// wizard polls `detect()` until the distro registers.
+    /// package exists. Genuinely fire-and-forget: kill_on_drop must be OFF —
+    /// this Child is dropped immediately and the image download runs minutes
+    /// while the wizard polls `detect()`. Records that WE installed it, so
+    /// the first daemon setup knows to create a real user (with --no-launch
+    /// Ubuntu's OOBE never runs and the distro registers with root as its
+    /// only user).
     pub async fn launch_distro_install() -> anyhow::Result<()> {
-        let mut cmd = wsl_command();
+        let mut cmd = tokio::process::Command::new("wsl.exe");
+        cmd.env("WSL_UTF8", "1");
+        cmd.creation_flags(chimaera_core::CREATE_NO_WINDOW);
         cmd.args(["--install", "-d", "Ubuntu", "--no-launch"]);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
         cmd.spawn().context("failed to launch the Ubuntu install")?;
+        let mut p = load_persisted();
+        p.pending_first_setup = Some("Ubuntu".to_string());
+        save_persisted(&p);
         Ok(())
     }
 
-    /// Manifest → live pid → authenticated health, all three or nothing —
-    /// the WSL twin of the unix probe. The health check runs against the
-    /// Windows loopback (the NAT forward), which is exactly the path the UI
-    /// will use, so passing it proves the forward too.
-    async fn probe(distro: &str) -> Option<Manifest> {
-        let out = run_script(distro, script::READ_MANIFEST, None, SCRIPT_TIMEOUT)
+    /// Resolve WHERE the daemon lives — distro, pinned user, home — and
+    /// persist the answer so every later launch targets the same place (the
+    /// wizard's pick must survive restarts, and the registry default must
+    /// not silently win over it).
+    async fn resolve_target(preferred: Option<String>) -> anyhow::Result<Target> {
+        let report = full_report().await;
+        if report.state != WslState::Ready {
+            return Err(anyhow::Error::new(WslNotReady(report)));
+        }
+        let mut persisted = load_persisted();
+        let persisted_distro = persisted
+            .distro
+            .clone()
+            // A persisted distro that was since unregistered must not wedge
+            // startup — fall through to the default.
+            .filter(|d| {
+                report
+                    .distros
+                    .iter()
+                    .any(|i| i.name == *d && i.version == 2)
+            });
+        let Some(distro) = preferred
+            .or(persisted_distro)
+            .or_else(|| report.default_distro.clone())
+        else {
+            return Err(anyhow::Error::new(WslNotReady(report)));
+        };
+
+        let user = match persisted
+            .user
+            .clone()
+            .filter(|_| persisted.distro.as_deref() == Some(distro.as_str()))
+        {
+            Some(u) => u,
+            None => {
+                let out = run_script(&distro, None, "id -un", None, SCRIPT_TIMEOUT).await?;
+                if !out.status.success() {
+                    bail!(
+                        "could not resolve the default user in {distro}: {}",
+                        decode_wsl_output(&out.stderr).trim()
+                    );
+                }
+                let mut user = decode_wsl_output(&out.stdout).trim().to_string();
+                // A wizard-installed Ubuntu registered as root (no OOBE):
+                // create the real account once, make it the distro default,
+                // and use it — otherwise everything lands root-owned and is
+                // orphaned the moment OOBE later flips the default user.
+                if user == "root" && persisted.pending_first_setup.as_deref() == Some(&distro) {
+                    user = create_default_user(&distro).await?;
+                }
+                persisted.pending_first_setup = None;
+                user
+            }
+        };
+
+        let home_out = target_probe_home(&distro, &user).await?;
+        let target = Target {
+            distro: distro.clone(),
+            user: user.clone(),
+            home: home_out,
+        };
+        persisted.distro = Some(distro);
+        persisted.user = Some(user);
+        save_persisted(&persisted);
+        Ok(target)
+    }
+
+    async fn target_probe_home(distro: &str, user: &str) -> anyhow::Result<String> {
+        let out = run_script(distro, Some(user), "echo \"$HOME\"", None, SCRIPT_TIMEOUT).await?;
+        let home = decode_wsl_output(&out.stdout).trim().to_string();
+        if !out.status.success() || home.is_empty() || !home.starts_with('/') {
+            bail!("could not resolve $HOME for {user} in {distro}");
+        }
+        Ok(home)
+    }
+
+    /// Create the wizard-installed distro's first real account: named after
+    /// the Windows user (sanitized to a safe charset — it is interpolated
+    /// into sh), default shell bash, sudo where the group exists, and made
+    /// the distro default via wsl.conf (which needs a distro restart to
+    /// apply — hence the --terminate).
+    async fn create_default_user(distro: &str) -> anyhow::Result<String> {
+        let name = default_username();
+        tracing::info!("creating user {name} in wizard-installed {distro}");
+        let script = format!(
+            "useradd -m -s /bin/bash {name} 2>/dev/null || true; \
+             usermod -aG sudo {name} 2>/dev/null || true; \
+             printf '[user]\\ndefault={name}\\n' >> /etc/wsl.conf && id -u {name}"
+        );
+        let out = run_script(distro, Some("root"), &script, None, SCRIPT_TIMEOUT).await?;
+        if !out.status.success() {
+            bail!(
+                "could not create user {name} in {distro}: {}",
+                decode_wsl_output(&out.stderr).trim()
+            );
+        }
+        // Apply the new default (and drop the root session state).
+        let mut cmd = wsl_command();
+        cmd.args(["--terminate", distro]);
+        let _ = run(cmd, None, STATUS_TIMEOUT).await;
+        Ok(name)
+    }
+
+    /// The Windows username as a valid Linux account name; whitelist
+    /// charset so it can never break the shell it is interpolated into.
+    fn default_username() -> String {
+        let raw = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
+        let name: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_')
+            .collect();
+        let name = name.trim_start_matches(['-', '_']).to_string();
+        if name.is_empty() || !name.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+            "chimaera".to_string()
+        } else {
+            name
+        }
+    }
+
+    /// Manifest → authenticated health, both or nothing. Health runs against
+    /// the Windows loopback (the NAT forward) — exactly the path the UI uses
+    /// — and doubles as the liveness check (a 200 from the token handshake
+    /// proves the daemon better than any kill -0 could, without the extra
+    /// wsl.exe spawn per poll).
+    async fn probe(t: &Target) -> Option<Manifest> {
+        let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT)
             .await
             .ok()?;
         if !out.status.success() {
             return None;
         }
         let m: Manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok()?;
-        let alive = run_script(distro, &script::alive(m.pid), None, SCRIPT_TIMEOUT)
-            .await
-            .ok()?
-            .status
-            .success();
-        if !alive {
-            return None;
-        }
+        health(&m).await.then_some(m)
+    }
+
+    async fn health(m: &Manifest) -> bool {
         let (port, token) = (m.port, m.token.clone());
-        let ok = tokio::task::spawn_blocking(move || crate::daemon::health_ok(port, &token))
+        tokio::task::spawn_blocking(move || crate::daemon::health_ok(port, &token))
             .await
-            .unwrap_or(false);
-        ok.then_some(m)
+            .unwrap_or(false)
     }
 
-    /// Graceful stop, unix-parity semantics: TERM, poll ~10s, never KILL.
-    async fn stop(distro: &str, pid: u32) -> anyhow::Result<()> {
-        tracing::info!("stopping WSL daemon (pid {pid} in {distro})");
-        let out = run_script(distro, &script::stop(pid), None, SCRIPT_TIMEOUT).await?;
-        if !out.status.success() {
-            bail!("failed to signal pid {pid} in {distro}");
+    /// Graceful stop: one in-distro TERM+wait invocation, never KILL.
+    async fn stop(t: &Target, pid: u32) -> anyhow::Result<()> {
+        tracing::info!("stopping WSL daemon (pid {pid} in {})", t.distro);
+        let out = target_script(t, &script::stop_and_wait(pid), None, STOP_TIMEOUT).await?;
+        match out.status.code() {
+            Some(0) => Ok(()),
+            Some(3) => bail!(
+                "WSL daemon (pid {pid}) is still running 15s after SIGTERM — refusing to \
+                 kill -9 it; something is keeping it busy (open browser tabs hold its \
+                 sockets). Close them and retry.",
+            ),
+            _ => bail!(
+                "could not stop pid {pid} in {}: {}",
+                t.distro,
+                decode_wsl_output(&out.stderr).trim()
+            ),
         }
-        for _ in 0..100 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let alive = run_script(distro, &script::alive(pid), None, SCRIPT_TIMEOUT)
-                .await?
-                .status
-                .success();
-            if !alive {
-                return Ok(());
-            }
-        }
-        bail!("WSL daemon (pid {pid}) is still running 10s after SIGTERM — refusing to kill -9 it")
     }
 
-    /// Ensure the daemon binary exists in the distro, fetching the release
-    /// asset (same cache + sha256 verify as `connect`) and streaming it over
-    /// wsl.exe stdin — never 9P, never curl-in-distro.
-    async fn ensure_binary(
-        distro: &str,
-        progress: &(dyn Fn(&str) + Send + Sync),
-    ) -> anyhow::Result<()> {
-        let present = run_script(distro, script::HAS_BINARY, None, SCRIPT_TIMEOUT)
-            .await?
-            .status
-            .success();
-        if present {
-            return Ok(());
-        }
-        progress("downloading");
-        let arch_out = run_script(distro, "uname -m", None, SCRIPT_TIMEOUT).await?;
+    /// Download the release daemon for the distro's arch into the local
+    /// cache (same assets + sha256 verify as `connect`) WITHOUT touching the
+    /// running daemon — fetch-before-stop, so a failed download never
+    /// strands the distro with nothing running.
+    async fn fetch_binary(t: &Target) -> anyhow::Result<PathBuf> {
+        let arch_out = target_script(t, "uname -m", None, SCRIPT_TIMEOUT).await?;
         let arch = decode_wsl_output(&arch_out.stdout).trim().to_string();
-        let path = chimaera_remote::fetch_daemon_binary("linux", &arch, &|_| {})
+        chimaera_remote::fetch_release_binary("linux", &arch, &|_| {})
             .await
-            .context("failed to fetch the daemon release binary")?;
-        progress("installing");
-        let bytes = tokio::fs::read(&path).await?;
-        let out = run_script(distro, script::INSTALL, Some(bytes), INSTALL_TIMEOUT).await?;
+            .context("failed to fetch the daemon release binary")
+    }
+
+    /// Stream `staged` (the verified cache file) into the distro and install
+    /// it atomically (staged name + rename).
+    async fn install_binary(t: &Target, staged: &std::path::Path) -> anyhow::Result<()> {
+        let out = target_script(
+            t,
+            script::INSTALL,
+            Some(Stdin::File(staged.to_path_buf())),
+            INSTALL_TIMEOUT,
+        )
+        .await?;
         if !out.status.success() {
             bail!(
-                "failed to install the daemon into {distro}: {}",
+                "failed to install the daemon into {}: {}",
+                t.distro,
                 decode_wsl_output(&out.stderr).trim()
             );
         }
         Ok(())
     }
 
-    fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
-        LocalDaemon {
-            port: m.port,
-            token: m.token,
-            build: m.build,
-            outdated,
-            live_sessions,
-        }
+    async fn has_binary(t: &Target) -> anyhow::Result<bool> {
+        Ok(target_script(t, script::HAS_BINARY, None, SCRIPT_TIMEOUT)
+            .await?
+            .status
+            .success())
     }
 
-    /// The Windows `ensure_local_daemon`: adopt a healthy daemon in the
-    /// chosen (or default) distro, applying the same build-parity decision
-    /// policy as unix/connect; else provision + spawn + poll. On success the
-    /// same distro is wired for remote hosts (ControlMaster ssh + the
-    /// askpass wrapper) — best-effort, because a wiring failure must not
-    /// take local sessions down with it.
-    pub async fn ensure_daemon(
-        distro: Option<String>,
-        progress: &(dyn Fn(&str) + Send + Sync),
-    ) -> anyhow::Result<LocalDaemon> {
-        let report = detect();
-        let distro = match distro.or_else(|| report.default_distro.clone()) {
-            Some(d) if report.state == WslState::Ready => d,
-            _ => return Err(anyhow::Error::new(WslNotReady(report))),
-        };
-        let local = ensure_inner(&distro, progress).await?;
-        if let Err(e) = wire_connect(&distro).await {
-            tracing::warn!("could not wire remote-connect through {distro}: {e:#}");
+    /// Start the daemon and adopt it: poll the manifest until it parses
+    /// (a spawn per try, usually one), then poll ONLY the spawn-free health
+    /// check on the forwarded loopback.
+    async fn start_and_adopt(t: &Target) -> anyhow::Result<LocalDaemon> {
+        let out = target_script(t, script::START, None, SCRIPT_TIMEOUT).await?;
+        if !out.status.success() {
+            bail!(
+                "failed to start the daemon in {}: {}",
+                t.distro,
+                decode_wsl_output(&out.stderr).trim()
+            );
         }
+        let mut manifest: Option<Manifest> = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if manifest.is_none() {
+                let out = target_script(t, script::READ_MANIFEST, None, SCRIPT_TIMEOUT).await?;
+                if out.status.success() {
+                    manifest = serde_json::from_str(decode_wsl_output(&out.stdout).trim()).ok();
+                }
+            }
+            let healthy = match &manifest {
+                Some(m) => health(m).await,
+                None => false,
+            };
+            if healthy {
+                let m = manifest.take().expect("checked above");
+                tracing::info!("WSL daemon up in {} on 127.0.0.1:{}", t.distro, m.port);
+                return Ok(crate::daemon::attached(m, false, None));
+            }
+        }
+        bail!(
+            "the daemon did not come up in {} within 15s — check \
+             ~/.chimaera/logs/serve.log inside the distro",
+            t.distro
+        )
+    }
+
+    /// Adopt-only: attach to a HEALTHY daemon (same build-parity policy as
+    /// unix), or report why the shell must go through the wizard instead —
+    /// anything that needs provisioning/replacing runs there, visibly, not
+    /// invisibly inside a window-less startup.
+    pub async fn adopt_daemon() -> anyhow::Result<LocalDaemon> {
+        let target = resolve_target(None).await?;
+        let Some(m) = probe(&target).await else {
+            return Err(anyhow::Error::new(WslNotReady(full_report().await)));
+        };
+        let local_build = chimaera_core::BUILD_ID;
+        let sessions = if chimaera_core::builds_match(local_build, m.build.as_deref()) {
+            None
+        } else {
+            crate::daemon::live_session_count(m.port, &m.token).await
+        };
+        let local = match chimaera_remote::update_decision(
+            local_build,
+            m.build.as_deref(),
+            sessions,
+            false,
+        ) {
+            Decision::Reuse => {
+                tracing::info!(
+                    "attaching to WSL daemon in {} on 127.0.0.1:{}",
+                    target.distro,
+                    m.port
+                );
+                crate::daemon::attached(m, false, sessions)
+            }
+            // Replacing is provisioning work — the wizard shows it.
+            Decision::Update => return Err(anyhow::Error::new(WslNotReady(full_report().await))),
+            Decision::ConnectOutdated => {
+                tracing::warn!(
+                    "WSL daemon is an older build with live sessions — attaching as outdated"
+                );
+                crate::daemon::attached(m, true, sessions)
+            }
+        };
+        wire_connect(&target).await;
         Ok(local)
     }
 
-    async fn ensure_inner(
-        distro: &str,
+    /// The full ensure: adopt a healthy same-build daemon, REPLACE a
+    /// different-build one (fetch first, then stop, then install — a failed
+    /// download must never stop a working daemon), or provision from
+    /// nothing. `force_replace` is the explicit update affordance: it
+    /// replaces regardless of live sessions (the button says what it ends).
+    pub async fn ensure_daemon(
+        distro: Option<String>,
+        force_replace: bool,
         progress: &(dyn Fn(&str) + Send + Sync),
     ) -> anyhow::Result<LocalDaemon> {
-        let distro = distro.to_string();
+        let target = resolve_target(distro).await?;
         progress("checking");
-        if let Some(m) = probe(&distro).await {
+        if let Some(m) = probe(&target).await {
             let local_build = chimaera_core::BUILD_ID;
             let sessions = if chimaera_core::builds_match(local_build, m.build.as_deref()) {
                 None
             } else {
                 crate::daemon::live_session_count(m.port, &m.token).await
             };
-            match chimaera_remote::update_decision(local_build, m.build.as_deref(), sessions, false)
-            {
+            match chimaera_remote::update_decision(
+                local_build,
+                m.build.as_deref(),
+                sessions,
+                force_replace,
+            ) {
                 Decision::Reuse => {
-                    tracing::info!(
-                        "attaching to WSL daemon in {distro} on 127.0.0.1:{}",
-                        m.port
-                    );
-                    return Ok(attached(m, false, sessions));
+                    wire_connect(&target).await;
+                    return Ok(crate::daemon::attached(m, false, sessions));
                 }
                 Decision::Update => {
-                    tracing::info!("WSL daemon build differs and is idle — replacing it");
-                    stop(&distro, m.pid).await?;
+                    tracing::info!("replacing the WSL daemon (build differs)");
+                    progress("downloading");
+                    let staged = fetch_binary(&target).await?;
+                    stop(&target, m.pid).await?;
+                    progress("installing");
+                    install_binary(&target, &staged).await?;
                 }
                 Decision::ConnectOutdated => {
-                    tracing::warn!(
-                        "WSL daemon is an older build with live sessions — attaching as outdated"
-                    );
-                    return Ok(attached(m, true, sessions));
+                    wire_connect(&target).await;
+                    return Ok(crate::daemon::attached(m, true, sessions));
                 }
             }
+        } else if !has_binary(&target).await? {
+            progress("downloading");
+            let staged = fetch_binary(&target).await?;
+            progress("installing");
+            install_binary(&target, &staged).await?;
         }
-
-        ensure_binary(&distro, progress).await?;
         progress("starting");
-        let out = run_script(&distro, script::START, None, SCRIPT_TIMEOUT).await?;
-        if !out.status.success() {
-            bail!(
-                "failed to start the daemon in {distro}: {}",
-                decode_wsl_output(&out.stderr).trim()
-            );
-        }
-        progress("adopting");
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Some(m) = probe(&distro).await {
-                tracing::info!("WSL daemon up in {distro} on 127.0.0.1:{}", m.port);
-                return Ok(attached(m, false, None));
-            }
-        }
-        bail!(
-            "the daemon did not come up in {distro} within 15s — check \
-             ~/.chimaera/logs/serve.log inside the distro"
-        )
+        let local = start_and_adopt(&target).await?;
+        wire_connect(&target).await;
+        Ok(local)
     }
 
-    /// Wire remote-host support through the distro (idempotent, re-run on
-    /// every successful ensure): the ControlMaster socket dir, the askpass
-    /// wrapper script with the relay's port + token baked in, the
-    /// `SSH_ASKPASS` env that crosses into WSL via `WSLENV`, and the
-    /// chimaera-remote command transport. This is what turns `connect` on —
-    /// ssh runs INSIDE the distro (Linux OpenSSH has the ControlMaster
-    /// multiplexing Win32-OpenSSH lacks), prompts ride interop back to the
-    /// Windows shell.
-    async fn wire_connect(distro: &str) -> anyhow::Result<()> {
-        let home_out = run_script(distro, "echo \"$HOME\"", None, SCRIPT_TIMEOUT).await?;
-        let home = decode_wsl_output(&home_out.stdout).trim().to_string();
-        if home.is_empty() || !home.starts_with('/') {
-            bail!("could not resolve $HOME in {distro}");
-        }
+    /// Explicit update affordance: replace regardless of session count.
+    pub async fn update_daemon(
+        progress: &(dyn Fn(&str) + Send + Sync),
+    ) -> anyhow::Result<LocalDaemon> {
+        ensure_daemon(None, true, progress).await
+    }
 
-        // ssh creates ControlMaster sockets under this dir but never the dir
-        // itself; chimaera-remote points ControlPath here under the transport.
-        run_script(
-            distro,
-            "mkdir -p \"$HOME/.chimaera/cm\"",
-            None,
+    /// Wire remote-host support through the target (idempotent, re-run on
+    /// every successful adopt/ensure). The chimaera-remote transport is set
+    /// FIRST — it only needs facts we already have — so a later askpass
+    /// hiccup degrades exactly like unix (key/agent hosts still work,
+    /// password hosts fail cleanly) instead of silently falling back to
+    /// Win32-OpenSSH. Failures are warned, never fatal: remote wiring must
+    /// not take local sessions down.
+    async fn wire_connect(t: &Target) {
+        chimaera_remote::set_wsl_transport(Some(chimaera_remote::WslTransport {
+            distro: t.distro.clone(),
+            user: t.user.clone(),
+            home: t.home.clone(),
+        }));
+        if let Err(e) = wire_askpass(t).await {
+            tracing::warn!(
+                "askpass wiring through {} failed — password/2FA hosts will fail cleanly: {e:#}",
+                t.distro
+            );
+        }
+    }
+
+    /// Install the distro-side SSH_ASKPASS wrapper (ControlMaster dir rides
+    /// along) and export the env that crosses into WSL via WSLENV.
+    async fn wire_askpass(t: &Target) -> anyhow::Result<()> {
+        let Some((port, token)) = crate::askpass::relay_endpoint() else {
+            bail!("askpass relay not listening");
+        };
+        let exe = std::env::current_exe().context("resolve current executable")?;
+        let exe_wsl = chimaera_remote::windows_path_as_wsl(&exe.to_string_lossy());
+        if !exe_wsl.starts_with("/mnt/") {
+            // UNC or otherwise un-translatable: the distro cannot exec it.
+            bail!("app path {exe_wsl:?} is not reachable from inside WSL");
+        }
+        // The exe path is user-controlled (profile dir) — quote-escape it
+        // for the single-quoted sh assignment (O'Brien is a legal Windows
+        // user name). Port/token are u16/hex and safe by construction.
+        let exe_quoted = exe_wsl.replace('\'', r"'\''");
+        // The prompt travels on stdin end to end (ssh → script arg → helper
+        // stdin): interop's Linux-argv→Windows-cmdline marshaling is
+        // unverified for arbitrary prompt text, so only fixed tokens ride
+        // argv. Missing exe / disabled interop exits 0 with no output — ssh
+        // gets an empty answer and fails cleanly.
+        let wrapper = format!(
+            "#!/bin/sh\n\
+             # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
+             exe='{exe_quoted}'\n\
+             [ -x \"$exe\" ] || exit 0\n\
+             {{ printf '%s %s\\n' '{port}' '{token}'; printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
+        );
+        let out = target_script(
+            t,
+            "mkdir -p \"$HOME/.chimaera/cm\" && \
+             cat > \"$HOME/.chimaera/askpass.sh\" && \
+             chmod 700 \"$HOME/.chimaera/askpass.sh\"",
+            Some(Stdin::Bytes(wrapper.into_bytes())),
             SCRIPT_TIMEOUT,
         )
         .await?;
-
-        if let Some((port, token)) = crate::askpass::relay_endpoint() {
-            let exe = std::env::current_exe().context("resolve current executable")?;
-            let exe_wsl = windows_path_in_wsl(&exe);
-            // The prompt travels on stdin end to end (ssh → script arg →
-            // helper stdin): interop's Linux-argv→Windows-cmdline marshaling
-            // is unverified for arbitrary prompt text, so only fixed tokens
-            // ride argv. Missing exe / disabled interop exits 0 with no
-            // output — ssh gets an empty answer and fails cleanly.
-            let script = format!(
-                "#!/bin/sh\n\
-                 # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
-                 exe='{exe_wsl}'\n\
-                 [ -x \"$exe\" ] || exit 0\n\
-                 {{ printf '%s %s\\n' '{port}' '{token}'; printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
+        if !out.status.success() {
+            bail!(
+                "failed to install the askpass wrapper: {}",
+                decode_wsl_output(&out.stderr).trim()
             );
-            let out = run_script(
-                distro,
-                "cat > \"$HOME/.chimaera/askpass.sh\" && chmod 700 \"$HOME/.chimaera/askpass.sh\"",
-                Some(script.into_bytes()),
-                SCRIPT_TIMEOUT,
-            )
-            .await?;
-            if !out.status.success() {
-                bail!(
-                    "failed to install the askpass wrapper in {distro}: {}",
-                    decode_wsl_output(&out.stderr).trim()
-                );
-            }
-            // Values are distro-side paths/strings passed verbatim — no /p
-            // path-translation flags. ssh children of every wsl.exe we spawn
-            // inherit these through WSLENV.
-            std::env::set_var("SSH_ASKPASS", format!("{home}/.chimaera/askpass.sh"));
-            std::env::set_var("SSH_ASKPASS_REQUIRE", "force");
-            extend_wslenv(&["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]);
-        } else {
-            tracing::warn!("askpass relay not listening — password/2FA hosts will fail cleanly");
         }
-
-        chimaera_remote::set_wsl_transport(Some(chimaera_remote::WslTransport {
-            distro: distro.to_string(),
-            home,
-        }));
+        // Values are distro-side paths/strings passed verbatim — no /p
+        // path-translation flags. ssh children of every wsl.exe we spawn
+        // inherit these through WSLENV. (set_var is fine here: Windows
+        // SetEnvironmentVariableW is OS-synchronized, and the values are
+        // idempotent across re-wires.)
+        std::env::set_var("SSH_ASKPASS", format!("{}/.chimaera/askpass.sh", t.home));
+        std::env::set_var("SSH_ASKPASS_REQUIRE", "force");
+        extend_wslenv(&["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]);
         Ok(())
-    }
-
-    /// `C:\Users\x\chimaera.exe` → `/mnt/c/Users/x/chimaera.exe`: how the
-    /// wrapper script inside the distro addresses the Windows helper.
-    fn windows_path_in_wsl(path: &std::path::Path) -> String {
-        let s = path.to_string_lossy().replace('\\', "/");
-        if s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/' {
-            format!("/mnt/{}{}", s[..1].to_ascii_lowercase(), &s[2..])
-        } else {
-            s
-        }
     }
 
     /// Add `vars` to `WSLENV` (colon-separated) so they cross into every
@@ -635,33 +991,6 @@ mod imp {
         }
         std::env::set_var("WSLENV", parts.join(":"));
     }
-
-    /// Explicit update: stop whatever runs (the affordance says what it
-    /// ends), then force a fresh provision — the daemon is NOT our exe here,
-    /// so "update" means re-fetch the release asset, not respawn-self.
-    pub async fn update_daemon(
-        progress: &(dyn Fn(&str) + Send + Sync),
-    ) -> anyhow::Result<LocalDaemon> {
-        let report = detect();
-        let Some(distro) = report.default_distro.clone() else {
-            return Err(anyhow::Error::new(WslNotReady(report)));
-        };
-        if let Some(m) = probe(&distro).await {
-            if chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref()) {
-                return Ok(attached(m, false, None));
-            }
-            stop(&distro, m.pid).await?;
-        }
-        // Drop the possibly-stale binary so ensure_binary re-fetches.
-        let _ = run_script(
-            &distro,
-            "rm -f \"$HOME/.chimaera/bin/chimaera\"",
-            None,
-            SCRIPT_TIMEOUT,
-        )
-        .await;
-        ensure_daemon(Some(distro), progress).await
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +1009,15 @@ mod imp {
         }
     }
 
+    pub async fn full_report() -> WslReport {
+        detect()
+    }
+
     pub async fn launch_wsl_install() -> anyhow::Result<()> {
+        anyhow::bail!("WSL setup only applies to the Windows app")
+    }
+
+    pub async fn launch_wsl_update() -> anyhow::Result<()> {
         anyhow::bail!("WSL setup only applies to the Windows app")
     }
 
@@ -690,17 +1027,24 @@ mod imp {
 
     pub async fn ensure_daemon(
         _distro: Option<String>,
+        _force_replace: bool,
         _progress: &(dyn Fn(&str) + Send + Sync),
     ) -> anyhow::Result<LocalDaemon> {
         anyhow::bail!("WSL hosting only applies to the Windows app")
     }
 }
 
-pub use imp::{detect, ensure_daemon, launch_distro_install, launch_wsl_install};
-// Only the Windows daemon-update path exists; unix updates its local daemon
-// by respawning itself (daemon.rs), never through here.
+// `detect` is only called from the windows imp + the e2e smoke; the unix
+// build re-exports it solely so the surface is identical on both platforms.
+#[cfg_attr(not(windows), allow(unused_imports))]
+pub use imp::{
+    detect, ensure_daemon, full_report, launch_distro_install, launch_wsl_install,
+    launch_wsl_update,
+};
+// Only the Windows shell adopts/updates a WSL daemon; unix owns its local
+// daemon in daemon.rs, never through here.
 #[cfg(windows)]
-pub use imp::update_daemon;
+pub use imp::{adopt_daemon, update_daemon};
 
 #[cfg(test)]
 mod tests {
@@ -827,15 +1171,17 @@ mod e2e {
     #[tokio::test]
     #[ignore = "needs a real WSL2 distro — run via the wsl-smoke workflow"]
     async fn wsl_end_to_end() {
-        let report = detect();
+        let report = full_report().await;
         assert_eq!(
             report.state,
             WslState::Ready,
-            "the runner must provide a WSL2 distro: {report:?}"
+            "the runner must provide a modern WSL2 distro: {report:?}"
         );
         let progress = |p: &str| eprintln!("[smoke] phase: {p}");
 
-        let local = ensure_daemon(None, &progress).await.expect("ensure daemon");
+        let local = ensure_daemon(None, false, &progress)
+            .await
+            .expect("ensure daemon");
         eprintln!("[smoke] daemon on 127.0.0.1:{}", local.port);
 
         // The daemon API through the forward — a real workspace and a real
@@ -857,9 +1203,17 @@ mod e2e {
             .expect("session json");
         eprintln!("[smoke] shell session {} is up", session["id"]);
 
-        // Re-ensure must adopt, not respawn (same port = same daemon).
-        let again = ensure_daemon(None, &progress).await.expect("re-ensure");
+        // Re-ensure must adopt, not respawn (same port = same daemon), and
+        // so must the startup-path adopt-only probe.
+        let again = ensure_daemon(None, false, &progress)
+            .await
+            .expect("re-ensure");
         assert_eq!(again.port, local.port, "second ensure adopted the daemon");
+        let adopted = adopt_daemon().await.expect("adopt-only attach");
+        assert_eq!(
+            adopted.port, local.port,
+            "adopt_daemon attached, not respawned"
+        );
 
         // wire_connect ran on the ensure path: the ControlMaster socket dir
         // for the ssh-in-WSL transport must exist in the distro. (The full
@@ -869,6 +1223,7 @@ mod e2e {
         let distro = report.default_distro.expect("ready distro");
         let cm = imp::run_script(
             &distro,
+            None,
             "test -d \"$HOME/.chimaera/cm\"",
             None,
             std::time::Duration::from_secs(30),
@@ -885,7 +1240,7 @@ mod e2e {
             .expect("wsl --shutdown");
         assert!(out.status.success(), "wsl --shutdown failed");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let revived = ensure_daemon(None, &progress)
+        let revived = ensure_daemon(None, false, &progress)
             .await
             .expect("revive after wsl --shutdown");
         eprintln!("[smoke] revived on 127.0.0.1:{}", revived.port);

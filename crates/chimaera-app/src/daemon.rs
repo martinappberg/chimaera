@@ -16,7 +16,6 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use anyhow::{bail, Context};
-#[cfg(unix)]
 use chimaera_core::Manifest;
 #[cfg(unix)]
 use chimaera_remote::Decision;
@@ -127,11 +126,13 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
 }
 
 // On Windows the local daemon is the Linux musl binary inside WSL2; the wsl
-// module owns detect/provision/spawn/adopt. Errors carrying WslNotReady make
-// startup open the setup wizard instead of failing.
+// module owns detect/provision/spawn/adopt. Startup only ADOPTS here —
+// anything that would provision, replace, or install runs in the wizard
+// window instead, so minutes of download/setup are never invisible. Errors
+// carrying WslNotReady make startup open that wizard rather than fail.
 #[cfg(windows)]
 pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
-    crate::wsl::ensure_daemon(None, &|_| {}).await
+    crate::wsl::adopt_daemon().await
 }
 
 #[cfg(windows)]
@@ -139,8 +140,8 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     crate::wsl::update_daemon(&|_| {}).await
 }
 
-#[cfg(unix)]
-fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
+/// Manifest → LocalDaemon, shared by the unix adopt path and the WSL engine.
+pub(crate) fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
     LocalDaemon {
         port: m.port,
         token: m.token,

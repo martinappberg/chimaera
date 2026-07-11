@@ -207,6 +207,13 @@ fn resolve_login_shell(
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
+/// CREATE_NO_WINDOW for child-process spawns: a windowless GUI parent
+/// otherwise flashes a console per spawned console-subsystem child (wsl.exe,
+/// ssh.exe, curl.exe). One shared constant so the spawn-flag discipline
+/// can't drift between crates.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Generate an auth token: 32 random bytes as lowercase hex (64 chars).
 pub fn generate_token() -> String {
     use rand::RngCore;
