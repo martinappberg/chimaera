@@ -332,6 +332,17 @@
   // --- the rail's Recents section (ended agent conversations) ---
   let recents = $state<RecentConvo[]>([]);
   let recentsExpanded = $state(false);
+  /** Recents to SHOW: drop any whose conversation is currently LIVE (a live
+   *  agent with the same title). A running conversation belongs under AGENTS,
+   *  not RECENT — and the server's live-exclusion can briefly miss a fresh
+   *  session whose transcript id isn't recorded yet, so a row would otherwise
+   *  appear in both sections at once. */
+  const visibleRecents = $derived.by(() => {
+    const liveTitles = new Set(
+      sessions.filter((s) => s.kind === "agent" && s.alive).map((s) => displayName(s)),
+    );
+    return recents.filter((r) => r.title === "" || !liveTitles.has(r.title));
+  });
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
   /** Rail row currently in inline rename (double-click or F2). */
@@ -3042,11 +3053,11 @@
         <!-- Recents: ended agent conversations, any agent type, newest
              first — the daemon remembers them across restarts. Click
              resumes (claude) or honestly starts fresh (the tooltip says). -->
-        {#if recents.length > 0}
+        {#if visibleRecents.length > 0}
           <div class="recents">
             <div class="recents-head">recent</div>
             <div class="recents-list" class:expanded={recentsExpanded}>
-              {#each recentsExpanded ? recents : recents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
+              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
                 <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
@@ -3054,12 +3065,12 @@
                 </button>
               {/each}
             </div>
-            {#if recents.length > 3}
+            {#if visibleRecents.length > 3}
               <button
                 class="recents-more"
                 onclick={() => (recentsExpanded = !recentsExpanded)}
               >
-                {recentsExpanded ? "show less" : `all ${recents.length}`}
+                {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
               </button>
             {/if}
           </div>
@@ -4184,6 +4195,10 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* Column so the tree can grow to fill — a right-click in the empty area
+       below the last row then still lands on the tree's context menu. */
+    display: flex;
+    flex-direction: column;
   }
 
   .daemon {

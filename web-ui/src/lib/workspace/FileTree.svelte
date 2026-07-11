@@ -734,6 +734,7 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    flex: 1; /* fill .files-body so the tree's empty area is right-clickable */
   }
 
   /* Quiet filter affordance: a small magnifier that expands into an input.
@@ -812,6 +813,10 @@
     flex-direction: column;
     padding: 2px 0.45rem 0.5rem;
     outline: none;
+    /* Fill the FILES area so a right-click BELOW the last row still hits the
+       tree's context menu (Paste into the root) instead of the browser's. */
+    flex: 1;
+    min-height: 0;
   }
 
   /* An OS-desktop file drag is hovering the tree: a quiet accent frame marks

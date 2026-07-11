@@ -128,11 +128,14 @@
     transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
   }
 
-  // On (re)mount, restore the saved reading position: bottom-pinned sessions
-  // stick to the bottom, otherwise jump back to where the user was reading.
+  // On (re)mount, restore the saved reading position ONCE: bottom-pinned
+  // sessions stick to the bottom, otherwise jump back to where the user was
+  // reading. Guarded so it never re-fires mid-stream and fights the autoscroll.
+  let didRestore = false;
   $effect(() => {
     const el = transcriptEl;
-    if (el === null) return;
+    if (el === null || didRestore) return;
+    didRestore = true;
     const saved = chatScroll(session.id);
     void tick().then(() => {
       if (transcriptEl === null) return;
@@ -461,7 +464,14 @@
   const modelLabel = $derived.by(() => {
     if (currentModel !== undefined) return currentModel.label;
     const m = store.model;
-    if (m === null) return null;
+    if (m === null) {
+      // A fresh session never reports a model until its first turn — don't
+      // skeleton forever. Once the catalog is loaded, show the DEFAULT it will
+      // use (correct for a new chat); only the brief pre-catalog window (no
+      // choices yet) stays null → skeleton.
+      const def = modelChoices.find((c) => c.id === "default") ?? modelChoices[0];
+      return def?.label ?? null;
+    }
     const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
     return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
   });

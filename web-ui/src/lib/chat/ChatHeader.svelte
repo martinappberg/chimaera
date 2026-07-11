@@ -88,17 +88,18 @@
   <div class="menu-host">
     <button
       class="chip pick"
-      title={store.model === null ? "resolving model…" : "model — click to switch"}
+      title={modelLabel === null ? "resolving model…" : "model — click to switch"}
       aria-haspopup="menu"
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
     >
-      <!-- store.model stays null until the first init/ready payload resolves —
-           show a neutral skeleton then, never a concrete (wrong) default name. -->
-      {#if store.model === null}
+      <!-- Skeleton only in the brief window before the model catalog loads
+           (modelLabel null). Once it's loaded, modelLabel is the session's real
+           model — or the default a fresh chat will use — never a wrong flash. -->
+      {#if modelLabel === null}
         <span class="model-skel" aria-label="loading model"></span>
       {:else}
-        {modelLabel ?? "model"}
+        {modelLabel}
       {/if}
       {@render caret()}
     </button>

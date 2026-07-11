@@ -387,9 +387,15 @@ export function sessionPaneId(l: Layout, sessionId: string): string | null {
  */
 export function openFile(l: Layout, path: string, preview = false): Layout {
   const tab: FileTab = preview ? { surface: "file", path, preview: true } : { surface: "file", path };
-  // Dedupe first: a path open anywhere focuses its existing tab (and never
-  // demotes a pinned tab to preview).
-  if (paneForTab(l.root, tab) !== null) return openTab(l, tab);
+  // Dedupe first: a path open anywhere focuses its existing tab. A pinned open
+  // of an already-open PREVIEW tab promotes it (double-clicking a tree row that
+  // was preview-opened by the two single-clicks pins it); a preview open never
+  // demotes a pinned tab.
+  const loc = paneForTab(l.root, tab);
+  if (loc !== null) {
+    const focused = activateTab(l, loc.paneId, loc.index);
+    return preview ? focused : pinTab(focused, loc.paneId, loc.index);
+  }
   if (!preview) return openTab(l, tab);
   // Replace the focused pane's existing preview file tab in place, if any.
   const paneId = findPane(l.root, l.focusedPaneId) !== null ? l.focusedPaneId : panes(l.root)[0]?.id;
