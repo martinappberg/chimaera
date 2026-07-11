@@ -321,6 +321,7 @@ async fn spawn_chat_ui(
         model: body.model.clone(),
         resume: body.resume.clone(),
         fork_at: None,
+        rollback_turns: None,
         theme: theme.to_string(),
     };
 

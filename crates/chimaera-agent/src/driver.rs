@@ -46,6 +46,10 @@ pub struct SpawnSpec {
     /// journaled on `Init`, compared against the driver's tested pin for
     /// the non-fatal drift notice.
     pub agent_version: Option<String>,
+    /// Conversation-rewind respawn (codex): drop this many trailing turns via
+    /// `thread/rollback` right after `thread/resume`. Claude ignores it — its
+    /// fork rides argv (`--fork-session --resume-session-at`).
+    pub rollback_turns: Option<u32>,
     pub handshake_timeout: Duration,
 }
 
@@ -59,6 +63,7 @@ impl SpawnSpec {
             env_remove: Vec::new(),
             pinned_native_id: None,
             agent_version: None,
+            rollback_turns: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
@@ -115,6 +120,12 @@ pub trait Mapper: Send {
     /// once, right before `Exited`.
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
         Vec::new()
+    }
+    /// Time-driven work on the harness's ~100ms tick (codex auto-resolves
+    /// expired questions here; claude's question timeouts are CLI-side —
+    /// askUserQuestionTimeout — so it keeps the empty default).
+    fn tick(&mut self) -> DriverStep {
+        DriverStep::default()
     }
 }
 
@@ -396,6 +407,11 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
                     if io.events.send(ev).await.is_err() {
                         break DriverExit::Killed;
                     }
+                }
+                match deliver(&mut sink, &io, mapper.tick()).await {
+                    Delivery::Ok => {}
+                    Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
+                    Delivery::ReceiverGone => break DriverExit::Killed,
                 }
             }
         }

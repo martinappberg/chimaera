@@ -1,28 +1,47 @@
 <script lang="ts">
   /**
-   * Checkpoint-rewind confirmation (claude). A dry-run report drives the body:
-   * checking → no-checkpoint → the file list + confirm actions. The host owns
+   * Checkpoint-rewind confirmation. Claude: a dry-run report drives the body
+   * (checking → no-checkpoint → the file list + confirm actions). Codex
+   * (`conversationOnly`): no file restore exists, so the body is a plain
+   * confirmation and the rewind drops whole turns in place. The host owns
    * the intent flag that keeps replayed RewindResult events from reopening this.
    */
   import type { RewindReport } from "./store.svelte";
 
   interface Props {
     /** The in-flight rewind intent; `stage` gates checking vs applying. */
-    intent: { id: string; preceding: string | null; fork: boolean; stage: "dry" | "applying" };
-    /** The dry-run/apply report for this intent, once it lands. */
+    intent: {
+      id: string;
+      preceding: string | null;
+      fork: boolean;
+      stage: "dry" | "confirm" | "applying";
+    };
+    /** The dry-run/apply report for this intent, once it lands (claude). */
     report: RewindReport | null;
+    /** The agent rewinds the conversation only — no file restore (codex). */
+    conversationOnly?: boolean;
     onCancel: () => void;
     onConfirm: (fork: boolean) => void;
     onOpenFile?: (path: string) => void;
   }
 
-  let { intent, report, onCancel, onConfirm, onOpenFile }: Props = $props();
+  let { intent, report, conversationOnly = false, onCancel, onConfirm, onOpenFile }: Props =
+    $props();
 </script>
 
 <div class="dialog-veil">
   <div class="dialog" role="alertdialog" aria-label="rewind to checkpoint">
     {#if intent.stage === "applying"}
       <div class="dialog-title">rewinding…</div>
+    {:else if conversationOnly}
+      <div class="dialog-title">rewind the conversation to before this message</div>
+      <div class="dialog-note">
+        drops this message and everything after it — files on disk are not touched
+      </div>
+      <div class="dialog-actions">
+        <button class="opt primary" onclick={() => onConfirm(true)}>rewind conversation</button>
+        <button class="opt quiet" onclick={onCancel}>cancel</button>
+      </div>
     {:else if report === null}
       <div class="dialog-title">checking checkpoint…</div>
       <div class="dialog-actions">

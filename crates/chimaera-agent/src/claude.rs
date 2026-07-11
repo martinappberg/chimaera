@@ -1931,14 +1931,29 @@ impl ClaudeMapper {
                 ));
             }
             AgentCommand::StopTask { task_id } => {
+                // The client sends the transcript ROW id (all it ever sees).
+                // Resolve it to the native task key: task_rows maps task_id →
+                // row for both synthesized ("task:{id}") and Task-tool-card
+                // rows; the prefix strip covers a row whose map entry is gone.
+                let native = self
+                    .task_rows
+                    .iter()
+                    .find(|(_, row)| **row == task_id)
+                    .map(|(key, _)| key.clone())
+                    .or_else(|| task_id.strip_prefix("task:").map(String::from))
+                    .unwrap_or(task_id);
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::StopTask);
                 step.outbound.push(control_request_frame(
                     &id,
-                    json!({ "subtype": "stop_task", "task_id": task_id }),
+                    json!({ "subtype": "stop_task", "task_id": native }),
                 ));
             }
+            // Compact rides claude's own slash catalog: the composer sends
+            // "/compact" as prompt text, so the control channel has nothing
+            // to do (this command is the codex path).
+            AgentCommand::Compact => {}
             AgentCommand::Rewind {
                 user_message_id,
                 dry_run,
@@ -3140,6 +3155,42 @@ mod tests {
             &step.events[0],
             AgentEvent::Notice { text } if text.contains("background")
         ));
+    }
+
+    #[test]
+    fn stop_task_resolves_transcript_row_ids_to_native_task_keys() {
+        let mut m = mapper();
+        // A subagent with no matching Task card synthesizes a "task:{id}" row.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-9",
+            "description": "summarize the docs",
+        }));
+        // The client stops by the ROW id it sees; the wire carries the key.
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "task:tk-9".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["subtype"], "stop_task");
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-9");
+
+        // A subagent that landed on its Task tool card: the row id is the
+        // tool_use_id, reverse-mapped through task_rows.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{
+                "type": "tool_use", "id": "tu-7", "name": "Task",
+                "input": { "description": "audit the tests", "prompt": "…" },
+            }]},
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-10",
+            "description": "audit the tests",
+        }));
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "tu-7".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-10");
     }
 
     #[test]

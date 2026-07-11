@@ -346,6 +346,12 @@ pub enum AgentCommand {
     },
     /// Ask the agent for account usage (claude get_usage -> UsageReport).
     GetUsage,
+    /// Compact the conversation context (codex thread/compact/start; the
+    /// compaction runs as its own turn whose contextCompaction item lands
+    /// the "context compacted" notice). Claude compacts via its own
+    /// `/compact` slash command — the composer sends that as prompt text,
+    /// so this command is a documented no-op there.
+    Compact,
     /// Checkpoint rewind (claude rewind_files). Dry-run answers with a
     /// `RewindResult` report; apply restores the files on disk. The
     /// conversation-side fork (--fork-session) is a server concern.

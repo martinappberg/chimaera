@@ -12,7 +12,7 @@ TUI (see [view switch](#view-switch-and-rewind)).
 `QuestionCard`, `RewindDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
 `paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
-`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 14 `AgentCommand`s),
+`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 17 `AgentCommand`s),
 `POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
@@ -40,7 +40,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
   placeholder, never the bytes.
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
-  [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name.
+  [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
+  is native for codex (`thread/compact/start`; the compaction runs as its own turn and lands a
+  "context compacted" notice) — claude's `/compact` rides its own CLI catalog as prompt text.
 - **Where.** `Composer.svelte`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
 
@@ -87,6 +89,11 @@ TUI (see [view switch](#view-switch-and-rewind)).
   · 2 files"); groups auto-collapse once every tool finished cleanly, stay open while anything runs
   or failed. Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
   pending); `tool_output_delta` streams live output ahead of the authoritative result.
+- **Background / stop a running row (claude).** A running tool row offers a ⤓ "continue in the
+  background" affordance (`background_tool` → the CLI's `background_tasks`, Ctrl-B parity; a
+  refusal lands an honest notice), and a running **Agent** (subagent) row offers a ■ stop
+  (`stop_task`; the driver resolves the row id to the CLI's opaque task key). Codex has no
+  equivalents — the buttons are omitted there.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
@@ -109,6 +116,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
+  A codex question carrying `autoResolutionMs` auto-skips at the deadline (empty answers — the
+  official client's behavior) with a visible "question timed out" notice; claude's question
+  timeouts run CLI-side.
 - **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
   `PlanApprovalCard.svelte`, `QuestionCard.svelte`; commands `permission` (optional `destination`,
   `feedback`) / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
@@ -169,6 +179,12 @@ TUI (see [view switch](#view-switch-and-rewind)).
   which respawns `--resume … --fork-session --resume-session-at …` and truncates the reused journal at
   the fork. Needs `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true`; tracks only file tools (a
   Bash-created file survives).
+- **Rewind (codex, conversation-only).** Same "↺" on user messages that opened a turn (steered
+  mid-turn sends aren't rewindable boundaries, and codex has no file restore, so the dialog is a
+  plain confirmation). The same rewind endpoint truncates the journal at the checkpoint, counts the
+  dropped turns, and respawns `thread/resume` + `thread/rollback {numTurns}` — the thread id
+  survives (no fork). The count is journal-derived, so turns run outside chat (TUI-interleaved via
+  the view toggle) are invisible to it — see PROTOCOL.md pass 8.
 
 ## Status: partial
 
@@ -177,7 +193,8 @@ TUI (see [view switch](#view-switch-and-rewind)).
   [lifecycle-and-persistence.md](lifecycle-and-persistence.md); `sv-11` follow-up).
 - Codex **create-time model** is dropped in chat mode (a `TODO(seam)` in `chat.rs`).
 - Codex **guardian** auto-approval reviewer is parsed but not rendered.
-- `BackgroundTool` / `StopTask` commands exist in `model.rs` but have no UI yet.
+- Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
+  undercount it — the rollback then leaves those turns in place).
 
 ---
 
@@ -211,7 +228,25 @@ _Captured 2026-07-10 (from the maintainer)._
   "Parity!" is the whole rationale for deny-with-feedback.
 - **How settled it is:** parity with the official clients is the promise — option wording, wire
   shapes (`updatedInput.userFeedback`/`userComments`, `interrupt:false` denials), and two-driver
-  symmetry follow the vendors' own semantics (PROTOCOL.md pass 8). The card layouts themselves are
+  symmetry follow the vendors' own semantics (PROTOCOL.md pass 9). The card layouts themselves are
   **additions** — improvable like the rest of the chat chrome.
 - **Do not change (without care):** the parity direction — when the official UIs and chimaera's
   permission UX diverge, the gap is a bug to close, not a place to invent different behavior.
+
+### Parity batch (codex rewind · /compact · question timeouts · background/stop) — why it exists
+_Captured 2026-07-10 (from the maintainer, PR #43)._
+
+- **Problem it solves:** chat mode must not be second-class. It is the default agent view, so
+  anything the CLI/TUI or the official clients can do — rewind, compact, background a tool, stop a
+  subagent — must work there too; using chimaera should carry no capability tax.
+- **How settled it is (intended vs provisional):** the *capabilities* are the promise — that
+  rewind/compact/background/stop exist in chat mode. The *mechanics* are free to improve: the
+  journal-derived turn counting, the dialog shapes, the button styling are implementation details,
+  not contracts.
+- **Deliberately left out:** a visible countdown for `autoResolutionMs` questions, the codex
+  create-time-model seam, and rendering the guardian auto-approval reviewer — all conscious
+  deferrals, open for later.
+- **Grade — addition, open to change:** improve freely, as long as two-driver symmetry and the
+  additive-only wire rule hold. (The one technical sharp edge — codex `thread/rollback` silently
+  clamping on overcount, hence the exact journal-derived count — is recorded as a wire fact in
+  PROTOCOL.md pass 10 rather than frozen here.)

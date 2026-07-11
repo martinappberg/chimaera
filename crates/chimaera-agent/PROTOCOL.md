@@ -769,3 +769,55 @@ claude's feedback-denial, realized per this protocol's capability.
 - `PermissionRequest.plan: Option<String>` — present ⇒ plan-approval card.
 - `AgentCommand::Permission.feedback: Option<String>` — deny reasons and
   plan-approval comments; absent/empty = the bare decision.
+
+## Pass 10 (2026-07-10 — live probe 0.142.5 + vsix 26.623.101652): codex
+rewind, compact, question timeouts. ADOPTED.
+
+### Codex: thread/rollback (live-verified)
+
+`thread/rollback {threadId, numTurns}` → result `{thread:{…}}` (the updated
+thread object; same shape as thread/start's). Drops the LAST `numTurns`
+turns from the thread in place — the thread id survives, and a follow-up
+turn confirms the model no longer sees the rolled-back content. Works
+immediately after `thread/resume` (the rewind-respawn path). **An overcount
+does NOT error — it silently clamps** (numTurns:99 on a 2-turn thread
+empties it), so the count must be exact: an overcount would eat good turns.
+The extension's own uses: edit-last-message = rollback 1 on the live
+thread + re-send; fork-from-turn = `thread/fork` (thread/start-shaped
+params, `ephemeral` flag) then rollback `total - target - 1` on the fork.
+
+Chimaera's rewind: codex Checkpoint events anchor turn-OPENING sends only
+(steers join a running turn; rollback can't cut mid-turn). The server
+truncates the journal at the anchor, counts the dropped `TurnStarted`
+events, and respawns with `thread/resume` + `thread/rollback` of that
+count. Known seam: turns run outside the journal (TUI-interleaved via the
+view toggle) are invisible to the count — the rollback is only as complete
+as the journal. `thread/resume` also answers `initialTurnsPage` (null in
+our probes — likely needs a paging param) and a settings echo
+(approvalPolicy, permissions, reasoningEffort, …).
+
+### Codex: thread/compact/start (live-verified)
+
+`thread/compact/start {threadId}` → `{}` ack. The compaction then runs AS
+ITS OWN TURN: `thread/status/changed active` → `turn/started` →
+`item/started`/`item/completed` of a `contextCompaction` item →
+`turn/completed`. **No `thread/compacted` notification fires on 0.142.5**
+(it exists in the extension's routing table, but the item is the real
+signal — our contextCompaction→Notice mapping already covers it).
+
+### Codex: question auto-resolution (adopted)
+
+`item/tool/requestUserInput`'s `autoResolutionMs` is honored driver-side:
+at the deadline the driver answers `{answers:{}}` (the official client's
+empty-skip), withdraws the card (QuestionResolved), and drops a visible
+notice. Claude needs no equivalent — its `askUserQuestionTimeout` runs
+CLI-side and unanswered prompts settle via the park deadline.
+
+### Codex: misc notifications seen live (tolerated silently)
+
+`thread/started` (first turn/start), `thread/goal/cleared` (after
+rollback), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
+`userMessage` items carry `clientId` (null unless the client sent
+`clientUserMessageId`). `account/rateLimits/updated` params here were
+`{rateLimits:{limitId, primary:{usedPercent, windowDurationMins,
+resetsAt}, secondary:…}}` — still ignored (account/read is the source).
