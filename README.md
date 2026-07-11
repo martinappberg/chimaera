@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://martinappberg.github.io/chimaera/"><strong>Website</strong></a>
+  <a href="https://chimaera.sh/"><strong>Website</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://martinappberg.github.io/chimaera/docs.html">Docs</a>
+  <a href="https://chimaera.sh/docs.html">Docs</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/martinappberg/chimaera/releases/latest">Download</a>
 </p>
