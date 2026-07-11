@@ -19,7 +19,7 @@
 //!   (mirroring the CLI's own frames). A top-level `request_id` is silently
 //!   ignored and the CLI hangs waiting for the answer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -29,18 +29,18 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec,
+    SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
     ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
-    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, DIFF_FILE_BUDGET,
-    DIFF_TURN_BUDGET,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-07-07).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.204";
+/// CLI version these frame shapes were verified against (2026-07-10).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.206";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -130,7 +130,10 @@ pub enum PermissionDecision {
     /// `updated_input` echoes (or edits) the tool input; the CLI applies it.
     Allow { updated_input: Value },
     /// `message` is shown to the model as the tool error, so it can react.
-    Deny { message: String },
+    /// `interrupt:true` ABORTS the turn (the bare-deny directive path);
+    /// `interrupt:false` keeps it alive — the feedback-denial path, where
+    /// the message carries the user's reason for the model to react to.
+    Deny { message: String, interrupt: bool },
 }
 
 impl PermissionDecision {
@@ -139,12 +142,18 @@ impl PermissionDecision {
             PermissionDecision::Allow { updated_input } => {
                 json!({ "behavior": "allow", "updatedInput": updated_input })
             }
-            PermissionDecision::Deny { message } => {
-                json!({ "behavior": "deny", "message": message })
+            PermissionDecision::Deny { message, interrupt } => {
+                json!({ "behavior": "deny", "message": message, "interrupt": interrupt })
             }
         }
     }
 }
+
+/// The official extension's deny directive: directive stops beat bare
+/// rejections (the model otherwise retries with a different tool).
+const DENY_DIRECTIVE: &str = "The user doesn't want to proceed with this tool use. \
+    The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the \
+    file). STOP what you are doing and wait for the user to tell you how to proceed.";
 
 // --- probe client (used by the live smoke tests) ----------------------------
 
@@ -298,6 +307,14 @@ struct ClaudeDriver;
 impl Driver for ClaudeDriver {
     type Mapper = ClaudeMapper;
 
+    fn kind(&self) -> &'static str {
+        "claude"
+    }
+
+    fn tested_version(&self) -> &'static str {
+        TESTED_CLAUDE_VERSION
+    }
+
     fn env_extra(&self) -> Vec<(String, String)> {
         vec![
             ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
@@ -324,7 +341,11 @@ impl Driver for ClaudeDriver {
         }
         let commands_catalog = await_initialize(stream).await?;
 
-        let mut mapper = ClaudeMapper::new(spec.pinned_native_id.clone(), &commands_catalog);
+        let mut mapper = ClaudeMapper::new(
+            spec.pinned_native_id.clone(),
+            spec.agent_version.clone(),
+            &commands_catalog,
+        );
         let mut initial: Vec<DriverStep> = Vec::new();
         // Seed the effort/ultracode chips with the CLI's applied settings.
         let mut step = DriverStep::default();
@@ -371,6 +392,17 @@ async fn await_initialize(stream: &mut JsonlStream) -> std::result::Result<Value
     }
 }
 
+/// A parked can_use_tool request: everything the eventual answer needs.
+struct PendingPermission {
+    /// Tool name — ExitPlanMode answers get plan-approval shaping.
+    tool: String,
+    /// Verbatim input (an allow response must echo it exactly).
+    input: Value,
+    /// permission_suggestions from the request — all types:
+    /// addRules/addDirectories/setMode.
+    suggestions: Vec<Value>,
+}
+
 enum PendingControl {
     SetMode(String),
     SetModel(String),
@@ -405,6 +437,9 @@ enum PendingControl {
 /// thin delegator below.
 struct ClaudeMapper {
     native_session_id: Option<String>,
+    /// Launcher-probed `--version` line, echoed on every Init (journal truth,
+    /// and the harness's drift-notice source). `None` = the probe failed.
+    agent_version: Option<String>,
     model: Option<String>,
     current_mode: Option<String>,
     slash_commands: Vec<SlashCommand>,
@@ -420,9 +455,8 @@ struct ClaudeMapper {
     current_stream_msg: Option<String>,
     /// tool_use_id → kind, to choose result rendering; cleared per turn.
     tool_kinds: HashMap<String, ToolKind>,
-    /// Outstanding can_use_tool requests: our request_id → (input,
-    /// permission_suggestions — all types: addRules/addDirectories/setMode).
-    pending_permissions: HashMap<String, (Value, Vec<Value>)>,
+    /// Outstanding can_use_tool requests, keyed by request_id.
+    pending_permissions: HashMap<String, PendingPermission>,
     /// Outstanding AskUserQuestion prompts: request_id → original input
     /// (echoed back inside updatedInput.questions with the answers).
     pending_questions: HashMap<String, Value>,
@@ -430,16 +464,49 @@ struct ClaudeMapper {
     /// completed result string; "dismiss" cancels).
     pending_dialogs: HashMap<String, ()>,
     pending_controls: HashMap<String, PendingControl>,
+    /// CLI→client control subtypes we don't handle and have already said so
+    /// about — the notice fires once per subtype, not per frame.
+    noticed_controls: HashSet<String>,
     /// Subagent task_id → transcript row id. task_id is NOT the Task tool's
     /// tool_use_id (mined: the extension treats it as an opaque key), so
     /// correlation is by description; unmatched tasks get their own row.
     task_rows: HashMap<String, String>,
     /// Open Task tool cards: tool_use_id → description, for that correlation.
     agent_tools: HashMap<String, String>,
-    /// User messages sent while a turn was running: the CLI queues them
-    /// natively (mid-turn stdin writes are the official client's behavior),
-    /// so the mapper defers the TurnStarted boundary until each result lands.
-    queued_sends: u32,
+    /// User messages the user queued while a turn was running, FIFO of
+    /// `(client uuid, stdin content)`. They are HELD here — deliberately NOT
+    /// written to the CLI mid-turn — and flushed to stdin all at once the
+    /// moment the running turn's result lands (`on_result`), each resolving
+    /// `sent` at that same boundary. Holding is what makes delivery
+    /// deterministic: the CLI never sees them mid-turn, so it can't coalesce
+    /// them into fewer results than messages, so no id can strand. It also
+    /// matches the official client, whose queued messages wait for the current
+    /// turn to finish rather than steering into it. The queue survives a
+    /// stop/failed turn — an abort ends only the CURRENT turn, and the held
+    /// messages flush right after it (pull one back with its ✕ instead). Only
+    /// genuinely-undeliverable ends drop them `dropped`: process death
+    /// (`drain_pending`) or a flush whose write never shipped (`flushing`).
+    queued_sends: VecDeque<(String, Value)>,
+    /// The uuids of the batch flushed on the most recent turn-end, awaiting
+    /// confirmation that their stdin write shipped. `on_result` empties
+    /// `queued_sends` into the flush step (writes + `sent` events) BEFORE
+    /// `deliver` performs the write — so if that write fails (a child that
+    /// wedged or died right after its result), the `sent` events are dropped
+    /// and `queued_sends` is already empty, leaving the messages stranded
+    /// "queued". Recording them here lets `drain_pending` (teardown) drop them.
+    /// Cleared on the next frame: reaching `on_frame` again means `deliver`
+    /// returned Ok, so the write shipped. A drop after a successful send is a
+    /// harmless no-op (the reducer ignores an update for an already-resolved id).
+    flushing: Vec<String>,
+    /// We issued an interrupt control request and no result has landed
+    /// since — the one deterministic "this abort was user-initiated" fact.
+    /// The CLI's result string is free text and cannot carry that signal.
+    interrupt_requested: bool,
+    /// Interrupt watchdog: ticks remaining before we synthesize the abort the
+    /// CLI never sent. Armed on `Interrupt`, counted down in `tick`, disarmed
+    /// when a real result lands (a turn end) or a fresh turn opens. See
+    /// `INTERRUPT_GRACE_TICKS`.
+    interrupt_grace: Option<u32>,
     /// One title request per conversation, fired with the first user send
     /// (the extension's exact moment; description = the message text).
     title_requested: bool,
@@ -453,7 +520,11 @@ struct ClaudeMapper {
 }
 
 impl ClaudeMapper {
-    fn new(pinned_native_id: Option<String>, commands_catalog: &Value) -> Self {
+    fn new(
+        pinned_native_id: Option<String>,
+        agent_version: Option<String>,
+        commands_catalog: &Value,
+    ) -> Self {
         let slash_commands = commands_catalog["commands"]
             .as_array()
             .map(|cmds| {
@@ -500,6 +571,7 @@ impl ClaudeMapper {
             .unwrap_or_default();
         Self {
             native_session_id: pinned_native_id,
+            agent_version,
             model: None,
             current_mode: None,
             slash_commands,
@@ -514,9 +586,13 @@ impl ClaudeMapper {
             pending_questions: HashMap::new(),
             pending_dialogs: HashMap::new(),
             pending_controls: HashMap::new(),
+            noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
-            queued_sends: 0,
+            queued_sends: VecDeque::new(),
+            flushing: Vec::new(),
+            interrupt_requested: false,
+            interrupt_grace: None,
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
@@ -532,6 +608,7 @@ impl ClaudeMapper {
             current_mode: self.current_mode.clone(),
             slash_commands: self.slash_commands.clone(),
             models: self.models.clone(),
+            agent_version: self.agent_version.clone(),
         }
     }
 
@@ -561,10 +638,27 @@ impl ClaudeMapper {
         if !self.turn_active {
             self.turn_n += 1;
             self.turn_active = true;
+            // A turn opening is a clean slate for the interrupt watchdog: an
+            // interrupt armed against a previous (or idle) state must not abort
+            // this fresh turn.
+            self.interrupt_grace = None;
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
         }
+    }
+
+    /// One cheap `get_context_usage` round-trip after a turn end — the
+    /// extension's cadence, kept honest for aborts too (an interrupted turn
+    /// still consumed context). Only issued for a turn that was actually open.
+    fn refresh_context_usage(&mut self, step: &mut DriverStep) {
+        let id = self.ctl_id();
+        self.pending_controls
+            .insert(id.clone(), PendingControl::ContextUsage);
+        step.outbound.push(control_request_frame(
+            &id,
+            json!({ "subtype": "get_context_usage" }),
+        ));
     }
 
     fn flush(&mut self) -> Option<AgentEvent> {
@@ -573,6 +667,10 @@ impl ClaudeMapper {
 
     fn on_frame(&mut self, frame: &Value) -> DriverStep {
         let mut step = DriverStep::default();
+        // Reaching here means `deliver` returned Ok for the previous step, so
+        // any batch flushed on the last result has shipped to the CLI — it no
+        // longer needs the teardown drop-guard.
+        self.flushing.clear();
         // Subagent-attributed transcript frames are hidden (the official
         // client does the same — the visible surface is the Task tool row);
         // only task-status frames pass, whoever they're attributed to.
@@ -592,8 +690,10 @@ impl ClaudeMapper {
             Some("control_cancel_request") => {
                 let id = frame["request_id"].as_str().unwrap_or_default().to_string();
                 if self.pending_questions.remove(&id).is_some() {
-                    step.events
-                        .push(AgentEvent::QuestionResolved { request_id: id });
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id: id,
+                        answers: Default::default(),
+                    });
                 } else if self.pending_permissions.remove(&id).is_some()
                     || self.pending_dialogs.remove(&id).is_some()
                 {
@@ -963,6 +1063,16 @@ impl ClaudeMapper {
             return;
         }
 
+        // Questions are a first-class card (QuestionRequest via the
+        // can_use_tool path), not a tool row: a bare "AskUserQuestion" card
+        // with a stuck spinner next to the real question card is noise. Its
+        // tool_result still resolves via tool_kinds like TodoWrite's does
+        // (the client ignores updates for rows it never rendered).
+        if name == "AskUserQuestion" {
+            self.tool_kinds.insert(id, ToolKind::Other);
+            return;
+        }
+
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
         if name == "Task" {
@@ -1029,6 +1139,28 @@ impl ClaudeMapper {
             return;
         }
         if request["subtype"] != "can_use_tool" {
+            // Deliberately NOT answered: the CLI parks an unanswered control
+            // request until its own deadline (or another attached client)
+            // settles it, and an error reply here could break flows that work
+            // via that fallback (mined subtypes: hook_callback, mcp_message,
+            // elicitation, oauth refreshes). But never park SILENTLY — the
+            // agent's later "I was blocked" prose must not be the only trace
+            // the ask existed. One notice per subtype, not per frame.
+            let subtype = request["subtype"].as_str().unwrap_or("unknown");
+            // `subtype` is agent-influenced; bound the once-per-subtype dedupe
+            // set (real streams carry a handful of distinct control subtypes)
+            // so a buggy/hostile stream can't grow it without end.
+            const MAX_NOTICED_CONTROLS: usize = 64;
+            let fresh = self.noticed_controls.len() < MAX_NOTICED_CONTROLS
+                && self.noticed_controls.insert(subtype.to_string());
+            if fresh {
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "claude sent a request chimaera doesn't handle yet ({subtype}) — \
+                         the agent may wait on it until it times out"
+                    ),
+                });
+            }
             return;
         }
         // AskUserQuestion rides the permission path but is a QUESTION, not a
@@ -1062,6 +1194,10 @@ impl ClaudeMapper {
             }
         }
         let tool_use_id = request["tool_use_id"].as_str().map(String::from);
+        let tool = request["tool_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let input = request["input"].clone();
         // All suggestion types ride "always allow": addRules,
         // addDirectories, setMode (the extension sends the full set back).
@@ -1070,23 +1206,51 @@ impl ClaudeMapper {
             .cloned()
             .unwrap_or_default();
 
-        let mut options = vec![PermissionOption {
-            id: "allow_once".into(),
-            label: "Allow".into(),
-            kind: PermissionOptionKind::AllowOnce,
-        }];
-        if !suggestions.is_empty() {
+        // ExitPlanMode is a plan approval, not a tool permission: the card
+        // shows the plan itself with the official extension's three answers.
+        // "auto-accept edits" resolves as allow + a set_permission_mode
+        // follow-up; "keep planning" is the deny path (comments ride the
+        // feedback-denial message).
+        let (options, plan) = if tool == "ExitPlanMode" {
+            let plan = input["plan"].as_str().map(|p| cap_output(p).0);
+            let options = vec![
+                PermissionOption {
+                    id: "allow_accept_edits".into(),
+                    label: "Yes, and auto-accept edits".into(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOption {
+                    id: "allow_once".into(),
+                    label: "Yes, manually approve".into(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "reject_once".into(),
+                    label: "No, keep planning".into(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ];
+            (options, plan)
+        } else {
+            let mut options = vec![PermissionOption {
+                id: "allow_once".into(),
+                label: "Allow".into(),
+                kind: PermissionOptionKind::AllowOnce,
+            }];
+            if !suggestions.is_empty() {
+                options.push(PermissionOption {
+                    id: "allow_always".into(),
+                    label: "Always allow".into(),
+                    kind: PermissionOptionKind::AllowAlways,
+                });
+            }
             options.push(PermissionOption {
-                id: "allow_always".into(),
-                label: "Always allow".into(),
-                kind: PermissionOptionKind::AllowAlways,
+                id: "reject_once".into(),
+                label: "Deny".into(),
+                kind: PermissionOptionKind::RejectOnce,
             });
-        }
-        options.push(PermissionOption {
-            id: "reject_once".into(),
-            label: "Deny".into(),
-            kind: PermissionOptionKind::RejectOnce,
-        });
+            (options, None)
+        };
 
         let title = request["display_name"]
             .as_str()
@@ -1097,15 +1261,29 @@ impl ClaudeMapper {
         // must echo updatedInput exactly); the PREVIEW is capped so a
         // multi-megabyte Write `content` can't bloat the journaled/replayed
         // event (caps-at-event-construction).
-        let input_preview = cap_preview(&input);
-        self.pending_permissions
-            .insert(request_id.clone(), (input, suggestions));
+        let mut input_preview = cap_preview(&input);
+        if plan.is_some() {
+            // The plan already rides its own (capped) field — carrying it in
+            // the preview too would double-store it in the journal.
+            if let Some(obj) = input_preview.as_object_mut() {
+                obj.remove("plan");
+            }
+        }
+        self.pending_permissions.insert(
+            request_id.clone(),
+            PendingPermission {
+                tool,
+                input,
+                suggestions,
+            },
+        );
         step.events.push(AgentEvent::PermissionRequest {
             request_id,
             tool_call_id: tool_use_id,
             title,
             options,
             input_preview,
+            plan,
         });
     }
 
@@ -1168,13 +1346,22 @@ impl ClaudeMapper {
                 )
             }
             other => {
-                // Unknown kind: answer cancelled immediately — declared
-                // kinds must never park.
-                tracing::debug!(kind = ?other, "unsupported user dialog kind cancelled");
+                // Unknown kind: answer cancelled immediately — declared kinds
+                // must never park — but say so visibly. A silent cancel left
+                // the agent narrating "I'm blocked" with no trace of WHAT
+                // asked (the "harness is blocking" mystery).
+                let kind = other.unwrap_or("unknown");
+                tracing::debug!(kind, "unsupported user dialog kind cancelled");
                 step.outbound.push(permission_response_frame(
                     &json!(request_id),
                     json!({ "behavior": "cancelled" }),
                 ));
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "claude asked something chimaera doesn't support yet ({kind}) — \
+                         dismissed automatically"
+                    ),
+                });
                 return;
             }
         };
@@ -1185,6 +1372,7 @@ impl ClaudeMapper {
             title,
             options,
             input_preview: payload.clone(),
+            plan: None,
         });
     }
 
@@ -1376,6 +1564,15 @@ impl ClaudeMapper {
             step.events.push(flushed);
         }
         let turn_id = self.turn_id();
+        // Capture BEFORE clearing. A result can arrive with NO turn open: the
+        // real CLI coalesces rapid queued sends (live-verified: 3 sends → 2
+        // results), so a queued message can resolve `sent` off a turn whose
+        // content never streamed — a bare result. `was_active` gates the
+        // turn-END events so that bare result never emits a phantom
+        // TurnCompleted/TurnAborted. A genuine turn always streamed content,
+        // so `ensure_turn` fired and this is true — the normal case is
+        // unchanged.
+        let was_active = self.turn_active;
         self.turn_active = false;
         self.tool_kinds.clear();
         self.streamed.clear();
@@ -1383,60 +1580,79 @@ impl ClaudeMapper {
         self.task_rows.clear();
         self.agent_tools.clear();
         self.thinking_emitted = 0;
+        // A real result is the turn end — disarm the interrupt watchdog (the
+        // interrupt's own is_error result lands here too, so a genuine turn is
+        // never double-aborted by the watchdog).
+        self.interrupt_grace = None;
+
+        // Consumed at EVERY result, both branches: an interrupt whose turn
+        // ended before the control request landed must not mislabel the
+        // NEXT turn's genuine failure as a quiet stop.
+        let interrupted = std::mem::take(&mut self.interrupt_requested);
 
         if frame["is_error"] == json!(true) {
-            // An aborted turn drops the CLI's queue with it; leaking the
-            // count would open phantom turn boundaries later.
-            self.queued_sends = 0;
-            step.events.push(AgentEvent::TurnAborted {
+            // Only an OPEN turn can be aborted — a bare is_error result with
+            // no turn open must not synthesize a phantom abort (nor a context
+            // refresh for a turn that never ran here).
+            if was_active {
+                step.events.push(AgentEvent::TurnAborted {
+                    turn_id,
+                    reason: frame["result"]
+                        .as_str()
+                        .unwrap_or(if interrupted {
+                            "interrupted"
+                        } else {
+                            "turn failed"
+                        })
+                        .to_string(),
+                    interrupted,
+                });
+                self.refresh_context_usage(step);
+            }
+        } else if was_active {
+            // Only an OPEN turn completes — see `was_active`.
+            let usage = &frame["usage"];
+            step.events.push(AgentEvent::TurnCompleted {
                 turn_id,
-                reason: frame["result"]
-                    .as_str()
-                    .unwrap_or("turn failed")
-                    .to_string(),
+                usage: Usage {
+                    cost_usd: frame["total_cost_usd"].as_f64(),
+                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0)
+                        + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
+                        + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: 0,
+                    duration_ms: frame["duration_ms"].as_u64().unwrap_or(0),
+                    context_window: None,
+                },
             });
-            // An interrupted turn still consumed context — keep the meter
-            // honest instead of skipping the refresh on aborts.
-            let id = self.ctl_id();
-            self.pending_controls
-                .insert(id.clone(), PendingControl::ContextUsage);
-            step.outbound.push(control_request_frame(
-                &id,
-                json!({ "subtype": "get_context_usage" }),
-            ));
-            return;
+            self.refresh_context_usage(step);
         }
-        let usage = &frame["usage"];
-        step.events.push(AgentEvent::TurnCompleted {
-            turn_id,
-            usage: Usage {
-                cost_usd: frame["total_cost_usd"].as_f64(),
-                input_tokens: usage["input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-                output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                total_tokens: 0,
-                duration_ms: frame["duration_ms"].as_u64().unwrap_or(0),
-                context_window: None,
-            },
-        });
-        // Keep the context meter current: one cheap control round-trip per
-        // finished turn (the extension's own cadence).
-        let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::ContextUsage);
-        step.outbound.push(control_request_frame(
-            &id,
-            json!({ "subtype": "get_context_usage" }),
-        ));
-        // A user message sent mid-turn was queued by the CLI and runs next:
-        // open its turn boundary now so streamed chunks land in it.
-        if self.queued_sends > 0 {
-            self.queued_sends -= 1;
-            self.turn_n += 1;
-            self.turn_active = true;
-            step.events.push(AgentEvent::TurnStarted {
-                turn_id: self.turn_id(),
+        // The running turn has ended — however it ended — so NOW flush
+        // everything the user queued behind it. A stop/failure ends only the
+        // CURRENT turn (maintainer decision 2026-07-11): the held messages were
+        // never part of it (never written), so they still deliver, in full,
+        // right after the abort — Stop is not "discard my queue" (the ✕ on each
+        // bubble is). Each held message is written to the CLI here (the first
+        // moment it is idle for them) and resolves `sent` in the same step.
+        // Two things make this deterministic where the old per-result FIFO pop
+        // was a guess: (1) we never dumped them mid-turn, so the CLI cannot
+        // coalesce them into fewer results than messages and strand an id; and
+        // (2) marking `sent` is tied to OUR write, not to counting the CLI's
+        // results. The response turn's boundary still opens LAZILY — a synthetic
+        // TurnStarted here (with no matching result if the CLI coalesces the
+        // flushed batch) was the old "stuck running" bug; `ensure_turn` fires
+        // instead when the first real response frame streams. The `sent` events
+        // land after this turn's end event, so each bubble enters the
+        // transcript AFTER the finished turn, never spliced into its output.
+        for (id, content) in std::mem::take(&mut self.queued_sends) {
+            step.outbound.push(user_message_frame(&id, content));
+            // Stage for the teardown drop-guard until the write is confirmed
+            // shipped (cleared on the next frame). If `deliver`'s write fails,
+            // the `sent` event below never leaves and `drain_pending` drops it.
+            self.flushing.push(id.clone());
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Sent,
             });
         }
     }
@@ -1465,25 +1681,37 @@ impl ClaudeMapper {
                 step.events.push(AgentEvent::UserMessage {
                     text: text.clone(),
                     attachments,
+                    id: Some(uuid.clone()),
+                    queued: self.turn_active,
                 });
                 step.events.push(AgentEvent::Checkpoint {
                     user_message_id: uuid.clone(),
                     preceding_uuid: preceding,
                 });
                 if self.turn_active {
-                    // Mid-turn stdin writes are queued by the CLI itself (the
-                    // official client's path); the turn boundary opens when
-                    // the running turn's result lands.
-                    self.queued_sends += 1;
+                    // A turn is running: HOLD this message (do NOT write it to
+                    // the CLI now). It flushes to stdin when the running turn's
+                    // result lands, which also resolves it `sent`. Holding — vs
+                    // the official client's own mid-turn queue — is what keeps
+                    // the CLI from coalescing rapid sends into fewer results and
+                    // stranding one, and it keeps the delivered bubble from
+                    // splicing into the still-streaming turn.
+                    self.queued_sends.push_back((uuid.clone(), json!(content)));
                 } else {
+                    // Idle: this send opens a fresh turn and goes to the CLI
+                    // immediately. An interrupt sent while idle (benign no-op on
+                    // the CLI) must not relabel this fresh turn's genuine failure
+                    // as a quiet stop, nor let its armed watchdog abort it.
+                    self.interrupt_requested = false;
+                    self.interrupt_grace = None;
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
                         turn_id: self.turn_id(),
                     });
+                    step.outbound
+                        .push(user_message_frame(&uuid, json!(content)));
                 }
-                step.outbound
-                    .push(user_message_frame(&uuid, json!(content)));
                 // Name the conversation off the first message (the
                 // extension's moment and shape: description = message text).
                 if !self.title_requested && !text.trim().is_empty() {
@@ -1505,6 +1733,7 @@ impl ClaudeMapper {
                 request_id,
                 option_id,
                 destination,
+                feedback,
             } => {
                 // Decision dialogs (refusal fallback, Fable overage): the
                 // option id IS the completed result string.
@@ -1522,10 +1751,32 @@ impl ClaudeMapper {
                     });
                     return step;
                 }
-                let Some((input, mut suggestions)) = self.pending_permissions.remove(&request_id)
+                let Some(PendingPermission {
+                    tool,
+                    mut input,
+                    mut suggestions,
+                }) = self.pending_permissions.remove(&request_id)
                 else {
+                    // The ask predates this driver process (respawn, toggle,
+                    // resume): its reply route died with that process. The
+                    // definitive, JOURNALED resolution below is what un-wedges
+                    // every attached client and every future replay —
+                    // silently dropping the click was the "UI stuck on a
+                    // permission card" bug.
+                    step.events.push(AgentEvent::PermissionResolved {
+                        request_id,
+                        option_id: "expired".into(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that permission prompt is no longer active \
+                               (the agent restarted since it asked)"
+                            .into(),
+                    });
                     return step;
                 };
+                let feedback = feedback
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty());
                 // The destination cycler: the user's chosen save target
                 // replaces the CLI's suggested one — except on setMode
                 // suggestions, which keep their own (the extension's exact
@@ -1537,6 +1788,22 @@ impl ClaudeMapper {
                         }
                     }
                 }
+                let allowed = option_id.starts_with("allow");
+                // Plan-approval comments ride updatedInput.{userFeedback,
+                // userComments} (the extension's fields). ONLY ExitPlanMode
+                // input takes injected keys — for real tools updatedInput is
+                // the input the CLI executes, and must echo verbatim.
+                let delivered_feedback = if tool == "ExitPlanMode" && allowed {
+                    if let Some(fb) = &feedback {
+                        input["userFeedback"] = json!(fb);
+                        input["userComments"] = json!(fb);
+                    }
+                    feedback.clone()
+                } else if !allowed {
+                    feedback.clone()
+                } else {
+                    None
+                };
                 let response = match option_id.as_str() {
                     "allow_always" if !suggestions.is_empty() => json!({
                         "behavior": "allow",
@@ -1547,25 +1814,61 @@ impl ClaudeMapper {
                         "behavior": "allow",
                         "updatedInput": input,
                     }),
-                    // The official extension's constant: directive stops
-                    // beat bare rejections (the model otherwise retries with
-                    // a different tool).
-                    _ => json!({
-                        "behavior": "deny",
-                        "message": "The user doesn't want to proceed with this tool use. \
-                    The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the \
-                    file). STOP what you are doing and wait for the user to tell you how to proceed.",
-                        "interrupt": true,
-                    }),
+                    // Feedback-denial: the reason rides the deny message and
+                    // interrupt:false keeps the turn alive so the model
+                    // reacts to it in place (the extension's semantics).
+                    _ => match &feedback {
+                        Some(fb) => json!({
+                            "behavior": "deny",
+                            "message": format!("{DENY_DIRECTIVE}\n\nThe user's feedback: {fb}"),
+                            "interrupt": false,
+                        }),
+                        // Bare deny: the directive constant, aborting the turn.
+                        None => json!({
+                            "behavior": "deny",
+                            "message": DENY_DIRECTIVE,
+                            "interrupt": true,
+                        }),
+                    },
                 };
                 step.outbound
                     .push(permission_response_frame(&json!(request_id), response));
+                // "Yes, and auto-accept edits": the mode change is a separate
+                // verified control; its ack lands as ModeChanged.
+                if tool == "ExitPlanMode" && option_id == "allow_accept_edits" {
+                    let id = self.ctl_id();
+                    self.pending_controls
+                        .insert(id.clone(), PendingControl::SetMode("acceptEdits".into()));
+                    step.outbound.push(control_request_frame(
+                        &id,
+                        json!({ "subtype": "set_permission_mode", "mode": "acceptEdits" }),
+                    ));
+                }
                 step.events.push(AgentEvent::PermissionResolved {
                     request_id,
                     option_id,
                 });
+                // Feedback the model actually received is transcript truth —
+                // echo it as the user message it is (replay rebuilds it too).
+                if let Some(fb) = delivered_feedback {
+                    step.events.push(AgentEvent::UserMessage {
+                        text: fb,
+                        attachments: 0,
+                        id: None,
+                        queued: false,
+                    });
+                }
             }
             AgentCommand::Interrupt => {
+                // Recorded so on_result can stamp the abort as user-initiated
+                // (TurnAborted.interrupted) — the ack itself says nothing and
+                // the result string is free text.
+                self.interrupt_requested = true;
+                // Arm the watchdog: if the CLI never answers with an is_error
+                // result (an interrupt it treats as a no-op, or a wedged
+                // turn), `tick` synthesizes the abort so the user can escape a
+                // stuck-running state. A real result disarms it first.
+                self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::Interrupt);
@@ -1643,6 +1946,17 @@ impl ClaudeMapper {
                 answers,
             } => {
                 let Some(input) = self.pending_questions.remove(&request_id) else {
+                    // Same stale-ask contract as Permission above: resolve +
+                    // notice instead of silently eating the user's answer.
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that question is no longer active (the agent \
+                               restarted since it asked) — ask again if needed"
+                            .into(),
+                    });
                     return step;
                 };
                 // Mined contract: allow with updatedInput {questions (echoed),
@@ -1661,8 +1975,12 @@ impl ClaudeMapper {
                         },
                     }),
                 ));
-                step.events
-                    .push(AgentEvent::QuestionResolved { request_id });
+                // The chosen labels ride the resolution so the transcript
+                // (and every replay) shows question + answer, not a vanish.
+                step.events.push(AgentEvent::QuestionResolved {
+                    request_id,
+                    answers,
+                });
             }
             AgentCommand::GetUsage => {
                 let id = self.ctl_id();
@@ -1683,14 +2001,29 @@ impl ClaudeMapper {
                 ));
             }
             AgentCommand::StopTask { task_id } => {
+                // The client sends the transcript ROW id (all it ever sees).
+                // Resolve it to the native task key: task_rows maps task_id →
+                // row for both synthesized ("task:{id}") and Task-tool-card
+                // rows; the prefix strip covers a row whose map entry is gone.
+                let native = self
+                    .task_rows
+                    .iter()
+                    .find(|(_, row)| **row == task_id)
+                    .map(|(key, _)| key.clone())
+                    .or_else(|| task_id.strip_prefix("task:").map(String::from))
+                    .unwrap_or(task_id);
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::StopTask);
                 step.outbound.push(control_request_frame(
                     &id,
-                    json!({ "subtype": "stop_task", "task_id": task_id }),
+                    json!({ "subtype": "stop_task", "task_id": native }),
                 ));
             }
+            // Compact rides claude's own slash catalog: the composer sends
+            // "/compact" as prompt text, so the control channel has nothing
+            // to do (this command is the codex path).
+            AgentCommand::Compact => {}
             AgentCommand::Rewind {
                 user_message_id,
                 dry_run,
@@ -1739,6 +2072,24 @@ impl ClaudeMapper {
                     json!({ "subtype": "mcp_reconnect", "serverName": server }),
                 ));
             }
+            // Pull back a still-queued message. Because queued messages are HELD
+            // (never written to the CLI until the running turn ends), a cancel is
+            // a pure local removal — there is nothing in the CLI to un-queue, so
+            // the pull-back is guaranteed, with no `cancel_async_message`
+            // round-trip that could race or fail. The `Cancelled` resolution is
+            // emitted unconditionally, tombstone-style: for a held message it
+            // pulls it back before the flush; for a DROPPED one (process died —
+            // its ✕ is the "dismiss" affordance) it clears the "not delivered"
+            // bubble on live and replay alike; for one that already flushed
+            // `sent` (a late click racing the flush) the reducer no-ops — the
+            // message is visibly in the transcript, which is its own answer.
+            AgentCommand::CancelQueued { id } => {
+                self.queued_sends.retain(|(q, _)| q != &id);
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Cancelled,
+                });
+            }
         }
         step
     }
@@ -1746,6 +2097,105 @@ impl ClaudeMapper {
     fn ctl_id(&mut self) -> String {
         self.next_ctl += 1;
         format!("ctl_{}", self.next_ctl)
+    }
+
+    /// Teardown resolutions: every pending ask's reply route is this
+    /// process's stdin, so the journal must not outlive it with the ask
+    /// dangling (a replay would strand the card forever — see the harness's
+    /// drain call in `run_driver`).
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
+            events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+        }
+        let permissions = std::mem::take(&mut self.pending_permissions).into_keys();
+        let dialogs = std::mem::take(&mut self.pending_dialogs).into_keys();
+        for request_id in permissions.chain(dialogs) {
+            events.push(AgentEvent::PermissionResolved {
+                request_id,
+                option_id: "expired".into(),
+            });
+        }
+        // A hard kill mid-queue must not strand a held message as "queued"
+        // forever on replay — drop what the CLI never got (it was never even
+        // written), the same resolution an interrupt's is_error result gives.
+        for (id, _content) in std::mem::take(&mut self.queued_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        // Also drop any batch flushed on the final result whose write never
+        // confirmed shipped (no frame followed): the process is gone, so those
+        // ids would otherwise strand "queued". A drop for one that DID ship (it
+        // already resolved `sent`) is a harmless no-op in the reducer.
+        for id in self.flushing.drain(..) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        events
+    }
+
+    /// Harness timer tick: just the interrupt watchdog. Queued sends need no
+    /// timer — they are held and flushed deterministically on the running turn's
+    /// result, so there is no coalesced surplus for a timer to reconcile.
+    fn tick(&mut self) -> DriverStep {
+        self.interrupt_watchdog()
+    }
+
+    /// The interrupt watchdog. Interrupting a claude turn is only observable
+    /// through the CLI's own is_error `result` (there's no interrupt-specific
+    /// ack), so an interrupt the CLI treats as a no-op — or a wedged turn —
+    /// would leave the session "running" with no escape. When the grace armed
+    /// on `Interrupt` expires with a turn still open, synthesize the abort the
+    /// CLI never sent (`TurnAborted{interrupted}`) — and, like every turn end,
+    /// flush the held queue: a stop ends only the current turn, never the
+    /// user's queued messages. The write is best-effort against a possibly
+    /// wedged child — a failed/timed-out write tears the driver down and the
+    /// `flushing` stage drops the batch honestly. Idle-guarded, so an
+    /// interrupt pressed with nothing running stays a no-op.
+    fn interrupt_watchdog(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        let Some(remaining) = self.interrupt_grace else {
+            return step;
+        };
+        if remaining > 1 {
+            self.interrupt_grace = Some(remaining - 1);
+            return step;
+        }
+        self.interrupt_grace = None;
+        if !self.turn_active {
+            // Interrupt while idle is a CLI no-op — nothing to abort.
+            return step;
+        }
+        let turn_id = self.turn_id();
+        self.turn_active = false;
+        self.interrupt_requested = false;
+        // Same per-turn cleanup a real result performs.
+        self.tool_kinds.clear();
+        self.streamed.clear();
+        self.task_rows.clear();
+        self.agent_tools.clear();
+        self.thinking_emitted = 0;
+        step.events.push(AgentEvent::TurnAborted {
+            turn_id,
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        for (id, content) in std::mem::take(&mut self.queued_sends) {
+            step.outbound.push(user_message_frame(&id, content));
+            self.flushing.push(id.clone());
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Sent,
+            });
+        }
+        step
     }
 }
 
@@ -1764,6 +2214,12 @@ impl Mapper for ClaudeMapper {
     }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
+    }
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        self.drain_pending()
+    }
+    fn tick(&mut self) -> DriverStep {
+        self.tick()
     }
 }
 
@@ -1948,6 +2404,7 @@ mod tests {
     fn mapper() -> ClaudeMapper {
         ClaudeMapper::new(
             Some("native-1".into()),
+            None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
     }
@@ -1960,13 +2417,20 @@ mod tests {
                 text: "hello".into(),
             }],
         });
-        assert_eq!(
-            step.events[0],
+        match &step.events[0] {
             AgentEvent::UserMessage {
-                text: "hello".into(),
-                attachments: 0
+                text,
+                attachments,
+                id,
+                queued,
+            } => {
+                assert_eq!(text, "hello");
+                assert_eq!(*attachments, 0);
+                assert!(id.is_some(), "sends carry a delivery id");
+                assert!(!queued, "a fresh-turn send is not queued");
             }
-        );
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
         let uuid = match &step.events[1] {
             AgentEvent::Checkpoint {
                 user_message_id,
@@ -2001,6 +2465,13 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
             "mid-turn send must not open a turn"
         );
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a mid-turn send echoes queued");
+                id.clone().unwrap()
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         match &step.events[1] {
             AgentEvent::Checkpoint { preceding_uuid, .. } => {
                 assert_eq!(preceding_uuid.as_deref(), Some(uuid.as_str()));
@@ -2011,12 +2482,607 @@ mod tests {
             "type": "result", "is_error": false,
             "usage": { "output_tokens": 1 }, "duration_ms": 10,
         }));
+        // The result resolves the queued message `sent` but opens NO turn: the
+        // boundary is LAZY (a synthetic TurnStarted here per queued message was
+        // the "stuck running" bug, since the CLI coalesces rapid queued sends).
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            "queued pop must NOT eagerly open a turn: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Sent,
+                } if *id == queued_id
+            )),
+            "the dequeued message resolves sent at that boundary: {:?}",
+            step.events
+        );
+        // The turn opens only when the queued message's first real frame
+        // streams (ensure_turn) — then it is t2.
+        let step = m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "hi" } },
+        }));
         assert!(
             step.events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
-            "queued send opens its turn when the result lands: {:?}",
+            "the queued turn opens lazily on its first real frame: {:?}",
             step.events
+        );
+    }
+
+    /// Two mid-turn sends: the CLI's native queue is FIFO, so each finished
+    /// turn resolves the OLDEST queued id and opens the next boundary.
+    /// Queued sends are HELD, then flushed together the moment the running
+    /// turn's result lands: every held id resolves `sent` in that one step and
+    /// each is written to the CLI right then. No per-result FIFO guessing (the
+    /// off-by-one that could strand a middle message), no result-count vs
+    /// message-count race — a single result flushes the whole held batch.
+    #[test]
+    fn queued_sends_flush_together_on_turn_end() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let second = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "then this".into(),
+            }],
+        }));
+        let third = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "and this".into(),
+            }],
+        }));
+        // Held, not dumped: nothing reached the CLI while the turn ran.
+        assert_eq!(m.queued_sends.len(), 2, "both sends are held, not written");
+
+        let result = json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        });
+        let step = m.on_frame(&result);
+        // BOTH held messages resolve sent on the single turn-end result…
+        for id in [&second, &third] {
+            assert!(
+                step.events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::UserMessageUpdate { id: got, state: UserMessageState::Sent } if got == id
+                )),
+                "every held send flushes sent on the turn's result: {:?}",
+                step.events
+            );
+        }
+        // …and each is written to the CLI at that flush (a `user` frame per id).
+        let flushed: Vec<&str> = step
+            .outbound
+            .iter()
+            .filter(|o| o["type"] == "user")
+            .filter_map(|o| o["uuid"].as_str())
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![second.as_str(), third.as_str()],
+            "both held sends are written to the CLI, in order: {:?}",
+            step.outbound
+        );
+        assert!(m.queued_sends.is_empty(), "the held queue drained");
+
+        // Queue drained: the next turn's result opens no phantom boundary and
+        // resolves nothing.
+        let step = m.on_frame(&result);
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. }))
+                && !step
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "no phantom turn or resolution after the queue drains: {:?}",
+            step.events
+        );
+    }
+
+    /// The flush stages its batch until the write is confirmed shipped: if the
+    /// child wedges/dies right after its result, `deliver`'s stdin write fails
+    /// and the `sent` events never leave — so the teardown MUST drop the staged
+    /// batch, not strand it "queued" forever. And once a later frame confirms
+    /// the ship, the teardown drops nothing.
+    #[test]
+    fn a_flush_whose_write_never_ships_is_dropped_on_teardown() {
+        let result = json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        });
+
+        // Write-failure path: flush, then NO confirming frame → teardown drops.
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "held".into(),
+                }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+        // Turn ends: on_result stages the batch (write + sent are in the step,
+        // but `deliver` performs the write AFTER — it can still fail).
+        let step = m.on_frame(&result);
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued
+            )),
+            "the flush built a sent event: {:?}",
+            step.events
+        );
+        assert_eq!(m.flushing, vec![queued.clone()], "the batch is staged");
+        // The write failed (child gone): no frame ever confirms it, and teardown
+        // drops the staged id rather than leaving it stranded "queued".
+        let drained = m.drain_pending();
+        assert!(
+            drained.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "the un-shipped flush drops on teardown: {drained:?}"
+        );
+
+        // Ship-confirmed path: a later frame clears the stage, so teardown drops
+        // nothing (the message already resolved sent).
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "held".into(),
+            }],
+        });
+        m.on_frame(&result); // flush stages the batch
+        assert!(!m.flushing.is_empty(), "staged after the flush");
+        // The CLI responds — a subsequent frame proves the write shipped.
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "hi" } },
+        }));
+        assert!(m.flushing.is_empty(), "a confirming frame clears the stage");
+        assert!(
+            m.drain_pending()
+                .iter()
+                .all(|e| !matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "a shipped flush is not re-dropped on teardown"
+        );
+    }
+
+    /// A user interrupt aborts ONLY the running turn: the abort carries the
+    /// structural `interrupted` flag, and the held queue SURVIVES — it flushes
+    /// (written + `sent`) right after the abort, so a stop never un-delivers
+    /// the user's queued messages (maintainer decision 2026-07-11).
+    #[test]
+    fn interrupt_marks_abort_user_initiated_and_preserves_queue() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "queued".into(),
+            }],
+        });
+        let queued = match &step.events[0] {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(step.outbound[0]["request"]["subtype"], "interrupt");
+
+        // The CLI ends the turn with an is_error result; its `result` string
+        // is free text (often absent) — the flag, not the string, classifies.
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "a user stop is structurally marked: {:?}",
+            step.events
+        );
+        // The held message survives the stop: it flushes to the CLI and
+        // resolves `sent` in the same step — never `dropped`.
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued
+            )),
+            "the queued send still delivers after the stop: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound
+                .iter()
+                .any(|o| o["type"] == "user" && o["uuid"] == json!(queued.as_str())),
+            "the held send is written to the CLI at the abort flush: {:?}",
+            step.outbound
+        );
+        // The abort precedes the flush in the step, so the delivered bubble
+        // lands AFTER the aborted turn in the transcript.
+        let abort_pos = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnAborted { .. }))
+            .unwrap();
+        let sent_pos = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::UserMessageUpdate { .. }))
+            .unwrap();
+        assert!(abort_pos < sent_pos, "abort first, then the flush");
+
+        // The flag is consumed: a later genuine failure stays a failure.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "again".into(),
+            }],
+        });
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: false, reason, .. } if reason == "turn failed"
+            )),
+            "the next failure is not mislabeled a stop: {:?}",
+            step.events
+        );
+    }
+
+    /// An interrupt raced past the turn end (benign on the CLI) must not
+    /// relabel the NEXT turn's outcome: the flag clears at every result and
+    /// at every fresh-turn open.
+    #[test]
+    fn stale_interrupt_never_relabels_the_next_turn() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        m.on_command(AgentCommand::Interrupt);
+        // The turn completed normally before the interrupt reached the CLI.
+        m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "next".into(),
+            }],
+        });
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: false,
+                    ..
+                }
+            )),
+            "stale interrupt cleared at the result boundary: {:?}",
+            step.events
+        );
+    }
+
+    /// The `was_active` guard: a result can arrive with NO turn open — e.g. the
+    /// CLI answered a flushed message with an empty response, so `ensure_turn`
+    /// never fired. The held queue still flushes on that result, but a bare
+    /// (turn-less) result must NOT emit a phantom TurnCompleted/TurnAborted —
+    /// that stray turn-end was the "stuck running" symptom.
+    #[test]
+    fn bare_result_with_no_open_turn_emits_no_phantom_turn_end() {
+        let mut m = mapper();
+        assert!(!m.turn_active, "no turn is open");
+        // Seed a held send directly (as if queued behind a turn that then ended
+        // without ever opening a boundary of its own).
+        m.queued_sends.push_back(("qid".into(), json!([])));
+
+        let step = m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "a bare result opens no phantom TurnCompleted: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if id == "qid"
+            )),
+            "the held id still flushes sent, guard or not: {:?}",
+            step.events
+        );
+
+        // Same for an is_error bare result: no phantom abort — and the held
+        // queue STILL flushes (an error ends only the turn, never the queue).
+        m.queued_sends.push_back(("qid2".into(), json!([])));
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "a bare is_error result opens no phantom TurnAborted: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if id == "qid2"
+            )),
+            "the held id still flushes sent, error or not: {:?}",
+            step.events
+        );
+    }
+
+    /// The interrupt watchdog: when the CLI never answers an interrupt with a
+    /// result (a no-op interrupt, or a wedged turn), the grace expires and the
+    /// driver synthesizes the abort so the user escapes a stuck-running state.
+    #[test]
+    fn interrupt_watchdog_aborts_a_hung_turn_after_the_grace() {
+        let mut m = mapper();
+        // A running turn with a queued message behind it.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "queued".into(),
+                }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+
+        // Interrupt: the CLI (fake) never answers with a result. Ticks below
+        // the grace do nothing…
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(step.outbound[0]["request"]["subtype"], "interrupt");
+        for _ in 0..(INTERRUPT_GRACE_TICKS - 1) {
+            let step = m.tick();
+            assert!(step.events.is_empty(), "no abort before the grace expires");
+        }
+        assert!(m.turn_active, "still running until the grace fires");
+
+        // …the expiring tick synthesizes the abort — and, like every turn end,
+        // flushes the held queue (best-effort write; `sent`). A stop never
+        // un-delivers the user's queued messages.
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "the watchdog aborts the hung turn as a user stop: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued
+            )),
+            "the queue still delivers after the watchdog abort: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound
+                .iter()
+                .any(|o| o["type"] == "user" && o["uuid"] == json!(queued.as_str())),
+            "the held send is written at the watchdog flush: {:?}",
+            step.outbound
+        );
+        assert!(!m.turn_active, "the turn is closed");
+
+        // Idempotent: a further tick does nothing (grace disarmed).
+        assert!(m.tick().events.is_empty(), "watchdog fires exactly once");
+    }
+
+    /// A real result landing before the grace expires disarms the watchdog, so
+    /// a genuine turn is never double-aborted.
+    #[test]
+    fn real_result_disarms_the_interrupt_watchdog() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        m.on_command(AgentCommand::Interrupt);
+        // The CLI answers the interrupt with its is_error result…
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "the real interrupt result aborts the turn: {:?}",
+            step.events
+        );
+        assert!(m.interrupt_grace.is_none(), "the watchdog is disarmed");
+        // …so ticking past the grace produces no second abort.
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no double abort after a real end"
+            );
+        }
+    }
+
+    /// Interrupt pressed while idle is a no-op: the grace expires without an
+    /// abort (there is no turn to stop).
+    #[test]
+    fn interrupt_while_idle_is_a_watchdog_no_op() {
+        let mut m = mapper();
+        assert!(!m.turn_active);
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "an idle interrupt never fabricates an abort"
+            );
+        }
+        assert!(!m.turn_active);
+    }
+
+    /// Feature 1 (unit): a coalesced surplus flushes `sent` when the driver
+    /// idles. Turn one's result pops the OLDEST queued id; the surplus never
+    /// gets a result of its own (the CLI coalesced it), so the idle-flush
+    /// resolves it once the grace expires — it must not stick "queued".
+    /// Feature 2 (unit): cancelling a still-held message removes it locally and
+    /// resolves it `Cancelled` — no `cancel_async_message` round-trip (the CLI
+    /// never received it) — and the turn-end flush then delivers only the
+    /// SURVIVING held message, never the cancelled one.
+    #[test]
+    fn cancel_queued_removes_a_held_send() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let second = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "second".into(),
+            }],
+        }));
+        let third = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "third".into(),
+            }],
+        }));
+
+        // Cancel the FIRST held ("second"): it leaves the queue and emits
+        // Cancelled — with NO outbound (the CLI never had it to un-queue).
+        let step = m.on_command(AgentCommand::CancelQueued { id: second.clone() });
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: second.clone(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+        assert!(
+            step.outbound.is_empty(),
+            "a held cancel needs no CLI round-trip: {:?}",
+            step.outbound
+        );
+
+        // The turn-end flush now delivers only "third" — the cancelled one is
+        // gone, so it neither resolves sent nor gets written to the CLI.
+        let step = m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == third
+            )),
+            "the surviving message resolves sent: {:?}",
+            step.events
+        );
+        assert!(
+            !step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, .. } if *id == second
+            )),
+            "the cancelled message never resolves again: {:?}",
+            step.events
+        );
+        let flushed: Vec<&str> = step
+            .outbound
+            .iter()
+            .filter(|o| o["type"] == "user")
+            .filter_map(|o| o["uuid"].as_str())
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![third.as_str()],
+            "only the surviving held send is written to the CLI: {:?}",
+            step.outbound
+        );
+    }
+
+    /// Cancelling a message that already resolved emits a tombstone
+    /// `Cancelled` (no CLI frame): for an already-`sent` id the reducer
+    /// no-ops (the message is visibly in the transcript), and for a DROPPED
+    /// one the same event is the ✕-dismiss that clears the "not delivered"
+    /// bubble on live and replay alike.
+    #[test]
+    fn cancel_queued_after_delivery_is_a_reducer_noop_tombstone() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "queued".into(),
+                }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+        // Turn one's result flushes it `sent` — now it's delivered.
+        m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        // A late cancel: the tombstone `Cancelled`, nothing to the CLI. The
+        // reducer ignores a cancel for an id no longer pending, so the
+        // delivered message is untouched.
+        let step = m.on_command(AgentCommand::CancelQueued { id: queued.clone() });
+        assert!(step.outbound.is_empty(), "nothing goes to the CLI");
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: queued,
+                state: UserMessageState::Cancelled,
+            }]
         );
     }
 
@@ -2173,6 +3239,7 @@ mod tests {
             request_id: "req-1".into(),
             option_id: "allow_always".into(),
             destination: None,
+            feedback: None,
         });
         let response = &step.outbound[0]["response"]["response"];
         assert_eq!(response["behavior"], "allow");
@@ -2184,6 +3251,202 @@ mod tests {
                 option_id: "allow_always".into()
             }
         );
+    }
+
+    #[test]
+    fn deny_with_feedback_keeps_turn_alive_and_echoes_user_text() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "rm -rf build" },
+                "tool_use_id": "tu1",
+            },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-1".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("  use `just clean` instead  ".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "deny");
+        assert_eq!(
+            response["interrupt"],
+            json!(false),
+            "feedback-denials must not abort the turn"
+        );
+        let message = response["message"].as_str().unwrap();
+        assert!(message.starts_with(DENY_DIRECTIVE));
+        assert!(message.contains("use `just clean` instead"));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { option_id, .. } if option_id == "reject_once"
+        ));
+        assert_eq!(
+            step.events[1],
+            AgentEvent::UserMessage {
+                text: "use `just clean` instead".into(),
+                attachments: 0,
+                id: None,
+                queued: false,
+            }
+        );
+
+        // A bare deny keeps the aborting directive shape.
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-2",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash",
+                         "input": { "command": "ls" }, "tool_use_id": "tu2" },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-2".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("   ".into()), // whitespace = no feedback
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["message"], DENY_DIRECTIVE);
+        assert_eq!(response["interrupt"], json!(true));
+        assert_eq!(step.events.len(), 1, "no user echo without feedback");
+    }
+
+    #[test]
+    fn exit_plan_mode_maps_to_plan_approval_card() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-p",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": { "plan": "## Plan\n1. add the field" },
+                "tool_use_id": "tu-p",
+            },
+        }));
+        match &step.events[0] {
+            AgentEvent::PermissionRequest {
+                options,
+                plan,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(plan.as_deref(), Some("## Plan\n1. add the field"));
+                let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    ["allow_accept_edits", "allow_once", "reject_once"],
+                    "the official plan-approval option set, in order"
+                );
+                assert_eq!(options[0].label, "Yes, and auto-accept edits");
+                assert_eq!(options[1].label, "Yes, manually approve");
+                assert_eq!(options[2].label, "No, keep planning");
+                assert!(
+                    input_preview["plan"].is_null(),
+                    "the plan rides its own field, not the preview too"
+                );
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+
+        // "Yes, and auto-accept edits" with comments: allow echoes the input
+        // plus userFeedback/userComments, and a set_permission_mode follow-up
+        // rides the same step.
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "allow_accept_edits".into(),
+            destination: None,
+            feedback: Some("also update the docs".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(
+            response["updatedInput"]["plan"],
+            "## Plan\n1. add the field"
+        );
+        assert_eq!(
+            response["updatedInput"]["userFeedback"],
+            "also update the docs"
+        );
+        assert_eq!(
+            response["updatedInput"]["userComments"],
+            "also update the docs"
+        );
+        assert_eq!(
+            step.outbound[1]["request"]["subtype"],
+            "set_permission_mode"
+        );
+        assert_eq!(step.outbound[1]["request"]["mode"], "acceptEdits");
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::UserMessage { text, .. } if text == "also update the docs"
+        ));
+        // The follow-up's ack resolves to ModeChanged(acceptEdits).
+        let ctl = step.outbound[1]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl, "response": {} },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::ModeChanged {
+                mode_id: "acceptEdits".into()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_approval_manual_and_keep_planning_paths() {
+        let plan_request = |id: &str| {
+            json!({
+                "type": "control_request",
+                "request_id": id,
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "ExitPlanMode",
+                    "input": { "plan": "the plan" },
+                    "tool_use_id": "tu-p",
+                },
+            })
+        };
+
+        // "Yes, manually approve": plain allow, no mode follow-up.
+        let mut m = mapper();
+        m.on_frame(&plan_request("req-p"));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "allow_once".into(),
+            destination: None,
+            feedback: None,
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "allow");
+        assert!(
+            response["updatedInput"]["userFeedback"].is_null(),
+            "no comments ⇒ no injected fields"
+        );
+        assert_eq!(step.outbound.len(), 1, "manual approve sets no mode");
+
+        // "No, keep planning" with comments: the feedback-denial shape.
+        let mut m = mapper();
+        m.on_frame(&plan_request("req-p"));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("split step 1 into two".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "deny");
+        assert_eq!(response["interrupt"], json!(false));
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("split step 1 into two"));
     }
 
     #[test]
@@ -2287,10 +3550,142 @@ mod tests {
             "SQLite"
         );
         assert!(response["updatedInput"]["questions"].is_array());
+        match &step.events[0] {
+            AgentEvent::QuestionResolved {
+                request_id,
+                answers,
+            } => {
+                assert_eq!(request_id, "req-q");
+                assert_eq!(
+                    answers.get("Which database?"),
+                    Some(&vec!["SQLite".to_string()]),
+                    "the chosen labels ride the resolution for history/replay"
+                );
+            }
+            other => panic!("expected QuestionResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_user_question_tool_use_emits_no_tool_row() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": "tu-q", "name": "AskUserQuestion",
+                  "input": { "questions": [{ "question": "Q?" }] } },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "the question card is the surface, not a bare tool row: {:?}",
+            step.events
+        );
+    }
+
+    #[test]
+    fn stale_answer_and_permission_resolve_definitively() {
+        // A reply whose request_id no pending map knows (the ask predates
+        // this driver process) must produce a journaled resolution + notice,
+        // never a silent drop — the reconnect-stranding bug.
+        let mut m = mapper();
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("q".to_string(), vec!["a".to_string()]);
+        let step = m.on_command(AgentCommand::Answer {
+            request_id: "gone-q".into(),
+            answers,
+        });
+        assert!(step.outbound.is_empty(), "no live request to answer");
         assert!(matches!(
             &step.events[0],
-            AgentEvent::QuestionResolved { request_id } if request_id == "req-q"
+            AgentEvent::QuestionResolved { request_id, answers } if request_id == "gone-q" && answers.is_empty()
         ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "gone-p".into(),
+            option_id: "allow_once".into(),
+            destination: None,
+            feedback: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "gone-p" && option_id == "expired"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+    }
+
+    #[test]
+    fn drain_pending_resolves_every_outstanding_ask() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-q",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": { "questions": [{ "question": "Q?", "options": [{ "label": "A" }] }] },
+            },
+        }));
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-p",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "make" },
+            },
+        }));
+        let events = Mapper::drain_pending(&mut m);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::QuestionResolved { request_id, answers } if request_id == "req-q" && answers.is_empty()
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "req-p" && option_id == "expired"
+        )));
+        assert!(
+            Mapper::drain_pending(&mut m).is_empty(),
+            "drain is exhaustive"
+        );
+    }
+
+    #[test]
+    fn unknown_control_subtype_notices_once() {
+        let mut m = mapper();
+        let frame = json!({
+            "type": "control_request",
+            "request_id": "req-m",
+            "request": { "subtype": "mcp_message" },
+        });
+        let step = m.on_frame(&frame);
+        assert!(
+            step.outbound.is_empty(),
+            "unknown subtypes park (the CLI's own deadline settles them)"
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("mcp_message")
+        ));
+        let step = m.on_frame(&frame);
+        assert!(
+            step.events.is_empty(),
+            "one notice per subtype, not per frame"
+        );
     }
 
     #[test]
@@ -2316,22 +3711,28 @@ mod tests {
             request_id: "req-d".into(),
             option_id: "retry_fallback".into(),
             destination: None,
+            feedback: None,
         });
         let response = &step.outbound[0]["response"]["response"];
         assert_eq!(response["behavior"], "completed");
         assert_eq!(response["result"], "retry_fallback");
 
-        // Unknown kinds must answer cancelled immediately (never park).
+        // Unknown kinds must answer cancelled immediately (never park) AND
+        // say so — a silent cancel leaves the agent's "I'm blocked" prose as
+        // the only trace the ask existed.
         let step = m.on_frame(&json!({
             "type": "control_request",
             "request_id": "req-x",
             "request": { "subtype": "request_user_dialog", "dialog_kind": "mystery" },
         }));
-        assert!(step.events.is_empty());
         assert_eq!(
             step.outbound[0]["response"]["response"]["behavior"],
             "cancelled"
         );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("mystery")
+        ));
     }
 
     #[test]
@@ -2351,6 +3752,42 @@ mod tests {
             &step.events[0],
             AgentEvent::Notice { text } if text.contains("background")
         ));
+    }
+
+    #[test]
+    fn stop_task_resolves_transcript_row_ids_to_native_task_keys() {
+        let mut m = mapper();
+        // A subagent with no matching Task card synthesizes a "task:{id}" row.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-9",
+            "description": "summarize the docs",
+        }));
+        // The client stops by the ROW id it sees; the wire carries the key.
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "task:tk-9".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["subtype"], "stop_task");
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-9");
+
+        // A subagent that landed on its Task tool card: the row id is the
+        // tool_use_id, reverse-mapped through task_rows.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{
+                "type": "tool_use", "id": "tu-7", "name": "Task",
+                "input": { "description": "audit the tests", "prompt": "…" },
+            }]},
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-10",
+            "description": "audit the tests",
+        }));
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "tu-7".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-10");
     }
 
     #[test]

@@ -14,11 +14,13 @@
   import ToolGroup from "./ToolGroup.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
+  import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
-  import Composer, { type ImageAttachment } from "./Composer.svelte";
+  import Composer from "./Composer.svelte";
+  import type { ImageAttachment } from "./images";
   import type { ChatBlock } from "./store.svelte";
 
   interface Props {
@@ -44,6 +46,9 @@
     onDegraded: () => (store.degraded = true),
     onExited: (status) => (store.exited = { status }),
     onError: (message) => (store.fatalError = message),
+    // A refused command is a notice, not a dead pane — the socket keeps
+    // reconnecting and the user keeps their transcript.
+    onCommandFailed: (message) => store.notice(message, "error"),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });
@@ -157,17 +162,35 @@
     return sendNow(text, images);
   }
 
-  function decide(requestId: string, optionId: string, destination?: string) {
-    socket.send({
+  function decide(requestId: string, optionId: string, destination?: string, feedback?: string) {
+    const sent = socket.send({
       type: "permission",
       request_id: requestId,
       option_id: optionId,
       ...(destination !== undefined ? { destination } : {}),
+      ...(feedback !== undefined ? { feedback } : {}),
     });
+    // Never lose a decision to a closed socket: the card stays answerable
+    // (no resolved event will arrive), so say why nothing happened.
+    if (!sent) store.notice("not connected — decision not sent, try again in a moment", "error");
+  }
+
+  function answer(requestId: string, answers: Record<string, string[]>) {
+    const sent = socket.send({ type: "answer", request_id: requestId, answers });
+    if (!sent) store.notice("not connected — answer not sent, try again in a moment", "error");
   }
 
   function interrupt() {
     socket.send({ type: "interrupt" });
+  }
+
+  /** Pull back a still-queued message before the agent consumes it. The store
+   *  removes it on the resulting `user_message_update{cancelled}` (deterministic
+   *  from the wire, so replay agrees). Respect the closed-socket rule: if it
+   *  can't send, the message stays queued and the user can retry. */
+  function cancelQueued(id: string) {
+    const sent = socket.send({ type: "cancel_queued", id });
+    if (!sent) store.notice("not connected — couldn't cancel, try again in a moment", "error");
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -222,6 +245,15 @@
         // the same data from account/read.
         socket.send({ type: "get_usage" });
         return true;
+      case "compact":
+        // Codex has no slash catalog; thread/compact/start is the native
+        // path (the compaction turn's notice confirms completion). Claude's
+        // own /compact rides its catalog — fall through to the CLI send.
+        if (agentKind !== "codex") return false;
+        if (socket.send({ type: "compact" })) {
+          store.notice("compacting context…", "info");
+        }
+        return true;
       case "mcp":
         if (agentKind === "claude") {
           store.mcpServers = null;
@@ -257,13 +289,15 @@
 
   /** Prose path candidates validate against the daemon relative to the
    *  session cwd (the terminal-link mechanism) — only real paths become
-   *  clickable, and dirs route to the Finder. */
+   *  clickable, and dirs route to the Finder. The workspace id enables the
+   *  daemon's unique-basename fallback, keeping chat links and terminal
+   *  links in parity for a bare "FIGURE_PLAN.md" living in a subdirectory. */
   async function resolveProsePaths(
     candidates: string[],
   ): Promise<Map<string, { path: string; kind: "file" | "dir" }>> {
     const out = new Map<string, { path: string; kind: "file" | "dir" }>();
     try {
-      const valid = await fsValidate(candidates, session.cwd);
+      const valid = await fsValidate(candidates, session.cwd, session.workspace_id ?? null);
       for (const [cand, hit] of Object.entries(valid)) {
         out.set(cand, { path: hit.path, kind: hit.kind });
       }
@@ -300,19 +334,25 @@
     if (agentKind === "claude") {
       native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
     }
+    if (agentKind === "codex") {
+      native.push({ name: "compact", description: "compact conversation context" });
+    }
     const nativeNames = new Set(native.map((n) => n.name));
     return [...native, ...store.slashCommands.filter((c) => !nativeNames.has(c.name))];
   });
 
-  // --- checkpoint rewind (claude) -------------------------------------------
-  // Click "rewind" on a user message → dry-run report → confirm dialog →
-  // restore files (rewind_files) → optionally fork the conversation there.
+  // --- checkpoint rewind ------------------------------------------------------
+  // Claude: click "rewind" on a user message → dry-run report (rewind_files) →
+  // confirm dialog → restore files → optionally fork the conversation there.
+  // Codex: no file restore exists — the dialog is a plain confirmation and the
+  // rewind is conversation-only (the daemon rolls the thread back in place).
   // The intent flag keeps replayed RewindResult events from reopening UI.
+  const conversationOnlyRewind = agentKind !== "claude";
   let rewindIntent = $state<null | {
     id: string;
     preceding: string | null;
     fork: boolean;
-    stage: "dry" | "applying";
+    stage: "dry" | "confirm" | "applying";
   }>(null);
   const rewindReport = $derived(
     rewindIntent !== null && store.rewind?.userMessageId === rewindIntent.id
@@ -322,12 +362,33 @@
 
   function askRewind(checkpoint: { id: string; preceding: string | null }) {
     store.rewind = null;
-    rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
-    socket.send({ type: "rewind", user_message_id: checkpoint.id, dry_run: true });
+    if (conversationOnlyRewind) {
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm" };
+    } else {
+      rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
+      socket.send({ type: "rewind", user_message_id: checkpoint.id, dry_run: true });
+    }
   }
 
   function confirmRewind(fork: boolean) {
     if (rewindIntent === null) return;
+    if (conversationOnlyRewind) {
+      const preceding = rewindIntent.preceding;
+      if (preceding === null) {
+        rewindIntent = null;
+        return;
+      }
+      rewindIntent = { ...rewindIntent, stage: "applying" };
+      void rewindSession(session.id, preceding)
+        .then(() => {
+          rewindIntent = null;
+        })
+        .catch((e: unknown) => {
+          rewindIntent = null;
+          store.notice(`rewind failed: ${String(e)}`, "error");
+        });
+      return;
+    }
     rewindIntent = { ...rewindIntent, fork, stage: "applying" };
     store.rewind = null;
     socket.send({ type: "rewind", user_message_id: rewindIntent.id, dry_run: false });
@@ -427,6 +488,9 @@
     const items: RenderItem[] = [];
     let group: Extract<RenderItem, { t: "group" }> | null = null;
     store.blocks.forEach((block, i) => {
+      // Every user block in `blocks` is delivered — queued/undelivered sends
+      // live in the bottom pending stack (`store.pendingSends`), never here — so
+      // they all render inline in transcript order.
       if (block.kind === "tool") {
         if (group === null) {
           group = { t: "group", key: `g-${block.id}`, tools: [] };
@@ -440,6 +504,11 @@
     });
     return items;
   });
+
+  /** Index of the last block (the streaming reveal keys off it). Every block
+   *  renders inline now — queued sends live in the pending stack, not in
+   *  `blocks` — so this is simply the tail. */
+  const lastInlineIndex = $derived(store.blocks.length - 1);
 </script>
 
 <!-- The outside-dismiss action closes any open header menu / the /mcp panel on
@@ -499,15 +568,31 @@
     {/if}
     {#each renderItems as item (item.key)}
       {#if item.t === "group"}
-        <ToolGroup tools={item.tools} {onOpenFile} />
+        <ToolGroup
+          tools={item.tools}
+          {onOpenFile}
+          onBackground={agentKind === "claude"
+            ? (id) => socket.send({ type: "background_tool", tool_call_id: id })
+            : undefined}
+          onStopTask={agentKind === "claude"
+            ? (id) => socket.send({ type: "stop_task", task_id: id })
+            : undefined}
+        />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
+        <!-- Only delivered (sent) user messages render inline; queued/dropped
+             ones live in the pending stack above the composer. -->
         <div class="msg user">
           <div class="bubble-row">
-            {#if agentKind === "claude" && block.checkpoint !== null}
+            <!-- Codex rewinds whole turns from a preceding anchor, so its
+                 first message (nothing precedes it) offers no button; claude
+                 can still restore files there. -->
+            {#if block.checkpoint !== null && (agentKind === "claude" || block.checkpoint.preceding !== null)}
               <button
                 class="rewind-btn"
-                title="rewind to before this message (restores files; optionally forks the conversation)"
+                title={agentKind === "claude"
+                  ? "rewind to before this message (restores files; optionally forks the conversation)"
+                  : "rewind the conversation to before this message"}
                 onclick={() => askRewind(block.checkpoint!)}
               >
                 ↺
@@ -529,7 +614,7 @@
         <div class="msg agent">
           <Markdown
             text={item.block.text}
-            streaming={store.running && item.index === store.blocks.length - 1}
+            streaming={store.running && item.index === lastInlineIndex}
             onOpenPath={openProsePath}
             resolvePaths={resolveProsePaths}
             onReveal={() => {
@@ -542,6 +627,16 @@
           <summary>thinking · {item.block.text.length} chars</summary>
           <div class="thought-body">{item.block.text}</div>
         </details>
+      {:else if item.block.kind === "question"}
+        <!-- The transcript's memory of an ask: invisible while the pending
+             overlay below is the answerable card, a quiet question+answer
+             card once resolved (replay rebuilds the same). -->
+        {#if item.block.resolved}
+          <QuestionCard
+            request={{ requestId: item.block.id, questions: item.block.questions }}
+            answered={item.block.answers}
+          />
+        {/if}
       {:else if item.block.kind === "notice"}
         <div class="notice" class:error={item.block.tone === "error"}>{item.block.text}</div>
       {:else if item.block.kind === "turn_end"}
@@ -563,18 +658,23 @@
     {/each}
 
     {#each store.pending as request (request.requestId)}
-      <PermissionCard
-        {request}
-        onDecide={(opt, dest) => decide(request.requestId, opt, dest)}
-      />
+      {#if request.plan !== null}
+        <PlanApprovalCard
+          {request}
+          onDecide={(opt, feedback) => decide(request.requestId, opt, undefined, feedback)}
+          onOpenPath={openProsePath}
+          resolvePaths={resolveProsePaths}
+        />
+      {:else}
+        <PermissionCard
+          {request}
+          onDecide={(opt, dest, feedback) => decide(request.requestId, opt, dest, feedback)}
+        />
+      {/if}
     {/each}
 
     {#each store.questions as request (request.requestId)}
-      <QuestionCard
-        {request}
-        onAnswer={(answers) =>
-          socket.send({ type: "answer", request_id: request.requestId, answers })}
-      />
+      <QuestionCard {request} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
     {#if store.running && store.pending.length === 0 && store.questions.length === 0}
@@ -623,6 +723,7 @@
     <RewindDialog
       intent={rewindIntent}
       report={rewindReport}
+      conversationOnly={conversationOnlyRewind}
       onCancel={() => (rewindIntent = null)}
       onConfirm={confirmRewind}
       {onOpenFile}
@@ -657,6 +758,45 @@
         aria-label="dismiss suggestion"
         onclick={() => (store.promptSuggestion = null)}>×</button
       >
+    </div>
+  {/if}
+
+  <!-- Pending stack: messages typed and waiting to send, held at the send
+       point (right above the composer) rather than inline in history. On
+       delivery the entry leaves this stack and enters the transcript as the
+       newest turn. Queued survives a Stop (it delivers after the abort); the
+       ✕ is how you discard one. A dropped one (the agent died before it could
+       be delivered) stays marked "not delivered" until its ✕ dismisses it —
+       the same cancel command, tombstoned in the journal so replay agrees. -->
+  {#if store.pendingSends.length > 0}
+    <div class="pending" aria-label="queued messages">
+      {#each store.pendingSends as send (send.id)}
+        <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
+          <div class="bubble-row">
+            <button
+              class="cancel-btn"
+              title={send.state === "dropped"
+                ? "dismiss (this message was never delivered)"
+                : "cancel this queued message (remove it before the agent sees it)"}
+              aria-label={send.state === "dropped"
+                ? "dismiss undelivered message"
+                : "cancel queued message"}
+              onclick={() => cancelQueued(send.id)}
+            >
+              ✕
+            </button>
+            <div class="bubble">
+              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
+            </div>
+          </div>
+          <span class="delivery" class:dropped={send.state === "dropped"}>
+            {send.state === "dropped" ? "not delivered" : "queued"}
+          </span>
+          {#if send.attachments > 0}
+            <span class="attach">{send.attachments} image{send.attachments > 1 ? "s" : ""}</span>
+          {/if}
+        </div>
+      {/each}
     </div>
   {/if}
 
@@ -723,6 +863,7 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
+  .chat > .pending,
   .chat > .plan {
     width: 100%;
     max-width: calc(var(--chat-measure) + 36px);
@@ -779,6 +920,48 @@
     color: var(--muted);
     font-size: var(--text-sm);
     margin-top: 2px;
+  }
+  /* The pending stack sits between the transcript and the composer, holding
+     messages typed and waiting to send. It reads as attached to the input:
+     same 18px side padding as the composer (the selector group above), a hair
+     of vertical breathing room, and a hairline top edge tying it to the
+     composer below. Collapses to nothing when empty (the {#if} guard). */
+  .pending {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-top: 8px;
+    padding-bottom: 6px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
+  }
+  /* A pending bubble is half-present — not in the conversation yet (claude's
+     native mid-turn queue / a codex steer in flight). Reuses .msg.user's
+     right-alignment so the queued→sent transition is visually continuous:
+     the same bubble un-fades and moves up into the transcript on delivery.
+     Tighter margins than an inline turn (the stack sets its own gap). */
+  .pending-msg {
+    margin-top: 0;
+    margin-bottom: 0;
+  }
+  .pending-msg .bubble {
+    opacity: 0.55;
+    /* Outline, not border: follows the radius with zero layout shift. */
+    outline: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+    outline-offset: -1px;
+  }
+  /* Dropped (e.g. claude dropped its queue on interrupt): the text stays
+     readable — no strikethrough — so it can be copied and re-sent by hand. */
+  .pending-msg.dropped .bubble {
+    outline-style: solid;
+    outline-color: color-mix(in srgb, var(--err) 45%, transparent);
+  }
+  .delivery {
+    color: var(--muted);
+    font-size: var(--text-xs);
+    margin-top: 2px;
+  }
+  .delivery.dropped {
+    color: var(--err);
   }
   .msg.agent {
     padding: 2px 0;
@@ -920,6 +1103,30 @@
   }
   .rewind-btn:hover {
     color: var(--accent);
+  }
+  /* The ✕ on a queued bubble: pull it back before the agent sees it. Quiet by
+     default (mirrors .rewind-btn), reveals on hover/focus of the pending row,
+     and warms to --err on hover since it discards. */
+  .cancel-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .pending-msg:hover .cancel-btn,
+  .cancel-btn:focus-visible {
+    opacity: 1;
+  }
+  .cancel-btn:hover {
+    color: var(--err);
   }
   .suggestion-row {
     display: flex;

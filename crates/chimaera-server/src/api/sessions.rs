@@ -252,7 +252,11 @@ async fn spawn_chat_ui(
     }
 
     let id = crate::agents::fresh_session_id();
-    let bin = match crate::launcher::detect(state, agent_kind, false).await.path {
+    // Take the path AND its probed version from one detection so the chat
+    // driver's version notice reflects the binary it actually spawns.
+    let detection = crate::launcher::detect(state, agent_kind, false).await;
+    let agent_version = detection.version.clone();
+    let bin = match detection.path {
         Ok(path) => path,
         Err(msg) => return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response(),
     };
@@ -311,11 +315,13 @@ async fn spawn_chat_ui(
         workspace_root: workspace.root.clone(),
         kind: agent_kind,
         bin,
+        version: agent_version,
         settings,
         mcp_config,
         model: body.model.clone(),
         resume: body.resume.clone(),
         fork_at: None,
+        rollback_turns: None,
         theme: theme.to_string(),
     };
 
@@ -462,6 +468,9 @@ pub(crate) async fn delete_session(
     }
     match state.sessions.kill(&id) {
         Ok(()) => {
+            // Shells never pass through `recents::retire` (that hook is
+            // agent-only), so their uploads are pruned here.
+            crate::upload::prune_session_uploads(&state, &id);
             state.changes.notify_waiters();
             StatusCode::NO_CONTENT.into_response()
         }

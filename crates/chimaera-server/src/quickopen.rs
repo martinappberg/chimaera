@@ -1,7 +1,9 @@
 //! Quick-open file index: GET /api/v1/fs/quickopen fuzzy-matches a
 //! workspace's files by name/path for the Cmd+P palette. A fresh walk is
 //! cheap at workspace scale; a short-TTL cache keeps a fast typer from
-//! hammering the disk on every keystroke.
+//! hammering the disk on every keystroke. The same cached index backs the
+//! `/fs/validate` bare-basename fallback (see [`workspace_index`] /
+//! [`unique_file_named`]), so link validation never adds a second walker.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,8 +34,16 @@ const IGNORED_DIRS: &[&str] = &[
     ".snakemake",
     "work",
 ];
-/// Walk guard: stop indexing past this many files (results are partial).
+/// Walk guards. The daemon lives on shared HPC login nodes where a workspace
+/// can sit on NFS/Lustre, so every walk is bounded three ways and yields
+/// honest partial results (cached like a full walk) when a guard trips:
+/// entry count (a scratch dir with hundreds of thousands of files must not
+/// balloon the index), depth (runaway generated/looping trees; real
+/// workspaces stay well under this), and wall time (a cold NFS walk must not
+/// wedge the request that triggered it).
 const MAX_INDEX_FILES: usize = 100_000;
+pub(crate) const MAX_INDEX_DEPTH: usize = 32;
+const WALK_TIME_CAP: Duration = Duration::from_secs(3);
 /// How long a walk result stays fresh.
 const CACHE_TTL: Duration = Duration::from_secs(5);
 /// Default and maximum result counts.
@@ -43,13 +53,13 @@ const MAX_LIMIT: usize = 200;
 /// One indexed entry (file or directory). The lowercase copies are
 /// precomputed once per walk so matching stays allocation-free per keystroke.
 pub(crate) struct IndexedFile {
-    path: String,
-    rel: String,
-    name: String,
-    mtime: u64,
-    rel_lower: String,
-    name_lower: String,
-    is_dir: bool,
+    pub(crate) path: String,
+    pub(crate) rel: String,
+    pub(crate) name: String,
+    pub(crate) mtime: u64,
+    pub(crate) rel_lower: String,
+    pub(crate) name_lower: String,
+    pub(crate) is_dir: bool,
 }
 
 /// Per-workspace walk cache with a [`CACHE_TTL`] freshness window.
@@ -93,7 +103,7 @@ pub(crate) async fn quickopen(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QuickOpenQuery>,
 ) -> Response {
-    let Some(workspace) = crate::lock(&state.workspaces).get(&query.workspace_id) else {
+    let Some(files) = workspace_index(&state, &query.workspace_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown workspace {}", query.workspace_id)})),
@@ -101,11 +111,27 @@ pub(crate) async fn quickopen(
             .into_response();
     };
 
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    Json(json!({"entries": search(&files, &query.q, limit, query.dirs)})).into_response()
+}
+
+/// The (possibly cached) file index for a workspace — the shared machinery
+/// behind GET /fs/quickopen and the `/fs/validate` bare-basename fallback.
+/// `None` for an unknown workspace. BLOCKING (a cache miss walks the tree):
+/// call from `spawn_blocking` or a handler that accepts the bounded inline
+/// walk. Cost ceiling: at most one [`walk`] per workspace per [`CACHE_TTL`],
+/// each bounded by the walk guards above — shared-login-node safe.
+pub(crate) fn workspace_index(
+    state: &Arc<AppState>,
+    workspace_id: &str,
+) -> Option<Arc<Vec<IndexedFile>>> {
+    let workspace = crate::lock(&state.workspaces).get(workspace_id)?;
+
     // Walk outside the cache lock: two racing queries may both walk, which
     // is fine at this scale — never hold a lock across disk I/O. (The lookup
     // is bound to its own statement so the guard drops before the re-lock.)
     let cached = crate::lock(&state.quickopen).get_fresh(&workspace.id);
-    let files = match cached {
+    Some(match cached {
         Some(files) => files,
         None => {
             // settings.json ground truth: user-tuned ignore list, else the
@@ -115,25 +141,64 @@ pub(crate) async fn quickopen(
             crate::lock(&state.quickopen).insert(workspace.id.clone(), files.clone());
             files
         }
-    };
+    })
+}
 
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    Json(json!({"entries": search(&files, &query.q, limit, query.dirs)})).into_response()
+/// The absolute path of the single FILE named `name` (exact, case-sensitive)
+/// in the index — `None` when absent OR ambiguous. Refusing on ambiguity is
+/// the false-positive defense for bare-basename links: `main.rs` mentioned in
+/// a multi-crate repo must not underline and open an arbitrary one.
+pub(crate) fn unique_file_named<'a>(files: &'a [IndexedFile], name: &str) -> Option<&'a str> {
+    let mut found: Option<&str> = None;
+    for file in files.iter().filter(|f| !f.is_dir && f.name == name) {
+        if found.is_some() {
+            return None;
+        }
+        found = Some(&file.path);
+    }
+    found
 }
 
 /// Walk `root` collecting regular files and directories, skipping the
 /// ignored dirs (`ignore` override from settings, else [`IGNORED_DIRS`]) and
-/// all symlinks (never followed: loop safety), stopping at
-/// [`MAX_INDEX_FILES`]. Unreadable entries are skipped silently, matching
-/// `fs/list`.
+/// all symlinks (never followed: loop safety), bounded by [`MAX_INDEX_FILES`]
+/// / [`MAX_INDEX_DEPTH`] / [`WALK_TIME_CAP`]. Unreadable entries are skipped
+/// silently, matching `fs/list`.
 fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
+    walk_bounded(
+        root,
+        ignore,
+        MAX_INDEX_FILES,
+        MAX_INDEX_DEPTH,
+        Instant::now() + WALK_TIME_CAP,
+    )
+}
+
+/// [`walk`] with explicit bounds, so tests can exercise the guards without
+/// building 100k-file trees.
+pub(crate) fn walk_bounded(
+    root: &Path,
+    ignore: Option<&[String]>,
+    max_files: usize,
+    max_depth: usize,
+    deadline: Instant,
+) -> Vec<IndexedFile> {
     let ignored = |name: &str| match ignore {
         Some(list) => list.iter().any(|d| d == name),
         None => IGNORED_DIRS.contains(&name),
     };
     let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        // Time guard checked per directory (not per entry): cheap, and a
+        // single directory read is the smallest unit worth interrupting.
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                root = %root.display(),
+                "quickopen index hit the time guard; results are partial"
+            );
+            return files;
+        }
         let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -148,14 +213,16 @@ fn walk(root: &Path, ignore: Option<&[String]>) -> Vec<IndexedFile> {
                 if ignored(&name) {
                     continue;
                 }
-                stack.push(entry.path());
+                if depth + 1 < max_depth {
+                    stack.push((entry.path(), depth + 1));
+                }
             } else if !file_type.is_file() {
                 continue;
             }
-            if files.len() >= MAX_INDEX_FILES {
+            if files.len() >= max_files {
                 tracing::warn!(
                     root = %root.display(),
-                    cap = MAX_INDEX_FILES,
+                    cap = max_files,
                     "quickopen index hit the file-count guard; results are partial"
                 );
                 return files;

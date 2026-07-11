@@ -7,7 +7,7 @@ use tower_http::trace::TraceLayer;
 use crate::AppState;
 use crate::{
     agents, api, assets, chat, download, fs, git, launcher, links, mcp, quickopen, recents,
-    runtimes, settings, update, view_state, ws,
+    runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -38,6 +38,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // app drives it through the tunnel to shut a remote host down.
         .route("/shutdown", post(api::shutdown))
         .route("/sessions/{id}/exec", post(api::exec_session))
+        // Streamed to disk with its own per-file/per-session caps (see
+        // `upload`); the DefaultBodyLimit override only lifts axum's 2MB
+        // buffered-body default out of the way of multi-MB screenshots.
+        .route(
+            "/sessions/{id}/upload",
+            post(upload::upload).layer(axum::extract::DefaultBodyLimit::max(
+                upload::MAX_UPLOAD_BYTES as usize + 64 * 1024,
+            )),
+        )
         .route("/sessions/{id}/journal", get(api::session_journal))
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))

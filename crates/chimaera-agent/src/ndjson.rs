@@ -132,7 +132,7 @@ impl JsonlChild {
 
         let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::default();
         let tail = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = CappedLines::new(stderr, MAX_STDERR_LINE_BYTES);
             while let Ok(Some(line)) = lines.next_line().await {
                 let mut tail = tail.lock().expect("stderr tail lock");
@@ -152,7 +152,11 @@ impl JsonlChild {
             stream: JsonlStream {
                 lines: CappedLines::new(stdout, MAX_STDOUT_LINE_BYTES),
             },
-            guard: ChildGuard { child, stderr_tail },
+            guard: ChildGuard {
+                child,
+                stderr_tail,
+                stderr_task,
+            },
         })
     }
 
@@ -237,24 +241,41 @@ impl JsonlStream {
     }
 }
 
+/// Bound on waiting for the stderr reader to drain after the child died —
+/// EOF is immediate once the last write end closes; the bound covers a
+/// grandchild that inherited the fd and outlives the agent.
+const STDERR_SETTLE: Duration = Duration::from_secs(1);
+
 /// Owns the child for lifecycle: bounded shutdown, kill, stderr diagnostics.
 pub struct ChildGuard {
     child: Child,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_task: tokio::task::JoinHandle<()>,
 }
 
 impl ChildGuard {
     /// Give the child a grace period after sinks were dropped, then kill. The
     /// harness's only reap path — an unbounded wait can't leak a lingering
     /// child (a normally-exiting one returns its status within the grace).
-    pub async fn shutdown(mut self, grace: Duration) -> Option<i32> {
-        match tokio::time::timeout(grace, self.child.wait()).await {
+    pub async fn shutdown(self, grace: Duration) -> Option<i32> {
+        self.shutdown_with_stderr(grace).await.0
+    }
+
+    /// Reap like [`Self::shutdown`] and return the SETTLED stderr tail with
+    /// the status: the reader task gets a bounded moment to drain the pipe
+    /// after the child died. A fast-crashing child otherwise loses the race
+    /// and its failure diagnostics read as an empty tail.
+    pub async fn shutdown_with_stderr(mut self, grace: Duration) -> (Option<i32>, String) {
+        let status = match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(Ok(status)) => status.code(),
             _ => {
                 self.child.start_kill().ok();
                 self.child.wait().await.ok().and_then(|s| s.code())
             }
-        }
+        };
+        let _ = tokio::time::timeout(STDERR_SETTLE, &mut self.stderr_task).await;
+        let tail = self.stderr_tail();
+        (status, tail)
     }
 
     pub fn stderr_tail(&self) -> String {

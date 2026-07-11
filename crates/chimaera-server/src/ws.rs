@@ -421,9 +421,16 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                         Ok(cmd) => {
                             if let Err(err) = state.chat.command(&id, cmd).await {
                                 tracing::debug!(%id, %err, "chat command failed");
+                                // code=command_failed: one refused command is
+                                // NOT a dead socket — without the code the
+                                // client treats this frame as fatal and stops
+                                // reconnecting forever (additive field; old
+                                // clients ignore unknown codes and keep their
+                                // previous behavior).
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "message": "agent unavailable"}),
+                                    &json!({"type": "error", "code": "command_failed",
+                                            "message": "agent unavailable"}),
                                 )
                                 .await;
                             }

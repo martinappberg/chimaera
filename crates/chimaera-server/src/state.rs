@@ -118,6 +118,13 @@ pub(crate) struct AppState {
     /// Theming-shim dir (`~/.chimaera/shims`), prepended to every session's
     /// PATH via spawn env only — user dotfiles are never touched.
     pub(crate) shims_dir: PathBuf,
+    /// Per-session upload landing pad (`~/.chimaera/uploads/<session-id>/`):
+    /// OS-desktop drops and pasted screenshots stream here so their PATHS can
+    /// be referenced in prompts/shells. Under the data dir (not runtime_dir):
+    /// uploads must live as long as their session, and runtime tmp gets
+    /// night-scrubbed on HPC. Size-capped per file and per session (`upload`),
+    /// pruned when the session ends and at boot.
+    pub(crate) uploads_root: PathBuf,
     /// Live install sessions, one per agent (POST /agents/{id}/install
     /// answers 409 while one runs): session id + reservation time. The id
     /// registers in `SessionManager` only after spawn, so a reservation
@@ -188,6 +195,7 @@ impl AppState {
             managed_root: data_dir.join("agents"),
             worktrees_root: data_dir.join("worktrees"),
             shims_dir: data_dir.join("shims"),
+            uploads_root: data_dir.join("uploads"),
             installs: Mutex::new(HashMap::new()),
             claude_settings_path: home.join(".claude").join("settings.json"),
             codex_config_path: home.join(".codex").join("config.toml"),

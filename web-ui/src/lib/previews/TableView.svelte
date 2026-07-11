@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fsTable, type TablePage } from "./files";
   import { getSetting } from "../settings/store.svelte";
+  import { copyText } from "../shared/clipboard";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -282,7 +283,7 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === "c" || e.key === "C")) {
       const text = selectionText();
       if (text !== "") {
-        void navigator.clipboard?.writeText(text);
+        void copyText(text);
         e.preventDefault();
       }
     } else if ((e.metaKey || e.ctrlKey) && (e.key === "a" || e.key === "A")) {

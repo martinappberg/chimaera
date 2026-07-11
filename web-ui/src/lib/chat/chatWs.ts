@@ -40,6 +40,9 @@ export interface ChatSocketHandlers {
   onExited(status: number | null): void;
   /** Fatal server-side error; the socket will not reconnect. */
   onError(message: string): void;
+  /** One command was refused (code=command_failed, e.g. the driver is gone):
+   *  the socket stays up and keeps reconnecting — surface it, don't die. */
+  onCommandFailed(message: string): void;
   /** The socket dropped and is reconnecting; the UI is no longer live. */
   onDisconnected(): void;
   /** Highest seq applied so far — sent with auth so reconnects replay only the gap. */
@@ -132,6 +135,14 @@ export class ChatSocket {
             this.unknownRetries < UNKNOWN_SESSION_RETRIES
           ) {
             this.unknownRetries += 1;
+            break;
+          }
+          // One refused command must not kill the pane: the socket is still
+          // healthy and the session may come back (respawn, toggle). Going
+          // fatal here permanently stopped reconnects after a single answer
+          // sent into a dead driver.
+          if (msg.code === "command_failed") {
+            this.handlers.onCommandFailed((msg.message as string) ?? "command failed");
             break;
           }
           this.fatal = true;

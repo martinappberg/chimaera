@@ -2,15 +2,10 @@
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
-  import { registerComposer } from "./composerBus";
+  import { registerComposer, registerComposerAttach } from "./composerBus";
+  import { imageToAttachment, type ImageAttachment } from "./images";
+  import { loadDraft, saveDraft } from "./drafts";
   import type { SlashCommand } from "./store.svelte";
-
-  export interface ImageAttachment {
-    media_type: string;
-    data: string;
-    /** Display label, e.g. "screenshot 412×280". */
-    label: string;
-  }
 
   export interface TerminalOption {
     id: string;
@@ -53,8 +48,25 @@
 
   const uid = $props.id();
 
-  let draft = $state("");
-  let images = $state<ImageAttachment[]>([]);
+  // The parent {#key}s ChatView (and so this composer) per session — one
+  // instance, one session — and remounts it on every tab switch, so the
+  // draft must live in the session-keyed module store, not the component.
+  // svelte-ignore state_referenced_locally
+  const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
+  let draft = $state(savedDraft.text);
+  let images = $state<ImageAttachment[]>(savedDraft.images);
+
+  // Write-through persistence: every draft/attachment change (typing, paste,
+  // popover picks, the post-send clear) lands in the session's draft slot.
+  // snapshot, not the proxy: it tracks in-place pushes (onPaste mutates) and
+  // stores plain data. Reads $state, writes the module map — no read+write
+  // loop, no timer.
+  $effect(() => {
+    const text = draft;
+    const imgs = $state.snapshot(images);
+    if (sessionId === null) return;
+    saveDraft(sessionId, text, imgs);
+  });
   let el = $state<HTMLTextAreaElement | null>(null);
   let selected = $state(0);
   let fileMatches = $state<QuickOpenEntry[]>([]);
@@ -84,6 +96,16 @@
     if (sessionId === null) return;
     return registerComposer(sessionId, (text) => {
       draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
+      el?.focus();
+    });
+  });
+
+  // Workbench attach flow (an image dropped from the OS desktop onto this
+  // chat pane): rides the same attachment state as clipboard paste.
+  $effect(() => {
+    if (sessionId === null) return;
+    return registerComposerAttach(sessionId, (image) => {
+      images.push(image);
       el?.focus();
     });
   });
@@ -268,11 +290,6 @@
     }
   }
 
-  /** Downscale cap matching the API's optimal image size. */
-  const IMAGE_MAX_DIM = 1568;
-  /** Post-encode payload cap; journal stores a placeholder anyway. */
-  const IMAGE_MAX_BASE64 = 2 * 1024 * 1024;
-
   async function onPaste(e: ClipboardEvent) {
     const items = [...(e.clipboardData?.items ?? [])].filter((i) =>
       i.type.startsWith("image/"),
@@ -282,24 +299,9 @@
     for (const item of items) {
       const file = item.getAsFile();
       if (file === null) continue;
-      try {
-        const bitmap = await createImageBitmap(file);
-        const scale = Math.min(1, IMAGE_MAX_DIM / Math.max(bitmap.width, bitmap.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.round(bitmap.width * scale);
-        canvas.height = Math.round(bitmap.height * scale);
-        canvas.getContext("2d")?.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        const url = canvas.toDataURL("image/png");
-        const data = url.slice(url.indexOf(",") + 1);
-        if (data.length > IMAGE_MAX_BASE64) continue;
-        images.push({
-          media_type: "image/png",
-          data,
-          label: `image ${canvas.width}×${canvas.height}`,
-        });
-      } catch {
-        // Unreadable clipboard image: nothing to attach.
-      }
+      // Unreadable/oversized clipboard images resolve null: nothing to attach.
+      const attachment = await imageToAttachment(file);
+      if (attachment !== null) images.push(attachment);
     }
   }
 </script>
@@ -381,24 +383,66 @@
     </div>
   {/if}
 
-  <textarea
-    bind:this={el}
-    bind:value={draft}
-    onkeydown={onKeydown}
-    onpaste={onPaste}
-    role="combobox"
-    aria-expanded={popover !== null}
-    aria-controls="{uid}-pop"
-    aria-autocomplete="list"
-    aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
-    placeholder={disabled
-      ? "chat ended"
-      : running
-        ? "type through — the agent hears you mid-run (Esc to stop)"
-        : "message the agent… (Enter to send · / commands · @ files)"}
-    rows={1}
-    {disabled}
-  ></textarea>
+  <div class="input-row">
+    <textarea
+      bind:this={el}
+      bind:value={draft}
+      onkeydown={onKeydown}
+      onpaste={onPaste}
+      role="combobox"
+      aria-expanded={popover !== null}
+      aria-controls="{uid}-pop"
+      aria-autocomplete="list"
+      aria-activedescendant={popover !== null ? `${uid}-opt-${selected}` : undefined}
+      placeholder={disabled
+        ? "chat ended"
+        : running
+          ? "type through — the agent hears you mid-run (Esc to stop)"
+          : "message the agent… (Enter to send · / commands · @ files)"}
+      rows={1}
+      {disabled}
+    ></textarea>
+    <!-- The action button morphs with the turn: send when idle, stop while the
+         agent works. Enter-to-send and Esc-to-stop keep working unchanged;
+         mousedown is swallowed so a click never steals the textarea's focus
+         (the popovers' pick-time caret logic is focus-fragile). Hidden when
+         the chat has ended, matching the disabled textarea. -->
+    {#if !disabled}
+      {#if running}
+        <button
+          class="action stop"
+          aria-label="interrupt the agent"
+          title="interrupt the agent (Esc)"
+          onmousedown={(e) => e.preventDefault()}
+          onclick={onInterrupt}
+        >
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <rect x="4" y="4" width="8" height="8" rx="1.5" fill="currentColor" />
+          </svg>
+        </button>
+      {:else}
+        <button
+          class="action send"
+          aria-label="send message"
+          title="send message (Enter)"
+          disabled={draft.trim().length === 0 && images.length === 0}
+          onmousedown={(e) => e.preventDefault()}
+          onclick={submit}
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <path
+              d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+      {/if}
+    {/if}
+  </div>
 </div>
 
 <style>
@@ -470,6 +514,12 @@
   .attachment-x:hover {
     color: var(--err);
   }
+  /* flex: kills the inline-block baseline gap under the textarea, so the
+     bottom-anchored action button measures from the real input edge. */
+  .input-row {
+    position: relative;
+    display: flex;
+  }
   textarea {
     width: 100%;
     resize: none;
@@ -480,7 +530,7 @@
     font: inherit;
     font-size: var(--text-md);
     line-height: 1.45;
-    padding: 7px 10px;
+    padding: 7px 38px 7px 10px; /* right clears the 26px action button */
     max-height: 130px; /* 6 lines at 13px/1.45 + 14px padding + 2px border */
     overflow-y: auto;
     outline: none;
@@ -491,5 +541,69 @@
   }
   textarea:disabled {
     opacity: 0.5;
+  }
+  /* Bottom-anchored so it stays put while the textarea autosizes upward. */
+  .action {
+    position: absolute;
+    right: 5px;
+    bottom: 5px;
+    width: 26px;
+    height: 26px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  /* The workbench's active-accent treatment (.chip.on / UpdateToast .primary):
+     tinted, not solid — there is no on-accent token, and the composer is quiet
+     chrome. */
+  .send {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    color: var(--accent);
+  }
+  .send:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
+  }
+  .send:disabled {
+    background: none;
+    border-color: color-mix(in srgb, var(--edge) 70%, transparent);
+    color: var(--muted);
+    opacity: 0.55;
+    cursor: default;
+  }
+  .stop {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+    color: var(--accent);
+    /* Faint breathing ring while the agent works — presence, not alarm. */
+    animation: stop-breathe 1.8s ease-in-out infinite;
+  }
+  .stop:hover {
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    border-color: var(--accent);
+  }
+  @keyframes stop-breathe {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    50% {
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 8%, transparent);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .stop {
+      animation: none;
+    }
   }
 </style>

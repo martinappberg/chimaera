@@ -467,6 +467,170 @@ async fn fs_validate_caps_candidates_and_rejects_relative_base() {
     assert!(body["error"].is_string(), "{body}");
 }
 
+/// One /fs/validate call with a workspace_id, returning the `valid` map.
+async fn validate_in_workspace(
+    state: &Arc<AppState>,
+    base: &std::path::Path,
+    workspace_id: &str,
+    candidates: &[&str],
+) -> serde_json::Value {
+    let (status, body) = request(
+        state,
+        Method::POST,
+        "/api/v1/fs/validate",
+        Some(serde_json::json!({
+            "candidates": candidates,
+            "base": base.to_string_lossy(),
+            "workspace_id": workspace_id,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["valid"].clone()
+}
+
+#[tokio::test]
+async fn fs_validate_bare_basename_falls_back_to_unique_workspace_file() {
+    let state = test_state();
+    let root = test_dir("validate-bare");
+    // The reported scenario: the agent says "FIGURE_PLAN.md", the file lives
+    // at paper/FIGURE_PLAN.md — direct-child resolution can never confirm it.
+    std::fs::create_dir_all(root.join("paper")).unwrap();
+    std::fs::write(root.join("paper/FIGURE_PLAN.md"), "x").unwrap();
+    // Ambiguous basename: two dup.md files — must refuse.
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::fs::write(root.join("a/dup.md"), "x").unwrap();
+    std::fs::write(root.join("b/dup.md"), "x").unwrap();
+    // Direct child shadows the fallback: top.md exists both at the base and
+    // in a subdirectory — the direct hit must win (old behavior unchanged).
+    std::fs::write(root.join("top.md"), "x").unwrap();
+    std::fs::write(root.join("a/top.md"), "x").unwrap();
+    // Never fallback-eligible: extension-less, dotfile, and a directory
+    // whose name is extension-shaped (the fallback matches FILES only).
+    std::fs::write(root.join("a/justfile"), "x").unwrap();
+    std::fs::write(root.join("a/.env"), "x").unwrap();
+    std::fs::create_dir_all(root.join("a/notes.md")).unwrap();
+    // Ignored dirs stay invisible to the fallback (quickopen's rules).
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    std::fs::write(root.join("node_modules/hidden.md"), "x").unwrap();
+    // Deeper than the index depth guard: never indexed, so never linked.
+    let mut deep = root.clone();
+    for i in 0..=quickopen::MAX_INDEX_DEPTH {
+        deep = deep.join(format!("d{i}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("buried.md"), "x").unwrap();
+
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ws}");
+    let ws_id = ws["id"].as_str().unwrap();
+    let canon = std::fs::canonicalize(&root).unwrap();
+
+    let valid = validate_in_workspace(
+        &state,
+        &root,
+        ws_id,
+        &[
+            "FIGURE_PLAN.md", // unique in a subdir -> resolves
+            "dup.md",         // ambiguous -> refused
+            "top.md",         // direct child -> wins over the subdir copy
+            "missing.md",     // nonexistent anywhere -> absent
+            "justfile",       // no extension -> not eligible
+            ".env",           // dotfile -> not eligible
+            "notes.md",       // only a DIRECTORY has this name -> absent
+            "hidden.md",      // only inside an ignored dir -> absent
+            "buried.md",      // past the depth guard -> absent
+        ],
+    )
+    .await;
+    let valid = valid.as_object().unwrap();
+    assert_eq!(
+        valid["FIGURE_PLAN.md"]["path"],
+        serde_json::json!(canon.join("paper/FIGURE_PLAN.md").to_string_lossy()),
+        "{valid:?}"
+    );
+    assert_eq!(valid["FIGURE_PLAN.md"]["kind"], "file");
+    assert_eq!(
+        valid["top.md"]["path"],
+        serde_json::json!(canon.join("top.md").to_string_lossy())
+    );
+    assert_eq!(valid.len(), 2, "only the two hits answer: {valid:?}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn fs_validate_bare_basename_without_workspace_keeps_old_behavior() {
+    let state = test_state();
+    let root = test_dir("validate-bare-nows");
+    std::fs::create_dir_all(root.join("paper")).unwrap();
+    std::fs::write(root.join("paper/FIGURE_PLAN.md"), "x").unwrap();
+
+    // No workspace_id: the fallback never fires (an older client's request).
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/fs/validate",
+        Some(serde_json::json!({
+            "candidates": ["FIGURE_PLAN.md"],
+            "base": root.to_string_lossy(),
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["valid"].as_object().unwrap().is_empty(), "{body}");
+
+    // An unknown workspace_id degrades silently to the same miss — no error.
+    let valid = validate_in_workspace(&state, &root, "w-nope", &["FIGURE_PLAN.md"]).await;
+    assert!(valid.as_object().unwrap().is_empty(), "{valid}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn quickopen_walk_guards_cap_entries_depth_and_time() {
+    let root = test_dir("walk-guards");
+    std::fs::create_dir_all(root.join("l1/l2/l3")).unwrap();
+    for i in 0..10 {
+        std::fs::write(root.join(format!("f{i}.txt")), "x").unwrap();
+    }
+    std::fs::write(root.join("l1/one.txt"), "x").unwrap();
+    std::fs::write(root.join("l1/l2/two.txt"), "x").unwrap();
+    let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+
+    // Entry cap: the walk stops at max_files entries (partial, not an error).
+    let files = quickopen::walk_bounded(&root, None, 3, quickopen::MAX_INDEX_DEPTH, far);
+    assert_eq!(files.len(), 3);
+
+    // Depth cap: max_depth levels of directories are read, nothing deeper.
+    // With max_depth=2 the root and l1 are read (one.txt indexed), l2 is
+    // recorded as an entry but never descended (two.txt absent).
+    let files = quickopen::walk_bounded(&root, None, 100_000, 2, far);
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"one.txt"), "{names:?}");
+    assert!(names.contains(&"l2"), "{names:?}");
+    assert!(!names.contains(&"two.txt"), "{names:?}");
+
+    // Time cap: an already-expired deadline yields an empty (partial) index.
+    let files = quickopen::walk_bounded(
+        &root,
+        None,
+        100_000,
+        quickopen::MAX_INDEX_DEPTH,
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    );
+    assert!(files.is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[tokio::test]
 async fn fs_list_dirs_first_sorted_with_metadata() {
     let state = test_state();
