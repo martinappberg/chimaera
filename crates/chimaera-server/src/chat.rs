@@ -350,7 +350,13 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
         }
         DriverExit::Clean(_) | DriverExit::Killed => {
             state.chat.remove(id);
-            crate::recents::retire(state, id, None, None);
+            crate::recents::retire(
+                state,
+                id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+            );
         }
     }
 }
@@ -381,7 +387,13 @@ async fn degrade_to_pty(
             }
             Err(err) => {
                 tracing::error!(%id, %err, "degrade respawn failed: agent binary missing");
-                crate::recents::retire(state, id, None, None);
+                crate::recents::retire(
+                    state,
+                    id,
+                    None,
+                    None,
+                    chimaera_agent::model::SessionUi::Chat,
+                );
                 return false;
             }
         }
@@ -428,7 +440,13 @@ async fn degrade_to_pty(
         }
         Err(err) => {
             tracing::error!(%id, %err, "degrade respawn failed");
-            crate::recents::retire(state, id, None, None);
+            crate::recents::retire(
+                state,
+                id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+            );
             false
         }
     }

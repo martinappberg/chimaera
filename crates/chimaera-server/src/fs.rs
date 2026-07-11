@@ -284,6 +284,21 @@ struct FsEntry {
     size: u64,
     /// Modification time as seconds since the unix epoch (0 if unavailable).
     mtime: u64,
+    /// This entry is a symlink. Additive + skip-when-false: absent on old
+    /// daemons, where the client reads it as a regular entry. `kind` still
+    /// reflects the RESOLVED target (a symlink-to-dir is `"dir"`), so
+    /// navigation is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    symlink: bool,
+    /// The raw link text (`readlink`), for the "→ target" hover. Present only
+    /// on symlinks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    /// A symlink whose target does not resolve (dangling). Emitted as
+    /// `kind: "file"` so the wire union stays "dir"|"file"; the client shows
+    /// it distinctly and refuses to open it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    broken: bool,
 }
 
 /// GET /api/v1/fs/list?path=<path>&hidden=<bool> — full directory listing
@@ -314,9 +329,39 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
             continue;
         }
         let entry_path = entry.path();
-        // metadata() follows symlinks; broken symlinks and unreadable entries
-        // are skipped.
+        // d_type from readdir (no extra syscall on the common filesystems);
+        // symlink-ness is the link itself, unlike the following metadata().
+        let is_link = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
+        let target = is_link.then(|| {
+            std::fs::read_link(&entry_path)
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        // metadata() follows symlinks. A dangling symlink stats as an error:
+        // rather than dropping it (invisible, unremovable from the UI), emit
+        // it as a broken file entry — delete/rename act on the link itself.
         let Ok(meta) = std::fs::metadata(&entry_path) else {
+            if is_link {
+                let mtime = std::fs::symlink_metadata(&entry_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                entries.push(FsEntry {
+                    name,
+                    path: entry_path.to_string_lossy().into_owned(),
+                    kind: "file",
+                    size: 0,
+                    mtime,
+                    symlink: true,
+                    target,
+                    broken: true,
+                });
+                if entries.len() >= MAX_DIR_ENTRIES {
+                    truncated = true;
+                    break;
+                }
+            }
             continue;
         };
         let mtime = meta
@@ -330,6 +375,9 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
             kind: if meta.is_dir() { "dir" } else { "file" },
             size: meta.len(),
             mtime,
+            symlink: is_link,
+            target,
+            broken: false,
         });
         if entries.len() >= MAX_DIR_ENTRIES {
             truncated = true;
@@ -1217,6 +1265,234 @@ pub(crate) async fn delete(
         Ok(MutateOutcome::Done(serde_json::Value::Null))
     };
     run_mutation(&state, work, &[&raw]).await
+}
+
+/// Hard ceiling on entries a single copy/move walk may touch — the same
+/// runaway backstop the zip builder uses, so a pathological tree aborts
+/// loudly instead of pinning a blocking thread indefinitely.
+const MAX_COPY_ENTRIES: usize = 250_000;
+
+/// How a copy resolves a target that already exists.
+#[derive(Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum OnConflict {
+    /// 409 (the default) — the UI decides what to do.
+    #[default]
+    Fail,
+    /// Auto-pick a free "name copy"/"name copy 2" sibling (macOS semantics).
+    Unique,
+}
+
+/// A collision-free variant of `to`: `to` itself when free, else
+/// `stem copy.ext`, `stem copy 2.ext`, … in `to`'s parent. Probed on disk.
+fn unique_dest(to: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(to).is_err() {
+        return to.to_path_buf();
+    }
+    let parent = to.parent().unwrap_or(Path::new("."));
+    let stem = to
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Keep a compound extension whole (foo.tar.gz -> foo copy.tar.gz) by
+    // splitting on the FIRST dot after the stem, not file_stem/extension.
+    let full = to.file_name().map(|n| n.to_string_lossy().into_owned());
+    let ext = full
+        .as_deref()
+        .and_then(|n| n.strip_prefix(&stem))
+        .filter(|s| s.starts_with('.'))
+        .map(str::to_string)
+        .unwrap_or_default();
+    for n in 1..10_000 {
+        let name = if n == 1 {
+            format!("{stem} copy{ext}")
+        } else {
+            format!("{stem} copy {n}{ext}")
+        };
+        let candidate = parent.join(name);
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    to.to_path_buf() // give up after 10k — the copy then fails loudly
+}
+
+/// Recursively copy `src` to `dst` (which must not yet exist). Symlinks are
+/// recreated as links, never followed (matching the download zip walk); files
+/// stream through `std::io::copy` (bounded internal buffer — never `read` the
+/// whole file into RAM); `entries` counts against [`MAX_COPY_ENTRIES`].
+fn copy_recursive(src: &Path, dst: &Path, entries: &mut usize) -> anyhow::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((from, to)) = stack.pop() {
+        *entries += 1;
+        if *entries > MAX_COPY_ENTRIES {
+            anyhow::bail!("more than {MAX_COPY_ENTRIES} entries — refusing to copy");
+        }
+        let meta = std::fs::symlink_metadata(&from)
+            .with_context(|| format!("{}: cannot read", from.display()))?;
+        if meta.file_type().is_symlink() {
+            let link = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(&link, &to)
+                .with_context(|| format!("{}: failed to recreate symlink", to.display()))?;
+        } else if meta.is_dir() {
+            std::fs::create_dir(&to)
+                .with_context(|| format!("{}: failed to create directory", to.display()))?;
+            for entry in std::fs::read_dir(&from)
+                .with_context(|| format!("{}: failed to read directory", from.display()))?
+            {
+                let entry = entry?;
+                stack.push((entry.path(), to.join(entry.file_name())));
+            }
+        } else {
+            let mut reader = std::fs::File::open(&from)
+                .with_context(|| format!("{}: failed to open", from.display()))?;
+            let mut writer = std::fs::File::create(&to)
+                .with_context(|| format!("{}: failed to create", to.display()))?;
+            std::io::copy(&mut reader, &mut writer)
+                .with_context(|| format!("{} → {}: copy failed", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// `child` is `ancestor` itself or lies beneath it (both already canonical) —
+/// the guard against copying/moving a directory into its own subtree.
+fn is_within(child: &Path, ancestor: &Path) -> bool {
+    child == ancestor || child.starts_with(ancestor)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CopyRequest {
+    from: String,
+    to: String,
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// POST /api/v1/fs/copy {from, to, on_conflict?} — copy a file, symlink (as a
+/// link), or directory (recursively) to `to`. `on_conflict:"unique"` picks a
+/// free "name copy" sibling instead of 409-ing. Refuses copying a directory
+/// into itself or a descendant. Returns the canonical new path.
+pub(crate) async fn copy(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CopyRequest>,
+) -> Response {
+    let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
+    let work = move || -> anyhow::Result<MutateOutcome> {
+        let from = canonical_parent_join(&body.from)?;
+        if std::fs::symlink_metadata(&from).is_err() {
+            anyhow::bail!("{}: No such file or directory", from.display());
+        }
+        let mut to = canonical_parent_join(&body.to)?;
+        // Guard against copying a directory into its own subtree (the canonical
+        // source vs the canonical destination PARENT — `to` itself doesn't
+        // exist yet).
+        if let (Ok(src_c), Some(parent)) = (std::fs::canonicalize(&from), to.parent()) {
+            if let Ok(dst_parent_c) = std::fs::canonicalize(parent) {
+                if is_within(&dst_parent_c, &src_c) {
+                    anyhow::bail!("cannot copy a directory into itself");
+                }
+            }
+        }
+        if std::fs::symlink_metadata(&to).is_ok() {
+            match body.on_conflict {
+                OnConflict::Unique => to = unique_dest(&to),
+                OnConflict::Fail => {
+                    return Ok(MutateOutcome::Conflict(format!(
+                        "{} already exists",
+                        to.display()
+                    )));
+                }
+            }
+        }
+        let mut entries = 0usize;
+        if let Err(err) = copy_recursive(&from, &to, &mut entries) {
+            // Leave no half-copy behind on failure.
+            let _ = std::fs::remove_dir_all(&to).or_else(|_| std::fs::remove_file(&to));
+            return Err(err);
+        }
+        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+    };
+    run_mutation(&state, work, &[&raw_from, &raw_to]).await
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MoveRequest {
+    from: String,
+    to: String,
+}
+
+/// POST /api/v1/fs/move {from, to} — move a file/symlink/directory. Tries a
+/// plain rename; on a cross-filesystem boundary falls back to a guarded
+/// recursive copy then deletes the source (only after the copy fully
+/// succeeds). Refuses moving the home directory or a directory into itself.
+/// 409 if `to` already exists. Returns the canonical new path.
+pub(crate) async fn move_(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<MoveRequest>,
+) -> Response {
+    let (raw_from, raw_to) = (body.from.clone(), body.to.clone());
+    let work = move || -> anyhow::Result<MutateOutcome> {
+        let from = canonical_parent_join(&body.from)?;
+        if std::fs::symlink_metadata(&from).is_err() {
+            anyhow::bail!("{}: No such file or directory", from.display());
+        }
+        let home = home_dir()
+            .and_then(|h| std::fs::canonicalize(&h).with_context(|| h.display().to_string()));
+        if home.is_ok_and(|h| std::fs::canonicalize(&from).is_ok_and(|f| f == h)) {
+            anyhow::bail!("refusing to move your home directory");
+        }
+        let to = canonical_parent_join(&body.to)?;
+        if let (Ok(src_c), Some(parent)) = (std::fs::canonicalize(&from), to.parent()) {
+            if let Ok(dst_parent_c) = std::fs::canonicalize(parent) {
+                if is_within(&dst_parent_c, &src_c) {
+                    anyhow::bail!("cannot move a directory into itself");
+                }
+            }
+        }
+        if std::fs::symlink_metadata(&to).is_ok() {
+            let same = std::fs::canonicalize(&to)
+                .is_ok_and(|resolved| std::fs::canonicalize(&from).is_ok_and(|f| f == resolved));
+            if !same {
+                return Ok(MutateOutcome::Conflict(format!(
+                    "{} already exists",
+                    to.display()
+                )));
+            }
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                // Copy across the boundary, then unlink the source — but only
+                // once the copy has fully succeeded (never lose data on a
+                // partial copy).
+                let mut entries = 0usize;
+                if let Err(err) = copy_recursive(&from, &to, &mut entries) {
+                    let _ = std::fs::remove_dir_all(&to).or_else(|_| std::fs::remove_file(&to));
+                    return Err(err);
+                }
+                let src_meta = std::fs::symlink_metadata(&from)?;
+                if src_meta.is_dir() {
+                    std::fs::remove_dir_all(&from).with_context(|| {
+                        format!("{}: copied but failed to remove", from.display())
+                    })?;
+                } else {
+                    std::fs::remove_file(&from).with_context(|| {
+                        format!("{}: copied but failed to remove", from.display())
+                    })?;
+                }
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to move {} to {}",
+                    from.display(),
+                    to.display()
+                )));
+            }
+        }
+        Ok(MutateOutcome::Done(json!({ "path": to.to_string_lossy() })))
+    };
+    run_mutation(&state, work, &[&raw_from, &raw_to]).await
 }
 
 /// In-memory store of short-lived raw-access tickets. A ticket is bound to

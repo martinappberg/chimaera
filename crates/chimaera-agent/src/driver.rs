@@ -356,22 +356,19 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     }
     // Version drift is warn-not-block: the wire is only VERIFIED against the
     // pinned TESTED_*_VERSION, but most updates stay compatible — refusing to
-    // spawn would break every routine update. The journaled notice is the
+    // spawn would break every routine update. A daemon log line (never a chat
+    // notice — unparsed frames already degrade visibly on their own) is the
     // ready-made diagnosis when a drifted binary later misbehaves. Substring
     // match because the probe line is the CLI's own phrasing
     // ("2.1.204 (Claude Code)", "codex-cli 0.142.5").
     if let Some(detected) = spec.agent_version.as_deref() {
         if !detected.contains(driver.tested_version()) {
-            let text = format!(
-                "{kind} {detected} detected; chat mode was verified against {kind} {tested} — \
-                 if this session misbehaves, that's likely why",
-                kind = driver.kind(),
+            tracing::warn!(
+                agent = driver.kind(),
+                detected,
                 tested = driver.tested_version(),
+                "agent CLI version drifts from the pin chat mode was verified against"
             );
-            if io.events.send(AgentEvent::Notice { text }).await.is_err() {
-                guard.shutdown(Duration::ZERO).await;
-                return DriverExit::Killed;
-            }
         }
     }
     // Post-handshake seeding/replay. A write failing THIS early means the

@@ -22,6 +22,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use chimaera_agent::model::SessionUi;
+
 use crate::agents::AgentKind;
 use crate::AppState;
 
@@ -44,6 +46,11 @@ pub(crate) struct RecentEntry {
     pub(crate) supersedes: Vec<String>,
     /// When the session ended, unix seconds.
     pub(crate) last_active: u64,
+    /// The surface the session last ran on (chat vs the real TUI), so
+    /// reopening the row lands in the same mode. `None` for pre-`ui` store
+    /// entries and transcript-scan rows (no known surface); the UI then falls
+    /// back to the launcher's sticky default.
+    pub(crate) ui: Option<SessionUi>,
 }
 
 /// Ancestor-chain bound: transcripts on disk outlive everything, so a
@@ -59,6 +66,7 @@ impl RecentEntry {
             "title": self.title,
             "resume": self.resume,
             "last_active": self.last_active,
+            "ui": self.ui,
         })
     }
 
@@ -69,6 +77,7 @@ impl RecentEntry {
             "resume": self.resume,
             "supersedes": self.supersedes,
             "last_active": self.last_active,
+            "ui": self.ui,
         })
     }
 
@@ -90,6 +99,15 @@ impl RecentEntry {
                 })
                 .unwrap_or_default(),
             last_active: value.get("last_active")?.as_u64()?,
+            // Tolerant: missing/invalid → None, so pre-`ui` entries load.
+            ui: value
+                .get("ui")
+                .and_then(|u| u.as_str())
+                .and_then(|s| match s {
+                    "chat" => Some(SessionUi::Chat),
+                    "term" => Some(SessionUi::Term),
+                    _ => None,
+                }),
         })
     }
 }
@@ -198,12 +216,15 @@ impl RecentsStore {
 /// when the conversation is recognizable, remember it in the workspace's
 /// recents. Called from the agent watch loop — the one place agent records
 /// die. `pinned` is the user-renamed session name, `osc` the last OSC title
-/// seen while the session was alive. Broadcasts a change when anything moved.
+/// seen while the session was alive, `ui` the surface it last ran on (so the
+/// recents row reopens in the same mode). Broadcasts a change when anything
+/// moved.
 pub(crate) fn retire(
     state: &Arc<AppState>,
     session_id: &str,
     pinned: Option<&str>,
     osc: Option<&str>,
+    ui: SessionUi,
 ) {
     let Some(record) = crate::lock(&state.agents).remove(session_id) else {
         return;
@@ -261,6 +282,7 @@ pub(crate) fn retire(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            ui: Some(ui),
         };
         crate::lock(&state.recents).push(&workspace_id, entry, record.resumed_from.as_deref());
         // The epoch rides /ws/events so the rail refetches exactly when a
@@ -352,6 +374,8 @@ pub(crate) async fn list_recents(
             "title": row.get("title").cloned().unwrap_or_default(),
             "resume": id,
             "last_active": row.get("mtime").cloned().unwrap_or(json!(0)),
+            // Conversations from outside chimaera have no known surface.
+            "ui": serde_json::Value::Null,
         }));
     }
     merged.sort_by_key(|e| {

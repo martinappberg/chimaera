@@ -131,7 +131,13 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // vanishing. Idempotent: a session already retired by an in-band
     // `close-all`/`shutdown` has no AgentRecord left, and `retire` no-ops.
     for info in state.chat.list() {
-        recents::retire(&state, &info.id, None, None);
+        recents::retire(
+            &state,
+            &info.id,
+            None,
+            None,
+            chimaera_agent::model::SessionUi::Chat,
+        );
     }
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
