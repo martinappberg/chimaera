@@ -2369,6 +2369,42 @@ mod tests {
     }
 
     #[test]
+    fn stop_task_resolves_transcript_row_ids_to_native_task_keys() {
+        let mut m = mapper();
+        // A subagent with no matching Task card synthesizes a "task:{id}" row.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-9",
+            "description": "summarize the docs",
+        }));
+        // The client stops by the ROW id it sees; the wire carries the key.
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "task:tk-9".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["subtype"], "stop_task");
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-9");
+
+        // A subagent that landed on its Task tool card: the row id is the
+        // tool_use_id, reverse-mapped through task_rows.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{
+                "type": "tool_use", "id": "tu-7", "name": "Task",
+                "input": { "description": "audit the tests", "prompt": "…" },
+            }]},
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-10",
+            "description": "audit the tests",
+        }));
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "tu-7".into(),
+        });
+        assert_eq!(step.outbound[0]["request"]["task_id"], "tk-10");
+    }
+
+    #[test]
     fn refusal_fallback_switches_model_and_retracts() {
         let mut m = mapper();
         let step = m.on_frame(&json!({
