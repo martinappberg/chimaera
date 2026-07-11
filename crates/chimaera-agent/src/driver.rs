@@ -107,6 +107,15 @@ pub trait Mapper: Send {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep;
     /// Emit any buffered coalesced text (the harness's timer tick + teardown).
     fn flush(&mut self) -> Option<AgentEvent>;
+    /// Resolution events for asks whose reply route dies with this mapper.
+    /// The pending question/permission maps are the ONLY route back to the
+    /// child, so when the driver ends they must resolve into the journal —
+    /// otherwise every future replay re-delivers an ask that can never be
+    /// answered (the "stuck permission card" bug). The harness calls this
+    /// once, right before `Exited`.
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        Vec::new()
+    }
 }
 
 /// A mapper's output for one input: outbound frames to write to the child,
@@ -397,6 +406,17 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     let age_at_exit = born.elapsed();
     if let Some(ev) = mapper.flush() {
         let _ = io.events.send(ev).await;
+    }
+    // A dying driver takes its reply routes with it: journal a definitive
+    // resolution for every pending ask so no attached client — nor any future
+    // replay of this journal — is left holding a card that cannot be answered.
+    // A respawn's handshake re-delivers still-parked prompts as fresh
+    // requests (claude pending_permission_requests), so nothing answerable is
+    // lost by resolving here.
+    for ev in mapper.drain_pending() {
+        if io.events.send(ev).await.is_err() {
+            break;
+        }
     }
     // Close stdin (the polite shutdown both protocols honor) so a child blocked
     // on read wakes, then reap with a bounded wait. A normally-exiting child

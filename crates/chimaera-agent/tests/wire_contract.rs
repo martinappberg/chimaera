@@ -162,3 +162,40 @@ fn turn_aborted_interrupted_flag_is_additive() {
         }
     );
 }
+
+#[test]
+fn question_resolved_answers_are_additive_on_the_wire() {
+    // Old journals (and old daemons) carry no `answers` — they must keep
+    // deserializing, and an empty map must keep serializing without the key.
+    let old: AgentEvent =
+        serde_json::from_value(json!({ "type": "question_resolved", "request_id": "r1" })).unwrap();
+    match &old {
+        AgentEvent::QuestionResolved {
+            request_id,
+            answers,
+        } => {
+            assert_eq!(request_id, "r1");
+            assert!(answers.is_empty());
+        }
+        other => panic!("expected QuestionResolved, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&old).unwrap(),
+        json!({ "type": "question_resolved", "request_id": "r1" })
+    );
+
+    let mut answers = std::collections::HashMap::new();
+    answers.insert("q1".to_string(), vec!["SQLite".to_string()]);
+    assert_eq!(
+        serde_json::to_value(AgentEvent::QuestionResolved {
+            request_id: "r1".into(),
+            answers,
+        })
+        .unwrap(),
+        json!({
+            "type": "question_resolved",
+            "request_id": "r1",
+            "answers": { "q1": ["SQLite"] }
+        })
+    );
+}

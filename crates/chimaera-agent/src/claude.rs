@@ -445,6 +445,9 @@ struct ClaudeMapper {
     /// completed result string; "dismiss" cancels).
     pending_dialogs: HashMap<String, ()>,
     pending_controls: HashMap<String, PendingControl>,
+    /// CLI→client control subtypes we don't handle and have already said so
+    /// about — the notice fires once per subtype, not per frame.
+    noticed_controls: HashSet<String>,
     /// Subagent task_id → transcript row id. task_id is NOT the Task tool's
     /// tool_use_id (mined: the extension treats it as an opaque key), so
     /// correlation is by description; unmatched tasks get their own row.
@@ -540,6 +543,7 @@ impl ClaudeMapper {
             pending_questions: HashMap::new(),
             pending_dialogs: HashMap::new(),
             pending_controls: HashMap::new(),
+            noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
             queued_sends: VecDeque::new(),
@@ -620,8 +624,10 @@ impl ClaudeMapper {
             Some("control_cancel_request") => {
                 let id = frame["request_id"].as_str().unwrap_or_default().to_string();
                 if self.pending_questions.remove(&id).is_some() {
-                    step.events
-                        .push(AgentEvent::QuestionResolved { request_id: id });
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id: id,
+                        answers: Default::default(),
+                    });
                 } else if self.pending_permissions.remove(&id).is_some()
                     || self.pending_dialogs.remove(&id).is_some()
                 {
@@ -991,6 +997,16 @@ impl ClaudeMapper {
             return;
         }
 
+        // Questions are a first-class card (QuestionRequest via the
+        // can_use_tool path), not a tool row: a bare "AskUserQuestion" card
+        // with a stuck spinner next to the real question card is noise. Its
+        // tool_result still resolves via tool_kinds like TodoWrite's does
+        // (the client ignores updates for rows it never rendered).
+        if name == "AskUserQuestion" {
+            self.tool_kinds.insert(id, ToolKind::Other);
+            return;
+        }
+
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
         if name == "Task" {
@@ -1057,6 +1073,22 @@ impl ClaudeMapper {
             return;
         }
         if request["subtype"] != "can_use_tool" {
+            // Deliberately NOT answered: the CLI parks an unanswered control
+            // request until its own deadline (or another attached client)
+            // settles it, and an error reply here could break flows that work
+            // via that fallback (mined subtypes: hook_callback, mcp_message,
+            // elicitation, oauth refreshes). But never park SILENTLY — the
+            // agent's later "I was blocked" prose must not be the only trace
+            // the ask existed. One notice per subtype, not per frame.
+            let subtype = request["subtype"].as_str().unwrap_or("unknown");
+            if self.noticed_controls.insert(subtype.to_string()) {
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "claude sent a request chimaera doesn't handle yet ({subtype}) — \
+                         the agent may wait on it until it times out"
+                    ),
+                });
+            }
             return;
         }
         // AskUserQuestion rides the permission path but is a QUESTION, not a
@@ -1196,13 +1228,22 @@ impl ClaudeMapper {
                 )
             }
             other => {
-                // Unknown kind: answer cancelled immediately — declared
-                // kinds must never park.
-                tracing::debug!(kind = ?other, "unsupported user dialog kind cancelled");
+                // Unknown kind: answer cancelled immediately — declared kinds
+                // must never park — but say so visibly. A silent cancel left
+                // the agent narrating "I'm blocked" with no trace of WHAT
+                // asked (the "harness is blocking" mystery).
+                let kind = other.unwrap_or("unknown");
+                tracing::debug!(kind, "unsupported user dialog kind cancelled");
                 step.outbound.push(permission_response_frame(
                     &json!(request_id),
                     json!({ "behavior": "cancelled" }),
                 ));
+                step.events.push(AgentEvent::Notice {
+                    text: format!(
+                        "claude asked something chimaera doesn't support yet ({kind}) — \
+                         dismissed automatically"
+                    ),
+                });
                 return;
             }
         };
@@ -1580,6 +1621,21 @@ impl ClaudeMapper {
                 }
                 let Some((input, mut suggestions)) = self.pending_permissions.remove(&request_id)
                 else {
+                    // The ask predates this driver process (respawn, toggle,
+                    // resume): its reply route died with that process. The
+                    // definitive, JOURNALED resolution below is what un-wedges
+                    // every attached client and every future replay —
+                    // silently dropping the click was the "UI stuck on a
+                    // permission card" bug.
+                    step.events.push(AgentEvent::PermissionResolved {
+                        request_id,
+                        option_id: "expired".into(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that permission prompt is no longer active \
+                               (the agent restarted since it asked)"
+                            .into(),
+                    });
                     return step;
                 };
                 // The destination cycler: the user's chosen save target
@@ -1703,6 +1759,17 @@ impl ClaudeMapper {
                 answers,
             } => {
                 let Some(input) = self.pending_questions.remove(&request_id) else {
+                    // Same stale-ask contract as Permission above: resolve +
+                    // notice instead of silently eating the user's answer.
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that question is no longer active (the agent \
+                               restarted since it asked) — ask again if needed"
+                            .into(),
+                    });
                     return step;
                 };
                 // Mined contract: allow with updatedInput {questions (echoed),
@@ -1721,8 +1788,12 @@ impl ClaudeMapper {
                         },
                     }),
                 ));
-                step.events
-                    .push(AgentEvent::QuestionResolved { request_id });
+                // The chosen labels ride the resolution so the transcript
+                // (and every replay) shows question + answer, not a vanish.
+                step.events.push(AgentEvent::QuestionResolved {
+                    request_id,
+                    answers,
+                });
             }
             AgentCommand::GetUsage => {
                 let id = self.ctl_id();
@@ -1807,6 +1878,29 @@ impl ClaudeMapper {
         self.next_ctl += 1;
         format!("ctl_{}", self.next_ctl)
     }
+
+    /// Teardown resolutions: every pending ask's reply route is this
+    /// process's stdin, so the journal must not outlive it with the ask
+    /// dangling (a replay would strand the card forever — see the harness's
+    /// drain call in `run_driver`).
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
+            events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+        }
+        let permissions = std::mem::take(&mut self.pending_permissions).into_keys();
+        let dialogs = std::mem::take(&mut self.pending_dialogs).into_keys();
+        for request_id in permissions.chain(dialogs) {
+            events.push(AgentEvent::PermissionResolved {
+                request_id,
+                option_id: "expired".into(),
+            });
+        }
+        events
+    }
 }
 
 /// Harness adapter: the inherent methods above ARE the state machine; these
@@ -1824,6 +1918,9 @@ impl Mapper for ClaudeMapper {
     }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
+    }
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        self.drain_pending()
     }
 }
 
@@ -2527,10 +2624,141 @@ mod tests {
             "SQLite"
         );
         assert!(response["updatedInput"]["questions"].is_array());
+        match &step.events[0] {
+            AgentEvent::QuestionResolved {
+                request_id,
+                answers,
+            } => {
+                assert_eq!(request_id, "req-q");
+                assert_eq!(
+                    answers.get("Which database?"),
+                    Some(&vec!["SQLite".to_string()]),
+                    "the chosen labels ride the resolution for history/replay"
+                );
+            }
+            other => panic!("expected QuestionResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_user_question_tool_use_emits_no_tool_row() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": "tu-q", "name": "AskUserQuestion",
+                  "input": { "questions": [{ "question": "Q?" }] } },
+            ]},
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
+            "the question card is the surface, not a bare tool row: {:?}",
+            step.events
+        );
+    }
+
+    #[test]
+    fn stale_answer_and_permission_resolve_definitively() {
+        // A reply whose request_id no pending map knows (the ask predates
+        // this driver process) must produce a journaled resolution + notice,
+        // never a silent drop — the reconnect-stranding bug.
+        let mut m = mapper();
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("q".to_string(), vec!["a".to_string()]);
+        let step = m.on_command(AgentCommand::Answer {
+            request_id: "gone-q".into(),
+            answers,
+        });
+        assert!(step.outbound.is_empty(), "no live request to answer");
         assert!(matches!(
             &step.events[0],
-            AgentEvent::QuestionResolved { request_id } if request_id == "req-q"
+            AgentEvent::QuestionResolved { request_id, answers } if request_id == "gone-q" && answers.is_empty()
         ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "gone-p".into(),
+            option_id: "allow_once".into(),
+            destination: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "gone-p" && option_id == "expired"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+    }
+
+    #[test]
+    fn drain_pending_resolves_every_outstanding_ask() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-q",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "input": { "questions": [{ "question": "Q?", "options": [{ "label": "A" }] }] },
+            },
+        }));
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-p",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "make" },
+            },
+        }));
+        let events = Mapper::drain_pending(&mut m);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::QuestionResolved { request_id, answers } if request_id == "req-q" && answers.is_empty()
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "req-p" && option_id == "expired"
+        )));
+        assert!(
+            Mapper::drain_pending(&mut m).is_empty(),
+            "drain is exhaustive"
+        );
+    }
+
+    #[test]
+    fn unknown_control_subtype_notices_once() {
+        let mut m = mapper();
+        let frame = json!({
+            "type": "control_request",
+            "request_id": "req-m",
+            "request": { "subtype": "mcp_message" },
+        });
+        let step = m.on_frame(&frame);
+        assert!(
+            step.outbound.is_empty(),
+            "unknown subtypes park (the CLI's own deadline settles them)"
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("mcp_message")
+        ));
+        let step = m.on_frame(&frame);
+        assert!(
+            step.events.is_empty(),
+            "one notice per subtype, not per frame"
+        );
     }
 
     #[test]
@@ -2561,17 +2789,22 @@ mod tests {
         assert_eq!(response["behavior"], "completed");
         assert_eq!(response["result"], "retry_fallback");
 
-        // Unknown kinds must answer cancelled immediately (never park).
+        // Unknown kinds must answer cancelled immediately (never park) AND
+        // say so — a silent cancel leaves the agent's "I'm blocked" prose as
+        // the only trace the ask existed.
         let step = m.on_frame(&json!({
             "type": "control_request",
             "request_id": "req-x",
             "request": { "subtype": "request_user_dialog", "dialog_kind": "mystery" },
         }));
-        assert!(step.events.is_empty());
         assert_eq!(
             step.outbound[0]["response"]["response"]["behavior"],
             "cancelled"
         );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("mystery")
+        ));
     }
 
     #[test]

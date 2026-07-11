@@ -45,6 +45,9 @@
     onDegraded: () => (store.degraded = true),
     onExited: (status) => (store.exited = { status }),
     onError: (message) => (store.fatalError = message),
+    // A refused command is a notice, not a dead pane — the socket keeps
+    // reconnecting and the user keeps their transcript.
+    onCommandFailed: (message) => store.notice(message, "error"),
     onDisconnected: () => store.onDisconnected(),
     lastSeq: () => store.lastSeq,
   });
@@ -159,12 +162,20 @@
   }
 
   function decide(requestId: string, optionId: string, destination?: string) {
-    socket.send({
+    const sent = socket.send({
       type: "permission",
       request_id: requestId,
       option_id: optionId,
       ...(destination !== undefined ? { destination } : {}),
     });
+    // Never lose a decision to a closed socket: the card stays answerable
+    // (no resolved event will arrive), so say why nothing happened.
+    if (!sent) store.notice("not connected — decision not sent, try again in a moment", "error");
+  }
+
+  function answer(requestId: string, answers: Record<string, string[]>) {
+    const sent = socket.send({ type: "answer", request_id: requestId, answers });
+    if (!sent) store.notice("not connected — answer not sent, try again in a moment", "error");
   }
 
   function interrupt() {
@@ -568,6 +579,16 @@
           <summary>thinking · {item.block.text.length} chars</summary>
           <div class="thought-body">{item.block.text}</div>
         </details>
+      {:else if item.block.kind === "question"}
+        <!-- The transcript's memory of an ask: invisible while the pending
+             overlay below is the answerable card, a quiet question+answer
+             card once resolved (replay rebuilds the same). -->
+        {#if item.block.resolved}
+          <QuestionCard
+            request={{ requestId: item.block.id, questions: item.block.questions }}
+            answered={item.block.answers}
+          />
+        {/if}
       {:else if item.block.kind === "notice"}
         <div class="notice" class:error={item.block.tone === "error"}>{item.block.text}</div>
       {:else if item.block.kind === "turn_end"}
@@ -596,11 +617,7 @@
     {/each}
 
     {#each store.questions as request (request.requestId)}
-      <QuestionCard
-        {request}
-        onAnswer={(answers) =>
-          socket.send({ type: "answer", request_id: request.requestId, answers })}
-      />
+      <QuestionCard {request} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
     {#if store.running && store.pending.length === 0 && store.questions.length === 0}

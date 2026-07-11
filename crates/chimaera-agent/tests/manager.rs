@@ -706,6 +706,200 @@ async fn matching_version_emits_no_drift_notice() {
 }
 
 #[tokio::test]
+async fn answered_question_carries_answers_and_replays() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-q1", &fx.cwd, "question"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-q1", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    fx.manager
+        .command(
+            "s-q1",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "pick one".into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let request = wait_for(&mut rx, &mut seen, "QuestionRequest", |ev| {
+        matches!(ev, AgentEvent::QuestionRequest { .. })
+    })
+    .await;
+    let request_id = match &request.ev {
+        AgentEvent::QuestionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+    assert!(
+        fx.manager.get("s-q1").unwrap().pending_permission,
+        "a pending question flags the session as waiting on a human"
+    );
+
+    let mut answers = std::collections::HashMap::new();
+    answers.insert("Which database?".to_string(), vec!["SQLite".to_string()]);
+    fx.manager
+        .command(
+            "s-q1",
+            AgentCommand::Answer {
+                request_id,
+                answers,
+            },
+        )
+        .await
+        .expect("answer");
+
+    let resolved = wait_for(&mut rx, &mut seen, "QuestionResolved", |ev| {
+        matches!(ev, AgentEvent::QuestionResolved { .. })
+    })
+    .await;
+    match &resolved.ev {
+        AgentEvent::QuestionResolved { answers, .. } => {
+            assert_eq!(
+                answers.get("Which database?"),
+                Some(&vec!["SQLite".to_string()]),
+                "the chosen labels are journaled on the resolution"
+            );
+        }
+        _ => unreachable!(),
+    }
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    assert!(!fx.manager.get("s-q1").unwrap().pending_permission);
+
+    // Replay from zero rebuilds the SAME history: the question AND its
+    // answers — a reconnecting client renders the answered card from this.
+    let replay = fx.manager.attach("s-q1", 0).expect("reattach").replay;
+    let req_at = replay
+        .iter()
+        .position(|e| matches!(e.ev, AgentEvent::QuestionRequest { .. }))
+        .expect("request replayed");
+    let res_at = replay
+        .iter()
+        .position(|e| {
+            matches!(
+                &e.ev,
+                AgentEvent::QuestionResolved { answers, .. }
+                    if answers.get("Which database?") == Some(&vec!["SQLite".to_string()])
+            )
+        })
+        .expect("resolution with answers replayed");
+    assert!(req_at < res_at);
+}
+
+#[tokio::test]
+async fn pending_ask_resolves_on_driver_death_and_dead_answer_is_definitive() {
+    // The reconnect-stranding scenario end-to-end: ask pending → driver
+    // dies → the journal must self-heal (drained resolution before Exited);
+    // then a respawned driver answering the OLD id must produce a definitive
+    // outcome (resolution + notice), never a silent drop.
+    let mut fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-q2", &fx.cwd, "question"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-q2", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    fx.manager
+        .command(
+            "s-q2",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "pick one".into(),
+                }],
+            },
+        )
+        .await
+        .expect("send");
+    let request = wait_for(&mut rx, &mut seen, "QuestionRequest", |ev| {
+        matches!(ev, AgentEvent::QuestionRequest { .. })
+    })
+    .await;
+    let stale_id = match &request.ev {
+        AgentEvent::QuestionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+
+    // Driver death drains the pending ask into the journal BEFORE Exited, so
+    // no replay of this journal ever ends on a dangling ask.
+    assert!(fx.manager.kill("s-q2"));
+    let resolved = wait_for(&mut rx, &mut seen, "drained QuestionResolved", |ev| {
+        matches!(
+            ev,
+            AgentEvent::QuestionResolved { request_id, answers }
+                if *request_id == stale_id && answers.is_empty()
+        )
+    })
+    .await;
+    let exited = wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    assert!(
+        resolved.seq < exited.seq,
+        "resolution journals before the exit marker"
+    );
+    let info = fx.manager.get("s-q2").unwrap();
+    assert!(!info.alive);
+    assert!(
+        !info.pending_permission,
+        "driver death must clear the waiting-on-human flag"
+    );
+    let _ = tokio::time::timeout(WAIT, fx.exits.recv()).await;
+
+    // Respawn under the same id (same journal — the view-toggle/resume
+    // path): the new driver never issued the old ask.
+    assert!(fx.manager.remove("s-q2").is_some());
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-q2", &fx.cwd, "question"))
+        .expect("respawn");
+    let att = fx.manager.attach("s-q2", exited.seq).expect("reattach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+    if !seen.iter().any(|e| matches!(e.ev, AgentEvent::Init { .. })) {
+        wait_for(&mut rx, &mut seen, "respawn Init", |ev| {
+            matches!(ev, AgentEvent::Init { .. })
+        })
+        .await;
+    }
+
+    // Answering the dead ask: definitive outcome, not a swallow.
+    let mut answers = std::collections::HashMap::new();
+    answers.insert("Which database?".to_string(), vec!["SQLite".to_string()]);
+    fx.manager
+        .command(
+            "s-q2",
+            AgentCommand::Answer {
+                request_id: stale_id.clone(),
+                answers,
+            },
+        )
+        .await
+        .expect("answer stale");
+    wait_for(&mut rx, &mut seen, "stale-answer QuestionResolved", |ev| {
+        matches!(
+            ev,
+            AgentEvent::QuestionResolved { request_id, answers }
+                if *request_id == stale_id && answers.is_empty()
+        )
+    })
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "stale-answer Notice",
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("no longer active")),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn kill_ends_driver_and_emits_exited() {
     let mut fx = fixture();
     fx.manager

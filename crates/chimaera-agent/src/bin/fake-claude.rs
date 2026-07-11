@@ -7,10 +7,12 @@
 //! running turn's) and an interrupt ends the turn with an is_error result
 //! that drops the queue — mirroring the real CLI's queueing semantics.
 //!
-//! Modes (argv[1]): `normal` (default), `silent` (never answers — handshake
-//! watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
-//! `die-after-handshake` (answer initialize, print a diagnostic on stderr,
-//! exit 2 — the post-update failure-at-birth tests).
+//! Modes (argv[1]): `normal` (default), `question` (the turn asks an
+//! AskUserQuestion instead of running a tool — ask-lifecycle tests),
+//! `silent` (never answers — handshake watchdog tests), `die` (exit 3
+//! immediately — spawn-crash tests), `die-after-handshake` (answer
+//! initialize, print a diagnostic on stderr, exit 2 — the post-update
+//! failure-at-birth tests).
 
 use std::io::{BufRead, Write};
 
@@ -70,15 +72,22 @@ fn main() {
             }
         } else if frame["type"] == "user" {
             if turn_active {
+                // Mid-turn frames queue natively in the real CLI; count them
+                // so the scripted turn-end runs each as its own follow-up turn.
                 queued += 1;
             } else {
                 turn_active = true;
-                run_canned_turn();
+                if mode == "question" {
+                    run_question_turn();
+                } else {
+                    run_canned_turn();
+                }
             }
         } else if frame["type"] == "control_response" {
-            // Only the scripted permission round-trip (req-1) drives the turn;
-            // ignore any other control_response so a future non-permission
-            // answer (get_settings, title, …) can't corrupt this state machine.
+            // Only the scripted round-trips (req-1 permission, req-q1
+            // question) drive the turn; ignore any other control_response so
+            // a future non-permission answer (get_settings, title, …) can't
+            // corrupt this state machine.
             if frame["response"]["request_id"] == "req-1" {
                 let allowed = frame["response"]["response"]["behavior"] == "allow";
                 finish_turn(allowed);
@@ -94,6 +103,17 @@ fn main() {
                     // native queue dies with it.
                     queued = 0;
                 }
+            } else if frame["response"]["request_id"] == "req-q1" {
+                // The AskUserQuestion answer (allow + updatedInput.answers)
+                // ends the turn with a plain success, like the real CLI. Reset
+                // turn state so a subsequent user frame starts a fresh turn.
+                turn_active = false;
+                emit(json!({
+                    "type": "result", "subtype": "success", "is_error": false,
+                    "result": "noted", "session_id": "fake-native-1",
+                    "total_cost_usd": 0.001, "duration_ms": 7,
+                    "usage": { "input_tokens": 3, "output_tokens": 2 },
+                }));
             }
         } else if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
             emit(json!({
@@ -183,6 +203,35 @@ fn run_canned_turn() {
                   "rules": [{ "toolName": "Bash", "ruleContent": "touch *" }],
                   "behavior": "allow", "destination": "localSettings" },
             ],
+        },
+    }));
+}
+
+/// A turn that parks on an AskUserQuestion (the mined can_use_tool shape) —
+/// it stays pending until a control_response for req-q1 lands or the
+/// process dies, which is exactly the lifecycle the ask tests exercise.
+fn run_question_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    emit(json!({
+        "type": "control_request",
+        "request_id": "req-q1",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "AskUserQuestion",
+            "tool_use_id": "tu-q1",
+            "input": { "questions": [{
+                "question": "Which database?",
+                "header": "Storage",
+                "options": [
+                    { "label": "SQLite", "description": "single file" },
+                    { "label": "Postgres" },
+                ],
+                "multiSelect": false,
+            }]},
         },
     }));
 }

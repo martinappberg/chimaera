@@ -394,6 +394,12 @@ struct CodexMapper {
     pending_questions: HashMap<String, Value>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
+    /// One auto-decline notice per turn: full-access maps to approvalPolicy
+    /// "never" (the official extension's table), so a genuinely blocked
+    /// action is DECLINED by codex itself with no approval card possible —
+    /// without this notice the agent's own "I'm blocked" prose is the only
+    /// trace ("harness is blocking").
+    decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
     /// fileChange item id → touched paths (approval titles look them up).
     item_locations: HashMap<String, Vec<String>>,
@@ -444,6 +450,7 @@ impl CodexMapper {
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
+            decline_notified: false,
             pending_rpcs: HashMap::new(),
             item_locations: HashMap::new(),
             out_streamed: HashMap::new(),
@@ -630,8 +637,10 @@ impl CodexMapper {
             "serverRequest/resolved" => {
                 let request_id = format!("codex-{}", frame["params"]["requestId"]);
                 if self.pending_questions.remove(&request_id).is_some() {
-                    step.events
-                        .push(AgentEvent::QuestionResolved { request_id });
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
                 } else if self.pending_approvals.remove(&request_id).is_some() {
                     step.events.push(AgentEvent::PermissionResolved {
                         request_id,
@@ -759,6 +768,7 @@ impl CodexMapper {
         self.streamed.clear();
         self.out_streamed.clear();
         self.safety_notified = false;
+        self.decline_notified = false;
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
@@ -1021,6 +1031,9 @@ impl CodexMapper {
                     let failed =
                         matches!(item["status"].as_str(), Some("declined") | Some("failed"))
                             || item["exitCode"].as_i64().is_some_and(|c| c != 0);
+                    if item["status"] == "declined" {
+                        self.note_auto_decline(step);
+                    }
                     let output = item["aggregatedOutput"].as_str().unwrap_or_default();
                     let content = if output.is_empty() {
                         None
@@ -1056,6 +1069,9 @@ impl CodexMapper {
                     self.item_locations.insert(id.clone(), locations);
                     let failed =
                         matches!(item["status"].as_str(), Some("declined") | Some("failed"));
+                    if item["status"] == "declined" {
+                        self.note_auto_decline(step);
+                    }
                     let diffs: Vec<ToolContent> = changes
                         .iter()
                         .filter_map(|c| {
@@ -1239,6 +1255,45 @@ impl CodexMapper {
             // nothing for them either).
             _ => {}
         }
+    }
+
+    /// A declined item in full-access mode was declined by CODEX ITSELF:
+    /// approvalPolicy "never" (the official extension's full-access mapping)
+    /// means no approval request can exist, so the auto-decline would
+    /// otherwise surface only as a failed tool card plus the agent's vague
+    /// "I'm blocked" narration. Name the mechanism once per turn. In every
+    /// other mode a declined status follows the user's own deny — no notice.
+    fn note_auto_decline(&mut self, step: &mut DriverStep) {
+        if self.current_mode != "full-access" || self.decline_notified {
+            return;
+        }
+        self.decline_notified = true;
+        step.events.push(AgentEvent::Notice {
+            text: "codex declined this action itself — full access never asks \
+                   for approval (switch to auto mode to be asked instead)"
+                .into(),
+        });
+    }
+
+    /// Teardown resolutions: every pending ask's reply route is this
+    /// process's JSON-RPC channel, so the journal must not outlive it with
+    /// the ask dangling (a replay would strand the card forever — see the
+    /// harness's drain call in `run_driver`).
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
+            events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+        }
+        for request_id in std::mem::take(&mut self.pending_approvals).into_keys() {
+            events.push(AgentEvent::PermissionResolved {
+                request_id,
+                option_id: "expired".into(),
+            });
+        }
+        events
     }
 
     /// Server→client approval requests. Decision payloads are prebuilt per
@@ -1591,6 +1646,19 @@ impl CodexMapper {
                 ..
             } => {
                 let Some((rpc_id, decisions)) = self.pending_approvals.remove(&request_id) else {
+                    // The ask predates this driver process (respawn, toggle,
+                    // resume) or the server already settled it: the reply
+                    // route is gone. Resolve — journaled — plus a notice, so
+                    // the click never silently vanishes into a stuck card.
+                    step.events.push(AgentEvent::PermissionResolved {
+                        request_id,
+                        option_id: "expired".into(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that permission prompt is no longer active \
+                               (the agent restarted since it asked)"
+                            .into(),
+                    });
                     return step;
                 };
                 // Unknown decision strings silently decline server-side, so
@@ -1668,6 +1736,17 @@ impl CodexMapper {
                 answers,
             } => {
                 let Some(rpc_id) = self.pending_questions.remove(&request_id) else {
+                    // Same stale-ask contract as Permission above: resolve +
+                    // notice instead of silently eating the user's answer.
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that question is no longer active (the agent \
+                               restarted since it asked) — ask again if needed"
+                            .into(),
+                    });
                     return step;
                 };
                 let mut map = serde_json::Map::new();
@@ -1676,8 +1755,12 @@ impl CodexMapper {
                 }
                 step.outbound
                     .push(json!({ "id": rpc_id, "result": { "answers": map } }));
-                step.events
-                    .push(AgentEvent::QuestionResolved { request_id });
+                // The chosen labels ride the resolution so the transcript
+                // (and every replay) shows question + answer, not a vanish.
+                step.events.push(AgentEvent::QuestionResolved {
+                    request_id,
+                    answers,
+                });
             }
             // No codex equivalents on this surface.
             AgentCommand::SetThinking { .. }
@@ -1708,6 +1791,9 @@ impl Mapper for CodexMapper {
     }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
+    }
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        self.drain_pending()
     }
 }
 
@@ -2364,6 +2450,12 @@ mod tests {
             step.outbound[0]["result"]["answers"]["q1"]["answers"],
             json!(["src only"])
         );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-91"
+                    && answers.get("q1") == Some(&vec!["src only".to_string()])
+        ));
 
         // A second prompt withdrawn by the server (timeout / other client).
         m.on_frame(&json!({
@@ -2377,8 +2469,124 @@ mod tests {
         }));
         assert!(matches!(
             &step.events[0],
-            AgentEvent::QuestionResolved { request_id } if request_id == "codex-92"
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-92" && answers.is_empty()
         ));
+    }
+
+    #[test]
+    fn stale_answer_and_permission_resolve_definitively() {
+        // Mirror of the claude driver's contract: a reply to an ask this
+        // process never issued resolves + notices instead of dropping.
+        let mut m = mapper();
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("q".to_string(), vec!["a".to_string()]);
+        let step = m.on_command(AgentCommand::Answer {
+            request_id: "codex-77".into(),
+            answers,
+        });
+        assert!(step.outbound.is_empty(), "no live request to answer");
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-77" && answers.is_empty()
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-78".into(),
+            option_id: "accept".into(),
+            destination: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "codex-78" && option_id == "expired"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+    }
+
+    #[test]
+    fn drain_pending_resolves_every_outstanding_ask() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "id": 91,
+            "method": "item/tool/requestUserInput",
+            "params": { "questions": [{ "id": "q1", "question": "Q?" }] },
+        }));
+        m.on_frame(&json!({
+            "id": 92,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "threadId": "thr-1", "itemId": "item-1", "command": "make" },
+        }));
+        let events = Mapper::drain_pending(&mut m);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-91" && answers.is_empty()
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "codex-92" && option_id == "expired"
+        )));
+        assert!(
+            Mapper::drain_pending(&mut m).is_empty(),
+            "drain is exhaustive"
+        );
+    }
+
+    #[test]
+    fn full_access_auto_decline_notices_once_per_turn() {
+        let mut m = mapper();
+        // full-access → approvalPolicy "never": codex declines by itself.
+        m.settings_update_unsupported = true;
+        m.on_command(AgentCommand::SetMode {
+            mode_id: "full-access".into(),
+        });
+        active_turn(&mut m);
+        let declined = |id: &str| {
+            json!({
+                "method": "item/completed",
+                "params": { "item": {
+                    "id": id, "type": "commandExecution", "status": "declined",
+                    "command": "curl example.com",
+                }},
+            })
+        };
+        let step = m.on_frame(&declined("item-1"));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Notice { text } if text.contains("full access never asks")
+            )),
+            "auto-decline must be named, not just a failed tool card: {:?}",
+            step.events
+        );
+        let step = m.on_frame(&declined("item-2"));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "one notice per turn"
+        );
+
+        // In auto mode a declined item follows the USER's own deny — silent.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&declined("item-3"));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
     }
 
     #[test]

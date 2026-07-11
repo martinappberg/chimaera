@@ -82,6 +82,19 @@ export type ChatBlock =
   | { kind: "message"; text: string; turnId: string }
   | { kind: "thought"; text: string; turnId: string }
   | {
+      /** A structured question, folded into history at the position it was
+       *  asked. While pending it renders nothing here (the interactive card
+       *  is the overlay); once resolved it renders as a quiet answered card —
+       *  question + chosen labels — and replay rebuilds the same. */
+      kind: "question";
+      id: string;
+      questions: Question[];
+      /** Chosen labels per question id; empty = resolved without an answer
+       *  (cancelled/expired, or a pre-answers journal). */
+      answers: Record<string, string[]>;
+      resolved: boolean;
+    }
+  | {
       kind: "tool";
       id: string;
       tool: string;
@@ -218,6 +231,8 @@ export class ChatStore {
   private toolIndex = new Map<string, number>();
   /** user-message delivery id -> index into blocks (user_message_update). */
   private userIndex = new Map<string, number>();
+  /** question request_id -> index into blocks, for the resolution fold. */
+  private questionIndex = new Map<string, number>();
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
@@ -245,6 +260,11 @@ export class ChatStore {
     this.blocks = [];
     this.toolIndex.clear();
     this.userIndex.clear();
+    this.questionIndex.clear();
+    // Pending asks belong to the journal being rebuilt; the fresh replay
+    // re-delivers any that are still live.
+    this.pending = [];
+    this.questions = [];
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
@@ -260,6 +280,12 @@ export class ChatStore {
         // replayed exit said (toggle round-trips, resumes).
         this.exited = null;
         this.degraded = false;
+        // Any ask still pending predates this driver process — its reply
+        // route died with the old one, so an answer could never land. Seq
+        // ordering makes this safe: a live driver's Init is journaled BEFORE
+        // its asks, so only stale ones are cleared. (A still-parked claude
+        // prompt is re-delivered as a fresh request right after this Init.)
+        this.expirePendingAsks();
         if (typeof ev.model === "string") this.model = ev.model;
         if (typeof ev.current_mode === "string") this.currentMode = ev.current_mode;
         if (Array.isArray(ev.modes)) this.modes = ev.modes as ModeInfo[];
@@ -422,28 +448,49 @@ export class ChatStore {
           inputPreview: ev.input_preview,
         });
         break;
-      case "question_request":
-        this.questions.push({
-          requestId: ev.request_id as string,
-          questions: ((ev.questions as Record<string, unknown>[]) ?? []).map((q) => ({
-            id: q.id as string,
-            header: (q.header as string) ?? "",
-            question: (q.question as string) ?? "",
-            options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
-              label: o.label as string,
-              description: (o.description as string) ?? "",
-            })),
-            multiSelect: q.multi_select === true,
+      case "question_request": {
+        const requestId = ev.request_id as string;
+        const questions = ((ev.questions as Record<string, unknown>[]) ?? []).map((q) => ({
+          id: q.id as string,
+          header: (q.header as string) ?? "",
+          question: (q.question as string) ?? "",
+          options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
+            label: o.label as string,
+            description: (o.description as string) ?? "",
           })),
-        });
+          multiSelect: q.multi_select === true,
+        }));
+        // Twice: the overlay is the answerable card, the block is the
+        // transcript's memory of it (invisible while pending, an answered
+        // card once resolved) — so an answered question never just vanishes.
+        this.questions.push({ requestId, questions });
+        this.blocks.push({ kind: "question", id: requestId, questions, answers: {}, resolved: false });
+        this.questionIndex.set(requestId, this.blocks.length - 1);
         break;
-      case "question_resolved":
-        this.questions = this.questions.filter((q) => q.requestId !== ev.request_id);
+      }
+      case "question_resolved": {
+        const requestId = ev.request_id as string;
+        this.questions = this.questions.filter((q) => q.requestId !== requestId);
+        const idx = this.questionIndex.get(requestId);
+        const block = idx !== undefined ? this.blocks[idx] : undefined;
+        if (block !== undefined && block.kind === "question") {
+          block.resolved = true;
+          block.answers = (ev.answers as Record<string, string[]>) ?? {};
+        }
         break;
+      }
       case "permission_resolved": {
         const req = this.pending.find((p) => p.requestId === ev.request_id);
         this.pending = this.pending.filter((p) => p.requestId !== ev.request_id);
         const option = ev.option_id as string;
+        if (req !== undefined) {
+          // Fold the decision into history as a quiet row — the card itself
+          // is overlay-only, and "what did I allow?" must survive a reload.
+          const label =
+            req.options.find((o) => o.id === option)?.label ??
+            (option === "cancelled" || option === "expired" ? "no longer active" : option);
+          this.notice(`${req.title} — ${label}`, "info");
+        }
         if (req?.toolCallId != null && !option.startsWith("allow")) {
           const idx = this.toolIndex.get(req.toolCallId);
           const block = idx !== undefined ? this.blocks[idx] : undefined;
@@ -561,6 +608,10 @@ export class ChatStore {
         this.running = false;
         this.activity = null;
         this.exited = { status: (ev.status as number | null) ?? null };
+        // The reply route for any pending ask died with the process. The
+        // driver drains resolutions before Exited, so this is usually a
+        // no-op — it covers old journals recorded before that fix.
+        this.expirePendingAsks();
         break;
       default:
         break;
@@ -584,12 +635,14 @@ export class ChatStore {
     const drop = this.blocks.length - cap + 1;
     const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
     this.blocks.splice(0, drop, notice);
-    // The front-splice invalidated every id→index position — rebuild both.
+    // The front-splice invalidated every id→index position — rebuild them all.
     this.toolIndex.clear();
     this.userIndex.clear();
+    this.questionIndex.clear();
     this.blocks.forEach((b, i) => {
       if (b.kind === "tool") this.toolIndex.set(b.id, i);
       if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
+      if (b.kind === "question") this.questionIndex.set(b.id, i);
     });
   }
 
@@ -608,6 +661,23 @@ export class ChatStore {
    *  intercepted commands) — they are NOT journaled, deliberately. */
   notice(text: string, tone: "info" | "error"): void {
     this.blocks.push({ kind: "notice", text, tone });
+  }
+
+  /** Withdraw every pending ask whose reply route is gone (driver exit or a
+   *  fresh handshake): the cards leave the overlay, and their history blocks
+   *  fold to a quiet "no longer active" so the user sees WHY they vanished.
+   *  Deterministic from journaled events (init/exited), so replay agrees. */
+  private expirePendingAsks(): void {
+    for (const q of this.questions) {
+      const idx = this.questionIndex.get(q.requestId);
+      const block = idx !== undefined ? this.blocks[idx] : undefined;
+      if (block !== undefined && block.kind === "question") block.resolved = true;
+    }
+    this.questions = [];
+    for (const p of this.pending) {
+      this.notice(`${p.title} — no longer active`, "info");
+    }
+    this.pending = [];
   }
 
   /** The previewable files THIS turn produced, for the end-of-turn gallery.
