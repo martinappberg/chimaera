@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec,
+    SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
@@ -483,6 +483,11 @@ struct ClaudeMapper {
     /// since — the one deterministic "this abort was user-initiated" fact.
     /// The CLI's result string is free text and cannot carry that signal.
     interrupt_requested: bool,
+    /// Interrupt watchdog: ticks remaining before we synthesize the abort the
+    /// CLI never sent. Armed on `Interrupt`, counted down in `tick`, disarmed
+    /// when a real result lands (a turn end) or a fresh turn opens. See
+    /// `INTERRUPT_GRACE_TICKS`.
+    interrupt_grace: Option<u32>,
     /// One title request per conversation, fired with the first user send
     /// (the extension's exact moment; description = the message text).
     title_requested: bool,
@@ -567,6 +572,7 @@ impl ClaudeMapper {
             agent_tools: HashMap::new(),
             queued_sends: VecDeque::new(),
             interrupt_requested: false,
+            interrupt_grace: None,
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
@@ -612,10 +618,27 @@ impl ClaudeMapper {
         if !self.turn_active {
             self.turn_n += 1;
             self.turn_active = true;
+            // A turn opening is a clean slate for the interrupt watchdog: an
+            // interrupt armed against a previous (or idle) state must not abort
+            // this fresh turn.
+            self.interrupt_grace = None;
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
         }
+    }
+
+    /// One cheap `get_context_usage` round-trip after a turn end — the
+    /// extension's cadence, kept honest for aborts too (an interrupted turn
+    /// still consumed context). Only issued for a turn that was actually open.
+    fn refresh_context_usage(&mut self, step: &mut DriverStep) {
+        let id = self.ctl_id();
+        self.pending_controls
+            .insert(id.clone(), PendingControl::ContextUsage);
+        step.outbound.push(control_request_frame(
+            &id,
+            json!({ "subtype": "get_context_usage" }),
+        ));
     }
 
     fn flush(&mut self) -> Option<AgentEvent> {
@@ -1517,6 +1540,15 @@ impl ClaudeMapper {
             step.events.push(flushed);
         }
         let turn_id = self.turn_id();
+        // Capture BEFORE clearing. A result can arrive with NO turn open: the
+        // real CLI coalesces rapid queued sends (live-verified: 3 sends → 2
+        // results), so a queued message can resolve `sent` off a turn whose
+        // content never streamed — a bare result. `was_active` gates the
+        // turn-END events so that bare result never emits a phantom
+        // TurnCompleted/TurnAborted. A genuine turn always streamed content,
+        // so `ensure_turn` fired and this is true — the normal case is
+        // unchanged.
+        let was_active = self.turn_active;
         self.turn_active = false;
         self.tool_kinds.clear();
         self.streamed.clear();
@@ -1524,6 +1556,10 @@ impl ClaudeMapper {
         self.task_rows.clear();
         self.agent_tools.clear();
         self.thinking_emitted = 0;
+        // A real result is the turn end — disarm the interrupt watchdog (the
+        // interrupt's own is_error result lands here too, so a genuine turn is
+        // never double-aborted by the watchdog).
+        self.interrupt_grace = None;
 
         // Consumed at EVERY result, both branches: an interrupt whose turn
         // ended before the control request landed must not mislabel the
@@ -1534,71 +1570,63 @@ impl ClaudeMapper {
             // An aborted turn drops the CLI's queue with it: resolve every
             // queued message as dropped (a journal that kept them looking
             // sent would lie on replay), and clear so no phantom turn
-            // boundaries open later.
+            // boundaries open later. This happens regardless of `was_active`
+            // — the CLI drops its native queue on any abort.
             for id in std::mem::take(&mut self.queued_sends) {
                 step.events.push(AgentEvent::UserMessageUpdate {
                     id,
                     state: UserMessageState::Dropped,
                 });
             }
-            step.events.push(AgentEvent::TurnAborted {
-                turn_id,
-                reason: frame["result"]
-                    .as_str()
-                    .unwrap_or(if interrupted {
-                        "interrupted"
-                    } else {
-                        "turn failed"
-                    })
-                    .to_string(),
-                interrupted,
-            });
-            // An interrupted turn still consumed context — keep the meter
-            // honest instead of skipping the refresh on aborts.
-            let id = self.ctl_id();
-            self.pending_controls
-                .insert(id.clone(), PendingControl::ContextUsage);
-            step.outbound.push(control_request_frame(
-                &id,
-                json!({ "subtype": "get_context_usage" }),
-            ));
+            // Only an OPEN turn can be aborted — a bare coalesced is_error
+            // result must not synthesize a phantom abort (nor a context
+            // refresh for a turn that never ran here).
+            if was_active {
+                step.events.push(AgentEvent::TurnAborted {
+                    turn_id,
+                    reason: frame["result"]
+                        .as_str()
+                        .unwrap_or(if interrupted {
+                            "interrupted"
+                        } else {
+                            "turn failed"
+                        })
+                        .to_string(),
+                    interrupted,
+                });
+                self.refresh_context_usage(step);
+            }
             return;
         }
-        let usage = &frame["usage"];
-        step.events.push(AgentEvent::TurnCompleted {
-            turn_id,
-            usage: Usage {
-                cost_usd: frame["total_cost_usd"].as_f64(),
-                input_tokens: usage["input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
-                    + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-                output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                total_tokens: 0,
-                duration_ms: frame["duration_ms"].as_u64().unwrap_or(0),
-                context_window: None,
-            },
-        });
-        // Keep the context meter current: one cheap control round-trip per
-        // finished turn (the extension's own cadence).
-        let id = self.ctl_id();
-        self.pending_controls
-            .insert(id.clone(), PendingControl::ContextUsage);
-        step.outbound.push(control_request_frame(
-            &id,
-            json!({ "subtype": "get_context_usage" }),
-        ));
+        // Only an OPEN turn completes — see `was_active`.
+        if was_active {
+            let usage = &frame["usage"];
+            step.events.push(AgentEvent::TurnCompleted {
+                turn_id,
+                usage: Usage {
+                    cost_usd: frame["total_cost_usd"].as_f64(),
+                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0)
+                        + usage["cache_read_input_tokens"].as_u64().unwrap_or(0)
+                        + usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: 0,
+                    duration_ms: frame["duration_ms"].as_u64().unwrap_or(0),
+                    context_window: None,
+                },
+            });
+            self.refresh_context_usage(step);
+        }
         // A user message sent mid-turn was queued by the CLI and runs next
-        // (FIFO): resolve its delivery and open its turn boundary now so
-        // streamed chunks land in it.
+        // (FIFO): resolve its delivery now. The turn boundary opens LAZILY —
+        // `ensure_turn` fires when this queued message's first REAL frame
+        // streams. Opening a synthetic turn here eagerly was the "stuck
+        // running" bug: the CLI produces FEWER results than queued sends when
+        // they arrive rapidly (it coalesces them), so the trailing synthetic
+        // TurnStarted never got a result and the UI stuck on "running".
         if let Some(id) = self.queued_sends.pop_front() {
             step.events.push(AgentEvent::UserMessageUpdate {
                 id,
                 state: UserMessageState::Sent,
-            });
-            self.turn_n += 1;
-            self.turn_active = true;
-            step.events.push(AgentEvent::TurnStarted {
-                turn_id: self.turn_id(),
             });
         }
     }
@@ -1643,8 +1671,10 @@ impl ClaudeMapper {
                 } else {
                     // An interrupt sent while idle (benign no-op on the CLI)
                     // must not relabel this fresh turn's genuine failure as
-                    // a quiet stop.
+                    // a quiet stop, nor let its armed watchdog abort this new
+                    // turn.
                     self.interrupt_requested = false;
+                    self.interrupt_grace = None;
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
@@ -1805,6 +1835,11 @@ impl ClaudeMapper {
                 // (TurnAborted.interrupted) — the ack itself says nothing and
                 // the result string is free text.
                 self.interrupt_requested = true;
+                // Arm the watchdog: if the CLI never answers with an is_error
+                // result (an interrupt it treats as a no-op, or a wedged
+                // turn), `tick` synthesizes the abort so the user can escape a
+                // stuck-running state. A real result disarms it first.
+                self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::Interrupt);
@@ -2048,6 +2083,51 @@ impl ClaudeMapper {
         }
         events
     }
+
+    /// Harness timer tick: the interrupt watchdog. Interrupting a claude turn
+    /// is only observable through the CLI's own is_error `result` (there's no
+    /// interrupt-specific ack), so an interrupt the CLI treats as a no-op —
+    /// or a wedged turn — would leave the session "running" with no escape.
+    /// When the grace armed on `Interrupt` expires with a turn still open,
+    /// synthesize the abort the CLI never sent: drop the queue (FIFO, like the
+    /// is_error path) and emit `TurnAborted{interrupted}`. Idle-guarded, so an
+    /// interrupt pressed with nothing running stays a no-op.
+    fn tick(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        let Some(remaining) = self.interrupt_grace else {
+            return step;
+        };
+        if remaining > 1 {
+            self.interrupt_grace = Some(remaining - 1);
+            return step;
+        }
+        self.interrupt_grace = None;
+        if !self.turn_active {
+            // Interrupt while idle is a CLI no-op — nothing to abort.
+            return step;
+        }
+        let turn_id = self.turn_id();
+        self.turn_active = false;
+        self.interrupt_requested = false;
+        // Same per-turn cleanup a real result performs.
+        self.tool_kinds.clear();
+        self.streamed.clear();
+        self.task_rows.clear();
+        self.agent_tools.clear();
+        self.thinking_emitted = 0;
+        for id in std::mem::take(&mut self.queued_sends) {
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        step.events.push(AgentEvent::TurnAborted {
+            turn_id,
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        step
+    }
 }
 
 /// Harness adapter: the inherent methods above ARE the state machine; these
@@ -2068,6 +2148,9 @@ impl Mapper for ClaudeMapper {
     }
     fn drain_pending(&mut self) -> Vec<AgentEvent> {
         self.drain_pending()
+    }
+    fn tick(&mut self) -> DriverStep {
+        self.tick()
     }
 }
 
@@ -2330,11 +2413,15 @@ mod tests {
             "type": "result", "is_error": false,
             "usage": { "output_tokens": 1 }, "duration_ms": 10,
         }));
+        // The result resolves the queued message `sent` but opens NO turn: the
+        // boundary is LAZY (a synthetic TurnStarted here per queued message was
+        // the "stuck running" bug, since the CLI coalesces rapid queued sends).
         assert!(
-            step.events
+            !step
+                .events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
-            "queued send opens its turn when the result lands: {:?}",
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            "queued pop must NOT eagerly open a turn: {:?}",
             step.events
         );
         assert!(
@@ -2346,6 +2433,20 @@ mod tests {
                 } if *id == queued_id
             )),
             "the dequeued message resolves sent at that boundary: {:?}",
+            step.events
+        );
+        // The turn opens only when the queued message's first real frame
+        // streams (ensure_turn) — then it is t2.
+        let step = m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "hi" } },
+        }));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
+            "the queued turn opens lazily on its first real frame: {:?}",
             step.events
         );
     }
@@ -2502,6 +2603,161 @@ mod tests {
             "stale interrupt cleared at the result boundary: {:?}",
             step.events
         );
+    }
+
+    /// The `was_active` guard: the real CLI coalesces rapid queued sends into
+    /// FEWER results than messages, so a result can arrive with NO turn open
+    /// (a queued id still resolves `sent`, but its content streamed under an
+    /// earlier turn). Such a bare result must NOT emit a phantom
+    /// TurnCompleted — that stray turn-end was the "stuck running" symptom.
+    #[test]
+    fn bare_result_with_no_open_turn_emits_no_phantom_turn_end() {
+        let mut m = mapper();
+        assert!(!m.turn_active, "no turn is open");
+        // Queue a delivery id directly (as if a prior turn's result popped an
+        // earlier queued message and left this one behind).
+        m.queued_sends.push_back("qid".into());
+
+        let step = m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "a bare result opens no phantom TurnCompleted: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if id == "qid"
+            )),
+            "the queued id still resolves sent, guard or not: {:?}",
+            step.events
+        );
+
+        // Same for an is_error bare result: dropped resolution, no phantom abort.
+        m.queued_sends.push_back("qid2".into());
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "a bare is_error result opens no phantom TurnAborted: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if id == "qid2"
+            )),
+            "the queued id still drops, guard or not: {:?}",
+            step.events
+        );
+    }
+
+    /// The interrupt watchdog: when the CLI never answers an interrupt with a
+    /// result (a no-op interrupt, or a wedged turn), the grace expires and the
+    /// driver synthesizes the abort so the user escapes a stuck-running state.
+    #[test]
+    fn interrupt_watchdog_aborts_a_hung_turn_after_the_grace() {
+        let mut m = mapper();
+        // A running turn with a queued message behind it.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "queued".into(),
+                }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+
+        // Interrupt: the CLI (fake) never answers with a result. Ticks below
+        // the grace do nothing…
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(step.outbound[0]["request"]["subtype"], "interrupt");
+        for _ in 0..(INTERRUPT_GRACE_TICKS - 1) {
+            let step = m.tick();
+            assert!(step.events.is_empty(), "no abort before the grace expires");
+        }
+        assert!(m.turn_active, "still running until the grace fires");
+
+        // …the expiring tick synthesizes the abort and drops the queue.
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "the watchdog aborts the hung turn as a user stop: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "the queue drops with the watchdog abort: {:?}",
+            step.events
+        );
+        assert!(!m.turn_active, "the turn is closed");
+
+        // Idempotent: a further tick does nothing (grace disarmed).
+        assert!(m.tick().events.is_empty(), "watchdog fires exactly once");
+    }
+
+    /// A real result landing before the grace expires disarms the watchdog, so
+    /// a genuine turn is never double-aborted.
+    #[test]
+    fn real_result_disarms_the_interrupt_watchdog() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "go".into() }],
+        });
+        m.on_command(AgentCommand::Interrupt);
+        // The CLI answers the interrupt with its is_error result…
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "the real interrupt result aborts the turn: {:?}",
+            step.events
+        );
+        assert!(m.interrupt_grace.is_none(), "the watchdog is disarmed");
+        // …so ticking past the grace produces no second abort.
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no double abort after a real end"
+            );
+        }
+    }
+
+    /// Interrupt pressed while idle is a no-op: the grace expires without an
+    /// abort (there is no turn to stop).
+    #[test]
+    fn interrupt_while_idle_is_a_watchdog_no_op() {
+        let mut m = mapper();
+        assert!(!m.turn_active);
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "an idle interrupt never fabricates an abort"
+            );
+        }
+        assert!(!m.turn_active);
     }
 
     #[test]

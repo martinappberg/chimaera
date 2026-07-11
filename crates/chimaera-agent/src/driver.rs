@@ -23,6 +23,20 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Polite-shutdown grace before SIGKILL.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
+/// Interrupt-watchdog deadline, counted in harness `tick`s (~1.5s at
+/// `COALESCE_INTERVAL_MS`). Both mappers arm it on `AgentCommand::Interrupt`
+/// and abort a still-open turn when it expires.
+///
+/// Why a deadline and not the interrupt ack: interrupt-when-idle is a CLI
+/// no-op on BOTH drivers (claude's `interrupt` control acks nothing about the
+/// turn; codex answers "no active turn to interrupt"), so without this a
+/// session wedged as "running" could never be escaped by pressing stop. The
+/// grace is only a floor for the genuine case — a real is_error `result`
+/// (claude) or `turn/completed{interrupted}` (codex) lands first and disarms
+/// the grace through the per-turn reset, so a live turn is never
+/// double-aborted.
+pub const INTERRUPT_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
+
 /// Everything needed to start a driver. `argv` is COMPLETE (binary plus all
 /// flags, already login-shell wrapped by the server) — argv assembly stays
 /// in chimaera-server's launcher where it is unit-tested; drivers only speak

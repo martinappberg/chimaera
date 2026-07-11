@@ -11,8 +11,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use chimaera_agent::claude::{ClaudeChat, PermissionDecision};
+use chimaera_agent::claude::{chat_args, ClaudeAdapter, ClaudeChat, PermissionDecision};
 use chimaera_agent::codex::CodexChat;
+use chimaera_agent::driver::SpawnSpec;
+use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock};
+use chimaera_agent::{ChatManager, EventHook, ExitHook};
 
 const HANDSHAKE: Duration = Duration::from_secs(20);
 const TURN: Duration = Duration::from_secs(120);
@@ -600,6 +603,77 @@ async fn claude_mid_turn_send_queues_natively() {
     chat.shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");
+}
+
+/// Three rapid queued sends against the REAL claude driver must SETTLE IDLE:
+/// every turn the CLI opens must also end. The real CLI coalesces rapid queued
+/// sends (the prior run confirmed 3 sends → 2 turns), so the count is not
+/// fixed — but the invariant is `opened == ended`. The old eager queued-turn
+/// open minted a synthetic TurnStarted per message; the coalesced-away one
+/// never got a result and left the session stuck "running". This drives the
+/// full ChatManager pipeline (the same normalized events the UI folds).
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills a few tiny turns"]
+async fn driver_rapid_queued_sends_settle_idle() {
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let on_event: EventHook = Box::new(|_, _| {});
+    let on_exit: ExitHook = Box::new(|_, _| {});
+    let manager = Arc::new(ChatManager::new(dir.path().join("chat"), on_event, on_exit));
+
+    // The driver's own argv (server-side extras aside): the chat stream-json
+    // flags plus the cheap model. env_extra (auto-updater off, checkpointing)
+    // is supplied by ClaudeAdapter.
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(chat_args(Some(CLAUDE_TEST_MODEL), None));
+    let spec = SpawnSpec::new("rapid", argv, dir.path().to_path_buf());
+    manager
+        .spawn(&ClaudeAdapter, spec)
+        .expect("spawn claude driver");
+    let mut rx = manager.attach("rapid", 0).expect("attach").live;
+
+    // Three sends with no waiting between them: the CLI queues (and coalesces)
+    // them behind the running turn.
+    for text in [
+        "Reply with exactly: one",
+        "Reply with exactly: two",
+        "Reply with exactly: three",
+    ] {
+        manager
+            .command(
+                "rapid",
+                AgentCommand::Send {
+                    blocks: vec![ContentBlock::Text { text: text.into() }],
+                },
+            )
+            .await
+            .expect("send");
+    }
+
+    // Drain until the session goes quiet (no event for a settle window); count
+    // the turn boundaries. A generous per-recv timeout tolerates think latency.
+    let mut opened = 0usize;
+    let mut ended = 0usize;
+    let settle = Duration::from_secs(20);
+    // Drain until a quiet window elapses with no further event (Err from the
+    // timeout) or the broadcast closes — either way the session is idle.
+    while let Ok(Ok(entry)) = tokio::time::timeout(settle, rx.recv()).await {
+        match &entry.ev {
+            AgentEvent::TurnStarted { .. } => opened += 1,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => ended += 1,
+            _ => {}
+        }
+    }
+
+    assert!(opened >= 1, "at least one turn opened (opened={opened})");
+    assert_eq!(
+        opened, ended,
+        "every opened turn must end — no turn left stuck running \
+         (opened={opened}, ended={ended})"
+    );
+
+    manager.kill("rapid");
 }
 
 /// Wait for a specific control_response and return its inner response value.

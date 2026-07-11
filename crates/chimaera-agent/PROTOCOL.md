@@ -674,9 +674,12 @@ Emission points, per driver:
 
 - **claude** — a mid-turn send echoes `queued:true` and its uuid joins a
   FIFO (`queued_sends`); the CLI queues the stdin frame natively. When the
-  running turn's result lands, the oldest uuid resolves `sent` alongside
-  the synthetic `TurnStarted` that opens its turn. An `is_error` result
-  drops the CLI's queue with the turn: every queued uuid resolves
+  running turn's result lands, the oldest uuid resolves `sent` — and NOTHING
+  more: the turn boundary opens LAZILY (`ensure_turn`, on that message's
+  first real frame), never a synthetic `TurnStarted` per queued pop. See
+  Pass 11 — the eager synthetic open was the "stuck running" bug, because
+  the CLI produces FEWER results than rapid queued sends. An `is_error`
+  result drops the CLI's queue with the turn: every queued uuid resolves
   `dropped` before the `TurnAborted`. (`cancel_async_message` un-queueing
   remains unadopted — same as the official extension.)
 - **codex** — a steered send (`turn/steer`, incl. sends buffered during
@@ -821,3 +824,72 @@ rollback), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
 `clientUserMessageId`). `account/rateLimits/updated` params here were
 `{rateLimits:{limitId, primary:{usedPercent, windowDurationMins,
 resetsAt}, secondary:…}}` — still ignored (account/read is the source).
+
+## Pass 11 (2026-07-11 — turn-boundary robustness): the "stuck running" fix
+
+Two turn-boundary corrections. Both change only WHEN normalized turn events
+are emitted, never their wire SHAPE (`tests/wire_contract.rs` unchanged).
+
+### Claude coalesces rapid queued sends — fewer results than sends (live)
+
+**Confirmed live: three rapid mid-turn sends produced only TWO turns.** The
+CLI queues mid-turn stdin frames natively (Pass 4), but when several arrive
+in quick succession it COALESCES them — it runs fewer follow-up turns, and
+emits fewer `result` frames, than there were messages. The count is not
+fixed (it depends on timing); the invariant is "results ≤ queued sends".
+
+Consequence for the old driver: it opened a synthetic `TurnStarted` for
+EACH queued message the instant the previous `result` landed (eager open).
+When the CLI coalesced N sends into M<N results, the surplus synthetic turns
+never got a result — `turn_active` stuck true and the UI stuck on
+"running"/"starting" forever.
+
+**Fix — lazy queued-turn open + a `was_active` guard** (`claude.rs`
+`on_result`):
+
+- A queued pop resolves `UserMessageUpdate{sent}` ONLY. It does NOT mint a
+  `TurnStarted`. The turn boundary opens LAZILY through `ensure_turn` when
+  that message's first real stream/assistant/tool frame arrives — and a real
+  turn always streams content, so a genuine turn still opens exactly once.
+- `on_result` captures `was_active = self.turn_active` BEFORE clearing it,
+  and emits the turn-END event (`TurnCompleted` on success, `TurnAborted` on
+  `is_error`) — plus the once-per-turn `get_context_usage` refresh — ONLY
+  when `was_active`. A bare/coalesced result that opened no turn thus emits
+  no phantom turn-end. The queued-drop (`is_error` → `dropped`) and the
+  `sent` resolution happen regardless of `was_active` (the CLI dropped/
+  accepted its native queue either way).
+
+Net: normal turns are byte-identical (content → `ensure_turn` fired →
+`was_active` true); coalesced/bare results resolve delivery without a
+phantom turn. Codex was already lazy here (turns open on `turn/started`),
+so only claude changed.
+
+### Interrupt watchdog (both drivers) — stop ALWAYS recovers
+
+Interrupt-when-idle is a no-op on both wires: claude's `interrupt` control
+acks nothing about the turn, and codex answers "no active turn to
+interrupt" (Pass 4). A turn wedged with no result / no `turn/completed`
+therefore had no escape — pressing stop did nothing.
+
+**Fix — a grace deadline armed on `AgentCommand::Interrupt`**, counted down
+on the harness `tick` (`INTERRUPT_GRACE_TICKS` ≈ 1.5s of
+`COALESCE_INTERVAL_MS` ticks, in `driver.rs`). When it expires with a turn
+STILL open, the mapper synthesizes the abort the CLI never sent:
+`TurnAborted{reason:"interrupted", interrupted:true}` + the queue drops
+(claude `queued_sends`, codex `drain_queued_sends()`) + turn state cleared.
+Idle-guarded, so interrupting nothing stays a no-op.
+
+Why a deadline and not the ack: a GENUINE interrupt lands its real end
+(claude's `is_error` result / codex's `turn/completed{interrupted}`) well
+within the grace, and that end DISARMS the watchdog through the per-turn
+reset (`on_result` / `reset_turn_state`) — so a live turn is never
+double-aborted. A fresh turn opening (`ensure_turn` / claude fresh-send /
+codex `turn/started`) also disarms it, so an idle-armed grace can't abort
+the next legitimate turn. claude gained a `tick` override; codex extended
+its existing `tick` (which also runs `expire_questions`). Symmetric.
+
+Belt-and-suspenders for the rare race where a real end lands JUST after the
+watchdog fired: both turn-end paths now no-op when the turn is already
+closed. claude's `on_result` already gated on `was_active`; codex's
+`turn/completed` / `turn/failed` gained the same `was_active` guard — so a
+late real end never emits a second `TurnAborted`/`TurnCompleted`.

@@ -9,10 +9,14 @@
 //!
 //! Modes (argv[1]): `normal` (default), `question` (the turn asks an
 //! AskUserQuestion instead of running a tool — ask-lifecycle tests),
-//! `silent` (never answers — handshake watchdog tests), `die` (exit 3
-//! immediately — spawn-crash tests), `die-after-handshake` (answer
-//! initialize, print a diagnostic on stderr, exit 2 — the post-update
-//! failure-at-birth tests).
+//! `coalesce` (two mid-turn sends but only ONE content-bearing follow-up
+//! turn — the real CLI's "rapid queued sends coalesce into fewer results"
+//! behavior, which the lazy turn-open fix must settle idle), `hang` (opens a
+//! turn, streams content, never ends it, and acks an interrupt with NO
+//! result — the interrupt-watchdog recovery tests), `silent` (never answers —
+//! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
+//! `die-after-handshake` (answer initialize, print a diagnostic on stderr,
+//! exit 2 — the post-update failure-at-birth tests).
 
 use std::io::{BufRead, Write};
 
@@ -77,10 +81,12 @@ fn main() {
                 queued += 1;
             } else {
                 turn_active = true;
-                if mode == "question" {
-                    run_question_turn();
-                } else {
-                    run_canned_turn();
+                match mode.as_str() {
+                    "question" => run_question_turn(),
+                    // Streams content, then never ends — the driver's interrupt
+                    // watchdog is the only thing that can recover it.
+                    "hang" => run_hang_turn(),
+                    _ => run_canned_turn(),
                 }
             }
         } else if frame["type"] == "control_response" {
@@ -103,12 +109,27 @@ fn main() {
                 }
                 turn_active = false;
                 if allowed || feedback_denial {
-                    // A successful turn end (allow, or a feedback-denial that
-                    // keeps the turn running) dequeues each pending message as
-                    // its own trivial turn.
-                    while queued > 0 {
-                        queued -= 1;
-                        emit_success_result();
+                    if mode == "coalesce" {
+                        // The real CLI COALESCES rapid queued sends: it emits
+                        // FEWER follow-up results than there were messages
+                        // (live-verified 3 sends → 2 turns). Model that as ONE
+                        // content-bearing follow-up turn regardless of how many
+                        // are queued. The driver opens it lazily (ensure_turn)
+                        // and resolves each queued id `sent` as results land —
+                        // so it must settle idle, not stick "running" on a
+                        // synthetic turn that never gets a result.
+                        if queued > 0 {
+                            emit_followup_turn();
+                            queued = 0;
+                        }
+                    } else {
+                        // A successful turn end (allow, or a feedback-denial
+                        // that keeps the turn running) dequeues each pending
+                        // message as its own content-bearing follow-up turn.
+                        while queued > 0 {
+                            queued -= 1;
+                            emit_followup_turn();
+                        }
                     }
                 } else {
                     // The deny's interrupt:true aborted the turn — the CLI's
@@ -136,7 +157,11 @@ fn main() {
                     "response": {},
                 },
             }));
-            if turn_active {
+            if turn_active && mode == "hang" {
+                // A wedged turn: ack the interrupt but emit NO result, exactly
+                // the state the interrupt watchdog exists to recover. turn_active
+                // stays true on the fake side — the fake never speaks again.
+            } else if turn_active {
                 // The real CLI ends the interrupted turn with an is_error
                 // result whose `result` string is free text — omitted here so
                 // tests exercise the driver's structural classification, not
@@ -164,15 +189,46 @@ fn main() {
     }
 }
 
-/// The success result a dequeued (previously mid-turn) message's turn ends
-/// with — the driver opens that turn boundary itself when the previous
-/// result lands, so the fake only needs to close it.
-fn emit_success_result() {
+/// A dequeued (previously mid-turn) message runs as its own follow-up turn.
+/// It MUST stream content before the result: the driver opens the turn
+/// boundary LAZILY (ensure_turn, on the first real frame), so a bare result
+/// would resolve the message `sent` without ever opening a turn — exactly the
+/// live CLI's shape, where every real turn produces content.
+fn emit_followup_turn() {
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "message_start", "message": { "id": "mq" } },
+    }));
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "content_block_delta",
+                   "delta": { "type": "text_delta", "text": "ok" } },
+    }));
     emit(json!({
         "type": "result", "subtype": "success", "is_error": false,
         "result": "done", "session_id": "fake-native-1",
         "total_cost_usd": 0.005, "duration_ms": 21,
         "usage": { "input_tokens": 4, "output_tokens": 2 },
+    }));
+}
+
+/// Open a turn and stream content, then say nothing more — no result ever.
+/// Paired with the hang-mode interrupt branch (ack, no result), this is the
+/// wedged-turn state the driver's interrupt watchdog must recover from.
+fn run_hang_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "message_start", "message": { "id": "mh" } },
+    }));
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "content_block_delta",
+                   "delta": { "type": "text_delta", "text": "working" } },
     }));
 }
 

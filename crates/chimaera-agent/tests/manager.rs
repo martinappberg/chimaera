@@ -475,6 +475,190 @@ async fn interrupt_drops_queued_send_and_classifies_user_stop() {
     );
 }
 
+/// Opened vs ended turns in a journal — a session is idle only when they
+/// balance (every TurnStarted has a matching TurnCompleted/TurnAborted). A
+/// dangling open turn is exactly the "stuck running" state.
+fn turn_balance(replay: &[Arc<SeqEvent>]) -> (usize, usize) {
+    let opened = replay
+        .iter()
+        .filter(|e| matches!(e.ev, AgentEvent::TurnStarted { .. }))
+        .count();
+    let ended = replay
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.ev,
+                AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. }
+            )
+        })
+        .count();
+    (opened, ended)
+}
+
+/// The real CLI coalesces rapid queued sends into FEWER results than messages
+/// (live-verified: 3 sends → 2 turns). The lazy turn-open fix must settle that
+/// idle: the ONE content-bearing follow-up turn opens AND completes, both
+/// queued messages resolve `sent`, and no phantom TurnStarted is left dangling
+/// (the old eager open minted a synthetic turn per queued message, and the
+/// coalesced-away one never got a result — the UI stuck on "running").
+#[tokio::test]
+async fn coalesced_queued_send_does_not_stick_running() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-co", &fx.cwd, "coalesce"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-co", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    // Turn one parks on a permission…
+    send_text(&fx, "s-co", "first").await;
+    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    let request_id = match &permission.ev {
+        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+    // …while TWO messages queue behind it (the coalescing case).
+    let mut queued_ids = Vec::new();
+    for text in ["second", "third"] {
+        send_text(&fx, "s-co", text).await;
+        let ev = wait_for(
+            &mut rx,
+            &mut seen,
+            "queued UserMessage",
+            |ev| matches!(ev, AgentEvent::UserMessage { text: t, queued: true, .. } if t == text),
+        )
+        .await;
+        match &ev.ev {
+            AgentEvent::UserMessage { id: Some(id), .. } => queued_ids.push(id.clone()),
+            _ => unreachable!(),
+        }
+    }
+
+    fx.manager
+        .command(
+            "s-co",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+
+    // Exactly ONE follow-up turn opens (t2) and completes. The two queued
+    // messages resolve `sent` off the two results the CLI actually produced:
+    // "second" at turn one's result (before t2), "third" right after t2's — so
+    // wait through t2's completion and the LAST send's `sent`, then verify both
+    // from the journal (avoids racing the early "second" resolution).
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "queued turn's TurnStarted",
+        |ev| matches!(ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t2"),
+    )
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "queued turn's TurnCompleted",
+        |ev| matches!(ev, AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t2"),
+    )
+    .await;
+    let last = queued_ids.last().unwrap().clone();
+    wait_for(&mut rx, &mut seen, "last UserMessageUpdate sent", |ev| {
+        matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == last)
+    })
+    .await;
+
+    let replay = fx.manager.attach("s-co", 0).expect("replay").replay;
+    // Both queued messages resolved `sent` (and never `dropped`).
+    for id in &queued_ids {
+        let states: Vec<_> = replay
+            .iter()
+            .filter_map(|e| match &e.ev {
+                AgentEvent::UserMessageUpdate { id: uid, state } if uid == id => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![UserMessageState::Sent],
+            "queued message {id} resolves sent exactly once"
+        );
+    }
+    // The journal balances: two turns opened, two ended, and there is NO third
+    // (phantom) turn — the session is genuinely idle.
+    let (opened, ended) = turn_balance(&replay);
+    assert_eq!(
+        (opened, ended),
+        (2, 2),
+        "opened turns must equal ended turns (idle): {:#?}",
+        replay
+    );
+    assert!(
+        !replay
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t3")),
+        "no phantom third turn from the coalesced send"
+    );
+}
+
+/// The interrupt watchdog recovers a wedged turn: the fake opens a turn, never
+/// ends it, and acks the interrupt with NO result. Without the watchdog the
+/// session would stay "running" forever; with it, a `TurnAborted{interrupted}`
+/// lands once the grace expires — the user's escape hatch.
+#[tokio::test]
+async fn interrupt_recovers_a_hung_turn_via_watchdog() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-hang", &fx.cwd, "hang"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-hang", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    send_text(&fx, "s-hang", "go").await;
+    // The turn opens and streams content, then hangs (no result ever).
+    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+        matches!(ev, AgentEvent::TurnStarted { .. })
+    })
+    .await;
+
+    fx.manager
+        .command("s-hang", AgentCommand::Interrupt)
+        .await
+        .expect("interrupt");
+
+    // The CLI (fake) acks the interrupt but sends no result — the watchdog is
+    // the only thing that can end the turn. It fires after the grace (~1.5s).
+    let aborted = wait_for(&mut rx, &mut seen, "watchdog TurnAborted", |ev| {
+        matches!(ev, AgentEvent::TurnAborted { .. })
+    })
+    .await;
+    match &aborted.ev {
+        AgentEvent::TurnAborted { interrupted, .. } => {
+            assert!(interrupted, "the watchdog abort is a structural user stop");
+        }
+        _ => unreachable!(),
+    }
+
+    // The recovered session is idle: opened turns balance ended turns.
+    let replay = fx.manager.attach("s-hang", 0).expect("replay").replay;
+    let (opened, ended) = turn_balance(&replay);
+    assert_eq!(
+        (opened, ended),
+        (1, 1),
+        "the hung turn is closed exactly once: {:#?}",
+        replay
+    );
+}
+
 #[tokio::test]
 async fn permission_deny_with_feedback_continues_turn() {
     let fx = fixture();

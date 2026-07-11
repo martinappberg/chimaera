@@ -184,7 +184,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec,
+    SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
@@ -468,6 +468,11 @@ struct CodexMapper {
     /// Sends captured during the turn/start→turn/started window; flushed as
     /// steers once the turn id arrives (or re-driven if the start fails).
     buffered_sends: Vec<(Value, String)>,
+    /// Interrupt watchdog: ticks remaining before we synthesize the abort the
+    /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
+    /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
+    /// See `INTERRUPT_GRACE_TICKS`.
+    interrupt_grace: Option<u32>,
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
@@ -535,6 +540,7 @@ impl CodexMapper {
             turn_active: false,
             turn_pending: false,
             buffered_sends: Vec::new(),
+            interrupt_grace: None,
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             pending_approvals: HashMap::new(),
@@ -599,6 +605,10 @@ impl CodexMapper {
                     .to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
+                // A fresh turn is a clean slate for the interrupt watchdog: an
+                // interrupt armed against a previous (or idle) state must not
+                // abort this new turn.
+                self.interrupt_grace = None;
                 step.events.push(AgentEvent::TurnStarted {
                     turn_id: self.turn_id.clone(),
                 });
@@ -804,53 +814,64 @@ impl CodexMapper {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                // A turn-end frame arriving AFTER the interrupt watchdog already
+                // closed this turn must NOT emit a second end (symmetry with
+                // claude on_result's `was_active` guard).
+                let was_active = self.turn_active;
                 self.turn_active = false;
-                let turn = &frame["params"]["turn"];
-                let mut usage = self.last_usage.clone();
-                usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
-                let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
-                if turn["status"] == "interrupted" {
-                    // status "interrupted" only follows a turn/interrupt RPC —
-                    // codex's wire carries the user-stop fact structurally.
-                    step.events.push(AgentEvent::TurnAborted {
-                        turn_id,
-                        reason: "interrupted".into(),
-                        interrupted: true,
-                    });
-                    // The user stopped: drop everything queued behind this turn
-                    // (mirrors claude's is_error queue drop) so a late steer
-                    // can't resurrect a queued message as a fresh turn.
-                    step.events.extend(self.drain_queued_sends());
-                } else {
-                    step.events
-                        .push(AgentEvent::TurnCompleted { turn_id, usage });
+                if was_active {
+                    let turn = &frame["params"]["turn"];
+                    let mut usage = self.last_usage.clone();
+                    usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
+                    let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
+                    if turn["status"] == "interrupted" {
+                        // status "interrupted" only follows a turn/interrupt RPC
+                        // — codex's wire carries the user-stop fact structurally.
+                        step.events.push(AgentEvent::TurnAborted {
+                            turn_id,
+                            reason: "interrupted".into(),
+                            interrupted: true,
+                        });
+                        // The user stopped: drop everything queued behind this
+                        // turn (mirrors claude's is_error queue drop) so a late
+                        // steer can't resurrect a queued message as a fresh turn.
+                        step.events.extend(self.drain_queued_sends());
+                    } else {
+                        step.events
+                            .push(AgentEvent::TurnCompleted { turn_id, usage });
+                    }
+                    // Refresh rate-limit telemetry once per turn (account/read
+                    // is the extension's source; tolerated if absent).
+                    let id = self.rpc_id();
+                    self.pending_rpcs
+                        .insert(id, PendingRpc::AccountRead { report: false });
+                    step.outbound.push(json!({
+                        "id": id, "method": "account/read",
+                        "params": { "refreshToken": false },
+                    }));
                 }
                 self.reset_turn_state();
-                // Refresh rate-limit telemetry once per turn (account/read
-                // is the extension's source; tolerated if absent).
-                let id = self.rpc_id();
-                self.pending_rpcs
-                    .insert(id, PendingRpc::AccountRead { report: false });
-                step.outbound.push(json!({
-                    "id": id, "method": "account/read",
-                    "params": { "refreshToken": false },
-                }));
             }
             "turn/failed" => {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                // Same `was_active` guard as turn/completed: a turn already
+                // closed by the watchdog must not fail a second time.
+                let was_active = self.turn_active;
                 self.turn_active = false;
-                step.events.push(AgentEvent::TurnAborted {
-                    turn_id: self.turn_id.clone(),
-                    reason: frame["params"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or("turn failed")
-                        .to_string(),
-                    interrupted: false,
-                });
-                // The turn died: its queue dies with it (claude parity).
-                step.events.extend(self.drain_queued_sends());
+                if was_active {
+                    step.events.push(AgentEvent::TurnAborted {
+                        turn_id: self.turn_id.clone(),
+                        reason: frame["params"]["error"]["message"]
+                            .as_str()
+                            .unwrap_or("turn failed")
+                            .to_string(),
+                        interrupted: false,
+                    });
+                    // The turn died: its queue dies with it (claude parity).
+                    step.events.extend(self.drain_queued_sends());
+                }
                 // A failed turn must reset per-turn state exactly like a
                 // completed one — else the safety notice stays suppressed and
                 // stream/location maps leak into the next turn.
@@ -871,6 +892,9 @@ impl CodexMapper {
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
+        // The turn ended on its own — the interrupt watchdog has nothing left
+        // to abort (a real turn is never double-aborted by it).
+        self.interrupt_grace = None;
         // Approvals only ever reference items of the current turn; keeping
         // these forever is unbounded growth over a long session.
         self.item_locations.clear();
@@ -1875,6 +1899,12 @@ impl CodexMapper {
                 }
             }
             AgentCommand::Interrupt => {
+                // Arm the watchdog: "no active turn to interrupt" is a benign
+                // no-op on the app-server, and a wedged turn may never emit
+                // turn/completed, so `tick` synthesizes the abort if no real
+                // turn end lands within the grace — the user's escape from a
+                // stuck-running state. A real turn end disarms it first.
+                self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
                 let id = self.rpc_id();
                 self.pending_rpcs.insert(id, PendingRpc::Interrupt);
                 step.outbound.push(json!({
@@ -2020,6 +2050,38 @@ impl CodexMapper {
         }
         step
     }
+
+    /// The interrupt watchdog (see `INTERRUPT_GRACE_TICKS`). When the grace
+    /// armed on `Interrupt` expires with a turn still open — the app-server
+    /// never emitted `turn/completed`, so the session would stay "running"
+    /// forever — synthesize the abort it owed: emit `TurnAborted{interrupted}`
+    /// and drop the queue (mirrors the turn/completed `interrupted` path). A
+    /// real turn end disarms the grace first, so a live turn is never
+    /// double-aborted; idle-guarded, so interrupting nothing stays a no-op.
+    fn interrupt_watchdog(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        let Some(remaining) = self.interrupt_grace else {
+            return step;
+        };
+        if remaining > 1 {
+            self.interrupt_grace = Some(remaining - 1);
+            return step;
+        }
+        self.interrupt_grace = None;
+        if !self.turn_active {
+            // Interrupt while idle is a benign no-op — nothing to abort.
+            return step;
+        }
+        self.turn_active = false;
+        step.events.push(AgentEvent::TurnAborted {
+            turn_id: self.turn_id.clone(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        step.events.extend(self.drain_queued_sends());
+        self.reset_turn_state();
+        step
+    }
 }
 
 /// Harness adapter: the inherent methods above ARE the state machine; these
@@ -2042,7 +2104,11 @@ impl Mapper for CodexMapper {
         self.drain_pending()
     }
     fn tick(&mut self) -> DriverStep {
-        self.expire_questions(std::time::Instant::now())
+        let mut step = self.expire_questions(std::time::Instant::now());
+        let watchdog = self.interrupt_watchdog();
+        step.events.extend(watchdog.events);
+        step.outbound.extend(watchdog.outbound);
+        step
     }
 }
 
@@ -2396,6 +2462,113 @@ mod tests {
             "must not redrive a queued message after a user stop: {:?}",
             step.outbound
         );
+    }
+
+    /// The interrupt watchdog (two-driver symmetry with claude): when the
+    /// app-server never emits turn/completed after an interrupt (wedged turn,
+    /// or the benign no-op interrupt), the grace expires and the driver
+    /// synthesizes the abort so the user escapes a stuck-running state.
+    #[test]
+    fn interrupt_watchdog_aborts_a_hung_turn_after_the_grace() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        // A message queued behind the (soon-hung) turn.
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS - 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no abort before the grace expires"
+            );
+        }
+        assert!(m.turn_active, "still running until the grace fires");
+
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "the watchdog aborts the hung turn as a user stop: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "the queue drops with the watchdog abort: {:?}",
+            step.events
+        );
+        assert!(!m.turn_active, "the turn is closed");
+        assert!(m.tick().events.is_empty(), "watchdog fires exactly once");
+
+        // A late real turn/completed for the same turn must NOT double-abort —
+        // the was_active guard suppresses the second end.
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "a late real turn end after the watchdog must not double-abort: {:?}",
+            step.events
+        );
+    }
+
+    /// A real turn/completed{interrupted} landing before the grace disarms the
+    /// watchdog, so a genuine turn is never double-aborted.
+    #[test]
+    fn real_turn_end_disarms_the_interrupt_watchdog() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "the real interrupt ends the turn: {:?}",
+            step.events
+        );
+        assert!(m.interrupt_grace.is_none(), "the watchdog is disarmed");
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no double abort after a real turn end"
+            );
+        }
+    }
+
+    /// Interrupt pressed while idle is a no-op: the grace expires without an
+    /// abort (there is no turn to stop).
+    #[test]
+    fn interrupt_while_idle_is_a_watchdog_no_op() {
+        let mut m = mapper();
+        assert!(!m.turn_active);
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "an idle interrupt never fabricates an abort"
+            );
+        }
+        assert!(!m.turn_active);
     }
 
     #[test]
