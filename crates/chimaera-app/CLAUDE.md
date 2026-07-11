@@ -40,7 +40,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
 | `wsl.rs` | The WSL2 engine: registry-first detection, hardened wsl.exe spawns, provision/spawn/probe/stop, the wizard's state machine (pure parts unit-tested on any host; e2e via wsl-smoke). |
 | `assets/setup.html` | The Windows first-run wizard (shell-local page — no daemon origin exists yet to serve the real UI). |
-| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Unix-socket transport is unix-only; the Windows TCP/interop variant is a planned milestone. |
+| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Transport: unix socket (unix) / token-gated loopback TCP fed through a WSL-interop wrapper (windows, installed by `wsl::wire_connect`). |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
 | `update.rs` | The auto-updater intent chain (consume-once, expiry). |
 | `menu.rs` | The menu bar. |

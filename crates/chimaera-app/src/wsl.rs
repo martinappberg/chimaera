@@ -272,8 +272,8 @@ mod imp {
     }
 
     /// `wsl -d <distro> --exec /bin/sh -c <script>` — POSIX sh, never the
-    /// user's login shell.
-    async fn run_script(
+    /// user's login shell. `pub(super)` for the e2e smoke's assertions.
+    pub(super) async fn run_script(
         distro: &str,
         script: &str,
         stdin_bytes: Option<Vec<u8>>,
@@ -455,7 +455,10 @@ mod imp {
 
     /// The Windows `ensure_local_daemon`: adopt a healthy daemon in the
     /// chosen (or default) distro, applying the same build-parity decision
-    /// policy as unix/connect; else provision + spawn + poll.
+    /// policy as unix/connect; else provision + spawn + poll. On success the
+    /// same distro is wired for remote hosts (ControlMaster ssh + the
+    /// askpass wrapper) — best-effort, because a wiring failure must not
+    /// take local sessions down with it.
     pub async fn ensure_daemon(
         distro: Option<String>,
         progress: &(dyn Fn(&str) + Send + Sync),
@@ -465,7 +468,18 @@ mod imp {
             Some(d) if report.state == WslState::Ready => d,
             _ => return Err(anyhow::Error::new(WslNotReady(report))),
         };
+        let local = ensure_inner(&distro, progress).await?;
+        if let Err(e) = wire_connect(&distro).await {
+            tracing::warn!("could not wire remote-connect through {distro}: {e:#}");
+        }
+        Ok(local)
+    }
 
+    async fn ensure_inner(
+        distro: &str,
+        progress: &(dyn Fn(&str) + Send + Sync),
+    ) -> anyhow::Result<LocalDaemon> {
+        let distro = distro.to_string();
         progress("checking");
         if let Some(m) = probe(&distro).await {
             let local_build = chimaera_core::BUILD_ID;
@@ -517,6 +531,109 @@ mod imp {
             "the daemon did not come up in {distro} within 15s — check \
              ~/.chimaera/logs/serve.log inside the distro"
         )
+    }
+
+    /// Wire remote-host support through the distro (idempotent, re-run on
+    /// every successful ensure): the ControlMaster socket dir, the askpass
+    /// wrapper script with the relay's port + token baked in, the
+    /// `SSH_ASKPASS` env that crosses into WSL via `WSLENV`, and the
+    /// chimaera-remote command transport. This is what turns `connect` on —
+    /// ssh runs INSIDE the distro (Linux OpenSSH has the ControlMaster
+    /// multiplexing Win32-OpenSSH lacks), prompts ride interop back to the
+    /// Windows shell.
+    async fn wire_connect(distro: &str) -> anyhow::Result<()> {
+        let home_out = run_script(distro, "echo \"$HOME\"", None, SCRIPT_TIMEOUT).await?;
+        let home = decode_wsl_output(&home_out.stdout).trim().to_string();
+        if home.is_empty() || !home.starts_with('/') {
+            bail!("could not resolve $HOME in {distro}");
+        }
+
+        // ssh creates ControlMaster sockets under this dir but never the dir
+        // itself; chimaera-remote points ControlPath here under the transport.
+        run_script(
+            distro,
+            "mkdir -p \"$HOME/.chimaera/cm\"",
+            None,
+            SCRIPT_TIMEOUT,
+        )
+        .await?;
+
+        if let Some((port, token)) = crate::askpass::relay_endpoint() {
+            let exe = std::env::current_exe().context("resolve current executable")?;
+            let exe_wsl = windows_path_in_wsl(&exe);
+            // The prompt travels on stdin end to end (ssh → script arg →
+            // helper stdin): interop's Linux-argv→Windows-cmdline marshaling
+            // is unverified for arbitrary prompt text, so only fixed tokens
+            // ride argv. Missing exe / disabled interop exits 0 with no
+            // output — ssh gets an empty answer and fails cleanly.
+            let script = format!(
+                "#!/bin/sh\n\
+                 # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
+                 exe='{exe_wsl}'\n\
+                 [ -x \"$exe\" ] || exit 0\n\
+                 {{ printf '%s %s\\n' '{port}' '{token}'; printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
+            );
+            let out = run_script(
+                distro,
+                "cat > \"$HOME/.chimaera/askpass.sh\" && chmod 700 \"$HOME/.chimaera/askpass.sh\"",
+                Some(script.into_bytes()),
+                SCRIPT_TIMEOUT,
+            )
+            .await?;
+            if !out.status.success() {
+                bail!(
+                    "failed to install the askpass wrapper in {distro}: {}",
+                    decode_wsl_output(&out.stderr).trim()
+                );
+            }
+            // Values are distro-side paths/strings passed verbatim — no /p
+            // path-translation flags. ssh children of every wsl.exe we spawn
+            // inherit these through WSLENV.
+            std::env::set_var("SSH_ASKPASS", format!("{home}/.chimaera/askpass.sh"));
+            std::env::set_var("SSH_ASKPASS_REQUIRE", "force");
+            extend_wslenv(&["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]);
+        } else {
+            tracing::warn!("askpass relay not listening — password/2FA hosts will fail cleanly");
+        }
+
+        chimaera_remote::set_wsl_transport(Some(chimaera_remote::WslTransport {
+            distro: distro.to_string(),
+            home,
+        }));
+        Ok(())
+    }
+
+    /// `C:\Users\x\chimaera.exe` → `/mnt/c/Users/x/chimaera.exe`: how the
+    /// wrapper script inside the distro addresses the Windows helper.
+    fn windows_path_in_wsl(path: &std::path::Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/' {
+            format!("/mnt/{}{}", s[..1].to_ascii_lowercase(), &s[2..])
+        } else {
+            s
+        }
+    }
+
+    /// Add `vars` to `WSLENV` (colon-separated) so they cross into every
+    /// wsl.exe child, preserving whatever was already listed.
+    fn extend_wslenv(vars: &[&str]) {
+        let mut parts: Vec<String> = std::env::var("WSLENV")
+            .map(|v| {
+                v.split(':')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for v in vars {
+            let listed = parts
+                .iter()
+                .any(|p| p == v || p.starts_with(&format!("{v}/")));
+            if !listed {
+                parts.push(v.to_string());
+            }
+        }
+        std::env::set_var("WSLENV", parts.join(":"));
     }
 
     /// Explicit update: stop whatever runs (the affordance says what it
@@ -743,6 +860,22 @@ mod e2e {
         // Re-ensure must adopt, not respawn (same port = same daemon).
         let again = ensure_daemon(None, &progress).await.expect("re-ensure");
         assert_eq!(again.port, local.port, "second ensure adopted the daemon");
+
+        // wire_connect ran on the ensure path: the ControlMaster socket dir
+        // for the ssh-in-WSL transport must exist in the distro. (The full
+        // askpass interop chain needs the installed app exe — real-hardware
+        // territory, not reproducible from a test binary.)
+        let report = detect();
+        let distro = report.default_distro.expect("ready distro");
+        let cm = imp::run_script(
+            &distro,
+            "test -d \"$HOME/.chimaera/cm\"",
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("check cm dir");
+        assert!(cm.status.success(), "connect wiring created ~/.chimaera/cm");
 
         // wsl --shutdown kills the VM (users run it routinely); the engine
         // must detect the dead daemon and bring a fresh one up.

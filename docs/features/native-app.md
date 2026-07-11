@@ -96,16 +96,21 @@ app-build` (never the root `cargo`).
   normal event (health-check + re-adopt/respawn); adoption always requires the token health
   handshake (a bare TCP accept can be a stranger's port under NAT forwarding). Verified live by
   the `wsl-smoke` workflow — a real WSL2 Ubuntu on a Windows runner runs the full
-  provision→spawn→session→shutdown→revive loop. **Not yet on Windows:** remote-host `connect`
-  and the askpass relay (the next milestone); the site deliberately doesn't advertise the
+  provision→spawn→session→shutdown→revive loop. **Remote hosts:** `connect`'s ssh runs INSIDE
+  the distro (`chimaera_remote::WslTransport` — Linux OpenSSH has the ControlMaster mux
+  Win32-OpenSSH lacks), and password/2FA prompts ride a distro-side `SSH_ASKPASS` wrapper →
+  WSL interop → `chimaera.exe --askpass` → a token-gated loopback TCP relay back to the shell
+  (`wsl::wire_connect` installs all of it on every successful daemon ensure). The interop
+  prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
   Windows download until then.
 
 ## Status: partial
 
 - The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
   discovery pass — treat it as under-documented.
-- **Windows is beta**: local WSL2 sessions only; `connect` + askpass land next. Wizard flow
-  verified in CI + visually, not yet hand-driven on retail Windows hardware.
+- **Windows is beta**: engine + connect transport + askpass relay are implemented and
+  CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
+  retail Windows hardware.
 
 ---
 

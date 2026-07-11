@@ -38,11 +38,88 @@ use tokio::process::{Child, Command};
 /// app's master never collides with the real app's. A normal home is
 /// unaffected — it keeps `data_dir()/cm/%C`.
 fn control_path() -> String {
+    if let Some(t) = wsl_transport() {
+        return wsl_control_path(&t.home);
+    }
     let dir = control_dir(&chimaera_core::data_dir());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
     }
     dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// On Windows every ssh/scp runs INSIDE the WSL2 distro that hosts the local
+/// daemon: `connect`'s whole architecture rides on ControlMaster, which
+/// Win32-OpenSSH does not implement — Linux OpenSSH in the distro does. The
+/// shell wires this once the distro is known; `None` (always, on unix) means
+/// spawn the system ssh directly.
+#[derive(Clone, Debug)]
+pub struct WslTransport {
+    /// The distro whose ssh (and daemon) we ride.
+    pub distro: String,
+    /// The distro-side `$HOME`, anchoring the ControlMaster sockets — a
+    /// socket ssh creates inside the distro cannot live on a Windows path.
+    pub home: String,
+}
+
+static WSL_TRANSPORT: std::sync::RwLock<Option<WslTransport>> = std::sync::RwLock::new(None);
+
+pub fn set_wsl_transport(t: Option<WslTransport>) {
+    *WSL_TRANSPORT.write().unwrap_or_else(|p| p.into_inner()) = t;
+}
+
+fn wsl_transport() -> Option<WslTransport> {
+    WSL_TRANSPORT
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The ssh/scp process builder, transport-aware. `--exec` bypasses the
+/// distro's login shell; env the ssh children need (`SSH_ASKPASS` et al)
+/// crosses the boundary via `WSLENV`, which the shell exports.
+fn transport_command(program: &str) -> Command {
+    match wsl_transport() {
+        Some(t) => {
+            let mut c = Command::new("wsl.exe");
+            c.args(["-d", &t.distro, "--exec", program]);
+            // CREATE_NO_WINDOW: a windowless GUI parent otherwise flashes a
+            // console per spawned child.
+            #[cfg(windows)]
+            c.creation_flags(0x0800_0000);
+            c
+        }
+        None => Command::new(program),
+    }
+}
+
+/// ssh runs inside the distro, so its ControlMaster socket must live on a
+/// distro-side path (the shell `mkdir -p`s the dir when wiring the
+/// transport). Deliberately the same `~/.chimaera/cm` an in-distro `connect`
+/// would use: the app and the distro share one authenticated master per
+/// host. Pure so the shape is testable without touching the global.
+fn wsl_control_path(home: &str) -> String {
+    format!("{home}/.chimaera/cm/%C")
+}
+
+/// How a local file path is spelled for a process inside WSL (`C:\x\y` →
+/// `/mnt/c/x/y`) — scp's "local" side runs in the distro under the transport.
+pub fn local_path_for_scp(path: &std::path::Path) -> String {
+    if wsl_transport().is_none() {
+        return path.to_string_lossy().into_owned();
+    }
+    windows_path_as_wsl(&path.to_string_lossy())
+}
+
+/// The pure conversion behind [`local_path_for_scp`]: drive-letter absolute
+/// paths become `/mnt/<drive>/…`; anything else passes through untouched.
+fn windows_path_as_wsl(s: &str) -> String {
+    let s = s.replace('\\', "/");
+    if s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/' {
+        format!("/mnt/{}{}", s[..1].to_ascii_lowercase(), &s[2..])
+    } else {
+        s
+    }
 }
 
 /// The ControlMaster socket DIRECTORY for a given state dir: `<data_dir>/cm`
@@ -110,7 +187,7 @@ fn ssh_opts() -> [String; 14] {
 /// flag-heavy invocations where the destination must come last
 /// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
 fn ssh_base() -> Command {
-    let mut c = Command::new("ssh");
+    let mut c = transport_command("ssh");
     c.args(ssh_opts());
     c
 }
@@ -129,7 +206,7 @@ fn ssh_cmd(host: &str) -> Command {
 /// reuses the connection the probe already authenticated instead of prompting
 /// again.
 fn scp_cmd() -> Command {
-    let mut c = Command::new("scp");
+    let mut c = transport_command("scp");
     c.args(ssh_opts());
     c
 }
@@ -1058,7 +1135,9 @@ async fn deploy_binary(
     tracing::info!("installing {} on {host} ({})", path.display(), home.dir());
     ssh_run(host, &format!("mkdir -p {}", home.bin_dir())).await?;
     let output = scp_cmd()
-        .arg(path)
+        // Under the WSL transport scp itself runs in the distro, so the
+        // "local" side must be spelled as a /mnt path.
+        .arg(local_path_for_scp(path))
         .arg(format!("{host}:{}", home.scp_staged_bin()))
         .output()
         .await
@@ -1306,6 +1385,26 @@ mod tests {
             "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev-app/data",
         ));
         assert_ne!(other, deep);
+    }
+
+    /// The WSL transport's path vocabulary, pure halves only (the global
+    /// transport switch is never flipped in tests — other tests exercise the
+    /// direct-ssh path concurrently).
+    #[test]
+    fn wsl_transport_path_spelling() {
+        // scp's "local" side runs in the distro: drive-letter absolutes
+        // become /mnt paths, spaces survive, non-drive paths pass through.
+        assert_eq!(
+            windows_path_as_wsl(r"C:\Users\First Last\bin\chimaera.exe"),
+            "/mnt/c/Users/First Last/bin/chimaera.exe"
+        );
+        assert_eq!(windows_path_as_wsl(r"D:\x"), "/mnt/d/x");
+        assert_eq!(windows_path_as_wsl("/already/unixy"), "/already/unixy");
+        // The in-distro master socket: same ~/.chimaera/cm shape an
+        // in-distro connect uses, comfortably under the sun_path cap.
+        let cp = wsl_control_path("/home/someuser");
+        assert_eq!(cp, "/home/someuser/.chimaera/cm/%C");
+        assert!(cp.len() <= 100);
     }
 
     #[test]
