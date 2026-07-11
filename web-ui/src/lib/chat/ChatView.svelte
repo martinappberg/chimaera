@@ -83,13 +83,13 @@
    *  picker values ("opus[1m]"), catalog resolvedModel
    *  ("claude-opus-4-8[1m]"), and the BARE api id assistant messages report
    *  ("claude-opus-4-8") — match all three, preferring named entries over
-   *  "Default (recommended)" (both resolve to the same model). Before the
-   *  first turn the "default" entry IS the truth. */
+   *  "Default (recommended)" (both resolve to the same model). While the real
+   *  model is not yet known (store.model === null, before init/ready resolves)
+   *  this is undefined so the header shows a neutral loading chip — NOT a
+   *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived.by(() => {
     const target = store.model;
-    if (target === null) {
-      return store.models.find((m) => m.id === "default") ?? store.models[0];
-    }
+    if (target === null) return undefined;
     const exact = store.models.find((m) => m.id === target || m.resolved === target);
     if (exact !== undefined) return exact;
     const norm = (s: string) => s.replace(/\[[^\]]*\]$/, "");
@@ -475,6 +475,38 @@
     }
   });
 
+  // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
+  // ticks each second. Kept in the VIEW, never the reducer/journal —
+  // performance.now() must not leak into replay. The $effect captures the start
+  // when store.running flips true and tears down its interval when the turn ends
+  // or the component unmounts, so no interval outlives its turn.
+  let turnElapsedMs = $state(0);
+  $effect(() => {
+    if (!store.running) {
+      turnElapsedMs = 0;
+      return;
+    }
+    const start = performance.now();
+    turnElapsedMs = 0;
+    const iv = setInterval(() => {
+      turnElapsedMs = performance.now() - start;
+    }, 1000);
+    return () => clearInterval(iv);
+  });
+  /** Upward "1h 2m 13s"-style elapsed, leading zero-units dropped: "7s",
+   *  "1m 04s", "1h 02m 03s". Null below 5s so quick turns stay uncluttered. */
+  const turnElapsedLabel = $derived.by(() => {
+    const total = Math.floor(turnElapsedMs / 1000);
+    if (total < 5) return null;
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    if (h > 0) return `${h}h ${pad(m)}m ${pad(s)}s`;
+    if (m > 0) return `${m}m ${pad(s)}s`;
+    return `${s}s`;
+  });
+
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
 
   /** Render list: consecutive tool blocks coalesce into one ToolGroup so a
@@ -683,6 +715,9 @@
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
         </span>
         <span class="status-label">{activityLabel}</span>
+        {#if turnElapsedLabel !== null}
+          <span class="status-elapsed">{turnElapsedLabel}</span>
+        {/if}
       </div>
     {/if}
 
@@ -1024,6 +1059,13 @@
   /* Ellipsis that breathes with the spark, without layout shift. */
   .status-label::after {
     content: "…";
+  }
+  /* Elapsed counter: a still, muted number beside the pulsing label (only
+     appears past 5s). No animation — reduced-motion safe by construction. */
+  .status-elapsed {
+    font-family: var(--mono, monospace);
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--muted) 80%, transparent);
   }
   @keyframes spark-pulse {
     0%,

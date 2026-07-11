@@ -131,6 +131,10 @@ export type ChatBlock =
       status: "pending" | "in_progress" | "completed" | "failed";
       content: ToolContent | null;
       denied: boolean;
+      /** The user answered this tool's permission prompt with an allow option
+       *  (claude `allow_*`, codex `accept*`) — distinct from a plain completion
+       *  so the card can read "allowed" rather than dumping the command. */
+      allowed: boolean;
       /** Live output streamed ahead of the authoritative result. */
       streaming: boolean;
     }
@@ -459,6 +463,7 @@ export class ChatStore {
             status: ev.status as "pending" | "in_progress",
             content: null,
             denied: false,
+            allowed: false,
             streaming: false,
           });
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
@@ -553,6 +558,14 @@ export class ChatStore {
         const req = this.pending.find((p) => p.requestId === ev.request_id);
         this.pending = this.pending.filter((p) => p.requestId !== ev.request_id);
         const option = ev.option_id as string;
+        // Allow vs deny reads the resolved option's ACP KIND, never the raw id:
+        // claude allows are `allow_*` but codex allows are `accept*`, so the old
+        // id-prefix check silently marked every ALLOWED codex command "denied"
+        // (→ the group counted it "1 command failed"). `cancelled`/`expired` are
+        // synthetic ids with no option entry — fall back to the id check, which
+        // keeps their prior "not allowed" (denied) treatment unchanged.
+        const kind = req?.options.find((o) => o.id === option)?.kind ?? null;
+        const allowed = kind !== null ? kind.startsWith("allow") : option.startsWith("allow");
         if (req !== undefined) {
           // Fold the decision into history as a quiet row — the card itself
           // is overlay-only, and "what did I allow?" must survive a reload.
@@ -561,10 +574,13 @@ export class ChatStore {
             (option === "cancelled" || option === "expired" ? "no longer active" : option);
           this.notice(`${req.title} — ${label}`, "info");
         }
-        if (req?.toolCallId != null && !option.startsWith("allow")) {
+        if (req?.toolCallId != null) {
           const idx = this.toolIndex.get(req.toolCallId);
           const block = idx !== undefined ? this.blocks[idx] : undefined;
-          if (block !== undefined && block.kind === "tool") block.denied = true;
+          if (block !== undefined && block.kind === "tool") {
+            if (allowed) block.allowed = true;
+            else block.denied = true;
+          }
         }
         break;
       }

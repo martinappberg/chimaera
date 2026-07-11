@@ -17,6 +17,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { basename, fsDownload, midTruncate, viewKindFor } from "../previews/files";
+  import { isRemoteHost } from "../net/api";
   import { fsRenameOp } from "../workspace/fsEvents";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
@@ -345,7 +346,9 @@
         },
         { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
         "separator",
-        { label: "Download", onSelect: () => void fsDownload(tab.path) },
+        ...(isRemoteHost()
+          ? [{ label: "Download", onSelect: () => void fsDownload(tab.path) } as ContextMenuEntry]
+          : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
         close,

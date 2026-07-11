@@ -53,8 +53,25 @@ async function json<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** Memoized catalog: repeated ChatView mounts (and the launcher) share ONE
+ *  in-flight/resolved fetch instead of re-hitting GET /agents each time, which
+ *  reflashed the header model chip. `refresh` bypasses it and replaces it (App
+ *  re-probes after the install flow); a rejected fetch is dropped so a transient
+ *  error can't poison later calls. */
+let agentsCache: Promise<AgentInfo[]> | null = null;
+
 /** GET /api/v1/agents — what this host has, per known agent. */
-export async function listAgents(refresh = false): Promise<AgentInfo[]> {
+export function listAgents(refresh = false): Promise<AgentInfo[]> {
+  if (!refresh && agentsCache !== null) return agentsCache;
+  const pending = fetchAgents(refresh);
+  agentsCache = pending;
+  void pending.catch(() => {
+    if (agentsCache === pending) agentsCache = null;
+  });
+  return pending;
+}
+
+async function fetchAgents(refresh: boolean): Promise<AgentInfo[]> {
   const body = await json<unknown>(await api(`/agents${refresh ? "?refresh=true" : ""}`));
   if (!Array.isArray(body)) return [];
   return body.flatMap((raw): AgentInfo[] => {
