@@ -9,7 +9,7 @@
  * base64 up to 2 MB against a ~5 MB sessionStorage quota.
  */
 
-import type { ImageAttachment } from "./Composer.svelte";
+import type { ImageAttachment } from "./images";
 
 export interface Draft {
   text: string;
