@@ -46,7 +46,18 @@ selection references (see [terminals.md](terminals.md)).
 
 ## OS-desktop file drops
 
-- **What & when.** Drop a file from the desktop/Finder onto a live-session pane. The daemon that
+- **What & when.** Drop a file from the desktop/Finder onto a live-session pane (uploads into
+  the session's uploads dir + references the path) OR onto a **file-manager folder** — a Finder
+  column or a FILES-tree directory — which uploads the file **into that folder** on the daemon.
+  The folder target wins over the session pane it may sit inside. The daemon that owns the
+  session/window receives the bytes, so an agent (or a shell) on a remote host can read a file
+  you dragged from your laptop. Folder uploads go through `POST /api/v1/fs/upload?dir=&name=`
+  (`upload::upload_to_dir`), stream the same way, cap per-file at 32 MB, then bump the fs epoch
+  so the tree/Finder re-list. In-app **move between folders** is done via copy/cut/paste (a
+  pointer-drag folder-move is a follow-up); dragging files **out to the desktop** is punted —
+  the pointer-drag stack plus remote-over-tunnel bytes make it not worth it in two of three
+  runtimes; the per-row Download menu covers remote→local retrieval.
+- **What & when (session pane).** Drop a file onto a live-session pane. The daemon that
   owns the session receives the bytes and the path is referenced in that session — so an agent (or
   a shell) on a remote host can read a file you dragged from your laptop.
 - **How it's used.** Drag a file over the app; a whole live-session pane lights as the

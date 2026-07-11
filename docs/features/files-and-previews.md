@@ -31,38 +31,57 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   "File management" below). Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!)
   and a recolored name; a collapsed dir containing changes shows a rollup dot.
 
-## File management (create / rename / delete / download)
+## File management (create / rename / copy / paste / delete / download)
 
 - **What & when.** Right-click anywhere files show — tree rows, the tree background, Finder
   entries, Finder column backgrounds, file-backed pane tabs — for New File…/New Folder…,
-  Rename…, Download, Copy Path, and Delete…. The FILES section header also carries
-  new-file/new-folder buttons targeting the workspace root.
+  Copy/Cut/Paste, Rename…, Download (remote only), Copy Path, and Delete…. The FILES section
+  header also carries new-file/new-folder buttons targeting the workspace root.
 - **How it's used.** Creates are **inline**, VS Code-style: an editable row appears in place;
   the typed name may nest (`a/b/c.txt` creates the intermediate folders). A created file opens
-  immediately. Rename swaps the row (or tab label) for an input with the stem preselected;
-  renaming a *terminal/chat tab* pins the session name instead (the "master name" pattern —
-  see [workbench.md](workbench.md)). Delete always confirms in a modal (permanent — no
-  server-side trash). Download streams a single file as-is, a folder as `<name>.zip`; it works
-  identically against a remote daemon (the window's origin *is* the ssh tunnel).
+  immediately (pinned). Rename swaps the row (or tab label) for an input with the stem
+  preselected; renaming a *terminal/chat tab* pins the session name instead (the "master name"
+  pattern — see [workbench.md](workbench.md)). **Copy/Cut/Paste** works from the menu and from
+  ⌘/Ctrl+C/X/V while a tree row or Finder is focused (scoped so terminals keep their own
+  copy): paste runs a server-side copy/move (bytes never round-trip the browser), copies get a
+  macOS "name copy" sibling on collision, a cut row dims until it lands (Escape clears it), and
+  a cut into the same folder is a no-op. Files can also be **dragged from the OS desktop** onto
+  a Finder column or a FILES-tree folder to upload into it (see
+  [drag-drop-and-uploads.md](drag-drop-and-uploads.md)). Delete always confirms in a modal
+  (permanent — no server-side trash). Download streams a single file as-is (forced via the
+  anchor `download` attribute so it never navigates the native webview), a folder as
+  `<name>.zip`; it is **hidden on local workspaces** (the file already lives on this machine)
+  and shown only on remote ones, where the window's origin *is* the ssh tunnel.
+- **Symlinks.** A symlinked file/dir renders with an italic name and a small alias-arrow badge,
+  its `→ target` on hover; navigation still resolves the target (a symlinked dir opens it). A
+  **broken (dangling) symlink** is now visible — err-tinted, refuses to open — so it can be
+  renamed or deleted (both act on the link itself, never its target).
 - **Where it lives.** UI: `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the one
   right-click menu), `shared/ConfirmDialog.svelte`, `shared/fsNames.ts` (name validation +
-  stem preselect), `workspace/fsEvents.ts` (the mutation bus). Daemon: `fs.rs` handlers
-  `create`/`rename`/`delete` + `crates/chimaera-server/src/download.rs`.
-- **Routes.** `POST /api/v1/fs/create {path, kind:"file"|"dir"}` (makes parents; 409 if the
-  target exists), `POST /api/v1/fs/rename {from, to}` (409 on existing target; symlink-safe —
-  parents are canonicalized, the leaf never resolved; case-only renames allowed; cross-device
-  moves refused), `POST /api/v1/fs/delete {path}` (recursive; refuses `/` and `$HOME`), all
-  bearer-authed. Downloads ride the ticket pattern: `POST /api/v1/fs/ticket` now accepts
+  stem preselect), `workspace/fsEvents.ts` (the mutation bus), `workspace/fileClipboard.svelte.ts`
+  (the in-app file clipboard + paste). Daemon: `fs.rs` handlers
+  `create`/`rename`/`copy`/`move`/`delete` + `crates/chimaera-server/src/download.rs`.
+- **Routes.** `POST /api/v1/fs/create {path, kind}` (makes parents; 409 if the target exists),
+  `POST /api/v1/fs/rename {from, to}` (409 on existing target; symlink-safe; case-only renames
+  allowed; cross-device moves refused), `POST /api/v1/fs/copy {from, to, on_conflict?}`
+  (recursive; symlinks recreated as links, never followed; `unique` picks a free "name copy"
+  sibling; refuses copying a dir into its own subtree; 250k-entry ceiling), `POST /api/v1/fs/move
+  {from, to}` (rename, falling back to a guarded copy+delete across filesystems; refuses `$HOME`
+  and dir-into-itself), `POST /api/v1/fs/delete {path}` (recursive; refuses `/` and `$HOME`),
+  all bearer-authed. `fs/list` entries now carry `symlink`/`target`/`broken` (additive, absent
+  on older daemons). Downloads ride the ticket pattern: `POST /api/v1/fs/ticket` accepts
   directories too, and the unauthenticated `GET /download/{ticket}` streams a file (with
   `Content-Disposition: attachment`, RFC 5987 unicode names) or a zip built on the fly
   (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool; symlinks never
   followed; 250k-entry ceiling aborts loudly). `/raw/{ticket}` stays file-only.
 - **Key behaviors.** Every mutation bumps the client `fsEpoch` (tree + Finder re-list from any
   surface's change) and nudges `git::mark_path_dirty`. App subscribes to `lastFsMutation`:
-  a rename **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
+  a rename/move **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
   `rewriteTabPaths` in `layout/layout.ts`); a delete closes tabs under the path and retargets
-  Finders to the parent (`pruneDeletedPath`). A file tab's Rename is disabled while the file
-  has unsaved edits. Escape cancels any inline input; blur commits a non-empty valid name.
+  Finders to the parent (`pruneDeletedPath`). A slow (remote) listing shows a delayed spinner —
+  a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. A file tab's
+  Rename is disabled while the file has unsaved edits. Escape cancels any inline input; blur
+  commits a non-empty valid name.
 
 ## Raw reads & lightweight editing
 

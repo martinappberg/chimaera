@@ -68,8 +68,19 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   open anywhere, that tab is focused). Middle-click or `×` closes a tab (**detaches the view —
   never kills the session**). `Mod+Alt+[`/`]` cycle tabs. Drag a tab to reorder within a bar,
   move to another pane, tear off into a split, or slam a **window edge** to split the whole window.
-- **Where it lives.** `web-ui/src/lib/layout/layout.ts` (`splitPane`, `openTab`, `detachTab`,
-  `tabKey`, `moveTabToIndex`/`dropTab`/`dropTabAtRootEdge`), `dnd.ts` (custom pointer DnD),
+  A **pane grip** (a small window icon) fades in at the top-left of the tab strip on hover; drag
+  it to move the **whole pane** (all its tabs) to another split — center merges, edges tear a
+  split, a window edge re-roots. It hides when the window has one pane or the pane is zoomed.
+- **Preview (italic) tabs.** File opens are **preview** tabs, VS Code-style: the name renders
+  italic, opening another file **replaces** the one preview slot per pane (so single-clicking
+  through files doesn't pile up tabs), and it **pins** (non-italic, permanent) on a
+  double-click of the tab or the tree row, on any edit (a dirty file auto-pins so an unsaved
+  edit can't be replaced away), or on a tab move/reorder. Tree single-click = preview, tree
+  double-click / a created file = pinned; chat/quick-open/terminal-link/Finder opens = preview.
+  The preview flag persists in the layout blob (`pv:1`, additive).
+- **Where it lives.** `web-ui/src/lib/layout/layout.ts` (`splitPane`, `openFile`/`pinTab`/
+  `pinPaths`, `detachTab`, `tabKey`, `moveTabToIndex`/`dropTab`/`dropTabAtRootEdge`,
+  `movePane`/`movePaneToRootEdge`/`movePaneToIndex`), `dnd.ts` (custom pointer DnD),
   `SplitNode.svelte`/`Pane.svelte`/`PaneTabs.svelte`.
 - **Key behaviors.** Ratio clamps to `[0.05, 0.95]` and a 120px minimum during drag; divider
   drags are rAF-throttled and **gate terminal refits** (`pool.setDragging`) to avoid reflow
