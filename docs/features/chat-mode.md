@@ -185,3 +185,18 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   `-p stream-json`, so state is derived from events, not hooks).
 - **Do not change (without care):** the `agents.defaultView` lever and the protocol-authoritative
   rule.
+
+### Plan approval + deny-with-feedback — why they exist
+_Captured 2026-07-10 (from the maintainer)._
+
+- **Problem it solves:** chat mode is meant to be "a fully functioning working version of the chat
+  UI, so that people don't have to use the wonky TUI most of the time. But for that we can't leave
+  features out." Plan approval and deny-with-feedback were the two highest-leverage permission-UX
+  gaps vs the official vendor UIs; closing them is feature-parity work, not new invention —
+  "Parity!" is the whole rationale for deny-with-feedback.
+- **How settled it is:** parity with the official clients is the promise — option wording, wire
+  shapes (`updatedInput.userFeedback`/`userComments`, `interrupt:false` denials), and two-driver
+  symmetry follow the vendors' own semantics (PROTOCOL.md pass 8). The card layouts themselves are
+  **additions** — improvable like the rest of the chat chrome.
+- **Do not change (without care):** the parity direction — when the official UIs and chimaera's
+  permission UX diverge, the gap is a bug to close, not a place to invent different behavior.
