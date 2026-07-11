@@ -17,7 +17,7 @@ import { SessionSocket } from "./ws";
 import { registerPathLinks, type LinkContext, type PathKind } from "./links";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
 import { isMac } from "../shared/keys";
-import { writeClipboard } from "../net/native";
+import { copyText } from "../shared/clipboard";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
@@ -209,24 +209,11 @@ function scheduleFit(entry: PoolEntry): void {
  * terminal's OWN selection: xterm keeps its selection off the DOM, so the
  * browser's native copy grabs nothing. copyOnSelect is the separate
  * as-you-select convenience; this is the explicit-chord path.
+ *
+ * All writes go through shared/clipboard's `copyText` — native-shell first
+ * (WKWebView rejects non-gesture `navigator.clipboard` writes), browser
+ * fallback second.
  */
-/**
- * Copy to the OS clipboard, native-shell first. WKWebView rejects
- * `navigator.clipboard.writeText` from a NON-gesture callback (an agent's OSC 52,
- * a selection change) with NotAllowedError — so on a remote window (app-only)
- * those copies silently failed. `writeClipboard` routes through the Rust process
- * (no gesture gate) inside the shell, and returns false in a plain browser, where
- * we fall back to `navigator.clipboard` (Chromium allows a focused-document write).
- */
-async function copyText(text: string): Promise<void> {
-  if (await writeClipboard(text)) return;
-  try {
-    await navigator.clipboard?.writeText(text);
-  } catch {
-    // clipboard unavailable (denied, or no gesture in a plain browser) — nothing more to do
-  }
-}
-
 function registerTerminalClipboard(term: Terminal): void {
   term.parser.registerOscHandler(52, (data) => {
     const semi = data.indexOf(";");

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from "../shared/clipboard";
   import type { ChatBlock, ToolContent } from "./store.svelte";
 
   interface Props {
@@ -45,6 +46,27 @@
     if (!block.streaming || block.content === null) return;
     void block.content.text;
     bodyEl?.scrollTo({ top: bodyEl.scrollHeight });
+  });
+
+  // Copy the plain-text output body (the same string the pre renders — a
+  // truncated block copies what the UI has; the trunc note is visible).
+  let copied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | null = null;
+  function copyOutput() {
+    const text = block.content?.kind === "output" ? (block.content.text ?? "") : "";
+    if (text === "") return;
+    void copyText(text).then((ok) => {
+      if (!ok) return;
+      copied = true;
+      if (copiedTimer !== null) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => {
+        copiedTimer = null;
+        copied = false;
+      }, 1400);
+    });
+  }
+  $effect(() => () => {
+    if (copiedTimer !== null) clearTimeout(copiedTimer);
   });
 </script>
 
@@ -108,22 +130,68 @@
     ></span>
   </div>
   {#if open && hasBody && block.content !== null}
-    <div class="body" bind:this={bodyEl}>
+    <!-- .body scrolls; the wrapper is the non-scrolling anchor the copy
+         button pins to, so it never rides away with the content. -->
+    <div class="body-wrap">
+      <div class="body" bind:this={bodyEl}>
+        {#if block.content.kind === "output"}
+          <pre>{block.content.text}</pre>
+          {#if block.streaming}
+            <span class="cursor" aria-hidden="true"></span>
+          {/if}
+          {#if block.content.truncated}
+            <span class="trunc">output truncated</span>
+          {/if}
+        {:else if block.content.kind === "diff"}
+          {@render diff(block.content)}
+        {:else if block.content.kind === "batch"}
+          {@const diffs = block.content.diffs ?? []}
+          {#each diffs as d, i (i)}
+            {@render diff(d, i === 0 || diffs[i - 1].path !== d.path)}
+          {/each}
+        {/if}
+      </div>
       {#if block.content.kind === "output"}
-        <pre>{block.content.text}</pre>
-        {#if block.streaming}
-          <span class="cursor" aria-hidden="true"></span>
-        {/if}
-        {#if block.content.truncated}
-          <span class="trunc">output truncated</span>
-        {/if}
-      {:else if block.content.kind === "diff"}
-        {@render diff(block.content)}
-      {:else if block.content.kind === "batch"}
-        {@const diffs = block.content.diffs ?? []}
-        {#each diffs as d, i (i)}
-          {@render diff(d, i === 0 || diffs[i - 1].path !== d.path)}
-        {/each}
+        <button
+          class="copy"
+          class:copied
+          aria-label={copied ? "copied" : "copy output"}
+          title={copied ? "copied" : "copy output"}
+          onclick={copyOutput}
+        >
+          {#if copied}
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M3.5 8.5l3 3 6-6.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          {:else}
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <rect
+                x="6"
+                y="6"
+                width="7.5"
+                height="7.5"
+                rx="1.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+              />
+              <path
+                d="M4 10h-.5A1.5 1.5 0 0 1 2 8.5v-5A1.5 1.5 0 0 1 3.5 2h5A1.5 1.5 0 0 1 10 3.5V4"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+          {/if}
+        </button>
       {/if}
     </div>
   {/if}
@@ -238,6 +306,9 @@
   .denied {
     box-shadow: inset 2px 0 0 color-mix(in srgb, var(--err) 60%, transparent);
   }
+  .body-wrap {
+    position: relative;
+  }
   .body {
     border-top: 1px solid var(--edge);
     padding: 6px 10px;
@@ -245,6 +316,36 @@
     overflow: auto;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+  }
+  /* Hover-reveal copy, pinned over the scrolling body (the .loc/.rewind-btn
+     hover language; scrim keeps it legible over scrolled text). Collapsed
+     rows never render it, so the quiet card stays quiet. */
+  .copy {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4px;
+    background: color-mix(in srgb, var(--term-bg) 82%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .body-wrap:hover .copy,
+  .copy:focus-visible,
+  .copy.copied {
+    opacity: 1;
+  }
+  .copy:hover,
+  .copy.copied {
+    color: var(--accent);
   }
   pre {
     margin: 0;
