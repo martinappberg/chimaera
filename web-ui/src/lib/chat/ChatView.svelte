@@ -5,8 +5,7 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer } from "./composerBus";
-  import { ChatSocket } from "./chatWs";
-  import { ChatStore } from "./store.svelte";
+  import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
@@ -36,23 +35,15 @@
 
   let { session, focused, terminals = [], onOpenFile, onOpenPath }: Props = $props();
 
-  const store = new ChatStore();
-  // The component is {#key}ed on session id by its parent: one instance, one
-  // session, one socket — the initial capture is the contract.
+  // The component is {#key}ed on session id by its parent: one instance per
+  // session. The store + socket come from the session-keyed chat pool, so a
+  // tab switch (which remounts this component) reuses the warm store and the
+  // open socket instead of re-fetching the whole journal. Release keeps them
+  // warm; the pool disposes them when the session ends or toggles to a PTY.
   // svelte-ignore state_referenced_locally
-  const socket = new ChatSocket(session.id, {
-    onReady: (info, replayFrom, head) => store.onReady(info, replayFrom, head),
-    onEvent: (entry) => store.apply(entry),
-    onDegraded: () => (store.degraded = true),
-    onExited: (status) => (store.exited = { status }),
-    onError: (message) => (store.fatalError = message),
-    // A refused command is a notice, not a dead pane — the socket keeps
-    // reconnecting and the user keeps their transcript.
-    onCommandFailed: (message) => store.notice(message, "error"),
-    onDisconnected: () => store.onDisconnected(),
-    lastSeq: () => store.lastSeq,
-  });
-  onDestroy(() => socket.close());
+  const { store, socket } = acquireChat(session.id);
+  // svelte-ignore state_referenced_locally
+  onDestroy(() => releaseChat(session.id));
 
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
@@ -73,7 +64,10 @@
   });
 
   let transcriptEl = $state<HTMLElement | null>(null);
-  let atBottom = $state(true);
+  // Seed scroll intent from the pool so a remount restores the reading
+  // position instead of snapping to the bottom.
+  // svelte-ignore state_referenced_locally
+  let atBottom = $state(chatScroll(session.id).atBottom);
   let menu = $state<"model" | "mode" | "effort" | "mcp" | null>(null);
 
   /** Model picker: the agent's own catalog (claude initialize.models /
@@ -126,11 +120,26 @@
     const el = transcriptEl;
     if (el === null) return;
     atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    // Persist into the pool so the next remount restores this position.
+    saveChatScroll(session.id, el.scrollTop, atBottom);
   }
 
   function scrollToBottom() {
     transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
   }
+
+  // On (re)mount, restore the saved reading position: bottom-pinned sessions
+  // stick to the bottom, otherwise jump back to where the user was reading.
+  $effect(() => {
+    const el = transcriptEl;
+    if (el === null) return;
+    const saved = chatScroll(session.id);
+    void tick().then(() => {
+      if (transcriptEl === null) return;
+      if (saved.atBottom) scrollToBottom();
+      else transcriptEl.scrollTop = saved.scrollTop;
+    });
+  });
 
   // Stick to the bottom while new content streams, unless the user scrolled
   // up to read history. Guarded on atBottom so a background stream never forces
@@ -476,18 +485,18 @@
   });
 
   // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
-  // ticks each second. Kept in the VIEW, never the reducer/journal —
-  // performance.now() must not leak into replay. The $effect captures the start
-  // when store.running flips true and tears down its interval when the turn ends
-  // or the component unmounts, so no interval outlives its turn.
+  // ticks each second. The START is held in the chat pool (per session), so
+  // switching away mid-turn and back keeps counting from the real turn start
+  // instead of resetting — and performance.now() never leaks into replay. The
+  // interval tears down when the turn ends or the component unmounts.
   let turnElapsedMs = $state(0);
   $effect(() => {
-    if (!store.running) {
+    const start = chatTurnStart(session.id, store.running, performance.now());
+    if (start === null) {
       turnElapsedMs = 0;
       return;
     }
-    const start = performance.now();
-    turnElapsedMs = 0;
+    turnElapsedMs = performance.now() - start;
     const iv = setInterval(() => {
       turnElapsedMs = performance.now() - start;
     }, 1000);

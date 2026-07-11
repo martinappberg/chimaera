@@ -169,6 +169,7 @@
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
+  import * as chatPool from "./lib/chat/chatPool";
   import {
     applyRemoteSettings,
     flushSettings,
@@ -587,11 +588,13 @@
     return () => unregisterStage(el);
   });
 
-  // Dispose pooled terminals for sessions that no longer exist.
+  // Dispose pooled terminals AND pooled chat sessions for sessions that no
+  // longer exist (a killed session, a workspace switch).
   $effect(() => {
     const ids = sessions.map((s) => s.id);
     if (!gotSessions) return;
     pool.syncSessions(ids);
+    chatPool.syncChatSessions(new Set(ids));
   });
 
   onMount(() => {
@@ -734,6 +737,7 @@
       setUploadPathInserter(null);
       events.close();
       pool.disposePool();
+      chatPool.disposeAllChats();
     };
   });
 
@@ -1522,6 +1526,10 @@
   const lastCreatedAt = new Map<string, number>();
 
   function applySessions(list: Session[]): void {
+    // A session being optimistically killed is tombstoned: never re-add it
+    // from an intervening snapshot (the server hasn't finished the stop yet),
+    // so the row can't flicker back before it's really gone.
+    if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
     for (const s of list) {
       if (s.created_at !== 0) lastCreatedAt.set(s.id, s.created_at);
     }
@@ -1535,9 +1543,12 @@
     // A session now running as chat has no PTY: dispose any warm terminal
     // for it in THIS window (every window sees the flip on the bus), so a
     // later toggle back to terminal mounts fresh instead of replaying a
-    // dead socket's screen.
+    // dead socket's screen. Symmetrically, a session now running as a TUI has
+    // no chat driver — drop its pooled chat socket (it flagged `ended` on the
+    // degrade frame and stopped reconnecting; it's dead weight).
     for (const s of list) {
       if (s.ui === "chat") pool.disposeSession(s.id);
+      else if (s.ui === "term") chatPool.disposeChat(s.id);
     }
     // An install session that has exited (gone from the roster, or alive:false)
     // means the catalog may have changed: re-probe so the button reflects it.
@@ -1565,6 +1576,10 @@
    */
   const recentlyCreated = new Map<string, number>();
   const RECENT_MS = 10_000;
+  /** Sessions being optimistically killed: dropped locally at once, tombstoned
+   *  so an in-flight snapshot can't re-add the dying row before the daemon's
+   *  stop completes. Cleared when the kill request resolves. */
+  const killing = new Set<string>();
 
   /**
    * Once both the persisted layout and the first session snapshot are in:
@@ -1979,15 +1994,24 @@
       : `${r.kind} can't resume a finished conversation yet — starts a fresh one`;
   }
 
-  /** Kill the session's process on the daemon and drop it locally. */
+  /** Kill the session's process on the daemon and drop it locally — OPTIMISTIC:
+   *  the row/tab vanishes at once and the ChatView tears down immediately,
+   *  while the daemon's stop + retire-to-recents runs in the background. The
+   *  tombstone keeps an in-flight snapshot from re-adding the dying row, so
+   *  there's no lingering half-dead state, and the recents entry appears once
+   *  (via the recents epoch) instead of the row "popping up weirdly". */
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
+    killing.add(id);
+    chatPool.disposeChat(id); // stop its socket reconnecting right away
+    applySessions(sessions.filter((s) => s.id !== id));
     try {
       await deleteSession(id);
     } catch {
-      // already gone or unreachable; fall through and drop it locally
+      // already gone or unreachable — it's already dropped locally.
+    } finally {
+      killing.delete(id);
     }
-    applySessions(sessions.filter((s) => s.id !== id));
   }
 
   /** End every live session in a workspace — the home-screen "stop". The
@@ -2189,6 +2213,7 @@
       const s = sessions.find((x) => x.id === sessionId);
       if (s !== undefined) s.ui = target;
       if (target === "chat") pool.disposeSession(sessionId);
+      else chatPool.disposeChat(sessionId); // the chat driver is gone now
     } finally {
       switchingViews.update((s) => {
         const next = new Set(s);
