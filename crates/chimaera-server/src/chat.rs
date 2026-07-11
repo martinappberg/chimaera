@@ -41,6 +41,12 @@ pub(crate) struct ChatRecipe {
     pub(crate) workspace_root: PathBuf,
     pub(crate) kind: AgentKind,
     pub(crate) bin: PathBuf,
+    /// The `--version` line the launcher probed for `bin` at resolution
+    /// (`None` = probe failed). Threaded into the driver's `SpawnSpec` so the
+    /// harness can journal it on `Init` and emit the non-fatal drift notice
+    /// when it differs from the driver's `TESTED_*_VERSION`. Carried on the
+    /// recipe so a view-switch/rewind respawn keeps the same provenance.
+    pub(crate) version: Option<String>,
     pub(crate) settings: Option<PathBuf>,
     pub(crate) mcp_config: Option<PathBuf>,
     pub(crate) model: Option<String>,
@@ -545,14 +551,14 @@ async fn resolve_respawn_inputs(
     state: &Arc<AppState>,
     id: &str,
     kind: AgentKind,
-) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf), String> {
+) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf, Option<String>), String> {
     let settings = Some(crate::agents::settings_path(id)).filter(|p| p.exists());
     let mcp_config = Some(crate::agents::mcp_config_path(id)).filter(|p| p.exists());
-    let bin = crate::launcher::detect(state, kind, false)
-        .await
-        .path
-        .map_err(|e| e.to_string())?;
-    Ok((settings, mcp_config, bin))
+    // Take the path and its probed version from the SAME detection so the
+    // respawn's version matches the binary it will actually run.
+    let detection = crate::launcher::detect(state, kind, false).await;
+    let bin = detection.path.map_err(|e| e.to_string())?;
+    Ok((settings, mcp_config, bin, detection.version))
 }
 
 /// Truncate a rewound session's journal at the conversation-fork point.
@@ -804,7 +810,8 @@ async fn perform_switch(
 
     // Resolve every respawn precondition BEFORE killing the old process (see
     // `resolve_respawn_inputs`).
-    let (settings, mcp_config, bin) = resolve_respawn_inputs(state, id, record.kind).await?;
+    let (settings, mcp_config, bin, version) =
+        resolve_respawn_inputs(state, id, record.kind).await?;
     // The claude chat driver needs both per-session files; fail now, not
     // after the kill (spawn_chat_session would otherwise bail post-kill).
     if target_chat
@@ -842,6 +849,7 @@ async fn perform_switch(
             workspace_root: workspace_root.clone(),
             kind: record.kind,
             bin: bin.clone(),
+            version: version.clone(),
             settings: settings.clone(),
             mcp_config: mcp_config.clone(),
             model: None,
@@ -855,6 +863,7 @@ async fn perform_switch(
             workspace_root,
             kind: record.kind,
             bin,
+            version,
             settings,
             mcp_config,
             model: None,
@@ -933,10 +942,11 @@ pub(crate) async fn rewind_session(
     // Resolve every respawn precondition BEFORE the kill (same discipline as
     // the view switch): a post-kill failure would strand the session. Rewind
     // is claude-only, which needs both per-session files.
-    let (settings, mcp_config, bin) = match resolve_respawn_inputs(&state, &id, record.kind).await {
-        Ok(inputs) => inputs,
-        Err(msg) => return err(StatusCode::CONFLICT, msg),
-    };
+    let (settings, mcp_config, bin, version) =
+        match resolve_respawn_inputs(&state, &id, record.kind).await {
+            Ok(inputs) => inputs,
+            Err(msg) => return err(StatusCode::CONFLICT, msg),
+        };
     if settings.is_none() || mcp_config.is_none() {
         return err(
             StatusCode::CONFLICT,
@@ -986,6 +996,7 @@ pub(crate) async fn rewind_session(
             workspace_root,
             kind: record.kind,
             bin,
+            version,
             settings,
             mcp_config,
             model: None,
@@ -1159,6 +1170,11 @@ pub(crate) fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::launcher_context_env();
     spec.pinned_native_id = pinned;
+    // The binary version the launcher resolved alongside `recipe.bin`: the
+    // harness journals it on Init and warns (non-fatally) when it drifts from
+    // the driver's tested pin. `None` when the probe failed — the harness then
+    // simply skips the drift check.
+    spec.agent_version = recipe.version.clone();
 
     // Resuming a finished conversation mints a NEW chimaera session id, and the
     // agents replay no history over the wire — seed the new journal so attach

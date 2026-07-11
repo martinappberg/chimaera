@@ -32,6 +32,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             workspace_root: dir.clone(),
             kind: agents::AgentKind::Claude,
             bin: tui.clone(),
+            version: None,
             settings: Some(settings),
             mcp_config: Some(mcp),
             model: None,
