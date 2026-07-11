@@ -141,10 +141,11 @@
     return { left, top, width, maxH };
   });
 
-  /** Spawn (or install). The default surface is the structured chat UI —
-   *  the row press, "open", and Enter all mean chat; the terminal button
-   *  (or ⌘↵) is the one explicit TUI path. Agents with no chat view open
-   *  their TUI either way. */
+  /** Spawn (or install). A plain row press / Enter follows the STICKY default
+   *  (agents.defaultView); the "open" button, the terminal button, and ⌘↵ are
+   *  explicit surface picks that also become the sticky default. Agents with no
+   *  chat view always open their TUI — but that never flips the user's default.
+   *  `ui` undefined = non-explicit, follow the setting. */
   function activate(i: number, ui?: "chat" | "term"): void {
     const a = agents?.[i];
     if (a === undefined) return;
@@ -154,7 +155,15 @@
       if (a.managedInstall) onInstall(a);
       return;
     }
-    onPick({ agent: a.id, ui: ui ?? (a.chatCapable ? "chat" : "term") });
+    if (!a.chatCapable) {
+      // Always a TUI, but NOT an explicit pick — launching a non-chat agent
+      // must not silently change the default for chat-capable ones.
+      onPick({ agent: a.id, ui: "term", explicit: false });
+      return;
+    }
+    // A concrete ui is a deliberate choice → sticky; undefined follows the
+    // setting (createSession reads agents.defaultView when ui is omitted).
+    onPick({ agent: a.id, ui, explicit: ui !== undefined });
   }
 
   function move(delta: number): void {

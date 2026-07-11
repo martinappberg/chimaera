@@ -173,6 +173,7 @@
     applyRemoteSettings,
     flushSettings,
     loadSettings,
+    setSetting,
   } from "./lib/settings/store.svelte";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
   import {
@@ -1866,11 +1867,18 @@
     }
   }
 
-  /** Every launcher selection becomes the new default agent and spawns. */
+  /** Every launcher selection becomes the new default agent and spawns. An
+   *  EXPLICIT surface pick (the "open"/terminal buttons, ⌘↵) also becomes the
+   *  sticky default view, so the split button and the next plain row press
+   *  follow it until the user picks the other surface again. */
   function launcherPick(pick: LaunchPick): void {
     launcherOpen = false;
     agentDefault = { agent: pick.agent };
     setAgentDefault(agentDefault);
+    if (pick.explicit === true && pick.ui !== undefined) {
+      // The setting's vocabulary is "terminal"; the wire/pick term is "term".
+      setSetting("agents.defaultView", pick.ui === "term" ? "terminal" : "chat");
+    }
     void spawnSession("agent", pick);
   }
 
@@ -1952,11 +1960,16 @@
    *  showing a bare "claude" until a new turn regenerates one. */
   function openRecent(r: RecentConvo): void {
     const titleHint = r.title !== "" ? r.title : undefined;
+    // Reopen in the SURFACE it last ran on (TUI vs chat). Null (old entries,
+    // scanned transcripts) leaves `ui` undefined so createSession falls back
+    // to the launcher's sticky default. createSession's own guards
+    // (claude/codex-only + chatCapable) keep a "chat" row honest.
+    const ui = r.ui ?? undefined;
     void spawnSession(
       "agent",
       r.resume !== null
-        ? { agent: r.kind, resume: r.resume, titleHint }
-        : { agent: r.kind, titleHint },
+        ? { agent: r.kind, resume: r.resume, titleHint, ui }
+        : { agent: r.kind, titleHint, ui },
     );
   }
 

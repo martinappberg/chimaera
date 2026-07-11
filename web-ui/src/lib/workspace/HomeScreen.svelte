@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import BrandMark from "../shared/BrandMark.svelte";
   import { keyHint } from "../shared/keybindings";
-  import { needsAttention, type Session, type Workspace } from "./sessions";
+  import { isBusy, needsAttention, type Session, type Workspace } from "./sessions";
   import {
     addHost,
     beginUpdate,
@@ -130,8 +130,10 @@
     }
   }
 
-  /** Current live sessions on the daemon serving this window. */
-  const liveNow = $derived(sessions.filter((s) => s.alive).length);
+  /** Sessions doing ACTIVE work right now (a shell running a command, an agent
+   *  mid-turn). Idle sessions restore cleanly across a stateful daemon
+   *  restart, so only these are worth warning about before an update. */
+  const busyNow = $derived(sessions.filter(isBusy).length);
 
   const PHASE_LABEL: Record<ConnectProgress["phase"], string> = {
     probing: "probing for a running daemon…",
@@ -317,6 +319,13 @@
     return ` (ends ${n} session${n === 1 ? "" : "s"})`;
   }
 
+  /** The note beside the LOCAL daemon update button. A stateful restart brings
+   *  every session back, so idle ones aren't a warning — only genuinely BUSY
+   *  work (a command running, an agent mid-turn) is interrupted. */
+  function updateNote(busy: number): string {
+    return busy === 0 ? "" : ` (${busy} busy will restart)`;
+  }
+
   function mapWithout<K, V>(map: Map<K, V>, key: K): Map<K, V> {
     const next = new Map(map);
     next.delete(key);
@@ -384,7 +393,7 @@
         <div class="update-line" title={buildNote(localState.build)}>
           <span>daemon is an older build —</span>
           <button class="update-act" disabled={localUpdating} onclick={() => void updateLocal()}>
-            {localUpdating ? "updating…" : `update${endsLabel(liveNow)}`}
+            {localUpdating ? "updating…" : `update${updateNote(busyNow)}`}
           </button>
         </div>
         {#if localError !== null}

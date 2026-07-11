@@ -88,4 +88,10 @@
     color: var(--muted);
     opacity: 0.75;
   }
+
+  /* An idle shell (alive, at the prompt): a calm, present dot — distinctly not
+     the "active" accent, and a touch stronger than the exited/unknown muting. */
+  .sglyph.idle {
+    color: var(--muted);
+  }
 </style>
