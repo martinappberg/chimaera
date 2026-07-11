@@ -403,6 +403,16 @@ export function openFinder(l: Layout, path: string): { layout: Layout; id: strin
   return { layout: openTab(l, { surface: "finder", id, path }), id };
 }
 
+/**
+ * A Finder tab NOT yet in any layout — the drag payload for a directory
+ * (tree rows drag dirs as Finders, so a zone/tab drop opens a legitimate
+ * browsing surface instead of a broken file preview). Each call mints a
+ * fresh instance id, matching openFinder's never-dedupe semantics.
+ */
+export function freshFinderTab(path: string): FinderTab {
+  return { surface: "finder", id: uid(), path };
+}
+
 /** The Finder instance with `id`, and where it lives, if open. */
 export function findFinder(
   l: Layout,

@@ -65,6 +65,10 @@
   /** A link-intent drag (from the link icon) hovering anywhere in this agent
    *  pane: the whole view lights up as one target. */
   const linkPane = $derived(dropSpot?.kind === "linkpane" && dropSpot.paneId === node.id);
+  /** An OS-desktop file drag hovering this live-session pane: the whole pane
+   *  is the upload-and-reference target (HTML5 dnd — no tile gesture to
+   *  partition against). */
+  const uploadPane = $derived(dropSpot?.kind === "upload" && dropSpot.paneId === node.id);
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -232,6 +236,16 @@
          opens a tab, never submits. Visibly distinct from the adopt zone. -->
     <div class="drop-ref">
       <span class="drop-ref-label"><span class="drop-ref-at">@</span> reference</span>
+    </div>
+  {/if}
+
+  {#if uploadPane}
+    <!-- OS-desktop drop: uploads to the session's host, then types the
+         path — same "@ reference" grammar, whole pane as the target. -->
+    <div class="drop-upload">
+      <span class="drop-ref-label"
+        ><span class="drop-ref-at">@</span> drop to upload &amp; reference</span
+      >
     </div>
   {/if}
 </section>
@@ -423,6 +437,23 @@
   .drop-linkpane.hued {
     background: hsl(var(--band-hue) 55% 55% / 0.14);
     border-color: hsl(var(--band-hue) 55% 55% / 0.6);
+  }
+
+  /* OS-desktop file drop: the whole pane is the upload-and-reference target
+     (HTML5 dnd has no competing tile gesture to partition against), so the
+     "@ reference" band recipe washes the entire view instead of a bottom band. */
+  .drop-upload {
+    position: absolute;
+    z-index: 7;
+    inset: 0;
+    margin: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1.5px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+    border-radius: 8px;
+    pointer-events: none;
   }
 
   .band-label {

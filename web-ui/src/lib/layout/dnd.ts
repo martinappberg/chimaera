@@ -15,8 +15,14 @@ export type DropSpot =
   | { kind: "zone"; paneId: string; zone: Zone }
   | { kind: "tab"; paneId: string; index: number }
   | { kind: "edge"; edge: Side }
-  /** The "@ reference" band over a session pane's bottom (file drags only). */
+  /** The "@ reference" band over a session pane's bottom (path-carrying
+   *  drags — file previews and Finder/dir payloads; see DragPayload.refPath). */
   | { kind: "ref"; paneId: string }
+  /** A whole session pane lit as the target of an OS-DESKTOP file drag
+   *  (HTML5 dnd, not a pointer drag: there is no competing tile gesture, so
+   *  the full pane is the drop zone). Produced by App's window drop handlers,
+   *  never by spotAt. */
+  | { kind: "upload"; paneId: string }
   /** The "link to agent" band over an agent pane's input area — a plain
    *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }
@@ -35,6 +41,12 @@ export interface DragPayload {
   /** The surface being dragged (terminal session or file preview). */
   tab: Tab;
   label: string;
+  /**
+   * Absolute path this payload can REFERENCE. Its presence is what arms the
+   * "@ reference" band — payloads opt in explicitly (file previews and
+   * Finder/dir drags do) instead of dnd hard-coding surfaces.
+   */
+  refPath?: string;
 }
 
 /** Layout mutations the pane tree invokes; implemented by App. */
@@ -152,6 +164,21 @@ export function paneRootEl(paneId: string): HTMLElement | null {
   return paneRegs.get(paneId)?.root ?? null;
 }
 
+/**
+ * The pane whose root contains the viewport point (x, y), if any. OS-desktop
+ * file drops (HTML5 dnd — outside the pointer-drag machinery above) hit-test
+ * with this against the same registered pane geometry.
+ */
+export function paneIdAt(x: number, y: number): string | null {
+  for (const [paneId, reg] of paneRegs) {
+    const r = reg.root.getBoundingClientRect();
+    if (r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+      return paneId;
+    }
+  }
+  return null;
+}
+
 export interface DragCallbacks {
   /** Current drop spot under the pointer (null when over nothing). */
   onSpot(spot: DropSpot | null): void;
@@ -162,8 +189,9 @@ export interface DragCallbacks {
   onEnd(): void;
   /**
    * Context bridge: true when `paneId` currently shows a live session, so a
-   * FILE drag over it grows the "@ reference" band along its bottom. Omitted
-   * (or false) for non-file drags — the band never appears for tab moves.
+   * path-carrying drag (file or Finder/dir) over it grows the "@ reference"
+   * band along its bottom. Only consulted when the payload sets `refPath` —
+   * the band never appears for plain tab moves.
    */
   acceptsRef?(paneId: string): boolean;
 }
@@ -480,9 +508,9 @@ export function startDrag(
     // capture can fail if the pointer is already gone; drag still works
   }
 
-  // The reference band only exists for FILE drags (the payload is the gate;
-  // the callback decides per-pane whether a live session sits there).
-  const refFor = payload.tab.surface === "file" ? (cb.acceptsRef?.bind(cb) ?? null) : null;
+  // The reference band only exists for path-carrying drags (refPath is the
+  // gate; the callback decides per-pane whether a live session sits there).
+  const refFor = payload.refPath !== undefined ? (cb.acceptsRef?.bind(cb) ?? null) : null;
 
   const update = () => {
     raf = 0;
