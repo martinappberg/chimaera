@@ -643,6 +643,96 @@ export function pruneFiles(l: Layout, dead: ReadonlySet<string>): Layout {
   return pruneTabs(l, (t) => t.surface !== "file" || !dead.has(t.path));
 }
 
+/** True when `p` is `prefix` itself or lies under it. */
+function underPath(p: string, prefix: string): boolean {
+  return p === prefix || p.startsWith(`${prefix}/`);
+}
+
+/** Containing directory of an absolute path ("/" at the top). */
+function parentPath(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i > 0 ? p.slice(0, i) : "/";
+}
+
+/**
+ * Rewrite every path-keyed tab after an fs rename: file and diff tabs at or
+ * under `from` follow to `to` (prefix-aware — a dir rename carries its open
+ * descendants), and Finder tabs retarget their navigation path the same way.
+ * A rewrite can collide with an already-open tab of the target path; dedupe
+ * by tabKey (first in walk order wins), panes emptied by the dedupe collapse.
+ */
+export function rewriteTabPaths(l: Layout, from: string, to: string): Layout {
+  const move = (p: string): string => (underPath(p, from) ? to + p.slice(from.length) : p);
+  const mapTab = (t: Tab): Tab => {
+    if (t.surface !== "file" && t.surface !== "diff" && t.surface !== "finder") return t;
+    const p = move(t.path);
+    return p === t.path ? t : { ...t, path: p };
+  };
+  const seen = new Set<string>();
+  const walk = (node: LayoutNode): LayoutNode | null => {
+    if (node.type === "pane") {
+      let changed = false;
+      const tabs: Tab[] = [];
+      for (const t of node.tabs) {
+        const next = mapTab(t);
+        if (next !== t) changed = true;
+        const key = tabKey(next);
+        if (seen.has(key)) {
+          changed = true; // rewrite collided with an open tab: first wins
+          continue;
+        }
+        seen.add(key);
+        tabs.push(next);
+      }
+      if (!changed) return node;
+      if (tabs.length === 0) return null;
+      const activeTab = node.tabs[node.active];
+      const keptActive =
+        activeTab !== undefined
+          ? tabs.findIndex((t) => tabKey(t) === tabKey(mapTab(activeTab)))
+          : -1;
+      const active = keptActive >= 0 ? keptActive : Math.min(node.active, tabs.length - 1);
+      return { ...node, tabs, active };
+    }
+    const a = walk(node.a);
+    const b = walk(node.b);
+    if (a === node.a && b === node.b) return node;
+    if (a === null) return b;
+    if (b === null) return a;
+    return { ...node, a, b };
+  };
+  const root = walk(l.root);
+  if (root === l.root) return l;
+  return normalize({ ...l, root: root ?? emptyPane() });
+}
+
+/**
+ * After an fs delete: file and diff tabs at/under `path` close; a Finder
+ * browsing at/under it retargets to the deleted path's parent instead of
+ * closing — a Miller-columns browser shouldn't vanish because the folder it
+ * was showing did.
+ */
+export function pruneDeletedPath(l: Layout, path: string): Layout {
+  const parent = parentPath(path);
+  const retarget = (node: LayoutNode): LayoutNode => {
+    if (node.type === "pane") {
+      const tabs = node.tabs.map((t) =>
+        t.surface === "finder" && underPath(t.path, path) ? { ...t, path: parent } : t,
+      );
+      return tabs.some((t, i) => t !== node.tabs[i]) ? { ...node, tabs } : node;
+    }
+    const a = retarget(node.a);
+    const b = retarget(node.b);
+    return a === node.a && b === node.b ? node : { ...node, a, b };
+  };
+  const root = retarget(l.root);
+  const retargeted = root === l.root ? l : { ...l, root };
+  return pruneTabs(
+    retargeted,
+    (t) => (t.surface !== "file" && t.surface !== "diff") || !underPath(t.path, path),
+  );
+}
+
 // --- geometric focus navigation -------------------------------------------
 
 interface Rect {
@@ -1039,4 +1129,44 @@ if (import.meta.env.DEV) {
   pr = pruneFiles(pr, new Set(["/tmp/keep.md"]));
   ok(allFilePaths(pr).length === 0, "file prune drops dead file tabs");
   ok(allSessionIds(pr).join() === "s1", "file prune keeps sessions");
+
+  // rename rewrite: a dir rename carries open descendants — file, diff, and
+  // finder tabs all follow the new prefix; unrelated paths are untouched.
+  let rw = defaultLayout();
+  rw = openFile(rw, "/w/proj/src/a.ts");
+  rw = openFile(rw, "/w/other/b.ts");
+  rw = openDiff(rw, "/w/proj/src/a.ts", "unstaged");
+  const rwf = openFinder(rw, "/w/proj/src");
+  rw = rwf.layout;
+  rw = rewriteTabPaths(rw, "/w/proj", "/w/renamed");
+  ok(
+    allFilePaths(rw).sort().join() === "/w/other/b.ts,/w/renamed/src/a.ts",
+    "dir rename rewrites descendant file tabs only",
+  );
+  ok(findFinder(rw, rwf.id)?.tab.path === "/w/renamed/src", "dir rename retargets finders");
+  ok(
+    panes(rw.root).some((p) =>
+      p.tabs.some((t) => t.surface === "diff" && t.path === "/w/renamed/src/a.ts"),
+    ),
+    "dir rename rewrites diff tabs",
+  );
+
+  // a rewrite that collides with an already-open target tab dedupes (first
+  // wins) instead of leaving two tabs with one identity
+  let cd = defaultLayout();
+  cd = openFile(cd, "/w/old.txt");
+  cd = openFile(cd, "/w/new.txt");
+  cd = rewriteTabPaths(cd, "/w/old.txt", "/w/new.txt");
+  ok(allFilePaths(cd).join() === "/w/new.txt", "rewrite collision dedupes by tabKey");
+
+  // delete pruning: file/diff tabs under the path close; a finder browsing
+  // inside it retargets to the parent rather than closing
+  let dl = defaultLayout();
+  dl = openFile(dl, "/w/gone/deep/f.txt");
+  dl = openFile(dl, "/w/stay.txt");
+  const dlf = openFinder(dl, "/w/gone/deep");
+  dl = dlf.layout;
+  dl = pruneDeletedPath(dl, "/w/gone");
+  ok(allFilePaths(dl).join() === "/w/stay.txt", "delete closes file tabs under the path");
+  ok(findFinder(dl, dlf.id)?.tab.path === "/w", "delete retargets finders to the parent");
 }

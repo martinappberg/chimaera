@@ -27,6 +27,15 @@ csv = "1.4.0"
 # Gzip tier for fs/file + fs/table (.gz/.bgz previews). BGZF is standard
 # multi-member gzip, which MultiGzDecoder decodes sequentially.
 flate2 = "1.1"
+# Folder downloads stream a zip: async_zip writes data-descriptor entries to
+# any AsyncWrite (no Seek), so the archive flows through a bounded duplex
+# pipe — never materialized in memory or on disk. Its read side also backs
+# the tests, so no extra dev-dependency.
+async_zip = { version = "0.0.17", default-features = false, features = ["tokio", "deflate"] }
+# ReaderStream bridges plain files and the duplex's read half into an axum
+# body stream (GET /download/{ticket}); compat adapts tokio files onto
+# async_zip's futures-flavored entry writer.
+tokio-util = { version = "0.7", features = ["io", "compat"] }
 
 # macOS-only: foreground-process name/cwd for session display names
 # (proc_pidinfo BSDINFO name / PIDVNODEPATHINFO cwd); Linux reads /proc.

@@ -14,6 +14,7 @@
   import ToolGroup from "./ToolGroup.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
+  import PlanApprovalCard from "./PlanApprovalCard.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
@@ -161,12 +162,13 @@
     return sendNow(text, images);
   }
 
-  function decide(requestId: string, optionId: string, destination?: string) {
+  function decide(requestId: string, optionId: string, destination?: string, feedback?: string) {
     const sent = socket.send({
       type: "permission",
       request_id: requestId,
       option_id: optionId,
       ...(destination !== undefined ? { destination } : {}),
+      ...(feedback !== undefined ? { feedback } : {}),
     });
     // Never lose a decision to a closed socket: the card stays answerable
     // (no resolved event will arrive), so say why nothing happened.
@@ -610,10 +612,19 @@
     {/each}
 
     {#each store.pending as request (request.requestId)}
-      <PermissionCard
-        {request}
-        onDecide={(opt, dest) => decide(request.requestId, opt, dest)}
-      />
+      {#if request.plan !== null}
+        <PlanApprovalCard
+          {request}
+          onDecide={(opt, feedback) => decide(request.requestId, opt, undefined, feedback)}
+          onOpenPath={openProsePath}
+          resolvePaths={resolveProsePaths}
+        />
+      {:else}
+        <PermissionCard
+          {request}
+          onDecide={(opt, dest, feedback) => decide(request.requestId, opt, dest, feedback)}
+        />
+      {/if}
     {/each}
 
     {#each store.questions as request (request.requestId)}

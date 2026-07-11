@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ApiError, getHostLabel } from "../net/api";
   import { openWindow } from "../net/native";
+  import { validateEntryName } from "../shared/fsNames";
   import {
     createWorkspace,
     fsDirs,
@@ -25,7 +26,9 @@
   type Row =
     | { kind: "recent"; ws: Workspace }
     | { kind: "here"; path: string }
-    | { kind: "dir"; dir: DirEntry };
+    | { kind: "dir"; dir: DirEntry }
+    /** The browse-mode "new folder…" affordance (creates in the browsed dir). */
+    | { kind: "newfolder" };
 
   let input = $state("");
   let listing = $state<DirListing | null>(null);
@@ -34,6 +37,7 @@
   let navigated = $state(false);
   let listEl = $state<HTMLDivElement | null>(null);
   let crumbsEl = $state<HTMLDivElement | null>(null);
+  let filterEl = $state<HTMLInputElement | null>(null);
   let busy = false;
 
   const showRecents = $derived(!navigated && input === "" && recents.length > 0);
@@ -118,6 +122,9 @@
     if (here !== null) {
       out.push({ kind: "here", path: here });
       for (const dir of browseDirs) out.push({ kind: "dir", dir });
+      // Browse mode only: create in the directory being browsed (the typed-
+      // path mode has its own create — the flipped top row).
+      if (typedPath === null) out.push({ kind: "newfolder" });
     }
     return out;
   });
@@ -143,6 +150,8 @@
         return row.path;
       case "dir":
         return row.dir.path;
+      case "newfolder":
+        return null; // not a navigable target — Enter enters create mode
     }
   }
 
@@ -218,6 +227,68 @@
     }
   }
 
+  // --- browse-mode "new folder…" (create in the browsed directory) -----------
+  // Unlike the typed-path create (createFolder above, which opens the new
+  // folder as a workspace immediately), this creates and NAVIGATES INTO it —
+  // "open this folder" is then one Enter away, and the user can keep nesting.
+
+  let creating = $state(false);
+  let createDraft = $state("");
+
+  function startCreate(): void {
+    creating = true;
+    createDraft = "";
+  }
+
+  function cancelCreate(): void {
+    creating = false;
+    createDraft = "";
+    filterEl?.focus();
+  }
+
+  async function commitCreate(viaBlur = false): Promise<void> {
+    if (!creating) return;
+    const name = createDraft.trim();
+    if (name === "") {
+      cancelCreate();
+      return;
+    }
+    // Slashes allowed: fsMkdir creates parents, so a/b nests — consistent
+    // with the inline creates in the tree and Finder.
+    const invalid = validateEntryName(name, { allowSlashes: true });
+    if (invalid !== null) {
+      if (viaBlur) cancelCreate();
+      else error = invalid;
+      return;
+    }
+    const base = listing?.path;
+    if (base === undefined || busy) return;
+    busy = true;
+    try {
+      const created = await fsMkdir(`${base === "/" ? "" : base}/${name}`);
+      error = null;
+      creating = false;
+      createDraft = "";
+      filterEl?.focus();
+      await navigate(created); // fresh folder is empty → "open this folder" highlights
+    } catch (e) {
+      error = e instanceof ApiError ? e.message : "could not create folder";
+    } finally {
+      busy = false;
+    }
+  }
+
+  function onCreateKeydown(e: KeyboardEvent): void {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitCreate();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelCreate(); // nulled before blur fires, so blur no-ops
+    }
+  }
+
   async function openNewWindow(path: string | null): Promise<void> {
     if (path === null || busy) return;
     busy = true;
@@ -257,6 +328,11 @@
     } else if (e.key === "Enter") {
       e.preventDefault();
       const row = rows[highlight];
+      // The tail row is a mode switch, with or without modifiers.
+      if (row?.kind === "newfolder") {
+        startCreate();
+        return;
+      }
       // Cmd/Ctrl+Enter always opens the highlighted target as a workspace —
       // creating the folder first when the typed path doesn't exist yet.
       if (e.metaKey || e.ctrlKey) {
@@ -377,6 +453,7 @@
   <div class="panel" role="dialog" aria-modal="true" aria-label="open folder">
     <input
       class="filter"
+      bind:this={filterEl}
       bind:value={input}
       placeholder="filter, or type a path"
       spellcheck="false"
@@ -479,6 +556,44 @@
             {@render newWindow(dir.path)}
           </div>
         {/each}
+        {#if typedPath === null && listing !== null}
+          {@const nfIdx = browseOffset + 1 + browseDirs.length}
+          <div
+            class="rowwrap"
+            role="presentation"
+            class:hl={highlight === nfIdx && !creating}
+            data-idx={nfIdx}
+            onmouseenter={() => (highlight = nfIdx)}
+          >
+            {#if creating}
+              <div class="row creating">
+                <!-- svelte-ignore a11y_autofocus -->
+                <input
+                  class="create-input"
+                  type="text"
+                  placeholder="folder name — a/b nests"
+                  spellcheck="false"
+                  autocomplete="off"
+                  aria-label="new folder name"
+                  bind:value={createDraft}
+                  use:focusOnMount
+                  onkeydown={onCreateKeydown}
+                  onblur={() => void commitCreate(true)}
+                />
+              </div>
+            {:else}
+              <button
+                class="row"
+                tabindex="-1"
+                title={`new folder in ${listing.path}`}
+                onmousedown={keepFocus}
+                onclick={startCreate}
+              >
+                <span class="name here-label create">new folder…</span>
+              </button>
+            {/if}
+          </div>
+        {/if}
         {#if listTruncated}
           <div class="trunc">large folder — showing the first {browseDirs.length}. narrow your filter.</div>
         {/if}
@@ -633,6 +748,30 @@
     text-align: left;
     padding: 6px 8px;
     cursor: pointer;
+  }
+
+  .row.creating {
+    cursor: default;
+    padding: 4px 8px;
+  }
+
+  /* Inline new-folder input, sized like the row text it replaces. */
+  .create-input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: var(--text-md);
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
+    border-radius: 4px;
+    padding: 2px 6px;
+    outline: none;
+  }
+
+  .create-input::placeholder {
+    color: var(--muted);
+    opacity: 0.6;
   }
 
   .name {

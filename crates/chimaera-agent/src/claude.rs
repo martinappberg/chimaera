@@ -39,8 +39,8 @@ use crate::model::{
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-07-07).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.204";
+/// CLI version these frame shapes were verified against (2026-07-10).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.206";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -130,7 +130,10 @@ pub enum PermissionDecision {
     /// `updated_input` echoes (or edits) the tool input; the CLI applies it.
     Allow { updated_input: Value },
     /// `message` is shown to the model as the tool error, so it can react.
-    Deny { message: String },
+    /// `interrupt:true` ABORTS the turn (the bare-deny directive path);
+    /// `interrupt:false` keeps it alive — the feedback-denial path, where
+    /// the message carries the user's reason for the model to react to.
+    Deny { message: String, interrupt: bool },
 }
 
 impl PermissionDecision {
@@ -139,12 +142,18 @@ impl PermissionDecision {
             PermissionDecision::Allow { updated_input } => {
                 json!({ "behavior": "allow", "updatedInput": updated_input })
             }
-            PermissionDecision::Deny { message } => {
-                json!({ "behavior": "deny", "message": message })
+            PermissionDecision::Deny { message, interrupt } => {
+                json!({ "behavior": "deny", "message": message, "interrupt": interrupt })
             }
         }
     }
 }
+
+/// The official extension's deny directive: directive stops beat bare
+/// rejections (the model otherwise retries with a different tool).
+const DENY_DIRECTIVE: &str = "The user doesn't want to proceed with this tool use. \
+    The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the \
+    file). STOP what you are doing and wait for the user to tell you how to proceed.";
 
 // --- probe client (used by the live smoke tests) ----------------------------
 
@@ -383,6 +392,17 @@ async fn await_initialize(stream: &mut JsonlStream) -> std::result::Result<Value
     }
 }
 
+/// A parked can_use_tool request: everything the eventual answer needs.
+struct PendingPermission {
+    /// Tool name — ExitPlanMode answers get plan-approval shaping.
+    tool: String,
+    /// Verbatim input (an allow response must echo it exactly).
+    input: Value,
+    /// permission_suggestions from the request — all types:
+    /// addRules/addDirectories/setMode.
+    suggestions: Vec<Value>,
+}
+
 enum PendingControl {
     SetMode(String),
     SetModel(String),
@@ -435,9 +455,8 @@ struct ClaudeMapper {
     current_stream_msg: Option<String>,
     /// tool_use_id → kind, to choose result rendering; cleared per turn.
     tool_kinds: HashMap<String, ToolKind>,
-    /// Outstanding can_use_tool requests: our request_id → (input,
-    /// permission_suggestions — all types: addRules/addDirectories/setMode).
-    pending_permissions: HashMap<String, (Value, Vec<Value>)>,
+    /// Outstanding can_use_tool requests, keyed by request_id.
+    pending_permissions: HashMap<String, PendingPermission>,
     /// Outstanding AskUserQuestion prompts: request_id → original input
     /// (echoed back inside updatedInput.questions with the answers).
     pending_questions: HashMap<String, Value>,
@@ -1122,6 +1141,10 @@ impl ClaudeMapper {
             }
         }
         let tool_use_id = request["tool_use_id"].as_str().map(String::from);
+        let tool = request["tool_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let input = request["input"].clone();
         // All suggestion types ride "always allow": addRules,
         // addDirectories, setMode (the extension sends the full set back).
@@ -1130,23 +1153,51 @@ impl ClaudeMapper {
             .cloned()
             .unwrap_or_default();
 
-        let mut options = vec![PermissionOption {
-            id: "allow_once".into(),
-            label: "Allow".into(),
-            kind: PermissionOptionKind::AllowOnce,
-        }];
-        if !suggestions.is_empty() {
+        // ExitPlanMode is a plan approval, not a tool permission: the card
+        // shows the plan itself with the official extension's three answers.
+        // "auto-accept edits" resolves as allow + a set_permission_mode
+        // follow-up; "keep planning" is the deny path (comments ride the
+        // feedback-denial message).
+        let (options, plan) = if tool == "ExitPlanMode" {
+            let plan = input["plan"].as_str().map(|p| cap_output(p).0);
+            let options = vec![
+                PermissionOption {
+                    id: "allow_accept_edits".into(),
+                    label: "Yes, and auto-accept edits".into(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOption {
+                    id: "allow_once".into(),
+                    label: "Yes, manually approve".into(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "reject_once".into(),
+                    label: "No, keep planning".into(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ];
+            (options, plan)
+        } else {
+            let mut options = vec![PermissionOption {
+                id: "allow_once".into(),
+                label: "Allow".into(),
+                kind: PermissionOptionKind::AllowOnce,
+            }];
+            if !suggestions.is_empty() {
+                options.push(PermissionOption {
+                    id: "allow_always".into(),
+                    label: "Always allow".into(),
+                    kind: PermissionOptionKind::AllowAlways,
+                });
+            }
             options.push(PermissionOption {
-                id: "allow_always".into(),
-                label: "Always allow".into(),
-                kind: PermissionOptionKind::AllowAlways,
+                id: "reject_once".into(),
+                label: "Deny".into(),
+                kind: PermissionOptionKind::RejectOnce,
             });
-        }
-        options.push(PermissionOption {
-            id: "reject_once".into(),
-            label: "Deny".into(),
-            kind: PermissionOptionKind::RejectOnce,
-        });
+            (options, None)
+        };
 
         let title = request["display_name"]
             .as_str()
@@ -1157,15 +1208,29 @@ impl ClaudeMapper {
         // must echo updatedInput exactly); the PREVIEW is capped so a
         // multi-megabyte Write `content` can't bloat the journaled/replayed
         // event (caps-at-event-construction).
-        let input_preview = cap_preview(&input);
-        self.pending_permissions
-            .insert(request_id.clone(), (input, suggestions));
+        let mut input_preview = cap_preview(&input);
+        if plan.is_some() {
+            // The plan already rides its own (capped) field — carrying it in
+            // the preview too would double-store it in the journal.
+            if let Some(obj) = input_preview.as_object_mut() {
+                obj.remove("plan");
+            }
+        }
+        self.pending_permissions.insert(
+            request_id.clone(),
+            PendingPermission {
+                tool,
+                input,
+                suggestions,
+            },
+        );
         step.events.push(AgentEvent::PermissionRequest {
             request_id,
             tool_call_id: tool_use_id,
             title,
             options,
             input_preview,
+            plan,
         });
     }
 
@@ -1254,6 +1319,7 @@ impl ClaudeMapper {
             title,
             options,
             input_preview: payload.clone(),
+            plan: None,
         });
     }
 
@@ -1602,6 +1668,7 @@ impl ClaudeMapper {
                 request_id,
                 option_id,
                 destination,
+                feedback,
             } => {
                 // Decision dialogs (refusal fallback, Fable overage): the
                 // option id IS the completed result string.
@@ -1619,7 +1686,11 @@ impl ClaudeMapper {
                     });
                     return step;
                 }
-                let Some((input, mut suggestions)) = self.pending_permissions.remove(&request_id)
+                let Some(PendingPermission {
+                    tool,
+                    mut input,
+                    mut suggestions,
+                }) = self.pending_permissions.remove(&request_id)
                 else {
                     // The ask predates this driver process (respawn, toggle,
                     // resume): its reply route died with that process. The
@@ -1638,6 +1709,9 @@ impl ClaudeMapper {
                     });
                     return step;
                 };
+                let feedback = feedback
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty());
                 // The destination cycler: the user's chosen save target
                 // replaces the CLI's suggested one — except on setMode
                 // suggestions, which keep their own (the extension's exact
@@ -1649,6 +1723,22 @@ impl ClaudeMapper {
                         }
                     }
                 }
+                let allowed = option_id.starts_with("allow");
+                // Plan-approval comments ride updatedInput.{userFeedback,
+                // userComments} (the extension's fields). ONLY ExitPlanMode
+                // input takes injected keys — for real tools updatedInput is
+                // the input the CLI executes, and must echo verbatim.
+                let delivered_feedback = if tool == "ExitPlanMode" && allowed {
+                    if let Some(fb) = &feedback {
+                        input["userFeedback"] = json!(fb);
+                        input["userComments"] = json!(fb);
+                    }
+                    feedback.clone()
+                } else if !allowed {
+                    feedback.clone()
+                } else {
+                    None
+                };
                 let response = match option_id.as_str() {
                     "allow_always" if !suggestions.is_empty() => json!({
                         "behavior": "allow",
@@ -1659,23 +1749,50 @@ impl ClaudeMapper {
                         "behavior": "allow",
                         "updatedInput": input,
                     }),
-                    // The official extension's constant: directive stops
-                    // beat bare rejections (the model otherwise retries with
-                    // a different tool).
-                    _ => json!({
-                        "behavior": "deny",
-                        "message": "The user doesn't want to proceed with this tool use. \
-                    The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the \
-                    file). STOP what you are doing and wait for the user to tell you how to proceed.",
-                        "interrupt": true,
-                    }),
+                    // Feedback-denial: the reason rides the deny message and
+                    // interrupt:false keeps the turn alive so the model
+                    // reacts to it in place (the extension's semantics).
+                    _ => match &feedback {
+                        Some(fb) => json!({
+                            "behavior": "deny",
+                            "message": format!("{DENY_DIRECTIVE}\n\nThe user's feedback: {fb}"),
+                            "interrupt": false,
+                        }),
+                        // Bare deny: the directive constant, aborting the turn.
+                        None => json!({
+                            "behavior": "deny",
+                            "message": DENY_DIRECTIVE,
+                            "interrupt": true,
+                        }),
+                    },
                 };
                 step.outbound
                     .push(permission_response_frame(&json!(request_id), response));
+                // "Yes, and auto-accept edits": the mode change is a separate
+                // verified control; its ack lands as ModeChanged.
+                if tool == "ExitPlanMode" && option_id == "allow_accept_edits" {
+                    let id = self.ctl_id();
+                    self.pending_controls
+                        .insert(id.clone(), PendingControl::SetMode("acceptEdits".into()));
+                    step.outbound.push(control_request_frame(
+                        &id,
+                        json!({ "subtype": "set_permission_mode", "mode": "acceptEdits" }),
+                    ));
+                }
                 step.events.push(AgentEvent::PermissionResolved {
                     request_id,
                     option_id,
                 });
+                // Feedback the model actually received is transcript truth —
+                // echo it as the user message it is (replay rebuilds it too).
+                if let Some(fb) = delivered_feedback {
+                    step.events.push(AgentEvent::UserMessage {
+                        text: fb,
+                        attachments: 0,
+                        id: None,
+                        queued: false,
+                    });
+                }
             }
             AgentCommand::Interrupt => {
                 // Recorded so on_result can stamp the abort as user-initiated
@@ -2510,6 +2627,7 @@ mod tests {
             request_id: "req-1".into(),
             option_id: "allow_always".into(),
             destination: None,
+            feedback: None,
         });
         let response = &step.outbound[0]["response"]["response"];
         assert_eq!(response["behavior"], "allow");
@@ -2521,6 +2639,202 @@ mod tests {
                 option_id: "allow_always".into()
             }
         );
+    }
+
+    #[test]
+    fn deny_with_feedback_keeps_turn_alive_and_echoes_user_text() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "rm -rf build" },
+                "tool_use_id": "tu1",
+            },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-1".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("  use `just clean` instead  ".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "deny");
+        assert_eq!(
+            response["interrupt"],
+            json!(false),
+            "feedback-denials must not abort the turn"
+        );
+        let message = response["message"].as_str().unwrap();
+        assert!(message.starts_with(DENY_DIRECTIVE));
+        assert!(message.contains("use `just clean` instead"));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { option_id, .. } if option_id == "reject_once"
+        ));
+        assert_eq!(
+            step.events[1],
+            AgentEvent::UserMessage {
+                text: "use `just clean` instead".into(),
+                attachments: 0,
+                id: None,
+                queued: false,
+            }
+        );
+
+        // A bare deny keeps the aborting directive shape.
+        m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-2",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash",
+                         "input": { "command": "ls" }, "tool_use_id": "tu2" },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-2".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("   ".into()), // whitespace = no feedback
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["message"], DENY_DIRECTIVE);
+        assert_eq!(response["interrupt"], json!(true));
+        assert_eq!(step.events.len(), 1, "no user echo without feedback");
+    }
+
+    #[test]
+    fn exit_plan_mode_maps_to_plan_approval_card() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "control_request",
+            "request_id": "req-p",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "input": { "plan": "## Plan\n1. add the field" },
+                "tool_use_id": "tu-p",
+            },
+        }));
+        match &step.events[0] {
+            AgentEvent::PermissionRequest {
+                options,
+                plan,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(plan.as_deref(), Some("## Plan\n1. add the field"));
+                let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    ["allow_accept_edits", "allow_once", "reject_once"],
+                    "the official plan-approval option set, in order"
+                );
+                assert_eq!(options[0].label, "Yes, and auto-accept edits");
+                assert_eq!(options[1].label, "Yes, manually approve");
+                assert_eq!(options[2].label, "No, keep planning");
+                assert!(
+                    input_preview["plan"].is_null(),
+                    "the plan rides its own field, not the preview too"
+                );
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+
+        // "Yes, and auto-accept edits" with comments: allow echoes the input
+        // plus userFeedback/userComments, and a set_permission_mode follow-up
+        // rides the same step.
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "allow_accept_edits".into(),
+            destination: None,
+            feedback: Some("also update the docs".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(
+            response["updatedInput"]["plan"],
+            "## Plan\n1. add the field"
+        );
+        assert_eq!(
+            response["updatedInput"]["userFeedback"],
+            "also update the docs"
+        );
+        assert_eq!(
+            response["updatedInput"]["userComments"],
+            "also update the docs"
+        );
+        assert_eq!(
+            step.outbound[1]["request"]["subtype"],
+            "set_permission_mode"
+        );
+        assert_eq!(step.outbound[1]["request"]["mode"], "acceptEdits");
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::UserMessage { text, .. } if text == "also update the docs"
+        ));
+        // The follow-up's ack resolves to ModeChanged(acceptEdits).
+        let ctl = step.outbound[1]["request_id"].as_str().unwrap().to_string();
+        let step = m.on_frame(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": ctl, "response": {} },
+        }));
+        assert_eq!(
+            step.events[0],
+            AgentEvent::ModeChanged {
+                mode_id: "acceptEdits".into()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_approval_manual_and_keep_planning_paths() {
+        let plan_request = |id: &str| {
+            json!({
+                "type": "control_request",
+                "request_id": id,
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "ExitPlanMode",
+                    "input": { "plan": "the plan" },
+                    "tool_use_id": "tu-p",
+                },
+            })
+        };
+
+        // "Yes, manually approve": plain allow, no mode follow-up.
+        let mut m = mapper();
+        m.on_frame(&plan_request("req-p"));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "allow_once".into(),
+            destination: None,
+            feedback: None,
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "allow");
+        assert!(
+            response["updatedInput"]["userFeedback"].is_null(),
+            "no comments ⇒ no injected fields"
+        );
+        assert_eq!(step.outbound.len(), 1, "manual approve sets no mode");
+
+        // "No, keep planning" with comments: the feedback-denial shape.
+        let mut m = mapper();
+        m.on_frame(&plan_request("req-p"));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "req-p".into(),
+            option_id: "reject_once".into(),
+            destination: None,
+            feedback: Some("split step 1 into two".into()),
+        });
+        let response = &step.outbound[0]["response"]["response"];
+        assert_eq!(response["behavior"], "deny");
+        assert_eq!(response["interrupt"], json!(false));
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("split step 1 into two"));
     }
 
     #[test]
@@ -2687,6 +3001,7 @@ mod tests {
             request_id: "gone-p".into(),
             option_id: "allow_once".into(),
             destination: None,
+            feedback: None,
         });
         assert!(step.outbound.is_empty());
         assert!(matches!(
@@ -2784,6 +3099,7 @@ mod tests {
             request_id: "req-d".into(),
             option_id: "retry_fallback".into(),
             destination: None,
+            feedback: None,
         });
         let response = &step.outbound[0]["response"]["response"];
         assert_eq!(response["behavior"], "completed");

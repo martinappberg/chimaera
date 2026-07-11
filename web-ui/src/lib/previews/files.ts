@@ -256,6 +256,85 @@ export async function fsRawUrl(path: string): Promise<string> {
 }
 
 /**
+ * Create an empty file or directory (POST /fs/create), making any missing
+ * parents — the inline "new file" input accepts nested a/b/c.txt names.
+ * 409 (already exists) surfaces as ApiError with the server's message.
+ * Resolves to the canonical created path.
+ */
+export async function fsCreate(path: string, kind: "file" | "dir"): Promise<string> {
+  const body = await json<{ path: string }>(
+    await api("/fs/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, kind }),
+    }),
+  );
+  return body.path;
+}
+
+/**
+ * Rename/move a file or directory (POST /fs/rename). `to` is the full new
+ * path; an existing target is a 409 ApiError. Resolves to the canonical new
+ * path. Prefer fsRenameOp (workspace/fsEvents) so open surfaces refresh.
+ */
+export async function fsRename(from: string, to: string): Promise<string> {
+  const body = await json<{ path: string }>(
+    await api("/fs/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, to }),
+    }),
+  );
+  return body.path;
+}
+
+/**
+ * Permanently delete a file or directory (POST /fs/delete; recursive, no
+ * trash). The UI fronts this with an explicit confirmation. Prefer
+ * fsDeleteOp (workspace/fsEvents) so open surfaces refresh.
+ */
+export async function fsDelete(path: string): Promise<void> {
+  const res = await api("/fs/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    let message = `delete failed with status ${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body.error) message = body.error;
+    } catch {
+      // non-JSON error body; keep the generic message
+    }
+    throw new ApiError(res.status, message);
+  }
+}
+
+/**
+ * Download `path` (file or folder) as a browser download: mint a ticket,
+ * then navigate a transient anchor at /download/{ticket}. The server's
+ * Content-Disposition names the file (folders arrive as <name>.zip); an
+ * attachment response never navigates the SPA. Works identically against a
+ * remote daemon — the window's origin IS the ssh tunnel.
+ */
+export async function fsDownload(path: string): Promise<void> {
+  const body = await json<{ ticket: string }>(
+    await api("/fs/ticket", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  );
+  const a = document.createElement("a");
+  a.href = `/download/${body.ticket}`;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/**
  * Cheap existence probe for restore-time pruning. Only a definitive server
  * "no such file" (400/404) counts as dead — an unreachable daemon or an
  * older daemon without the endpoint (405) must never wipe tabs.

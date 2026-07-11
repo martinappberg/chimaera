@@ -3,6 +3,7 @@ mod agents;
 mod api;
 mod assets;
 mod chat;
+mod download;
 mod exec;
 mod fs;
 mod git;

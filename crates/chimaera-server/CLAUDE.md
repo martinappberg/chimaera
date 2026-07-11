@@ -28,7 +28,8 @@ the module you need and read its header doc.
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
 | `git/` | Read-only git, split into `resolve`/`parse`/`service`/`worktree`/`http`: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
-| `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, ranged raw reads, atomic writes, `/raw` tickets). There is no separate `previews` module — previews live here. |
+| `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, ranged raw reads, atomic writes, create/rename/delete for the file-manager menus, `/raw` tickets — tickets may name directories for downloads). There is no separate `previews` module — previews live here. |
+| `download.rs` | `GET /download/{ticket}` — browser downloads via the ticket pattern: files stream as attachments, folders stream a zip built on the fly (bounded memory, symlinks never followed). |
 | `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. |
 

@@ -90,13 +90,30 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
-  captures focus on arrival; Enter = first allow-once, Esc = first reject.
+  captures focus on arrival; Enter = first allow-once, Esc = first reject (or closes the feedback
+  row first when it's open).
+- **Deny with feedback.** Every permission card has a "deny with feedback…" affordance: the typed
+  reason rides the deny so the agent reacts to it instead of aborting. Claude: the reason is
+  appended to the deny directive with `interrupt:false` — the tool errors but the turn runs on;
+  codex: the decline answers the rpc, then the reason steers into the running turn (`turn/steer`).
+  Either way the reason is journaled as a user message (it's transcript truth — the model received
+  it).
+- **Plan approval.** Claude's `ExitPlanMode` renders a dedicated card instead of the generic
+  permission prompt: the plan markdown itself (sanitized, file references clickable) plus the
+  official three answers — "Yes, and auto-accept edits" / "Yes, manually approve" / "No, keep
+  planning" — and an optional comment that rides the decision (approvals:
+  `updatedInput.userFeedback`/`userComments`; keep-planning: the feedback-denial). Auto-accept
+  follows the allow with a `set_permission_mode acceptEdits`, so the mode chip flips with it.
+  Enter (card focused) = auto-accept, Esc = keep planning; Enter inside the comment field is
+  deliberately inert (a comment can accompany any of the three answers).
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
-- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`, `QuestionCard.svelte`;
-  commands `permission` / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
-  / `permission_resolved`, `question_request` / `question_resolved`.
+- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
+  `PlanApprovalCard.svelte`, `QuestionCard.svelte`; commands `permission` (optional `destination`,
+  `feedback`) / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
+  (optional `plan` = the plan-approval marker + markdown) / `permission_resolved`,
+  `question_request` / `question_resolved`. Wire facts: `crates/chimaera-agent/PROTOCOL.md` pass 8.
 
 ## Inline artifacts
 
@@ -183,3 +200,18 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   `-p stream-json`, so state is derived from events, not hooks).
 - **Do not change (without care):** the `agents.defaultView` lever and the protocol-authoritative
   rule.
+
+### Plan approval + deny-with-feedback — why they exist
+_Captured 2026-07-10 (from the maintainer)._
+
+- **Problem it solves:** chat mode is meant to be "a fully functioning working version of the chat
+  UI, so that people don't have to use the wonky TUI most of the time. But for that we can't leave
+  features out." Plan approval and deny-with-feedback were the two highest-leverage permission-UX
+  gaps vs the official vendor UIs; closing them is feature-parity work, not new invention —
+  "Parity!" is the whole rationale for deny-with-feedback.
+- **How settled it is:** parity with the official clients is the promise — option wording, wire
+  shapes (`updatedInput.userFeedback`/`userComments`, `interrupt:false` denials), and two-driver
+  symmetry follow the vendors' own semantics (PROTOCOL.md pass 8). The card layouts themselves are
+  **additions** — improvable like the rest of the chat chrome.
+- **Do not change (without care):** the parity direction — when the official UIs and chimaera's
+  permission UX diverge, the gap is a bug to close, not a place to invent different behavior.

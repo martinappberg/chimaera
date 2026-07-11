@@ -38,6 +38,9 @@ export interface PendingPermission {
   title: string;
   options: PermissionOption[];
   inputPreview: unknown;
+  /** Plan markdown when this is a plan approval (claude ExitPlanMode) —
+   *  non-null ⇒ rendered as the plan-approval card. */
+  plan: string | null;
 }
 
 export interface QuestionOption {
@@ -446,6 +449,7 @@ export class ChatStore {
           title: ev.title as string,
           options: (ev.options as PermissionOption[]) ?? [],
           inputPreview: ev.input_preview,
+          plan: (ev.plan as string) ?? null,
         });
         break;
       case "question_request": {

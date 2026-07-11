@@ -33,7 +33,10 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **What & when.** Browse the daemon's filesystem to open (or create) a folder as a workspace.
 - **How it's used.** `Mod+O`. Opens at `$HOME`; type to filter the current directory or type
   an absolute/`~` path for shell-style tab-completion. When the typed path doesn't exist the
-  top row flips to "create folder". Enter opens here; Cmd/Ctrl+Enter opens in a new window.
+  top row flips to "create folder" (create + open as a workspace in one step). In browse mode
+  a tail **"new folder…"** row swaps to an inline input that creates in the *browsed*
+  directory (`a/b` nests) and navigates into it — "open this folder" is the next Enter.
+  Enter opens here; Cmd/Ctrl+Enter opens in a new window.
 - **Where it lives.** `web-ui/src/lib/workspace/FolderPicker.svelte`; `fsHome`/`fsDirs`/`fsMkdir`
   in `sessions.ts`. Routes: `GET /api/v1/fs/home`, `GET /api/v1/fs/dirs`, `POST /api/v1/fs/mkdir`,
   `POST /api/v1/workspaces`.
@@ -76,6 +79,26 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   drag types its path into a live session — see [drag-drop-and-uploads.md](drag-drop-and-uploads.md),
   which also covers OS-desktop file drops and screenshot paste) and a **"link to agent"** band (a
   terminal drag leashes it — see [linked-terminals.md](linked-terminals.md)).
+
+## Tab context menu & the "master name" rename
+
+- **What & when.** Right-click a pane tab for surface-appropriate actions; renaming is the
+  same *thing-level* rename everywhere — a name change applies to the underlying session or
+  file, never to a per-tab alias.
+- **How it's used.** Terminal/chat tabs: **Rename…** (inline input in the tab) pins the
+  session's display name — the same pin as the rail's double-click/F2 rename and chat's
+  `/rename`, so the tab, rail row, and quick-open all agree. File tabs: **Rename…** renames
+  the file *on disk* (disabled while the file has unsaved edits), plus Reveal in File Tree,
+  Download, Copy Path. Every other surface gets Close. Rail session rows also carry a
+  right-click Rename….
+- **Where it lives.** `PaneTabs.svelte` (`tabMenu`, the inline rename input);
+  `shared/contextMenu.svelte.ts` + `ContextMenuHost.svelte` (the app-wide menu singleton);
+  session rename via `PATCH /api/v1/sessions/{id}` (unchanged), file rename via
+  `POST /api/v1/fs/rename` (see [files-and-previews.md](files-and-previews.md)).
+- **Key behaviors.** The inline input is armored against the tab's capture-phase drag,
+  middle-click close, and double-click zoom; Escape cancels, blur commits a non-empty valid
+  name. A file rename flows through the fs-mutation bus, so the tab (and any diff/Finder tab
+  under a renamed folder) rewrites in place.
 
 ## Zoom, focus mode & keyboard window management
 

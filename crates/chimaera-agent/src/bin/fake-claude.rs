@@ -89,11 +89,23 @@ fn main() {
             // a future non-permission answer (get_settings, title, …) can't
             // corrupt this state machine.
             if frame["response"]["request_id"] == "req-1" {
-                let allowed = frame["response"]["response"]["behavior"] == "allow";
-                finish_turn(allowed);
-                turn_active = false;
+                let response = &frame["response"]["response"];
+                let allowed = response["behavior"] == "allow";
+                let feedback_denial = !allowed && response["interrupt"] == json!(false);
                 if allowed {
-                    // Each queued message runs as its own (trivial) turn.
+                    finish_turn(true);
+                } else if feedback_denial {
+                    // Feedback-denial (live-verified): the tool errors but the
+                    // turn keeps running and ends with a SUCCESS result.
+                    finish_feedback_denial();
+                } else {
+                    finish_turn(false);
+                }
+                turn_active = false;
+                if allowed || feedback_denial {
+                    // A successful turn end (allow, or a feedback-denial that
+                    // keeps the turn running) dequeues each pending message as
+                    // its own trivial turn.
                     while queued > 0 {
                         queued -= 1;
                         emit_success_result();
@@ -233,6 +245,30 @@ fn run_question_turn() {
                 "multiSelect": false,
             }]},
         },
+    }));
+}
+
+/// An interrupt:false denial errors the tool, then the model reacts to the
+/// feedback and the turn completes normally (NOT the TurnAborted path).
+fn finish_feedback_denial() {
+    emit(json!({
+        "type": "user",
+        "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "tu-1",
+              "content": "User rejected this action", "is_error": true },
+        ]},
+    }));
+    emit(json!({
+        "type": "assistant",
+        "message": { "id": "m2", "content": [
+            { "type": "text", "text": "understood" },
+        ]},
+    }));
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "understood", "session_id": "fake-native-1",
+        "total_cost_usd": 0.01, "duration_ms": 42,
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
     }));
 }
 

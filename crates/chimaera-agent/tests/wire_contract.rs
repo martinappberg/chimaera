@@ -10,7 +10,7 @@
 //! `debug_assert` that otherwise guards it).
 
 use chimaera_agent::journal::SeqEvent;
-use chimaera_agent::model::{AgentEvent, UserMessageState};
+use chimaera_agent::model::{AgentEvent, PermissionOption, PermissionOptionKind, UserMessageState};
 use serde_json::json;
 
 #[test]
@@ -197,5 +197,46 @@ fn question_resolved_answers_are_additive_on_the_wire() {
             "request_id": "r1",
             "answers": { "q1": ["SQLite"] }
         })
+    );
+}
+
+#[test]
+fn permission_request_wire_shape_is_additive() {
+    // The plan field is strictly additive: absent for ordinary permissions
+    // (an old client's shape, byte for byte), present only for plan approvals.
+    let base = AgentEvent::PermissionRequest {
+        request_id: "r1".into(),
+        tool_call_id: None,
+        title: "Bash".into(),
+        options: vec![PermissionOption {
+            id: "allow_once".into(),
+            label: "Allow".into(),
+            kind: PermissionOptionKind::AllowOnce,
+        }],
+        input_preview: json!({ "command": "ls" }),
+        plan: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&base).unwrap(),
+        json!({
+            "type": "permission_request",
+            "request_id": "r1",
+            "title": "Bash",
+            "options": [{ "id": "allow_once", "label": "Allow", "kind": "allow_once" }],
+            "input_preview": { "command": "ls" }
+        })
+    );
+
+    let planned = AgentEvent::PermissionRequest {
+        request_id: "r2".into(),
+        tool_call_id: None,
+        title: "ExitPlanMode".into(),
+        options: vec![],
+        input_preview: json!({}),
+        plan: Some("## Plan".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&planned).unwrap()["plan"],
+        json!("## Plan")
     );
 }

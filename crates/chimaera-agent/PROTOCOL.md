@@ -6,7 +6,7 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 (`TESTED_*_VERSION`).
 
 Sources:
-- **live**: probed against the real CLIs (claude 2.1.204, codex 0.142.5).
+- **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5).
 - **vsix**: mined from the official VS Code extension bundles
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
@@ -714,3 +714,58 @@ reason-string matching survives only for pre-upgrade events.
   follows a `turn/interrupt` RPC) maps to `interrupted: true`, reason
   stays codex's own word "interrupted"; `turn/failed` stays
   `interrupted: false`.
+
+## Pass 9 (2026-07-10 — permission-UX parity). ADOPTED.
+
+Plan approvals and deny-with-feedback, closing the two biggest permission
+gaps vs the official clients.
+
+### Claude: ExitPlanMode is a plan approval, not a tool permission
+
+- The plan proposal is an ordinary `can_use_tool` request with
+  `tool_name:"ExitPlanMode"`; `input.plan` is the plan MARKDOWN (live).
+  The driver maps it to a `PermissionRequest` whose additive `plan` field
+  carries the (capped) markdown — the client renders a plan-approval card,
+  and `input_preview` drops the `plan` key so the journal never stores the
+  text twice.
+- Options mirror the official card, verbatim and in order: **"Yes, and
+  auto-accept edits"** / **"Yes, manually approve"** / **"No, keep
+  planning"**.
+- Approval = `{behavior:"allow", updatedInput}` where updatedInput echoes
+  the input; optional user comments ride
+  `updatedInput.{userFeedback,userComments}` (both fields, same text — the
+  extension's shape; live: the CLI accepts the injected keys and the turn
+  completes). The CLI exits plan mode itself — the mode change rides
+  `system/status` (pass 6).
+- "Yes, and auto-accept edits": chimaera sends the allow, then a
+  `set_permission_mode acceptEdits` control request in the same step (a
+  verified control; its ack → ModeChanged). The extension re-stamps a
+  `setMode` permission_suggestion instead — we deliberately use the
+  explicit control so the behavior doesn't depend on which suggestions the
+  CLI happened to attach.
+- "No, keep planning" is the deny path: bare = the directive constant with
+  `interrupt:true` (model stops, still in plan mode, waits); with comments
+  = the feedback-denial below, so the model revises the plan immediately.
+
+### Claude: feedback-denials (live-verified)
+
+`{behavior:"deny", message: <directive constant> + "\n\nThe user's
+feedback: " + <reason>, interrupt:false}` — the tool errors (is_error
+tool_result) but the turn is NOT aborted: it runs on and ends with a
+SUCCESS result (contrast the bare deny's `interrupt:true` → is_error
+result → TurnAborted). The driver journals the reason as a `UserMessage`
+event, since the model really received it.
+
+### Codex: decline has no message field — feedback steers
+
+The app-server decision union carries no free-text slot, so a decline with
+feedback answers the rpc with `{"decision":"decline"}` and then delivers
+the reason as user input into the still-running turn via the normal
+`turn/steer` path (buffered/turn-started like any send). Same UX as
+claude's feedback-denial, realized per this protocol's capability.
+
+### Wire additions (daemon↔UI, strictly additive)
+
+- `PermissionRequest.plan: Option<String>` — present ⇒ plan-approval card.
+- `AgentCommand::Permission.feedback: Option<String>` — deny reasons and
+  plan-approval comments; absent/empty = the bare decision.

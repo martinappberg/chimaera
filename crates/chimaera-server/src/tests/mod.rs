@@ -1,4 +1,5 @@
 mod agents;
+mod download;
 mod exec;
 mod fs;
 mod git;

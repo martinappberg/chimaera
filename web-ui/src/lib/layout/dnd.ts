@@ -84,6 +84,11 @@ export interface LayoutCtrl {
    */
   openPathFrom(paneId: string, path: string, kind: "file" | "dir", newSplit: boolean): void;
   /**
+   * Reveal `path` in the rail's file tree (a file tab's context menu). A
+   * no-op for paths outside the workspace root.
+   */
+  revealPathInTree(path: string): void;
+  /**
    * Open (or focus) the session-scoped CHANGES review (the files that session
    * touched) FROM `paneId` — lands in the adjacent pane, or a fresh split when
    * the window has one pane / `newSplit` (Cmd/Ctrl) is set.

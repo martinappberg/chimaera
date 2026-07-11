@@ -9,6 +9,26 @@ use crate::{git, ledger, recents, runtimes, update};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
+    // One daemon per state dir: the manifest is the registry, and a second
+    // daemon over the same ledger respawns every session AGAIN (duplicate
+    // agent processes), while each failed-connect retry piles one more daemon
+    // onto a shared login node. Refuse before touching anything — including
+    // the handoff, which is consume-once. Only a manifest whose pid is alive
+    // AND whose port answers HTTP counts: a crash leftover or a recycled pid
+    // must not block startup. Best-effort (not a lock) — it closes the retry
+    // pile-up, not a deliberate simultaneous double-start race.
+    if let Ok(Some(m)) = chimaera_core::Manifest::load() {
+        if m.is_alive() && port_answers_http(m.port).await {
+            anyhow::bail!(
+                "a chimaera daemon for {} is already running (pid {}, \
+                 http://127.0.0.1:{}) — refusing to start a second",
+                chimaera_core::data_dir().display(),
+                m.pid,
+                m.port
+            );
+        }
+    }
+
     // A predecessor that stopped gracefully left a handoff: rebind its port
     // with its token so ssh forwards stay valid and every client heals with
     // a plain reconnect — the "update without losing your windows" half of
@@ -123,6 +143,36 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether an HTTP server answers on `127.0.0.1:port` within 2s. Any status
+/// counts — even a 401 had to come from a live server. The manifest's pid
+/// check alone can't be trusted on a long-lived login node (pids recycle), so
+/// only a served response proves the manifest's daemon is really there.
+async fn port_answers_http(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!(
+                    "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.ok()?;
+        (&buf == b"HTTP/").then_some(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), attempt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 async fn fresh_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
     TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
         .await
@@ -213,6 +263,46 @@ mod tests {
             busy_port,
             "must fall back to a different (OS-assigned) port"
         );
+    }
+
+    /// The single-instance guard keys on this probe: an HTTP answer means a
+    /// live daemon (refuse to double-start), while an accept-only listener or
+    /// a closed port means the manifest is stale (a crash leftover, a recycled
+    /// pid) and startup must proceed.
+    #[tokio::test]
+    async fn port_answers_http_requires_a_response_not_just_an_accept() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Accepts and holds the socket open, never writing: not a daemon.
+        let silent = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = silent.accept().await {
+                held.push(s);
+            }
+        });
+        assert!(!port_answers_http(silent_port).await);
+
+        // Answers any bytes with an HTTP status line: a live daemon.
+        let http = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = http.accept().await {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        assert!(port_answers_http(http_port).await);
+
+        // Nothing listening: stale manifest, start normally.
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free_port = free.local_addr().unwrap().port();
+        drop(free);
+        assert!(!port_answers_http(free_port).await);
     }
 
     /// A free handoff port is rebound and its token reused.

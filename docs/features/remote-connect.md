@@ -29,8 +29,10 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   (2) **Probe** (`resolve_daemon`): `cat ~/.chimaera/manifest.json` + `kill -0 pid` over ssh →
   *Reuse* if a matching-build daemon runs; if builds differ, count live sessions and *Update* if
   provably idle (or `--update-daemon`), else *ConnectOutdated*; no daemon → *fresh start*.
-  (3) **Resolve the binary** to deploy — explicit `--binary`, else a dev's `~/.chimaera/dist/` stash,
-  else auto-fetch the matching musl/darwin release build (sha256-verified) — always **before**
+  (3) **Resolve the binary** to deploy — explicit `--binary`, else auto-fetch the matching
+  musl/darwin release build (sha256-verified); the `~/.chimaera/dist/` stash feeds **dev connects
+  only** (a stash build is the `0.0.1` sentinel, which relocates its state to `~/.chimaera-dev` and
+  can never serve the real home) — always **before**
   stopping any running daemon (a failed fetch must never strand a host with no daemon). (4) **Deploy**
   via `scp` (staged `.new` + `mv -f`), **start** (`setsid nohup … chimaera serve … & disown`, poll the
   manifest ≤15s). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`, poll the port ≤15s) and
@@ -51,6 +53,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
+- **A fresh start version-probes the installed binary** (`ensure_remote_binary` runs
+  `~/.chimaera/bin/chimaera --version` over ssh): a dev (`0.0.1`) binary stranded in the real home —
+  e.g. deployed by a pre-fix release that trusted the dist stash — is replaced with the release
+  instead of reused, because started it would relocate to `~/.chimaera-dev` and the manifest poll
+  would time out forever.
 - **Never force-kill a remote daemon.** `stop_remote` is SIGTERM-only (a daemon that won't die may
   hold sessions that mustn't be torn out — it errors honestly). `TunnelPhaseError` is
   downcast-distinguished so the app retries *only* tunnel-phase failures on a fresh port (re-running
