@@ -45,6 +45,13 @@ pub fn open_ui_window(
     };
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .title(title)
+        // Tauri's own drag-drop handler intercepts OS file drops and suppresses
+        // the webview's DOM drop events. The workbench handles drops itself in
+        // the web UI (upload to the session's owning host, then reference the
+        // path) — one code path for browser and native shell, correct for local
+        // AND tunneled-remote windows by construction (a bare local path means
+        // nothing on a remote host). Disabling it hands HTML5 dnd back to the UI.
+        .disable_drag_drop_handler()
         .inner_size(1280.0, 840.0)
         .min_inner_size(680.0, 440.0);
     if let (Some(w), Some(h)) = (record.width, record.height) {

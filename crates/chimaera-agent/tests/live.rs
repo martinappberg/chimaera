@@ -11,8 +11,11 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use chimaera_agent::claude::{ClaudeChat, PermissionDecision};
+use chimaera_agent::claude::{chat_args, ClaudeAdapter, ClaudeChat, PermissionDecision};
 use chimaera_agent::codex::CodexChat;
+use chimaera_agent::driver::SpawnSpec;
+use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock, UserMessageState};
+use chimaera_agent::{ChatManager, EventHook, ExitHook};
 
 const HANDSHAKE: Duration = Duration::from_secs(20);
 const TURN: Duration = Duration::from_secs(120);
@@ -187,6 +190,7 @@ async fn claude_permission_roundtrip_allow_then_deny() {
                 &frame["request_id"],
                 PermissionDecision::Deny {
                     message: "User rejected this action".into(),
+                    interrupt: true,
                 },
             )
             .await
@@ -210,6 +214,154 @@ async fn claude_permission_roundtrip_allow_then_deny() {
     assert!(
         !deny_dir.path().join("probe.txt").exists(),
         "denied tool must not run"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Feedback-denial semantics: `{behavior:"deny", message, interrupt:false}`
+/// must error the tool WITHOUT aborting the turn — the model reads the
+/// reason from the tool error and the turn runs on to a SUCCESS result.
+/// (The bare deny's `interrupt:true` aborts with an is_error result — the
+/// TurnAborted path; that contrast is what this pins.)
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn"]
+async fn claude_feedback_denial_keeps_turn_alive() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Create a file named probe.txt containing exactly hello, using the Bash tool.",
+    )
+    .await
+    .expect("send");
+
+    let mut denied_tool_result = false;
+    let result = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            // Deny every attempt with a reason, interrupt:false (the
+            // driver's feedback-denial shape).
+            chat.respond_permission(
+                &frame["request_id"],
+                PermissionDecision::Deny {
+                    message:
+                        "The user doesn't want to proceed with this tool use. \
+                        The user's feedback: do NOT create any file; reply with exactly: understood"
+                            .into(),
+                    interrupt: false,
+                },
+            )
+            .await
+            .expect("respond deny with feedback");
+        } else if frame["type"] == "user" {
+            if let Some(blocks) = frame["message"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"] == "tool_result" && block["is_error"] == json!(true) {
+                        denied_tool_result = true;
+                    }
+                }
+            }
+        } else if frame["type"] == "result" {
+            break frame;
+        }
+    };
+    assert!(
+        denied_tool_result,
+        "denial surfaced as an error tool_result"
+    );
+    assert_eq!(
+        result["is_error"],
+        json!(false),
+        "interrupt:false denial must NOT abort the turn: {result}"
+    );
+    assert_eq!(result["subtype"], "success");
+    assert!(
+        !dir.path().join("probe.txt").exists(),
+        "denied tool must not run"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Plan approval: in plan mode the CLI proposes its plan via an ExitPlanMode
+/// `can_use_tool` whose input carries the plan markdown; an allow whose
+/// updatedInput adds userFeedback/userComments (the extension's comment
+/// fields) is accepted and the turn completes.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one planning turn"]
+async fn claude_exit_plan_mode_approval_roundtrip() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+
+    let ctl = chat
+        .send_control(json!({ "subtype": "set_permission_mode", "mode": "plan" }))
+        .await
+        .expect("set plan mode");
+    await_control_response(&mut chat, &ctl).await;
+
+    chat.send_user_text(
+        "Plan how you would create a file named plan-probe.txt containing hello. \
+         Keep the plan to two short steps, then present it.",
+    )
+    .await
+    .expect("send");
+
+    let mut plan_seen = false;
+    let result = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            let request = &frame["request"];
+            if request["tool_name"] == "ExitPlanMode" {
+                plan_seen = true;
+                let plan = request["input"]["plan"]
+                    .as_str()
+                    .expect("ExitPlanMode input carries the plan markdown");
+                assert!(!plan.is_empty());
+                // Approve with comments riding updatedInput (the driver's
+                // plan-approval shape).
+                let mut updated = request["input"].clone();
+                updated["userFeedback"] = json!("looks good");
+                updated["userComments"] = json!("looks good");
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: updated,
+                    },
+                )
+                .await
+                .expect("approve plan");
+            } else {
+                // Anything else in plan mode (read-only probes): allow as-is.
+                let input = request["input"].clone();
+                chat.respond_permission(
+                    &frame["request_id"],
+                    PermissionDecision::Allow {
+                        updated_input: input,
+                    },
+                )
+                .await
+                .expect("allow");
+            }
+        } else if frame["type"] == "result" {
+            break frame;
+        }
+    };
+    assert!(plan_seen, "an ExitPlanMode can_use_tool was routed to us");
+    assert_eq!(
+        result["subtype"], "success",
+        "plan approval with comment fields completes the turn: {result}"
     );
     chat.shutdown(Duration::from_secs(5))
         .await
@@ -453,6 +605,190 @@ async fn claude_mid_turn_send_queues_natively() {
         .expect("shutdown");
 }
 
+/// LIVE PROBE — does `cancel_async_message` actually un-queue a mid-turn send?
+/// The subtype is defined in the SDK but never called by the official
+/// extension. NOTE: since the hold-until-flush rework the driver no longer
+/// sends this control request at all — it HOLDS queued messages and cancels a
+/// still-held one locally (nothing ever reached the CLI to un-queue). This
+/// probe now only documents the raw CLI's behavior for the record; the driver's
+/// CancelQueued no longer depends on it. Queue a distinctively-answered message
+/// mid-turn, send the cancel for its uuid, drain to idle, and REPORT whether it
+/// ran — asserting only the session-health invariant.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills tiny turns — reports cancel_async_message behavior"]
+async fn claude_cancel_async_message_behavior() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+
+    // Turn 1 runs; a second message queues behind it with a known uuid and a
+    // distinctive reply we can spot if it ever runs.
+    chat.send_user_text("Reply with exactly: first")
+        .await
+        .expect("send 1");
+    let cancel_uuid = chat
+        .send_user_text_with_uuid("Reply with exactly: CANCELME")
+        .await
+        .expect("send 2");
+
+    // Immediately ask the CLI to un-queue that message.
+    chat.send_control(json!({
+        "subtype": "cancel_async_message",
+        "message_uuid": cancel_uuid,
+    }))
+    .await
+    .expect("cancel_async_message");
+
+    // Drain: count result frames and watch for the CANCELME reply. If the CLI
+    // honored the cancel, only turn 1 runs (one result, then idle, no CANCELME).
+    // If it ignored it, the queued message runs too (a second result + CANCELME).
+    let mut results = 0;
+    let mut saw_cancelme = false;
+    loop {
+        match chat.recv(TURN).await {
+            Ok(Some(frame)) => match frame["type"].as_str() {
+                Some("result") => {
+                    results += 1;
+                    if results >= 2 {
+                        break;
+                    }
+                }
+                Some("assistant") => {
+                    let text = frame["message"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if text.contains("CANCELME") {
+                        saw_cancelme = true;
+                    }
+                }
+                _ => {}
+            },
+            Ok(None) => break, // CLI exited
+            Err(_) => break,   // idle: no further frame within TURN
+        }
+    }
+
+    eprintln!(
+        "LIVE cancel_async_message: results={results}, queued_message_ran={saw_cancelme} => \
+         cancel_async_message {}",
+        if saw_cancelme {
+            "does NOT un-queue (the message still ran)"
+        } else {
+            "UN-QUEUES (the message did not run)"
+        }
+    );
+
+    // Either outcome is acceptable; the invariant is that the cancel didn't
+    // wedge the session — turn 1 completed and the stream stayed healthy.
+    assert!(
+        results >= 1,
+        "at least turn 1 completed (results={results})"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// Three rapid sends against the REAL claude driver — the user's exact
+/// scenario. The hold-until-flush model must (a) settle idle: every turn the
+/// CLI opens also ends, and (b) DELIVER every held message: each `queued:true`
+/// echo resolves `sent`, none stranded "queued" or wrongly "dropped". The two
+/// trailing sends are HELD (never dumped mid-turn) and flushed at the running
+/// turn's end, so the CLI can't coalesce them into a bare result and lose one.
+/// This drives the full ChatManager pipeline (the same normalized events the
+/// UI folds).
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills a few tiny turns"]
+async fn driver_rapid_queued_sends_settle_idle() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let dir = tmpdir();
+    let on_event: EventHook = Box::new(|_, _| {});
+    let on_exit: ExitHook = Box::new(|_, _| {});
+    let manager = Arc::new(ChatManager::new(dir.path().join("chat"), on_event, on_exit));
+
+    // The driver's own argv (server-side extras aside): the chat stream-json
+    // flags plus the cheap model. env_extra (auto-updater off, checkpointing)
+    // is supplied by ClaudeAdapter.
+    let mut argv = vec!["claude".to_string()];
+    argv.extend(chat_args(Some(CLAUDE_TEST_MODEL), None));
+    let spec = SpawnSpec::new("rapid", argv, dir.path().to_path_buf());
+    manager
+        .spawn(&ClaudeAdapter, spec)
+        .expect("spawn claude driver");
+    let mut rx = manager.attach("rapid", 0).expect("attach").live;
+
+    // Three sends with no waiting between them: the first opens a turn, the next
+    // two are held behind it and flush when it ends.
+    for text in [
+        "Reply with exactly: one",
+        "Reply with exactly: two",
+        "Reply with exactly: three",
+    ] {
+        manager
+            .command(
+                "rapid",
+                AgentCommand::Send {
+                    blocks: vec![ContentBlock::Text { text: text.into() }],
+                },
+            )
+            .await
+            .expect("send");
+    }
+
+    // Drain until the session goes quiet (no event for a settle window); count
+    // the turn boundaries and track each queued send's final delivery state.
+    let mut opened = 0usize;
+    let mut ended = 0usize;
+    let mut queued_ids: Vec<String> = Vec::new();
+    let mut final_state: HashMap<String, UserMessageState> = HashMap::new();
+    let settle = Duration::from_secs(20);
+    // Drain until a quiet window elapses with no further event (Err from the
+    // timeout) or the broadcast closes — either way the session is idle.
+    while let Ok(Ok(entry)) = tokio::time::timeout(settle, rx.recv()).await {
+        match &entry.ev {
+            AgentEvent::TurnStarted { .. } => opened += 1,
+            AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => ended += 1,
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => queued_ids.push(id.clone()),
+            AgentEvent::UserMessageUpdate { id, state } => {
+                final_state.insert(id.clone(), *state);
+            }
+            _ => {}
+        }
+    }
+
+    assert!(opened >= 1, "at least one turn opened (opened={opened})");
+    assert_eq!(
+        opened, ended,
+        "every opened turn must end — no turn left stuck running \
+         (opened={opened}, ended={ended})"
+    );
+    // The crux of the user's bug: every message queued behind the running turn
+    // is DELIVERED — resolved `sent`, never left "queued" and never stranded
+    // "not delivered" (dropped).
+    assert!(
+        !queued_ids.is_empty(),
+        "the trailing sends echoed queued (queued_ids={queued_ids:?})"
+    );
+    for id in &queued_ids {
+        assert_eq!(
+            final_state.get(id),
+            Some(&UserMessageState::Sent),
+            "held message {id} must resolve sent, not strand \
+             (state={:?})",
+            final_state.get(id)
+        );
+    }
+
+    manager.kill("rapid");
+}
+
 /// Wait for a specific control_response and return its inner response value.
 async fn await_control_response(chat: &mut ClaudeChat, ctl_id: &str) -> Value {
     loop {
@@ -631,6 +967,127 @@ async fn codex_steer_settings_and_account_surface() {
     );
 
     chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// The codex rewind/compact surface (PROTOCOL.md pass 8): thread/rollback
+/// drops trailing turns in place (result = the updated thread), works right
+/// after thread/resume (the rewind-respawn path), and thread/compact/start
+/// acks then runs the compaction as its own turn with a contextCompaction
+/// item (no thread/compacted notification on the pinned version).
+#[tokio::test]
+#[ignore = "live: spawns real codex twice, needs auth, bills two tiny turns"]
+async fn codex_rollback_and_compact_surface() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let thread_id = chat
+        .thread_start(dir.path(), HANDSHAKE)
+        .await
+        .expect("thread/start");
+
+    // Two turns of history to roll back / compact.
+    for word in ["one", "two"] {
+        chat.turn_start(&thread_id, &format!("Reply with exactly: {word}"))
+            .await
+            .expect("turn/start");
+        loop {
+            let frame = chat
+                .recv(TURN)
+                .await
+                .expect("recv")
+                .expect("codex exited mid-turn");
+            if frame["method"] == "turn/completed" {
+                break;
+            }
+        }
+    }
+
+    // Rollback drops the last turn in place; the result is the thread object.
+    let rollback = chat
+        .request_raw(
+            "thread/rollback",
+            json!({ "threadId": thread_id, "numTurns": 1 }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/rollback answered");
+    assert!(
+        rollback.get("error").is_none(),
+        "rollback failed: {rollback}"
+    );
+    assert_eq!(
+        rollback["result"]["thread"]["id"].as_str(),
+        Some(thread_id.as_str()),
+        "rollback returns the updated thread: {rollback}"
+    );
+
+    // Compact acks empty, then runs as its own turn with a contextCompaction
+    // item — the driver's "context compacted" notice source.
+    let compact = chat
+        .request_raw(
+            "thread/compact/start",
+            json!({ "threadId": thread_id }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/compact/start answered");
+    assert!(compact.get("error").is_none(), "compact failed: {compact}");
+    let mut saw_compaction_item = false;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("codex exited mid-compaction");
+        match frame["method"].as_str() {
+            Some("item/completed") if frame["params"]["item"]["type"] == "contextCompaction" => {
+                saw_compaction_item = true;
+            }
+            Some("turn/completed") => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_compaction_item,
+        "compaction runs as a turn with a contextCompaction item"
+    );
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+
+    // The rewind-respawn path: a fresh process resumes the thread and rolls
+    // back immediately, exactly like the driver's handshake does.
+    let mut resumed = CodexChat::spawn("codex", dir.path()).expect("respawn codex");
+    resumed.initialize(HANDSHAKE).await.expect("initialize");
+    let resume = resumed
+        .request_raw(
+            "thread/resume",
+            json!({ "threadId": thread_id, "cwd": dir.path() }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/resume answered");
+    assert_eq!(
+        resume["result"]["thread"]["id"].as_str(),
+        Some(thread_id.as_str()),
+        "resume keeps the thread id: {resume}"
+    );
+    let rollback = resumed
+        .request_raw(
+            "thread/rollback",
+            json!({ "threadId": thread_id, "numTurns": 1 }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("post-resume rollback answered");
+    assert!(
+        rollback.get("error").is_none(),
+        "rollback after resume failed: {rollback}"
+    );
+    resumed
+        .shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");
 }

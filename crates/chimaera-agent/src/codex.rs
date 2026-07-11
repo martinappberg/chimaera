@@ -184,11 +184,12 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec,
+    SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
     PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
+    UserMessageState,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -210,6 +211,14 @@ struct CodexDriver;
 impl Driver for CodexDriver {
     type Mapper = CodexMapper;
 
+    fn kind(&self) -> &'static str {
+        "codex"
+    }
+
+    fn tested_version(&self) -> &'static str {
+        TESTED_CODEX_VERSION
+    }
+
     // Handshake covers initialize AND thread start/resume — a driver that
     // cannot open a thread is as dead as one that cannot speak at all.
     async fn handshake<'a>(
@@ -218,19 +227,48 @@ impl Driver for CodexDriver {
         stream: &'a mut JsonlStream,
         spec: &'a SpawnSpec,
     ) -> std::result::Result<Handshake<CodexMapper>, String> {
-        let (thread_id, models) = codex_handshake(sink, stream, spec).await?;
+        let hs = codex_handshake(sink, stream, spec).await?;
+        // A failed conversation rewind degrades to a notice, not a dead pane:
+        // the thread resumed whole, only the rollback was refused/ignored.
+        let initial = hs
+            .rollback_error
+            .into_iter()
+            .map(|err| DriverStep {
+                events: vec![AgentEvent::Notice {
+                    text: format!(
+                        "conversation rewind failed: {err} (the agent may still see the rewound turns)"
+                    ),
+                }],
+                outbound: Vec::new(),
+            })
+            .collect();
         Ok(Handshake {
-            mapper: CodexMapper::new(thread_id, models),
-            initial: Vec::new(),
+            mapper: CodexMapper::new(
+                hs.thread_id,
+                hs.models,
+                spec.agent_version.clone(),
+                hs.next_id,
+            ),
+            initial,
         })
     }
+}
+
+/// What the codex handshake hands the driver: the opened thread, the model
+/// catalog, the next free JSON-RPC id, and whether a requested
+/// conversation rollback failed (surfaced as a notice, never a dead pane).
+struct CodexHandshake {
+    thread_id: String,
+    models: Vec<crate::model::ModelInfo>,
+    next_id: u64,
+    rollback_error: Option<String>,
 }
 
 async fn codex_handshake(
     sink: &mut JsonlSink,
     stream: &mut JsonlStream,
     spec: &SpawnSpec,
-) -> std::result::Result<(String, Vec<crate::model::ModelInfo>), String> {
+) -> std::result::Result<CodexHandshake, String> {
     if sink.send(&initialize_request(0)).await.is_err() {
         return Err("initialize write failed".into());
     }
@@ -261,13 +299,51 @@ async fn codex_handshake(
         .as_str()
         .map(String::from)
         .ok_or_else(|| format!("thread open result missing thread.id: {result}"))?;
+    let mut next_id = 2u64;
+
+    // Conversation rewind: drop the trailing turns right after the resume,
+    // while the exchange is still lock-step (live-verified: thread/rollback
+    // works immediately after thread/resume; an overcount clamps silently,
+    // so the count must be exact — the server derives it from the journal).
+    let mut rollback_error = None;
+    if let (Some(_), Some(turns)) = (
+        &spec.pinned_native_id,
+        spec.rollback_turns.filter(|n| *n > 0),
+    ) {
+        let id = next_id;
+        next_id += 1;
+        if sink
+            .send(&json!({
+                "id": id, "method": "thread/rollback",
+                "params": { "threadId": thread_id, "numTurns": turns },
+            }))
+            .await
+            .is_err()
+        {
+            return Err("thread/rollback write failed".into());
+        }
+        // Bounded like model/list: a binary that silently drops the method
+        // must not wedge the handshake until the watchdog fires.
+        rollback_error = match tokio::time::timeout(
+            Duration::from_secs(5),
+            await_rpc_result(stream, id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(err)) => Some(err),
+            Err(_) => Some("no response to thread/rollback (unsupported binary?)".into()),
+        };
+    }
 
     // The agent's own catalog beats any curated list; absence (older
     // binaries) is not a handshake failure.
+    let list_id = next_id;
+    next_id += 1;
     let mut models = Vec::new();
     if sink
         .send(&json!({
-            "id": 2, "method": "model/list",
+            "id": list_id, "method": "model/list",
             "params": { "includeHidden": false, "cursor": null, "limit": 100 },
         }))
         .await
@@ -277,7 +353,7 @@ async fn codex_handshake(
         // can't wedge the whole handshake until the 20s watchdog fires — the
         // model catalog is optional, so a timeout is just an empty catalog.
         let listed =
-            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, 2)).await;
+            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, list_id)).await;
         if let Ok(Ok(list)) = listed {
             for m in list["data"].as_array().unwrap_or(&Vec::new()) {
                 if let Some(id) = m["model"].as_str() {
@@ -304,7 +380,12 @@ async fn codex_handshake(
             }
         }
     }
-    Ok((thread_id, models))
+    Ok(CodexHandshake {
+        thread_id,
+        models,
+        next_id,
+        rollback_error,
+    })
 }
 
 async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Result<Value, String> {
@@ -345,6 +426,19 @@ enum PendingRpc {
     AccountRead {
         report: bool,
     },
+    /// thread/compact/start ack; the compaction itself runs as its own turn
+    /// whose contextCompaction item lands the "context compacted" notice.
+    Compact,
+}
+
+/// An outstanding item/tool/requestUserInput prompt.
+struct PendingQuestion {
+    /// The server request's JSON-RPC id (the answer goes back by it).
+    rpc_id: Value,
+    /// Auto-skip deadline (the request's `autoResolutionMs`): the official
+    /// client sends empty answers when it fires; ours does too, from the
+    /// harness tick.
+    deadline: Option<std::time::Instant>,
 }
 
 /// Protocol → normalized-model translator for the app-server stream. Pure
@@ -352,6 +446,8 @@ enum PendingRpc {
 struct CodexMapper {
     thread_id: String,
     models: Vec<crate::model::ModelInfo>,
+    /// Launcher-probed `--version` line, echoed on every Init (journal truth).
+    agent_version: Option<String>,
     model: Option<String>,
     /// Model override for subsequent turns (set_model).
     pending_model: Option<String>,
@@ -372,17 +468,34 @@ struct CodexMapper {
     /// Sends captured during the turn/start→turn/started window; flushed as
     /// steers once the turn id arrives (or re-driven if the start fails).
     buffered_sends: Vec<(Value, String)>,
+    /// Interrupt watchdog: ticks remaining before we synthesize the abort the
+    /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
+    /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
+    /// See `INTERRUPT_GRACE_TICKS`.
+    interrupt_grace: Option<u32>,
+    /// Idle-flush watchdog: ticks remaining before we rescue a stranded
+    /// buffer. Managed in `tick`, armed when the driver is idle (no active or
+    /// pending turn) with `buffered_sends` still holding messages a turn end
+    /// left un-steered. Symmetric to claude's idle-flush; see
+    /// `IDLE_FLUSH_GRACE_TICKS`.
+    idle_flush_grace: Option<u32>,
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
     /// Outstanding server approval requests: our request_id →
     /// (JSON-RPC id, option_id → prebuilt decision payload).
     pending_approvals: HashMap<String, (Value, HashMap<String, Value>)>,
-    /// Outstanding item/tool/requestUserInput prompts: request_id → rpc id.
+    /// Outstanding item/tool/requestUserInput prompts by request_id.
     /// Answers go back as {answers:{questionId:{answers:[label,…]}}}.
-    pending_questions: HashMap<String, Value>,
+    pending_questions: HashMap<String, PendingQuestion>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
+    /// One auto-decline notice per turn: full-access maps to approvalPolicy
+    /// "never" (the official extension's table), so a genuinely blocked
+    /// action is DECLINED by codex itself with no approval card possible —
+    /// without this notice the agent's own "I'm blocked" prose is the only
+    /// trace ("harness is blocking").
+    decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
     /// fileChange item id → touched paths (approval titles look them up).
     item_locations: HashMap<String, Vec<String>>,
@@ -391,6 +504,10 @@ struct CodexMapper {
     out_streamed: HashMap<String, usize>,
     /// Latest cumulative token usage (turn/completed carries none here).
     last_usage: Usage,
+    /// The last turn-OPENING send's minted uuid — the fork anchor chain for
+    /// Checkpoint events. Steered/buffered sends join a running turn, and
+    /// thread/rollback drops whole turns, so only turn openers anchor.
+    last_checkpoint: Option<String>,
     next_id: u64,
 }
 
@@ -408,10 +525,16 @@ fn codex_modes() -> Vec<crate::model::ModeInfo> {
 }
 
 impl CodexMapper {
-    fn new(thread_id: String, models: Vec<crate::model::ModelInfo>) -> Self {
+    fn new(
+        thread_id: String,
+        models: Vec<crate::model::ModelInfo>,
+        agent_version: Option<String>,
+        next_id: u64,
+    ) -> Self {
         Self {
             thread_id,
             models,
+            agent_version,
             model: None,
             pending_model: None,
             pending_effort: None,
@@ -423,16 +546,22 @@ impl CodexMapper {
             turn_active: false,
             turn_pending: false,
             buffered_sends: Vec::new(),
+            interrupt_grace: None,
+            idle_flush_grace: None,
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
+            decline_notified: false,
             pending_rpcs: HashMap::new(),
             item_locations: HashMap::new(),
             out_streamed: HashMap::new(),
             last_usage: Usage::default(),
-            next_id: 3, // 0/1/2 spent by the handshake (init, thread, model/list)
+            last_checkpoint: None,
+            // The handshake minted 0..next_id (init, thread open, optional
+            // rollback, model/list) and hands over the next free id.
+            next_id,
         }
     }
 
@@ -444,6 +573,7 @@ impl CodexMapper {
             current_mode: Some(self.current_mode.clone()),
             slash_commands: Vec::new(),
             models: self.models.clone(),
+            agent_version: self.agent_version.clone(),
         }
     }
 
@@ -482,6 +612,10 @@ impl CodexMapper {
                     .to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
+                // A fresh turn is a clean slate for the interrupt watchdog: an
+                // interrupt armed against a previous (or idle) state must not
+                // abort this new turn.
+                self.interrupt_grace = None;
                 step.events.push(AgentEvent::TurnStarted {
                     turn_id: self.turn_id.clone(),
                 });
@@ -613,8 +747,10 @@ impl CodexMapper {
             "serverRequest/resolved" => {
                 let request_id = format!("codex-{}", frame["params"]["requestId"]);
                 if self.pending_questions.remove(&request_id).is_some() {
-                    step.events
-                        .push(AgentEvent::QuestionResolved { request_id });
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
                 } else if self.pending_approvals.remove(&request_id).is_some() {
                     step.events.push(AgentEvent::PermissionResolved {
                         request_id,
@@ -685,47 +821,82 @@ impl CodexMapper {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                // A turn-end frame arriving AFTER the interrupt watchdog already
+                // closed this turn must NOT emit a second end (symmetry with
+                // claude on_result's `was_active` guard).
+                let was_active = self.turn_active;
                 self.turn_active = false;
-                let turn = &frame["params"]["turn"];
-                let mut usage = self.last_usage.clone();
-                usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
-                let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
-                if turn["status"] == "interrupted" {
-                    step.events.push(AgentEvent::TurnAborted {
-                        turn_id,
-                        reason: "interrupted".into(),
-                    });
-                } else {
-                    step.events
-                        .push(AgentEvent::TurnCompleted { turn_id, usage });
+                let mut aborted = false;
+                if was_active {
+                    let turn = &frame["params"]["turn"];
+                    let mut usage = self.last_usage.clone();
+                    usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
+                    let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
+                    if turn["status"] == "interrupted" {
+                        // status "interrupted" only follows a turn/interrupt RPC
+                        // — codex's wire carries the user-stop fact structurally.
+                        step.events.push(AgentEvent::TurnAborted {
+                            turn_id,
+                            reason: "interrupted".into(),
+                            interrupted: true,
+                        });
+                        aborted = true;
+                    } else {
+                        step.events
+                            .push(AgentEvent::TurnCompleted { turn_id, usage });
+                    }
+                    // Refresh rate-limit telemetry once per turn (account/read
+                    // is the extension's source; tolerated if absent).
+                    let id = self.rpc_id();
+                    self.pending_rpcs
+                        .insert(id, PendingRpc::AccountRead { report: false });
+                    step.outbound.push(json!({
+                        "id": id, "method": "account/read",
+                        "params": { "refreshToken": false },
+                    }));
                 }
                 self.reset_turn_state();
-                // Refresh rate-limit telemetry once per turn (account/read
-                // is the extension's source; tolerated if absent).
-                let id = self.rpc_id();
-                self.pending_rpcs
-                    .insert(id, PendingRpc::AccountRead { report: false });
-                step.outbound.push(json!({
-                    "id": id, "method": "account/read",
-                    "params": { "refreshToken": false },
-                }));
+                if aborted {
+                    // A stop ends only THIS turn, never the user's queued
+                    // messages (claude parity, maintainer decision 2026-07-11):
+                    // re-drive the buffered queue as the next turn, and leave
+                    // in-flight steers tracked — codex is alive, so their
+                    // post-abort error answers re-drive them through the same
+                    // fresh-turn path. AFTER reset_turn_state, which would
+                    // clobber the re-drive's turn_pending start window.
+                    self.redrive_queued_after_abort(&mut step);
+                }
             }
             "turn/failed" => {
                 if let Some(flushed) = self.coalescer.flush() {
                     step.events.push(flushed);
                 }
+                // Same `was_active` guard as turn/completed: a turn already
+                // closed by the watchdog must not fail a second time.
+                let was_active = self.turn_active;
                 self.turn_active = false;
-                step.events.push(AgentEvent::TurnAborted {
-                    turn_id: self.turn_id.clone(),
-                    reason: frame["params"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or("turn failed")
-                        .to_string(),
-                });
+                if was_active {
+                    step.events.push(AgentEvent::TurnAborted {
+                        turn_id: self.turn_id.clone(),
+                        reason: frame["params"]["error"]["message"]
+                            .as_str()
+                            .unwrap_or("turn failed")
+                            .to_string(),
+                        interrupted: false,
+                    });
+                }
                 // A failed turn must reset per-turn state exactly like a
                 // completed one — else the safety notice stays suppressed and
                 // stream/location maps leak into the next turn.
                 self.reset_turn_state();
+                if was_active {
+                    // Only THIS turn died — the queued messages behind it still
+                    // deliver (claude parity): re-drive the buffer as the next
+                    // turn (after reset_turn_state, which would clobber its
+                    // turn_pending window); in-flight steers stay tracked and
+                    // re-drive off their own error answers.
+                    self.redrive_queued_after_abort(&mut step);
+                }
             }
             _ => {}
         }
@@ -738,9 +909,13 @@ impl CodexMapper {
         self.streamed.clear();
         self.out_streamed.clear();
         self.safety_notified = false;
+        self.decline_notified = false;
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
+        // The turn ended on its own — the interrupt watchdog has nothing left
+        // to abort (a real turn is never double-aborted by it).
+        self.interrupt_grace = None;
         // Approvals only ever reference items of the current turn; keeping
         // these forever is unbounded growth over a long session.
         self.item_locations.clear();
@@ -770,7 +945,7 @@ impl CodexMapper {
                     // Re-drive any buffered sends so they aren't stranded.
                     if !self.buffered_sends.is_empty() {
                         let (input, client_msg_id) = self.buffered_sends.remove(0);
-                        self.emit_turn_start(input, client_msg_id, step);
+                        self.redrive_as_fresh_turn(input, client_msg_id, step);
                     }
                 }
             }
@@ -810,11 +985,18 @@ impl CodexMapper {
                     // Not a turn-id mismatch: if the turn ended between our send
                     // and this steer, re-drive the saved input as a fresh turn
                     // instead of dropping the already-echoed user message.
-                    None if !self.turn_active => self.emit_turn_start(input, client_msg_id, step),
+                    None if !self.turn_active => {
+                        self.redrive_as_fresh_turn(input, client_msg_id, step)
+                    }
                     None => {
                         step.events.push(AgentEvent::Error {
                             message: format!("steer failed: {msg}"),
                             fatal: false,
+                        });
+                        // Final failure: the agent never saw this message.
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id: client_msg_id,
+                            state: UserMessageState::Dropped,
                         });
                     }
                 }
@@ -828,11 +1010,16 @@ impl CodexMapper {
                 Some(err),
             ) => {
                 if !self.turn_active {
-                    self.emit_turn_start(input, client_msg_id, step);
+                    self.redrive_as_fresh_turn(input, client_msg_id, step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("steer failed: {}", err["message"]),
                         fatal: false,
+                    });
+                    // Retried and still refused: the message was not consumed.
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id: client_msg_id,
+                        state: UserMessageState::Dropped,
                     });
                 }
             }
@@ -864,6 +1051,12 @@ impl CodexMapper {
             (PendingRpc::AccountRead { .. }, Some(_)) => {
                 // Absent on older binaries; the chip just stays empty.
             }
+            (PendingRpc::Compact, Some(err)) => {
+                step.events.push(AgentEvent::Error {
+                    message: format!("compact failed: {}", err["message"]),
+                    fatal: false,
+                });
+            }
             (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
                 self.current_mode = mode_id.clone();
                 step.events.push(AgentEvent::ModeChanged { mode_id });
@@ -871,7 +1064,18 @@ impl CodexMapper {
             (PendingRpc::AccountRead { report }, None) => {
                 self.on_account(&frame["result"], report, step);
             }
-            (PendingRpc::TurnStart | PendingRpc::Steer { .. } | PendingRpc::Interrupt, None) => {}
+            (PendingRpc::Steer { client_msg_id, .. }, None) => {
+                // The steer was accepted: the running turn consumed the
+                // message (steering has no follow-up wire item — the echoed
+                // userMessage item is deliberately ignored to avoid dupes).
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id: client_msg_id,
+                    state: UserMessageState::Sent,
+                });
+            }
+            // Compact's ack is an empty result; the compaction turn's
+            // contextCompaction item carries the visible notice.
+            (PendingRpc::TurnStart | PendingRpc::Interrupt | PendingRpc::Compact, None) => {}
         }
     }
 
@@ -979,6 +1183,9 @@ impl CodexMapper {
                     let failed =
                         matches!(item["status"].as_str(), Some("declined") | Some("failed"))
                             || item["exitCode"].as_i64().is_some_and(|c| c != 0);
+                    if item["status"] == "declined" {
+                        self.note_auto_decline(step);
+                    }
                     let output = item["aggregatedOutput"].as_str().unwrap_or_default();
                     let content = if output.is_empty() {
                         None
@@ -1014,6 +1221,9 @@ impl CodexMapper {
                     self.item_locations.insert(id.clone(), locations);
                     let failed =
                         matches!(item["status"].as_str(), Some("declined") | Some("failed"));
+                    if item["status"] == "declined" {
+                        self.note_auto_decline(step);
+                    }
                     let diffs: Vec<ToolContent> = changes
                         .iter()
                         .filter_map(|c| {
@@ -1199,6 +1409,100 @@ impl CodexMapper {
         }
     }
 
+    /// A declined item in full-access mode was declined by CODEX ITSELF:
+    /// approvalPolicy "never" (the official extension's full-access mapping)
+    /// means no approval request can exist, so the auto-decline would
+    /// otherwise surface only as a failed tool card plus the agent's vague
+    /// "I'm blocked" narration. Name the mechanism once per turn. In every
+    /// other mode a declined status follows the user's own deny — no notice.
+    fn note_auto_decline(&mut self, step: &mut DriverStep) {
+        if self.current_mode != "full-access" || self.decline_notified {
+            return;
+        }
+        self.decline_notified = true;
+        step.events.push(AgentEvent::Notice {
+            text: "codex declined this action itself — full access never asks \
+                   for approval (switch to auto mode to be asked instead)"
+                .into(),
+        });
+    }
+
+    /// Teardown resolutions: every pending ask's reply route is this
+    /// process's JSON-RPC channel, so the journal must not outlive it with
+    /// the ask dangling (a replay would strand the card forever — see the
+    /// harness's drain call in `run_driver`).
+    /// After a user stop or a failed turn, the not-yet-delivered queue still
+    /// delivers — the abort ends only the CURRENT turn (claude parity,
+    /// maintainer decision 2026-07-11). Re-drive the FIRST buffered send as a
+    /// fresh turn; the rest stay buffered and steer into it once its
+    /// `turn/started` lands (the existing start-window path). In-flight steer
+    /// RPCs are deliberately NOT touched: codex is alive on these paths, so it
+    /// answers each steer — success resolves `sent` (it landed before the
+    /// abort), and an error re-drives it as a fresh turn via `on_response`'s
+    /// steer-error arms. Call AFTER `reset_turn_state` (which clears the
+    /// `turn_pending` window this re-drive opens).
+    fn redrive_queued_after_abort(&mut self, step: &mut DriverStep) {
+        if self.buffered_sends.is_empty() {
+            return;
+        }
+        let (input, client_msg_id) = self.buffered_sends.remove(0);
+        self.redrive_as_fresh_turn(input, client_msg_id, step);
+    }
+
+    /// Drop every user message still queued behind the current turn — the
+    /// not-yet-sent `buffered_sends` and any in-flight `Steer` RPC. This is
+    /// the DEAD-OR-UNRESPONSIVE-agent resolution only (teardown, and the
+    /// interrupt watchdog whose firing means codex stopped answering): with
+    /// no live agent to deliver to or answer a steer, `dropped` is the honest
+    /// terminal state — and removing the pending steers stops a late error
+    /// from resurrecting a message against a gone process. A LIVE abort
+    /// (turn/completed interrupted, turn/failed) re-drives instead — see
+    /// `redrive_queued_after_abort`.
+    fn drain_queued_sends(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for (_input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id: client_msg_id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        let steer_ids: Vec<u64> = self
+            .pending_rpcs
+            .iter()
+            .filter(|(_, p)| matches!(p, PendingRpc::Steer { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in steer_ids {
+            if let Some(PendingRpc::Steer { client_msg_id, .. }) = self.pending_rpcs.remove(&id) {
+                events.push(AgentEvent::UserMessageUpdate {
+                    id: client_msg_id,
+                    state: UserMessageState::Dropped,
+                });
+            }
+        }
+        events
+    }
+
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        for request_id in std::mem::take(&mut self.pending_questions).into_keys() {
+            events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+        }
+        for request_id in std::mem::take(&mut self.pending_approvals).into_keys() {
+            events.push(AgentEvent::PermissionResolved {
+                request_id,
+                option_id: "expired".into(),
+            });
+        }
+        // A hard kill mid-queue must not strand a queued message as "queued"
+        // forever on replay — resolve them dropped, like a turn abort would.
+        events.extend(self.drain_queued_sends());
+        events
+    }
+
     /// Server→client approval requests. Decision payloads are prebuilt per
     /// option here (string or object union — snake_case inside the object
     /// variants); the Permission command just looks its option up. Unknown
@@ -1230,7 +1534,14 @@ impl CodexMapper {
                 })
                 .unwrap_or_default();
             if !questions.is_empty() {
-                self.pending_questions.insert(request_id.clone(), rpc_id);
+                // autoResolutionMs: the server wants this prompt auto-skipped
+                // after the timeout (the official client's behavior) — the
+                // harness tick expires it with empty answers + a notice.
+                let deadline = params["autoResolutionMs"]
+                    .as_u64()
+                    .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+                self.pending_questions
+                    .insert(request_id.clone(), PendingQuestion { rpc_id, deadline });
                 step.events.push(AgentEvent::QuestionRequest {
                     request_id,
                     questions,
@@ -1416,6 +1727,7 @@ impl CodexMapper {
             title,
             options,
             input_preview,
+            plan: None,
         });
     }
 
@@ -1481,6 +1793,43 @@ impl CodexMapper {
         }
     }
 
+    /// A queued send whose steer/start window collapsed becomes a fresh
+    /// turn's input — the same standing as a fresh send, so its delivery
+    /// resolves `sent` here (a fresh send never echoes queued at all; a
+    /// later turn/start failure surfaces as an Error notice for both).
+    fn redrive_as_fresh_turn(
+        &mut self,
+        input: Value,
+        client_msg_id: String,
+        step: &mut DriverStep,
+    ) {
+        step.events.push(AgentEvent::UserMessageUpdate {
+            id: client_msg_id.clone(),
+            state: UserMessageState::Sent,
+        });
+        self.emit_turn_start(input, client_msg_id, step);
+    }
+
+    /// Route the decline-feedback reason into the conversation whatever the
+    /// turn state: steer the running turn, buffer through an unidentified
+    /// start window, or open a fresh turn. (Send does its own dispatch inline
+    /// so it can thread the delivery-tracking `client_msg_id`; this mints its
+    /// own untracked id since the feedback text is not a queued user bubble.)
+    fn dispatch_input(&mut self, input: Value, step: &mut DriverStep) {
+        let client_msg_id = crate::model::fresh_uuid();
+        if self.turn_active && !self.turn_id.is_empty() {
+            // Type-through: inject into the RUNNING turn (steer).
+            self.emit_steer(input, client_msg_id, step);
+        } else if self.turn_pending {
+            // A turn/start is in flight but unidentified: buffer to steer
+            // once turn/started lands, so we don't race a second turn/start
+            // (rejected) and lose the echoed message.
+            self.buffered_sends.push((input, client_msg_id));
+        } else {
+            self.emit_turn_start(input, client_msg_id, step);
+        }
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
@@ -1502,12 +1851,18 @@ impl CodexMapper {
                         }));
                     }
                 }
+                let input = json!(input);
+                let client_msg_id = crate::model::fresh_uuid();
+                // A steered/buffered send is not consumed by the agent yet:
+                // it echoes queued and resolves via UserMessageUpdate when
+                // the steer RPC answers (or the buffered flush's steer does).
+                let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
                 step.events.push(AgentEvent::UserMessage {
                     text: text.clone(),
                     attachments,
+                    id: Some(client_msg_id.clone()),
+                    queued,
                 });
-                let input = json!(input);
-                let client_msg_id = crate::model::fresh_uuid();
                 if self.turn_active && !self.turn_id.is_empty() {
                     // Type-through: inject into the RUNNING turn (steer).
                     self.emit_steer(input, client_msg_id, &mut step);
@@ -1517,15 +1872,39 @@ impl CodexMapper {
                     // turn/start (rejected) and lose the echoed message.
                     self.buffered_sends.push((input, client_msg_id));
                 } else {
+                    // Only a turn-OPENING send anchors a checkpoint: rewind
+                    // rolls back whole turns (thread/rollback numTurns), so a
+                    // steered message — joining a running turn — is not a
+                    // rewindable boundary. Emitted right after UserMessage
+                    // (the journal-truncation cut relies on the adjacency).
+                    let preceding = self.last_checkpoint.replace(client_msg_id.clone());
+                    step.events.push(AgentEvent::Checkpoint {
+                        user_message_id: client_msg_id.clone(),
+                        preceding_uuid: preceding,
+                    });
                     self.emit_turn_start(input, client_msg_id, &mut step);
                 }
             }
             AgentCommand::Permission {
                 request_id,
                 option_id,
+                feedback,
                 ..
             } => {
                 let Some((rpc_id, decisions)) = self.pending_approvals.remove(&request_id) else {
+                    // The ask predates this driver process (respawn, toggle,
+                    // resume) or the server already settled it: the reply
+                    // route is gone. Resolve — journaled — plus a notice, so
+                    // the click never silently vanishes into a stuck card.
+                    step.events.push(AgentEvent::PermissionResolved {
+                        request_id,
+                        option_id: "expired".into(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that permission prompt is no longer active \
+                               (the agent restarted since it asked)"
+                            .into(),
+                    });
                     return step;
                 };
                 // Unknown decision strings silently decline server-side, so
@@ -1534,14 +1913,39 @@ impl CodexMapper {
                     .get(&option_id)
                     .cloned()
                     .unwrap_or_else(|| json!({ "decision": "decline" }));
+                let declined = result["decision"] == json!("decline");
                 step.outbound
                     .push(json!({ "id": rpc_id, "result": result }));
                 step.events.push(AgentEvent::PermissionResolved {
                     request_id,
                     option_id,
                 });
+                // Deny feedback: the app-server decline carries no message
+                // field, so the reason follows the decline as user input into
+                // the (still running) turn — the protocol's equivalent of
+                // claude's feedback-denial.
+                if declined {
+                    if let Some(fb) = feedback
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                    {
+                        step.events.push(AgentEvent::UserMessage {
+                            text: fb.clone(),
+                            attachments: 0,
+                            id: None,
+                            queued: false,
+                        });
+                        self.dispatch_input(json!([{ "type": "text", "text": fb }]), &mut step);
+                    }
+                }
             }
             AgentCommand::Interrupt => {
+                // Arm the watchdog: "no active turn to interrupt" is a benign
+                // no-op on the app-server, and a wedged turn may never emit
+                // turn/completed, so `tick` synthesizes the abort if no real
+                // turn end lands within the grace — the user's escape from a
+                // stuck-running state. A real turn end disarms it first.
+                self.interrupt_grace = Some(INTERRUPT_GRACE_TICKS);
                 let id = self.rpc_id();
                 self.pending_rpcs.insert(id, PendingRpc::Interrupt);
                 step.outbound.push(json!({
@@ -1602,7 +2006,18 @@ impl CodexMapper {
                 request_id,
                 answers,
             } => {
-                let Some(rpc_id) = self.pending_questions.remove(&request_id) else {
+                let Some(question) = self.pending_questions.remove(&request_id) else {
+                    // Same stale-ask contract as Permission above: resolve +
+                    // notice instead of silently eating the user's answer.
+                    step.events.push(AgentEvent::QuestionResolved {
+                        request_id,
+                        answers: Default::default(),
+                    });
+                    step.events.push(AgentEvent::Notice {
+                        text: "that question is no longer active (the agent \
+                               restarted since it asked) — ask again if needed"
+                            .into(),
+                    });
                     return step;
                 };
                 let mut map = serde_json::Map::new();
@@ -1610,11 +2025,58 @@ impl CodexMapper {
                     map.insert(qid.clone(), json!({ "answers": labels }));
                 }
                 step.outbound
-                    .push(json!({ "id": rpc_id, "result": { "answers": map } }));
-                step.events
-                    .push(AgentEvent::QuestionResolved { request_id });
+                    .push(json!({ "id": question.rpc_id, "result": { "answers": map } }));
+                // The chosen labels ride the resolution so the transcript
+                // (and every replay) shows question + answer, not a vanish.
+                step.events.push(AgentEvent::QuestionResolved {
+                    request_id,
+                    answers,
+                });
             }
-            // No codex equivalents on this surface.
+            AgentCommand::Compact => {
+                // Live-verified: the ack is an empty result; the compaction
+                // then runs as its own turn whose contextCompaction item maps
+                // to the "context compacted" notice (no thread/compacted
+                // notification on the pinned version).
+                let id = self.rpc_id();
+                self.pending_rpcs.insert(id, PendingRpc::Compact);
+                step.outbound.push(json!({
+                    "id": id, "method": "thread/compact/start",
+                    "params": { "threadId": self.thread_id },
+                }));
+            }
+            // Pull back a still-queued message. A send still in the pre-steer
+            // buffer is genuinely pulled back (it never reached codex). A send
+            // whose steer RPC is IN FLIGHT is mid-delivery — it's on the wire
+            // and its `sent`/re-drive resolution is still coming, so a
+            // tombstone now would vanish a bubble the agent may consume:
+            // that one gets a Notice instead. Anything else already resolved:
+            // emit `Cancelled` tombstone-style (claude parity) — it dismisses
+            // a DROPPED "not delivered" bubble on live and replay alike, and
+            // the reducer no-ops for an already-`sent` id (the message is
+            // visibly in the transcript, which is its own answer).
+            AgentCommand::CancelQueued { id } => {
+                let steer_in_flight = self.pending_rpcs.values().any(
+                    |p| matches!(p, PendingRpc::Steer { client_msg_id, .. } if *client_msg_id == id),
+                );
+                if steer_in_flight {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that message is already on its way to the agent — \
+                               too late to cancel it"
+                            .into(),
+                    });
+                } else {
+                    self.buffered_sends.retain(|(_, cid)| cid != &id);
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Cancelled,
+                    });
+                }
+            }
+            // No codex equivalents on this surface. Rewind is not a driver
+            // command here: the conversation rewind is the server's respawn
+            // recipe (thread/resume + thread/rollback at handshake), and
+            // codex has no rewind_files-style file restore to answer with.
             AgentCommand::SetThinking { .. }
             | AgentCommand::SetUltracode { .. }
             | AgentCommand::BackgroundTool { .. }
@@ -1623,6 +2085,106 @@ impl CodexMapper {
             | AgentCommand::GetMcp
             | AgentCommand::SetMcpEnabled { .. }
             | AgentCommand::ReconnectMcp { .. } => {}
+        }
+        step
+    }
+
+    /// Auto-skip questions whose `autoResolutionMs` deadline passed: empty
+    /// answers back to the server (the official client's behavior), the card
+    /// withdrawn, and a visible note in the transcript. Split from [`tick`]
+    /// so tests can drive the clock.
+    fn expire_questions(&mut self, now: std::time::Instant) -> DriverStep {
+        let mut step = DriverStep::default();
+        let expired: Vec<String> = self
+            .pending_questions
+            .iter()
+            .filter(|(_, q)| q.deadline.is_some_and(|d| d <= now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for request_id in expired {
+            let Some(question) = self.pending_questions.remove(&request_id) else {
+                continue;
+            };
+            step.outbound
+                .push(json!({ "id": question.rpc_id, "result": { "answers": {} } }));
+            // Timed-out question resolves with empty answers (the official
+            // client's empty-skip) so the transcript/replay shows it withdrawn.
+            step.events.push(AgentEvent::QuestionResolved {
+                request_id,
+                answers: Default::default(),
+            });
+            step.events.push(AgentEvent::Notice {
+                text: "question timed out unanswered — skipped (codex auto-resolution)".into(),
+            });
+        }
+        step
+    }
+
+    /// The interrupt watchdog (see `INTERRUPT_GRACE_TICKS`). When the grace
+    /// armed on `Interrupt` expires with a turn still open — the app-server
+    /// never emitted `turn/completed`, so the session would stay "running"
+    /// forever — synthesize the abort it owed: emit `TurnAborted{interrupted}`
+    /// and DROP the queue. Dropping (not re-driving) is deliberate here,
+    /// unlike the live-abort paths: the watchdog firing means codex stopped
+    /// answering, so a steer will never get its ack and a re-driven
+    /// `turn/start` would strand "queued" against a wedged process —
+    /// `dropped` (dismissible) is the honest state. A real turn end disarms
+    /// the grace first, so a live turn is never double-aborted; idle-guarded,
+    /// so interrupting nothing stays a no-op.
+    fn interrupt_watchdog(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        let Some(remaining) = self.interrupt_grace else {
+            return step;
+        };
+        if remaining > 1 {
+            self.interrupt_grace = Some(remaining - 1);
+            return step;
+        }
+        self.interrupt_grace = None;
+        if !self.turn_active {
+            // Interrupt while idle is a benign no-op — nothing to abort.
+            return step;
+        }
+        self.turn_active = false;
+        step.events.push(AgentEvent::TurnAborted {
+            turn_id: self.turn_id.clone(),
+            reason: "interrupted".into(),
+            interrupted: true,
+        });
+        step.events.extend(self.drain_queued_sends());
+        self.reset_turn_state();
+        step
+    }
+
+    /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`). codex normally resolves
+    /// every queued message at a well-defined point (a steer's RPC answer, a
+    /// live abort's re-drive, or the teardown drain), so this is the defensive
+    /// rescue for the one seam where it can't: a turn end that fires while a
+    /// `turn/start` was still in flight (`turn_pending`) leaves
+    /// `buffered_sends` stranded with no turn to steer them into. When the
+    /// driver is idle with a stranded buffer past the grace, re-drive the
+    /// oldest as a fresh turn (delivering it, resolving `sent`); the rest
+    /// re-buffer and steer once it starts — the same path a `turn/start` error
+    /// takes. A codex buffer was never sent, so we DELIVER it rather than
+    /// declare it sent unseen.
+    fn idle_flush(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        if self.turn_active || self.turn_pending || self.buffered_sends.is_empty() {
+            self.idle_flush_grace = None;
+            return step;
+        }
+        match self.idle_flush_grace {
+            None => {
+                self.idle_flush_grace = Some(IDLE_FLUSH_GRACE_TICKS);
+            }
+            Some(remaining) if remaining > 1 => {
+                self.idle_flush_grace = Some(remaining - 1);
+            }
+            Some(_) => {
+                self.idle_flush_grace = None;
+                let (input, client_msg_id) = self.buffered_sends.remove(0);
+                self.redrive_as_fresh_turn(input, client_msg_id, &mut step);
+            }
         }
         step
     }
@@ -1643,6 +2205,19 @@ impl Mapper for CodexMapper {
     }
     fn flush(&mut self) -> Option<AgentEvent> {
         self.flush()
+    }
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        self.drain_pending()
+    }
+    fn tick(&mut self) -> DriverStep {
+        let mut step = self.expire_questions(std::time::Instant::now());
+        let watchdog = self.interrupt_watchdog();
+        step.events.extend(watchdog.events);
+        step.outbound.extend(watchdog.outbound);
+        let flush = self.idle_flush();
+        step.events.extend(flush.events);
+        step.outbound.extend(flush.outbound);
+        step
     }
 }
 
@@ -1741,7 +2316,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new())
+        CodexMapper::new("thr-1".into(), Vec::new(), None, 3)
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -1760,9 +2335,31 @@ mod tests {
                 text: "also do X".into(),
             }],
         });
+        // The echo marks the message queued until the steer RPC answers.
+        let msg_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a steered send echoes queued");
+                id.clone().expect("steered send carries a delivery id")
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-A");
-        assert!(step.outbound[0]["params"]["clientUserMessageId"].is_string());
+        assert_eq!(
+            step.outbound[0]["params"]["clientUserMessageId"],
+            json!(msg_id)
+        );
+
+        // Steer accepted → the message resolves sent, exactly once.
+        let rpc_id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": rpc_id, "result": {} }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: msg_id,
+                state: UserMessageState::Sent,
+            }]
+        );
     }
 
     #[test]
@@ -1775,7 +2372,8 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/start");
         assert!(m.turn_pending);
         // Second send arrives BEFORE turn/started: it must NOT fire a second
-        // turn/start (which the server rejects, losing the message) — it buffers.
+        // turn/start (which the server rejects, losing the message) — it buffers,
+        // echoed queued until its flushed steer resolves.
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "two".into() }],
         });
@@ -1784,6 +2382,13 @@ mod tests {
             "second send buffers, no second turn/start: {:?}",
             step.outbound
         );
+        let buffered_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a buffered send echoes queued");
+                id.clone().unwrap()
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         // turn/started lands: the buffered send flushes as a steer into it.
         let step = m.on_frame(&json!({
             "method": "turn/started",
@@ -1796,6 +2401,59 @@ mod tests {
             .find(|f| f["method"] == "turn/steer")
             .expect("buffered send steered");
         assert_eq!(steer["params"]["expectedTurnId"], "turn-Z");
+        // …and the flushed steer's success resolves the buffered send.
+        let rpc_id = steer["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": rpc_id, "result": {} }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: buffered_id,
+                state: UserMessageState::Sent,
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_end_classifies_user_interrupt_vs_failure() {
+        // status "interrupted" is codex's structural user-stop signal.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: true,
+                    reason,
+                    ..
+                } if reason == "interrupted"
+            )),
+            "user interrupt carries the structural flag: {:?}",
+            step.events
+        );
+
+        // turn/failed is a genuine failure — never flagged interrupted.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "turn/failed",
+            "params": { "error": { "message": "boom" } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: false,
+                    reason,
+                    ..
+                } if reason == "boom"
+            )),
+            "failures keep interrupted false: {:?}",
+            step.events
+        );
     }
 
     #[test]
@@ -1870,6 +2528,325 @@ mod tests {
     }
 
     #[test]
+    fn user_interrupt_preserves_queued_steer_via_redrive() {
+        // Two-driver symmetry with claude: a stop ends only the CURRENT turn
+        // (maintainer decision 2026-07-11). A message whose steer was still in
+        // flight when the user stopped is NOT dropped — codex answers the
+        // steer with an error (turn gone), and that answer re-drives it as a
+        // fresh turn, so the user's message still delivers in full.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "B".into() }],
+        });
+        let steer_id = step.outbound[0]["id"].as_u64().unwrap();
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // User hits stop; the turn then ends interrupted. The in-flight steer
+        // is left tracked (codex is alive and WILL answer it) — nothing drops.
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "the stop resolves nothing — the steer's own answer will: {:?}",
+            step.events
+        );
+        // The steer's error answer re-drives B as a fresh turn, resolving it
+        // `sent` — the queued message survives the stop.
+        let step = m.on_frame(&json!({
+            "id": steer_id,
+            "error": { "message": "no active turn" },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent }
+                    if id == &queued_id
+            )),
+            "the stopped-past steer re-drives and resolves sent: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "the saved input re-drives as a fresh turn: {:?}",
+            step.outbound
+        );
+    }
+
+    /// Feature 2 (codex): a send still sitting in the pre-steer buffer can be
+    /// cancelled — it resolves `Cancelled`, leaves the buffer, and never steers
+    /// into the turn once it starts.
+    #[test]
+    fn cancel_queued_drops_a_buffered_send() {
+        let mut m = mapper();
+        // First send opens the turn (turn/start); the start window is now open.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "A".into() }],
+        });
+        assert!(m.turn_pending);
+        // Second send buffers during the window.
+        let buffered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // Cancel it: resolves Cancelled and empties the buffer.
+        let step = m.on_command(AgentCommand::CancelQueued {
+            id: buffered.clone(),
+        });
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: buffered.clone(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+        assert!(m.buffered_sends.is_empty(), "the buffer is emptied");
+        // turn/started now steers NOTHING — the cancelled send is gone.
+        let step = m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-Z" } },
+        }));
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/steer"),
+            "a cancelled buffered send never steers: {:?}",
+            step.outbound
+        );
+    }
+
+    /// Feature 2 (codex): a send already steered into the running turn is
+    /// mid-delivery — its steer RPC is on the wire and unanswered, so a
+    /// tombstone now could vanish a bubble the agent then consumes.
+    /// Cancelling it is a Notice; the steer's own answer resolves it.
+    #[test]
+    fn cancel_queued_mid_steer_is_a_notice() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let steered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // It was steered (buffer is empty; the RPC is in flight, unanswered).
+        assert!(m.buffered_sends.is_empty());
+        let step = m.on_command(AgentCommand::CancelQueued { id: steered });
+        assert!(matches!(
+            step.events.as_slice(),
+            [AgentEvent::Notice { text }] if text.contains("on its way")
+        ));
+    }
+
+    /// A cancel for an id that already fully resolved (nothing held, no steer
+    /// in flight) is the tombstone `Cancelled`: it dismisses a dropped "not
+    /// delivered" bubble on live and replay, and the reducer no-ops for an
+    /// already-`sent` id.
+    #[test]
+    fn cancel_queued_after_resolution_is_a_tombstone() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::CancelQueued {
+            id: "gone-id".into(),
+        });
+        assert!(step.outbound.is_empty(), "nothing goes to codex");
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "gone-id".into(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+    }
+
+    /// Feature 1 (codex): a buffer stranded when a turn ended under a pending
+    /// turn/start is rescued by the idle-flush — re-driven as a fresh turn
+    /// (delivered, resolves `sent`), never left faded "queued". Symmetric to
+    /// claude's idle-flush.
+    #[test]
+    fn idle_flush_redrives_a_stranded_buffer() {
+        let mut m = mapper();
+        // A turn/start in flight, with a send buffered behind it…
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "A".into() }],
+        });
+        assert!(m.turn_pending);
+        let buffered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // …then a turn ends under the pending start (no turn/started ever
+        // landed), stranding the buffer: reset_turn_state clears turn_pending
+        // but leaves buffered_sends, and turn_active was never set.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(!m.turn_pending && !m.turn_active);
+        assert_eq!(m.buffered_sends.len(), 1, "the buffer is stranded");
+
+        // Ticks below the grace do nothing…
+        for _ in 0..IDLE_FLUSH_GRACE_TICKS {
+            assert!(
+                m.tick().events.is_empty(),
+                "no flush before the idle grace expires"
+            );
+        }
+        // …the expiring tick re-drives it: resolves sent AND opens a real turn
+        // (honest delivery — a codex buffer was never sent).
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == buffered
+            )),
+            "the stranded buffer resolves sent: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "and is delivered as a fresh turn: {:?}",
+            step.outbound
+        );
+        assert!(m.buffered_sends.is_empty(), "the buffer drained");
+    }
+
+    /// The interrupt watchdog (two-driver symmetry with claude): when the
+    /// app-server never emits turn/completed after an interrupt (wedged turn,
+    /// or the benign no-op interrupt), the grace expires and the driver
+    /// synthesizes the abort so the user escapes a stuck-running state.
+    #[test]
+    fn interrupt_watchdog_aborts_a_hung_turn_after_the_grace() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        // A message queued behind the (soon-hung) turn.
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS - 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no abort before the grace expires"
+            );
+        }
+        assert!(m.turn_active, "still running until the grace fires");
+
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "the watchdog aborts the hung turn as a user stop: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "the queue drops with the watchdog abort: {:?}",
+            step.events
+        );
+        assert!(!m.turn_active, "the turn is closed");
+        assert!(m.tick().events.is_empty(), "watchdog fires exactly once");
+
+        // A late real turn/completed for the same turn must NOT double-abort —
+        // the was_active guard suppresses the second end.
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "a late real turn end after the watchdog must not double-abort: {:?}",
+            step.events
+        );
+    }
+
+    /// A real turn/completed{interrupted} landing before the grace disarms the
+    /// watchdog, so a genuine turn is never double-aborted.
+    #[test]
+    fn real_turn_end_disarms_the_interrupt_watchdog() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_command(AgentCommand::Interrupt);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
+            "the real interrupt ends the turn: {:?}",
+            step.events
+        );
+        assert!(m.interrupt_grace.is_none(), "the watchdog is disarmed");
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "no double abort after a real turn end"
+            );
+        }
+    }
+
+    /// Interrupt pressed while idle is a no-op: the grace expires without an
+    /// abort (there is no turn to stop).
+    #[test]
+    fn interrupt_while_idle_is_a_watchdog_no_op() {
+        let mut m = mapper();
+        assert!(!m.turn_active);
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..(INTERRUPT_GRACE_TICKS + 1) {
+            assert!(
+                m.tick().events.is_empty(),
+                "an idle interrupt never fabricates an abort"
+            );
+        }
+        assert!(!m.turn_active);
+    }
+
+    #[test]
     fn steer_retries_once_with_parsed_live_turn_id() {
         let mut m = mapper();
         active_turn(&mut m);
@@ -1885,7 +2862,8 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-B");
 
-        // Second failure surfaces instead of looping.
+        // Second failure surfaces instead of looping — and resolves the
+        // still-queued message as dropped, not stranded.
         let id2 = step.outbound[0]["id"].as_u64().unwrap();
         let step = m.on_frame(&json!({
             "id": id2,
@@ -1896,6 +2874,17 @@ mod tests {
             &step.events[0],
             AgentEvent::Error { fatal: false, .. }
         ));
+        assert!(
+            matches!(
+                &step.events[1],
+                AgentEvent::UserMessageUpdate {
+                    state: UserMessageState::Dropped,
+                    ..
+                }
+            ),
+            "final steer failure drops the message: {:?}",
+            step.events
+        );
     }
 
     #[test]
@@ -1910,13 +2899,20 @@ mod tests {
                 },
             ],
         });
-        assert_eq!(
-            step.events[0],
+        match &step.events[0] {
             AgentEvent::UserMessage {
-                text: "see".into(),
-                attachments: 1
+                text,
+                attachments,
+                id,
+                queued,
+            } => {
+                assert_eq!(text, "see");
+                assert_eq!(*attachments, 1);
+                assert!(id.is_some(), "sends carry a delivery id");
+                assert!(!queued, "a fresh-turn send is not queued");
             }
-        );
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
         let input = &step.outbound[0]["params"]["input"];
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "image");
@@ -1999,6 +2995,7 @@ mod tests {
             request_id,
             option_id: amendment_opt,
             destination: None,
+            feedback: None,
         });
         assert_eq!(step.outbound[0]["id"], 77);
         assert_eq!(
@@ -2035,10 +3032,65 @@ mod tests {
             request_id: "codex-78".into(),
             option_id: "allowHostAlways".into(),
             destination: None,
+            feedback: None,
         });
         let amendment = &step.outbound[0]["result"]["decision"]["applyNetworkPolicyAmendment"]
             ["network_policy_amendment"];
         assert_eq!(amendment["action"], "allow");
+    }
+
+    #[test]
+    fn decline_with_feedback_steers_the_reason_into_the_turn() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&json!({
+            "id": 80,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "itemId": "item-3",
+                "command": "rm -rf build",
+                "commandActions": [{ "type": "run", "command": "rm -rf build" }],
+            },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-80".into(),
+            option_id: "decline".into(),
+            destination: None,
+            feedback: Some("  use `just clean` instead  ".into()),
+        });
+        // The decline answers the rpc first; the reason then steers into the
+        // still-running turn as user input.
+        assert_eq!(step.outbound[0]["id"], 80);
+        assert_eq!(step.outbound[0]["result"]["decision"], "decline");
+        assert_eq!(step.outbound[1]["method"], "turn/steer");
+        assert_eq!(
+            step.outbound[1]["params"]["input"][0]["text"],
+            "use `just clean` instead"
+        );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { option_id, .. } if option_id == "decline"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::UserMessage { text, .. } if text == "use `just clean` instead"
+        ));
+
+        // Feedback on an ACCEPT is never delivered (nothing to steer).
+        m.on_frame(&json!({
+            "id": 81,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "itemId": "item-4", "command": "ls",
+                        "commandActions": [{ "type": "run", "command": "ls" }] },
+        }));
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-81".into(),
+            option_id: "accept".into(),
+            destination: None,
+            feedback: Some("stray text".into()),
+        });
+        assert_eq!(step.outbound.len(), 1, "accept sends only the decision");
+        assert_eq!(step.events.len(), 1, "no user echo on accept");
     }
 
     #[test]
@@ -2197,6 +3249,12 @@ mod tests {
             step.outbound[0]["result"]["answers"]["q1"]["answers"],
             json!(["src only"])
         );
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-91"
+                    && answers.get("q1") == Some(&vec!["src only".to_string()])
+        ));
 
         // A second prompt withdrawn by the server (timeout / other client).
         m.on_frame(&json!({
@@ -2210,8 +3268,241 @@ mod tests {
         }));
         assert!(matches!(
             &step.events[0],
-            AgentEvent::QuestionResolved { request_id } if request_id == "codex-92"
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-92" && answers.is_empty()
         ));
+    }
+
+    #[test]
+    fn stale_answer_and_permission_resolve_definitively() {
+        // Mirror of the claude driver's contract: a reply to an ask this
+        // process never issued resolves + notices instead of dropping.
+        let mut m = mapper();
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("q".to_string(), vec!["a".to_string()]);
+        let step = m.on_command(AgentCommand::Answer {
+            request_id: "codex-77".into(),
+            answers,
+        });
+        assert!(step.outbound.is_empty(), "no live request to answer");
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-77" && answers.is_empty()
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+
+        let step = m.on_command(AgentCommand::Permission {
+            request_id: "codex-78".into(),
+            option_id: "accept".into(),
+            destination: None,
+            feedback: None,
+        });
+        assert!(step.outbound.is_empty());
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "codex-78" && option_id == "expired"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("no longer active")
+        ));
+    }
+
+    #[test]
+    fn drain_pending_resolves_every_outstanding_ask() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "id": 91,
+            "method": "item/tool/requestUserInput",
+            "params": { "questions": [{ "id": "q1", "question": "Q?" }] },
+        }));
+        m.on_frame(&json!({
+            "id": 92,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "threadId": "thr-1", "itemId": "item-1", "command": "make" },
+        }));
+        let events = Mapper::drain_pending(&mut m);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::QuestionResolved { request_id, answers }
+                if request_id == "codex-91" && answers.is_empty()
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::PermissionResolved { request_id, option_id }
+                if request_id == "codex-92" && option_id == "expired"
+        )));
+        assert!(
+            Mapper::drain_pending(&mut m).is_empty(),
+            "drain is exhaustive"
+        );
+    }
+
+    #[test]
+    fn full_access_auto_decline_notices_once_per_turn() {
+        let mut m = mapper();
+        // full-access → approvalPolicy "never": codex declines by itself.
+        m.settings_update_unsupported = true;
+        m.on_command(AgentCommand::SetMode {
+            mode_id: "full-access".into(),
+        });
+        active_turn(&mut m);
+        let declined = |id: &str| {
+            json!({
+                "method": "item/completed",
+                "params": { "item": {
+                    "id": id, "type": "commandExecution", "status": "declined",
+                    "command": "curl example.com",
+                }},
+            })
+        };
+        let step = m.on_frame(&declined("item-1"));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Notice { text } if text.contains("full access never asks")
+            )),
+            "auto-decline must be named, not just a failed tool card: {:?}",
+            step.events
+        );
+        let step = m.on_frame(&declined("item-2"));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "one notice per turn"
+        );
+
+        // In auto mode a declined item follows the USER's own deny — silent.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&declined("item-3"));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Notice { .. })));
+    }
+
+    #[test]
+    fn turn_opening_send_anchors_checkpoint_but_steer_does_not() {
+        let mut m = mapper();
+        // First turn-opening send: checkpoint with nothing preceding.
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "one".into() }],
+        });
+        let first_id = match (&step.events[0], &step.events[1]) {
+            (
+                AgentEvent::UserMessage { .. },
+                AgentEvent::Checkpoint {
+                    user_message_id,
+                    preceding_uuid,
+                },
+            ) => {
+                assert!(preceding_uuid.is_none(), "nothing precedes the first send");
+                user_message_id.clone()
+            }
+            other => panic!("expected UserMessage+Checkpoint, got {other:?}"),
+        };
+        // A steered mid-turn send joins the running turn: no checkpoint (the
+        // rewind rolls back whole turns, so a steer is not a boundary).
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-A" } },
+        }));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "also".into(),
+            }],
+        });
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Checkpoint { .. })),
+            "steered sends must not anchor checkpoints"
+        );
+        // The next turn-opening send chains its preceding uuid.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "two".into() }],
+        });
+        match &step.events[1] {
+            AgentEvent::Checkpoint { preceding_uuid, .. } => {
+                assert_eq!(preceding_uuid.as_deref(), Some(first_id.as_str()));
+            }
+            other => panic!("expected Checkpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_command_sends_thread_compact_start_and_error_surfaces() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::Compact);
+        assert_eq!(step.outbound[0]["method"], "thread/compact/start");
+        assert_eq!(step.outbound[0]["params"]["threadId"], "thr-1");
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        // The ack is an empty result — nothing to render (the compaction
+        // turn's contextCompaction item is the visible notice).
+        let step = m.on_frame(&json!({ "id": id, "result": {} }));
+        assert!(step.events.is_empty());
+        // A refusal surfaces as a non-fatal error.
+        let step = m.on_command(AgentCommand::Compact);
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "id": id,
+            "error": { "message": "not now" },
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Error { fatal: false, message } if message.contains("not now")
+        ));
+    }
+
+    #[test]
+    fn auto_resolution_deadline_skips_question_with_empty_answers() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "id": 93,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "questions": [{ "id": "q1", "question": "Proceed?" }],
+                "autoResolutionMs": 50,
+            },
+        }));
+        // Before the deadline: nothing expires.
+        let step = m.expire_questions(std::time::Instant::now());
+        assert!(step.outbound.is_empty() && step.events.is_empty());
+        // Past the deadline: empty answers + withdrawal + a visible note.
+        let later = std::time::Instant::now() + Duration::from_millis(60);
+        let step = m.expire_questions(later);
+        assert_eq!(step.outbound[0]["id"], 93);
+        assert_eq!(step.outbound[0]["result"]["answers"], json!({}));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::QuestionResolved { request_id, .. } if request_id == "codex-93"
+        ));
+        assert!(matches!(
+            &step.events[1],
+            AgentEvent::Notice { text } if text.contains("auto-resolution")
+        ));
+        // A question without the field never expires.
+        m.on_frame(&json!({
+            "id": 94,
+            "method": "item/tool/requestUserInput",
+            "params": { "questions": [{ "id": "q2", "question": "Still there?" }] },
+        }));
+        let far = std::time::Instant::now() + Duration::from_secs(3600);
+        let step = m.expire_questions(far);
+        assert!(step.outbound.is_empty(), "no deadline, no auto-skip");
     }
 
     #[test]

@@ -23,9 +23,11 @@
     root: string;
     /** Open a file surface in the layout. */
     onOpen(path: string): void;
-    /** Begin a pointer drag of a file entry (same grammar as rail rows and
-     *  pane tabs; a sub-threshold release becomes a plain open). */
-    onDragStart(e: PointerEvent, path: string): void;
+    /** Begin a pointer drag of a tree entry — file OR dir (same grammar as
+     *  rail rows and pane tabs). `onEntryClick` is the sub-threshold action
+     *  (open for files, expand/collapse for dirs), routed through the drag so
+     *  a completed drag never ALSO fires the row's click. */
+    onDragStart(e: PointerEvent, path: string, kind: "file" | "dir", onEntryClick: () => void): void;
     /** The focused pane's active file, for the subtle current marker. */
     activePath: string | null;
     /**
@@ -531,16 +533,17 @@
       title={entry.path}
       data-path={entry.path}
       style:padding-left={`${8 + depth * 13}px`}
-      onclick={() => {
-        // Files open via the drag's sub-threshold click path (below), so a
-        // completed drag never ALSO opens the file in the focused pane.
-        if (edit?.mode === "rename" && edit.path === entry.path) return;
-        if (entry.kind === "dir") toggle(entry.path);
-      }}
       onpointerdowncapture={(e) => {
         // The rename input stays a plain interactive target (rail-row idiom).
         if (e.target instanceof Element && e.target.closest(".edit-input")) return;
-        if (entry.kind === "file") onDragStart(e, entry.path);
+        // Both kinds click via the drag's sub-threshold path — a DOM onclick
+        // would ALSO fire after a completed drag (pointer capture retargets
+        // the click back to this row) and double-act. Skip while renaming.
+        onDragStart(e, entry.path, entry.kind, () => {
+          if (edit?.mode === "rename" && edit.path === entry.path) return;
+          if (entry.kind === "dir") toggle(entry.path);
+          else onOpen(entry.path);
+        });
       }}
       onkeydown={(e) => onRowKey(e, entry)}
       oncontextmenu={(e) => contextMenu.openAt(e, menuFor(entry))}

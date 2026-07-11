@@ -43,6 +43,12 @@ pub enum AgentEvent {
         /// empty = the UI falls back to the curated list.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         models: Vec<ModelInfo>,
+        /// The agent CLI's `--version` line as the launcher probed it at
+        /// spawn (`None` when the probe failed) — journaled so a drifted
+        /// binary is diagnosable after the fact; the harness's drift Notice
+        /// keys off the same value. Additive: old clients ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_version: Option<String>,
     },
     TurnStarted {
         turn_id: String,
@@ -69,6 +75,16 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         attachments: u32,
+        /// Client-minted delivery key (claude checkpoint uuid / codex
+        /// clientUserMessageId) — what a later `UserMessageUpdate` resolves.
+        /// Absent on pre-upgrade journals and transcript-seeded messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// The agent has NOT consumed this message yet (claude queues
+        /// mid-turn stdin frames; codex steers/buffers into a running turn).
+        /// Resolved by a `UserMessageUpdate`; default false = delivered.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        queued: bool,
     },
     ToolCall {
         id: String,
@@ -103,6 +119,11 @@ pub enum AgentEvent {
         options: Vec<PermissionOption>,
         /// Raw tool input for the expandable detail view.
         input_preview: Value,
+        /// Plan markdown when this request is a plan approval (claude
+        /// ExitPlanMode) — present ⇒ the client renders a plan-approval card
+        /// instead of the generic permission card. Capped at construction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
     },
     PermissionResolved {
         request_id: String,
@@ -117,6 +138,13 @@ pub enum AgentEvent {
     },
     QuestionResolved {
         request_id: String,
+        /// The user's chosen labels per question id — journaled so history
+        /// (and every replay) can show the question WITH its answer. Empty =
+        /// resolved without one (cancelled, expired, or a pre-answers
+        /// journal). Additive optional field: old journals deserialize to
+        /// empty, old clients ignore it.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        answers: std::collections::HashMap<String, Vec<String>>,
     },
     ModeChanged {
         mode_id: String,
@@ -136,6 +164,13 @@ pub enum AgentEvent {
     TurnAborted {
         turn_id: String,
         reason: String,
+        /// The abort was a deliberate user stop (the interrupt command), a
+        /// fact the driver knows structurally — consumers render it quiet
+        /// (idle rail, muted notice), never as a failure. Optional-with-
+        /// default so pre-upgrade journals deserialize (false) and failure
+        /// aborts serialize byte-identically to before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        interrupted: bool,
     },
     /// Context-window occupancy after a turn (claude: get_context_usage;
     /// codex: tokenUsage vs modelContextWindow).
@@ -233,6 +268,39 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<i32>,
     },
+    /// Delivery resolution for a `queued` UserMessage, matched by `id`:
+    /// claude dequeues one message per finished turn (and an aborted turn
+    /// drops the whole native queue; a coalesced surplus the CLI never runs
+    /// separately resolves `sent` when the driver goes idle); codex resolves
+    /// on the steer RPC answer. `cancelled` is the user's own pull-back
+    /// (`CancelQueued`). Replay is self-correcting — the journal carries the
+    /// queued echo and this update through the same reducer, so a
+    /// queued-then-sent message renders exactly once, a queued-never-sent one
+    /// replays in its final dropped state, and a cancelled one vanishes.
+    UserMessageUpdate {
+        id: String,
+        state: UserMessageState,
+    },
+}
+
+/// Final delivery state of a queued user message.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMessageState {
+    /// The agent consumed it (claude ran it as the next turn — or coalesced it
+    /// into a running one; codex steered it into the running turn).
+    Sent,
+    /// The agent never saw it (claude's queue dies with an aborted turn;
+    /// a codex steer failed for good).
+    Dropped,
+    /// The user pulled it back before the agent consumed it (the `CancelQueued`
+    /// command, honored only while the message is still queued). A cancelled
+    /// message never happened: clients REMOVE the bubble entirely — from both
+    /// the pending stack and the transcript — and replay agrees (the journaled
+    /// `UserMessage{queued}` + this update fold to nothing). APPENDED last so
+    /// pre-upgrade clients that don't know the variant still deserialize every
+    /// other update.
+    Cancelled,
 }
 
 /// Commands a client sends into a chat session (WS frames deserialize
@@ -251,6 +319,13 @@ pub enum AgentCommand {
         /// None = the agent's suggested default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
+        /// Free text riding the decision. On a deny: the user's reason
+        /// (claude: appended to the deny message with interrupt:false;
+        /// codex: steered into the running turn after the decline). On a
+        /// plan approval: comments (claude: updatedInput.userFeedback/
+        /// userComments). Empty/None = the bare decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
     },
     Interrupt,
     SetMode {
@@ -281,6 +356,12 @@ pub enum AgentCommand {
     },
     /// Ask the agent for account usage (claude get_usage -> UsageReport).
     GetUsage,
+    /// Compact the conversation context (codex thread/compact/start; the
+    /// compaction runs as its own turn whose contextCompaction item lands
+    /// the "context compacted" notice). Claude compacts via its own
+    /// `/compact` slash command — the composer sends that as prompt text,
+    /// so this command is a documented no-op there.
+    Compact,
     /// Checkpoint rewind (claude rewind_files). Dry-run answers with a
     /// `RewindResult` report; apply restores the files on disk. The
     /// conversation-side fork (--fork-session) is a server concern.
@@ -308,6 +389,17 @@ pub enum AgentCommand {
     /// Reconnect a failed MCP server (claude mcp_reconnect).
     ReconnectMcp {
         server: String,
+    },
+    /// Pull back a still-queued user message before the agent consumes it
+    /// (`id` = the queued `UserMessage.id`). Honored only while the message is
+    /// genuinely queued: claude removes it from its native mid-turn queue (a
+    /// `cancel_async_message` control request) and codex drops it from the
+    /// pre-steer buffer, both emitting `UserMessageUpdate{Cancelled}`. Once the
+    /// agent has already taken the message, the driver answers with a `Notice`
+    /// instead (it can't be un-said). APPENDED last: strictly additive, so a
+    /// pre-upgrade client that never sends it is unaffected.
+    CancelQueued {
+        id: String,
     },
 }
 
@@ -710,6 +802,8 @@ mod tests {
 
     #[test]
     fn command_deserializes_from_ws_frame_shape() {
+        // The optional fields are strictly additive: an old client's bare
+        // frame must keep deserializing (the wire is a public contract).
         let cmd: AgentCommand = serde_json::from_str(
             r#"{"type":"permission","request_id":"r1","option_id":"allow_once"}"#,
         )
@@ -720,6 +814,21 @@ mod tests {
                 request_id: "r1".into(),
                 option_id: "allow_once".into(),
                 destination: None,
+                feedback: None,
+            }
+        );
+
+        let cmd: AgentCommand = serde_json::from_str(
+            r#"{"type":"permission","request_id":"r1","option_id":"reject_once","feedback":"use rg"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            AgentCommand::Permission {
+                request_id: "r1".into(),
+                option_id: "reject_once".into(),
+                destination: None,
+                feedback: Some("use rg".into()),
             }
         );
     }

@@ -43,7 +43,7 @@ gap-replay idea as the PTY transport, realized for structured streams.
 | File | What it owns | Start here when… |
 |---|---|---|
 | `lib.rs` | `ChatManager`: the session registry + the pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`. | adding session lifecycle, changing fan-out, touching `ChatInfo`. |
-| `driver.rs` | The `AgentAdapter` trait, `SpawnSpec`, `DriverIo`, `DriverExit`, handshake/kill timeouts. | adding a new agent, changing spawn inputs or exit classification. |
+| `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. `agent_version`, `rollback_turns`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
 | `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), `Usage`, the delta `Coalescer`, and the size caps (`cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`). | adding an event/command kind, or a cap. |
 | `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
 | `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn lifecycle, approvals. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
@@ -86,8 +86,13 @@ gap-replay idea as the PTY transport, realized for structured streams.
    a `DriverExit`. Reuse `ndjson.rs` for framing — do not re-roll a line reader.
 2. Emit only normalized `model.rs` events. If you need a new event kind, add it
    there (stable serde tags) so every surface gets it for free.
-3. Pin the tested CLI version; add a `tests/live.rs` case behind the same env
-   gate; extend `PROTOCOL.md`.
+3. Implement `tested_version()` + `kind()` (no default impl) and pin the tested
+   CLI version; the harness journals the launcher-probed version on `Init` and
+   warns (never blocks) on drift from your pin — see PROTOCOL.md "Version
+   detection". Override `tick`/`drain_pending` if your driver has time-driven
+   work or asks/queued sends whose reply route dies with the process (otherwise
+   they no-op). Add a `tests/live.rs` case behind the same env gate; extend
+   `PROTOCOL.md`.
 4. The server (`chimaera-server`) decides *which* adapter to spawn — this crate
    just runs the one it is handed.
 

@@ -3,11 +3,26 @@
 
   interface Props {
     request: PendingPermission;
-    onDecide: (optionId: string, destination?: string) => void;
+    onDecide: (optionId: string, destination?: string, feedback?: string) => void;
   }
 
   let { request, onDecide }: Props = $props();
   let showInput = $state(false);
+
+  /** Deny-with-feedback: the typed reason rides the deny so the agent reacts
+   *  to it instead of aborting (both drivers deliver it per their protocol). */
+  let feedbackOpen = $state(false);
+  let feedbackText = $state("");
+  let feedbackEl = $state<HTMLInputElement | null>(null);
+  const rejectOption = $derived(request.options.find((o) => o.kind === "reject_once"));
+  $effect(() => {
+    if (feedbackOpen) feedbackEl?.focus({ preventScroll: true });
+  });
+  function submitFeedback() {
+    const text = feedbackText.trim();
+    if (rejectOption === undefined || text.length === 0) return;
+    onDecide(rejectOption.id, undefined, text);
+  }
 
   /** Where "Always allow" saves the rule — claude's destination cycler
    *  (option id "allow_always" is the claude driver's; codex "always"
@@ -55,7 +70,8 @@
    *  Enter only counts when the card itself has focus — keydown bubbles from
    *  the option buttons, and hijacking it would fire "allow" from a
    *  Tab-focused reject button. Escape stays unguarded: child buttons have no
-   *  Escape default, and Esc-rejects-from-anywhere matches the TUI. */
+   *  Escape default, and Esc-rejects-from-anywhere matches the TUI — except
+   *  while the feedback row is open, where the first Esc just closes it. */
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && e.target === e.currentTarget) {
       const allow = request.options.find((o) => o.kind === "allow_once");
@@ -64,9 +80,14 @@
         decide(allow.id);
       }
     } else if (e.key === "Escape") {
+      e.preventDefault();
+      if (feedbackOpen) {
+        feedbackOpen = false;
+        cardEl?.focus({ preventScroll: true });
+        return;
+      }
       const deny = request.options.find((o) => o.kind === "reject_once");
       if (deny) {
-        e.preventDefault();
         decide(deny.id);
       }
     }
@@ -99,6 +120,16 @@
         {option.label}
       </button>
     {/each}
+    {#if rejectOption !== undefined}
+      <button
+        class="fb-toggle"
+        class:open={feedbackOpen}
+        title="deny and tell the agent what to do instead"
+        onclick={() => (feedbackOpen = !feedbackOpen)}
+      >
+        deny with feedback…
+      </button>
+    {/if}
     {#if hasDestination}
       <button
         class="dest"
@@ -109,6 +140,24 @@
       </button>
     {/if}
   </div>
+  {#if feedbackOpen}
+    <div class="feedback">
+      <input
+        bind:this={feedbackEl}
+        bind:value={feedbackText}
+        placeholder="what should the agent do instead?"
+        onkeydown={(e) => {
+          if (e.key === "Enter" && feedbackText.trim().length > 0) {
+            e.preventDefault();
+            submitFeedback();
+          }
+        }}
+      />
+      <button class="opt quiet" disabled={feedbackText.trim().length === 0} onclick={submitFeedback}>
+        deny + send
+      </button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -198,5 +247,39 @@
   }
   .dest:hover {
     color: var(--fg);
+  }
+  .fb-toggle {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    padding: 3px 4px;
+    transition: color 0.12s ease;
+  }
+  .fb-toggle:hover,
+  .fb-toggle.open {
+    color: var(--err);
+  }
+  .feedback {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .feedback input {
+    flex: 1;
+    min-width: 0;
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    padding: 4px 10px;
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+  .feedback input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
   }
 </style>

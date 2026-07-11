@@ -33,7 +33,7 @@ hard-resets and rebuilds.
 
 | File | What it owns |
 |---|---|
-| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** |
+| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `ChatView.svelte` | The host: wires the socket + store, renders the transcript, and hangs the header/composer/overlays/panels off itself. Still the big one — keep new chrome in child components, not inline. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
@@ -41,13 +41,19 @@ hard-resets and rebuilds.
 | `Composer.svelte` | Input: draft, images, `@`-mention + `/`-slash popovers, submit/interrupt. |
 | `Markdown.svelte` | Renders agent prose. **Sanitizes untrusted model output** (marked → DOMPurify, `<style>` forbidden, external links `noopener`); stamps validated file paths as clickable. |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). |
-| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`). |
-| `RewindDialog.svelte` | The rewind/fork-point confirmation overlay. |
+| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field). |
+| `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
+| `RewindDialog.svelte` | The rewind/fork-point confirmation overlay (claude fork + codex `thread/rollback`). |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
 | `UserText.svelte` | User-message bubble. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
-| `composerBus.ts` | Cross-component channel to insert text into the active composer (e.g. `@term:` grants, references). |
+| `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |
+| `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. |
+| `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type); size-bounded. |
+
+The transcript's copy affordances reuse `../shared/clipboard.ts` (the native-first
+clipboard writer lifted out of the terminal pool) — see the shared/ area.
 
 ## Invariants / gotchas
 
@@ -58,6 +64,19 @@ hard-resets and rebuilds.
 - **Never lose a user action to a closed socket.** `socket.send` returns `false`
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
+- **A queued send is NOT a transcript block.** Queued/undelivered user messages
+  live in `store.pendingSends` (the stack above the composer), never in `blocks` —
+  so a mid-turn send can't splice into a running turn's output. The reducer moves
+  an entry into `blocks` (appended at the end) only when `user_message_update`
+  resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
+  and it stays in the stack until dismissed. A **Stop never drops the queue** —
+  the driver aborts only the current turn and the held messages resolve `sent`
+  right after, so `dropped` means genuinely undeliverable (agent died). The ✕ on
+  any pending bubble rides `socket.send({type:"cancel_queued", id})`: it pulls
+  back a queued send, dismisses a dropped one (the driver's tombstone
+  `Cancelled` makes that survive replay), and no-ops for one already delivered.
+  All pure reducer, so replay rebuilds the identical order — see
+  `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
 - **Runes discipline.** Mutate `$state` only inside the store's methods; give

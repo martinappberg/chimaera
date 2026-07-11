@@ -13,6 +13,7 @@ mod sessions;
 mod settings;
 mod shell;
 mod support;
+mod upload;
 mod view_state;
 mod workspaces;
 mod ws;

@@ -842,48 +842,133 @@ fn sniff_delimiter(path: &Path, gz: bool) -> anyhow::Result<u8> {
 pub(crate) struct ValidateRequest {
     candidates: Vec<String>,
     base: String,
+    /// Additive (older clients omit it, older daemons ignore it): enables the
+    /// bare-basename fallback below, scoped to this workspace's index.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
-/// POST /api/v1/fs/validate {candidates, base} — batched existence check
-/// behind the terminal link provider: only path-like strings that resolve to
-/// something real get underlined. Each candidate is resolved (absolute, or
-/// relative against the absolute `base`, `~` expanded) and answered under
-/// `valid` as `{path, kind}` — the canonical absolute path and whether it is
-/// a `file` or a `dir`. Misses are simply absent. Candidates past
-/// [`MAX_VALIDATE_CANDIDATES`] are ignored: cheap and batched by design.
-pub(crate) async fn validate(Json(body): Json<ValidateRequest>) -> Response {
-    let base = Path::new(&body.base);
-    if !base.is_absolute() {
+/// A candidate eligible for the bare-basename fallback: a single path segment
+/// (no `/`), not a dotfile / `~` form / flag-like token, shaped like
+/// `name.ext` with a letter-led extension of at most 8 alphanumerics — the
+/// same shape the terminal client's `BARE_EXT_RE` admits. Prose words
+/// (`docs`, `license`) and version numbers (`1.2.3`) never qualify, so the
+/// fallback cannot widen what the clients already treat as path-like.
+fn bare_basename(candidate: &str) -> bool {
+    if candidate.contains('/') {
+        return false;
+    }
+    if candidate.starts_with(['.', '~', '-']) {
+        return false;
+    }
+    let Some((stem, ext)) = candidate.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (1..=8).contains(&ext.len())
+        && ext.starts_with(|c: char| c.is_ascii_alphabetic())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// POST /api/v1/fs/validate {candidates, base, workspace_id?} — batched
+/// existence check behind the terminal and chat link providers: only
+/// path-like strings that resolve to something real get underlined. Each
+/// candidate is resolved (absolute, or relative against the absolute `base`,
+/// `~` expanded) and answered under `valid` as `{path, kind}` — the canonical
+/// absolute path and whether it is a `file` or a `dir`. Misses are simply
+/// absent. Candidates past [`MAX_VALIDATE_CANDIDATES`] are ignored: cheap and
+/// batched by design.
+///
+/// Bare-basename fallback: an agent often mentions a file by basename alone
+/// ("FIGURE_PLAN.md") when it lives in a subdirectory (`paper/FIGURE_PLAN.md`),
+/// so direct-child resolution can never confirm it. When `workspace_id` is
+/// given and a [`bare_basename`]-shaped candidate misses, the workspace's
+/// quickopen index is consulted and the candidate resolves IFF exactly one
+/// indexed file has that exact name — ambiguity (three `main.rs`) refuses,
+/// and the hit is re-canonicalized so a file deleted since the walk stays a
+/// miss (existence-verified links only, same as the direct path). Bounds: the
+/// index is the quickopen walk — entry/depth/time-capped, ignore-respecting,
+/// cached per workspace with a short TTL — fetched at most once per request
+/// and only when a fallback-eligible candidate actually missed.
+pub(crate) async fn validate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ValidateRequest>,
+) -> Response {
+    if !Path::new(&body.base).is_absolute() {
         return bad_request(&anyhow::anyhow!(
             "base {:?} is not an absolute path",
             body.base
         ));
     }
-    let mut valid = serde_json::Map::new();
-    for candidate in body.candidates.iter().take(MAX_VALIDATE_CANDIDATES) {
-        if candidate.is_empty() || valid.contains_key(candidate) {
-            continue;
+    // Every resolution stats the disk and a fallback may walk a (bounded)
+    // tree — NFS-slow work that must stay off the async reactor.
+    let work = move || {
+        let base = Path::new(&body.base);
+        let mut valid = serde_json::Map::new();
+        // Lazily fetched, at most once per request; inner None = unknown
+        // workspace (fallback silently off — degrade, don't error).
+        let mut index: Option<Option<Arc<Vec<crate::quickopen::IndexedFile>>>> = None;
+        for candidate in body.candidates.iter().take(MAX_VALIDATE_CANDIDATES) {
+            if candidate.is_empty() || valid.contains_key(candidate) {
+                continue;
+            }
+            let Ok(expanded) = expand_tilde(candidate) else {
+                continue;
+            };
+            let joined = if expanded.is_absolute() {
+                expanded
+            } else {
+                base.join(expanded)
+            };
+            // canonicalize both resolves (symlinks, `..`) and checks existence;
+            // anything unresolvable is a miss, never an error.
+            if let Ok(resolved) = std::fs::canonicalize(&joined) {
+                let kind = if resolved.is_dir() { "dir" } else { "file" };
+                valid.insert(
+                    candidate.clone(),
+                    json!({"path": resolved.to_string_lossy(), "kind": kind}),
+                );
+                continue;
+            }
+            // Direct resolution missed — try the unique-basename fallback.
+            let Some(workspace_id) = body.workspace_id.as_deref() else {
+                continue;
+            };
+            if !bare_basename(candidate) {
+                continue;
+            }
+            let files = index
+                .get_or_insert_with(|| crate::quickopen::workspace_index(&state, workspace_id));
+            let Some(files) = files.as_deref() else {
+                continue;
+            };
+            let Some(path) = crate::quickopen::unique_file_named(files, candidate) else {
+                continue;
+            };
+            // The index may be up to its TTL stale: re-canonicalize so only a
+            // file that exists RIGHT NOW links (and the answer is canonical,
+            // matching the direct path's contract).
+            let Ok(resolved) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            if !resolved.is_file() {
+                continue;
+            }
+            valid.insert(
+                candidate.clone(),
+                json!({"path": resolved.to_string_lossy(), "kind": "file"}),
+            );
         }
-        let Ok(expanded) = expand_tilde(candidate) else {
-            continue;
-        };
-        let joined = if expanded.is_absolute() {
-            expanded
-        } else {
-            base.join(expanded)
-        };
-        // canonicalize both resolves (symlinks, `..`) and checks existence;
-        // anything unresolvable is a miss, never an error.
-        let Ok(resolved) = std::fs::canonicalize(&joined) else {
-            continue;
-        };
-        let kind = if resolved.is_dir() { "dir" } else { "file" };
-        valid.insert(
-            candidate.clone(),
-            json!({"path": resolved.to_string_lossy(), "kind": kind}),
-        );
+        json!({"valid": valid})
+    };
+    match tokio::task::spawn_blocking(work).await {
+        Ok(body) => Json(body).into_response(),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("validate task failed: {join}")})),
+        )
+            .into_response(),
     }
-    Json(json!({"valid": valid})).into_response()
 }
 
 #[derive(Deserialize)]

@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::model::{AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
+use crate::model::{cap_output, AgentCommand, AgentEvent, COALESCE_INTERVAL_MS};
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// Cold NFS caches make agent CLIs slow to first output; `--version` alone
@@ -22,6 +22,38 @@ use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Polite-shutdown grace before SIGKILL.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// Interrupt-watchdog deadline, counted in harness `tick`s (~1.5s at
+/// `COALESCE_INTERVAL_MS`). Both mappers arm it on `AgentCommand::Interrupt`
+/// and abort a still-open turn when it expires.
+///
+/// Why a deadline and not the interrupt ack: interrupt-when-idle is a CLI
+/// no-op on BOTH drivers (claude's `interrupt` control acks nothing about the
+/// turn; codex answers "no active turn to interrupt"), so without this a
+/// session wedged as "running" could never be escaped by pressing stop. The
+/// grace is only a floor for the genuine case — a real is_error `result`
+/// (claude) or `turn/completed{interrupted}` (codex) lands first and disarms
+/// the grace through the per-turn reset, so a live turn is never
+/// double-aborted.
+pub const INTERRUPT_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
+
+/// Idle-flush deadline, counted in harness `tick`s (~1.5s at
+/// `COALESCE_INTERVAL_MS`), armed while the driver is idle with messages still
+/// queued. Both mappers use it to settle a queue the agent has drained without
+/// producing a per-message result.
+///
+/// Why it's needed: claude COALESCES rapid mid-turn sends — it runs FEWER turns
+/// (fewer `result` frames) than there were messages (live-verified: 3 sends → 2
+/// turns), so the surplus queued ids never get popped by a result and their
+/// bubbles would stay faded "queued" forever. Once the CLI is idle again it has
+/// drained/coalesced the queue, so those messages DID reach it: resolve them
+/// `sent`. The grace guards against flushing a message that a genuinely
+/// in-flight next turn is about to open (a real turn opens within it and
+/// disarms the flush); a premature flush would only be `sent` early, which is
+/// the message's correct terminal state anyway (an idle driver has no live turn
+/// left to abort it). codex uses the same deadline for the symmetric defensive
+/// case (a buffer stranded when a turn ended under it).
+pub const IDLE_FLUSH_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
 
 /// Everything needed to start a driver. `argv` is COMPLETE (binary plus all
 /// flags, already login-shell wrapped by the server) — argv assembly stays
@@ -40,6 +72,16 @@ pub struct SpawnSpec {
     /// The agent's native session handle when known at spawn (claude
     /// `--session-id`/`--resume` value, codex thread id to resume).
     pub pinned_native_id: Option<String>,
+    /// The binary's `--version` line as the server probed it (`None` when
+    /// the probe failed). Neither wire protocol offers a reliable version
+    /// handshake (see PROTOCOL.md), so the server-side probe is the source:
+    /// journaled on `Init`, compared against the driver's tested pin for
+    /// the non-fatal drift notice.
+    pub agent_version: Option<String>,
+    /// Conversation-rewind respawn (codex): drop this many trailing turns via
+    /// `thread/rollback` right after `thread/resume`. Claude ignores it — its
+    /// fork rides argv (`--fork-session --resume-session-at`).
+    pub rollback_turns: Option<u32>,
     pub handshake_timeout: Duration,
 }
 
@@ -52,6 +94,8 @@ impl SpawnSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             pinned_native_id: None,
+            agent_version: None,
+            rollback_turns: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
@@ -100,6 +144,21 @@ pub trait Mapper: Send {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep;
     /// Emit any buffered coalesced text (the harness's timer tick + teardown).
     fn flush(&mut self) -> Option<AgentEvent>;
+    /// Resolution events for asks whose reply route dies with this mapper.
+    /// The pending question/permission maps are the ONLY route back to the
+    /// child, so when the driver ends they must resolve into the journal —
+    /// otherwise every future replay re-delivers an ask that can never be
+    /// answered (the "stuck permission card" bug). The harness calls this
+    /// once, right before `Exited`.
+    fn drain_pending(&mut self) -> Vec<AgentEvent> {
+        Vec::new()
+    }
+    /// Time-driven work on the harness's ~100ms tick (codex auto-resolves
+    /// expired questions here; claude's question timeouts are CLI-side —
+    /// askUserQuestionTimeout — so it keeps the empty default).
+    fn tick(&mut self) -> DriverStep {
+        DriverStep::default()
+    }
 }
 
 /// A mapper's output for one input: outbound frames to write to the child,
@@ -125,6 +184,16 @@ pub struct Handshake<M> {
 /// spawn/supervision/teardown logic lives exactly once.
 pub trait Driver: Send {
     type Mapper: Mapper;
+
+    /// The agent kind ("claude"/"codex") — names the agent in the
+    /// harness-emitted startup-failure and version-drift events. No default:
+    /// the compiler enforces both drivers carry it.
+    fn kind(&self) -> &'static str;
+
+    /// The CLI version this driver's wire facts were live-verified against
+    /// (`TESTED_*_VERSION`) — the drift notice's comparison pin. No default,
+    /// so a new driver cannot ship unpinned.
+    fn tested_version(&self) -> &'static str;
 
     /// Env vars appended to the spawn (claude pins the auto-updater off and
     /// enables SDK file checkpointing; codex needs none).
@@ -179,6 +248,51 @@ async fn deliver(sink: &mut JsonlSink, io: &DriverIo, step: DriverStep) -> Deliv
     Delivery::Ok
 }
 
+/// Journal + broadcast the client-visible face of a startup failure, then the
+/// terminal `Exited`. The handshake-failure exit paths previously returned
+/// before any event reached the pump: the reason and stderr tail went only to
+/// the daemon log and the chat pane just showed a bare "agent exited" — the
+/// reported post-update failure mode. `fatal:true` renders as the chat
+/// surface's error banner (and errors the rail row); a later reattach replays
+/// it from the journal.
+async fn report_startup_failure(
+    io: &DriverIo,
+    kind: &str,
+    reason: &str,
+    stderr_tail: &str,
+    status: Option<i32>,
+) {
+    // The stderr ring is already bounded (ndjson), but run it through the
+    // shared cap so this event obeys caps-at-construction even if that
+    // budget ever grows.
+    let (tail, _) = cap_output(stderr_tail);
+    let tail = tail.trim();
+    let mut message = format!("{kind} failed to start: {reason}");
+    if !tail.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(tail);
+    }
+    message.push_str(&format!(
+        "\n\nIf {kind} was just updated, its chat protocol may have changed — \
+         reopen this session as a terminal, or check that `{kind}` still runs in one."
+    ));
+    let _ = io
+        .events
+        .send(AgentEvent::Error {
+            message,
+            fatal: true,
+        })
+        .await;
+    let _ = io.events.send(AgentEvent::Exited { status }).await;
+}
+
+/// An agent that handshakes and then exits almost immediately never served a
+/// conversation — that exit is a startup failure (the plausible post-update
+/// crash mode), not an end-of-life, and its stderr is the only diagnostic.
+/// Time-based because neither protocol has a "goodbye" frame: generous enough
+/// for slow first traffic, far shorter than any real session.
+pub const FAILURE_AT_BIRTH_WINDOW: Duration = Duration::from_secs(10);
+
 /// The shared driver harness: spawn the child, run the driver's handshake
 /// under the watchdog, then pump frames/commands/kills through the mapper
 /// until the child, the client, or a kill signal ends the session. Every exit
@@ -195,10 +309,12 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     ) {
         Ok(child) => child,
         Err(err) => {
+            let reason = format!("spawn failed: {err:#}");
+            report_startup_failure(&io, driver.kind(), &reason, "", None).await;
             return DriverExit::HandshakeFailed {
-                reason: format!("spawn failed: {err:#}"),
+                reason,
                 stderr_tail: String::new(),
-            }
+            };
         }
     };
     let (mut sink, mut stream, guard) = child.split();
@@ -216,18 +332,19 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     } = match handshake {
         Ok(Ok(hs)) => hs,
         Ok(Err(reason)) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
+            let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
             return DriverExit::HandshakeFailed {
                 reason,
                 stderr_tail: tail,
             };
         }
         Err(_) => {
-            let tail = guard.stderr_tail();
-            guard.shutdown(Duration::ZERO).await;
+            let reason = format!("no handshake within {:?}", spec.handshake_timeout);
+            let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+            report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
             return DriverExit::HandshakeFailed {
-                reason: format!("no handshake within {:?}", spec.handshake_timeout),
+                reason,
                 stderr_tail: tail,
             };
         }
@@ -237,14 +354,53 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
         guard.shutdown(Duration::ZERO).await;
         return DriverExit::Killed;
     }
-    // Post-handshake seeding/replay. A failure here means no client is left or
-    // the child's stdin already broke — either way, tear down immediately.
-    for step in initial {
-        if !matches!(deliver(&mut sink, &io, step).await, Delivery::Ok) {
-            guard.shutdown(Duration::ZERO).await;
-            return DriverExit::Killed;
+    // Version drift is warn-not-block: the wire is only VERIFIED against the
+    // pinned TESTED_*_VERSION, but most updates stay compatible — refusing to
+    // spawn would break every routine update. The journaled notice is the
+    // ready-made diagnosis when a drifted binary later misbehaves. Substring
+    // match because the probe line is the CLI's own phrasing
+    // ("2.1.204 (Claude Code)", "codex-cli 0.142.5").
+    if let Some(detected) = spec.agent_version.as_deref() {
+        if !detected.contains(driver.tested_version()) {
+            let text = format!(
+                "{kind} {detected} detected; chat mode was verified against {kind} {tested} — \
+                 if this session misbehaves, that's likely why",
+                kind = driver.kind(),
+                tested = driver.tested_version(),
+            );
+            if io.events.send(AgentEvent::Notice { text }).await.is_err() {
+                guard.shutdown(Duration::ZERO).await;
+                return DriverExit::Killed;
+            }
         }
     }
+    // Post-handshake seeding/replay. A write failing THIS early means the
+    // child died right after answering the handshake (the post-update crash
+    // mode) — surface it as the startup failure it is, not a silent teardown;
+    // a gone receiver means the session itself was torn down.
+    for step in initial {
+        match deliver(&mut sink, &io, step).await {
+            Delivery::Ok => {}
+            Delivery::WriteFailed(err) => {
+                let reason = format!("agent exited during startup ({err})");
+                let (status, tail) = guard.shutdown_with_stderr(Duration::ZERO).await;
+                report_startup_failure(&io, driver.kind(), &reason, &tail, status).await;
+                return DriverExit::HandshakeFailed {
+                    reason,
+                    stderr_tail: tail,
+                };
+            }
+            Delivery::ReceiverGone => {
+                guard.shutdown(Duration::ZERO).await;
+                return DriverExit::Killed;
+            }
+        }
+    }
+
+    // Failure-at-birth clock: starts once the handshake has proven the wire,
+    // so the epilogue can tell end-of-life from a binary that handshakes and
+    // then crashes (see FAILURE_AT_BIRTH_WINDOW).
+    let born = tokio::time::Instant::now();
 
     let mut tick = tokio::time::interval(Duration::from_millis(COALESCE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -284,18 +440,55 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
                         break DriverExit::Killed;
                     }
                 }
+                match deliver(&mut sink, &io, mapper.tick()).await {
+                    Delivery::Ok => {}
+                    Delivery::WriteFailed(reason) => break DriverExit::ProtocolError(reason),
+                    Delivery::ReceiverGone => break DriverExit::Killed,
+                }
             }
         }
     };
 
+    // Age measured at loop exit (before the reap's grace wait), so the
+    // failure-at-birth window is about the child's behavior, not ours.
+    let age_at_exit = born.elapsed();
     if let Some(ev) = mapper.flush() {
         let _ = io.events.send(ev).await;
+    }
+    // A dying driver takes its reply routes with it: journal a definitive
+    // resolution for every pending ask so no attached client — nor any future
+    // replay of this journal — is left holding a card that cannot be answered.
+    // A respawn's handshake re-delivers still-parked prompts as fresh
+    // requests (claude pending_permission_requests), so nothing answerable is
+    // lost by resolving here.
+    for ev in mapper.drain_pending() {
+        if io.events.send(ev).await.is_err() {
+            break;
+        }
     }
     // Close stdin (the polite shutdown both protocols honor) so a child blocked
     // on read wakes, then reap with a bounded wait. A normally-exiting child
     // returns its real status at once; a lingerer is SIGKILLed after the grace.
     drop(sink);
-    let status = guard.shutdown(KILL_GRACE).await;
+    let (status, stderr_tail) = guard.shutdown_with_stderr(KILL_GRACE).await;
+    // Exit-at-birth reclassification: a bare "Clean" here would conflate
+    // end-of-life with failure-at-birth and discard the stderr diagnostic
+    // that HandshakeFailed preserves. A genuine 0 exit is respected.
+    if matches!(exit, DriverExit::Clean(_))
+        && age_at_exit < FAILURE_AT_BIRTH_WINDOW
+        && status != Some(0)
+    {
+        let reason = format!(
+            "exited {}s after startup (status {})",
+            age_at_exit.as_secs(),
+            status.map_or_else(|| "unknown".to_string(), |s| s.to_string()),
+        );
+        report_startup_failure(&io, driver.kind(), &reason, &stderr_tail, status).await;
+        return DriverExit::HandshakeFailed {
+            reason,
+            stderr_tail,
+        };
+    }
     let _ = io.events.send(AgentEvent::Exited { status }).await;
     match exit {
         DriverExit::Clean(_) => DriverExit::Clean(status),

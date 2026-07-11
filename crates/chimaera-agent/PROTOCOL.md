@@ -6,7 +6,7 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 (`TESTED_*_VERSION`).
 
 Sources:
-- **live**: probed against the real CLIs (claude 2.1.204, codex 0.142.5).
+- **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5).
 - **vsix**: mined from the official VS Code extension bundles
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
@@ -121,6 +121,99 @@ capture before mapping).
 - Caps at event construction, not sinks (login-node budgets).
 - Handshake watchdog + degrade-to-PTY is per-driver mandatory behavior.
 
+## Version detection (both drivers)
+
+Neither wire protocol carries a version handshake we can depend on:
+
+- **claude**: the `initialize` control response is the command + model catalog
+  (see pass 5) — it carries NO version field.
+- **codex**: the `initialize` RESULT carries `userAgent` (+ `codexHome`,
+  `platform`), but it is the server's own phrasing, not a stable version
+  contract, and the driver handshake discards it.
+
+So the version comes from OUTSIDE the wire: the server probes `bin --version`
+(`launcher::probe_version`, 2s budget), stores the first line on
+`AgentDetection.version`, and — kept fresh across in-place updates by the
+cache-staleness stamp (see `validate_cache_hit`) — threads it through
+`ChatRecipe.version` → `SpawnSpec.agent_version` into the driver harness.
+
+The harness (`run_driver`) then, once past the handshake:
+
+1. **Journals it on `Init`** (`AgentEvent::Init.agent_version`, additive/
+   optional) so a drifted binary is diagnosable after the fact from the
+   journal alone. Both mappers echo `spec.agent_version` verbatim.
+2. **Warns, never blocks, on drift**: if the probed line does not *contain*
+   the driver's `TESTED_*_VERSION` (`Driver::tested_version()`), it emits a
+   NON-FATAL `Notice` naming both versions. Substring (not equality) because
+   the probe line is the CLI's own phrasing — `"2.1.204 (Claude Code)"`,
+   `"codex-cli 0.142.5"`. Refusing to spawn would break every routine update;
+   the wire is *usually* compatible, and the journaled notice is the
+   ready-made diagnosis the one time it isn't. A probe that failed
+   (`agent_version == None`) skips the check entirely.
+
+The old hard gate stays orthogonal: `launcher::is_outdated` still refuses the
+known-broken codex 0.1.x line — that is a *refuse*, this is a *warn*.
+
+### Ask lifecycle (questions + permissions) — 2026-07-10
+
+The reply route for every ask (question / permission / dialog) is a
+per-driver-process pending map, while the ask itself is journaled and
+replayed forever. Three rules reconcile those lifetimes; both drivers
+implement all three:
+
+- **Every reply gets a definitive outcome.** A command whose `request_id`
+  no pending map knows (the ask predates this driver process — respawn,
+  toggle, resume) emits `QuestionResolved` (empty answers) /
+  `PermissionResolved{option_id:"expired"}` plus a `Notice`, never a
+  silent drop. The journaled resolution un-wedges every attached client
+  and every future replay.
+- **Driver teardown drains pending asks** (`Mapper::drain_pending`, called
+  by the harness right before `Exited`): each pending question resolves
+  with empty answers, each pending permission/dialog resolves `expired` —
+  so no journal ever ends on a dangling ask. A still-parked claude prompt
+  is re-delivered as a fresh request by the next handshake
+  (`pending_permission_requests`), so nothing answerable is lost.
+- **`QuestionResolved` carries the user's answers** (`answers:
+  {question_id: [labels]}`, serde-defaulted — additive; empty = resolved
+  without an answer: cancelled/expired/old journal). Clients fold the
+  question + chosen labels into the transcript; replay rebuilds it.
+
+`option_id` vocabulary on `PermissionResolved`: driver option ids on a
+user decision, `"cancelled"` when the agent withdrew its own ask
+(claude `control_cancel_request`, codex `serverRequest/resolved`),
+`"expired"` when the reply route died (teardown drain / stale reply).
+
+Related: claude's `AskUserQuestion` tool_use no longer emits a `ToolCall`
+row (the QuestionCard is the surface; a bare "AskUserQuestion" row with a
+stuck spinner was noise) — codex's `requestUserInput` parent item never
+produced one. `ChatInfo.pending_permission` and the server's
+`NeedsPermission` rail state now cover questions too.
+
+### "The harness blocked me" — what it is and what surfaces (2026-07-10)
+
+When the agent's prose says a "harness" blocked it, that blockage usually
+happened BELOW chimaera's event layer and no permission card can exist:
+
+- **claude's own hook layer** (e.g. a repo's destructive-command
+  PreToolUse guard) denies the tool call inside the CLI; the wire carries
+  only the failed tool_result. Chimaera cannot (and should not) synthesize
+  a card from prose — the tool card's failure output is the record.
+- **codex full-access** maps to approvalPolicy `"never"` (the official
+  extension's exact table, kept deliberately): codex auto-declines
+  instead of asking, so no `requestApproval` exists. The driver now emits
+  a once-per-turn Notice naming the mechanism ("full access never asks —
+  switch to auto mode to be asked") when a declined item lands in
+  full-access mode. Remapping full-access to an asking policy would
+  diverge from the mined table — a product decision, not taken here.
+- **claude unknown dialog kinds** are answered `cancelled` (result
+  strings for unmined kinds are unknown — cancel is the safe floor) but
+  now with a visible Notice naming the kind.
+- **claude unknown control_request subtypes** (hook_callback,
+  mcp_message, elicitation, oauth refreshes…) are deliberately left
+  unanswered — the CLI parks them until its own deadline or another
+  client settles them, and an error reply could break flows that rely on
+  that fallback — but a once-per-subtype Notice names what is waiting.
+
 ## Extension mining, pass 2 (2026-07-08 — vsix)
 
 ### Claude: slash-command execution model
@@ -153,9 +246,11 @@ planning"; plan comments ride `updatedInput.{userFeedback,userComments}`.
 > **Deny → abort (needs live re-verify in chat-smoke).** Because the standard
 > deny carries `interrupt:true`, the CLI ABORTS the turn — it emits an
 > `is_error:true` result (→ `TurnAborted`), NOT a success result. `fake-claude`
-> now mirrors this. UNVERIFIED: `on_result` zeroing `queued_sends` on any
-> `is_error` result assumes the CLI drops its native stdin queue with the
-> aborted turn; the driver now also defensively opens an implicit turn if a
+> now mirrors this. UNVERIFIED: `on_result` clearing the `queued_sends` FIFO
+> on any `is_error` result assumes the CLI drops its native stdin queue with
+> the aborted turn (each cleared uuid now also emits
+> `UserMessageUpdate{dropped}` — see pass 8 — so the journal records the
+> drop); the driver also defensively opens an implicit turn if a
 > stream/assistant/tool frame arrives with `turn_active == false`, so a wrong
 > assumption degrades to a correct boundary instead of a phantom turn. Confirm
 > the real queue-after-abort behavior and delete this note.
@@ -337,8 +432,9 @@ file list is therefore honest about exactly what will revert.
   thresholds — render whatever non-allowed arrives.
 - Queueing: NO client queue exists — mid-turn user frames go straight to
   stdin and the CLI queues them (live-verified: two results, in order).
-  `cancel_async_message {message_uuid}` exists in the SDK but the extension
-  never calls it; ours doesn't either.
+  `cancel_async_message {message_uuid}` exists in the SDK; the extension
+  never calls it, but ours DOES now, for the `CancelQueued` command — see
+  Pass 12 for the un-queue reliability.
 - Subagents: `task_started {task_id, task_type ("local_agent" only),
   description, prompt}`, `task_progress {task_id, description?,
   last_tool_name?, summary?, usage:{total_tokens, tool_uses, duration_ms}}`,
@@ -557,3 +653,483 @@ that can change the serving model mid-conversation:
   timedOut|aborted, riskLevel?, rationale?}}` — the guardian reviewer's
   verdicts; not yet rendered (we don't offer guardian mode).
 - item/mcpToolCall/progress: confirmed ignored by the official client too.
+
+## Pass 8 (2026-07-10 — normalized-wire additions): delivery + user-stop
+
+Additive fields/events on OUR normalized model (`model.rs`), pinned in
+`tests/wire_contract.rs`; all defaults serialize to nothing, so pre-upgrade
+journals replay and failure aborts stay byte-identical on the wire.
+
+### UserMessage delivery: `id` + `queued` + `user_message_update`
+
+`UserMessage` now carries the client-minted uuid the driver already stamps
+on the outbound frame (`id` = claude's checkpoint uuid / codex's
+`clientUserMessageId`) plus `queued: bool` — true when the agent has NOT
+consumed the message at echo time. A later
+`{"type":"user_message_update","id","state":"sent"|"dropped"}` resolves it.
+Replay is self-correcting: the journal carries the queued echo and the
+update through the same reducer, so queued-then-sent renders exactly once
+and queued-never-sent replays dropped.
+
+Emission points, per driver:
+
+- **claude** — a mid-turn send echoes `queued:true` and its uuid joins a
+  FIFO (`queued_sends`); the CLI queues the stdin frame natively. When the
+  running turn's result lands, the oldest uuid resolves `sent` — and NOTHING
+  more: the turn boundary opens LAZILY (`ensure_turn`, on that message's
+  first real frame), never a synthetic `TurnStarted` per queued pop. See
+  Pass 11 — the eager synthetic open was the "stuck running" bug, because
+  the CLI produces FEWER results than rapid queued sends. An `is_error`
+  result drops the CLI's queue with the turn: every queued uuid resolves
+  `dropped` before the `TurnAborted`. A coalesced SURPLUS the CLI never runs
+  as its own turn resolves `sent` on the idle-flush (Pass 12), never stuck
+  "queued". `cancel_async_message` un-queueing is now adopted for the
+  `CancelQueued` command (Pass 12).
+- **codex** — a steered send (`turn/steer`, incl. sends buffered during
+  the turn/start window and flushed on `turn/started`) echoes
+  `queued:true` and resolves `sent` when the steer RPC succeeds (steering
+  has no follow-up item we consume — the echoed `userMessage` item is
+  deliberately ignored). A steer that fails for good (after the one
+  expectedTurnId retry, while a turn is still active) resolves `dropped`
+  next to the Error notice. A steer/buffered send re-driven as a fresh
+  `turn/start` (the turn ended under it) resolves `sent` at the re-drive —
+  it has the same standing as a fresh send from there on.
+- Fresh-turn sends on both drivers echo `queued:false` (field omitted) and
+  never get an update. Transcript-seeded UserMessages carry no `id`.
+
+### TurnAborted `interrupted: bool` — the structural user-stop signal
+
+`TurnAborted` gains `interrupted: true` when the driver positively knows
+the abort was user-initiated; consumers (the session-rail state machine in
+chimaera-server `chat.rs`, the chat UI notice) render those as a quiet
+"interrupted" instead of an error, keying on the flag — the old
+reason-string matching survives only for pre-upgrade events.
+
+- **claude** — the CLI's `is_error` result carries a free-text (often
+  absent) `result` string that NEVER reliably says "interrupt", so the
+  driver records the one deterministic fact it has: it sent the
+  `interrupt` control request. The flag arms on `AgentCommand::Interrupt`
+  and is consumed at EVERY result (and cleared on opening a fresh turn),
+  so a raced/stale interrupt cannot mislabel the next turn's genuine
+  failure. When armed and the result string is absent, the reason falls
+  back to "interrupted" (not "turn failed"). The deny-with-`interrupt:true`
+  permission path deliberately does NOT set the flag — whether a directive
+  deny should read as a quiet stop is a rail-semantics call for the
+  maintainer.
+- **codex** — `turn/completed` with `status:"interrupted"` (which only
+  follows a `turn/interrupt` RPC) maps to `interrupted: true`, reason
+  stays codex's own word "interrupted"; `turn/failed` stays
+  `interrupted: false`.
+
+## Pass 9 (2026-07-10 — permission-UX parity). ADOPTED.
+
+Plan approvals and deny-with-feedback, closing the two biggest permission
+gaps vs the official clients.
+
+### Claude: ExitPlanMode is a plan approval, not a tool permission
+
+- The plan proposal is an ordinary `can_use_tool` request with
+  `tool_name:"ExitPlanMode"`; `input.plan` is the plan MARKDOWN (live).
+  The driver maps it to a `PermissionRequest` whose additive `plan` field
+  carries the (capped) markdown — the client renders a plan-approval card,
+  and `input_preview` drops the `plan` key so the journal never stores the
+  text twice.
+- Options mirror the official card, verbatim and in order: **"Yes, and
+  auto-accept edits"** / **"Yes, manually approve"** / **"No, keep
+  planning"**.
+- Approval = `{behavior:"allow", updatedInput}` where updatedInput echoes
+  the input; optional user comments ride
+  `updatedInput.{userFeedback,userComments}` (both fields, same text — the
+  extension's shape; live: the CLI accepts the injected keys and the turn
+  completes). The CLI exits plan mode itself — the mode change rides
+  `system/status` (pass 6).
+- "Yes, and auto-accept edits": chimaera sends the allow, then a
+  `set_permission_mode acceptEdits` control request in the same step (a
+  verified control; its ack → ModeChanged). The extension re-stamps a
+  `setMode` permission_suggestion instead — we deliberately use the
+  explicit control so the behavior doesn't depend on which suggestions the
+  CLI happened to attach.
+- "No, keep planning" is the deny path: bare = the directive constant with
+  `interrupt:true` (model stops, still in plan mode, waits); with comments
+  = the feedback-denial below, so the model revises the plan immediately.
+
+### Claude: feedback-denials (live-verified)
+
+`{behavior:"deny", message: <directive constant> + "\n\nThe user's
+feedback: " + <reason>, interrupt:false}` — the tool errors (is_error
+tool_result) but the turn is NOT aborted: it runs on and ends with a
+SUCCESS result (contrast the bare deny's `interrupt:true` → is_error
+result → TurnAborted). The driver journals the reason as a `UserMessage`
+event, since the model really received it.
+
+### Codex: decline has no message field — feedback steers
+
+The app-server decision union carries no free-text slot, so a decline with
+feedback answers the rpc with `{"decision":"decline"}` and then delivers
+the reason as user input into the still-running turn via the normal
+`turn/steer` path (buffered/turn-started like any send). Same UX as
+claude's feedback-denial, realized per this protocol's capability.
+
+### Wire additions (daemon↔UI, strictly additive)
+
+- `PermissionRequest.plan: Option<String>` — present ⇒ plan-approval card.
+- `AgentCommand::Permission.feedback: Option<String>` — deny reasons and
+  plan-approval comments; absent/empty = the bare decision.
+
+## Pass 10 (2026-07-10 — live probe 0.142.5 + vsix 26.623.101652): codex
+rewind, compact, question timeouts. ADOPTED.
+
+### Codex: thread/rollback (live-verified)
+
+`thread/rollback {threadId, numTurns}` → result `{thread:{…}}` (the updated
+thread object; same shape as thread/start's). Drops the LAST `numTurns`
+turns from the thread in place — the thread id survives, and a follow-up
+turn confirms the model no longer sees the rolled-back content. Works
+immediately after `thread/resume` (the rewind-respawn path). **An overcount
+does NOT error — it silently clamps** (numTurns:99 on a 2-turn thread
+empties it), so the count must be exact: an overcount would eat good turns.
+The extension's own uses: edit-last-message = rollback 1 on the live
+thread + re-send; fork-from-turn = `thread/fork` (thread/start-shaped
+params, `ephemeral` flag) then rollback `total - target - 1` on the fork.
+
+Chimaera's rewind: codex Checkpoint events anchor turn-OPENING sends only
+(steers join a running turn; rollback can't cut mid-turn). The server
+truncates the journal at the anchor, counts the dropped `TurnStarted`
+events, and respawns with `thread/resume` + `thread/rollback` of that
+count. Known seam: turns run outside the journal (TUI-interleaved via the
+view toggle) are invisible to the count — the rollback is only as complete
+as the journal. `thread/resume` also answers `initialTurnsPage` (null in
+our probes — likely needs a paging param) and a settings echo
+(approvalPolicy, permissions, reasoningEffort, …).
+
+### Codex: thread/compact/start (live-verified)
+
+`thread/compact/start {threadId}` → `{}` ack. The compaction then runs AS
+ITS OWN TURN: `thread/status/changed active` → `turn/started` →
+`item/started`/`item/completed` of a `contextCompaction` item →
+`turn/completed`. **No `thread/compacted` notification fires on 0.142.5**
+(it exists in the extension's routing table, but the item is the real
+signal — our contextCompaction→Notice mapping already covers it).
+
+### Codex: question auto-resolution (adopted)
+
+`item/tool/requestUserInput`'s `autoResolutionMs` is honored driver-side:
+at the deadline the driver answers `{answers:{}}` (the official client's
+empty-skip), withdraws the card (QuestionResolved), and drops a visible
+notice. Claude needs no equivalent — its `askUserQuestionTimeout` runs
+CLI-side and unanswered prompts settle via the park deadline.
+
+### Codex: misc notifications seen live (tolerated silently)
+
+`thread/started` (first turn/start), `thread/goal/cleared` (after
+rollback), `mcpServer/startupStatus/updated`, `remoteControl/status/changed`.
+`userMessage` items carry `clientId` (null unless the client sent
+`clientUserMessageId`). `account/rateLimits/updated` params here were
+`{rateLimits:{limitId, primary:{usedPercent, windowDurationMins,
+resetsAt}, secondary:…}}` — still ignored (account/read is the source).
+
+## Pass 11 (2026-07-11 — turn-boundary robustness): the "stuck running" fix
+
+Two turn-boundary corrections. Both change only WHEN normalized turn events
+are emitted, never their wire SHAPE (`tests/wire_contract.rs` unchanged).
+
+### Claude coalesces rapid queued sends — fewer results than sends (live)
+
+> **Superseded for claude by Pass 13.** The lazy-open + per-result FIFO pop
+> below was a best-effort *guess* at what the CLI's opaque coalescer did, and it
+> could strand a middle message or fire a phantom turn. Pass 13 stops dumping
+> queued sends mid-turn entirely (hold-until-flush), so the CLI never coalesces
+> *our* sends and the guess is gone. The `was_active` guard and the interrupt
+> watchdog below still stand. Kept here as the historical record of why.
+
+**Confirmed live: three rapid mid-turn sends produced only TWO turns.** The
+CLI queues mid-turn stdin frames natively (Pass 4), but when several arrive
+in quick succession it COALESCES them — it runs fewer follow-up turns, and
+emits fewer `result` frames, than there were messages. The count is not
+fixed (it depends on timing); the invariant is "results ≤ queued sends".
+
+Consequence for the old driver: it opened a synthetic `TurnStarted` for
+EACH queued message the instant the previous `result` landed (eager open).
+When the CLI coalesced N sends into M<N results, the surplus synthetic turns
+never got a result — `turn_active` stuck true and the UI stuck on
+"running"/"starting" forever.
+
+**Fix — lazy queued-turn open + a `was_active` guard** (`claude.rs`
+`on_result`):
+
+- A queued pop resolves `UserMessageUpdate{sent}` ONLY. It does NOT mint a
+  `TurnStarted`. The turn boundary opens LAZILY through `ensure_turn` when
+  that message's first real stream/assistant/tool frame arrives — and a real
+  turn always streams content, so a genuine turn still opens exactly once.
+- `on_result` captures `was_active = self.turn_active` BEFORE clearing it,
+  and emits the turn-END event (`TurnCompleted` on success, `TurnAborted` on
+  `is_error`) — plus the once-per-turn `get_context_usage` refresh — ONLY
+  when `was_active`. A bare/coalesced result that opened no turn thus emits
+  no phantom turn-end. The queued-drop (`is_error` → `dropped`) and the
+  `sent` resolution happen regardless of `was_active` (the CLI dropped/
+  accepted its native queue either way).
+
+Net: normal turns are byte-identical (content → `ensure_turn` fired →
+`was_active` true); coalesced/bare results resolve delivery without a
+phantom turn. Codex was already lazy here (turns open on `turn/started`),
+so only claude changed.
+
+### Interrupt watchdog (both drivers) — stop ALWAYS recovers
+
+Interrupt-when-idle is a no-op on both wires: claude's `interrupt` control
+acks nothing about the turn, and codex answers "no active turn to
+interrupt" (Pass 4). A turn wedged with no result / no `turn/completed`
+therefore had no escape — pressing stop did nothing.
+
+**Fix — a grace deadline armed on `AgentCommand::Interrupt`**, counted down
+on the harness `tick` (`INTERRUPT_GRACE_TICKS` ≈ 1.5s of
+`COALESCE_INTERVAL_MS` ticks, in `driver.rs`). When it expires with a turn
+STILL open, the mapper synthesizes the abort the CLI never sent:
+`TurnAborted{reason:"interrupted", interrupted:true}` + the queue drops
+(claude `queued_sends`, codex `drain_queued_sends()`) + turn state cleared.
+Idle-guarded, so interrupting nothing stays a no-op.
+
+Why a deadline and not the ack: a GENUINE interrupt lands its real end
+(claude's `is_error` result / codex's `turn/completed{interrupted}`) well
+within the grace, and that end DISARMS the watchdog through the per-turn
+reset (`on_result` / `reset_turn_state`) — so a live turn is never
+double-aborted. A fresh turn opening (`ensure_turn` / claude fresh-send /
+codex `turn/started`) also disarms it, so an idle-armed grace can't abort
+the next legitimate turn. claude gained a `tick` override; codex extended
+its existing `tick` (which also runs `expire_questions`). Symmetric.
+
+Belt-and-suspenders for the rare race where a real end lands JUST after the
+watchdog fired: both turn-end paths now no-op when the turn is already
+closed. claude's `on_result` already gated on `was_active`; codex's
+`turn/completed` / `turn/failed` gained the same `was_active` guard — so a
+late real end never emits a second `TurnAborted`/`TurnCompleted`.
+
+## Pass 12 (2026-07-11 — queued-message lifecycle): idle-flush + CancelQueued
+
+> **Superseded for claude by Pass 13.** The idle-flush existed only to reconcile
+> a *coalesced surplus*; hold-until-flush produces no surplus, so claude's
+> idle-flush is deleted. claude's `CancelQueued` no longer sends
+> `cancel_async_message` (a held message never reached the CLI — cancel is a
+> local removal). The wire additions (`UserMessageState::Cancelled`,
+> `AgentCommand::CancelQueued`) and codex's behavior are unchanged.
+
+Two maintainer decisions on the queued (faded) user bubble. Both are strictly
+additive on the normalized wire (`UserMessageState::Cancelled` appended;
+`AgentCommand::CancelQueued` appended — `tests/wire_contract.rs` pins both), so
+pre-upgrade journals replay and old clients are unaffected.
+
+### Idle-flush: a coalesced surplus resolves `sent`, never stuck "queued"
+
+Because claude COALESCES rapid mid-turn sends (Pass 11 — fewer `result` frames
+than messages), a surplus queued uuid is never popped by a result and its
+bubble would stay faded "queued" forever (until teardown drops it). The
+maintainer kept the native coalescing (NOT client-side sequential delivery), so
+the fix is at resolution time: once the driver is IDLE with the queue still
+non-empty, the CLI has drained/coalesced it — the messages reached stdin the
+instant they were written — so resolve every remaining uuid `sent`.
+
+- Mechanism: a tick-counted grace (`IDLE_FLUSH_GRACE_TICKS` ≈ 1.5s in
+  `driver.rs`), armed in the harness `tick` when `!turn_active` and the queue is
+  non-empty, reset while a turn is active or the queue empties. On expiry every
+  remaining queued uuid → `UserMessageUpdate{sent}`. Guarded so a genuinely
+  in-flight next turn preempts it (a real turn opening disarms it via
+  `ensure_turn`/fresh-send on claude, `turn/started` on codex); a premature
+  flush would only mark `sent` early, which is the message's correct terminal
+  state anyway (an idle driver has no live turn left to abort it). The
+  is_error/interrupt DROP path is unchanged — an aborted turn still drops its
+  queue.
+- Both drivers, symmetric intent: claude flushes `queued_sends` → `sent` (they
+  were written to stdin already); codex RE-DRIVES a stranded `buffered_sends`
+  entry as a fresh turn (a codex buffer was never sent, so it is DELIVERED, not
+  declared sent unseen) — the defensive rescue for the one seam where a turn
+  ends under a pending `turn/start`.
+
+### CancelQueued: pull back a still-queued message
+
+`AgentCommand::CancelQueued{id}` (client frame `{type:"cancel_queued", id}`,
+deserialized straight to the driver — no server switch) + the resolution
+`UserMessageState::Cancelled`. A cancelled message NEVER happened: the UI drops
+the bubble from both the pending stack and the transcript, and replay agrees
+(the journaled `UserMessage{queued}` + `UserMessageUpdate{cancelled}` fold to
+nothing).
+
+- **claude**: if `id` is still in `queued_sends`, remove it and send the CLI a
+  `{"subtype":"cancel_async_message","message_uuid":id}` control request, then
+  emit `Cancelled`. If it is no longer queued (already popped `sent`, or
+  idle-flushed), emit a `Notice` ("too late to cancel") — it can't be un-said.
+- **codex**: if `id` is still in the pre-steer `buffered_sends`, remove it and
+  emit `Cancelled`. If it was already steered into the running turn (delivered),
+  emit the same `Notice`. Symmetric intent, per-protocol capability.
+
+### `cancel_async_message` reliability — LIVE
+
+The subtype is defined in the bundled SDK but the official extension never calls
+it, so its real un-queue effect was unverified. `tests/live.rs`
+(`claude_cancel_async_message_behavior`, chat-smoke) queues a distinctively-
+answered message mid-turn, sends the cancel for its uuid, and reports whether the
+message still ran.
+
+> **Observed (chat-smoke, claude 2.1.206): it UN-QUEUES.** The probe queued
+> "Reply with exactly: CANCELME" behind a running turn, sent
+> `cancel_async_message` for its uuid, and drained to idle — result: ONE turn
+> completed, the CANCELME reply NEVER ran (`results=1, queued_message_ran=false`).
+> So the real CLI honors the control request and drops the named message from its
+> native queue, contrary to the "SDK-defined but never called" mining note. This
+> makes claude's `CancelQueued` a true cancel, not just a local relabel.
+>
+> Best-effort by design regardless: the driver marks the bubble `Cancelled`
+> locally and journals the resolution whether or not the CLI honors the request,
+> so the UI stays honest and deterministic. We do NOT rewrite the queue model on
+> the strength of it — a future CLI that stops honoring the control degrades to a
+> local-only relabel (the message would still run, but the journaled `Cancelled`
+> keeps replay consistent), and the live probe would catch the regression.
+
+## Pass 13 (2026-07-11 — claude queued sends: hold-until-flush). ADOPTED.
+
+The maintainer hit it live: several messages queued behind a running turn came
+back with a MIDDLE one stranded "not delivered" while its neighbours delivered,
+plus a phantom turn "responding to an empty message." Root cause was structural,
+not a missed edge case. Passes 11–12 let the driver **dump every queued send to
+stdin immediately** and then *reverse-engineer* what the CLI's opaque coalescer
+did — pop one queued id `sent` per `result` (FIFO), with an idle-flush timer
+mopping up the surplus. That reconciliation is a guess with no ground truth:
+
+- The first `result` after queuing is the END of the pre-existing turn, yet the
+  FIFO pop marked a queued id `sent` off it — off by one.
+- The CLI coalesces rapid sends into FEWER results than messages, so the
+  id↔result mapping drifts; timing decided which id stranded.
+- The DROP paths (`is_error`/interrupt/kill) drain the WHOLE queue, so a send
+  that arrived after a mid-sequence abort could strand while its neighbours went
+  through — exactly the "middle one not delivered."
+
+**Fix — hold, don't dump.** A send that arrives while a turn is active is now
+HELD in `queued_sends` (`VecDeque<(uuid, stdin content)>`) and is **not written
+to the CLI**. When the running turn's `result` lands, `on_result` flushes the
+whole held batch: writes each message to stdin AND resolves each
+`UserMessageUpdate{sent}` in that one step. Determinism replaces the guess:
+
+- Delivery is tied to OUR write, not to counting the CLI's results — so the
+  result count is irrelevant and no id can strand. If the CLI later coalesces the
+  flushed batch, every message is already `sent`; we don't care how many results
+  come back.
+- No mid-turn stdin write means the delivered bubble lands AFTER the turn's
+  `TurnCompleted` (the store appends at the current end), never spliced into the
+  still-streaming turn — and the CLI never receives our sends mid-turn, so it
+  can't coalesce them into a bare result or a phantom empty turn.
+- This is also more faithful to the official client, whose queued messages wait
+  for the current turn to finish rather than steering into it.
+
+Deleted with the guess: the per-result FIFO pop, the **idle-flush** (+
+`idle_flush_grace`, `IDLE_FLUSH_GRACE_TICKS` usage in claude — the const stays
+for codex), and the `cancel_async_message` round-trip in `CancelQueued`.
+`CancelQueued` on a held message is now a pure local removal (`Cancelled`, no CLI
+frame — nothing reached the CLI to un-queue); once flushed+`sent` the bubble
+loses its ✕, and a late cancel finds nothing held → `Notice`. The abort paths
+(`is_error`/interrupt watchdog/`drain_pending`) still drop the held queue
+`dropped` — now HONESTLY, since a held message was never sent. **[Superseded by
+Pass 14: only `drain_pending`/an unshipped flush still drop — a live abort now
+flushes the queue, and the late-cancel Notice became a tombstone `Cancelled`.]**
+The `was_active` guard and the interrupt watchdog (Pass 11) are unchanged. The
+wire SHAPE is untouched (`tests/wire_contract.rs` green); only the TIMING of the
+same normalized events changed.
+
+**Codex is deliberately NOT changed.** Its native model is `turn/steer` —
+inject into the RUNNING turn — with a per-message RPC answer, so it already maps
+each send deterministically and never coalesces/strands. Holding would DIVERGE
+from codex-native (the maintainer's "keep native" applies per agent: claude
+queues-then-runs, codex steers). A steered codex bubble genuinely joins the
+running turn, so its `sent` mid-turn is honest. The two drivers stay symmetric in
+*intent* (a queued send is never lost and never splices a claude turn), asymmetric
+in *mechanism* because the two agents' protocols differ.
+
+Tests: hermetic `queued_sends_flush_together_on_turn_end`,
+`several_held_sends_all_resolve_sent_and_none_strand` (the multi-message case),
+`queued_send_flushes_with_no_client_attached` (the flush is daemon-side, off the
+CLI's result — a hidden/closed tab can't stall it), `cancel_queued_removes_a_held_send`,
+`a_flush_whose_write_never_ships_is_dropped_on_teardown`, and the updated
+`bare_result_*` guard; live `driver_rapid_queued_sends_settle_idle` now also
+asserts every held id resolves `sent`. `just chat-smoke` re-run for the driver change.
+
+**Flush all-at-once (maintainer's choice), and its accepted edges.** When the
+turn ends the WHOLE held batch flushes in one step (all written, all `sent`),
+rather than one-per-turn. The maintainer chose batched over one-at-a-time
+(2026-07-11), accepting two edges:
+
+- *Grouped ordering.* Several queued bubbles render together, then their
+  responses — `[q2, q3, resp2, resp3]`, not interleaved `[q2, resp2, q3, resp3]`.
+  A consequence of resolving the batch on the single turn-end result. Not a splice
+  (all `sent` land after that turn's `TurnCompleted`, before any next-turn frame).
+- *Stop-during-batch.* Only the first flushed message opens a turn; the rest sit
+  in the CLI's native queue. Marking them `sent` on OUR write is honest (delivered
+  to the CLI), but if the user interrupts the first, the CLI drops the siblings and
+  they stay `sent` with no reply. One-at-a-time would instead keep them held and
+  drop them "not delivered". Accepted for batched mode.
+
+**Write-confirmation (`flushing`).** `on_result` empties `queued_sends` into the
+flush step (writes + `sent`) BEFORE `deliver` performs the write. A `WriteFailed`
+(child wedged/died right after its result) would drop the `sent` events with the
+queue already empty — stranding the ids "queued" forever (`drain_pending` had
+nothing to drop). Fix: the flushed uuids are staged in `flushing`, cleared on the
+next frame (reaching `on_frame` again means `deliver` returned Ok), and dropped by
+`drain_pending`. A drop for an already-`sent` id is a reducer no-op.
+
+**Known narrow edge (not fixed).** Cancelling a HELD message that is another held
+message's checkpoint `preceding`, then forking at that successor, resolves the
+fork anchor to the cancelled (never-written) uuid — the held-cancel makes its
+absence from the native transcript deterministic. Needs ≥2 held sends with no
+intervening assistant/user frame, a cancel of the earlier, then a fork at the
+later. Low severity; the preceding-chain is not repaired on cancel.
+
+## Pass 14 (2026-07-11 — stop preserves the queue; ✕ dismisses). ADOPTED.
+
+Live testing of Pass 13 surfaced the wrong default: pressing **Stop** with
+messages queued dropped the whole held queue "not delivered" — a wall of
+un-dismissible red bubbles, and the user's typed messages silently un-sent.
+Maintainer decision: **a stop (or a failed turn) ends only the CURRENT turn —
+the queued messages still deliver, in full.** Dropping-on-abort was inherited
+from the pre-Pass-13 world, where the CLI owned the queue and genuinely
+discarded it on interrupt; with the driver holding the messages it is an
+unforced choice, and the wrong one. `dropped` now means *genuinely
+undeliverable* — the agent process died (teardown) or the flush's write never
+shipped — and nothing else.
+
+**claude.** `on_result` flushes the held queue at EVERY turn end: the is_error
+branch no longer drops — it emits `TurnAborted` (when a turn was open), then
+falls through to the same flush as a completion, so the delivered bubbles land
+after the abort marker. The interrupt watchdog does the same on firing
+(best-effort write against a possibly wedged child — a failed/timed-out write
+tears the driver down and the `flushing` stage drops the batch honestly).
+`drain_pending` (process death) is the only remaining `dropped` producer.
+
+**codex.** The live-abort paths (`turn/completed{interrupted}`, `turn/failed`)
+no longer call the drop-drain: the first buffered send re-drives as a fresh
+turn (the rest steer into it on its `turn/started`), and in-flight steer RPCs
+stay tracked — codex is alive on these paths, so a steer that landed before
+the abort resolves `sent` off its ack, and one that missed re-drives off its
+error answer (the pre-existing `on_response` steer-error arms; the Pass 12
+"never resurrect after a stop" special-case is deliberately REVERTED — the
+resurrection is now the point). Called after `reset_turn_state`, which would
+otherwise clobber the re-drive's `turn_pending` window. The interrupt watchdog
+and teardown still drop: the watchdog firing means codex stopped answering, so
+a re-driven `turn/start` would just strand "queued" against a wedged process.
+
+**CancelQueued is now the universal pull-back/dismiss.** For a still-held
+(claude) / still-buffered (codex) send it removes it and emits `Cancelled`.
+For an id that already resolved it emits the same `Cancelled` as a TOMBSTONE:
+the reducer removes a `dropped` bubble (the ✕ on a "not delivered" bubble is
+this dismiss — replay-stable, since the tombstone is journaled) and no-ops for
+an already-`sent` id (seq order guarantees `sent` folds first — the delivered
+message can't be un-said). One codex exception: an id whose steer RPC is IN
+FLIGHT is mid-delivery (its resolution is still coming), so a tombstone would
+vanish a bubble the agent may consume — that one gets a Notice ("on its way").
+The UI shows ✕ on every pending bubble, queued or dropped.
+
+Tests: claude `interrupt_marks_abort_user_initiated_and_preserves_queue`,
+`interrupt_watchdog_aborts_a_hung_turn_after_the_grace` (flush, not drop),
+`bare_result_*` (error flush), `cancel_queued_after_delivery_is_a_reducer_noop_tombstone`;
+codex `user_interrupt_preserves_queued_steer_via_redrive`,
+`cancel_queued_mid_steer_is_a_notice`, `cancel_queued_after_resolution_is_a_tombstone`;
+e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
+`cancel_queued_after_delivery_is_a_reducer_noop_tombstone`; reducer vitest
+covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
+untouched. `just chat-smoke` re-run for the driver change.

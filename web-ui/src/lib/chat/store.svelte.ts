@@ -38,6 +38,9 @@ export interface PendingPermission {
   title: string;
   options: PermissionOption[];
   inputPreview: unknown;
+  /** Plan markdown when this is a plan approval (claude ExitPlanMode) —
+   *  non-null ⇒ rendered as the plan-approval card. */
+  plan: string | null;
 }
 
 export interface QuestionOption {
@@ -65,10 +68,60 @@ export interface CheckpointRef {
   preceding: string | null;
 }
 
+/** A user message the agent has NOT consumed yet — held in the pending stack
+ *  above the composer, deliberately kept OUT of the transcript `blocks` so it
+ *  can never splice into a running turn's output. Rebuilt purely from journaled
+ *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
+ *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
+ *  here marked "not delivered". */
+export interface PendingSend {
+  /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
+   *  `CancelQueued` match key. */
+  id: string;
+  text: string;
+  attachments: number;
+  /** Its checkpoint anchor arrives (claude) right after the queued echo; kept
+   *  here so it rides along when the send is promoted into `blocks`. */
+  checkpoint: CheckpointRef | null;
+  /** queued = still waiting for the agent (a Stop does NOT drop it — the queue
+   *  delivers after the aborted turn; its ✕ is how you discard one); dropped =
+   *  genuinely undeliverable (the agent process died / a codex steer failed for
+   *  good) — kept visible as "not delivered" so the text can be copied and
+   *  re-sent, until its ✕ dismisses it (the same `cancel_queued` command; the
+   *  driver's tombstone `Cancelled` makes the dismissal survive replay). */
+  state: "queued" | "dropped";
+}
+
 export type ChatBlock =
-  | { kind: "user"; text: string; attachments: number; checkpoint: CheckpointRef | null }
+  | {
+      /** A DELIVERED user message, in transcript order. A queued send is NOT a
+       *  block — it lives in `pendingSends` until it resolves `sent`, then it
+       *  is appended here at the current end (after the turn it waited behind),
+       *  never spliced into a running turn's output. So a user block in `blocks`
+       *  is always one the agent received. */
+      kind: "user";
+      text: string;
+      attachments: number;
+      checkpoint: CheckpointRef | null;
+      /** Delivery key (the wire's client-minted uuid); null on old journals,
+       *  transcript-seeded messages, and permission-feedback echoes. */
+      id: string | null;
+    }
   | { kind: "message"; text: string; turnId: string }
   | { kind: "thought"; text: string; turnId: string }
+  | {
+      /** A structured question, folded into history at the position it was
+       *  asked. While pending it renders nothing here (the interactive card
+       *  is the overlay); once resolved it renders as a quiet answered card —
+       *  question + chosen labels — and replay rebuilds the same. */
+      kind: "question";
+      id: string;
+      questions: Question[];
+      /** Chosen labels per question id; empty = resolved without an answer
+       *  (cancelled/expired, or a pre-answers journal). */
+      answers: Record<string, string[]>;
+      resolved: boolean;
+    }
   | {
       kind: "tool";
       id: string;
@@ -185,12 +238,25 @@ export class ChatStore {
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
 
+  /** Queued/undelivered user messages, in order — rendered in a holding stack
+   *  pinned above the composer (the send point), NEVER inline in history: a
+   *  queued message is one you've typed and are waiting on. This is its OWN
+   *  list, not a slice of `blocks`, so a queued send can't splice into a
+   *  running turn's output. A `user_message_update{sent}` moves the entry into
+   *  `blocks` at the current end (the reducer, so replay agrees); `cancelled`
+   *  removes it; `dropped` marks it "not delivered" and it stays here. */
+  pendingSends = $state<PendingSend[]>([]);
+
   /** Highest seq applied; the reconnect auth carries it for gap replay.
    *  Reactive so views can track "any event applied" (in-place chunk appends
    *  and tool patches change no collection lengths). */
   lastSeq = $state(0);
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
+  /** user-message delivery id -> index into blocks (user_message_update). */
+  private userIndex = new Map<string, number>();
+  /** question request_id -> index into blocks, for the resolution fold. */
+  private questionIndex = new Map<string, number>();
 
   onReady(session: ChatSessionInfo, _replayFrom: number, head: number | undefined): void {
     this.connected = true;
@@ -217,6 +283,13 @@ export class ChatStore {
   private resetTranscript(): void {
     this.blocks = [];
     this.toolIndex.clear();
+    this.userIndex.clear();
+    this.questionIndex.clear();
+    // Pending asks and sends belong to the journal being rebuilt; the fresh
+    // replay re-delivers any that are still live.
+    this.pending = [];
+    this.pendingSends = [];
+    this.questions = [];
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
@@ -232,6 +305,12 @@ export class ChatStore {
         // replayed exit said (toggle round-trips, resumes).
         this.exited = null;
         this.degraded = false;
+        // Any ask still pending predates this driver process — its reply
+        // route died with the old one, so an answer could never land. Seq
+        // ordering makes this safe: a live driver's Init is journaled BEFORE
+        // its asks, so only stale ones are cleared. (A still-parked claude
+        // prompt is re-delivered as a fresh request right after this Init.)
+        this.expirePendingAsks();
         if (typeof ev.model === "string") this.model = ev.model;
         if (typeof ev.current_mode === "string") this.currentMode = ev.current_mode;
         if (Array.isArray(ev.modes)) this.modes = ev.modes as ModeInfo[];
@@ -250,27 +329,86 @@ export class ChatStore {
         }
         break;
       }
-      case "user_message":
-        this.blocks.push({
-          kind: "user",
-          text: ev.text as string,
-          attachments: (ev.attachments as number) ?? 0,
-          checkpoint: null,
-        });
+      case "user_message": {
+        const id = (ev.id as string) ?? null;
+        const text = ev.text as string;
+        const attachments = (ev.attachments as number) ?? 0;
+        if (ev.queued === true && id !== null) {
+          // Queued: park it in the pending stack, NOT in the transcript at its
+          // mid-turn send position (that splice would split the agent's live
+          // message in two). It enters `blocks` only once delivery resolves.
+          this.pendingSends.push({ id, text, attachments, checkpoint: null, state: "queued" });
+        } else {
+          // A fresh (turn-opening) send, or a permission-feedback echo — it was
+          // received, so it goes straight into history.
+          this.blocks.push({ kind: "user", text, attachments, checkpoint: null, id });
+          if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
+        }
         this.promptSuggestion = null;
         break;
+      }
+      case "user_message_update": {
+        // Delivery resolution for a queued send. Driven purely by the reducer,
+        // so live and replay build the identical transcript.
+        const id = ev.id as string;
+        const pIdx = this.pendingSends.findIndex((p) => p.id === id);
+        if (pIdx === -1) break; // unknown / already resolved
+        const pending = this.pendingSends[pIdx];
+        const state = ev.state as string;
+        if (state === "sent") {
+          // Delivered: leave the pending stack and enter the transcript at the
+          // CURRENT end — after the turn it was queued behind, never spliced
+          // into it. appendText only inspects the tail, so a following agent
+          // chunk starts a fresh block: the agent's message is never split.
+          this.pendingSends.splice(pIdx, 1);
+          this.blocks.push({
+            kind: "user",
+            text: pending.text,
+            attachments: pending.attachments,
+            checkpoint: pending.checkpoint,
+            id: pending.id,
+          });
+          this.userIndex.set(pending.id, this.blocks.length - 1);
+        } else if (state === "cancelled") {
+          // Pulled back before the agent saw it — it never happened. Vanish
+          // entirely (it was never in `blocks`), so nothing to clean up there.
+          this.pendingSends.splice(pIdx, 1);
+        } else {
+          // dropped: the agent never got it — keep it visible as "not
+          // delivered" so the text can be copied and re-sent.
+          pending.state = "dropped";
+        }
+        break;
+      }
       case "prompt_suggestion":
         this.promptSuggestion = ev.text as string;
         break;
       case "checkpoint": {
-        // Stamps the user message it directly follows.
+        // Stamps the user message it belongs to, matched by uuid (the driver
+        // emits the checkpoint right after that message's echo, carrying its
+        // id). A queued send is still in the pending stack at this point, so
+        // check there first; the anchor rides along when it promotes to a block.
+        const umid = ev.user_message_id as string;
+        const cp: CheckpointRef = { id: umid, preceding: (ev.preceding_uuid as string) ?? null };
+        const p = this.pendingSends.find((s) => s.id === umid);
+        if (p !== undefined) {
+          p.checkpoint = cp;
+          break;
+        }
+        const idx = this.userIndex.get(umid);
+        if (idx !== undefined) {
+          const block = this.blocks[idx];
+          if (block.kind === "user") {
+            block.checkpoint = cp;
+            break;
+          }
+        }
+        // Fallback for pre-id journals (the user echo carried no id to match):
+        // stamp the last delivered user block, the message this followed.
         for (let i = this.blocks.length - 1; i >= 0; i--) {
           const block = this.blocks[i];
           if (block.kind === "user") {
-            block.checkpoint = {
-              id: ev.user_message_id as string,
-              preceding: (ev.preceding_uuid as string) ?? null,
-            };
+            block.checkpoint = cp;
             break;
           }
         }
@@ -377,30 +515,52 @@ export class ChatStore {
           title: ev.title as string,
           options: (ev.options as PermissionOption[]) ?? [],
           inputPreview: ev.input_preview,
+          plan: (ev.plan as string) ?? null,
         });
         break;
-      case "question_request":
-        this.questions.push({
-          requestId: ev.request_id as string,
-          questions: ((ev.questions as Record<string, unknown>[]) ?? []).map((q) => ({
-            id: q.id as string,
-            header: (q.header as string) ?? "",
-            question: (q.question as string) ?? "",
-            options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
-              label: o.label as string,
-              description: (o.description as string) ?? "",
-            })),
-            multiSelect: q.multi_select === true,
+      case "question_request": {
+        const requestId = ev.request_id as string;
+        const questions = ((ev.questions as Record<string, unknown>[]) ?? []).map((q) => ({
+          id: q.id as string,
+          header: (q.header as string) ?? "",
+          question: (q.question as string) ?? "",
+          options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
+            label: o.label as string,
+            description: (o.description as string) ?? "",
           })),
-        });
+          multiSelect: q.multi_select === true,
+        }));
+        // Twice: the overlay is the answerable card, the block is the
+        // transcript's memory of it (invisible while pending, an answered
+        // card once resolved) — so an answered question never just vanishes.
+        this.questions.push({ requestId, questions });
+        this.blocks.push({ kind: "question", id: requestId, questions, answers: {}, resolved: false });
+        this.questionIndex.set(requestId, this.blocks.length - 1);
         break;
-      case "question_resolved":
-        this.questions = this.questions.filter((q) => q.requestId !== ev.request_id);
+      }
+      case "question_resolved": {
+        const requestId = ev.request_id as string;
+        this.questions = this.questions.filter((q) => q.requestId !== requestId);
+        const idx = this.questionIndex.get(requestId);
+        const block = idx !== undefined ? this.blocks[idx] : undefined;
+        if (block !== undefined && block.kind === "question") {
+          block.resolved = true;
+          block.answers = (ev.answers as Record<string, string[]>) ?? {};
+        }
         break;
+      }
       case "permission_resolved": {
         const req = this.pending.find((p) => p.requestId === ev.request_id);
         this.pending = this.pending.filter((p) => p.requestId !== ev.request_id);
         const option = ev.option_id as string;
+        if (req !== undefined) {
+          // Fold the decision into history as a quiet row — the card itself
+          // is overlay-only, and "what did I allow?" must survive a reload.
+          const label =
+            req.options.find((o) => o.id === option)?.label ??
+            (option === "cancelled" || option === "expired" ? "no longer active" : option);
+          this.notice(`${req.title} — ${label}`, "info");
+        }
         if (req?.toolCallId != null && !option.startsWith("allow")) {
           const idx = this.toolIndex.get(req.toolCallId);
           const block = idx !== undefined ? this.blocks[idx] : undefined;
@@ -485,14 +645,16 @@ export class ChatStore {
       case "turn_aborted": {
         this.running = false;
         this.activity = null;
-        // A deliberate stop (Esc / stop button) is not an error state: codex
-        // reports reason "interrupted", claude's result string contains
-        // "interrupted by user" — render those quiet, keep --err for real
-        // failures. Both drivers' fallback reason is literally "turn failed",
-        // so don't prefix it into "turn stopped: turn failed".
+        // A deliberate stop (Esc / stop chip) is not an error state: the
+        // wire's `interrupted` flag is the drivers' structural signal
+        // (claude's free-text result string never reliably said so); the
+        // reason regex survives only for pre-flag journal replays. Render a
+        // calm muted "stopped", keep --err for real failures. Both drivers'
+        // fallback reason is literally "turn failed", so don't prefix it
+        // into "turn failed: turn failed".
         const reason = ev.reason as string;
-        if (/interrupt/i.test(reason)) {
-          this.notice("interrupted", "info");
+        if (ev.interrupted === true || /interrupt/i.test(reason)) {
+          this.notice("stopped", "info");
         } else {
           this.notice(reason === "turn failed" ? "turn failed" : `turn failed: ${reason}`, "error");
         }
@@ -510,12 +672,22 @@ export class ChatStore {
         break;
       case "error":
         this.notice(ev.message as string, "error");
-        if (ev.fatal === true) this.fatalError = ev.message as string;
+        if (ev.fatal === true) {
+          this.fatalError = ev.message as string;
+          // A dead driver is not running — don't strand the stop button and
+          // the "starting…" row waiting on a turn end that can't come.
+          this.running = false;
+          this.activity = null;
+        }
         break;
       case "exited":
         this.running = false;
         this.activity = null;
         this.exited = { status: (ev.status as number | null) ?? null };
+        // The reply route for any pending ask died with the process. The
+        // driver drains resolutions before Exited, so this is usually a
+        // no-op — it covers old journals recorded before that fix.
+        this.expirePendingAsks();
         break;
       default:
         break;
@@ -539,11 +711,8 @@ export class ChatStore {
     const drop = this.blocks.length - cap + 1;
     const notice: ChatBlock = { kind: "notice", text: TRIM_NOTICE, tone: "info" };
     this.blocks.splice(0, drop, notice);
-    // The front-splice invalidated every toolIndex position — rebuild it.
-    this.toolIndex.clear();
-    this.blocks.forEach((b, i) => {
-      if (b.kind === "tool") this.toolIndex.set(b.id, i);
-    });
+    // The front-splice invalidated every id→index position — rebuild them all.
+    this.rebuildIndexes();
   }
 
   private appendText(kind: "message" | "thought", ev: AgentEvent): void {
@@ -563,6 +732,23 @@ export class ChatStore {
     this.blocks.push({ kind: "notice", text, tone });
   }
 
+  /** Withdraw every pending ask whose reply route is gone (driver exit or a
+   *  fresh handshake): the cards leave the overlay, and their history blocks
+   *  fold to a quiet "no longer active" so the user sees WHY they vanished.
+   *  Deterministic from journaled events (init/exited), so replay agrees. */
+  private expirePendingAsks(): void {
+    for (const q of this.questions) {
+      const idx = this.questionIndex.get(q.requestId);
+      const block = idx !== undefined ? this.blocks[idx] : undefined;
+      if (block !== undefined && block.kind === "question") block.resolved = true;
+    }
+    this.questions = [];
+    for (const p of this.pending) {
+      this.notice(`${p.title} — no longer active`, "info");
+    }
+    this.pending = [];
+  }
+
   /** The previewable files THIS turn produced, for the end-of-turn gallery.
    *  Scans back to the turn boundary (previous user message / turn_end) and
    *  keeps previewable locations from writes (edit kind) plus any image a
@@ -574,6 +760,8 @@ export class ChatStore {
     const seen = new Set<string>();
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
+      // Every user block here is delivered (queued sends live in pendingSends),
+      // so a user block IS this turn's opening boundary — stop the scan.
       if (b.kind === "user" || b.kind === "turn_end") break;
       if (b.kind !== "tool" || b.status !== "completed" || b.denied) continue;
       for (const loc of b.locations) {
@@ -588,16 +776,36 @@ export class ChatStore {
     return out.slice(0, 8);
   }
 
+  /** Rebuild every id→index map from `blocks` after a non-tail splice
+   *  invalidated positions. */
+  private rebuildIndexes(): void {
+    this.toolIndex.clear();
+    this.userIndex.clear();
+    this.questionIndex.clear();
+    this.blocks.forEach((b, i) => {
+      if (b.kind === "tool") this.toolIndex.set(b.id, i);
+      if (b.kind === "user" && b.id !== null) this.userIndex.set(b.id, i);
+      if (b.kind === "question") this.questionIndex.set(b.id, i);
+    });
+  }
+
   /** Withdraw the current turn's trailing agent prose (refusal retries and
-   *  superseding messages REPLACE it). Tool cards and user messages stay;
-   *  removal is tail-only so toolIndex positions remain valid. */
+   *  superseding messages REPLACE it). Tool cards and user messages stay. Only
+   *  delivered user messages live in `blocks` now (queued sends are in the
+   *  pending stack), so the trailing prose run is always at the very tail — a
+   *  plain tail splice. A codex steer that resolved `sent` mid-turn is a real
+   *  boundary and correctly stops the scan. A non-tail splice → rebuild. */
   private dropTrailingProse(): void {
-    let end = this.blocks.length;
-    while (end > 0) {
-      const kind = this.blocks[end - 1].kind;
+    const end = this.blocks.length;
+    let start = end;
+    while (start > 0) {
+      const kind = this.blocks[start - 1].kind;
       if (kind !== "message" && kind !== "thought") break;
-      end--;
+      start--;
     }
-    if (end < this.blocks.length) this.blocks.splice(end);
+    if (start < end) {
+      this.blocks.splice(start, end - start);
+      if (end < this.blocks.length) this.rebuildIndexes();
+    }
   }
 }

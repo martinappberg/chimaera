@@ -78,7 +78,11 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   prose never has (a full `ls`/`ls -l` line) — because the daemon runs on shared login nodes and
   prose must never be mass-validated. Verdicts cached 15s; requests batched + deduped; a
   whole-viewport prefetch keeps hovers instant. Relative paths resolve against the session's live
-  cwd first, then the workspace root.
+  cwd first, then the workspace root; a bare `name.ext` that misses both also links when exactly
+  one file in the workspace bears that name (an agent saying `FIGURE_PLAN.md` about
+  `paper/FIGURE_PLAN.md`) — the daemon answers from the bounded quickopen index and refuses on
+  ambiguity, so links stay existence-verified. Chat prose paths share the same endpoint and
+  fallback.
 
 ## Clipboard, selection & copy provenance
 
