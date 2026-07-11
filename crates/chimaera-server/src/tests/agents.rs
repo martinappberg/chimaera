@@ -91,11 +91,16 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     // The degrade-in-progress marker (the WS "degraded" classification) is
-    // cleaned up once the successor exists.
-    assert!(
-        crate::lock(&state.chat_switching).is_empty(),
-        "degrade marker must not outlive the degrade"
-    );
+    // cleaned up once the successor exists — the removal is async relative to
+    // the mode_switch stamp above, so poll rather than race it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::lock(&state.chat_switching).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "degrade marker must not outlive the degrade"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let _ = state.sessions.kill(&id);
 }
 
