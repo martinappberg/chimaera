@@ -58,8 +58,10 @@
   import {
     reportUploadError,
     setUploadPathInserter,
+    trackFileOp,
     uploadAndInsert,
     uploadJobs,
+    uploadToDir,
   } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
@@ -193,7 +195,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
-  import { fsDeleteOp, lastFsMutation, pendingDelete } from "./lib/workspace/fsEvents";
+  import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
@@ -889,6 +891,32 @@
     return s !== undefined && s.alive ? s : null;
   }
 
+  /** The FOLDER an OS-desktop file drop at (x, y) should land in — a Finder
+   *  column, a FILES-tree dir row, or the tree root — or null when the point
+   *  is over neither. Hit-tests the data attributes those surfaces stamp
+   *  (elementFromPoint is valid during an HTML5 drag; there is no in-DOM ghost
+   *  to occlude). `paneId` is the Finder pane to wash (null for the rail tree). */
+  function osFolderTargetAt(x: number, y: number): { paneId: string | null; dir: string } | null {
+    const el = document.elementFromPoint(x, y);
+    if (!(el instanceof Element)) return null;
+    // A FILES-tree dir row (files target their parent; broken links have none).
+    const row = el.closest<HTMLElement>("[data-drop-dir]");
+    if (row?.dataset.dropDir != null && el.closest(".tree") !== null) {
+      return { paneId: null, dir: row.dataset.dropDir };
+    }
+    // The tree background → the workspace root.
+    const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
+    if (treeRoot?.dataset.treeRoot != null) {
+      return { paneId: null, dir: treeRoot.dataset.treeRoot };
+    }
+    // A Finder column → that column's directory.
+    const col = el.closest<HTMLElement>("[data-finder-dir]");
+    if (col?.dataset.finderDir != null) {
+      return { paneId: paneIdAt(x, y), dir: col.dataset.finderDir };
+    }
+    return null;
+  }
+
   /** Depth-counted dragenter/leave so child enter/leave churn never flickers
    *  the drop overlay off mid-drag. */
   let osDragDepth = 0;
@@ -911,6 +939,14 @@
     // breaks text/URL drop into the composer and every other input).
     if (!isOsFileDrag(e)) return;
     e.preventDefault();
+    // A folder target (Finder column / FILES-tree dir) wins over the session
+    // pane it may sit inside — dropping onto the file manager uploads THERE.
+    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    if (folder !== null) {
+      if (e.dataTransfer !== null) e.dataTransfer.dropEffect = "copy";
+      dropSpot = { kind: "uploadDir", paneId: folder.paneId, dir: folder.dir };
+      return;
+    }
     const paneId = paneIdAt(e.clientX, e.clientY);
     const ok = paneId !== null && osDropSession(paneId) !== null;
     if (e.dataTransfer !== null) e.dataTransfer.dropEffect = ok ? "copy" : "none";
@@ -922,7 +958,9 @@
   function onWindowDragLeave(e: DragEvent): void {
     if (!isOsFileDrag(e)) return;
     osDragDepth = Math.max(0, osDragDepth - 1);
-    if (osDragDepth === 0 && dropSpot?.kind === "upload") dropSpot = null;
+    if (osDragDepth === 0 && (dropSpot?.kind === "upload" || dropSpot?.kind === "uploadDir")) {
+      dropSpot = null;
+    }
   }
 
   function onWindowDrop(e: DragEvent): void {
@@ -931,18 +969,53 @@
     if (!isOsFileDrag(e)) return;
     e.preventDefault();
     osDragDepth = 0;
-    if (dropSpot?.kind === "upload") dropSpot = null;
+    const spot = dropSpot;
+    if (spot?.kind === "upload" || spot?.kind === "uploadDir") dropSpot = null;
     const dt = e.dataTransfer;
     if (dt === null) return;
-    const paneId = paneIdAt(e.clientX, e.clientY);
-    const s = paneId !== null ? osDropSession(paneId) : null;
-    if (s === null) return;
     // Read files AND directory-ness synchronously — webkitGetAsEntry is only
     // valid while the drop event dispatches.
     const picked = [...dt.items]
       .filter((i) => i.kind === "file")
       .map((i) => ({ file: i.getAsFile(), dir: i.webkitGetAsEntry?.()?.isDirectory === true }));
+    // A folder target (file manager) uploads INTO that directory; otherwise
+    // fall back to the live-session upload+reference flow.
+    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    if (folder !== null) {
+      void dropFilesInDir(folder.dir, picked);
+      return;
+    }
+    const paneId = paneIdAt(e.clientX, e.clientY);
+    const s = paneId !== null ? osDropSession(paneId) : null;
+    if (s === null) return;
     void dropFilesOnSession(s.id, picked);
+  }
+
+  /** Upload each dropped file INTO `dir` (a file-manager folder target), then
+   *  nudge the fs bus so the tree/Finder re-list. Same 8-file cap + folders-
+   *  rejected rule as the session drop. */
+  async function dropFilesInDir(
+    dir: string,
+    picked: { file: File | null; dir: boolean }[],
+  ): Promise<void> {
+    let accepted = 0;
+    for (const { file, dir: isDir } of picked) {
+      if (isDir) {
+        reportUploadError(`${file?.name ?? "folder"}: drop files, not folders`);
+        continue;
+      }
+      if (file === null) continue;
+      if (accepted >= OS_DROP_MAX_FILES) {
+        reportUploadError(`${file.name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
+        continue;
+      }
+      accepted += 1;
+      const result = await trackFileOp(`Uploading ${file.name}…`, () =>
+        uploadToDir(dir, file, file.name),
+      );
+      // Re-list the destination so the new file appears without a manual refresh.
+      if (result !== null) notifyCreated(result.path);
+    }
   }
 
   /** How many files one drop gesture will accept. */
@@ -3074,6 +3147,7 @@
                 activePath={focusedFilePath}
                 reveal={treeReveal}
                 createRequest={treeCreate}
+                dropActive={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null}
               />
             </div>
           {/if}

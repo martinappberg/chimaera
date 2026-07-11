@@ -572,6 +572,7 @@
         class:active={ci === activeCol}
         role="group"
         aria-label={col.dir}
+        data-finder-dir={col.dir}
         oncontextmenu={(e) => contextMenu.openAt(e, columnMenu(ci))}
       >
         {#if edit?.mode === "create" && edit.colIndex === ci}

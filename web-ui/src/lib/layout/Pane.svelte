@@ -72,6 +72,9 @@
    *  is the upload-and-reference target (HTML5 dnd — no tile gesture to
    *  partition against). */
   const uploadPane = $derived(dropSpot?.kind === "upload" && dropSpot.paneId === node.id);
+  /** An OS-desktop file drag hovering a Finder pane: upload INTO the folder
+   *  under the pointer (the whole Finder pane washes; `dir` names the target). */
+  const uploadDir = $derived(dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id ? dropSpot.dir : null);
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -250,6 +253,12 @@
       <span class="drop-ref-label"
         ><span class="drop-ref-at">@</span> drop to upload &amp; reference</span
       >
+    </div>
+  {:else if uploadDir !== null}
+    <!-- OS-desktop drop onto a Finder pane: upload INTO the folder under the
+         pointer (no @-reference — this is a file-manager drop). -->
+    <div class="drop-upload">
+      <span class="drop-ref-label">drop to upload here</span>
     </div>
   {/if}
 </section>

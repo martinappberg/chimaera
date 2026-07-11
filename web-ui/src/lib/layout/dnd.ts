@@ -23,6 +23,11 @@ export type DropSpot =
    *  the full pane is the drop zone). Produced by App's window drop handlers,
    *  never by spotAt. */
   | { kind: "upload"; paneId: string }
+  /** An OS-DESKTOP file drag over a FOLDER target — a Finder pane/column or a
+   *  FILES-tree dir. `dir` is the destination directory; `paneId` is the
+   *  Finder pane to wash (null for the rail tree, highlighted separately).
+   *  Produced by App's window drop handlers, never by spotAt. */
+  | { kind: "uploadDir"; paneId: string | null; dir: string }
   /** The "link to agent" band over an agent pane's input area — a plain
    *  shell-terminal TAB drag (not link-intent); see startDrag's linkTargets. */
   | { kind: "link"; paneId: string }

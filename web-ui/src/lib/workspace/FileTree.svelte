@@ -54,6 +54,8 @@
      * workspace root). The nonce distinguishes repeats.
      */
     createRequest?: { kind: "file" | "dir"; nonce: number } | null;
+    /** An OS-desktop file drag is hovering the tree (highlight the drop zone). */
+    dropActive?: boolean;
   }
 
   let {
@@ -64,6 +66,7 @@
     activePath,
     reveal = null,
     createRequest = null,
+    dropActive = false,
   }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
@@ -532,9 +535,11 @@
   </div>
   <div
     class="tree"
+    class:drop-active={dropActive}
     role="tree"
     tabindex="-1"
     bind:this={treeEl}
+    data-tree-root={root}
     onkeydown={onTreeKeydown}
     oncontextmenu={(e) =>
       contextMenu.openAt(e, [
@@ -608,6 +613,7 @@
       tabindex="0"
       title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
       data-path={entry.path}
+      data-drop-dir={entry.broken ? undefined : entry.kind === "dir" ? entry.path : parentOf(entry.path)}
       style:padding-left={`${8 + depth * 13}px`}
       onpointerdowncapture={(e) => {
         // The rename input stays a plain interactive target (rail-row idiom).
@@ -798,6 +804,14 @@
     flex-direction: column;
     padding: 2px 0.45rem 0.5rem;
     outline: none;
+  }
+
+  /* An OS-desktop file drag is hovering the tree: a quiet accent frame marks
+     it as a drop zone (dropping uploads into the folder under the pointer). */
+  .tree.drop-active {
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
   }
 
   .tree-error,

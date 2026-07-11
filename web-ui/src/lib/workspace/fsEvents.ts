@@ -37,6 +37,12 @@ function notify(mutation: FsMutationInput): void {
   fsEpoch.update((n) => n + 1);
 }
 
+/** Announce that `path` appeared by some other route (an OS-desktop drop that
+ *  already streamed to disk) so every listing surface re-lists. */
+export function notifyCreated(path: string): void {
+  notify({ kind: "create", path });
+}
+
 /** Create + notify. Resolves to the canonical created path. */
 export async function fsCreateOp(path: string, kind: "file" | "dir"): Promise<string> {
   const created = await fsCreate(path, kind);
