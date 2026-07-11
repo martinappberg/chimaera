@@ -31,6 +31,18 @@
   function chosen(qid: string): string[] {
     return answered?.[qid] ?? [];
   }
+  /** The answered card folds into history collapsed — a one-line summary of
+   *  what was chosen is what matters when scanning back; click to expand the
+   *  full options. */
+  let open = $state(false);
+  const answerSummary = $derived(
+    unanswered
+      ? "not answered"
+      : request.questions
+          .map((q) => chosen(q.id).join(", "))
+          .filter((s) => s.length > 0)
+          .join(" · "),
+  );
   /** Free-text answers ride as labels; anything chosen that is not one of
    *  the offered options renders as its own chip. */
   function freeText(qid: string, options: { label: string }[]): string[] {
@@ -77,26 +89,58 @@
   role="group"
   aria-label={readOnly ? "answered question" : "the agent has a question"}
 >
-  {#each request.questions as q, qi (qi)}
-    <div class="q">
-      {#if q.header.length > 0}
-        <span class="q-header">{q.header}</span>
-      {/if}
-      <div class="q-text">{q.question}</div>
-      {#if readOnly}
-        <!-- History face: the chosen labels stay lit, the road not taken
-             dims; free-text answers get their own chip. -->
-        <div class="q-options">
-          {#each q.options as opt, oi (oi)}
-            <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)}>
-              {opt.label}
-            </span>
-          {/each}
-          {#each freeText(q.id, q.options) as free (free)}
-            <span class="q-opt static on">{free}</span>
-          {/each}
+  {#if readOnly}
+    <!-- History face: collapsed to a one-line answer summary; expand for the
+         full options (chosen lit, the road not taken dimmed). -->
+    <button
+      class="q-collapse"
+      onclick={() => (open = !open)}
+      aria-expanded={open}
+      title={open ? "collapse" : "expand"}
+    >
+      <svg class="chev" class:open viewBox="0 0 16 16" width="10" height="10" aria-hidden="true">
+        <path
+          d="M5 3l6 5-6 5"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="q-collapse-label">answered</span>
+      <span class="q-collapse-answer" class:none={unanswered}>{answerSummary}</span>
+    </button>
+    {#if open}
+      {#each request.questions as q, qi (qi)}
+        <div class="q">
+          {#if q.header.length > 0}
+            <span class="q-header">{q.header}</span>
+          {/if}
+          <div class="q-text">{q.question}</div>
+          <div class="q-options">
+            {#each q.options as opt, oi (oi)}
+              <span class="q-opt static" class:on={chosen(q.id).includes(opt.label)}>
+                {opt.label}
+              </span>
+            {/each}
+            {#each freeText(q.id, q.options) as free (free)}
+              <span class="q-opt static on">{free}</span>
+            {/each}
+          </div>
         </div>
-      {:else}
+      {/each}
+      {#if unanswered}
+        <div class="q-note">no longer active — not answered</div>
+      {/if}
+    {/if}
+  {:else}
+    {#each request.questions as q, qi (qi)}
+      <div class="q">
+        {#if q.header.length > 0}
+          <span class="q-header">{q.header}</span>
+        {/if}
+        <div class="q-text">{q.question}</div>
         <div class="q-options">
           {#each q.options as opt, oi (oi)}
             <button
@@ -121,14 +165,8 @@
             }
           }}
         />
-      {/if}
-    </div>
-  {/each}
-  {#if readOnly}
-    {#if unanswered}
-      <div class="q-note">no longer active — not answered</div>
-    {/if}
-  {:else}
+      </div>
+    {/each}
     <div class="q-actions">
       <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
     </div>
@@ -212,6 +250,56 @@
     margin-top: 8px;
     color: var(--muted);
     font-size: var(--text-sm);
+  }
+  /* Collapsed answered header: a quiet toggle showing what was chosen. */
+  .q-collapse {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    text-align: left;
+  }
+  .q-collapse .chev {
+    flex: none;
+    color: var(--muted);
+    transition: transform 0.12s ease;
+  }
+  .q-collapse .chev.open {
+    transform: rotate(90deg);
+  }
+  .q-collapse-label {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .q-collapse-answer {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .q-collapse-answer.none {
+    color: var(--muted);
+    font-style: italic;
+  }
+  .question.answered .q:first-of-type {
+    margin-top: 10px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .q-collapse .chev {
+      transition: none;
+    }
   }
   .q-other {
     margin-top: 8px;

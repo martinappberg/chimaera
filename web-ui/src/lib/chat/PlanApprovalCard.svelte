@@ -20,10 +20,30 @@
 
   let { request, onDecide, onOpenPath, resolvePaths }: Props = $props();
   let comment = $state("");
+  /** The inline card shows a bounded plan preview; a long plan is easier to
+   *  read in a big overlay where the card's controls ride along the bottom. */
+  let expanded = $state(false);
 
   function decide(optionId: string) {
     const text = comment.trim();
+    expanded = false;
     onDecide(optionId, text.length > 0 ? text : undefined);
+  }
+
+  let panelEl = $state<HTMLDivElement | null>(null);
+  $effect(() => {
+    // Focus the overlay when it opens so Esc closes it (preventScroll: the
+    // transcript's own stick-to-bottom owns scrolling).
+    if (expanded) panelEl?.focus({ preventScroll: true });
+  });
+  function onOverlayKeydown(e: KeyboardEvent) {
+    // Esc here just closes the overlay back to the card — the actual
+    // keep-planning stop is Esc on the card itself.
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      expanded = false;
+    }
   }
 
   let cardEl = $state<HTMLDivElement | null>(null);
@@ -59,6 +79,21 @@
   <div class="head">
     <span class="mark">✓</span>
     <span class="label">plan ready — approve to leave plan mode</span>
+    {#if request.plan !== null && request.plan.length > 0}
+      <button class="expand" type="button" onclick={() => (expanded = true)} title="open the full plan">
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path
+            d="M6 2H2v4M10 14h4v-4M2 2l5 5M14 14l-5-5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        full plan
+      </button>
+    {/if}
   </div>
   {#if request.plan !== null && request.plan.length > 0}
     <div class="plan-body">
@@ -79,6 +114,53 @@
     {/each}
   </div>
 </div>
+
+{#if expanded}
+  <!-- Full-plan overlay: the card's controls ride the bottom so a decision can
+       be made from the full read; Esc / backdrop / ✕ close back to the card. -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="plan-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-label="full plan"
+    tabindex="-1"
+    onkeydown={onOverlayKeydown}
+  >
+    <button
+      class="plan-backdrop"
+      type="button"
+      aria-label="close full plan"
+      onclick={() => (expanded = false)}
+    ></button>
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <div class="plan-panel" tabindex="-1" bind:this={panelEl}>
+      <div class="panel-head">
+        <span class="mark">✓</span>
+        <span class="label">plan</span>
+        <button class="close" type="button" aria-label="close" onclick={() => (expanded = false)}>✕</button>
+      </div>
+      <div class="panel-body">
+        <Markdown text={request.plan ?? ""} {onOpenPath} {resolvePaths} />
+      </div>
+      <div class="panel-foot">
+        <input class="comment" bind:value={comment} placeholder="optional feedback on the plan…" />
+        <div class="actions">
+          {#each request.options as option, i (option.id)}
+            <button
+              class="opt"
+              class:primary={i === 0 && option.kind.startsWith("allow")}
+              class:quiet={option.kind.startsWith("reject")}
+              onclick={() => decide(option.id)}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .plan-approval {
@@ -161,5 +243,109 @@
   .opt.quiet:hover {
     color: var(--err);
     border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  }
+  .expand {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: none;
+    border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    border-radius: 6px;
+    padding: 2px 8px;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+    transition:
+      color 0.12s ease,
+      border-color 0.12s ease;
+  }
+  .expand:hover {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 50%, var(--edge));
+  }
+  /* Full-plan overlay: mirrors RewindDialog's scrim + panel tokens. */
+  .plan-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: grid;
+    place-items: center;
+    padding: 4vh 4vw;
+  }
+  .plan-backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    padding: 0;
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    cursor: default;
+  }
+  .plan-panel {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    width: min(860px, 100%);
+    max-height: 92vh;
+    background: var(--overlay-bg);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--edge));
+    border-radius: 10px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
+    outline: none;
+    animation: rise 0.15s ease;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .plan-panel {
+      animation: none;
+    }
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    font-size: var(--text-sm);
+  }
+  .panel-head .label {
+    flex: 1;
+  }
+  .panel-head .close {
+    flex: none;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: var(--text-md);
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 6px;
+  }
+  .panel-head .close:hover {
+    color: var(--fg);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
+  .panel-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 14px 16px;
+    font-size: var(--text-sm);
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--fg) 22%, transparent) transparent;
+  }
+  .panel-foot {
+    flex: none;
+    padding: 10px 14px 12px;
+    border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
+    background: color-mix(in srgb, var(--fg) 2%, transparent);
+  }
+  .panel-foot .comment {
+    margin-top: 0;
+  }
+  .panel-foot .actions {
+    margin-top: 8px;
   }
 </style>

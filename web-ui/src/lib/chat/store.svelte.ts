@@ -606,7 +606,13 @@ export class ChatStore {
         break;
       case "error":
         this.notice(ev.message as string, "error");
-        if (ev.fatal === true) this.fatalError = ev.message as string;
+        if (ev.fatal === true) {
+          this.fatalError = ev.message as string;
+          // A dead driver is not running — don't strand the stop button and
+          // the "starting…" row waiting on a turn end that can't come.
+          this.running = false;
+          this.activity = null;
+        }
         break;
       case "exited":
         this.running = false;
