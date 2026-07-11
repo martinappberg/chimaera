@@ -83,9 +83,12 @@ export interface PendingSend {
   /** Its checkpoint anchor arrives (claude) right after the queued echo; kept
    *  here so it rides along when the send is promoted into `blocks`. */
   checkpoint: CheckpointRef | null;
-  /** queued = still waiting for the agent; dropped = it never got it (claude's
-   *  queue died with an aborted turn / a codex steer failed for good) — kept
-   *  visible as "not delivered" so the text can be copied and re-sent. */
+  /** queued = still waiting for the agent (a Stop does NOT drop it — the queue
+   *  delivers after the aborted turn; its ✕ is how you discard one); dropped =
+   *  genuinely undeliverable (the agent process died / a codex steer failed for
+   *  good) — kept visible as "not delivered" so the text can be copied and
+   *  re-sent, until its ✕ dismisses it (the same `cancel_queued` command; the
+   *  driver's tombstone `Cancelled` makes the dismissal survive replay). */
   state: "queued" | "dropped";
 }
 

@@ -104,6 +104,47 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.pendingSends[0]).toMatchObject({ id: "q1", state: "dropped" });
   });
 
+  it("a stop delivers the queue after the abort: aborted turn, then the sent bubble", () => {
+    // The driver's stop semantics: TurnAborted first, then the held send
+    // flushes `sent` — the bubble lands AFTER the aborted turn, and later
+    // response chunks open a fresh block (the abort is never spliced).
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "half an ans" },
+      { type: "user_message", text: "queued during t1", id: "q1", queued: true },
+      { type: "turn_aborted", turn_id: "t1", reason: "interrupted", interrupted: true },
+      { type: "user_message_update", id: "q1", state: "sent" },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "message_chunk", turn_id: "t2", text: "answering the queued one" },
+    ]);
+    expect(store.pendingSends).toHaveLength(0);
+    // The abort renders its "stopped" notice, THEN the delivered bubble, then
+    // its fresh answer — the queued send survives the stop, in order.
+    expect(store.blocks.map((b) => b.kind)).toEqual(["message", "notice", "user", "message"]);
+    expect(store.blocks[2]).toMatchObject({ kind: "user", id: "q1" });
+  });
+
+  it("the ✕ tombstone dismisses a dropped bubble and no-ops for a delivered one", () => {
+    // Dismiss: dropped → cancelled removes it from the stack (replay-stable).
+    const dismissed = fold([
+      { type: "user_message", text: "never made it", id: "q1", queued: true },
+      { type: "user_message_update", id: "q1", state: "dropped" },
+      { type: "user_message_update", id: "q1", state: "cancelled" },
+    ]);
+    expect(dismissed.pendingSends).toHaveLength(0);
+    expect(dismissed.blocks.some((b) => b.kind === "user")).toBe(false);
+    // No-op: sent → cancelled leaves the delivered message untouched (a late
+    // ✕ click racing the flush can't un-say it).
+    const delivered = fold([
+      { type: "user_message", text: "made it", id: "q2", queued: true },
+      { type: "user_message_update", id: "q2", state: "sent" },
+      { type: "user_message_update", id: "q2", state: "cancelled" },
+    ]);
+    expect(delivered.pendingSends).toHaveLength(0);
+    expect(delivered.blocks.filter((b) => b.kind === "user")).toHaveLength(1);
+    expect(delivered.blocks[0]).toMatchObject({ kind: "user", id: "q2", text: "made it" });
+  });
+
   it("a fresh (turn-opening) send goes straight into the transcript", () => {
     const store = fold([
       { type: "user_message", text: "hi", id: "u1", queued: false },

@@ -764,23 +764,27 @@
   <!-- Pending stack: messages typed and waiting to send, held at the send
        point (right above the composer) rather than inline in history. On
        delivery the entry leaves this stack and enters the transcript as the
-       newest turn; a still-queued one can be pulled back with ✕; a dropped one
-       stays here, marked "not delivered". -->
+       newest turn. Queued survives a Stop (it delivers after the abort); the
+       ✕ is how you discard one. A dropped one (the agent died before it could
+       be delivered) stays marked "not delivered" until its ✕ dismisses it —
+       the same cancel command, tombstoned in the journal so replay agrees. -->
   {#if store.pendingSends.length > 0}
     <div class="pending" aria-label="queued messages">
       {#each store.pendingSends as send (send.id)}
         <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
           <div class="bubble-row">
-            {#if send.state === "queued"}
-              <button
-                class="cancel-btn"
-                title="cancel this queued message (remove it before the agent sees it)"
-                aria-label="cancel queued message"
-                onclick={() => cancelQueued(send.id)}
-              >
-                ✕
-              </button>
-            {/if}
+            <button
+              class="cancel-btn"
+              title={send.state === "dropped"
+                ? "dismiss (this message was never delivered)"
+                : "cancel this queued message (remove it before the agent sees it)"}
+              aria-label={send.state === "dropped"
+                ? "dismiss undelivered message"
+                : "cancel queued message"}
+              onclick={() => cancelQueued(send.id)}
+            >
+              ✕
+            </button>
             <div class="bubble">
               <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
             </div>

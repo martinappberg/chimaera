@@ -1026,10 +1026,12 @@ for codex), and the `cancel_async_message` round-trip in `CancelQueued`.
 frame — nothing reached the CLI to un-queue); once flushed+`sent` the bubble
 loses its ✕, and a late cancel finds nothing held → `Notice`. The abort paths
 (`is_error`/interrupt watchdog/`drain_pending`) still drop the held queue
-`dropped` — now HONESTLY, since a held message was never sent. The `was_active`
-guard and the interrupt watchdog (Pass 11) are unchanged. The wire SHAPE is
-untouched (`tests/wire_contract.rs` green); only the TIMING of the same
-normalized events changed.
+`dropped` — now HONESTLY, since a held message was never sent. **[Superseded by
+Pass 14: only `drain_pending`/an unshipped flush still drop — a live abort now
+flushes the queue, and the late-cancel Notice became a tombstone `Cancelled`.]**
+The `was_active` guard and the interrupt watchdog (Pass 11) are unchanged. The
+wire SHAPE is untouched (`tests/wire_contract.rs` green); only the TIMING of the
+same normalized events changed.
 
 **Codex is deliberately NOT changed.** Its native model is `turn/steer` —
 inject into the RUNNING turn — with a per-message RPC answer, so it already maps
@@ -1077,3 +1079,57 @@ fork anchor to the cancelled (never-written) uuid — the held-cancel makes its
 absence from the native transcript deterministic. Needs ≥2 held sends with no
 intervening assistant/user frame, a cancel of the earlier, then a fork at the
 later. Low severity; the preceding-chain is not repaired on cancel.
+
+## Pass 14 (2026-07-11 — stop preserves the queue; ✕ dismisses). ADOPTED.
+
+Live testing of Pass 13 surfaced the wrong default: pressing **Stop** with
+messages queued dropped the whole held queue "not delivered" — a wall of
+un-dismissible red bubbles, and the user's typed messages silently un-sent.
+Maintainer decision: **a stop (or a failed turn) ends only the CURRENT turn —
+the queued messages still deliver, in full.** Dropping-on-abort was inherited
+from the pre-Pass-13 world, where the CLI owned the queue and genuinely
+discarded it on interrupt; with the driver holding the messages it is an
+unforced choice, and the wrong one. `dropped` now means *genuinely
+undeliverable* — the agent process died (teardown) or the flush's write never
+shipped — and nothing else.
+
+**claude.** `on_result` flushes the held queue at EVERY turn end: the is_error
+branch no longer drops — it emits `TurnAborted` (when a turn was open), then
+falls through to the same flush as a completion, so the delivered bubbles land
+after the abort marker. The interrupt watchdog does the same on firing
+(best-effort write against a possibly wedged child — a failed/timed-out write
+tears the driver down and the `flushing` stage drops the batch honestly).
+`drain_pending` (process death) is the only remaining `dropped` producer.
+
+**codex.** The live-abort paths (`turn/completed{interrupted}`, `turn/failed`)
+no longer call the drop-drain: the first buffered send re-drives as a fresh
+turn (the rest steer into it on its `turn/started`), and in-flight steer RPCs
+stay tracked — codex is alive on these paths, so a steer that landed before
+the abort resolves `sent` off its ack, and one that missed re-drives off its
+error answer (the pre-existing `on_response` steer-error arms; the Pass 12
+"never resurrect after a stop" special-case is deliberately REVERTED — the
+resurrection is now the point). Called after `reset_turn_state`, which would
+otherwise clobber the re-drive's `turn_pending` window. The interrupt watchdog
+and teardown still drop: the watchdog firing means codex stopped answering, so
+a re-driven `turn/start` would just strand "queued" against a wedged process.
+
+**CancelQueued is now the universal pull-back/dismiss.** For a still-held
+(claude) / still-buffered (codex) send it removes it and emits `Cancelled`.
+For an id that already resolved it emits the same `Cancelled` as a TOMBSTONE:
+the reducer removes a `dropped` bubble (the ✕ on a "not delivered" bubble is
+this dismiss — replay-stable, since the tombstone is journaled) and no-ops for
+an already-`sent` id (seq order guarantees `sent` folds first — the delivered
+message can't be un-said). One codex exception: an id whose steer RPC is IN
+FLIGHT is mid-delivery (its resolution is still coming), so a tombstone would
+vanish a bubble the agent may consume — that one gets a Notice ("on its way").
+The UI shows ✕ on every pending bubble, queued or dropped.
+
+Tests: claude `interrupt_marks_abort_user_initiated_and_preserves_queue`,
+`interrupt_watchdog_aborts_a_hung_turn_after_the_grace` (flush, not drop),
+`bare_result_*` (error flush), `cancel_queued_after_delivery_is_a_reducer_noop_tombstone`;
+codex `user_interrupt_preserves_queued_steer_via_redrive`,
+`cancel_queued_mid_steer_is_a_notice`, `cancel_queued_after_resolution_is_a_tombstone`;
+e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
+`cancel_queued_after_delivery_is_a_reducer_noop_tombstone`; reducer vitest
+covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
+untouched. `just chat-smoke` re-run for the driver change.

@@ -69,9 +69,14 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   so a mid-turn send can't splice into a running turn's output. The reducer moves
   an entry into `blocks` (appended at the end) only when `user_message_update`
   resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
-  and it stays in the stack. Cancel rides the `cancel_queued` command (the ✕ on a
-  queued bubble → `socket.send({type:"cancel_queued", id})`). This is all pure
-  reducer, so replay rebuilds the identical order — see `store.svelte.test.ts`.
+  and it stays in the stack until dismissed. A **Stop never drops the queue** —
+  the driver aborts only the current turn and the held messages resolve `sent`
+  right after, so `dropped` means genuinely undeliverable (agent died). The ✕ on
+  any pending bubble rides `socket.send({type:"cancel_queued", id})`: it pulls
+  back a queued send, dismisses a dropped one (the driver's tombstone
+  `Cancelled` makes that survive replay), and no-ops for one already delivered.
+  All pure reducer, so replay rebuilds the identical order — see
+  `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
 - **Runes discipline.** Mutate `$state` only inside the store's methods; give

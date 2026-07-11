@@ -826,6 +826,7 @@ impl CodexMapper {
                 // claude on_result's `was_active` guard).
                 let was_active = self.turn_active;
                 self.turn_active = false;
+                let mut aborted = false;
                 if was_active {
                     let turn = &frame["params"]["turn"];
                     let mut usage = self.last_usage.clone();
@@ -839,10 +840,7 @@ impl CodexMapper {
                             reason: "interrupted".into(),
                             interrupted: true,
                         });
-                        // The user stopped: drop everything queued behind this
-                        // turn (mirrors claude's is_error queue drop) so a late
-                        // steer can't resurrect a queued message as a fresh turn.
-                        step.events.extend(self.drain_queued_sends());
+                        aborted = true;
                     } else {
                         step.events
                             .push(AgentEvent::TurnCompleted { turn_id, usage });
@@ -858,6 +856,16 @@ impl CodexMapper {
                     }));
                 }
                 self.reset_turn_state();
+                if aborted {
+                    // A stop ends only THIS turn, never the user's queued
+                    // messages (claude parity, maintainer decision 2026-07-11):
+                    // re-drive the buffered queue as the next turn, and leave
+                    // in-flight steers tracked — codex is alive, so their
+                    // post-abort error answers re-drive them through the same
+                    // fresh-turn path. AFTER reset_turn_state, which would
+                    // clobber the re-drive's turn_pending start window.
+                    self.redrive_queued_after_abort(&mut step);
+                }
             }
             "turn/failed" => {
                 if let Some(flushed) = self.coalescer.flush() {
@@ -876,13 +884,19 @@ impl CodexMapper {
                             .to_string(),
                         interrupted: false,
                     });
-                    // The turn died: its queue dies with it (claude parity).
-                    step.events.extend(self.drain_queued_sends());
                 }
                 // A failed turn must reset per-turn state exactly like a
                 // completed one — else the safety notice stays suppressed and
                 // stream/location maps leak into the next turn.
                 self.reset_turn_state();
+                if was_active {
+                    // Only THIS turn died — the queued messages behind it still
+                    // deliver (claude parity): re-drive the buffer as the next
+                    // turn (after reset_turn_state, which would clobber its
+                    // turn_pending window); in-flight steers stay tracked and
+                    // re-drive off their own error answers.
+                    self.redrive_queued_after_abort(&mut step);
+                }
             }
             _ => {}
         }
@@ -1417,13 +1431,33 @@ impl CodexMapper {
     /// process's JSON-RPC channel, so the journal must not outlive it with
     /// the ask dangling (a replay would strand the card forever — see the
     /// harness's drain call in `run_driver`).
+    /// After a user stop or a failed turn, the not-yet-delivered queue still
+    /// delivers — the abort ends only the CURRENT turn (claude parity,
+    /// maintainer decision 2026-07-11). Re-drive the FIRST buffered send as a
+    /// fresh turn; the rest stay buffered and steer into it once its
+    /// `turn/started` lands (the existing start-window path). In-flight steer
+    /// RPCs are deliberately NOT touched: codex is alive on these paths, so it
+    /// answers each steer — success resolves `sent` (it landed before the
+    /// abort), and an error re-drives it as a fresh turn via `on_response`'s
+    /// steer-error arms. Call AFTER `reset_turn_state` (which clears the
+    /// `turn_pending` window this re-drive opens).
+    fn redrive_queued_after_abort(&mut self, step: &mut DriverStep) {
+        if self.buffered_sends.is_empty() {
+            return;
+        }
+        let (input, client_msg_id) = self.buffered_sends.remove(0);
+        self.redrive_as_fresh_turn(input, client_msg_id, step);
+    }
+
     /// Drop every user message still queued behind the current turn — the
-    /// not-yet-sent `buffered_sends` and any in-flight `Steer` RPC. Mirrors
-    /// claude dropping its native queue when a turn aborts (interrupt or
-    /// failure): those messages were never consumed, so replay must show them
-    /// not-delivered, and — critically — removing the pending steer here stops
-    /// a late steer-error from resurrecting a queued message as a fresh turn
-    /// AFTER the user hit stop (the two-driver-symmetry bug).
+    /// not-yet-sent `buffered_sends` and any in-flight `Steer` RPC. This is
+    /// the DEAD-OR-UNRESPONSIVE-agent resolution only (teardown, and the
+    /// interrupt watchdog whose firing means codex stopped answering): with
+    /// no live agent to deliver to or answer a steer, `dropped` is the honest
+    /// terminal state — and removing the pending steers stops a late error
+    /// from resurrecting a message against a gone process. A LIVE abort
+    /// (turn/completed interrupted, turn/failed) re-drives instead — see
+    /// `redrive_queued_after_abort`.
     fn drain_queued_sends(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         for (_input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
@@ -2011,24 +2045,31 @@ impl CodexMapper {
                     "params": { "threadId": self.thread_id },
                 }));
             }
-            // Pull back a still-queued message. Only a send still sitting in
-            // the pre-steer buffer (captured during a turn/start window) can be
-            // cancelled — it never reached codex. A send no longer in the buffer
-            // already resolved (steered/delivered, or a prior cancel/drop), so
-            // it can't be un-said: emit a Notice. Don't assert WHICH — "already
-            // delivered" would be a lie for a stale ✕ after a drop — the
-            // symmetric-intent counterpart to claude's neutral notice.
+            // Pull back a still-queued message. A send still in the pre-steer
+            // buffer is genuinely pulled back (it never reached codex). A send
+            // whose steer RPC is IN FLIGHT is mid-delivery — it's on the wire
+            // and its `sent`/re-drive resolution is still coming, so a
+            // tombstone now would vanish a bubble the agent may consume:
+            // that one gets a Notice instead. Anything else already resolved:
+            // emit `Cancelled` tombstone-style (claude parity) — it dismisses
+            // a DROPPED "not delivered" bubble on live and replay alike, and
+            // the reducer no-ops for an already-`sent` id (the message is
+            // visibly in the transcript, which is its own answer).
             AgentCommand::CancelQueued { id } => {
-                let before = self.buffered_sends.len();
-                self.buffered_sends.retain(|(_, cid)| cid != &id);
-                if self.buffered_sends.len() != before {
+                let steer_in_flight = self.pending_rpcs.values().any(
+                    |p| matches!(p, PendingRpc::Steer { client_msg_id, .. } if *client_msg_id == id),
+                );
+                if steer_in_flight {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that message is already on its way to the agent — \
+                               too late to cancel it"
+                            .into(),
+                    });
+                } else {
+                    self.buffered_sends.retain(|(_, cid)| cid != &id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Cancelled,
-                    });
-                } else {
-                    step.events.push(AgentEvent::Notice {
-                        text: "that message is no longer queued — nothing to cancel".into(),
                     });
                 }
             }
@@ -2083,9 +2124,13 @@ impl CodexMapper {
     /// armed on `Interrupt` expires with a turn still open — the app-server
     /// never emitted `turn/completed`, so the session would stay "running"
     /// forever — synthesize the abort it owed: emit `TurnAborted{interrupted}`
-    /// and drop the queue (mirrors the turn/completed `interrupted` path). A
-    /// real turn end disarms the grace first, so a live turn is never
-    /// double-aborted; idle-guarded, so interrupting nothing stays a no-op.
+    /// and DROP the queue. Dropping (not re-driving) is deliberate here,
+    /// unlike the live-abort paths: the watchdog firing means codex stopped
+    /// answering, so a steer will never get its ack and a re-driven
+    /// `turn/start` would strand "queued" against a wedged process —
+    /// `dropped` (dismissible) is the honest state. A real turn end disarms
+    /// the grace first, so a live turn is never double-aborted; idle-guarded,
+    /// so interrupting nothing stays a no-op.
     fn interrupt_watchdog(&mut self) -> DriverStep {
         let mut step = DriverStep::default();
         let Some(remaining) = self.interrupt_grace else {
@@ -2111,17 +2156,16 @@ impl CodexMapper {
         step
     }
 
-    /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`) — codex's symmetric
-    /// counterpart to claude's. codex normally resolves every queued message at
-    /// a well-defined point (a steer's RPC answer, or the turn-end drain), so
-    /// this is the defensive rescue for the one seam where it can't: a turn end
-    /// that fires while a `turn/start` was still in flight (`turn_pending`)
-    /// leaves `buffered_sends` stranded with no turn to steer them into. When
-    /// the driver is idle with a stranded buffer past the grace, re-drive the
+    /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`). codex normally resolves
+    /// every queued message at a well-defined point (a steer's RPC answer, a
+    /// live abort's re-drive, or the teardown drain), so this is the defensive
+    /// rescue for the one seam where it can't: a turn end that fires while a
+    /// `turn/start` was still in flight (`turn_pending`) leaves
+    /// `buffered_sends` stranded with no turn to steer them into. When the
+    /// driver is idle with a stranded buffer past the grace, re-drive the
     /// oldest as a fresh turn (delivering it, resolving `sent`); the rest
     /// re-buffer and steer once it starts — the same path a `turn/start` error
-    /// takes. Honest by construction: unlike claude's write-then-coalesce
-    /// queue, a codex buffer was never sent, so we DELIVER it rather than
+    /// takes. A codex buffer was never sent, so we DELIVER it rather than
     /// declare it sent unseen.
     fn idle_flush(&mut self) -> DriverStep {
         let mut step = DriverStep::default();
@@ -2484,10 +2528,12 @@ mod tests {
     }
 
     #[test]
-    fn user_interrupt_drops_queued_steer_instead_of_redriving() {
-        // Two-driver symmetry with claude: a message queued while a turn runs
-        // must DROP when the user stops that turn, not be resurrected as a
-        // fresh turn (which would undo the stop and bill unwanted work).
+    fn user_interrupt_preserves_queued_steer_via_redrive() {
+        // Two-driver symmetry with claude: a stop ends only the CURRENT turn
+        // (maintainer decision 2026-07-11). A message whose steer was still in
+        // flight when the user stopped is NOT dropped — codex answers the
+        // steer with an error (turn gone), and that answer re-drives it as a
+        // fresh turn, so the user's message still delivers in full.
         let mut m = mapper();
         active_turn(&mut m);
         let step = m.on_command(AgentCommand::Send {
@@ -2502,29 +2548,39 @@ mod tests {
             } => id.clone(),
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
-        // User hits stop; the turn then ends interrupted.
+        // User hits stop; the turn then ends interrupted. The in-flight steer
+        // is left tracked (codex is alive and WILL answer it) — nothing drops.
         m.on_command(AgentCommand::Interrupt);
         let step = m.on_frame(&json!({
             "method": "turn/completed",
             "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
         }));
         assert!(
-            step.events.iter().any(|e| matches!(
-                e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped }
-                    if id == &queued_id
-            )),
-            "queued message must drop on interrupt: {:?}",
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "the stop resolves nothing — the steer's own answer will: {:?}",
             step.events
         );
-        // The now-stale steer response must NOT re-drive B as a fresh turn.
+        // The steer's error answer re-drives B as a fresh turn, resolving it
+        // `sent` — the queued message survives the stop.
         let step = m.on_frame(&json!({
             "id": steer_id,
             "error": { "message": "no active turn" },
         }));
         assert!(
-            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
-            "must not redrive a queued message after a user stop: {:?}",
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent }
+                    if id == &queued_id
+            )),
+            "the stopped-past steer re-drives and resolves sent: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "the saved input re-drives as a fresh turn: {:?}",
             step.outbound
         );
     }
@@ -2577,9 +2633,11 @@ mod tests {
     }
 
     /// Feature 2 (codex): a send already steered into the running turn is
-    /// delivered — cancelling it is a Notice, never a phantom `Cancelled`.
+    /// mid-delivery — its steer RPC is on the wire and unanswered, so a
+    /// tombstone now could vanish a bubble the agent then consumes.
+    /// Cancelling it is a Notice; the steer's own answer resolves it.
     #[test]
-    fn cancel_queued_after_steer_is_a_notice() {
+    fn cancel_queued_mid_steer_is_a_notice() {
         let mut m = mapper();
         active_turn(&mut m);
         let steered = match &m
@@ -2593,13 +2651,33 @@ mod tests {
             } => id.clone().unwrap(),
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
-        // It was steered (buffer is empty), so it can't be pulled back.
+        // It was steered (buffer is empty; the RPC is in flight, unanswered).
         assert!(m.buffered_sends.is_empty());
         let step = m.on_command(AgentCommand::CancelQueued { id: steered });
         assert!(matches!(
             step.events.as_slice(),
-            [AgentEvent::Notice { text }] if text.contains("no longer queued")
+            [AgentEvent::Notice { text }] if text.contains("on its way")
         ));
+    }
+
+    /// A cancel for an id that already fully resolved (nothing held, no steer
+    /// in flight) is the tombstone `Cancelled`: it dismisses a dropped "not
+    /// delivered" bubble on live and replay, and the reducer no-ops for an
+    /// already-`sent` id.
+    #[test]
+    fn cancel_queued_after_resolution_is_a_tombstone() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::CancelQueued {
+            id: "gone-id".into(),
+        });
+        assert!(step.outbound.is_empty(), "nothing goes to codex");
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: "gone-id".into(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
     }
 
     /// Feature 1 (codex): a buffer stranded when a turn ended under a pending

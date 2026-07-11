@@ -490,10 +490,11 @@ async fn queued_send_flushes_with_no_client_attached() {
     fx.manager.kill("s-hidden");
 }
 
-/// A user interrupt aborts the turn (structurally marked `interrupted`) and
-/// drops the CLI's queue: the queued message replays in its dropped state.
+/// A user interrupt aborts ONLY the running turn (structurally marked
+/// `interrupted`) — the queued message SURVIVES the stop: it flushes right
+/// after the abort, runs as its own turn, and replays in its `sent` state.
 #[tokio::test]
-async fn interrupt_drops_queued_send_and_classifies_user_stop() {
+async fn interrupt_classifies_user_stop_and_queue_still_delivers() {
     let fx = fixture();
     fx.manager
         .spawn(&ClaudeAdapter, spec("s-q2", &fx.cwd, "normal"))
@@ -509,16 +510,8 @@ async fn interrupt_drops_queued_send_and_classifies_user_stop() {
         .await
         .expect("interrupt");
 
-    // The queue dies with the aborted turn (dropped precedes the abort)…
-    wait_for(
-        &mut rx,
-        &mut seen,
-        "UserMessageUpdate dropped",
-        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued_id),
-    )
-    .await;
-    // …and the abort is a quiet user stop, not a failure — the fake omits
-    // the result string, so this proves the structural flag, not a string
+    // The abort is a quiet user stop, not a failure — the fake omits the
+    // result string, so this proves the structural flag, not a string
     // heuristic.
     let aborted = wait_for(&mut rx, &mut seen, "TurnAborted", |ev| {
         matches!(ev, AgentEvent::TurnAborted { .. })
@@ -535,8 +528,46 @@ async fn interrupt_drops_queued_send_and_classifies_user_stop() {
         }
         _ => unreachable!(),
     }
+    // The stop ended only that turn: the held message flushes `sent`…
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessageUpdate sent",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued_id),
+    )
+    .await;
+    // …and runs as its own turn against the (fake) CLI. Answer its
+    // permission so the session settles idle.
+    let perm = wait_for(
+        &mut rx,
+        &mut seen,
+        "flushed turn's PermissionRequest",
+        |ev| matches!(ev, AgentEvent::PermissionRequest { .. }),
+    )
+    .await;
+    let request_id = match &perm.ev {
+        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+    fx.manager
+        .command(
+            "s-q2",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+    wait_for(&mut rx, &mut seen, "flushed turn's TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
 
-    // Replay: queued-never-sent ends dropped, echoed exactly once.
+    // Replay: the queued message is echoed exactly once and ends `sent` —
+    // never dropped — and the user-stop classification survives.
     let replay = fx.manager.attach("s-q2", 0).expect("replay").replay;
     let echoes = replay
         .iter()
@@ -550,7 +581,7 @@ async fn interrupt_drops_queued_send_and_classifies_user_stop() {
             _ => None,
         })
         .collect();
-    assert_eq!(updates, vec![UserMessageState::Dropped]);
+    assert_eq!(updates, vec![UserMessageState::Sent]);
     assert!(
         replay.iter().any(|e| matches!(
             &e.ev,
@@ -561,6 +592,9 @@ async fn interrupt_drops_queued_send_and_classifies_user_stop() {
         )),
         "the user-stop classification survives replay"
     );
+    // Every opened turn ended — the stop left nothing dangling.
+    let (opened, ended) = turn_balance(&replay);
+    assert_eq!(opened, ended, "no turn left stuck running: {replay:#?}");
 }
 
 /// Opened vs ended turns in a journal — a session is idle only when they
@@ -851,10 +885,13 @@ async fn cancel_queued_removes_a_still_queued_message() {
     );
 }
 
-/// Feature 2 — cancelling a message the agent ALREADY took is a no-op with a
-/// Notice: the driver can't un-say it, so it never emits a phantom `Cancelled`.
+/// Feature 2 — cancelling a message that already resolved emits the tombstone
+/// `Cancelled`. For an already-`sent` id the reducer no-ops (the delivered
+/// message stays in the transcript, live and on replay — `sent` precedes the
+/// tombstone in seq order); the same event is what dismisses a dropped
+/// "not delivered" bubble.
 #[tokio::test]
-async fn cancel_queued_after_delivery_is_a_notice() {
+async fn cancel_queued_after_delivery_is_a_reducer_noop_tombstone() {
     let fx = fixture();
     fx.manager
         .spawn(&ClaudeAdapter, spec("s-cn", &fx.cwd, "normal"))
@@ -865,7 +902,7 @@ async fn cancel_queued_after_delivery_is_a_notice() {
 
     let (queued_id, request_id) = queue_second_send(&fx, "s-cn", &mut rx, &mut seen).await;
 
-    // Let turn one finish so the queued message dequeues `sent` (delivered).
+    // Let turn one finish so the queued message flushes `sent` (delivered).
     fx.manager
         .command(
             "s-cn",
@@ -886,7 +923,9 @@ async fn cancel_queued_after_delivery_is_a_notice() {
     )
     .await;
 
-    // Now cancel it — too late. A Notice, and NO Cancelled for that id.
+    // Now cancel it — too late to matter: the tombstone `Cancelled` lands
+    // AFTER the `sent` in seq order, so a reducer folding the journal keeps
+    // the delivered message.
     fx.manager
         .command(
             "s-cn",
@@ -899,21 +938,23 @@ async fn cancel_queued_after_delivery_is_a_notice() {
     wait_for(
         &mut rx,
         &mut seen,
-        "too-late Notice",
-        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("no longer queued")),
+        "tombstone Cancelled",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Cancelled } if *id == queued_id),
     )
     .await;
 
     let replay = fx.manager.attach("s-cn", 0).expect("replay").replay;
-    assert!(
-        !replay.iter().any(|e| matches!(
-            &e.ev,
-            AgentEvent::UserMessageUpdate {
-                id,
-                state: UserMessageState::Cancelled,
-            } if *id == queued_id
-        )),
-        "a delivered message must never resolve cancelled"
+    let updates: Vec<_> = replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::UserMessageUpdate { id, state } if *id == queued_id => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updates,
+        vec![UserMessageState::Sent, UserMessageState::Cancelled],
+        "sent precedes the tombstone on replay, so the delivery wins"
     );
 }
 
