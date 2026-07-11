@@ -908,6 +908,18 @@ mod imp {
             user: t.user.clone(),
             home: t.home.clone(),
         }));
+        // The ControlMaster socket dir is the TRANSPORT's need, not the
+        // askpass relay's: key/agent-auth hosts must work even when the
+        // relay is absent, and ssh creates sockets but never their dir.
+        match target_script(t, "mkdir -p \"$HOME/.chimaera/cm\"", None, SCRIPT_TIMEOUT).await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::warn!(
+                "could not create the ssh control dir in {} — remote connects will fail: {}",
+                t.distro,
+                decode_wsl_output(&out.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("could not create the ssh control dir: {e:#}"),
+        }
         if let Err(e) = wire_askpass(t).await {
             tracing::warn!(
                 "askpass wiring through {} failed — password/2FA hosts will fail cleanly: {e:#}",
@@ -916,8 +928,8 @@ mod imp {
         }
     }
 
-    /// Install the distro-side SSH_ASKPASS wrapper (ControlMaster dir rides
-    /// along) and export the env that crosses into WSL via WSLENV.
+    /// Install the distro-side SSH_ASKPASS wrapper and export the env that
+    /// crosses into WSL via WSLENV.
     async fn wire_askpass(t: &Target) -> anyhow::Result<()> {
         let Some((port, token)) = crate::askpass::relay_endpoint() else {
             bail!("askpass relay not listening");
@@ -946,8 +958,7 @@ mod imp {
         );
         let out = target_script(
             t,
-            "mkdir -p \"$HOME/.chimaera/cm\" && \
-             cat > \"$HOME/.chimaera/askpass.sh\" && \
+            "cat > \"$HOME/.chimaera/askpass.sh\" && \
              chmod 700 \"$HOME/.chimaera/askpass.sh\"",
             Some(Stdin::Bytes(wrapper.into_bytes())),
             SCRIPT_TIMEOUT,

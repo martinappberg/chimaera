@@ -52,6 +52,9 @@ jobs:
       # --release, not the default test profile: the shared "app" cache holds
       # `tauri build` RELEASE artifacts (release.yml writes it on main) — a
       # dev-profile build restores nothing and cold-compiles the tauri tree
-      # every run.
+      # every run. GITHUB_TOKEN authenticates the release-asset lookup —
+      # anonymous api.github.com from pool-IP runners rate-limits routinely.
       - run: cargo test --release wsl_end_to_end -- --ignored --nocapture
         working-directory: crates/chimaera-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

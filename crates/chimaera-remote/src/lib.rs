@@ -952,17 +952,24 @@ async fn release_asset(
     let api = format!("https://api.github.com/repos/{repo}/releases/{release_ref}");
     // No `-f`: a missing release answers 404 with a JSON body we detect below,
     // which we want to treat as "fall back", not as a curl error.
-    let out = output_bounded(
-        curl_command().args(["-sSL", "--max-time", "30"]).args([
-            "-H",
-            "Accept: application/vnd.github+json",
-            &api,
-        ]),
-        45,
-        "curl (release metadata)",
-    )
-    .await
-    .context("is curl installed?")?;
+    let mut cmd = curl_command();
+    cmd.args(["-sSL", "--max-time", "30"]).args([
+        "-H",
+        "Accept: application/vnd.github+json",
+        &api,
+    ]);
+    // Unauthenticated api.github.com is rate-limited PER IP — CI runners
+    // share pool IPs and hit it constantly. Ride a token when the
+    // environment has one (GITHUB_TOKEN in workflows); end-user machines do
+    // fine on the anonymous quota.
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.is_empty() {
+            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    let out = output_bounded(&mut cmd, 45, "curl (release metadata)")
+        .await
+        .context("is curl installed?")?;
     if !out.status.success() {
         bail!(
             "release metadata request failed: {}",
@@ -972,8 +979,18 @@ async fn release_asset(
     let meta: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
     // A missing release is `{"message": "Not Found", ...}` — no `tag_name`.
+    // Anything ELSE without a tag (rate limit, auth failure) is a transient
+    // API error and must surface as one: falling back would misreport it as
+    // "no release provides <asset>" and strand provisioning with a lie.
     let Some(tag) = meta.get("tag_name").and_then(serde_json::Value::as_str) else {
-        return Ok(None);
+        let message = meta
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unrecognized payload");
+        if message == "Not Found" {
+            return Ok(None);
+        }
+        bail!("GitHub API refused the release lookup: {message}");
     };
     let Some(asset) = meta
         .get("assets")
