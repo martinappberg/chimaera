@@ -835,6 +835,13 @@ are emitted, never their wire SHAPE (`tests/wire_contract.rs` unchanged).
 
 ### Claude coalesces rapid queued sends — fewer results than sends (live)
 
+> **Superseded for claude by Pass 13.** The lazy-open + per-result FIFO pop
+> below was a best-effort *guess* at what the CLI's opaque coalescer did, and it
+> could strand a middle message or fire a phantom turn. Pass 13 stops dumping
+> queued sends mid-turn entirely (hold-until-flush), so the CLI never coalesces
+> *our* sends and the guess is gone. The `was_active` guard and the interrupt
+> watchdog below still stand. Kept here as the historical record of why.
+
 **Confirmed live: three rapid mid-turn sends produced only TWO turns.** The
 CLI queues mid-turn stdin frames natively (Pass 4), but when several arrive
 in quick succession it COALESCES them — it runs fewer follow-up turns, and
@@ -898,6 +905,13 @@ closed. claude's `on_result` already gated on `was_active`; codex's
 late real end never emits a second `TurnAborted`/`TurnCompleted`.
 
 ## Pass 12 (2026-07-11 — queued-message lifecycle): idle-flush + CancelQueued
+
+> **Superseded for claude by Pass 13.** The idle-flush existed only to reconcile
+> a *coalesced surplus*; hold-until-flush produces no surplus, so claude's
+> idle-flush is deleted. claude's `CancelQueued` no longer sends
+> `cancel_async_message` (a held message never reached the CLI — cancel is a
+> local removal). The wire additions (`UserMessageState::Cancelled`,
+> `AgentCommand::CancelQueued`) and codex's behavior are unchanged.
 
 Two maintainer decisions on the queued (faded) user bubble. Both are strictly
 additive on the normalized wire (`UserMessageState::Cancelled` appended;
@@ -969,3 +983,97 @@ message still ran.
 > the strength of it — a future CLI that stops honoring the control degrades to a
 > local-only relabel (the message would still run, but the journaled `Cancelled`
 > keeps replay consistent), and the live probe would catch the regression.
+
+## Pass 13 (2026-07-11 — claude queued sends: hold-until-flush). ADOPTED.
+
+The maintainer hit it live: several messages queued behind a running turn came
+back with a MIDDLE one stranded "not delivered" while its neighbours delivered,
+plus a phantom turn "responding to an empty message." Root cause was structural,
+not a missed edge case. Passes 11–12 let the driver **dump every queued send to
+stdin immediately** and then *reverse-engineer* what the CLI's opaque coalescer
+did — pop one queued id `sent` per `result` (FIFO), with an idle-flush timer
+mopping up the surplus. That reconciliation is a guess with no ground truth:
+
+- The first `result` after queuing is the END of the pre-existing turn, yet the
+  FIFO pop marked a queued id `sent` off it — off by one.
+- The CLI coalesces rapid sends into FEWER results than messages, so the
+  id↔result mapping drifts; timing decided which id stranded.
+- The DROP paths (`is_error`/interrupt/kill) drain the WHOLE queue, so a send
+  that arrived after a mid-sequence abort could strand while its neighbours went
+  through — exactly the "middle one not delivered."
+
+**Fix — hold, don't dump.** A send that arrives while a turn is active is now
+HELD in `queued_sends` (`VecDeque<(uuid, stdin content)>`) and is **not written
+to the CLI**. When the running turn's `result` lands, `on_result` flushes the
+whole held batch: writes each message to stdin AND resolves each
+`UserMessageUpdate{sent}` in that one step. Determinism replaces the guess:
+
+- Delivery is tied to OUR write, not to counting the CLI's results — so the
+  result count is irrelevant and no id can strand. If the CLI later coalesces the
+  flushed batch, every message is already `sent`; we don't care how many results
+  come back.
+- No mid-turn stdin write means the delivered bubble lands AFTER the turn's
+  `TurnCompleted` (the store appends at the current end), never spliced into the
+  still-streaming turn — and the CLI never receives our sends mid-turn, so it
+  can't coalesce them into a bare result or a phantom empty turn.
+- This is also more faithful to the official client, whose queued messages wait
+  for the current turn to finish rather than steering into it.
+
+Deleted with the guess: the per-result FIFO pop, the **idle-flush** (+
+`idle_flush_grace`, `IDLE_FLUSH_GRACE_TICKS` usage in claude — the const stays
+for codex), and the `cancel_async_message` round-trip in `CancelQueued`.
+`CancelQueued` on a held message is now a pure local removal (`Cancelled`, no CLI
+frame — nothing reached the CLI to un-queue); once flushed+`sent` the bubble
+loses its ✕, and a late cancel finds nothing held → `Notice`. The abort paths
+(`is_error`/interrupt watchdog/`drain_pending`) still drop the held queue
+`dropped` — now HONESTLY, since a held message was never sent. The `was_active`
+guard and the interrupt watchdog (Pass 11) are unchanged. The wire SHAPE is
+untouched (`tests/wire_contract.rs` green); only the TIMING of the same
+normalized events changed.
+
+**Codex is deliberately NOT changed.** Its native model is `turn/steer` —
+inject into the RUNNING turn — with a per-message RPC answer, so it already maps
+each send deterministically and never coalesces/strands. Holding would DIVERGE
+from codex-native (the maintainer's "keep native" applies per agent: claude
+queues-then-runs, codex steers). A steered codex bubble genuinely joins the
+running turn, so its `sent` mid-turn is honest. The two drivers stay symmetric in
+*intent* (a queued send is never lost and never splices a claude turn), asymmetric
+in *mechanism* because the two agents' protocols differ.
+
+Tests: hermetic `queued_sends_flush_together_on_turn_end`,
+`several_held_sends_all_resolve_sent_and_none_strand` (the multi-message case),
+`queued_send_flushes_with_no_client_attached` (the flush is daemon-side, off the
+CLI's result — a hidden/closed tab can't stall it), `cancel_queued_removes_a_held_send`,
+`a_flush_whose_write_never_ships_is_dropped_on_teardown`, and the updated
+`bare_result_*` guard; live `driver_rapid_queued_sends_settle_idle` now also
+asserts every held id resolves `sent`. `just chat-smoke` re-run for the driver change.
+
+**Flush all-at-once (maintainer's choice), and its accepted edges.** When the
+turn ends the WHOLE held batch flushes in one step (all written, all `sent`),
+rather than one-per-turn. The maintainer chose batched over one-at-a-time
+(2026-07-11), accepting two edges:
+
+- *Grouped ordering.* Several queued bubbles render together, then their
+  responses — `[q2, q3, resp2, resp3]`, not interleaved `[q2, resp2, q3, resp3]`.
+  A consequence of resolving the batch on the single turn-end result. Not a splice
+  (all `sent` land after that turn's `TurnCompleted`, before any next-turn frame).
+- *Stop-during-batch.* Only the first flushed message opens a turn; the rest sit
+  in the CLI's native queue. Marking them `sent` on OUR write is honest (delivered
+  to the CLI), but if the user interrupts the first, the CLI drops the siblings and
+  they stay `sent` with no reply. One-at-a-time would instead keep them held and
+  drop them "not delivered". Accepted for batched mode.
+
+**Write-confirmation (`flushing`).** `on_result` empties `queued_sends` into the
+flush step (writes + `sent`) BEFORE `deliver` performs the write. A `WriteFailed`
+(child wedged/died right after its result) would drop the `sent` events with the
+queue already empty — stranding the ids "queued" forever (`drain_pending` had
+nothing to drop). Fix: the flushed uuids are staged in `flushing`, cleared on the
+next frame (reaching `on_frame` again means `deliver` returned Ok), and dropped by
+`drain_pending`. A drop for an already-`sent` id is a reducer no-op.
+
+**Known narrow edge (not fixed).** Cancelling a HELD message that is another held
+message's checkpoint `preceding`, then forking at that successor, resolves the
+fork anchor to the cancelled (never-written) uuid — the held-cancel makes its
+absence from the native transcript deterministic. Needs ≥2 held sends with no
+intervening assistant/user frame, a cancel of the earlier, then a fork at the
+later. Low severity; the preceding-chain is not repaired on cancel.

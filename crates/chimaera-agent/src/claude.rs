@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
+    SpawnSpec, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
@@ -473,12 +473,29 @@ struct ClaudeMapper {
     task_rows: HashMap<String, String>,
     /// Open Task tool cards: tool_use_id → description, for that correlation.
     agent_tools: HashMap<String, String>,
-    /// User messages sent while a turn was running, FIFO of their client-
-    /// minted uuids: the CLI queues them natively (mid-turn stdin writes are
-    /// the official client's behavior), so the mapper defers the TurnStarted
-    /// boundary until each result lands — and resolves each message's
-    /// delivery (UserMessageUpdate sent/dropped) at that same boundary.
-    queued_sends: VecDeque<String>,
+    /// User messages the user queued while a turn was running, FIFO of
+    /// `(client uuid, stdin content)`. They are HELD here — deliberately NOT
+    /// written to the CLI mid-turn — and flushed to stdin all at once the
+    /// moment the running turn's result lands (`on_result`), each resolving
+    /// `sent` at that same boundary. Holding is what makes delivery
+    /// deterministic: the CLI never sees them mid-turn, so it can't coalesce
+    /// them into fewer results than messages, so no id can strand. It also
+    /// matches the official client, whose queued messages wait for the current
+    /// turn to finish rather than steering into it. An abort (is_error /
+    /// interrupt / process death) drops the still-held queue `dropped` —
+    /// honestly, since nothing was ever sent.
+    queued_sends: VecDeque<(String, Value)>,
+    /// The uuids of the batch flushed on the most recent turn-end, awaiting
+    /// confirmation that their stdin write shipped. `on_result` empties
+    /// `queued_sends` into the flush step (writes + `sent` events) BEFORE
+    /// `deliver` performs the write — so if that write fails (a child that
+    /// wedged or died right after its result), the `sent` events are dropped
+    /// and `queued_sends` is already empty, leaving the messages stranded
+    /// "queued". Recording them here lets `drain_pending` (teardown) drop them.
+    /// Cleared on the next frame: reaching `on_frame` again means `deliver`
+    /// returned Ok, so the write shipped. A drop after a successful send is a
+    /// harmless no-op (the reducer ignores an update for an already-resolved id).
+    flushing: Vec<String>,
     /// We issued an interrupt control request and no result has landed
     /// since — the one deterministic "this abort was user-initiated" fact.
     /// The CLI's result string is free text and cannot carry that signal.
@@ -488,13 +505,6 @@ struct ClaudeMapper {
     /// when a real result lands (a turn end) or a fresh turn opens. See
     /// `INTERRUPT_GRACE_TICKS`.
     interrupt_grace: Option<u32>,
-    /// Idle-flush watchdog: ticks remaining before we resolve a coalesced
-    /// surplus. Managed entirely in `tick` — armed when the driver is idle with
-    /// `queued_sends` non-empty, reset whenever a turn is active or the queue
-    /// empties. On expiry every still-queued id resolves `sent` (the CLI
-    /// drained/coalesced the queue — the messages reached it). See
-    /// `IDLE_FLUSH_GRACE_TICKS`.
-    idle_flush_grace: Option<u32>,
     /// One title request per conversation, fired with the first user send
     /// (the extension's exact moment; description = the message text).
     title_requested: bool,
@@ -578,9 +588,9 @@ impl ClaudeMapper {
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
             queued_sends: VecDeque::new(),
+            flushing: Vec::new(),
             interrupt_requested: false,
             interrupt_grace: None,
-            idle_flush_grace: None,
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
@@ -628,10 +638,8 @@ impl ClaudeMapper {
             self.turn_active = true;
             // A turn opening is a clean slate for the interrupt watchdog: an
             // interrupt armed against a previous (or idle) state must not abort
-            // this fresh turn. It also preempts the idle-flush: a genuine next
-            // turn opened, so the surplus resolves via its result, not the timer.
+            // this fresh turn.
             self.interrupt_grace = None;
-            self.idle_flush_grace = None;
             step.events.push(AgentEvent::TurnStarted {
                 turn_id: self.turn_id(),
             });
@@ -657,6 +665,10 @@ impl ClaudeMapper {
 
     fn on_frame(&mut self, frame: &Value) -> DriverStep {
         let mut step = DriverStep::default();
+        // Reaching here means `deliver` returned Ok for the previous step, so
+        // any batch flushed on the last result has shipped to the CLI — it no
+        // longer needs the teardown drop-guard.
+        self.flushing.clear();
         // Subagent-attributed transcript frames are hidden (the official
         // client does the same — the visible surface is the Task tool row);
         // only task-status frames pass, whoever they're attributed to.
@@ -1577,12 +1589,12 @@ impl ClaudeMapper {
         let interrupted = std::mem::take(&mut self.interrupt_requested);
 
         if frame["is_error"] == json!(true) {
-            // An aborted turn drops the CLI's queue with it: resolve every
-            // queued message as dropped (a journal that kept them looking
-            // sent would lie on replay), and clear so no phantom turn
-            // boundaries open later. This happens regardless of `was_active`
-            // — the CLI drops its native queue on any abort.
-            for id in std::mem::take(&mut self.queued_sends) {
+            // The turn aborted, so the messages the user queued behind it never
+            // run: they are still HELD (unwritten), so dropping them is honest —
+            // resolve every one `dropped` (a journal that kept them looking sent
+            // would lie on replay) and clear so no held message leaks into a
+            // later turn's flush.
+            for (id, _content) in std::mem::take(&mut self.queued_sends) {
                 step.events.push(AgentEvent::UserMessageUpdate {
                     id,
                     state: UserMessageState::Dropped,
@@ -1626,14 +1638,25 @@ impl ClaudeMapper {
             });
             self.refresh_context_usage(step);
         }
-        // A user message sent mid-turn was queued by the CLI and runs next
-        // (FIFO): resolve its delivery now. The turn boundary opens LAZILY —
-        // `ensure_turn` fires when this queued message's first REAL frame
-        // streams. Opening a synthetic turn here eagerly was the "stuck
-        // running" bug: the CLI produces FEWER results than queued sends when
-        // they arrive rapidly (it coalesces them), so the trailing synthetic
-        // TurnStarted never got a result and the UI stuck on "running".
-        if let Some(id) = self.queued_sends.pop_front() {
+        // The running turn has ended — NOW flush everything the user queued
+        // behind it. Each held message is written to the CLI here (the first
+        // moment it is idle for them) and resolves `sent` in the same step.
+        // Two things make this deterministic where the old per-result FIFO pop
+        // was a guess: (1) we never dumped them mid-turn, so the CLI cannot
+        // coalesce them into fewer results than messages and strand an id; and
+        // (2) marking `sent` is tied to OUR write, not to counting the CLI's
+        // results. The response turn's boundary still opens LAZILY — a synthetic
+        // TurnStarted here (with no matching result if the CLI coalesces the
+        // flushed batch) was the old "stuck running" bug; `ensure_turn` fires
+        // instead when the first real response frame streams. The `sent` events
+        // land after this turn's TurnCompleted, so each bubble enters the
+        // transcript AFTER the finished turn, never spliced into its output.
+        for (id, content) in std::mem::take(&mut self.queued_sends) {
+            step.outbound.push(user_message_frame(&id, content));
+            // Stage for the teardown drop-guard until the write is confirmed
+            // shipped (cleared on the next frame). If `deliver`'s write fails,
+            // the `sent` event below never leaves and `drain_pending` drops it.
+            self.flushing.push(id.clone());
             step.events.push(AgentEvent::UserMessageUpdate {
                 id,
                 state: UserMessageState::Sent,
@@ -1673,27 +1696,29 @@ impl ClaudeMapper {
                     preceding_uuid: preceding,
                 });
                 if self.turn_active {
-                    // Mid-turn stdin writes are queued by the CLI itself (the
-                    // official client's path); the turn boundary opens when
-                    // the running turn's result lands — which also resolves
-                    // this message's delivery (sent, or dropped on abort).
-                    self.queued_sends.push_back(uuid.clone());
+                    // A turn is running: HOLD this message (do NOT write it to
+                    // the CLI now). It flushes to stdin when the running turn's
+                    // result lands, which also resolves it `sent`. Holding — vs
+                    // the official client's own mid-turn queue — is what keeps
+                    // the CLI from coalescing rapid sends into fewer results and
+                    // stranding one, and it keeps the delivered bubble from
+                    // splicing into the still-streaming turn.
+                    self.queued_sends.push_back((uuid.clone(), json!(content)));
                 } else {
-                    // An interrupt sent while idle (benign no-op on the CLI)
-                    // must not relabel this fresh turn's genuine failure as
-                    // a quiet stop, nor let its armed watchdog abort this new
-                    // turn. A fresh turn also preempts the idle-flush.
+                    // Idle: this send opens a fresh turn and goes to the CLI
+                    // immediately. An interrupt sent while idle (benign no-op on
+                    // the CLI) must not relabel this fresh turn's genuine failure
+                    // as a quiet stop, nor let its armed watchdog abort it.
                     self.interrupt_requested = false;
                     self.interrupt_grace = None;
-                    self.idle_flush_grace = None;
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
                         turn_id: self.turn_id(),
                     });
+                    step.outbound
+                        .push(user_message_frame(&uuid, json!(content)));
                 }
-                step.outbound
-                    .push(user_message_frame(&uuid, json!(content)));
                 // Name the conversation off the first message (the
                 // extension's moment and shape: description = message text).
                 if !self.title_requested && !text.trim().is_empty() {
@@ -2054,33 +2079,30 @@ impl ClaudeMapper {
                     json!({ "subtype": "mcp_reconnect", "serverName": server }),
                 ));
             }
-            // Pull back a still-queued message. If it is still in the native
-            // mid-turn queue, un-queue it (`cancel_async_message`, mined but
-            // never called by the official extension — its real un-queue
-            // reliability is the chat-smoke crux; see PROTOCOL.md) and resolve
-            // it `Cancelled` so the bubble vanishes. If the CLI already took it
-            // (popped `sent`, or coalesced+idle-flushed), the queue no longer
-            // holds it: emit a Notice instead of a phantom Cancelled — it can't
-            // be un-said. Best-effort by design: even if the CLI ignores the
-            // control request, the local Cancelled keeps the UI honest and the
-            // journaled state deterministic (we do NOT rewrite the queue model).
+            // Pull back a still-queued message. Because queued messages are HELD
+            // (never written to the CLI until the running turn ends), a cancel is
+            // a pure local removal — there is nothing in the CLI to un-queue, so
+            // the pull-back is guaranteed, with no `cancel_async_message`
+            // round-trip that could race or fail. Once the turn ends the message
+            // flushes and resolves `sent`, and its bubble loses the ✕; a
+            // CancelQueued that still arrives after that (a late click racing the
+            // `sent` event) finds nothing held and emits a Notice — it can't be
+            // un-said.
             AgentCommand::CancelQueued { id } => {
-                if self.queued_sends.iter().any(|q| q == &id) {
-                    self.queued_sends.retain(|q| q != &id);
-                    let ctl = self.ctl_id();
-                    step.outbound.push(control_request_frame(
-                        &ctl,
-                        json!({ "subtype": "cancel_async_message", "message_uuid": id }),
-                    ));
+                let before = self.queued_sends.len();
+                self.queued_sends.retain(|(q, _)| q != &id);
+                if self.queued_sends.len() != before {
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Cancelled,
                     });
                 } else {
+                    // Not currently held: it already resolved (flushed `sent`,
+                    // or a prior cancel/drop). Don't assert WHICH — a stale ✕
+                    // click after a `dropped` would make "already delivered" a
+                    // lie. State only the actionable fact.
                     step.events.push(AgentEvent::Notice {
-                        text: "that message was already delivered to the agent — \
-                               too late to cancel it"
-                            .into(),
+                        text: "that message is no longer queued — nothing to cancel".into(),
                     });
                 }
             }
@@ -2113,10 +2135,20 @@ impl ClaudeMapper {
                 option_id: "expired".into(),
             });
         }
-        // A hard kill mid-queue must not strand a queued message as "queued"
-        // forever on replay — drop (FIFO) what the CLI never got to run, the
-        // same resolution an interrupt's is_error result would have produced.
-        for id in std::mem::take(&mut self.queued_sends) {
+        // A hard kill mid-queue must not strand a held message as "queued"
+        // forever on replay — drop what the CLI never got (it was never even
+        // written), the same resolution an interrupt's is_error result gives.
+        for (id, _content) in std::mem::take(&mut self.queued_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        // Also drop any batch flushed on the final result whose write never
+        // confirmed shipped (no frame followed): the process is gone, so those
+        // ids would otherwise strand "queued". A drop for one that DID ship (it
+        // already resolved `sent`) is a harmless no-op in the reducer.
+        for id in self.flushing.drain(..) {
             events.push(AgentEvent::UserMessageUpdate {
                 id,
                 state: UserMessageState::Dropped,
@@ -2125,15 +2157,11 @@ impl ClaudeMapper {
         events
     }
 
-    /// Harness timer tick: the interrupt watchdog THEN the idle-flush. The
-    /// interrupt watchdog runs first because a firing abort drops the queue,
-    /// which leaves the idle-flush a no-op (no double resolution).
+    /// Harness timer tick: just the interrupt watchdog. Queued sends need no
+    /// timer — they are held and flushed deterministically on the running turn's
+    /// result, so there is no coalesced surplus for a timer to reconcile.
     fn tick(&mut self) -> DriverStep {
-        let mut step = self.interrupt_watchdog();
-        let flush = self.idle_flush();
-        step.events.extend(flush.events);
-        step.outbound.extend(flush.outbound);
-        step
+        self.interrupt_watchdog()
     }
 
     /// The interrupt watchdog. Interrupting a claude turn is only observable
@@ -2141,7 +2169,7 @@ impl ClaudeMapper {
     /// ack), so an interrupt the CLI treats as a no-op — or a wedged turn —
     /// would leave the session "running" with no escape. When the grace armed
     /// on `Interrupt` expires with a turn still open, synthesize the abort the
-    /// CLI never sent: drop the queue (FIFO, like the is_error path) and emit
+    /// CLI never sent: drop the held queue (like the is_error path) and emit
     /// `TurnAborted{interrupted}`. Idle-guarded, so an interrupt pressed with
     /// nothing running stays a no-op.
     fn interrupt_watchdog(&mut self) -> DriverStep {
@@ -2167,7 +2195,7 @@ impl ClaudeMapper {
         self.task_rows.clear();
         self.agent_tools.clear();
         self.thinking_emitted = 0;
-        for id in std::mem::take(&mut self.queued_sends) {
+        for (id, _content) in std::mem::take(&mut self.queued_sends) {
             step.events.push(AgentEvent::UserMessageUpdate {
                 id,
                 state: UserMessageState::Dropped,
@@ -2178,44 +2206,6 @@ impl ClaudeMapper {
             reason: "interrupted".into(),
             interrupted: true,
         });
-        step
-    }
-
-    /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`). The CLI coalesces rapid
-    /// mid-turn sends into fewer results than messages, so a surplus queued id
-    /// never gets popped by a result — its bubble would stay faded "queued"
-    /// forever. Once the driver is idle with the queue still non-empty, the CLI
-    /// has drained/coalesced it (the messages reached stdin the instant they
-    /// were written), so resolve every remaining id `sent`. The grace guards
-    /// the honest case where a genuinely in-flight next turn is about to open:
-    /// while `turn_active` (or the queue is empty) the countdown resets, and a
-    /// real turn opening (`ensure_turn`/a fresh send) disarms it before it can
-    /// fire. Contrast the is_error/interrupt DROP paths — an aborted turn drops
-    /// its queue; only an idle, un-aborted queue flips to `sent`.
-    fn idle_flush(&mut self) -> DriverStep {
-        let mut step = DriverStep::default();
-        if self.turn_active || self.queued_sends.is_empty() {
-            // Busy or nothing pending — don't count down toward a flush.
-            self.idle_flush_grace = None;
-            return step;
-        }
-        match self.idle_flush_grace {
-            None => {
-                self.idle_flush_grace = Some(IDLE_FLUSH_GRACE_TICKS);
-            }
-            Some(remaining) if remaining > 1 => {
-                self.idle_flush_grace = Some(remaining - 1);
-            }
-            Some(_) => {
-                self.idle_flush_grace = None;
-                for id in std::mem::take(&mut self.queued_sends) {
-                    step.events.push(AgentEvent::UserMessageUpdate {
-                        id,
-                        state: UserMessageState::Sent,
-                    });
-                }
-            }
-        }
         step
     }
 }
@@ -2543,8 +2533,13 @@ mod tests {
 
     /// Two mid-turn sends: the CLI's native queue is FIFO, so each finished
     /// turn resolves the OLDEST queued id and opens the next boundary.
+    /// Queued sends are HELD, then flushed together the moment the running
+    /// turn's result lands: every held id resolves `sent` in that one step and
+    /// each is written to the CLI right then. No per-result FIFO guessing (the
+    /// off-by-one that could strand a middle message), no result-count vs
+    /// message-count race — a single result flushes the whole held batch.
     #[test]
-    fn queued_sends_resolve_sent_in_fifo_order() {
+    fn queued_sends_flush_together_on_turn_end() {
         let mut m = mapper();
         m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "run".into() }],
@@ -2565,38 +2560,133 @@ mod tests {
                 text: "and this".into(),
             }],
         }));
+        // Held, not dumped: nothing reached the CLI while the turn ran.
+        assert_eq!(m.queued_sends.len(), 2, "both sends are held, not written");
 
         let result = json!({
             "type": "result", "is_error": false,
             "usage": { "output_tokens": 1 }, "duration_ms": 10,
         });
         let step = m.on_frame(&result);
-        assert!(
-            step.events.iter().any(|e| matches!(
-                e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == second
-            )),
-            "first result dequeues the oldest send: {:?}",
-            step.events
+        // BOTH held messages resolve sent on the single turn-end result…
+        for id in [&second, &third] {
+            assert!(
+                step.events.iter().any(|e| matches!(
+                    e,
+                    AgentEvent::UserMessageUpdate { id: got, state: UserMessageState::Sent } if got == id
+                )),
+                "every held send flushes sent on the turn's result: {:?}",
+                step.events
+            );
+        }
+        // …and each is written to the CLI at that flush (a `user` frame per id).
+        let flushed: Vec<&str> = step
+            .outbound
+            .iter()
+            .filter(|o| o["type"] == "user")
+            .filter_map(|o| o["uuid"].as_str())
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![second.as_str(), third.as_str()],
+            "both held sends are written to the CLI, in order: {:?}",
+            step.outbound
         );
-        let step = m.on_frame(&result);
-        assert!(
-            step.events.iter().any(|e| matches!(
-                e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == third
-            )),
-            "second result dequeues the next: {:?}",
-            step.events
-        );
-        // Queue drained: a third result opens no phantom boundary.
+        assert!(m.queued_sends.is_empty(), "the held queue drained");
+
+        // Queue drained: the next turn's result opens no phantom boundary and
+        // resolves nothing.
         let step = m.on_frame(&result);
         assert!(
             !step
                 .events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
-            "no phantom turn after the queue drains: {:?}",
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. }))
+                && !step
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "no phantom turn or resolution after the queue drains: {:?}",
             step.events
+        );
+    }
+
+    /// The flush stages its batch until the write is confirmed shipped: if the
+    /// child wedges/dies right after its result, `deliver`'s stdin write fails
+    /// and the `sent` events never leave — so the teardown MUST drop the staged
+    /// batch, not strand it "queued" forever. And once a later frame confirms
+    /// the ship, the teardown drops nothing.
+    #[test]
+    fn a_flush_whose_write_never_ships_is_dropped_on_teardown() {
+        let result = json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        });
+
+        // Write-failure path: flush, then NO confirming frame → teardown drops.
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text {
+                    text: "held".into(),
+                }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage { id, .. } => id.clone().unwrap(),
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
+        // Turn ends: on_result stages the batch (write + sent are in the step,
+        // but `deliver` performs the write AFTER — it can still fail).
+        let step = m.on_frame(&result);
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued
+            )),
+            "the flush built a sent event: {:?}",
+            step.events
+        );
+        assert_eq!(m.flushing, vec![queued.clone()], "the batch is staged");
+        // The write failed (child gone): no frame ever confirms it, and teardown
+        // drops the staged id rather than leaving it stranded "queued".
+        let drained = m.drain_pending();
+        assert!(
+            drained.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "the un-shipped flush drops on teardown: {drained:?}"
+        );
+
+        // Ship-confirmed path: a later frame clears the stage, so teardown drops
+        // nothing (the message already resolved sent).
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "held".into(),
+            }],
+        });
+        m.on_frame(&result); // flush stages the batch
+        assert!(!m.flushing.is_empty(), "staged after the flush");
+        // The CLI responds — a subsequent frame proves the write shipped.
+        m.on_frame(&json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta",
+                       "delta": { "type": "text_delta", "text": "hi" } },
+        }));
+        assert!(m.flushing.is_empty(), "a confirming frame clears the stage");
+        assert!(
+            m.drain_pending()
+                .iter()
+                .all(|e| !matches!(e, AgentEvent::UserMessageUpdate { .. })),
+            "a shipped flush is not re-dropped on teardown"
         );
     }
 
@@ -2695,18 +2785,18 @@ mod tests {
         );
     }
 
-    /// The `was_active` guard: the real CLI coalesces rapid queued sends into
-    /// FEWER results than messages, so a result can arrive with NO turn open
-    /// (a queued id still resolves `sent`, but its content streamed under an
-    /// earlier turn). Such a bare result must NOT emit a phantom
-    /// TurnCompleted — that stray turn-end was the "stuck running" symptom.
+    /// The `was_active` guard: a result can arrive with NO turn open — e.g. the
+    /// CLI answered a flushed message with an empty response, so `ensure_turn`
+    /// never fired. The held queue still flushes on that result, but a bare
+    /// (turn-less) result must NOT emit a phantom TurnCompleted/TurnAborted —
+    /// that stray turn-end was the "stuck running" symptom.
     #[test]
     fn bare_result_with_no_open_turn_emits_no_phantom_turn_end() {
         let mut m = mapper();
         assert!(!m.turn_active, "no turn is open");
-        // Queue a delivery id directly (as if a prior turn's result popped an
-        // earlier queued message and left this one behind).
-        m.queued_sends.push_back("qid".into());
+        // Seed a held send directly (as if queued behind a turn that then ended
+        // without ever opening a boundary of its own).
+        m.queued_sends.push_back(("qid".into(), json!([])));
 
         let step = m.on_frame(&json!({
             "type": "result", "is_error": false,
@@ -2725,12 +2815,12 @@ mod tests {
                 e,
                 AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if id == "qid"
             )),
-            "the queued id still resolves sent, guard or not: {:?}",
+            "the held id still flushes sent, guard or not: {:?}",
             step.events
         );
 
         // Same for an is_error bare result: dropped resolution, no phantom abort.
-        m.queued_sends.push_back("qid2".into());
+        m.queued_sends.push_back(("qid2".into(), json!([])));
         let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
         assert!(
             !step
@@ -2854,8 +2944,12 @@ mod tests {
     /// idles. Turn one's result pops the OLDEST queued id; the surplus never
     /// gets a result of its own (the CLI coalesced it), so the idle-flush
     /// resolves it once the grace expires — it must not stick "queued".
+    /// Feature 2 (unit): cancelling a still-held message removes it locally and
+    /// resolves it `Cancelled` — no `cancel_async_message` round-trip (the CLI
+    /// never received it) — and the turn-end flush then delivers only the
+    /// SURVIVING held message, never the cancelled one.
     #[test]
-    fn idle_flush_resolves_a_coalesced_surplus_sent() {
+    fn cancel_queued_removes_a_held_send() {
         let mut m = mapper();
         m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "run".into() }],
@@ -2877,141 +2971,8 @@ mod tests {
             }],
         }));
 
-        // Turn one's single result pops "second" (sent) and closes the turn.
-        // "third" is the coalesced surplus with no result to pop.
-        let step = m.on_frame(&json!({
-            "type": "result", "is_error": false,
-            "usage": { "output_tokens": 1 }, "duration_ms": 10,
-        }));
-        assert!(
-            step.events.iter().any(|e| matches!(
-                e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == second
-            )),
-            "turn one's result pops the oldest: {:?}",
-            step.events
-        );
-        assert!(!m.turn_active, "the turn closed on its result");
-
-        // Ticks below the grace do nothing — a genuine next turn could still
-        // open in this window.
-        for _ in 0..(IDLE_FLUSH_GRACE_TICKS) {
-            let step = m.tick();
-            assert!(
-                step.events.is_empty(),
-                "no flush before the idle grace expires: {:?}",
-                step.events
-            );
-        }
-        // The expiring tick resolves the stranded surplus `sent` (not dropped).
-        let step = m.tick();
-        assert_eq!(
-            step.events,
-            vec![AgentEvent::UserMessageUpdate {
-                id: third.clone(),
-                state: UserMessageState::Sent,
-            }],
-            "the coalesced surplus flushes sent on idle: {:?}",
-            step.events
-        );
-        // Idempotent: the queue is drained, so further ticks do nothing.
-        assert!(m.tick().events.is_empty(), "idle-flush fires exactly once");
-    }
-
-    /// A genuinely in-flight next turn disarms the idle-flush before it fires:
-    /// the surviving surplus resolves via that turn's own result, never the
-    /// timer. Two queued messages, so a surplus outlives turn one's single pop.
-    #[test]
-    fn a_real_next_turn_preempts_the_idle_flush() {
-        let mut m = mapper();
-        m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text { text: "run".into() }],
-        });
-        let queued_id = |step: &DriverStep| match &step.events[0] {
-            AgentEvent::UserMessage {
-                id, queued: true, ..
-            } => id.clone().unwrap(),
-            other => panic!("expected queued UserMessage, got {other:?}"),
-        };
-        let _second = queued_id(&m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text {
-                text: "second".into(),
-            }],
-        }));
-        let third = queued_id(&m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text {
-                text: "third".into(),
-            }],
-        }));
-        // Turn one ends: it pops "second"; the queue still holds "third".
-        m.on_frame(&json!({
-            "type": "result", "is_error": false,
-            "usage": { "output_tokens": 1 }, "duration_ms": 10,
-        }));
-        // A couple of idle ticks pass (arming the grace)…
-        m.tick();
-        m.tick();
-        assert!(m.idle_flush_grace.is_some(), "the grace armed while idle");
-        // …then "third"'s OWN turn actually opens (ensure_turn), which preempts
-        // the idle-flush immediately.
-        m.on_frame(&json!({
-            "type": "stream_event",
-            "event": { "type": "content_block_delta",
-                       "delta": { "type": "text_delta", "text": "hi" } },
-        }));
-        assert!(m.turn_active, "the surplus's real turn opened");
-        assert!(
-            m.idle_flush_grace.is_none(),
-            "the flush disarmed on the turn"
-        );
-        for _ in 0..(IDLE_FLUSH_GRACE_TICKS + 1) {
-            assert!(m.tick().events.is_empty(), "no flush while a turn runs");
-        }
-        // That turn's own result resolves "third" sent — via the pop, not the
-        // timer.
-        let step = m.on_frame(&json!({
-            "type": "result", "is_error": false,
-            "usage": { "output_tokens": 1 }, "duration_ms": 10,
-        }));
-        assert!(
-            step.events.iter().any(|e| matches!(
-                e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == third
-            )),
-            "the real turn's result resolves the surplus sent: {:?}",
-            step.events
-        );
-    }
-
-    /// Feature 2 (unit): cancelling a still-queued message removes it from the
-    /// native queue, writes a `cancel_async_message` control request, and
-    /// resolves it `Cancelled` — and a later result pops a DIFFERENT id, never
-    /// the cancelled one.
-    #[test]
-    fn cancel_queued_removes_from_the_native_queue() {
-        let mut m = mapper();
-        m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text { text: "run".into() }],
-        });
-        let queued_id = |step: &DriverStep| match &step.events[0] {
-            AgentEvent::UserMessage {
-                id, queued: true, ..
-            } => id.clone().unwrap(),
-            other => panic!("expected queued UserMessage, got {other:?}"),
-        };
-        let second = queued_id(&m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text {
-                text: "second".into(),
-            }],
-        }));
-        let third = queued_id(&m.on_command(AgentCommand::Send {
-            blocks: vec![ContentBlock::Text {
-                text: "third".into(),
-            }],
-        }));
-
-        // Cancel the FIRST queued ("second"): it un-queues, emits Cancelled,
-        // and sends the CLI a cancel_async_message naming that uuid.
+        // Cancel the FIRST held ("second"): it leaves the queue and emits
+        // Cancelled — with NO outbound (the CLI never had it to un-queue).
         let step = m.on_command(AgentCommand::CancelQueued { id: second.clone() });
         assert_eq!(
             step.events,
@@ -3020,14 +2981,14 @@ mod tests {
                 state: UserMessageState::Cancelled,
             }]
         );
-        assert_eq!(
-            step.outbound[0]["request"]["subtype"],
-            "cancel_async_message"
+        assert!(
+            step.outbound.is_empty(),
+            "a held cancel needs no CLI round-trip: {:?}",
+            step.outbound
         );
-        assert_eq!(step.outbound[0]["request"]["message_uuid"], json!(second));
 
-        // Turn one's result now pops "third" (the cancelled one is gone), so
-        // the cancel really removed it from the FIFO.
+        // The turn-end flush now delivers only "third" — the cancelled one is
+        // gone, so it neither resolves sent nor gets written to the CLI.
         let step = m.on_frame(&json!({
             "type": "result", "is_error": false,
             "usage": { "output_tokens": 1 }, "duration_ms": 10,
@@ -3047,6 +3008,18 @@ mod tests {
             )),
             "the cancelled message never resolves again: {:?}",
             step.events
+        );
+        let flushed: Vec<&str> = step
+            .outbound
+            .iter()
+            .filter(|o| o["type"] == "user")
+            .filter_map(|o| o["uuid"].as_str())
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![third.as_str()],
+            "only the surviving held send is written to the CLI: {:?}",
+            step.outbound
         );
     }
 
@@ -3082,7 +3055,7 @@ mod tests {
         );
         assert!(matches!(
             step.events.as_slice(),
-            [AgentEvent::Notice { text }] if text.contains("too late to cancel")
+            [AgentEvent::Notice { text }] if text.contains("no longer queued")
         ));
     }
 

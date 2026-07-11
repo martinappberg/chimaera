@@ -3,24 +3,20 @@
 //! billing). It speaks just enough of the live-verified protocol: the
 //! initialize handshake, one canned turn with streaming deltas + a Bash
 //! tool_use, a can_use_tool permission round-trip, and result frames.
-//! Mid-turn user frames queue natively (one success result each, after the
-//! running turn's) and an interrupt ends the turn with an is_error result
-//! that drops the queue — mirroring the real CLI's queueing semantics.
+//! Back-to-back user frames queue natively (one content-bearing follow-up turn
+//! each, after the running turn's) and an interrupt ends the turn with an
+//! is_error result that drops the queue — mirroring the real CLI. The driver
+//! HOLDS queued sends and flushes them only at a turn boundary, so it never
+//! writes a frame mid-turn; the queue here only fills when the driver flushes
+//! two-or-more held sends back-to-back and the CLI queues the later ones.
 //!
 //! Modes (argv[1]): `normal` (default), `question` (the turn asks an
-//! AskUserQuestion instead of running a tool — ask-lifecycle tests),
-//! `coalesce` (two mid-turn sends but only ONE content-bearing follow-up
-//! turn — the real CLI's "rapid queued sends coalesce into fewer results"
-//! behavior, which the lazy turn-open fix must settle idle), `coalesce-all`
-//! (the extreme: EVERY queued send is coalesced into the running turn, so the
-//! surplus gets no follow-up result at all — the idle-flush must resolve the
-//! leftover `sent`), `hang` (opens a turn, streams content, never ends it, and
-//! acks an interrupt with NO result — the interrupt-watchdog recovery tests),
-//! `silent` (never answers — handshake watchdog tests), `die` (exit 3
-//! immediately — spawn-crash tests), `die-after-handshake` (answer initialize,
-//! print a diagnostic on stderr, exit 2 — the post-update failure-at-birth
-//! tests). A `cancel_async_message` control request (the CancelQueued path)
-//! un-queues one pending message in any mode.
+//! AskUserQuestion instead of running a tool — ask-lifecycle tests), `hang`
+//! (opens a turn, streams content, never ends it, and acks an interrupt with NO
+//! result — the interrupt-watchdog recovery tests), `silent` (never answers —
+//! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
+//! `die-after-handshake` (answer initialize, print a diagnostic on stderr, exit
+//! 2 — the post-update failure-at-birth tests).
 
 use std::io::{BufRead, Write};
 
@@ -113,34 +109,14 @@ fn main() {
                 }
                 turn_active = false;
                 if allowed || feedback_denial {
-                    if mode == "coalesce-all" {
-                        // The CLI coalesced EVERY queued send into this single
-                        // running turn: it emits NO follow-up result, so any
-                        // surplus queued id gets no result to pop. The driver's
-                        // idle-flush must resolve the leftover `sent` once it
-                        // sees the session go idle with the queue non-empty.
-                        queued = 0;
-                    } else if mode == "coalesce" {
-                        // The real CLI COALESCES rapid queued sends: it emits
-                        // FEWER follow-up results than there were messages
-                        // (live-verified 3 sends → 2 turns). Model that as ONE
-                        // content-bearing follow-up turn regardless of how many
-                        // are queued. The driver opens it lazily (ensure_turn)
-                        // and resolves each queued id `sent` as results land —
-                        // so it must settle idle, not stick "running" on a
-                        // synthetic turn that never gets a result.
-                        if queued > 0 {
-                            emit_followup_turn();
-                            queued = 0;
-                        }
-                    } else {
-                        // A successful turn end (allow, or a feedback-denial
-                        // that keeps the turn running) dequeues each pending
-                        // message as its own content-bearing follow-up turn.
-                        while queued > 0 {
-                            queued -= 1;
-                            emit_followup_turn();
-                        }
+                    // A successful turn end (allow, or a feedback-denial that
+                    // keeps the turn running) dequeues each pending message —
+                    // the sends the driver flushed back-to-back and this CLI
+                    // queued behind the running turn — as its own content-
+                    // bearing follow-up turn.
+                    while queued > 0 {
+                        queued -= 1;
+                        emit_followup_turn();
                     }
                 } else {
                     // The deny's interrupt:true aborted the turn — the CLI's
@@ -186,22 +162,6 @@ fn main() {
                     "usage": { "input_tokens": 10, "output_tokens": 2 },
                 }));
             }
-        } else if frame["type"] == "control_request"
-            && frame["request"]["subtype"] == "cancel_async_message"
-        {
-            // The CancelQueued path: the real CLI un-queues the named message
-            // (mined, un-verified upstream — see PROTOCOL.md). Model the
-            // successful un-queue by dropping one from the pending count so no
-            // follow-up turn runs for it, then ack.
-            queued = queued.saturating_sub(1);
-            emit(json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": frame["request_id"],
-                    "response": {},
-                },
-            }));
         } else if frame["type"] == "control_request" {
             // set_permission_mode / set_model / …: acknowledge.
             emit(json!({

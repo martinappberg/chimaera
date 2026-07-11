@@ -2013,10 +2013,11 @@ impl CodexMapper {
             }
             // Pull back a still-queued message. Only a send still sitting in
             // the pre-steer buffer (captured during a turn/start window) can be
-            // cancelled — it never reached codex. A send that was already
-            // steered into the running turn is delivered (its steer RPC is in
-            // flight or answered), so it can't be un-said: emit a Notice, the
-            // symmetric-intent counterpart to claude's "already delivered".
+            // cancelled — it never reached codex. A send no longer in the buffer
+            // already resolved (steered/delivered, or a prior cancel/drop), so
+            // it can't be un-said: emit a Notice. Don't assert WHICH — "already
+            // delivered" would be a lie for a stale ✕ after a drop — the
+            // symmetric-intent counterpart to claude's neutral notice.
             AgentCommand::CancelQueued { id } => {
                 let before = self.buffered_sends.len();
                 self.buffered_sends.retain(|(_, cid)| cid != &id);
@@ -2027,9 +2028,7 @@ impl CodexMapper {
                     });
                 } else {
                     step.events.push(AgentEvent::Notice {
-                        text: "that message was already delivered to the agent — \
-                               too late to cancel it"
-                            .into(),
+                        text: "that message is no longer queued — nothing to cancel".into(),
                     });
                 }
             }
@@ -2599,7 +2598,7 @@ mod tests {
         let step = m.on_command(AgentCommand::CancelQueued { id: steered });
         assert!(matches!(
             step.events.as_slice(),
-            [AgentEvent::Notice { text }] if text.contains("too late to cancel")
+            [AgentEvent::Notice { text }] if text.contains("no longer queued")
         ));
     }
 

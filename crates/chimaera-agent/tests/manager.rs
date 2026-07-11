@@ -330,8 +330,10 @@ async fn queue_second_send(
     (queued_id, request_id)
 }
 
-/// A mid-turn send echoes queued, resolves `sent` when the running turn's
-/// result lands, and the journal replays the pair (one message, one update).
+/// A mid-turn send echoes queued and is HELD; when the running turn's result
+/// lands it resolves `sent` (in one step) and is only then written to the CLI,
+/// where it runs as its own follow-up turn. The journal replays the pair (one
+/// message, one update) so a reducer renders one bubble in its final state.
 #[tokio::test]
 async fn queued_send_resolves_sent_and_replays_once() {
     let fx = fixture();
@@ -357,10 +359,14 @@ async fn queued_send_resolves_sent_and_replays_once() {
         .await
         .expect("permission");
 
-    // Turn one finishes; the queued message dequeues: sent, then its turn.
-    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
-        matches!(ev, AgentEvent::TurnCompleted { .. })
-    })
+    // Turn one finishes; the held message resolves sent AND is flushed to the
+    // CLI now (never mid-turn), opening its own follow-up turn t2.
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "TurnCompleted",
+        |ev| matches!(ev, AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t1"),
+    )
     .await;
     wait_for(
         &mut rx,
@@ -376,6 +382,28 @@ async fn queued_send_resolves_sent_and_replays_once() {
         |ev| matches!(ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t2"),
     )
     .await;
+    // t2 is a real turn (the flushed message ran fresh): it makes its own tool
+    // call and asks permission. Answer it so the turn completes.
+    let t2_perm = wait_for(&mut rx, &mut seen, "t2 PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    let t2_request_id = match &t2_perm.ev {
+        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+    fx.manager
+        .command(
+            "s-q1",
+            AgentCommand::Permission {
+                request_id: t2_request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("t2 permission");
     wait_for(
         &mut rx,
         &mut seen,
@@ -400,6 +428,66 @@ async fn queued_send_resolves_sent_and_replays_once() {
         })
         .collect();
     assert_eq!(updates, vec![UserMessageState::Sent]);
+}
+
+/// The daemon-side guarantee (the "tab hidden" case): a queued send is flushed
+/// and resolved `sent` even with NO client attached. The flush fires off the
+/// CLI's turn-end result INSIDE the driver — never on a UI event or client
+/// timer — so detaching every client after queuing cannot stall it. Queue a
+/// message, DROP the only receiver (the tab closes), answer the turn purely
+/// through the manager (no attachment needed), then re-attach and confirm the
+/// journal recorded the delivery.
+#[tokio::test]
+async fn queued_send_flushes_with_no_client_attached() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-hidden", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-hidden", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let (queued_id, request_id) = queue_second_send(&fx, "s-hidden", &mut rx, &mut seen).await;
+
+    // The tab goes away: drop the only client receiver. The daemon session and
+    // its driver keep running — windows are just views onto the daemon.
+    drop(rx);
+
+    // Answer turn one purely through the manager — no attachment required. Its
+    // result lands in the driver and flushes the held send server-side.
+    fx.manager
+        .command(
+            "s-hidden",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+
+    // Poll the journal (re-attach) until the held send resolves `sent` — proof
+    // the flush was journaled with nobody listening.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let replay = fx.manager.attach("s-hidden", 0).expect("replay").replay;
+        let sent = replay.iter().any(|e| {
+            matches!(&e.ev,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued_id)
+        });
+        if sent {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held send never resolved sent with no client attached"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    fx.manager.kill("s-hidden");
 }
 
 /// A user interrupt aborts the turn (structurally marked `interrupted`) and
@@ -495,17 +583,17 @@ fn turn_balance(replay: &[Arc<SeqEvent>]) -> (usize, usize) {
     (opened, ended)
 }
 
-/// The real CLI coalesces rapid queued sends into FEWER results than messages
-/// (live-verified: 3 sends → 2 turns). The lazy turn-open fix must settle that
-/// idle: the ONE content-bearing follow-up turn opens AND completes, both
-/// queued messages resolve `sent`, and no phantom TurnStarted is left dangling
-/// (the old eager open minted a synthetic turn per queued message, and the
-/// coalesced-away one never got a result — the UI stuck on "running").
+/// The user's real scenario: SEVERAL messages queued behind a running turn.
+/// Each is HELD, then flushed together when the turn ends — every one resolves
+/// `sent` exactly once (none stranded "queued"/"not delivered"), and the whole
+/// journal balances (every opened turn ends). This is the regression the
+/// hold-until-flush model exists to kill: the old eager-dump + FIFO-pop guess
+/// could strand a middle message and mint a phantom turn.
 #[tokio::test]
-async fn coalesced_queued_send_does_not_stick_running() {
+async fn several_held_sends_all_resolve_sent_and_none_strand() {
     let fx = fixture();
     fx.manager
-        .spawn(&ClaudeAdapter, spec("s-co", &fx.cwd, "coalesce"))
+        .spawn(&ClaudeAdapter, spec("s-co", &fx.cwd, "normal"))
         .expect("spawn");
     let att = fx.manager.attach("s-co", 0).expect("attach");
     let mut seen = att.replay.clone();
@@ -521,7 +609,7 @@ async fn coalesced_queued_send_does_not_stick_running() {
         AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
         _ => unreachable!(),
     };
-    // …while TWO messages queue behind it (the coalescing case).
+    // …while TWO messages queue behind it (both HELD, never dumped mid-turn).
     let mut queued_ids = Vec::new();
     for text in ["second", "third"] {
         send_text(&fx, "s-co", text).await;
@@ -538,6 +626,9 @@ async fn coalesced_queued_send_does_not_stick_running() {
         }
     }
 
+    // Allow turn one: it completes, then BOTH held sends flush — resolving sent
+    // and running as their own turns (the CLI queues the second behind the
+    // first). Answer each turn's permission so the session settles idle.
     fx.manager
         .command(
             "s-co",
@@ -551,33 +642,58 @@ async fn coalesced_queued_send_does_not_stick_running() {
         .await
         .expect("permission");
 
-    // Exactly ONE follow-up turn opens (t2) and completes. The two queued
-    // messages resolve `sent` off the two results the CLI actually produced:
-    // "second" at turn one's result (before t2), "third" right after t2's — so
-    // wait through t2's completion and the LAST send's `sent`, then verify both
-    // from the journal (avoids racing the early "second" resolution).
-    wait_for(
-        &mut rx,
-        &mut seen,
-        "queued turn's TurnStarted",
-        |ev| matches!(ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t2"),
-    )
-    .await;
-    wait_for(
-        &mut rx,
-        &mut seen,
-        "queued turn's TurnCompleted",
-        |ev| matches!(ev, AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t2"),
-    )
-    .await;
-    let last = queued_ids.last().unwrap().clone();
-    wait_for(&mut rx, &mut seen, "last UserMessageUpdate sent", |ev| {
-        matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == last)
-    })
-    .await;
+    // Two flushed turns follow (t2, t3); each makes a tool call and asks — allow
+    // both. (A generous cap: we answer every permission we see until the last
+    // send is sent and both follow-up turns have ended.)
+    let mut answered = 0;
+    let mut sent = std::collections::HashSet::new();
+    let mut ended_after_t1 = 0;
+    while sent.len() < queued_ids.len() || ended_after_t1 < 2 {
+        let ev = wait_for(&mut rx, &mut seen, "flush progress", |ev| {
+            matches!(
+                ev,
+                AgentEvent::PermissionRequest { .. }
+                    | AgentEvent::UserMessageUpdate {
+                        state: UserMessageState::Sent,
+                        ..
+                    }
+                    | AgentEvent::TurnCompleted { .. }
+            )
+        })
+        .await;
+        match &ev.ev {
+            AgentEvent::PermissionRequest { request_id, .. } => {
+                answered += 1;
+                assert!(answered <= 8, "runaway permission loop");
+                fx.manager
+                    .command(
+                        "s-co",
+                        AgentCommand::Permission {
+                            request_id: request_id.clone(),
+                            option_id: "allow_once".into(),
+                            destination: None,
+                            feedback: None,
+                        },
+                    )
+                    .await
+                    .expect("permission");
+            }
+            AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Sent,
+            } => {
+                sent.insert(id.clone());
+            }
+            AgentEvent::TurnCompleted { turn_id, .. } if turn_id != "t1" => {
+                ended_after_t1 += 1;
+            }
+            _ => {}
+        }
+    }
 
     let replay = fx.manager.attach("s-co", 0).expect("replay").replay;
-    // Both queued messages resolved `sent` (and never `dropped`).
+    // Every queued message resolved `sent` exactly once — none stranded, none
+    // dropped, none resolved twice.
     for id in &queued_ids {
         let states: Vec<_> = replay
             .iter()
@@ -589,23 +705,14 @@ async fn coalesced_queued_send_does_not_stick_running() {
         assert_eq!(
             states,
             vec![UserMessageState::Sent],
-            "queued message {id} resolves sent exactly once"
+            "held message {id} resolves sent exactly once"
         );
     }
-    // The journal balances: two turns opened, two ended, and there is NO third
-    // (phantom) turn — the session is genuinely idle.
+    // The journal balances: no dangling open turn (no "stuck running").
     let (opened, ended) = turn_balance(&replay);
     assert_eq!(
-        (opened, ended),
-        (2, 2),
-        "opened turns must equal ended turns (idle): {:#?}",
-        replay
-    );
-    assert!(
-        !replay
-            .iter()
-            .any(|e| matches!(&e.ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t3")),
-        "no phantom third turn from the coalesced send"
+        opened, ended,
+        "opened turns must equal ended turns (idle): {replay:#?}"
     );
 }
 
@@ -659,99 +766,9 @@ async fn interrupt_recovers_a_hung_turn_via_watchdog() {
     );
 }
 
-/// Feature 1 — a coalesced SURPLUS never sticks "queued". When the CLI folds
-/// every mid-turn send into the running turn (no follow-up result at all), the
-/// trailing queued id is never popped by a result; the idle-flush must resolve
-/// it `sent` once the session goes idle — not leave it faded forever, and not
-/// drop it (an idle un-aborted queue reached the CLI).
-#[tokio::test]
-async fn coalesced_surplus_flushes_sent_when_idle() {
-    let fx = fixture();
-    fx.manager
-        .spawn(&ClaudeAdapter, spec("s-idle", &fx.cwd, "coalesce-all"))
-        .expect("spawn");
-    let att = fx.manager.attach("s-idle", 0).expect("attach");
-    let mut seen = att.replay.clone();
-    let mut rx = att.live;
-
-    // Turn one parks on a permission, with TWO messages queued behind it.
-    send_text(&fx, "s-idle", "first").await;
-    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
-        matches!(ev, AgentEvent::PermissionRequest { .. })
-    })
-    .await;
-    let request_id = match &permission.ev {
-        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
-        _ => unreachable!(),
-    };
-    let mut queued_ids = Vec::new();
-    for text in ["second", "third"] {
-        send_text(&fx, "s-idle", text).await;
-        let ev = wait_for(
-            &mut rx,
-            &mut seen,
-            "queued UserMessage",
-            |ev| matches!(ev, AgentEvent::UserMessage { text: t, queued: true, .. } if t == text),
-        )
-        .await;
-        match &ev.ev {
-            AgentEvent::UserMessage { id: Some(id), .. } => queued_ids.push(id.clone()),
-            _ => unreachable!(),
-        }
-    }
-
-    // Allow the tool: the fake coalesces BOTH queued sends into turn one and
-    // emits no follow-up. Turn one's single result pops "second" (sent); the
-    // surplus "third" has no result to pop.
-    fx.manager
-        .command(
-            "s-idle",
-            AgentCommand::Permission {
-                request_id,
-                option_id: "allow_once".into(),
-                destination: None,
-                feedback: None,
-            },
-        )
-        .await
-        .expect("permission");
-
-    // The surplus resolves `sent` from the idle-flush (not a result), after the
-    // grace — the crux of Feature 1: it never stays stuck "queued".
-    let surplus = queued_ids.last().unwrap().clone();
-    wait_for(&mut rx, &mut seen, "idle-flush UserMessageUpdate sent", |ev| {
-        matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == surplus)
-    })
-    .await;
-
-    // Both queued messages end `sent` exactly once, never `dropped`; the
-    // session is idle (one turn opened, one ended — no phantom turn).
-    let replay = fx.manager.attach("s-idle", 0).expect("replay").replay;
-    for id in &queued_ids {
-        let states: Vec<_> = replay
-            .iter()
-            .filter_map(|e| match &e.ev {
-                AgentEvent::UserMessageUpdate { id: uid, state } if uid == id => Some(*state),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            states,
-            vec![UserMessageState::Sent],
-            "queued message {id} resolves sent exactly once via pop-or-idle-flush"
-        );
-    }
-    let (opened, ended) = turn_balance(&replay);
-    assert_eq!(
-        (opened, ended),
-        (1, 1),
-        "no phantom turn — the coalesced surplus opened none: {replay:#?}"
-    );
-}
-
-/// Feature 2 — cancelling a still-queued message un-queues it: the driver emits
-/// `Cancelled` (not sent/dropped), sends the CLI a `cancel_async_message`, and
-/// the message resolves exactly once as cancelled on replay.
+/// Feature 2 — cancelling a still-held message un-queues it: the driver emits
+/// `Cancelled` (not sent/dropped) with no CLI round-trip (the message was never
+/// written), and it resolves exactly once as cancelled on replay.
 #[tokio::test]
 async fn cancel_queued_removes_a_still_queued_message() {
     let fx = fixture();
@@ -782,9 +799,9 @@ async fn cancel_queued_removes_a_still_queued_message() {
     )
     .await;
 
-    // Finish turn one. The cancelled message was un-queued (the fake honored
-    // cancel_async_message), so NO follow-up turn runs for it and no `sent`
-    // ever lands for that id.
+    // Finish turn one. The cancelled message was held, so cancelling simply
+    // dropped it before the flush — it is never written to the CLI, no
+    // follow-up turn runs for it, and no `sent` ever lands for that id.
     fx.manager
         .command(
             "s-cx",
@@ -883,7 +900,7 @@ async fn cancel_queued_after_delivery_is_a_notice() {
         &mut rx,
         &mut seen,
         "too-late Notice",
-        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("too late to cancel")),
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("no longer queued")),
     )
     .await;
 

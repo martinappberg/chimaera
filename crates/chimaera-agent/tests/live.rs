@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use chimaera_agent::claude::{chat_args, ClaudeAdapter, ClaudeChat, PermissionDecision};
 use chimaera_agent::codex::CodexChat;
 use chimaera_agent::driver::SpawnSpec;
-use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock};
+use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock, UserMessageState};
 use chimaera_agent::{ChatManager, EventHook, ExitHook};
 
 const HANDSHAKE: Duration = Duration::from_secs(20);
@@ -607,12 +607,13 @@ async fn claude_mid_turn_send_queues_natively() {
 
 /// LIVE PROBE — does `cancel_async_message` actually un-queue a mid-turn send?
 /// The subtype is defined in the SDK but never called by the official
-/// extension, so its real effect is unverified (the crux of the CancelQueued
-/// feature). Queue a distinctively-answered message mid-turn, immediately send
-/// the cancel control request for its uuid, then drain to idle and REPORT
-/// whether the message still ran. Diagnostic either way — the driver marks the
-/// bubble Cancelled locally regardless — so this asserts only the session-
-/// health invariant and prints the observed behavior for PROTOCOL.md.
+/// extension. NOTE: since the hold-until-flush rework the driver no longer
+/// sends this control request at all — it HOLDS queued messages and cancels a
+/// still-held one locally (nothing ever reached the CLI to un-queue). This
+/// probe now only documents the raw CLI's behavior for the record; the driver's
+/// CancelQueued no longer depends on it. Queue a distinctively-answered message
+/// mid-turn, send the cancel for its uuid, drain to idle, and REPORT whether it
+/// ran — asserting only the session-health invariant.
 #[tokio::test]
 #[ignore = "live: spawns real claude, needs auth, bills tiny turns — reports cancel_async_message behavior"]
 async fn claude_cancel_async_message_behavior() {
@@ -689,16 +690,18 @@ async fn claude_cancel_async_message_behavior() {
         .expect("shutdown");
 }
 
-/// Three rapid queued sends against the REAL claude driver must SETTLE IDLE:
-/// every turn the CLI opens must also end. The real CLI coalesces rapid queued
-/// sends (the prior run confirmed 3 sends → 2 turns), so the count is not
-/// fixed — but the invariant is `opened == ended`. The old eager queued-turn
-/// open minted a synthetic TurnStarted per message; the coalesced-away one
-/// never got a result and left the session stuck "running". This drives the
-/// full ChatManager pipeline (the same normalized events the UI folds).
+/// Three rapid sends against the REAL claude driver — the user's exact
+/// scenario. The hold-until-flush model must (a) settle idle: every turn the
+/// CLI opens also ends, and (b) DELIVER every held message: each `queued:true`
+/// echo resolves `sent`, none stranded "queued" or wrongly "dropped". The two
+/// trailing sends are HELD (never dumped mid-turn) and flushed at the running
+/// turn's end, so the CLI can't coalesce them into a bare result and lose one.
+/// This drives the full ChatManager pipeline (the same normalized events the
+/// UI folds).
 #[tokio::test]
 #[ignore = "live: spawns real claude, needs auth, bills a few tiny turns"]
 async fn driver_rapid_queued_sends_settle_idle() {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     let dir = tmpdir();
@@ -717,8 +720,8 @@ async fn driver_rapid_queued_sends_settle_idle() {
         .expect("spawn claude driver");
     let mut rx = manager.attach("rapid", 0).expect("attach").live;
 
-    // Three sends with no waiting between them: the CLI queues (and coalesces)
-    // them behind the running turn.
+    // Three sends with no waiting between them: the first opens a turn, the next
+    // two are held behind it and flush when it ends.
     for text in [
         "Reply with exactly: one",
         "Reply with exactly: two",
@@ -736,9 +739,11 @@ async fn driver_rapid_queued_sends_settle_idle() {
     }
 
     // Drain until the session goes quiet (no event for a settle window); count
-    // the turn boundaries. A generous per-recv timeout tolerates think latency.
+    // the turn boundaries and track each queued send's final delivery state.
     let mut opened = 0usize;
     let mut ended = 0usize;
+    let mut queued_ids: Vec<String> = Vec::new();
+    let mut final_state: HashMap<String, UserMessageState> = HashMap::new();
     let settle = Duration::from_secs(20);
     // Drain until a quiet window elapses with no further event (Err from the
     // timeout) or the broadcast closes — either way the session is idle.
@@ -746,6 +751,14 @@ async fn driver_rapid_queued_sends_settle_idle() {
         match &entry.ev {
             AgentEvent::TurnStarted { .. } => opened += 1,
             AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => ended += 1,
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => queued_ids.push(id.clone()),
+            AgentEvent::UserMessageUpdate { id, state } => {
+                final_state.insert(id.clone(), *state);
+            }
             _ => {}
         }
     }
@@ -756,6 +769,22 @@ async fn driver_rapid_queued_sends_settle_idle() {
         "every opened turn must end — no turn left stuck running \
          (opened={opened}, ended={ended})"
     );
+    // The crux of the user's bug: every message queued behind the running turn
+    // is DELIVERED — resolved `sent`, never left "queued" and never stranded
+    // "not delivered" (dropped).
+    assert!(
+        !queued_ids.is_empty(),
+        "the trailing sends echoed queued (queued_ids={queued_ids:?})"
+    );
+    for id in &queued_ids {
+        assert_eq!(
+            final_state.get(id),
+            Some(&UserMessageState::Sent),
+            "held message {id} must resolve sent, not strand \
+             (state={:?})",
+            final_state.get(id)
+        );
+    }
 
     manager.kill("rapid");
 }
