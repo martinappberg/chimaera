@@ -121,6 +121,66 @@ capture before mapping).
 - Caps at event construction, not sinks (login-node budgets).
 - Handshake watchdog + degrade-to-PTY is per-driver mandatory behavior.
 
+### Ask lifecycle (questions + permissions) — 2026-07-10
+
+The reply route for every ask (question / permission / dialog) is a
+per-driver-process pending map, while the ask itself is journaled and
+replayed forever. Three rules reconcile those lifetimes; both drivers
+implement all three:
+
+- **Every reply gets a definitive outcome.** A command whose `request_id`
+  no pending map knows (the ask predates this driver process — respawn,
+  toggle, resume) emits `QuestionResolved` (empty answers) /
+  `PermissionResolved{option_id:"expired"}` plus a `Notice`, never a
+  silent drop. The journaled resolution un-wedges every attached client
+  and every future replay.
+- **Driver teardown drains pending asks** (`Mapper::drain_pending`, called
+  by the harness right before `Exited`): each pending question resolves
+  with empty answers, each pending permission/dialog resolves `expired` —
+  so no journal ever ends on a dangling ask. A still-parked claude prompt
+  is re-delivered as a fresh request by the next handshake
+  (`pending_permission_requests`), so nothing answerable is lost.
+- **`QuestionResolved` carries the user's answers** (`answers:
+  {question_id: [labels]}`, serde-defaulted — additive; empty = resolved
+  without an answer: cancelled/expired/old journal). Clients fold the
+  question + chosen labels into the transcript; replay rebuilds it.
+
+`option_id` vocabulary on `PermissionResolved`: driver option ids on a
+user decision, `"cancelled"` when the agent withdrew its own ask
+(claude `control_cancel_request`, codex `serverRequest/resolved`),
+`"expired"` when the reply route died (teardown drain / stale reply).
+
+Related: claude's `AskUserQuestion` tool_use no longer emits a `ToolCall`
+row (the QuestionCard is the surface; a bare "AskUserQuestion" row with a
+stuck spinner was noise) — codex's `requestUserInput` parent item never
+produced one. `ChatInfo.pending_permission` and the server's
+`NeedsPermission` rail state now cover questions too.
+
+### "The harness blocked me" — what it is and what surfaces (2026-07-10)
+
+When the agent's prose says a "harness" blocked it, that blockage usually
+happened BELOW chimaera's event layer and no permission card can exist:
+
+- **claude's own hook layer** (e.g. a repo's destructive-command
+  PreToolUse guard) denies the tool call inside the CLI; the wire carries
+  only the failed tool_result. Chimaera cannot (and should not) synthesize
+  a card from prose — the tool card's failure output is the record.
+- **codex full-access** maps to approvalPolicy `"never"` (the official
+  extension's exact table, kept deliberately): codex auto-declines
+  instead of asking, so no `requestApproval` exists. The driver now emits
+  a once-per-turn Notice naming the mechanism ("full access never asks —
+  switch to auto mode to be asked") when a declined item lands in
+  full-access mode. Remapping full-access to an asking policy would
+  diverge from the mined table — a product decision, not taken here.
+- **claude unknown dialog kinds** are answered `cancelled` (result
+  strings for unmined kinds are unknown — cancel is the safe floor) but
+  now with a visible Notice naming the kind.
+- **claude unknown control_request subtypes** (hook_callback,
+  mcp_message, elicitation, oauth refreshes…) are deliberately left
+  unanswered — the CLI parks them until its own deadline or another
+  client settles them, and an error reply could break flows that rely on
+  that fallback — but a once-per-subtype Notice names what is waiting.
+
 ## Extension mining, pass 2 (2026-07-08 — vsix)
 
 ### Claude: slash-command execution model
