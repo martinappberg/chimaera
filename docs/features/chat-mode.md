@@ -185,3 +185,21 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   `-p stream-json`, so state is derived from events, not hooks).
 - **Do not change (without care):** the `agents.defaultView` lever and the protocol-authoritative
   rule.
+
+### Parity batch (codex rewind · /compact · question timeouts · background/stop) — why it exists
+_Captured 2026-07-10 (from the maintainer, PR #43)._
+
+- **Problem it solves:** chat mode must not be second-class. It is the default agent view, so
+  anything the CLI/TUI or the official clients can do — rewind, compact, background a tool, stop a
+  subagent — must work there too; using chimaera should carry no capability tax.
+- **How settled it is (intended vs provisional):** the *capabilities* are the promise — that
+  rewind/compact/background/stop exist in chat mode. The *mechanics* are free to improve: the
+  journal-derived turn counting, the dialog shapes, the button styling are implementation details,
+  not contracts.
+- **Deliberately left out:** a visible countdown for `autoResolutionMs` questions, the codex
+  create-time-model seam, and rendering the guardian auto-approval reviewer — all conscious
+  deferrals, open for later.
+- **Grade — addition, open to change:** improve freely, as long as two-driver symmetry and the
+  additive-only wire rule hold. (The one technical sharp edge — codex `thread/rollback` silently
+  clamping on overcount, hence the exact journal-derived count — is recorded as a wire fact in
+  PROTOCOL.md pass 8 rather than frozen here.)
