@@ -955,8 +955,17 @@ it, so its real un-queue effect was unverified. `tests/live.rs`
 answered message mid-turn, sends the cancel for its uuid, and reports whether the
 message still ran.
 
-> **Observed (chat-smoke, claude PENDING_VERSION): PENDING — filled from the
-> live run.** Best-effort by design either way: the driver marks the bubble
-> `Cancelled` locally and journals the resolution regardless, so the UI stays
-> honest and deterministic even if the CLI ignores the control request. We do
-> NOT rewrite the queue model on the strength of it.
+> **Observed (chat-smoke, claude 2.1.206): it UN-QUEUES.** The probe queued
+> "Reply with exactly: CANCELME" behind a running turn, sent
+> `cancel_async_message` for its uuid, and drained to idle — result: ONE turn
+> completed, the CANCELME reply NEVER ran (`results=1, queued_message_ran=false`).
+> So the real CLI honors the control request and drops the named message from its
+> native queue, contrary to the "SDK-defined but never called" mining note. This
+> makes claude's `CancelQueued` a true cancel, not just a local relabel.
+>
+> Best-effort by design regardless: the driver marks the bubble `Cancelled`
+> locally and journals the resolution whether or not the CLI honors the request,
+> so the UI stays honest and deterministic. We do NOT rewrite the queue model on
+> the strength of it — a future CLI that stops honoring the control degrades to a
+> local-only relabel (the message would still run, but the journaled `Cancelled`
+> keeps replay consistent), and the live probe would catch the regression.
