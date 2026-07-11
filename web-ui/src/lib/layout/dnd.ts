@@ -38,8 +38,10 @@ export type DropSpot =
   | { kind: "linkrow"; sessionId: string };
 
 export interface DragPayload {
-  /** The surface being dragged (terminal session or file preview). */
-  tab: Tab;
+  /** The surface being dragged (terminal session or file preview). Absent for
+   *  a whole-PANE drag (the drop callback closes over the pane id instead) —
+   *  nothing in dnd.ts reads it, so its absence is inert. */
+  tab?: Tab;
   label: string;
   /**
    * Absolute path this payload can REFERENCE. Its presence is what arms the
@@ -57,6 +59,13 @@ export interface LayoutCtrl {
   setRatio(splitId: string, ratio: number): void;
   /** Begin a pointer drag of a tab (click-through handled by the drag). */
   dragTab(e: PointerEvent, paneId: string, index: number, tab: Tab): void;
+  /** Begin a pointer drag of a whole PANE (the pane grip): moves all its tabs
+   *  to another split position, reusing the tab-drag drop zones. A plain click
+   *  focuses the pane. */
+  dragPane(e: PointerEvent, paneId: string): void;
+  /** Promote a preview (italic) file tab to a permanent tab (dbl-click / Keep
+   *  Open). A no-op for non-preview tabs. */
+  pinTab(paneId: string, index: number): void;
   /**
    * Begin a pointer drag of an arbitrary surface with a custom click action —
    * the link icon uses this to drag its own terminal onto an agent (drop =

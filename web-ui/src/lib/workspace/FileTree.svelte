@@ -33,8 +33,10 @@
   interface Props {
     /** Workspace root on the daemon's filesystem. */
     root: string;
-    /** Open a file surface in the layout. */
+    /** Open a file surface in the layout (single click → a PREVIEW tab). */
     onOpen(path: string): void;
+    /** Open a file as a PERMANENT tab (double click, or a just-created file). */
+    onOpenPinned(path: string): void;
     /** Begin a pointer drag of a tree entry — file OR dir (same grammar as
      *  rail rows and pane tabs). `onEntryClick` is the sub-threshold action
      *  (open for files, expand/collapse for dirs), routed through the drag so
@@ -57,6 +59,7 @@
   let {
     root,
     onOpen,
+    onOpenPinned,
     onDragStart,
     activePath,
     reveal = null,
@@ -397,7 +400,8 @@
         // doReveal refreshes every ancestor listing (nested a/b/c names just
         // work), expands the chain, scrolls + flashes the new row.
         await doReveal(created);
-        if (cur.kind === "file") onOpen(created);
+        // A just-created file is for editing → open it as a permanent tab.
+        if (cur.kind === "file") onOpenPinned(created);
       } else {
         if (name === cur.name) {
           cancelEdit();
@@ -617,6 +621,13 @@
           if (entry.kind === "dir") toggle(entry.path);
           else onOpen(entry.path);
         });
+      }}
+      ondblclick={() => {
+        // VS Code: double-click a file PINS it (the two single-clicks already
+        // opened it as a preview; this promotes). Dirs are unaffected.
+        if (entry.kind === "file" && !entry.broken && !(edit?.mode === "rename" && edit.path === entry.path)) {
+          onOpenPinned(entry.path);
+        }
       }}
       onkeydown={(e) => onRowKey(e, entry)}
       oncontextmenu={(e) => contextMenu.openAt(e, menuFor(entry))}

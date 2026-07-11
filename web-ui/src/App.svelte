@@ -93,9 +93,14 @@
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    movePane,
+    movePaneToIndex,
+    movePaneToRootEdge,
     openChanges,
     openDiff,
     openFile,
+    pinTab,
+    pinPaths,
     openFinder,
     findFinder,
     freshFinderTab,
@@ -1008,17 +1013,19 @@
    * otherwise it lands in the adjacent pane, or a fresh split to the right
    * when the window has one pane or Cmd/Ctrl forced a new split.
    */
-  function openFileFromPane(paneId: string, path: string, newSplit: boolean): void {
+  function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
     } else {
+      // Opens are PREVIEW tabs (italic, replaced by the next preview open)
+      // unless the caller pinned them (a tree double-click, a created file).
       const neighbor = newSplit ? null : adjacentPane(layout, paneId);
       if (neighbor !== null) {
-        layout = openFile(focusPane(layout, neighbor), path);
+        layout = openFile(focusPane(layout, neighbor), path, !pinned);
       } else {
         layout = splitPane(layout, paneId, "row");
-        layout = openFile(layout, path);
+        layout = openFile(layout, path, !pinned);
       }
     }
     // A file surface took focus: pull DOM focus off the terminal so plain
@@ -1447,6 +1454,18 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
+  // A file that became dirty must never be a PREVIEW tab: an unsaved edit
+  // that the next preview open silently replaced would be lost. Promote any
+  // dirty preview tab to a permanent one. untrack() so writing `layout` here
+  // doesn't loop with the read; pinPaths returns the same reference when
+  // nothing matched, so this is inert until an edit actually lands.
+  $effect(() => {
+    const dirty = $dirtyFiles;
+    untrack(() => {
+      layout = pinPaths(layout, dirty);
+    });
+  });
+
   /** Open workspace `w` in THIS window — the launcher click, the folder
    *  picker's "open here", and worktree-session reveal all mean "here". A
    *  workspace already open in another window is deliberately NOT diverted to:
@@ -1647,9 +1666,14 @@
     }
   });
 
-  /** Open/focus a file preview tab (FILES tree click). */
-  function openFilePath(path: string): void {
-    layout = openFile(layout, path);
+  /** Open/focus a file tab (FILES tree / quick-open). A single click opens a
+   *  PREVIEW tab (italic, reused by the next preview open); `pinned` (a tree
+   *  double-click, a just-created file) makes it a permanent tab. */
+  function openFilePath(path: string, pinned = false): void {
+    // Guard unsaved edits: pin any dirty preview tab before a replace can drop
+    // it (belt-and-braces with the dirty-edit promotion effect).
+    layout = pinPaths(layout, get(dirtyFiles));
+    layout = openFile(layout, path, !pinned);
     // The pane now shows a file: pull DOM focus off any terminal so plain
     // keys stop reaching a PTY that is no longer visible.
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -2048,6 +2072,12 @@
     dragTab(e, paneId, index, tab) {
       beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
     },
+    dragPane(e, paneId) {
+      beginPaneDrag(e, paneId);
+    },
+    pinTab(paneId, index) {
+      layout = pinTab(layout, paneId, index);
+    },
     dragSurface(e, tab, onClick) {
       // The link icon: a link-intent drag — dropping anywhere but an agent
       // (rail row or pane band) is a no-op, never a tab move.
@@ -2304,6 +2334,63 @@
       },
       { linkTargets, linkSessions, linkIntent },
     );
+  }
+
+  /** The pane grip's whole-pane drag: move the ENTIRE pane (all tabs) to
+   *  another split position, reusing the tab-drag drop zones. A plain click
+   *  focuses the pane. No refPath/link arming — only tab/edge/zone spots fire,
+   *  and any spot targeting the dragged pane itself is suppressed. */
+  function beginPaneDrag(e: PointerEvent, paneId: string): void {
+    const pane = findPane(layout.root, paneId);
+    if (pane === null || panesOf(layout.root).length < 2) return; // last pane never moves
+    const active = pane.tabs[pane.active];
+    const base = active !== undefined ? tabLabel(active) : "pane";
+    const extra = pane.tabs.length > 1 ? ` +${pane.tabs.length - 1}` : "";
+    startDrag(
+      e,
+      { label: `${base}${extra}` },
+      {
+        onSpot: (s) => {
+          // Never advertise a drop onto the pane being dragged (self-move).
+          dropSpot = s !== null && "paneId" in s && s.paneId === paneId ? null : s;
+        },
+        onDrop: (spot) => {
+          if ("paneId" in spot && spot.paneId === paneId) return;
+          layout =
+            spot.kind === "tab"
+              ? movePaneToIndex(layout, paneId, spot.paneId, spot.index)
+              : spot.kind === "edge"
+                ? movePaneToRootEdge(layout, paneId, spot.edge)
+                : spot.kind === "zone"
+                  ? movePane(layout, paneId, spot.paneId, spot.zone)
+                  : layout;
+          const sid = focusedSessionOf(layout);
+          if (sid !== null) pool.focusTerminal(sid);
+        },
+        onClick: () => ctrl.focusPane(paneId),
+        onEnd: () => {
+          dropSpot = null;
+          bandPanes = new Set();
+        },
+      },
+    );
+  }
+
+  /** A tab's display label (shared by tab and whole-pane drags). */
+  function tabLabel(tab: Tab): string {
+    return tab.surface === "terminal"
+      ? (displayNames.get(tab.sessionId) ?? sessionsById.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8))
+      : tab.surface === "file"
+        ? (fileTitles.get(tab.path) ?? basename(tab.path))
+        : tab.surface === "finder"
+          ? (basename(tab.path) || "Finder")
+          : tab.surface === "diff"
+            ? `${basename(tab.path)} (diff)`
+            : tab.surface === "git"
+              ? "Source Control"
+              : tab.surface === "changes"
+                ? "Changes"
+                : "Settings";
   }
 
   // --- linked terminals ------------------------------------------------------
@@ -2944,6 +3031,7 @@
               <FileTree
                 root={workspace.root}
                 onOpen={openFilePath}
+                onOpenPinned={(p) => openFilePath(p, true)}
                 onDragStart={onTreeEntryDown}
                 activePath={focusedFilePath}
                 reveal={treeReveal}
@@ -3108,6 +3196,7 @@
             wsRoot={workspace?.root ?? null}
             wsId={activeWsId}
             {bandPanes}
+            soloPane={panesOf(layout.root).length === 1}
             {ctrl}
           />
         {/if}

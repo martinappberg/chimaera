@@ -27,6 +27,14 @@ export interface FileTab {
   surface: "file";
   /** Absolute path on the daemon's filesystem. */
   path: string;
+  /**
+   * A VS Code-style PREVIEW tab: rendered italic, replaced in place by the
+   * next preview open (so single-clicking through files reuses one slot), and
+   * promoted to a permanent tab by a double-click, an edit, or a move/reorder.
+   * Absent = a permanent (pinned) tab. Keyed by `path` regardless, so the
+   * no-duplicates invariant is unaffected.
+   */
+  preview?: boolean;
 }
 /** The settings surface — a singleton view (no-duplicates gives "focus the
  *  existing settings tab" for free, VS Code semantics). */
@@ -370,8 +378,79 @@ export function sessionPaneId(l: Layout, sessionId: string): string | null {
   );
 }
 
-export function openFile(l: Layout, path: string): Layout {
-  return openTab(l, { surface: "file", path });
+/**
+ * Open a file. `preview` (default false) opens it as a VS Code preview tab:
+ * if the path is already open anywhere it just focuses (dedupe wins — never
+ * duplicate), else if the focused pane already holds a preview file tab it is
+ * REPLACED in place (one preview slot per pane), else the tab is appended with
+ * the preview flag. A non-preview (pinned) open appends normally.
+ */
+export function openFile(l: Layout, path: string, preview = false): Layout {
+  const tab: FileTab = preview ? { surface: "file", path, preview: true } : { surface: "file", path };
+  // Dedupe first: a path open anywhere focuses its existing tab (and never
+  // demotes a pinned tab to preview).
+  if (paneForTab(l.root, tab) !== null) return openTab(l, tab);
+  if (!preview) return openTab(l, tab);
+  // Replace the focused pane's existing preview file tab in place, if any.
+  const paneId = findPane(l.root, l.focusedPaneId) !== null ? l.focusedPaneId : panes(l.root)[0]?.id;
+  if (paneId === undefined) return openTab(l, tab);
+  const pane = findPane(l.root, paneId);
+  const idx = pane?.tabs.findIndex((t) => t.surface === "file" && t.preview === true) ?? -1;
+  if (pane !== undefined && idx >= 0) {
+    const root = withPane(l.root, paneId, (p) => ({
+      ...p,
+      tabs: p.tabs.toSpliced(idx, 1, tab),
+      active: idx,
+    }));
+    return normalize({ ...l, root, focusedPaneId: paneId });
+  }
+  return openTab(l, tab);
+}
+
+/** Promote the tab at `index` in `paneId` to a permanent (non-preview) tab.
+ *  A no-op (same reference) when it isn't a preview file tab. */
+export function pinTab(l: Layout, paneId: string, index: number): Layout {
+  const p = findPane(l.root, paneId);
+  const t = p?.tabs[index];
+  if (p === undefined || t === undefined || t.surface !== "file" || t.preview !== true) return l;
+  const root = withPane(l.root, paneId, (pane) => ({
+    ...pane,
+    tabs: pane.tabs.map((x, i) => (i === index ? { surface: "file", path: (x as FileTab).path } : x)),
+  }));
+  return root === l.root ? l : { ...l, root };
+}
+
+/** Promote every preview file tab whose path is in `paths` (a file became
+ *  dirty → pin it so an unsaved edit can't be dropped by a preview replace).
+ *  Returns the same reference when nothing changed (structural sharing). */
+export function pinPaths(l: Layout, paths: ReadonlySet<string>): Layout {
+  if (paths.size === 0) return l;
+  let changed = false;
+  const map = (node: LayoutNode): LayoutNode => {
+    if (node.type === "pane") {
+      let touched = false;
+      const tabs = node.tabs.map((t) => {
+        if (t.surface === "file" && t.preview === true && paths.has(t.path)) {
+          touched = true;
+          changed = true;
+          return { surface: "file", path: t.path } satisfies FileTab;
+        }
+        return t;
+      });
+      return touched ? { ...node, tabs } : node;
+    }
+    const a = map(node.a);
+    const b = map(node.b);
+    return a === node.a && b === node.b ? node : { ...node, a, b };
+  };
+  const root = map(l.root);
+  return changed ? { ...l, root } : l;
+}
+
+/** Strip the preview flag off a file tab (used when a tab is dragged/reordered
+ *  — a deliberate move pins it, VS Code semantics). */
+function pinned(tab: Tab): Tab {
+  return tab.surface === "file" && tab.preview === true ? { surface: "file", path: tab.path } : tab;
 }
 
 /** Open (or focus) a side-by-side diff of `path` at the given comparison. */
@@ -515,7 +594,7 @@ export function dropTab(l: Layout, tab: Tab, targetPaneId: string, zone: Zone): 
     if (findPane(next.root, targetPaneId) === null) return l;
     const root = withPane(next.root, targetPaneId, (p) => ({
       ...p,
-      tabs: [...p.tabs, tab],
+      tabs: [...p.tabs, pinned(tab)],
       active: p.tabs.length,
     }));
     return normalize({ ...next, root, focusedPaneId: targetPaneId });
@@ -531,7 +610,7 @@ export function dropTab(l: Layout, tab: Tab, targetPaneId: string, zone: Zone): 
   const np: PaneNode = {
     type: "pane",
     id: uid(),
-    tabs: [tab],
+    tabs: [pinned(tab)],
     active: 0,
   };
   const dir: SplitDir = zone === "left" || zone === "right" ? "row" : "col";
@@ -560,7 +639,7 @@ export function dropTabAtRootEdge(l: Layout, tab: Tab, side: Side): Layout {
     }
   }
   const next = src !== null ? detachTab(l, src.paneId, src.index) : l;
-  const np: PaneNode = { type: "pane", id: uid(), tabs: [tab], active: 0 };
+  const np: PaneNode = { type: "pane", id: uid(), tabs: [pinned(tab)], active: 0 };
   const split: SplitNode = {
     type: "split",
     id: uid(),
@@ -583,7 +662,9 @@ export function moveTabToIndex(l: Layout, tab: Tab, paneId: string, index: numbe
   if (src !== null && src.paneId === paneId) {
     const insertAt = index > src.index ? index - 1 : index;
     if (insertAt === src.index) return activateTab(l, paneId, src.index);
-    const tabs = target.tabs.toSpliced(src.index, 1).toSpliced(insertAt, 0, target.tabs[src.index]);
+    // A deliberate reorder pins a preview tab (VS Code semantics).
+    const moved = pinned(target.tabs[src.index]);
+    const tabs = target.tabs.toSpliced(src.index, 1).toSpliced(insertAt, 0, moved);
     const root = withPane(l.root, paneId, (x) => ({ ...x, tabs, active: insertAt }));
     return normalize({ ...l, root, focusedPaneId: paneId });
   }
@@ -593,10 +674,85 @@ export function moveTabToIndex(l: Layout, tab: Tab, paneId: string, index: numbe
   const at = Math.min(Math.max(index, 0), t.tabs.length);
   const root = withPane(next.root, paneId, (x) => ({
     ...x,
-    tabs: x.tabs.toSpliced(at, 0, tab),
+    tabs: x.tabs.toSpliced(at, 0, pinned(tab)),
     active: at,
   }));
   return normalize({ ...next, root, focusedPaneId: paneId });
+}
+
+// --- whole-pane moves (the pane grip drags the entire pane, not one tab) -----
+//
+// These re-parent an existing PaneNode in the tree, reusing the same drop-spot
+// vocabulary as tab drags (tab-bar / edge zone / window edge). The no-duplicates
+// invariant makes a center MERGE a plain concat: a surface open in the source
+// pane cannot also be open in the target (paneForTab is global), so the tab
+// lists are always disjoint.
+
+/** Drop pane `paneId` onto `targetPaneId`: edge zones tear a split on that
+ *  side (the pane keeps its id/tabs/fontSize), center merges its tabs in. */
+export function movePane(l: Layout, paneId: string, targetPaneId: string, zone: Zone): Layout {
+  const src = findPane(l.root, paneId);
+  if (src === null || paneId === targetPaneId) return l;
+  const detached = replaceNode(l.root, paneId, null);
+  if (detached === null) return l; // the only pane never moves
+  if (findPane(detached, targetPaneId) === null) return l;
+  if (zone === "center") {
+    const root = withPane(detached, targetPaneId, (p) => ({
+      ...p,
+      tabs: [...p.tabs, ...src.tabs],
+      active: src.tabs.length > 0 ? p.tabs.length + src.active : p.active,
+    }));
+    return normalize({ ...l, root, focusedPaneId: targetPaneId });
+  }
+  const dir: SplitDir = zone === "left" || zone === "right" ? "row" : "col";
+  const before = zone === "left" || zone === "top";
+  const tmp = normalize({ ...l, root: detached });
+  // splitPane inserts the pre-existing `src` node, so its id/tabs/fontSize
+  // survive and focus follows it.
+  return splitPane(tmp, targetPaneId, dir, before, src);
+}
+
+/** Drop pane `paneId` on a window edge: split the ROOT, the pane taking the
+ *  full window height/width on that side. No-op for the only pane, or when the
+ *  pane already spans that edge. */
+export function movePaneToRootEdge(l: Layout, paneId: string, side: Side): Layout {
+  const src = findPane(l.root, paneId);
+  if (src === null || panes(l.root).length === 1) return l;
+  const dir: SplitDir = side === "left" || side === "right" ? "row" : "col";
+  const before = side === "left" || side === "top";
+  if (l.root.type === "split" && l.root.dir === dir) {
+    const edgeChild = before ? l.root.a : l.root.b;
+    if (edgeChild.id === paneId) return l; // already there
+  }
+  const detached = replaceNode(l.root, paneId, null);
+  if (detached === null) return l;
+  const split: SplitNode = {
+    type: "split",
+    id: uid(),
+    dir,
+    ratio: 0.5,
+    a: before ? src : detached,
+    b: before ? detached : src,
+  };
+  return normalize({ ...l, root: split, focusedPaneId: paneId, zoomedPaneId: null });
+}
+
+/** Drop pane `paneId`'s tabs into `targetPaneId`'s tab bar at `index` (a
+ *  {kind:"tab"} spot): merge the whole pane's tabs there in order. */
+export function movePaneToIndex(l: Layout, paneId: string, targetPaneId: string, index: number): Layout {
+  const src = findPane(l.root, paneId);
+  if (src === null || paneId === targetPaneId) return l;
+  const detached = replaceNode(l.root, paneId, null);
+  if (detached === null) return l;
+  const target = findPane(detached, targetPaneId);
+  if (target === null) return l;
+  const at = Math.min(Math.max(index, 0), target.tabs.length);
+  const root = withPane(detached, targetPaneId, (x) => ({
+    ...x,
+    tabs: x.tabs.toSpliced(at, 0, ...src.tabs),
+    active: src.tabs.length > 0 ? at + src.active : x.active,
+  }));
+  return normalize({ ...l, root, focusedPaneId: targetPaneId });
 }
 
 /**
@@ -799,7 +955,7 @@ export function moveFocus(l: Layout, dir: FocusDir): Layout {
  *  (additive within blob v1; `v` is "settings" or "git"). */
 type STab =
   | { s: string }
-  | { f: string }
+  | { f: string; pv?: 1 }
   | { v: string }
   | { d: string; di: string }
   | { gd: string; dm?: string }
@@ -834,7 +990,7 @@ function serNode(node: LayoutNode): SNode {
       id: node.id,
       tabs: node.tabs.map((t): STab => {
         if (t.surface === "terminal") return { s: t.sessionId };
-        if (t.surface === "file") return { f: t.path };
+        if (t.surface === "file") return t.preview === true ? { f: t.path, pv: 1 } : { f: t.path };
         if (t.surface === "finder") return { d: t.path, di: t.id };
         if (t.surface === "diff") return { gd: t.path, dm: t.mode };
         if (t.surface === "git") return { v: "git" };
@@ -884,7 +1040,7 @@ function deserNode(
       if (typeof t.s === "string" && t.s.length > 0) {
         tab = { surface: "terminal", sessionId: t.s };
       } else if (typeof t.f === "string" && t.f.length > 0 && t.f.length <= 4096) {
-        tab = { surface: "file", path: t.f };
+        tab = t.pv === 1 ? { surface: "file", path: t.f, preview: true } : { surface: "file", path: t.f };
       } else if (typeof t.d === "string" && t.d.length > 0 && t.d.length <= 4096) {
         // Finder: `di` is the instance id (mint a fresh one for pre-finder
         // blobs that somehow carry `d` without it).
