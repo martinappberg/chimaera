@@ -171,6 +171,49 @@ Gotchas:
 - **Old hosts.json entries with a `"dev"` key** (from the toggle era) still
   parse; the key is ignored.
 
+## Handing the human a live app to test (the flow to prompt them with)
+
+When you finish a change and want **the human** to test it in the real app
+(not your headless preview), give them a running isolated app — and if they want
+to test a **remote host**, stage the cross-built daemon first so their in-app
+connect Just Works. This is the flow to walk them through.
+
+**1. Launch the isolated native app** (a real window, isolated state, won't touch
+their real `~/.chimaera` app). `just app-dev-isolated`, or when `just` is absent,
+its three steps — the last one **in the background** (it's a long-running GUI):
+
+```sh
+nvm use 22 && npm --prefix web-ui run build          # UI is embedded/served from dist
+cargo build --manifest-path crates/chimaera-app/Cargo.toml
+bash .claude/skills/develop/run-app-isolated.sh      # run in background — opens the window
+```
+
+State lives under `CHIMAERA_HOME=~/.chimaera-dev-app/<worktree>`; the script
+scrubs `CLAUDE*`/`ANTHROPIC*` env (else the app's spawned agents die on start).
+Then tell the human: open a folder → start an agent → here's what to click.
+
+**2. To test against a REMOTE host from that isolated app** (e.g. Sherlock): a
+dev connect deploys **your** build, never a release, so a musl daemon of this
+branch must exist where THIS app looks. The trap: the in-app hint says
+`~/.chimaera/dist`, but an **isolated** app reads its own
+`$CHIMAERA_HOME/data/dist` — cross-build and stage there by the exact
+`chimaera-<arch>-linux-musl` name (`dist_name`, `chimaera-remote`):
+
+```sh
+# needs zig + cargo-zigbuild; arch = the host's (Sherlock = x86_64)
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
+HOME_DIR=~/.chimaera-dev-app/$(basename "$PWD")
+mkdir -p "$HOME_DIR/data/dist"
+cp target/x86_64-unknown-linux-musl/release/chimaera \
+   "$HOME_DIR/data/dist/chimaera-x86_64-linux-musl"
+```
+
+Then tell the human: **click the host row (it wears the amber `dev` pill) → connect.**
+The app deploys your build to the host's `~/.chimaera-dev`, starts the remote
+daemon, tunnels, and opens the remote workspace; an ssh password/Duo prompt
+surfaces in the app's askpass overlay. Now they can exercise remote-only paths
+(uploads streaming to the host, remote terminal links, reconnect/reauth).
+
 ## Which build is actually running? (debug workflow)
 
 - **Health = ground truth.** Read `port` + `token` from the manifest —
