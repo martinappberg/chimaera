@@ -84,6 +84,11 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Release awareness (GET /api/v1/update + the `update` ws frame).
     tokio::spawn(update::run_checker(state.clone()));
 
+    // Uploads left by sessions that ended while no daemon was watching
+    // (crashes, unclean stops) — swept once restore has decided which
+    // sessions still exist.
+    crate::upload::spawn_boot_prune(state.clone());
+
     // `state.clone()` (not a move) so the post-serve ledger snapshot + handoff
     // below still own it after graceful shutdown returns.
     axum::serve(listener, app(state.clone()))

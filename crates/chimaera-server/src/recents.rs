@@ -214,6 +214,10 @@ pub(crate) fn retire(
     // exit paths deliberately preserve it for the successor), and the PTY
     // retire paths — the watcher, DELETE, close-all — never cleared it.
     crate::lock(&state.chat_recipes).remove(session_id);
+    // Same identity-ends rule for what the session uploaded (screenshots,
+    // desktop drops): uploads are session-lifetime state, and leaving them
+    // would grow ~/.chimaera without bound on shared login nodes.
+    crate::upload::prune_session_uploads(state, session_id);
 
     let title = pinned
         .map(str::to_string)

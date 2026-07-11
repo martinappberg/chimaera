@@ -72,9 +72,10 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
   drags are rAF-throttled and **gate terminal refits** (`pool.setDragging`) to avoid reflow
   jank. The layout tree is pure/immutable with structural sharing. DnD is custom pointer-based
   (HTML5 DnD can't hit 60fps); the source captures the pointer so terminals never see the moves.
-  Two special drop bands over a pane's lower ~22%: an **"@ reference"** band (a file drag types
-  its path into a live agent) and a **"link to agent"** band (a terminal drag leashes it — see
-  [linked-terminals.md](linked-terminals.md)).
+  Two special drop bands over a pane's lower ~22%: an **"@ reference"** band (a file *or folder*
+  drag types its path into a live session — see [drag-drop-and-uploads.md](drag-drop-and-uploads.md),
+  which also covers OS-desktop file drops and screenshot paste) and a **"link to agent"** band (a
+  terminal drag leashes it — see [linked-terminals.md](linked-terminals.md)).
 
 ## Zoom, focus mode & keyboard window management
 

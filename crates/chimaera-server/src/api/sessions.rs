@@ -462,6 +462,9 @@ pub(crate) async fn delete_session(
     }
     match state.sessions.kill(&id) {
         Ok(()) => {
+            // Shells never pass through `recents::retire` (that hook is
+            // agent-only), so their uploads are pruned here.
+            crate::upload::prune_session_uploads(&state, &id);
             state.changes.notify_waiters();
             StatusCode::NO_CONTENT.into_response()
         }

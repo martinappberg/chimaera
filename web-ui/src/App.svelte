@@ -53,7 +53,14 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
-  import { insertIntoComposer } from "./lib/chat/composerBus";
+  import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
+  import { imageToAttachment } from "./lib/chat/images";
+  import {
+    reportUploadError,
+    setUploadPathInserter,
+    uploadAndInsert,
+    uploadJobs,
+  } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
     activeSelection,
@@ -91,6 +98,7 @@
     openFile,
     openFinder,
     findFinder,
+    freshFinderTab,
     setFinderPath,
     openGit,
     openSession,
@@ -126,6 +134,7 @@
   } from "./lib/workspace/git";
   import {
     paneContentEl,
+    paneIdAt,
     paneRootEl,
     registerLinkRow,
     registerStage,
@@ -579,6 +588,13 @@
       onOpenPath,
     });
     setReferenceHandler(referenceSelection);
+    setUploadPathInserter(insertUploadedPath);
+    // OS-desktop file drags: window-level so the navigate-away default is
+    // dead EVERYWHERE, not just over accepting panes.
+    window.addEventListener("dragenter", onWindowDragEnter);
+    window.addEventListener("dragover", onWindowDragOver);
+    window.addEventListener("dragleave", onWindowDragLeave);
+    window.addEventListener("drop", onWindowDrop);
     const events = new EventsSocket({
       onSessions: (list, linkList) => {
         applySessions(list);
@@ -692,8 +708,13 @@
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
       document.removeEventListener("copy", onCopy);
+      window.removeEventListener("dragenter", onWindowDragEnter);
+      window.removeEventListener("dragover", onWindowDragOver);
+      window.removeEventListener("dragleave", onWindowDragLeave);
+      window.removeEventListener("drop", onWindowDrop);
       stopChordHints();
       setReferenceHandler(null);
+      setUploadPathInserter(null);
       events.close();
       pool.disposePool();
     };
@@ -794,11 +815,14 @@
   }
 
   /**
-   * Drag-to-reference drop: type the dropped file's path into the pane's
-   * session — claude agents get the native @mention (workspace-relative),
-   * plain terminals get the shell-escaped path relative to their live cwd.
+   * Drag-to-reference drop: type the dropped path (file OR folder) into the
+   * pane's session — claude agents get the native @mention (workspace-
+   * relative), plain terminals get the shell-escaped path relative to their
+   * live cwd. Dir mentions carry a trailing slash (the composer/TUI
+   * convention — reads unambiguously as "this folder"); shell paths stay
+   * bare, matching what a shell command expects.
    */
-  function referenceFileDrop(paneId: string, path: string): void {
+  function referenceFileDrop(paneId: string, path: string, kind: "file" | "dir" = "file"): void {
     const p = findPane(layout.root, paneId);
     if (p === null) return;
     const active = p.tabs[p.active];
@@ -806,11 +830,126 @@
     const s = sessionsById.get(active.sessionId);
     if (s === undefined || !s.alive) return;
     const root = workspace?.root;
+    const rel = root !== undefined ? workspaceRelative(path, root) : path;
     const text =
       s.kind === "agent"
-        ? composeAgentPathReference(root !== undefined ? workspaceRelative(path, root) : path)
+        ? composeAgentPathReference(kind === "dir" ? `${rel}/` : rel)
         : composeShellPathReference(path, s.cwd_current ?? s.cwd);
     typeIntoSession(active.sessionId, text);
+  }
+
+  // --- OS-desktop file drops: upload to the session's host, then reference ---
+
+  /**
+   * Uploaded paths type through the same composition as drag-to-reference:
+   * agents get @mentions (absolute — uploads live outside the workspace
+   * root, which workspaceRelative passes through unchanged), shells get
+   * shell-escaped paths. Registered with the uploads module, which owns the
+   * upload half (terminal paste routes through it too).
+   */
+  function insertUploadedPath(sessionId: string, absPath: string): void {
+    const s = sessionsById.get(sessionId);
+    if (s === undefined || !s.alive) return;
+    const root = workspace?.root;
+    const text =
+      s.kind === "agent"
+        ? composeAgentPathReference(root !== undefined ? workspaceRelative(absPath, root) : absPath)
+        : composeShellPathReference(absPath, s.cwd_current ?? s.cwd);
+    typeIntoSession(sessionId, text);
+  }
+
+  /** The live session shown by `paneId`, if any — the OS-drop target gate
+   *  (same rule as the pointer-drag "@ reference" band). */
+  function osDropSession(paneId: string): Session | null {
+    const p = findPane(layout.root, paneId);
+    const a = p?.tabs[p.active];
+    if (a === undefined || a.surface !== "terminal") return null;
+    const s = sessionsById.get(a.sessionId);
+    return s !== undefined && s.alive ? s : null;
+  }
+
+  /** Depth-counted dragenter/leave so child enter/leave churn never flickers
+   *  the drop overlay off mid-drag. */
+  let osDragDepth = 0;
+
+  function isOsFileDrag(e: DragEvent): boolean {
+    return e.dataTransfer?.types.includes("Files") ?? false;
+  }
+
+  function onWindowDragEnter(e: DragEvent): void {
+    if (!isOsFileDrag(e)) return;
+    e.preventDefault();
+    osDragDepth += 1;
+  }
+
+  function onWindowDragOver(e: DragEvent): void {
+    // ALWAYS claim the drag: the browser's default for an unhandled file
+    // drop is to NAVIGATE AWAY from the app entirely.
+    e.preventDefault();
+    if (!isOsFileDrag(e)) return;
+    const paneId = paneIdAt(e.clientX, e.clientY);
+    const ok = paneId !== null && osDropSession(paneId) !== null;
+    if (e.dataTransfer !== null) e.dataTransfer.dropEffect = ok ? "copy" : "none";
+    // OS drops reuse the dropSpot plumbing: the whole pane is the target
+    // (HTML5 dnd has no competing tile gesture to partition against).
+    dropSpot = ok && paneId !== null ? { kind: "upload", paneId } : null;
+  }
+
+  function onWindowDragLeave(e: DragEvent): void {
+    if (!isOsFileDrag(e)) return;
+    osDragDepth = Math.max(0, osDragDepth - 1);
+    if (osDragDepth === 0 && dropSpot?.kind === "upload") dropSpot = null;
+  }
+
+  function onWindowDrop(e: DragEvent): void {
+    // preventDefault unconditionally — see onWindowDragOver.
+    e.preventDefault();
+    osDragDepth = 0;
+    if (dropSpot?.kind === "upload") dropSpot = null;
+    const dt = e.dataTransfer;
+    if (dt === null) return;
+    const paneId = paneIdAt(e.clientX, e.clientY);
+    const s = paneId !== null ? osDropSession(paneId) : null;
+    if (s === null) return;
+    // Read files AND directory-ness synchronously — webkitGetAsEntry is only
+    // valid while the drop event dispatches.
+    const picked = [...dt.items]
+      .filter((i) => i.kind === "file")
+      .map((i) => ({ file: i.getAsFile(), dir: i.webkitGetAsEntry?.()?.isDirectory === true }));
+    void dropFilesOnSession(s.id, picked);
+  }
+
+  /** How many files one drop gesture will accept. */
+  const OS_DROP_MAX_FILES = 8;
+
+  async function dropFilesOnSession(
+    sessionId: string,
+    picked: { file: File | null; dir: boolean }[],
+  ): Promise<void> {
+    let accepted = 0;
+    for (const { file, dir } of picked) {
+      if (dir) {
+        // Folder uploads need recursive traversal — out of scope for v1.
+        reportUploadError(`${file?.name ?? "folder"}: drop files, not folders`);
+        continue;
+      }
+      if (file === null) continue;
+      if (accepted >= OS_DROP_MAX_FILES) {
+        reportUploadError(`${file.name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
+        continue;
+      }
+      accepted += 1;
+      // An image dropped on a CHAT pane also attaches its pixels, so the
+      // model sees it immediately; the uploaded path stays the durable,
+      // host-side artifact the agent can re-read later.
+      const s = sessionsById.get(sessionId);
+      if (s?.ui === "chat" && file.type.startsWith("image/")) {
+        const attachment = await imageToAttachment(file);
+        if (attachment !== null) attachImageToComposer(sessionId, attachment);
+      }
+      // Sequential: keeps multi-file reference order stable in the input.
+      await uploadAndInsert(sessionId, file, file.name);
+    }
   }
 
   // --- clickable paths: the bridge's return direction ------------------------
@@ -2023,14 +2162,16 @@
               : tab.surface === "git"
                 ? "Source Control"
                 : "Settings";
-    // Arm the bottom bands for this drag: reference targets for file drags,
-    // link targets for shell-terminal drags. Drives the partitioned zone
-    // previews (the band region is reserved, never flashed over).
+    // Arm the bottom bands for this drag: reference targets for path drags
+    // (file previews and Finder/dir payloads), link targets for shell-
+    // terminal drags. Drives the partitioned zone previews (the band region
+    // is reserved, never flashed over).
+    const refPath = tab.surface === "file" || tab.surface === "finder" ? tab.path : undefined;
     const armed = new Set<string>();
     const linkTargets = linkTargetsFor(tab);
     const linkSessions = linkSessionsFor(tab);
     if (linkTargets !== undefined) for (const id of linkTargets.keys()) armed.add(id);
-    if (tab.surface === "file") {
+    if (refPath !== undefined) {
       for (const p of panesOf(layout.root)) {
         const a = p.tabs[p.active];
         if (
@@ -2045,13 +2186,14 @@
     bandPanes = armed;
     startDrag(
       e,
-      { tab, label },
+      { tab, label, refPath },
       {
         onSpot: (s) => (dropSpot = s),
         onDrop: (spot) => {
           if (spot.kind === "ref") {
             // Drag-to-reference: type into the session, never open a tab.
-            if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path);
+            if (tab.surface === "file") referenceFileDrop(spot.paneId, tab.path, "file");
+            else if (tab.surface === "finder") referenceFileDrop(spot.paneId, tab.path, "dir");
             return;
           }
           if (spot.kind === "link") {
@@ -2068,12 +2210,17 @@
           // A link-intent drag (from the link icon) only ever links — a drop
           // anywhere but an agent is a no-op, never a surprise tab move.
           if (linkIntent) return;
+          // `upload` never reaches this pointer-drag callback (it is only ever
+          // set on dropSpot by App's OS-drop handlers), so the zone arm is
+          // explicit and the impossible case is a no-op.
           layout =
             spot.kind === "tab"
               ? moveTabToIndex(layout, tab, spot.paneId, spot.index)
               : spot.kind === "edge"
                 ? dropTabAtRootEdge(layout, tab, spot.edge)
-                : dropTab(layout, tab, spot.paneId, spot.zone);
+                : spot.kind === "zone"
+                  ? dropTab(layout, tab, spot.paneId, spot.zone)
+                  : layout;
           if (tab.surface === "terminal") {
             pool.focusTerminal(tab.sessionId);
           } else if (document.activeElement instanceof HTMLElement) {
@@ -2190,9 +2337,21 @@
     beginDrag(e, { surface: "terminal", sessionId }, () => openSess(sessionId));
   }
 
-  /** FILES tree entries drag exactly like rail rows (surface parity). */
-  function onTreeEntryDown(e: PointerEvent, path: string): void {
-    beginDrag(e, { surface: "file", path }, () => openFilePath(path));
+  /**
+   * FILES tree entries drag exactly like rail rows (surface parity). Files
+   * drag as file tabs; dirs drag as FRESH Finder tabs, so a zone/tab drop
+   * opens a legitimate browsing surface (never a broken file preview) while
+   * the "@ reference" band accepts both. The sub-threshold click action
+   * (open / expand) comes from the tree, which owns its expansion state.
+   */
+  function onTreeEntryDown(
+    e: PointerEvent,
+    path: string,
+    kind: "file" | "dir",
+    onEntryClick: () => void,
+  ): void {
+    const tab: Tab = kind === "dir" ? freshFinderTab(path) : { surface: "file", path };
+    beginDrag(e, tab, onEntryClick);
   }
 
   /** Svelte action: register an agent rail row as a link-drop target, so a
@@ -2984,6 +3143,23 @@
      older than this app. One per window; dismissals are origin-wide. -->
 {#if updateOffer !== null}
   <UpdateToast offer={updateOffer} />
+{/if}
+
+<!-- OS-drop / paste uploads in flight (and, briefly, why one failed) —
+     multi-MB screenshots over a tunnel take a beat; say so quietly. -->
+{#if $uploadJobs.length > 0}
+  <div class="upload-jobs" role="status" aria-live="polite">
+    {#each $uploadJobs as job (job.id)}
+      <div class="upload-job" class:err={job.error !== null}>
+        {#if job.error === null}
+          <span class="upload-spinner" aria-hidden="true"></span>
+          <span class="upload-name">uploading {job.name}…</span>
+        {:else}
+          <span class="upload-name">{job.error}</span>
+        {/if}
+      </div>
+    {/each}
+  </div>
 {/if}
 
 {#if showReconnect && !$askpassActive}
@@ -4116,5 +4292,79 @@
   .reconnect-retry:disabled {
     color: var(--muted);
     cursor: default;
+  }
+
+  /* Upload chips: same quiet toast recipe as the update toast, stacked
+     bottom-center so they never cover the toast or the rail. */
+  .upload-jobs {
+    position: fixed;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    z-index: 170; /* under the update toast (180) and overlays (190+) */
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    pointer-events: none;
+  }
+
+  .upload-job {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 420px;
+    padding: 5px 12px;
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    animation: upload-in 0.16s ease-out;
+  }
+
+  @keyframes upload-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .upload-job.err {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--edge));
+  }
+
+  .upload-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .upload-spinner {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 1.5px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-top-color: var(--accent);
+    animation: upload-spin 0.8s linear infinite;
+  }
+
+  @keyframes upload-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .upload-spinner {
+      animation: none;
+    }
   }
 </style>

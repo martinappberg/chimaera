@@ -22,6 +22,7 @@ mod settings;
 mod spawn;
 mod state;
 mod update;
+mod upload;
 mod view_state;
 mod workspaces;
 mod ws;

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { pastedImageName, uploadAndInsert } from "../net/uploads";
   import { focusTerminal, release, show } from "./termPool";
 
   interface Props {
@@ -37,9 +38,29 @@
   $effect(() => {
     if (focused) focusTerminal(sessionId);
   });
+
+  /**
+   * Screenshot paste into a terminal: a PTY can't take pixels, so the image
+   * uploads to the session's host and its shell-quoted path types at the
+   * cursor instead. Capture-phase (fires before xterm's own paste handler),
+   * and ONLY when the clipboard holds an image and no text — a normal text
+   * paste must keep flowing to the PTY untouched.
+   */
+  function onPasteCapture(e: ClipboardEvent): void {
+    const dt = e.clipboardData;
+    if (dt == null || dt.types.includes("text/plain")) return;
+    const items = [...dt.items].filter((i) => i.type.startsWith("image/"));
+    if (items.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    for (const item of items) {
+      const file = item.getAsFile();
+      if (file !== null) void uploadAndInsert(sessionId, file, pastedImageName(file.type));
+    }
+  }
 </script>
 
-<div class="term-view" bind:this={host}></div>
+<div class="term-view" bind:this={host} onpastecapture={onPasteCapture}></div>
 
 <style>
   .term-view {
