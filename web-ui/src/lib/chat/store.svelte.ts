@@ -68,19 +68,41 @@ export interface CheckpointRef {
   preceding: string | null;
 }
 
+/** A user message the agent has NOT consumed yet — held in the pending stack
+ *  above the composer, deliberately kept OUT of the transcript `blocks` so it
+ *  can never splice into a running turn's output. Rebuilt purely from journaled
+ *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
+ *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
+ *  here marked "not delivered". */
+export interface PendingSend {
+  /** Delivery key (the wire's client-minted uuid) — the `UserMessageUpdate` /
+   *  `CancelQueued` match key. */
+  id: string;
+  text: string;
+  attachments: number;
+  /** Its checkpoint anchor arrives (claude) right after the queued echo; kept
+   *  here so it rides along when the send is promoted into `blocks`. */
+  checkpoint: CheckpointRef | null;
+  /** queued = still waiting for the agent; dropped = it never got it (claude's
+   *  queue died with an aborted turn / a codex steer failed for good) — kept
+   *  visible as "not delivered" so the text can be copied and re-sent. */
+  state: "queued" | "dropped";
+}
+
 export type ChatBlock =
   | {
+      /** A DELIVERED user message, in transcript order. A queued send is NOT a
+       *  block — it lives in `pendingSends` until it resolves `sent`, then it
+       *  is appended here at the current end (after the turn it waited behind),
+       *  never spliced into a running turn's output. So a user block in `blocks`
+       *  is always one the agent received. */
       kind: "user";
       text: string;
       attachments: number;
       checkpoint: CheckpointRef | null;
-      /** Delivery key (the wire's client-minted uuid); null on old journals
-       *  and transcript-seeded messages — those are sent by definition. */
+      /** Delivery key (the wire's client-minted uuid); null on old journals,
+       *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
-      /** queued = the agent hasn't consumed it yet (claude's native mid-turn
-       *  queue / a codex steer in flight); dropped = it never will (claude's
-       *  queue dies with an aborted turn; a codex steer failed for good). */
-      state: "sent" | "queued" | "dropped";
     }
   | { kind: "message"; text: string; turnId: string }
   | { kind: "thought"; text: string; turnId: string }
@@ -213,18 +235,14 @@ export class ChatStore {
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
 
-  /** Queued/undelivered user messages, in order — rendered in a holding
-   *  stack pinned above the composer (the send point), NOT inline in
-   *  history: a queued message is one you've typed and are waiting to send.
-   *  Derived from the single `blocks` source, so when a `user_message_update`
-   *  flips a block to `sent` it drops out of here and appears inline in the
-   *  transcript, chronologically in place (queued blocks are appended last). */
-  pendingUserBlocks = $derived(
-    this.blocks.filter(
-      (b): b is Extract<ChatBlock, { kind: "user" }> =>
-        b.kind === "user" && (b.state === "queued" || b.state === "dropped"),
-    ),
-  );
+  /** Queued/undelivered user messages, in order — rendered in a holding stack
+   *  pinned above the composer (the send point), NEVER inline in history: a
+   *  queued message is one you've typed and are waiting on. This is its OWN
+   *  list, not a slice of `blocks`, so a queued send can't splice into a
+   *  running turn's output. A `user_message_update{sent}` moves the entry into
+   *  `blocks` at the current end (the reducer, so replay agrees); `cancelled`
+   *  removes it; `dropped` marks it "not delivered" and it stays here. */
+  pendingSends = $state<PendingSend[]>([]);
 
   /** Highest seq applied; the reconnect auth carries it for gap replay.
    *  Reactive so views can track "any event applied" (in-place chunk appends
@@ -264,9 +282,10 @@ export class ChatStore {
     this.toolIndex.clear();
     this.userIndex.clear();
     this.questionIndex.clear();
-    // Pending asks belong to the journal being rebuilt; the fresh replay
-    // re-delivers any that are still live.
+    // Pending asks and sends belong to the journal being rebuilt; the fresh
+    // replay re-delivers any that are still live.
     this.pending = [];
+    this.pendingSends = [];
     this.questions = [];
     this.lastSeq = 0;
     this.exited = null;
@@ -309,40 +328,84 @@ export class ChatStore {
       }
       case "user_message": {
         const id = (ev.id as string) ?? null;
-        this.blocks.push({
-          kind: "user",
-          text: ev.text as string,
-          attachments: (ev.attachments as number) ?? 0,
-          checkpoint: null,
-          id,
-          state: ev.queued === true ? "queued" : "sent",
-        });
-        if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
+        const text = ev.text as string;
+        const attachments = (ev.attachments as number) ?? 0;
+        if (ev.queued === true && id !== null) {
+          // Queued: park it in the pending stack, NOT in the transcript at its
+          // mid-turn send position (that splice would split the agent's live
+          // message in two). It enters `blocks` only once delivery resolves.
+          this.pendingSends.push({ id, text, attachments, checkpoint: null, state: "queued" });
+        } else {
+          // A fresh (turn-opening) send, or a permission-feedback echo — it was
+          // received, so it goes straight into history.
+          this.blocks.push({ kind: "user", text, attachments, checkpoint: null, id });
+          if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
+        }
         this.promptSuggestion = null;
         break;
       }
       case "user_message_update": {
-        // Delivery resolution for a queued bubble — patched in place, so a
-        // queued-then-sent message renders exactly once on live AND replay.
-        const idx = this.userIndex.get(ev.id as string);
-        if (idx === undefined) break;
-        const block = this.blocks[idx];
-        if (block.kind !== "user") break;
-        block.state = ev.state === "dropped" ? "dropped" : "sent";
+        // Delivery resolution for a queued send. Driven purely by the reducer,
+        // so live and replay build the identical transcript.
+        const id = ev.id as string;
+        const pIdx = this.pendingSends.findIndex((p) => p.id === id);
+        if (pIdx === -1) break; // unknown / already resolved
+        const pending = this.pendingSends[pIdx];
+        const state = ev.state as string;
+        if (state === "sent") {
+          // Delivered: leave the pending stack and enter the transcript at the
+          // CURRENT end — after the turn it was queued behind, never spliced
+          // into it. appendText only inspects the tail, so a following agent
+          // chunk starts a fresh block: the agent's message is never split.
+          this.pendingSends.splice(pIdx, 1);
+          this.blocks.push({
+            kind: "user",
+            text: pending.text,
+            attachments: pending.attachments,
+            checkpoint: pending.checkpoint,
+            id: pending.id,
+          });
+          this.userIndex.set(pending.id, this.blocks.length - 1);
+        } else if (state === "cancelled") {
+          // Pulled back before the agent saw it — it never happened. Vanish
+          // entirely (it was never in `blocks`), so nothing to clean up there.
+          this.pendingSends.splice(pIdx, 1);
+        } else {
+          // dropped: the agent never got it — keep it visible as "not
+          // delivered" so the text can be copied and re-sent.
+          pending.state = "dropped";
+        }
         break;
       }
       case "prompt_suggestion":
         this.promptSuggestion = ev.text as string;
         break;
       case "checkpoint": {
-        // Stamps the user message it directly follows.
+        // Stamps the user message it belongs to, matched by uuid (the driver
+        // emits the checkpoint right after that message's echo, carrying its
+        // id). A queued send is still in the pending stack at this point, so
+        // check there first; the anchor rides along when it promotes to a block.
+        const umid = ev.user_message_id as string;
+        const cp: CheckpointRef = { id: umid, preceding: (ev.preceding_uuid as string) ?? null };
+        const p = this.pendingSends.find((s) => s.id === umid);
+        if (p !== undefined) {
+          p.checkpoint = cp;
+          break;
+        }
+        const idx = this.userIndex.get(umid);
+        if (idx !== undefined) {
+          const block = this.blocks[idx];
+          if (block.kind === "user") {
+            block.checkpoint = cp;
+            break;
+          }
+        }
+        // Fallback for pre-id journals (the user echo carried no id to match):
+        // stamp the last delivered user block, the message this followed.
         for (let i = this.blocks.length - 1; i >= 0; i--) {
           const block = this.blocks[i];
           if (block.kind === "user") {
-            block.checkpoint = {
-              id: ev.user_message_id as string,
-              preceding: (ev.preceding_uuid as string) ?? null,
-            };
+            block.checkpoint = cp;
             break;
           }
         }
@@ -694,9 +757,8 @@ export class ChatStore {
     const seen = new Set<string>();
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
-      // A queued/dropped user bubble sits at the tail DURING a turn — it is
-      // not the turn boundary, so skip past it to reach this turn's tools.
-      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) continue;
+      // Every user block here is delivered (queued sends live in pendingSends),
+      // so a user block IS this turn's opening boundary — stop the scan.
       if (b.kind === "user" || b.kind === "turn_end") break;
       if (b.kind !== "tool" || b.status !== "completed" || b.denied) continue;
       for (const loc of b.locations) {
@@ -725,21 +787,13 @@ export class ChatStore {
   }
 
   /** Withdraw the current turn's trailing agent prose (refusal retries and
-   *  superseding messages REPLACE it). Tool cards and user messages stay.
-   *  Queued/dropped user bubbles append to the tail DURING a turn, so they sit
-   *  AFTER this turn's prose — skip past them and drop the prose run beneath,
-   *  leaving the bubbles in place (a plain tail splice would stop at a bubble
-   *  and never retract the prose). A non-tail splice → rebuild the indexes. */
+   *  superseding messages REPLACE it). Tool cards and user messages stay. Only
+   *  delivered user messages live in `blocks` now (queued sends are in the
+   *  pending stack), so the trailing prose run is always at the very tail — a
+   *  plain tail splice. A codex steer that resolved `sent` mid-turn is a real
+   *  boundary and correctly stops the scan. A non-tail splice → rebuild. */
   private dropTrailingProse(): void {
-    let end = this.blocks.length;
-    while (end > 0) {
-      const b = this.blocks[end - 1];
-      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) {
-        end--;
-        continue;
-      }
-      break;
-    }
+    const end = this.blocks.length;
     let start = end;
     while (start > 0) {
       const kind = this.blocks[start - 1].kind;

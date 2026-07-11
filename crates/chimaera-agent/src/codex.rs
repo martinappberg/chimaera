@@ -184,7 +184,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{
     run_driver, AgentAdapter, Driver, DriverExit, DriverIo, DriverStep, Handshake, Mapper,
-    SpawnSpec, INTERRUPT_GRACE_TICKS,
+    SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
@@ -473,6 +473,12 @@ struct CodexMapper {
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
     /// See `INTERRUPT_GRACE_TICKS`.
     interrupt_grace: Option<u32>,
+    /// Idle-flush watchdog: ticks remaining before we rescue a stranded
+    /// buffer. Managed in `tick`, armed when the driver is idle (no active or
+    /// pending turn) with `buffered_sends` still holding messages a turn end
+    /// left un-steered. Symmetric to claude's idle-flush; see
+    /// `IDLE_FLUSH_GRACE_TICKS`.
+    idle_flush_grace: Option<u32>,
     coalescer: Coalescer,
     /// agentMessage item ids that streamed deltas (skip their completed text).
     streamed: HashSet<String>,
@@ -541,6 +547,7 @@ impl CodexMapper {
             turn_pending: false,
             buffered_sends: Vec::new(),
             interrupt_grace: None,
+            idle_flush_grace: None,
             coalescer: Coalescer::new(),
             streamed: HashSet::new(),
             pending_approvals: HashMap::new(),
@@ -2004,6 +2011,28 @@ impl CodexMapper {
                     "params": { "threadId": self.thread_id },
                 }));
             }
+            // Pull back a still-queued message. Only a send still sitting in
+            // the pre-steer buffer (captured during a turn/start window) can be
+            // cancelled — it never reached codex. A send that was already
+            // steered into the running turn is delivered (its steer RPC is in
+            // flight or answered), so it can't be un-said: emit a Notice, the
+            // symmetric-intent counterpart to claude's "already delivered".
+            AgentCommand::CancelQueued { id } => {
+                let before = self.buffered_sends.len();
+                self.buffered_sends.retain(|(_, cid)| cid != &id);
+                if self.buffered_sends.len() != before {
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id,
+                        state: UserMessageState::Cancelled,
+                    });
+                } else {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that message was already delivered to the agent — \
+                               too late to cancel it"
+                            .into(),
+                    });
+                }
+            }
             // No codex equivalents on this surface. Rewind is not a driver
             // command here: the conversation rewind is the server's respawn
             // recipe (thread/resume + thread/rollback at handshake), and
@@ -2082,6 +2111,40 @@ impl CodexMapper {
         self.reset_turn_state();
         step
     }
+
+    /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`) — codex's symmetric
+    /// counterpart to claude's. codex normally resolves every queued message at
+    /// a well-defined point (a steer's RPC answer, or the turn-end drain), so
+    /// this is the defensive rescue for the one seam where it can't: a turn end
+    /// that fires while a `turn/start` was still in flight (`turn_pending`)
+    /// leaves `buffered_sends` stranded with no turn to steer them into. When
+    /// the driver is idle with a stranded buffer past the grace, re-drive the
+    /// oldest as a fresh turn (delivering it, resolving `sent`); the rest
+    /// re-buffer and steer once it starts — the same path a `turn/start` error
+    /// takes. Honest by construction: unlike claude's write-then-coalesce
+    /// queue, a codex buffer was never sent, so we DELIVER it rather than
+    /// declare it sent unseen.
+    fn idle_flush(&mut self) -> DriverStep {
+        let mut step = DriverStep::default();
+        if self.turn_active || self.turn_pending || self.buffered_sends.is_empty() {
+            self.idle_flush_grace = None;
+            return step;
+        }
+        match self.idle_flush_grace {
+            None => {
+                self.idle_flush_grace = Some(IDLE_FLUSH_GRACE_TICKS);
+            }
+            Some(remaining) if remaining > 1 => {
+                self.idle_flush_grace = Some(remaining - 1);
+            }
+            Some(_) => {
+                self.idle_flush_grace = None;
+                let (input, client_msg_id) = self.buffered_sends.remove(0);
+                self.redrive_as_fresh_turn(input, client_msg_id, &mut step);
+            }
+        }
+        step
+    }
 }
 
 /// Harness adapter: the inherent methods above ARE the state machine; these
@@ -2108,6 +2171,9 @@ impl Mapper for CodexMapper {
         let watchdog = self.interrupt_watchdog();
         step.events.extend(watchdog.events);
         step.outbound.extend(watchdog.outbound);
+        let flush = self.idle_flush();
+        step.events.extend(flush.events);
+        step.outbound.extend(flush.outbound);
         step
     }
 }
@@ -2462,6 +2528,138 @@ mod tests {
             "must not redrive a queued message after a user stop: {:?}",
             step.outbound
         );
+    }
+
+    /// Feature 2 (codex): a send still sitting in the pre-steer buffer can be
+    /// cancelled — it resolves `Cancelled`, leaves the buffer, and never steers
+    /// into the turn once it starts.
+    #[test]
+    fn cancel_queued_drops_a_buffered_send() {
+        let mut m = mapper();
+        // First send opens the turn (turn/start); the start window is now open.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "A".into() }],
+        });
+        assert!(m.turn_pending);
+        // Second send buffers during the window.
+        let buffered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // Cancel it: resolves Cancelled and empties the buffer.
+        let step = m.on_command(AgentCommand::CancelQueued {
+            id: buffered.clone(),
+        });
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: buffered.clone(),
+                state: UserMessageState::Cancelled,
+            }]
+        );
+        assert!(m.buffered_sends.is_empty(), "the buffer is emptied");
+        // turn/started now steers NOTHING — the cancelled send is gone.
+        let step = m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-Z" } },
+        }));
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/steer"),
+            "a cancelled buffered send never steers: {:?}",
+            step.outbound
+        );
+    }
+
+    /// Feature 2 (codex): a send already steered into the running turn is
+    /// delivered — cancelling it is a Notice, never a phantom `Cancelled`.
+    #[test]
+    fn cancel_queued_after_steer_is_a_notice() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let steered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // It was steered (buffer is empty), so it can't be pulled back.
+        assert!(m.buffered_sends.is_empty());
+        let step = m.on_command(AgentCommand::CancelQueued { id: steered });
+        assert!(matches!(
+            step.events.as_slice(),
+            [AgentEvent::Notice { text }] if text.contains("too late to cancel")
+        ));
+    }
+
+    /// Feature 1 (codex): a buffer stranded when a turn ended under a pending
+    /// turn/start is rescued by the idle-flush — re-driven as a fresh turn
+    /// (delivered, resolves `sent`), never left faded "queued". Symmetric to
+    /// claude's idle-flush.
+    #[test]
+    fn idle_flush_redrives_a_stranded_buffer() {
+        let mut m = mapper();
+        // A turn/start in flight, with a send buffered behind it…
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "A".into() }],
+        });
+        assert!(m.turn_pending);
+        let buffered = match &m
+            .on_command(AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "B".into() }],
+            })
+            .events[0]
+        {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected a queued UserMessage, got {other:?}"),
+        };
+        // …then a turn ends under the pending start (no turn/started ever
+        // landed), stranding the buffer: reset_turn_state clears turn_pending
+        // but leaves buffered_sends, and turn_active was never set.
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(!m.turn_pending && !m.turn_active);
+        assert_eq!(m.buffered_sends.len(), 1, "the buffer is stranded");
+
+        // Ticks below the grace do nothing…
+        for _ in 0..IDLE_FLUSH_GRACE_TICKS {
+            assert!(
+                m.tick().events.is_empty(),
+                "no flush before the idle grace expires"
+            );
+        }
+        // …the expiring tick re-drives it: resolves sent AND opens a real turn
+        // (honest delivery — a codex buffer was never sent).
+        let step = m.tick();
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == buffered
+            )),
+            "the stranded buffer resolves sent: {:?}",
+            step.events
+        );
+        assert!(
+            step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "and is delivered as a fresh turn: {:?}",
+            step.outbound
+        );
+        assert!(m.buffered_sends.is_empty(), "the buffer drained");
     }
 
     /// The interrupt watchdog (two-driver symmetry with claude): when the

@@ -659,6 +659,247 @@ async fn interrupt_recovers_a_hung_turn_via_watchdog() {
     );
 }
 
+/// Feature 1 — a coalesced SURPLUS never sticks "queued". When the CLI folds
+/// every mid-turn send into the running turn (no follow-up result at all), the
+/// trailing queued id is never popped by a result; the idle-flush must resolve
+/// it `sent` once the session goes idle — not leave it faded forever, and not
+/// drop it (an idle un-aborted queue reached the CLI).
+#[tokio::test]
+async fn coalesced_surplus_flushes_sent_when_idle() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-idle", &fx.cwd, "coalesce-all"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-idle", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    // Turn one parks on a permission, with TWO messages queued behind it.
+    send_text(&fx, "s-idle", "first").await;
+    let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    let request_id = match &permission.ev {
+        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+    let mut queued_ids = Vec::new();
+    for text in ["second", "third"] {
+        send_text(&fx, "s-idle", text).await;
+        let ev = wait_for(
+            &mut rx,
+            &mut seen,
+            "queued UserMessage",
+            |ev| matches!(ev, AgentEvent::UserMessage { text: t, queued: true, .. } if t == text),
+        )
+        .await;
+        match &ev.ev {
+            AgentEvent::UserMessage { id: Some(id), .. } => queued_ids.push(id.clone()),
+            _ => unreachable!(),
+        }
+    }
+
+    // Allow the tool: the fake coalesces BOTH queued sends into turn one and
+    // emits no follow-up. Turn one's single result pops "second" (sent); the
+    // surplus "third" has no result to pop.
+    fx.manager
+        .command(
+            "s-idle",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+
+    // The surplus resolves `sent` from the idle-flush (not a result), after the
+    // grace — the crux of Feature 1: it never stays stuck "queued".
+    let surplus = queued_ids.last().unwrap().clone();
+    wait_for(&mut rx, &mut seen, "idle-flush UserMessageUpdate sent", |ev| {
+        matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == surplus)
+    })
+    .await;
+
+    // Both queued messages end `sent` exactly once, never `dropped`; the
+    // session is idle (one turn opened, one ended — no phantom turn).
+    let replay = fx.manager.attach("s-idle", 0).expect("replay").replay;
+    for id in &queued_ids {
+        let states: Vec<_> = replay
+            .iter()
+            .filter_map(|e| match &e.ev {
+                AgentEvent::UserMessageUpdate { id: uid, state } if uid == id => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![UserMessageState::Sent],
+            "queued message {id} resolves sent exactly once via pop-or-idle-flush"
+        );
+    }
+    let (opened, ended) = turn_balance(&replay);
+    assert_eq!(
+        (opened, ended),
+        (1, 1),
+        "no phantom turn — the coalesced surplus opened none: {replay:#?}"
+    );
+}
+
+/// Feature 2 — cancelling a still-queued message un-queues it: the driver emits
+/// `Cancelled` (not sent/dropped), sends the CLI a `cancel_async_message`, and
+/// the message resolves exactly once as cancelled on replay.
+#[tokio::test]
+async fn cancel_queued_removes_a_still_queued_message() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-cx", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-cx", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let (queued_id, request_id) = queue_second_send(&fx, "s-cx", &mut rx, &mut seen).await;
+
+    // Pull the queued message back BEFORE the running turn finishes.
+    fx.manager
+        .command(
+            "s-cx",
+            AgentCommand::CancelQueued {
+                id: queued_id.clone(),
+            },
+        )
+        .await
+        .expect("cancel");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessageUpdate cancelled",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Cancelled } if *id == queued_id),
+    )
+    .await;
+
+    // Finish turn one. The cancelled message was un-queued (the fake honored
+    // cancel_async_message), so NO follow-up turn runs for it and no `sent`
+    // ever lands for that id.
+    fx.manager
+        .command(
+            "s-cx",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "turn one TurnCompleted",
+        |ev| matches!(ev, AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t1"),
+    )
+    .await;
+
+    // Replay: the cancelled message is echoed once and resolves ONLY cancelled
+    // (a reducer folds the pair to nothing — the bubble vanishes).
+    let replay = fx.manager.attach("s-cx", 0).expect("replay").replay;
+    let echoes = replay
+        .iter()
+        .filter(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text == "second"))
+        .count();
+    assert_eq!(echoes, 1, "the cancelled message is echoed exactly once");
+    let updates: Vec<_> = replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::UserMessageUpdate { id, state } if *id == queued_id => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updates,
+        vec![UserMessageState::Cancelled],
+        "a cancelled message resolves cancelled, never sent/dropped"
+    );
+    // No phantom turn ran for the un-queued message.
+    assert!(
+        !replay
+            .iter()
+            .any(|e| matches!(&e.ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
+        "the un-queued message opened no turn"
+    );
+}
+
+/// Feature 2 — cancelling a message the agent ALREADY took is a no-op with a
+/// Notice: the driver can't un-say it, so it never emits a phantom `Cancelled`.
+#[tokio::test]
+async fn cancel_queued_after_delivery_is_a_notice() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-cn", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-cn", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let (queued_id, request_id) = queue_second_send(&fx, "s-cn", &mut rx, &mut seen).await;
+
+    // Let turn one finish so the queued message dequeues `sent` (delivered).
+    fx.manager
+        .command(
+            "s-cn",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+                feedback: None,
+            },
+        )
+        .await
+        .expect("permission");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessageUpdate sent",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued_id),
+    )
+    .await;
+
+    // Now cancel it — too late. A Notice, and NO Cancelled for that id.
+    fx.manager
+        .command(
+            "s-cn",
+            AgentCommand::CancelQueued {
+                id: queued_id.clone(),
+            },
+        )
+        .await
+        .expect("cancel");
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "too-late Notice",
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("too late to cancel")),
+    )
+    .await;
+
+    let replay = fx.manager.attach("s-cn", 0).expect("replay").replay;
+    assert!(
+        !replay.iter().any(|e| matches!(
+            &e.ev,
+            AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Cancelled,
+            } if *id == queued_id
+        )),
+        "a delivered message must never resolve cancelled"
+    );
+}
+
 #[tokio::test]
 async fn permission_deny_with_feedback_continues_turn() {
     let fx = fixture();

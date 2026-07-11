@@ -605,6 +605,90 @@ async fn claude_mid_turn_send_queues_natively() {
         .expect("shutdown");
 }
 
+/// LIVE PROBE — does `cancel_async_message` actually un-queue a mid-turn send?
+/// The subtype is defined in the SDK but never called by the official
+/// extension, so its real effect is unverified (the crux of the CancelQueued
+/// feature). Queue a distinctively-answered message mid-turn, immediately send
+/// the cancel control request for its uuid, then drain to idle and REPORT
+/// whether the message still ran. Diagnostic either way — the driver marks the
+/// bubble Cancelled locally regardless — so this asserts only the session-
+/// health invariant and prints the observed behavior for PROTOCOL.md.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills tiny turns — reports cancel_async_message behavior"]
+async fn claude_cancel_async_message_behavior() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+
+    // Turn 1 runs; a second message queues behind it with a known uuid and a
+    // distinctive reply we can spot if it ever runs.
+    chat.send_user_text("Reply with exactly: first")
+        .await
+        .expect("send 1");
+    let cancel_uuid = chat
+        .send_user_text_with_uuid("Reply with exactly: CANCELME")
+        .await
+        .expect("send 2");
+
+    // Immediately ask the CLI to un-queue that message.
+    chat.send_control(json!({
+        "subtype": "cancel_async_message",
+        "message_uuid": cancel_uuid,
+    }))
+    .await
+    .expect("cancel_async_message");
+
+    // Drain: count result frames and watch for the CANCELME reply. If the CLI
+    // honored the cancel, only turn 1 runs (one result, then idle, no CANCELME).
+    // If it ignored it, the queued message runs too (a second result + CANCELME).
+    let mut results = 0;
+    let mut saw_cancelme = false;
+    loop {
+        match chat.recv(TURN).await {
+            Ok(Some(frame)) => match frame["type"].as_str() {
+                Some("result") => {
+                    results += 1;
+                    if results >= 2 {
+                        break;
+                    }
+                }
+                Some("assistant") => {
+                    let text = frame["message"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if text.contains("CANCELME") {
+                        saw_cancelme = true;
+                    }
+                }
+                _ => {}
+            },
+            Ok(None) => break, // CLI exited
+            Err(_) => break,   // idle: no further frame within TURN
+        }
+    }
+
+    eprintln!(
+        "LIVE cancel_async_message: results={results}, queued_message_ran={saw_cancelme} => \
+         cancel_async_message {}",
+        if saw_cancelme {
+            "does NOT un-queue (the message still ran)"
+        } else {
+            "UN-QUEUES (the message did not run)"
+        }
+    );
+
+    // Either outcome is acceptable; the invariant is that the cancel didn't
+    // wedge the session — turn 1 completed and the stream stayed healthy.
+    assert!(
+        results >= 1,
+        "at least turn 1 completed (results={results})"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// Three rapid queued sends against the REAL claude driver must SETTLE IDLE:
 /// every turn the CLI opens must also end. The real CLI coalesces rapid queued
 /// sends (the prior run confirmed 3 sends → 2 turns), so the count is not

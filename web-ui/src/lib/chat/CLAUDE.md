@@ -33,7 +33,7 @@ hard-resets and rebuilds.
 
 | File | What it owns |
 |---|---|
-| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** |
+| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `ChatView.svelte` | The host: wires the socket + store, renders the transcript, and hangs the header/composer/overlays/panels off itself. Still the big one — keep new chrome in child components, not inline. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
@@ -64,6 +64,14 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
 - **Never lose a user action to a closed socket.** `socket.send` returns `false`
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
+- **A queued send is NOT a transcript block.** Queued/undelivered user messages
+  live in `store.pendingSends` (the stack above the composer), never in `blocks` —
+  so a mid-turn send can't splice into a running turn's output. The reducer moves
+  an entry into `blocks` (appended at the end) only when `user_message_update`
+  resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
+  and it stays in the stack. Cancel rides the `cancel_queued` command (the ✕ on a
+  queued bubble → `socket.send({type:"cancel_queued", id})`). This is all pure
+  reducer, so replay rebuilds the identical order — see `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
 - **Runes discipline.** Mutate `$state` only inside the store's methods; give

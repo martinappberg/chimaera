@@ -184,6 +184,15 @@
     socket.send({ type: "interrupt" });
   }
 
+  /** Pull back a still-queued message before the agent consumes it. The store
+   *  removes it on the resulting `user_message_update{cancelled}` (deterministic
+   *  from the wire, so replay agrees). Respect the closed-socket rule: if it
+   *  can't send, the message stays queued and the user can retry. */
+  function cancelQueued(id: string) {
+    const sent = socket.send({ type: "cancel_queued", id });
+    if (!sent) store.notice("not connected — couldn't cancel, try again in a moment", "error");
+  }
+
   /** Dialog-only slash commands get native UI here instead of the CLI's
    *  "isn't available in this environment" dead end. Arguments resolve
    *  directly ("/effort high", "/model opus"); bare commands open pickers. */
@@ -479,14 +488,9 @@
     const items: RenderItem[] = [];
     let group: Extract<RenderItem, { t: "group" }> | null = null;
     store.blocks.forEach((block, i) => {
-      // Queued/undelivered user messages live in the bottom pending stack
-      // (rendered above the composer), not inline in history — a queued
-      // message is one still waiting to send. Once delivery flips it to
-      // `sent` it re-enters here in place (it was appended last).
-      if (block.kind === "user" && (block.state === "queued" || block.state === "dropped")) {
-        group = null;
-        return;
-      }
+      // Every user block in `blocks` is delivered — queued/undelivered sends
+      // live in the bottom pending stack (`store.pendingSends`), never here — so
+      // they all render inline in transcript order.
       if (block.kind === "tool") {
         if (group === null) {
           group = { t: "group", key: `g-${block.id}`, tools: [] };
@@ -501,18 +505,10 @@
     return items;
   });
 
-  /** Index of the last block rendered INLINE (a pending user block, held in
-   *  the bottom stack, is skipped). The streaming reveal keys off this rather
-   *  than `blocks.length - 1`, so a queued send appended after the streaming
-   *  message doesn't stop the reveal. */
-  const lastInlineIndex = $derived.by(() => {
-    for (let i = store.blocks.length - 1; i >= 0; i--) {
-      const b = store.blocks[i];
-      if (b.kind === "user" && (b.state === "queued" || b.state === "dropped")) continue;
-      return i;
-    }
-    return -1;
-  });
+  /** Index of the last block (the streaming reveal keys off it). Every block
+   *  renders inline now — queued sends live in the pending stack, not in
+   *  `blocks` — so this is simply the tail. */
+  const lastInlineIndex = $derived(store.blocks.length - 1);
 </script>
 
 <!-- The outside-dismiss action closes any open header menu / the /mcp panel on
@@ -767,26 +763,33 @@
 
   <!-- Pending stack: messages typed and waiting to send, held at the send
        point (right above the composer) rather than inline in history. On
-       delivery the block leaves this stack and re-enters the transcript as
-       the newest turn; a dropped one stays here, marked "not delivered". -->
-  {#if store.pendingUserBlocks.length > 0}
+       delivery the entry leaves this stack and enters the transcript as the
+       newest turn; a still-queued one can be pulled back with ✕; a dropped one
+       stays here, marked "not delivered". -->
+  {#if store.pendingSends.length > 0}
     <div class="pending" aria-label="queued messages">
-      {#each store.pendingUserBlocks as block, i (block.id ?? `p-${i}`)}
-        <div class="msg user pending-msg" class:dropped={block.state === "dropped"}>
+      {#each store.pendingSends as send (send.id)}
+        <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
           <div class="bubble-row">
+            {#if send.state === "queued"}
+              <button
+                class="cancel-btn"
+                title="cancel this queued message (remove it before the agent sees it)"
+                aria-label="cancel queued message"
+                onclick={() => cancelQueued(send.id)}
+              >
+                ✕
+              </button>
+            {/if}
             <div class="bubble">
-              <UserText
-                text={block.text}
-                onOpenPath={openProsePath}
-                resolvePaths={resolveProsePaths}
-              />
+              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
             </div>
           </div>
-          <span class="delivery" class:dropped={block.state === "dropped"}>
-            {block.state === "dropped" ? "not delivered" : "queued"}
+          <span class="delivery" class:dropped={send.state === "dropped"}>
+            {send.state === "dropped" ? "not delivered" : "queued"}
           </span>
-          {#if block.attachments > 0}
-            <span class="attach">{block.attachments} image{block.attachments > 1 ? "s" : ""}</span>
+          {#if send.attachments > 0}
+            <span class="attach">{send.attachments} image{send.attachments > 1 ? "s" : ""}</span>
           {/if}
         </div>
       {/each}
@@ -1096,6 +1099,30 @@
   }
   .rewind-btn:hover {
     color: var(--accent);
+  }
+  /* The ✕ on a queued bubble: pull it back before the agent sees it. Quiet by
+     default (mirrors .rewind-btn), reveals on hover/focus of the pending row,
+     and warms to --err on hover since it discards. */
+  .cancel-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    opacity: 0;
+    transition:
+      opacity 0.12s ease,
+      color 0.12s ease;
+  }
+  .pending-msg:hover .cancel-btn,
+  .cancel-btn:focus-visible {
+    opacity: 1;
+  }
+  .cancel-btn:hover {
+    color: var(--err);
   }
   .suggestion-row {
     display: flex;

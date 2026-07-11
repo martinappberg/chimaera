@@ -432,8 +432,9 @@ file list is therefore honest about exactly what will revert.
   thresholds — render whatever non-allowed arrives.
 - Queueing: NO client queue exists — mid-turn user frames go straight to
   stdin and the CLI queues them (live-verified: two results, in order).
-  `cancel_async_message {message_uuid}` exists in the SDK but the extension
-  never calls it; ours doesn't either.
+  `cancel_async_message {message_uuid}` exists in the SDK; the extension
+  never calls it, but ours DOES now, for the `CancelQueued` command — see
+  Pass 12 for the un-queue reliability.
 - Subagents: `task_started {task_id, task_type ("local_agent" only),
   description, prompt}`, `task_progress {task_id, description?,
   last_tool_name?, summary?, usage:{total_tokens, tool_uses, duration_ms}}`,
@@ -680,8 +681,10 @@ Emission points, per driver:
   Pass 11 — the eager synthetic open was the "stuck running" bug, because
   the CLI produces FEWER results than rapid queued sends. An `is_error`
   result drops the CLI's queue with the turn: every queued uuid resolves
-  `dropped` before the `TurnAborted`. (`cancel_async_message` un-queueing
-  remains unadopted — same as the official extension.)
+  `dropped` before the `TurnAborted`. A coalesced SURPLUS the CLI never runs
+  as its own turn resolves `sent` on the idle-flush (Pass 12), never stuck
+  "queued". `cancel_async_message` un-queueing is now adopted for the
+  `CancelQueued` command (Pass 12).
 - **codex** — a steered send (`turn/steer`, incl. sends buffered during
   the turn/start window and flushed on `turn/started`) echoes
   `queued:true` and resolves `sent` when the steer RPC succeeds (steering
@@ -893,3 +896,67 @@ watchdog fired: both turn-end paths now no-op when the turn is already
 closed. claude's `on_result` already gated on `was_active`; codex's
 `turn/completed` / `turn/failed` gained the same `was_active` guard — so a
 late real end never emits a second `TurnAborted`/`TurnCompleted`.
+
+## Pass 12 (2026-07-11 — queued-message lifecycle): idle-flush + CancelQueued
+
+Two maintainer decisions on the queued (faded) user bubble. Both are strictly
+additive on the normalized wire (`UserMessageState::Cancelled` appended;
+`AgentCommand::CancelQueued` appended — `tests/wire_contract.rs` pins both), so
+pre-upgrade journals replay and old clients are unaffected.
+
+### Idle-flush: a coalesced surplus resolves `sent`, never stuck "queued"
+
+Because claude COALESCES rapid mid-turn sends (Pass 11 — fewer `result` frames
+than messages), a surplus queued uuid is never popped by a result and its
+bubble would stay faded "queued" forever (until teardown drops it). The
+maintainer kept the native coalescing (NOT client-side sequential delivery), so
+the fix is at resolution time: once the driver is IDLE with the queue still
+non-empty, the CLI has drained/coalesced it — the messages reached stdin the
+instant they were written — so resolve every remaining uuid `sent`.
+
+- Mechanism: a tick-counted grace (`IDLE_FLUSH_GRACE_TICKS` ≈ 1.5s in
+  `driver.rs`), armed in the harness `tick` when `!turn_active` and the queue is
+  non-empty, reset while a turn is active or the queue empties. On expiry every
+  remaining queued uuid → `UserMessageUpdate{sent}`. Guarded so a genuinely
+  in-flight next turn preempts it (a real turn opening disarms it via
+  `ensure_turn`/fresh-send on claude, `turn/started` on codex); a premature
+  flush would only mark `sent` early, which is the message's correct terminal
+  state anyway (an idle driver has no live turn left to abort it). The
+  is_error/interrupt DROP path is unchanged — an aborted turn still drops its
+  queue.
+- Both drivers, symmetric intent: claude flushes `queued_sends` → `sent` (they
+  were written to stdin already); codex RE-DRIVES a stranded `buffered_sends`
+  entry as a fresh turn (a codex buffer was never sent, so it is DELIVERED, not
+  declared sent unseen) — the defensive rescue for the one seam where a turn
+  ends under a pending `turn/start`.
+
+### CancelQueued: pull back a still-queued message
+
+`AgentCommand::CancelQueued{id}` (client frame `{type:"cancel_queued", id}`,
+deserialized straight to the driver — no server switch) + the resolution
+`UserMessageState::Cancelled`. A cancelled message NEVER happened: the UI drops
+the bubble from both the pending stack and the transcript, and replay agrees
+(the journaled `UserMessage{queued}` + `UserMessageUpdate{cancelled}` fold to
+nothing).
+
+- **claude**: if `id` is still in `queued_sends`, remove it and send the CLI a
+  `{"subtype":"cancel_async_message","message_uuid":id}` control request, then
+  emit `Cancelled`. If it is no longer queued (already popped `sent`, or
+  idle-flushed), emit a `Notice` ("too late to cancel") — it can't be un-said.
+- **codex**: if `id` is still in the pre-steer `buffered_sends`, remove it and
+  emit `Cancelled`. If it was already steered into the running turn (delivered),
+  emit the same `Notice`. Symmetric intent, per-protocol capability.
+
+### `cancel_async_message` reliability — LIVE
+
+The subtype is defined in the bundled SDK but the official extension never calls
+it, so its real un-queue effect was unverified. `tests/live.rs`
+(`claude_cancel_async_message_behavior`, chat-smoke) queues a distinctively-
+answered message mid-turn, sends the cancel for its uuid, and reports whether the
+message still ran.
+
+> **Observed (chat-smoke, claude PENDING_VERSION): PENDING — filled from the
+> live run.** Best-effort by design either way: the driver marks the bubble
+> `Cancelled` locally and journals the resolution regardless, so the UI stays
+> honest and deterministic even if the CLI ignores the control request. We do
+> NOT rewrite the queue model on the strength of it.

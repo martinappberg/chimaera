@@ -10,7 +10,9 @@
 //! `debug_assert` that otherwise guards it).
 
 use chimaera_agent::journal::SeqEvent;
-use chimaera_agent::model::{AgentEvent, PermissionOption, PermissionOptionKind, UserMessageState};
+use chimaera_agent::model::{
+    AgentCommand, AgentEvent, PermissionOption, PermissionOptionKind, UserMessageState,
+};
 use serde_json::json;
 
 #[test]
@@ -122,6 +124,63 @@ fn user_message_delivery_fields_are_additive() {
         .unwrap(),
         json!({ "type": "user_message_update", "id": "u1", "state": "dropped" })
     );
+}
+
+/// `Cancelled` is APPENDED to `UserMessageState`, so the two pre-existing
+/// states serialize byte-identically (old journals/clients are untouched) and
+/// only the user's own pull-back carries the new tag.
+#[test]
+fn cancelled_state_is_appended_and_leaves_the_others_intact() {
+    // The pre-existing states still round-trip with their exact wire tags.
+    for (state, tag) in [
+        (UserMessageState::Sent, "sent"),
+        (UserMessageState::Dropped, "dropped"),
+    ] {
+        assert_eq!(serde_json::to_value(state).unwrap(), json!(tag));
+    }
+    // The appended variant serializes to `cancelled` and folds into the same
+    // update event shape.
+    assert_eq!(
+        serde_json::to_value(UserMessageState::Cancelled).unwrap(),
+        json!("cancelled")
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::UserMessageUpdate {
+            id: "u1".into(),
+            state: UserMessageState::Cancelled,
+        })
+        .unwrap(),
+        json!({ "type": "user_message_update", "id": "u1", "state": "cancelled" })
+    );
+    // An old journal line carrying a pre-upgrade state still deserializes.
+    let old: AgentEvent = serde_json::from_value(
+        json!({ "type": "user_message_update", "id": "u1", "state": "sent" }),
+    )
+    .unwrap();
+    assert_eq!(
+        old,
+        AgentEvent::UserMessageUpdate {
+            id: "u1".into(),
+            state: UserMessageState::Sent,
+        }
+    );
+}
+
+/// `CancelQueued` is APPENDED to `AgentCommand`: the client frame
+/// `{type:"cancel_queued", id}` deserializes into it, and every pre-existing
+/// command frame keeps parsing unchanged (the wire is a public contract).
+#[test]
+fn cancel_queued_command_is_additive() {
+    let cmd: AgentCommand = serde_json::from_str(r#"{"type":"cancel_queued","id":"u1"}"#).unwrap();
+    assert_eq!(cmd, AgentCommand::CancelQueued { id: "u1".into() });
+    // Round-trips back to the same frame shape.
+    assert_eq!(
+        serde_json::to_value(AgentCommand::CancelQueued { id: "u1".into() }).unwrap(),
+        json!({ "type": "cancel_queued", "id": "u1" })
+    );
+    // A pre-upgrade command frame is untouched by the new variant.
+    let interrupt: AgentCommand = serde_json::from_str(r#"{"type":"interrupt"}"#).unwrap();
+    assert_eq!(interrupt, AgentCommand::Interrupt);
 }
 
 /// `interrupted` is additive the same way: false vanishes from the wire, old

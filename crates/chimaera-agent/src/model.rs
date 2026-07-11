@@ -270,11 +270,13 @@ pub enum AgentEvent {
     },
     /// Delivery resolution for a `queued` UserMessage, matched by `id`:
     /// claude dequeues one message per finished turn (and an aborted turn
-    /// drops the whole native queue); codex resolves on the steer RPC
-    /// answer. Replay is self-correcting — the journal carries the queued
-    /// echo and this update through the same reducer, so a queued-then-sent
-    /// message renders exactly once and a queued-never-sent one replays in
-    /// its final dropped state.
+    /// drops the whole native queue; a coalesced surplus the CLI never runs
+    /// separately resolves `sent` when the driver goes idle); codex resolves
+    /// on the steer RPC answer. `cancelled` is the user's own pull-back
+    /// (`CancelQueued`). Replay is self-correcting — the journal carries the
+    /// queued echo and this update through the same reducer, so a
+    /// queued-then-sent message renders exactly once, a queued-never-sent one
+    /// replays in its final dropped state, and a cancelled one vanishes.
     UserMessageUpdate {
         id: String,
         state: UserMessageState,
@@ -285,12 +287,20 @@ pub enum AgentEvent {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserMessageState {
-    /// The agent consumed it (claude ran it as the next turn; codex steered
-    /// it into the running turn).
+    /// The agent consumed it (claude ran it as the next turn — or coalesced it
+    /// into a running one; codex steered it into the running turn).
     Sent,
     /// The agent never saw it (claude's queue dies with an aborted turn;
     /// a codex steer failed for good).
     Dropped,
+    /// The user pulled it back before the agent consumed it (the `CancelQueued`
+    /// command, honored only while the message is still queued). A cancelled
+    /// message never happened: clients REMOVE the bubble entirely — from both
+    /// the pending stack and the transcript — and replay agrees (the journaled
+    /// `UserMessage{queued}` + this update fold to nothing). APPENDED last so
+    /// pre-upgrade clients that don't know the variant still deserialize every
+    /// other update.
+    Cancelled,
 }
 
 /// Commands a client sends into a chat session (WS frames deserialize
@@ -379,6 +389,17 @@ pub enum AgentCommand {
     /// Reconnect a failed MCP server (claude mcp_reconnect).
     ReconnectMcp {
         server: String,
+    },
+    /// Pull back a still-queued user message before the agent consumes it
+    /// (`id` = the queued `UserMessage.id`). Honored only while the message is
+    /// genuinely queued: claude removes it from its native mid-turn queue (a
+    /// `cancel_async_message` control request) and codex drops it from the
+    /// pre-steer buffer, both emitting `UserMessageUpdate{Cancelled}`. Once the
+    /// agent has already taken the message, the driver answers with a `Notice`
+    /// instead (it can't be un-said). APPENDED last: strictly additive, so a
+    /// pre-upgrade client that never sends it is unaffected.
+    CancelQueued {
+        id: String,
     },
 }
 
