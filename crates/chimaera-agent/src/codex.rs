@@ -189,6 +189,7 @@ use crate::driver::{
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
     PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
+    UserMessageState,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -707,9 +708,12 @@ impl CodexMapper {
                 usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
                 let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
                 if turn["status"] == "interrupted" {
+                    // status "interrupted" only follows a turn/interrupt RPC —
+                    // codex's wire carries the user-stop fact structurally.
                     step.events.push(AgentEvent::TurnAborted {
                         turn_id,
                         reason: "interrupted".into(),
+                        interrupted: true,
                     });
                 } else {
                     step.events
@@ -737,6 +741,7 @@ impl CodexMapper {
                         .as_str()
                         .unwrap_or("turn failed")
                         .to_string(),
+                    interrupted: false,
                 });
                 // A failed turn must reset per-turn state exactly like a
                 // completed one — else the safety notice stays suppressed and
@@ -786,7 +791,7 @@ impl CodexMapper {
                     // Re-drive any buffered sends so they aren't stranded.
                     if !self.buffered_sends.is_empty() {
                         let (input, client_msg_id) = self.buffered_sends.remove(0);
-                        self.emit_turn_start(input, client_msg_id, step);
+                        self.redrive_as_fresh_turn(input, client_msg_id, step);
                     }
                 }
             }
@@ -826,11 +831,18 @@ impl CodexMapper {
                     // Not a turn-id mismatch: if the turn ended between our send
                     // and this steer, re-drive the saved input as a fresh turn
                     // instead of dropping the already-echoed user message.
-                    None if !self.turn_active => self.emit_turn_start(input, client_msg_id, step),
+                    None if !self.turn_active => {
+                        self.redrive_as_fresh_turn(input, client_msg_id, step)
+                    }
                     None => {
                         step.events.push(AgentEvent::Error {
                             message: format!("steer failed: {msg}"),
                             fatal: false,
+                        });
+                        // Final failure: the agent never saw this message.
+                        step.events.push(AgentEvent::UserMessageUpdate {
+                            id: client_msg_id,
+                            state: UserMessageState::Dropped,
                         });
                     }
                 }
@@ -844,11 +856,16 @@ impl CodexMapper {
                 Some(err),
             ) => {
                 if !self.turn_active {
-                    self.emit_turn_start(input, client_msg_id, step);
+                    self.redrive_as_fresh_turn(input, client_msg_id, step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("steer failed: {}", err["message"]),
                         fatal: false,
+                    });
+                    // Retried and still refused: the message was not consumed.
+                    step.events.push(AgentEvent::UserMessageUpdate {
+                        id: client_msg_id,
+                        state: UserMessageState::Dropped,
                     });
                 }
             }
@@ -887,7 +904,16 @@ impl CodexMapper {
             (PendingRpc::AccountRead { report }, None) => {
                 self.on_account(&frame["result"], report, step);
             }
-            (PendingRpc::TurnStart | PendingRpc::Steer { .. } | PendingRpc::Interrupt, None) => {}
+            (PendingRpc::Steer { client_msg_id, .. }, None) => {
+                // The steer was accepted: the running turn consumed the
+                // message (steering has no follow-up wire item — the echoed
+                // userMessage item is deliberately ignored to avoid dupes).
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id: client_msg_id,
+                    state: UserMessageState::Sent,
+                });
+            }
+            (PendingRpc::TurnStart | PendingRpc::Interrupt, None) => {}
         }
     }
 
@@ -1497,6 +1523,23 @@ impl CodexMapper {
         }
     }
 
+    /// A queued send whose steer/start window collapsed becomes a fresh
+    /// turn's input — the same standing as a fresh send, so its delivery
+    /// resolves `sent` here (a fresh send never echoes queued at all; a
+    /// later turn/start failure surfaces as an Error notice for both).
+    fn redrive_as_fresh_turn(
+        &mut self,
+        input: Value,
+        client_msg_id: String,
+        step: &mut DriverStep,
+    ) {
+        step.events.push(AgentEvent::UserMessageUpdate {
+            id: client_msg_id.clone(),
+            state: UserMessageState::Sent,
+        });
+        self.emit_turn_start(input, client_msg_id, step);
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
@@ -1518,12 +1561,18 @@ impl CodexMapper {
                         }));
                     }
                 }
+                let input = json!(input);
+                let client_msg_id = crate::model::fresh_uuid();
+                // A steered/buffered send is not consumed by the agent yet:
+                // it echoes queued and resolves via UserMessageUpdate when
+                // the steer RPC answers (or the buffered flush's steer does).
+                let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
                 step.events.push(AgentEvent::UserMessage {
                     text: text.clone(),
                     attachments,
+                    id: Some(client_msg_id.clone()),
+                    queued,
                 });
-                let input = json!(input);
-                let client_msg_id = crate::model::fresh_uuid();
                 if self.turn_active && !self.turn_id.is_empty() {
                     // Type-through: inject into the RUNNING turn (steer).
                     self.emit_steer(input, client_msg_id, &mut step);
@@ -1776,9 +1825,31 @@ mod tests {
                 text: "also do X".into(),
             }],
         });
+        // The echo marks the message queued until the steer RPC answers.
+        let msg_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a steered send echoes queued");
+                id.clone().expect("steered send carries a delivery id")
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-A");
-        assert!(step.outbound[0]["params"]["clientUserMessageId"].is_string());
+        assert_eq!(
+            step.outbound[0]["params"]["clientUserMessageId"],
+            json!(msg_id)
+        );
+
+        // Steer accepted → the message resolves sent, exactly once.
+        let rpc_id = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": rpc_id, "result": {} }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: msg_id,
+                state: UserMessageState::Sent,
+            }]
+        );
     }
 
     #[test]
@@ -1791,7 +1862,8 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/start");
         assert!(m.turn_pending);
         // Second send arrives BEFORE turn/started: it must NOT fire a second
-        // turn/start (which the server rejects, losing the message) — it buffers.
+        // turn/start (which the server rejects, losing the message) — it buffers,
+        // echoed queued until its flushed steer resolves.
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "two".into() }],
         });
@@ -1800,6 +1872,13 @@ mod tests {
             "second send buffers, no second turn/start: {:?}",
             step.outbound
         );
+        let buffered_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a buffered send echoes queued");
+                id.clone().unwrap()
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         // turn/started lands: the buffered send flushes as a steer into it.
         let step = m.on_frame(&json!({
             "method": "turn/started",
@@ -1812,6 +1891,59 @@ mod tests {
             .find(|f| f["method"] == "turn/steer")
             .expect("buffered send steered");
         assert_eq!(steer["params"]["expectedTurnId"], "turn-Z");
+        // …and the flushed steer's success resolves the buffered send.
+        let rpc_id = steer["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({ "id": rpc_id, "result": {} }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::UserMessageUpdate {
+                id: buffered_id,
+                state: UserMessageState::Sent,
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_end_classifies_user_interrupt_vs_failure() {
+        // status "interrupted" is codex's structural user-stop signal.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "interrupted" } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: true,
+                    reason,
+                    ..
+                } if reason == "interrupted"
+            )),
+            "user interrupt carries the structural flag: {:?}",
+            step.events
+        );
+
+        // turn/failed is a genuine failure — never flagged interrupted.
+        let mut m = mapper();
+        active_turn(&mut m);
+        let step = m.on_frame(&json!({
+            "method": "turn/failed",
+            "params": { "error": { "message": "boom" } },
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: false,
+                    reason,
+                    ..
+                } if reason == "boom"
+            )),
+            "failures keep interrupted false: {:?}",
+            step.events
+        );
     }
 
     #[test]
@@ -1901,7 +2033,8 @@ mod tests {
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-B");
 
-        // Second failure surfaces instead of looping.
+        // Second failure surfaces instead of looping — and resolves the
+        // still-queued message as dropped, not stranded.
         let id2 = step.outbound[0]["id"].as_u64().unwrap();
         let step = m.on_frame(&json!({
             "id": id2,
@@ -1912,6 +2045,17 @@ mod tests {
             &step.events[0],
             AgentEvent::Error { fatal: false, .. }
         ));
+        assert!(
+            matches!(
+                &step.events[1],
+                AgentEvent::UserMessageUpdate {
+                    state: UserMessageState::Dropped,
+                    ..
+                }
+            ),
+            "final steer failure drops the message: {:?}",
+            step.events
+        );
     }
 
     #[test]
@@ -1926,13 +2070,20 @@ mod tests {
                 },
             ],
         });
-        assert_eq!(
-            step.events[0],
+        match &step.events[0] {
             AgentEvent::UserMessage {
-                text: "see".into(),
-                attachments: 1
+                text,
+                attachments,
+                id,
+                queued,
+            } => {
+                assert_eq!(text, "see");
+                assert_eq!(*attachments, 1);
+                assert!(id.is_some(), "sends carry a delivery id");
+                assert!(!queued, "a fresh-turn send is not queued");
             }
-        );
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
         let input = &step.outbound[0]["params"]["input"];
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "image");

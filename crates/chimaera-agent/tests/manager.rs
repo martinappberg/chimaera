@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
-use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock, ToolStatus};
+use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock, ToolStatus, UserMessageState};
 use chimaera_agent::{ChatManager, EventHook, ExitHook};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
@@ -277,6 +277,199 @@ async fn permission_deny_marks_tool_failed() {
         matches!(ev, AgentEvent::TurnAborted { .. })
     })
     .await;
+}
+
+/// Send a text message into a session.
+async fn send_text(fx: &Fixture, id: &str, text: &str) {
+    fx.manager
+        .command(
+            id,
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: text.into() }],
+            },
+        )
+        .await
+        .expect("send");
+}
+
+/// Drive a session to the mid-turn point (permission outstanding), then send
+/// a second message that the CLI queues. Returns the queued message's
+/// delivery id and the outstanding permission's request id.
+async fn queue_second_send(
+    fx: &Fixture,
+    id: &str,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<SeqEvent>>,
+    seen: &mut Vec<Arc<SeqEvent>>,
+) -> (String, String) {
+    send_text(fx, id, "first").await;
+    let permission = wait_for(rx, seen, "PermissionRequest", |ev| {
+        matches!(ev, AgentEvent::PermissionRequest { .. })
+    })
+    .await;
+    let request_id = match &permission.ev {
+        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+        _ => unreachable!(),
+    };
+
+    // Turn one is mid-flight: this send queues on the (fake) CLI and must
+    // echo as queued with a delivery id.
+    send_text(fx, id, "second").await;
+    let queued = wait_for(
+        rx,
+        seen,
+        "queued UserMessage",
+        |ev| matches!(ev, AgentEvent::UserMessage { text, queued: true, .. } if text == "second"),
+    )
+    .await;
+    let queued_id = match &queued.ev {
+        AgentEvent::UserMessage { id: Some(id), .. } => id.clone(),
+        _ => unreachable!(),
+    };
+    (queued_id, request_id)
+}
+
+/// A mid-turn send echoes queued, resolves `sent` when the running turn's
+/// result lands, and the journal replays the pair (one message, one update).
+#[tokio::test]
+async fn queued_send_resolves_sent_and_replays_once() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-q1", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-q1", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let (queued_id, request_id) = queue_second_send(&fx, "s-q1", &mut rx, &mut seen).await;
+
+    fx.manager
+        .command(
+            "s-q1",
+            AgentCommand::Permission {
+                request_id,
+                option_id: "allow_once".into(),
+                destination: None,
+            },
+        )
+        .await
+        .expect("permission");
+
+    // Turn one finishes; the queued message dequeues: sent, then its turn.
+    wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+        matches!(ev, AgentEvent::TurnCompleted { .. })
+    })
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessageUpdate sent",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued_id),
+    )
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "queued turn's TurnStarted",
+        |ev| matches!(ev, AgentEvent::TurnStarted { turn_id } if turn_id == "t2"),
+    )
+    .await;
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "queued turn's TurnCompleted",
+        |ev| matches!(ev, AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t2"),
+    )
+    .await;
+
+    // Journal replay carries the queued echo + its resolution exactly once:
+    // a reducer folding it renders one bubble in its final `sent` state.
+    let replay = fx.manager.attach("s-q1", 0).expect("replay").replay;
+    let echoes = replay
+        .iter()
+        .filter(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text == "second"))
+        .count();
+    assert_eq!(echoes, 1, "queued-then-sent appears exactly once");
+    let updates: Vec<_> = replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::UserMessageUpdate { id, state } if *id == queued_id => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates, vec![UserMessageState::Sent]);
+}
+
+/// A user interrupt aborts the turn (structurally marked `interrupted`) and
+/// drops the CLI's queue: the queued message replays in its dropped state.
+#[tokio::test]
+async fn interrupt_drops_queued_send_and_classifies_user_stop() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-q2", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-q2", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let (queued_id, _) = queue_second_send(&fx, "s-q2", &mut rx, &mut seen).await;
+
+    fx.manager
+        .command("s-q2", AgentCommand::Interrupt)
+        .await
+        .expect("interrupt");
+
+    // The queue dies with the aborted turn (dropped precedes the abort)…
+    wait_for(
+        &mut rx,
+        &mut seen,
+        "UserMessageUpdate dropped",
+        |ev| matches!(ev, AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued_id),
+    )
+    .await;
+    // …and the abort is a quiet user stop, not a failure — the fake omits
+    // the result string, so this proves the structural flag, not a string
+    // heuristic.
+    let aborted = wait_for(&mut rx, &mut seen, "TurnAborted", |ev| {
+        matches!(ev, AgentEvent::TurnAborted { .. })
+    })
+    .await;
+    match &aborted.ev {
+        AgentEvent::TurnAborted {
+            interrupted,
+            reason,
+            ..
+        } => {
+            assert!(interrupted, "user stop carries the structural flag");
+            assert_eq!(reason, "interrupted");
+        }
+        _ => unreachable!(),
+    }
+
+    // Replay: queued-never-sent ends dropped, echoed exactly once.
+    let replay = fx.manager.attach("s-q2", 0).expect("replay").replay;
+    let echoes = replay
+        .iter()
+        .filter(|e| matches!(&e.ev, AgentEvent::UserMessage { text, .. } if text == "second"))
+        .count();
+    assert_eq!(echoes, 1);
+    let updates: Vec<_> = replay
+        .iter()
+        .filter_map(|e| match &e.ev {
+            AgentEvent::UserMessageUpdate { id, state } if *id == queued_id => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates, vec![UserMessageState::Dropped]);
+    assert!(
+        replay.iter().any(|e| matches!(
+            &e.ev,
+            AgentEvent::TurnAborted {
+                interrupted: true,
+                ..
+            }
+        )),
+        "the user-stop classification survives replay"
+    );
 }
 
 #[tokio::test]

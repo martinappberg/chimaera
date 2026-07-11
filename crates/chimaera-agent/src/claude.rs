@@ -19,7 +19,7 @@
 //!   (mirroring the CLI's own frames). A top-level `request_id` is silently
 //!   ignored and the CLI hangs waiting for the answer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Duration;
 
@@ -34,8 +34,8 @@ use crate::driver::{
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer,
     ContentBlock, ModeInfo, PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus,
-    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, DIFF_FILE_BUDGET,
-    DIFF_TURN_BUDGET,
+    SlashCommand, ToolContent, ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -451,10 +451,16 @@ struct ClaudeMapper {
     task_rows: HashMap<String, String>,
     /// Open Task tool cards: tool_use_id → description, for that correlation.
     agent_tools: HashMap<String, String>,
-    /// User messages sent while a turn was running: the CLI queues them
-    /// natively (mid-turn stdin writes are the official client's behavior),
-    /// so the mapper defers the TurnStarted boundary until each result lands.
-    queued_sends: u32,
+    /// User messages sent while a turn was running, FIFO of their client-
+    /// minted uuids: the CLI queues them natively (mid-turn stdin writes are
+    /// the official client's behavior), so the mapper defers the TurnStarted
+    /// boundary until each result lands — and resolves each message's
+    /// delivery (UserMessageUpdate sent/dropped) at that same boundary.
+    queued_sends: VecDeque<String>,
+    /// We issued an interrupt control request and no result has landed
+    /// since — the one deterministic "this abort was user-initiated" fact.
+    /// The CLI's result string is free text and cannot carry that signal.
+    interrupt_requested: bool,
     /// One title request per conversation, fired with the first user send
     /// (the extension's exact moment; description = the message text).
     title_requested: bool,
@@ -536,7 +542,8 @@ impl ClaudeMapper {
             pending_controls: HashMap::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
-            queued_sends: 0,
+            queued_sends: VecDeque::new(),
+            interrupt_requested: false,
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
@@ -1405,16 +1412,33 @@ impl ClaudeMapper {
         self.agent_tools.clear();
         self.thinking_emitted = 0;
 
+        // Consumed at EVERY result, both branches: an interrupt whose turn
+        // ended before the control request landed must not mislabel the
+        // NEXT turn's genuine failure as a quiet stop.
+        let interrupted = std::mem::take(&mut self.interrupt_requested);
+
         if frame["is_error"] == json!(true) {
-            // An aborted turn drops the CLI's queue with it; leaking the
-            // count would open phantom turn boundaries later.
-            self.queued_sends = 0;
+            // An aborted turn drops the CLI's queue with it: resolve every
+            // queued message as dropped (a journal that kept them looking
+            // sent would lie on replay), and clear so no phantom turn
+            // boundaries open later.
+            for id in std::mem::take(&mut self.queued_sends) {
+                step.events.push(AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Dropped,
+                });
+            }
             step.events.push(AgentEvent::TurnAborted {
                 turn_id,
                 reason: frame["result"]
                     .as_str()
-                    .unwrap_or("turn failed")
+                    .unwrap_or(if interrupted {
+                        "interrupted"
+                    } else {
+                        "turn failed"
+                    })
                     .to_string(),
+                interrupted,
             });
             // An interrupted turn still consumed context — keep the meter
             // honest instead of skipping the refresh on aborts.
@@ -1450,10 +1474,14 @@ impl ClaudeMapper {
             &id,
             json!({ "subtype": "get_context_usage" }),
         ));
-        // A user message sent mid-turn was queued by the CLI and runs next:
-        // open its turn boundary now so streamed chunks land in it.
-        if self.queued_sends > 0 {
-            self.queued_sends -= 1;
+        // A user message sent mid-turn was queued by the CLI and runs next
+        // (FIFO): resolve its delivery and open its turn boundary now so
+        // streamed chunks land in it.
+        if let Some(id) = self.queued_sends.pop_front() {
+            step.events.push(AgentEvent::UserMessageUpdate {
+                id,
+                state: UserMessageState::Sent,
+            });
             self.turn_n += 1;
             self.turn_active = true;
             step.events.push(AgentEvent::TurnStarted {
@@ -1486,6 +1514,8 @@ impl ClaudeMapper {
                 step.events.push(AgentEvent::UserMessage {
                     text: text.clone(),
                     attachments,
+                    id: Some(uuid.clone()),
+                    queued: self.turn_active,
                 });
                 step.events.push(AgentEvent::Checkpoint {
                     user_message_id: uuid.clone(),
@@ -1494,9 +1524,14 @@ impl ClaudeMapper {
                 if self.turn_active {
                     // Mid-turn stdin writes are queued by the CLI itself (the
                     // official client's path); the turn boundary opens when
-                    // the running turn's result lands.
-                    self.queued_sends += 1;
+                    // the running turn's result lands — which also resolves
+                    // this message's delivery (sent, or dropped on abort).
+                    self.queued_sends.push_back(uuid.clone());
                 } else {
+                    // An interrupt sent while idle (benign no-op on the CLI)
+                    // must not relabel this fresh turn's genuine failure as
+                    // a quiet stop.
+                    self.interrupt_requested = false;
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
@@ -1587,6 +1622,10 @@ impl ClaudeMapper {
                 });
             }
             AgentCommand::Interrupt => {
+                // Recorded so on_result can stamp the abort as user-initiated
+                // (TurnAborted.interrupted) — the ack itself says nothing and
+                // the result string is free text.
+                self.interrupt_requested = true;
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::Interrupt);
@@ -1982,13 +2021,20 @@ mod tests {
                 text: "hello".into(),
             }],
         });
-        assert_eq!(
-            step.events[0],
+        match &step.events[0] {
             AgentEvent::UserMessage {
-                text: "hello".into(),
-                attachments: 0
+                text,
+                attachments,
+                id,
+                queued,
+            } => {
+                assert_eq!(text, "hello");
+                assert_eq!(*attachments, 0);
+                assert!(id.is_some(), "sends carry a delivery id");
+                assert!(!queued, "a fresh-turn send is not queued");
             }
-        );
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
         let uuid = match &step.events[1] {
             AgentEvent::Checkpoint {
                 user_message_id,
@@ -2023,6 +2069,13 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
             "mid-turn send must not open a turn"
         );
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage { id, queued, .. } => {
+                assert!(queued, "a mid-turn send echoes queued");
+                id.clone().unwrap()
+            }
+            other => panic!("expected UserMessage, got {other:?}"),
+        };
         match &step.events[1] {
             AgentEvent::Checkpoint { preceding_uuid, .. } => {
                 assert_eq!(preceding_uuid.as_deref(), Some(uuid.as_str()));
@@ -2038,6 +2091,171 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
             "queued send opens its turn when the result lands: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate {
+                    id,
+                    state: UserMessageState::Sent,
+                } if *id == queued_id
+            )),
+            "the dequeued message resolves sent at that boundary: {:?}",
+            step.events
+        );
+    }
+
+    /// Two mid-turn sends: the CLI's native queue is FIFO, so each finished
+    /// turn resolves the OLDEST queued id and opens the next boundary.
+    #[test]
+    fn queued_sends_resolve_sent_in_fifo_order() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let second = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "then this".into(),
+            }],
+        }));
+        let third = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "and this".into(),
+            }],
+        }));
+
+        let result = json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        });
+        let step = m.on_frame(&result);
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == second
+            )),
+            "first result dequeues the oldest send: {:?}",
+            step.events
+        );
+        let step = m.on_frame(&result);
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == third
+            )),
+            "second result dequeues the next: {:?}",
+            step.events
+        );
+        // Queue drained: a third result opens no phantom boundary.
+        let step = m.on_frame(&result);
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnStarted { .. })),
+            "no phantom turn after the queue drains: {:?}",
+            step.events
+        );
+    }
+
+    /// A user interrupt aborts the running turn AND drops the CLI's queue:
+    /// the abort carries the structural `interrupted` flag and every queued
+    /// message resolves dropped (the journal must not keep them looking sent).
+    #[test]
+    fn interrupt_marks_abort_user_initiated_and_drops_queue() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "queued".into(),
+            }],
+        });
+        let queued = match &step.events[0] {
+            AgentEvent::UserMessage {
+                id, queued: true, ..
+            } => id.clone().unwrap(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+
+        let step = m.on_command(AgentCommand::Interrupt);
+        assert_eq!(step.outbound[0]["request"]["subtype"], "interrupt");
+
+        // The CLI ends the turn with an is_error result; its `result` string
+        // is free text (often absent) — the flag, not the string, classifies.
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Dropped } if *id == queued
+            )),
+            "queued sends drop with the aborted turn: {:?}",
+            step.events
+        );
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: true, reason, .. } if reason == "interrupted"
+            )),
+            "a user stop is structurally marked: {:?}",
+            step.events
+        );
+
+        // The flag is consumed: a later genuine failure stays a failure.
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "again".into(),
+            }],
+        });
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted { interrupted: false, reason, .. } if reason == "turn failed"
+            )),
+            "the next failure is not mislabeled a stop: {:?}",
+            step.events
+        );
+    }
+
+    /// An interrupt raced past the turn end (benign on the CLI) must not
+    /// relabel the NEXT turn's outcome: the flag clears at every result and
+    /// at every fresh-turn open.
+    #[test]
+    fn stale_interrupt_never_relabels_the_next_turn() {
+        let mut m = mapper();
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "run".into() }],
+        });
+        m.on_command(AgentCommand::Interrupt);
+        // The turn completed normally before the interrupt reached the CLI.
+        m.on_frame(&json!({
+            "type": "result", "is_error": false,
+            "usage": { "output_tokens": 1 }, "duration_ms": 10,
+        }));
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "next".into(),
+            }],
+        });
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnAborted {
+                    interrupted: false,
+                    ..
+                }
+            )),
+            "stale interrupt cleared at the result boundary: {:?}",
             step.events
         );
     }

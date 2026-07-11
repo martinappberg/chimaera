@@ -25,6 +25,16 @@ TUI (see [view switch](#view-switch-and-rewind)).
   natively, codex steers the running turn. `socket.send` returns `false` when the socket isn't
   OPEN, so the draft is only cleared on an accepted send — a message during a reconnect window is
   preserved, not lost (no client-side queue; reconnect replays the gap).
+- **Delivery honesty + pending stack.** A mid-turn send doesn't drop into history — it waits in a
+  **pending stack pinned just above the composer** (the send point), faded, with a small "queued"
+  mark. When the agent actually consumes it (claude dequeues one per finished turn, codex on the
+  steer ack) the block leaves the stack and enters the transcript proper as the newest user turn,
+  solid. If the turn aborts first (claude drops its native queue on interrupt; a codex steer fails
+  for good) the message stays in the stack marked **"not delivered"** (text kept readable/copyable,
+  never auto-dumped back into a draft you may have started). Driven entirely off the single `blocks`
+  reducer — a derived `store.pendingUserBlocks` splits queued/dropped out of the inline render — and
+  journaled via `user_message` `id`/`queued` + `user_message_update`, so replay shows the same truth
+  (see PROTOCOL.md pass 8).
 - **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
   1568px max dim, 2 MiB post-encode cap (oversized silently dropped); the journal stores a
   placeholder, never the bytes.
@@ -53,6 +63,11 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Content.** User bubbles (right), agent prose (left, markdown), collapsible "thinking · N chars"
   blocks, per-turn duration rulers, plan/todo panel, tool cards, permission/question cards, inline
   artifacts. A live activity row ("thinking · ~1.2k tokens / writing / <tool>") pulses while running.
+- **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
+  not a failure: the abort event carries a structural `interrupted` flag set by the driver that
+  issued the interrupt (claude's result string is free text and never said so), the transcript
+  shows a muted "stopped" notice, and the session rail reads finished — error-red `turn failed`
+  and the Errored rail state are reserved for genuine failures.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
   `prefers-reduced-motion`). Markdown goes through **marked → DOMPurify**: `<style>` tag and `style`
   attribute are forbidden (injected CSS can't restyle the workbench to spoof a permission prompt),
