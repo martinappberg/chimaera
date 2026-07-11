@@ -14,29 +14,43 @@
 //! key in `~/.ssh/known_hosts`).
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
+#[cfg(unix)]
+use tauri::{Emitter, Manager};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
 /// Env var carrying the askpass socket path to the helper (and to ssh, which
 /// passes its environment through to the askpass program it runs).
+#[cfg(unix)]
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
 
 /// How long a prompt waits for the UI before giving up. A dropped window or
 /// an ignored modal must not pin an ssh process open forever — on timeout we
 /// return no answer and ssh fails cleanly.
+#[cfg(unix)]
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Prompts awaiting a UI answer, keyed by a per-request id. Managed as Tauri
@@ -110,6 +124,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The leaf name of the askpass relay socket.
+#[cfg(unix)]
 const SOCK_LEAF: &str = "askpass.sock";
 
 /// The askpass socket DIRECTORY for a given runtime dir: the runtime dir
@@ -120,6 +135,7 @@ const SOCK_LEAF: &str = "askpass.sock";
 /// `control_dir` in chimaera-remote (same cap, same fallback shape, still
 /// distinct per home so a dev app's relay never collides with the real
 /// app's); keep the two in step. Pure so the length invariant is testable.
+#[cfg(unix)]
 fn socket_dir(runtime_dir: &Path) -> PathBuf {
     /// Headroom under the ~104-byte `sun_path` cap.
     const SUN_PATH_SAFE: usize = 100;
@@ -135,6 +151,7 @@ fn socket_dir(runtime_dir: &Path) -> PathBuf {
     PathBuf::from(format!("/tmp/chimaera-{:08x}", h.finish() as u32)).join("run")
 }
 
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     let dir = socket_dir(&chimaera_core::runtime_dir());
     // The /tmp fallback dir is ours alone — same 0700 as the runtime dir it
@@ -148,6 +165,7 @@ fn socket_path() -> PathBuf {
     dir.join(SOCK_LEAF)
 }
 
+#[cfg(unix)]
 fn shim_path() -> PathBuf {
     chimaera_core::runtime_dir().join("askpass.sh")
 }
@@ -155,6 +173,7 @@ fn shim_path() -> PathBuf {
 /// Wire ssh/scp spawned from this process (and their ControlMaster children)
 /// to prompt through the app: write the askpass shim, export the ssh env, and
 /// start the socket listener. Called once at startup, before any connect.
+#[cfg(unix)]
 pub fn install(app: &AppHandle) -> Result<()> {
     let sock = socket_path();
     // A stale socket from a previous run would refuse the bind.
@@ -210,8 +229,19 @@ pub fn install(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// Windows: the askpass relay becomes a token-gated loopback TCP listener +
+/// a WSL-interop helper and lands with the WSL connect milestone. Until then
+/// there is nothing to install — hosts needing interactive auth fail cleanly
+/// (same as a missing socket today).
+#[cfg(windows)]
+pub fn install(_app: &AppHandle) -> Result<()> {
+    tracing::info!("askpass relay not available on Windows yet");
+    Ok(())
+}
+
 /// Serve one askpass request: read the prompt (the helper half-closes its
 /// write side to mark the end), ask the UI, write the answer back.
+#[cfg(unix)]
 async fn serve_one(app: AppHandle, mut stream: UnixStream) {
     let mut prompt = String::new();
     if let Err(e) = stream.read_to_string(&mut prompt).await {
@@ -253,6 +283,7 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
 /// `chimaera-app --askpass <prompt>`: the helper ssh execs. Relays the prompt
 /// to the running app and prints the answer for ssh to read. A missing socket
 /// or app yields an empty answer (ssh then fails cleanly, never hangs).
+#[cfg(unix)]
 pub fn run_helper() {
     let prompt = std::env::args()
         .skip_while(|a| a != "--askpass")
@@ -266,6 +297,12 @@ pub fn run_helper() {
     std::io::stdout().flush().ok();
 }
 
+/// Windows: no relay yet — print nothing, exactly the missing-socket
+/// behavior, so a stray --askpass invocation fails ssh cleanly.
+#[cfg(windows)]
+pub fn run_helper() {}
+
+#[cfg(unix)]
 fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
     stream.write_all(prompt.as_bytes())?;
@@ -277,7 +314,7 @@ fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
     Ok(answer.strip_suffix('\n').unwrap_or(&answer).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;

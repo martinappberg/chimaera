@@ -10,6 +10,9 @@ use tauri::{App, AppHandle, Emitter, Manager};
 pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
 
+    // The application menu (services/hide/show) is a macOS concept; Windows
+    // and Linux menubars start at File, where Quit must live instead.
+    #[cfg(target_os = "macos")]
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .separator()
@@ -48,8 +51,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::close_window(
             handle,
             Some("Close Window"),
-        )?)
-        .build()?;
+        )?);
+    #[cfg(not(target_os = "macos"))]
+    let file = file
+        .separator()
+        .item(&PredefinedMenuItem::quit(handle, None)?);
+    let file = file.build()?;
 
     let edit = SubmenuBuilder::new(handle, "Edit")
         .item(&PredefinedMenuItem::undo(handle, None)?)
@@ -70,9 +77,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::maximize(handle, None)?)
         .build()?;
 
-    let menu = MenuBuilder::new(handle)
-        .items(&[&app_menu, &file, &edit, &view, &window])
-        .build()?;
+    let menu = MenuBuilder::new(handle);
+    #[cfg(target_os = "macos")]
+    let menu = menu.items(&[&app_menu, &file, &edit, &view, &window]);
+    #[cfg(not(target_os = "macos"))]
+    let menu = menu.items(&[&file, &edit, &view, &window]);
+    let menu = menu.build()?;
     app.set_menu(menu)?;
 
     app.on_menu_event(|app: &AppHandle, event| {

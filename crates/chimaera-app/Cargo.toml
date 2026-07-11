@@ -36,10 +36,16 @@ tauri-plugin-updater = "2"
 tauri-plugin-clipboard-manager = "2"
 ureq = "2"
 urlencoding = "2"
-nix = { version = "0.29", features = ["signal"] }
 
 chimaera-core = { path = "../chimaera-core" }
 chimaera-remote = { path = "../chimaera-remote" }
+
+# Unix-only: `--daemon` embeds the server (the .app is self-contained), and
+# nix delivers the graceful SIGTERM in stop_local. On Windows neither exists —
+# the daemon is the Linux musl binary inside WSL2, so the whole server stack
+# (and its PTY/unix surface) must stay out of that build.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
 chimaera-server = { path = "../chimaera-server" }
 
 [profile.release]

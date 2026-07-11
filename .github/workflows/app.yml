@@ -75,3 +75,65 @@ jobs:
         with:
           name: chimaera-macos-arm64.dmg
           path: crates/chimaera-app/target/release/bundle/dmg/*.dmg
+
+  # Same build-check for the Linux bundle (AppImage/deb/rpm via
+  # tauri.linux.conf.json). ubuntu-22.04 on purpose: AppImages inherit the
+  # build host's glibc floor, and release.yml builds on 22.04 — checking on a
+  # newer image could go green while the release build (or an older user
+  # distro) fails.
+  linux:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      # Tauri v2's documented webkit2gtk-4.1 prerequisite set.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+          # rust-cache keys include the OS, so "app" here maps to the Linux
+          # cache release.yml's app-linux job writes on main — same pairing
+          # as the macos job above.
+          shared-key: app
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm install
+        working-directory: crates/chimaera-app
+      - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        working-directory: crates/chimaera-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimaera-linux-x86_64.AppImage
+          path: crates/chimaera-app/target/release/bundle/appimage/*.AppImage
+
+  # And the Windows bundle (NSIS via tauri.windows.conf.json). This is the
+  # only compile gate for the app's cfg(windows) code paths — macOS dev
+  # machines cannot cross-check them (C build scripts need the Windows SDK).
+  windows:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+          shared-key: app
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: npm install
+        working-directory: crates/chimaera-app
+      - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        working-directory: crates/chimaera-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimaera-windows-x64-setup.exe
+          path: crates/chimaera-app/target/release/bundle/nsis/*.exe

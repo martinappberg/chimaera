@@ -1,8 +1,10 @@
 //! Shared types and helpers for the chimaera daemon and CLI.
 
+#[cfg(unix)]
 pub mod shellint;
 
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -126,25 +128,41 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Per-user runtime directory: `$XDG_RUNTIME_DIR/chimaera` if set, else
-/// `/tmp/chimaera-$UID` (`$CHIMAERA_HOME/run` when isolated). Created with
-/// mode 0700 on demand.
+/// `/tmp/chimaera-$UID` (`$CHIMAERA_HOME/run` when isolated; on Windows
+/// `%LOCALAPPDATA%\chimaera\run` — already per-user, no /tmp analogue).
+/// Created with mode 0700 on demand where the platform has modes.
 pub fn runtime_dir() -> PathBuf {
     let dir = match state_home() {
         Some(home) => home.join("run"),
-        None => match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(base) if !base.is_empty() => PathBuf::from(base).join("chimaera"),
-            _ => PathBuf::from(format!(
-                "/tmp/chimaera-{}",
-                nix::unistd::Uid::current().as_raw()
-            )),
-        },
+        None => default_runtime_dir(),
     };
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
     if let Err(e) = builder.create(&dir) {
         tracing::warn!("failed to create runtime dir {}: {e}", dir.display());
     }
     dir
+}
+
+#[cfg(unix)]
+fn default_runtime_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(base) if !base.is_empty() => PathBuf::from(base).join("chimaera"),
+        _ => PathBuf::from(format!(
+            "/tmp/chimaera-{}",
+            nix::unistd::Uid::current().as_raw()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn default_runtime_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("chimaera")
+        .join("run")
 }
 
 /// The user's real login shell.
@@ -157,6 +175,7 @@ pub fn runtime_dir() -> PathBuf {
 /// live. So an unusable `$SHELL` falls back to the passwd database: the shell
 /// the OS itself starts for this user (exactly what Terminal.app reads),
 /// then `/bin/sh` as a last resort.
+#[cfg(unix)]
 pub fn login_shell() -> String {
     let passwd_shell = nix::unistd::User::from_uid(nix::unistd::Uid::current())
         .ok()
@@ -170,6 +189,7 @@ pub fn login_shell() -> String {
 /// Pure core of [`login_shell`] (env + passwd threaded in for testability).
 /// `$SHELL` wins when it names an existing shell that isn't the launchd-
 /// minimal `/bin/sh`; otherwise the passwd shell; otherwise `/bin/sh`.
+#[cfg(unix)]
 fn resolve_login_shell(
     shell_env: Option<String>,
     passwd_shell: Option<String>,
@@ -232,6 +252,7 @@ impl Manifest {
         let path = Self::path();
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        #[cfg(unix)]
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
@@ -246,7 +267,10 @@ impl Manifest {
         }
     }
 
-    /// Whether the recorded pid is alive (signal 0 probe).
+    /// Whether the recorded pid is alive (signal 0 probe). Unix-only by
+    /// design: on Windows the pid in a manifest belongs to a process inside
+    /// WSL, so liveness must be probed in the distro, never on the host.
+    #[cfg(unix)]
     pub fn is_alive(&self) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid as i32), None).is_ok()
     }
@@ -308,6 +332,7 @@ impl Handoff {
     pub fn write_at(&self, path: &Path) -> anyhow::Result<()> {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        #[cfg(unix)]
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -369,6 +394,7 @@ mod tests {
         assert!(is_dev_build(), "tests always run on the 0.0.1 sentinel");
     }
 
+    #[cfg(unix)]
     #[test]
     fn login_shell_prefers_real_shell_then_passwd() {
         let exists = |_: &str| true;
@@ -403,6 +429,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn login_shell_resolves_to_a_real_shell() {
         // On the host, it must name a non-empty absolute path (never a panic).
@@ -427,6 +454,8 @@ mod tests {
         assert!(data_dir_in(None).ends_with(".chimaera"));
     }
 
+    // Relies on $HOME relocation and unix file modes.
+    #[cfg(unix)]
     #[test]
     fn manifest_round_trip() {
         let tmp_home =
@@ -530,8 +559,11 @@ mod tests {
 
         let h = Handoff::new(43_211, "tok".to_string());
         h.write_at(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "handoff carries the token");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "handoff carries the token");
+        }
         let taken = Handoff::consume_at(&path).expect("fresh handoff consumed");
         assert_eq!((taken.port, taken.token.as_str()), (43_211, "tok"));
         assert!(Handoff::consume_at(&path).is_none(), "consume-once");

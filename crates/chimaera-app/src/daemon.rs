@@ -10,11 +10,16 @@
 //! update. Same rules as the remote flow, no ssh: the manifest is on disk
 //! and the session count comes straight off 127.0.0.1.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use anyhow::{bail, Context};
+#[cfg(unix)]
 use chimaera_core::Manifest;
+#[cfg(unix)]
 use chimaera_remote::Decision;
 
 /// A reachable local daemon.
@@ -31,7 +36,9 @@ pub struct LocalDaemon {
     pub live_sessions: Option<usize>,
 }
 
-/// Headless entry point for `chimaera-app --daemon`.
+/// Headless entry point for `chimaera-app --daemon`. Unix-only: on Windows
+/// the daemon is the Linux musl binary inside WSL2, never this executable.
+#[cfg(unix)]
 pub fn run_headless() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -53,6 +60,7 @@ pub fn run_headless() {
 /// A running daemon of a different build is replaced when idle (same
 /// decision policy as the remote connect flow) and attached as `outdated`
 /// when live sessions make replacing it unsafe.
+#[cfg(unix)]
 pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
     if let Some(m) = probe().await {
         let local_build = chimaera_core::BUILD_ID;
@@ -107,6 +115,7 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 /// Explicit local-daemon update (the home screen affordance): gracefully
 /// stop whatever is running — regardless of session count; the affordance
 /// says what it ends — and bring up a fresh daemon of our build.
+#[cfg(unix)]
 pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     if let Some(m) = probe().await {
         if chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref()) {
@@ -118,6 +127,19 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     ensure_local_daemon().await
 }
 
+// Local sessions on Windows live inside WSL2; until the WSL engine lands the
+// shell reports that plainly instead of pretending a host daemon can exist.
+#[cfg(windows)]
+pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
+    anyhow::bail!("local sessions on Windows run inside WSL2 — WSL support is not wired up yet")
+}
+
+#[cfg(windows)]
+pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
+    ensure_local_daemon().await
+}
+
+#[cfg(unix)]
 fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
     LocalDaemon {
         port: m.port,
@@ -129,6 +151,7 @@ fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalD
 }
 
 /// Manifest → live pid → authenticated health check, all three or nothing.
+#[cfg(unix)]
 async fn probe() -> Option<Manifest> {
     let m = Manifest::load().ok()??;
     if !m.is_alive() {
@@ -143,6 +166,7 @@ async fn probe() -> Option<Manifest> {
 }
 
 /// GET /api/v1/health with the manifest token; any 200 counts.
+#[cfg(unix)]
 fn health_ok(port: u16, token: &str) -> bool {
     ureq::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
         .set("Authorization", &format!("Bearer {token}"))
@@ -154,6 +178,7 @@ fn health_ok(port: u16, token: &str) -> bool {
 /// Live session count straight off the local daemon (loopback + manifest
 /// token, no ssh). `None` = could not determine; callers treat that as
 /// busy, never as zero.
+#[cfg(unix)]
 async fn live_session_count(port: u16, token: &str) -> Option<usize> {
     let token = token.to_string();
     tokio::task::spawn_blocking(move || {
@@ -173,6 +198,7 @@ async fn live_session_count(port: u16, token: &str) -> Option<usize> {
 /// Gracefully stop the local daemon: SIGTERM, then poll for exit for up to
 /// ~10s. Never escalates to SIGKILL — a daemon that will not die may be
 /// holding sessions that must not be torn out from under their owner.
+#[cfg(unix)]
 async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
     tracing::info!("stopping local daemon (pid {})", m.pid);
     nix::sys::signal::kill(
@@ -193,12 +219,14 @@ async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(unix)]
 fn log_path() -> std::path::PathBuf {
     chimaera_core::data_dir().join("logs").join("serve.log")
 }
 
 /// Spawn our own executable as `--daemon`, in a new session with stdio on
 /// the serve log, so it survives the shell quitting.
+#[cfg(unix)]
 fn spawn_detached() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let log = log_path();

@@ -25,7 +25,9 @@ fn main() {
 
     // `chimaera-app --daemon` IS the local daemon (headless, no Tauri init),
     // so the .app is self-contained — the shell spawns its own executable
-    // detached and the daemon outlives every window.
+    // detached and the daemon outlives every window. Unix-only: on Windows
+    // the daemon is the Linux musl binary inside WSL2, never this exe.
+    #[cfg(unix)]
     if std::env::args().any(|a| a == "--daemon") {
         daemon::run_headless();
         return;

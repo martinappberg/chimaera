@@ -14,6 +14,7 @@
 
 pub mod hosts;
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -924,9 +925,15 @@ async fn fetch_release_binary(
         );
     }
 
-    let mut perms = std::fs::metadata(&tmp)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&tmp, perms)?;
+    // The exec bit only matters where the cached binary runs in place (unix);
+    // on Windows the cache is transfer-only — the mode is set at install time
+    // inside the distro/host.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms)?;
+    }
     std::fs::rename(&tmp, &cached)
         .with_context(|| format!("failed to finalize {}", cached.display()))?;
     tracing::info!("cached daemon at {}", cached.display());
@@ -941,20 +948,16 @@ fn repo_slug() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Hex sha256 of `file`, via `sha256sum` (linux) or `shasum -a 256` (macOS).
+/// Hex sha256 of `file`, computed in-process — a Windows host has neither
+/// `sha256sum` nor `shasum`, and the verify step must never depend on
+/// platform hash tools.
 async fn sha256_file(file: &Path) -> anyhow::Result<String> {
-    for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
-        let out = Command::new(bin).args(args).arg(file).output().await;
-        if let Ok(out) = out {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(hex) = text.split_whitespace().next() {
-                    return Ok(hex.to_string());
-                }
-            }
-        }
-    }
-    bail!("could not compute a sha256 (neither sha256sum nor shasum is available)")
+    use sha2::{Digest, Sha256};
+    let bytes = tokio::fs::read(file)
+        .await
+        .with_context(|| format!("failed to read {} for checksum", file.display()))?;
+    let digest = Sha256::digest(&bytes);
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Resolve the LOCAL binary to deploy to a host of the target inferred from
