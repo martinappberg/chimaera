@@ -43,6 +43,12 @@ pub enum AgentEvent {
         /// empty = the UI falls back to the curated list.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         models: Vec<ModelInfo>,
+        /// The agent CLI's `--version` line as the launcher probed it at
+        /// spawn (`None` when the probe failed) — journaled so a drifted
+        /// binary is diagnosable after the fact; the harness's drift Notice
+        /// keys off the same value. Additive: old clients ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_version: Option<String>,
     },
     TurnStarted {
         turn_id: String,

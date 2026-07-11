@@ -411,6 +411,107 @@ async fn exit_right_after_handshake_is_failure_at_birth_with_stderr() {
     );
 }
 
+/// A binary whose server-probed `--version` differs from the driver's tested
+/// pin gets a NON-FATAL drift notice (warn, don't refuse): the session still
+/// lives, the version is journaled on Init so a later misbehavior is already
+/// diagnosed, and a Notice names both versions. Neither wire protocol carries
+/// a reliable version, so the value rides `SpawnSpec::agent_version`.
+#[tokio::test]
+async fn version_drift_emits_nonfatal_notice_and_journals_version() {
+    let fx = fixture();
+    let mut spec = spec("s-9", &fx.cwd, "normal");
+    spec.agent_version = Some("9.9.9-fake (Claude Code)".into());
+    fx.manager.spawn(&ClaudeAdapter, spec).expect("spawn");
+
+    let att = fx.manager.attach("s-9", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let init = wait_for(&mut rx, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    match &init.ev {
+        AgentEvent::Init { agent_version, .. } => assert_eq!(
+            agent_version.as_deref(),
+            Some("9.9.9-fake (Claude Code)"),
+            "the probed version is journaled on Init"
+        ),
+        _ => unreachable!(),
+    }
+
+    // The drift signal is a Notice (informational), never a fatal Error, and
+    // names both the detected version and the tested pin.
+    let notice = wait_for(
+        &mut rx,
+        &mut seen,
+        "drift Notice",
+        |ev| matches!(ev, AgentEvent::Notice { text } if text.contains("verified against")),
+    )
+    .await;
+    match &notice.ev {
+        AgentEvent::Notice { text } => {
+            assert!(
+                text.contains("9.9.9-fake"),
+                "notice names the detected version: {text}"
+            );
+            assert!(
+                text.contains("2.1.204"),
+                "notice names the tested pin: {text}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    // Warn, don't block: the drift never kills the session.
+    assert!(
+        fx.manager.get("s-9").unwrap().alive,
+        "version drift must not kill the session"
+    );
+}
+
+/// A probed version that CONTAINS the tested pin raises no drift notice — the
+/// substring match tolerates the CLI's own phrasing ("2.1.204 (Claude Code)")
+/// around the pinned version.
+#[tokio::test]
+async fn matching_version_emits_no_drift_notice() {
+    let fx = fixture();
+    let mut spec = spec("s-10", &fx.cwd, "normal");
+    spec.agent_version = Some("2.1.204 (Claude Code)".into());
+    fx.manager.spawn(&ClaudeAdapter, spec).expect("spawn");
+
+    let att = fx.manager.attach("s-10", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    wait_for(&mut rx, &mut seen, "Init", |ev| {
+        matches!(ev, AgentEvent::Init { .. })
+    })
+    .await;
+    // The drift notice, when raised, is emitted right after Init — strictly
+    // before the Send is processed into a UserMessage. So a UserMessage with
+    // no preceding drift Notice proves none was raised.
+    fx.manager
+        .command(
+            "s-10",
+            AgentCommand::Send {
+                blocks: vec![ContentBlock::Text { text: "go".into() }],
+            },
+        )
+        .await
+        .expect("send");
+    wait_for(&mut rx, &mut seen, "UserMessage", |ev| {
+        matches!(ev, AgentEvent::UserMessage { .. })
+    })
+    .await;
+
+    assert!(
+        !seen.iter().any(
+            |e| matches!(&e.ev, AgentEvent::Notice { text } if text.contains("verified against"))
+        ),
+        "a matching version must raise no drift notice; saw {seen:#?}"
+    );
+}
+
 #[tokio::test]
 async fn kill_ends_driver_and_emits_exited() {
     let mut fx = fixture();

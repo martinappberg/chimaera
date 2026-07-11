@@ -121,6 +121,39 @@ capture before mapping).
 - Caps at event construction, not sinks (login-node budgets).
 - Handshake watchdog + degrade-to-PTY is per-driver mandatory behavior.
 
+## Version detection (both drivers)
+
+Neither wire protocol carries a version handshake we can depend on:
+
+- **claude**: the `initialize` control response is the command + model catalog
+  (see pass 5) — it carries NO version field.
+- **codex**: the `initialize` RESULT carries `userAgent` (+ `codexHome`,
+  `platform`), but it is the server's own phrasing, not a stable version
+  contract, and the driver handshake discards it.
+
+So the version comes from OUTSIDE the wire: the server probes `bin --version`
+(`launcher::probe_version`, 2s budget), stores the first line on
+`AgentDetection.version`, and — kept fresh across in-place updates by the
+cache-staleness stamp (see `validate_cache_hit`) — threads it through
+`ChatRecipe.version` → `SpawnSpec.agent_version` into the driver harness.
+
+The harness (`run_driver`) then, once past the handshake:
+
+1. **Journals it on `Init`** (`AgentEvent::Init.agent_version`, additive/
+   optional) so a drifted binary is diagnosable after the fact from the
+   journal alone. Both mappers echo `spec.agent_version` verbatim.
+2. **Warns, never blocks, on drift**: if the probed line does not *contain*
+   the driver's `TESTED_*_VERSION` (`Driver::tested_version()`), it emits a
+   NON-FATAL `Notice` naming both versions. Substring (not equality) because
+   the probe line is the CLI's own phrasing — `"2.1.204 (Claude Code)"`,
+   `"codex-cli 0.142.5"`. Refusing to spawn would break every routine update;
+   the wire is *usually* compatible, and the journaled notice is the
+   ready-made diagnosis the one time it isn't. A probe that failed
+   (`agent_version == None`) skips the check entirely.
+
+The old hard gate stays orthogonal: `launcher::is_outdated` still refuses the
+known-broken codex 0.1.x line — that is a *refuse*, this is a *warn*.
+
 ## Extension mining, pass 2 (2026-07-08 — vsix)
 
 ### Claude: slash-command execution model

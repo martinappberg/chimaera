@@ -40,6 +40,12 @@ pub struct SpawnSpec {
     /// The agent's native session handle when known at spawn (claude
     /// `--session-id`/`--resume` value, codex thread id to resume).
     pub pinned_native_id: Option<String>,
+    /// The binary's `--version` line as the server probed it (`None` when
+    /// the probe failed). Neither wire protocol offers a reliable version
+    /// handshake (see PROTOCOL.md), so the server-side probe is the source:
+    /// journaled on `Init`, compared against the driver's tested pin for
+    /// the non-fatal drift notice.
+    pub agent_version: Option<String>,
     pub handshake_timeout: Duration,
 }
 
@@ -52,6 +58,7 @@ impl SpawnSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             pinned_native_id: None,
+            agent_version: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }
@@ -130,6 +137,11 @@ pub trait Driver: Send {
     /// harness-emitted startup-failure and version-drift events. No default:
     /// the compiler enforces both drivers carry it.
     fn kind(&self) -> &'static str;
+
+    /// The CLI version this driver's wire facts were live-verified against
+    /// (`TESTED_*_VERSION`) — the drift notice's comparison pin. No default,
+    /// so a new driver cannot ship unpinned.
+    fn tested_version(&self) -> &'static str;
 
     /// Env vars appended to the spawn (claude pins the auto-updater off and
     /// enables SDK file checkpointing; codex needs none).
@@ -289,6 +301,26 @@ pub async fn run_driver<D: Driver>(driver: D, spec: SpawnSpec, mut io: DriverIo)
     if io.events.send(mapper.init_event()).await.is_err() {
         guard.shutdown(Duration::ZERO).await;
         return DriverExit::Killed;
+    }
+    // Version drift is warn-not-block: the wire is only VERIFIED against the
+    // pinned TESTED_*_VERSION, but most updates stay compatible — refusing to
+    // spawn would break every routine update. The journaled notice is the
+    // ready-made diagnosis when a drifted binary later misbehaves. Substring
+    // match because the probe line is the CLI's own phrasing
+    // ("2.1.204 (Claude Code)", "codex-cli 0.142.5").
+    if let Some(detected) = spec.agent_version.as_deref() {
+        if !detected.contains(driver.tested_version()) {
+            let text = format!(
+                "{kind} {detected} detected; chat mode was verified against {kind} {tested} — \
+                 if this session misbehaves, that's likely why",
+                kind = driver.kind(),
+                tested = driver.tested_version(),
+            );
+            if io.events.send(AgentEvent::Notice { text }).await.is_err() {
+                guard.shutdown(Duration::ZERO).await;
+                return DriverExit::Killed;
+            }
+        }
     }
     // Post-handshake seeding/replay. A write failing THIS early means the
     // child died right after answering the handshake (the post-update crash
