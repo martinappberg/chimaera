@@ -782,6 +782,18 @@ struct ReleaseAsset {
     sha256: String,
 }
 
+/// Fetch (and cache under `dist_dir()/cache`) the release daemon binary for
+/// `(os, arch)`, verified against its published sha256. The Windows shell
+/// uses this to provision a WSL distro exactly the way `connect` provisions a
+/// remote host — same asset names, same cache, same verify.
+pub async fn fetch_daemon_binary(
+    os: &str,
+    arch: &str,
+    progress: &impl Fn(Phase),
+) -> anyhow::Result<PathBuf> {
+    fetch_release_binary(os, arch, progress).await
+}
+
 /// Resolve the daemon asset to download for `triple`. Prefers the release this
 /// build came from (`v{VERSION}` — so a real release's daemon shares our build
 /// id and connect never loops "updating"); falls back to GitHub's `latest`

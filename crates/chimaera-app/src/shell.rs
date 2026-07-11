@@ -72,6 +72,60 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Complete startup once a local daemon exists: manage `Shell` (BEFORE any
+/// window opens, so each registers its scope), reopen the persisted window
+/// set or the home window, and start the monitors. Two callers: `setup()` on
+/// the normal path, and the WSL wizard's finishing command on a Windows
+/// first run — where setup() deliberately returned early with no daemon.
+pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> tauri::Result<()> {
+    let (port, token) = (local.port, local.token.clone());
+    handle.manage(Shell {
+        local: Mutex::new(local),
+        tunnels: tokio::sync::Mutex::new(HashMap::new()),
+        connecting: Mutex::new(HashMap::new()),
+        windows: Mutex::new(HashMap::new()),
+        registry: Mutex::new(WindowRegistry::load_default()),
+        quitting: AtomicBool::new(false),
+    });
+    // Reopen last session's windows; first launch (or an all-remote set that
+    // is still connecting) gets the home window so the app never comes up
+    // invisible.
+    if !restore::restore_windows(handle, port, &token) {
+        open_ui_window(handle, port, &token, &WindowRecord::new(None, None))?;
+        tracing::info!("home window open on 127.0.0.1:{port}");
+    }
+    restore::spawn_health_monitor(handle.clone());
+    crate::update::spawn_update_watch(handle.clone());
+    // Slow flush for the geometry dirty flag (window drags).
+    let flush = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let Some(shell) = flush.try_state::<Shell>() else {
+                break;
+            };
+            lock(&shell.registry).save_if_dirty();
+        }
+    });
+    Ok(())
+}
+
+/// The WSL first-run wizard window: shell-local assets (`setup.html`), not
+/// the daemon origin — on a fresh Windows machine no daemon exists to serve
+/// the UI yet.
+fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
+    tauri::WebviewWindowBuilder::new(
+        handle,
+        "wsl-setup",
+        tauri::WebviewUrl::App("setup.html".into()),
+    )
+    .title("chimaera setup")
+    .inner_size(780.0, 640.0)
+    .min_inner_size(600.0, 520.0)
+    .build()?;
+    Ok(())
+}
+
 /// Build and run the Tauri app.
 pub fn run() {
     tauri::Builder::default()
@@ -96,6 +150,10 @@ pub fn run() {
             commands::answer_askpass,
             commands::list_askpass,
             commands::report_window_scope,
+            commands::wsl_status,
+            commands::wsl_install,
+            commands::wsl_install_distro,
+            commands::wsl_setup_daemon,
         ])
         .on_window_event(|window, event| {
             let Some(shell) = window.try_state::<Shell>() else {
@@ -155,11 +213,23 @@ pub fn run() {
             }
             // The daemon must be up before the first window points at it;
             // block setup on it (fast when a daemon is already running).
-            let mut local = tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon())
-                .map_err(|e| {
-                    tracing::error!("{e:#}");
-                    std::io::Error::other(format!("{e:#}"))
-                })?;
+            let mut local =
+                match tauri::async_runtime::block_on(crate::daemon::ensure_local_daemon()) {
+                    Ok(local) => local,
+                    // Windows first run: no WSL / no distro yet, so there is no
+                    // daemon origin to load — open the shell-local setup wizard
+                    // instead of failing; its finishing command (wsl_setup_daemon)
+                    // completes the startup this path skips.
+                    Err(e) if e.downcast_ref::<crate::wsl::WslNotReady>().is_some() => {
+                        tracing::info!("WSL not ready — opening the setup wizard");
+                        open_setup_window(&handle)?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::error!("{e:#}");
+                        return Err(std::io::Error::other(format!("{e:#}")).into());
+                    }
+                };
             // A fresh update intent = the user clicked "update" in the OLD
             // process and the app half already swapped; finish the chain by
             // replacing the outdated daemon NOW, before any window loads its
@@ -175,37 +245,7 @@ pub fn run() {
                     Err(e) => tracing::warn!("daemon update after app update failed: {e:#}"),
                 }
             }
-            let (port, token) = (local.port, local.token.clone());
-            // Manage Shell BEFORE opening any window so each can register
-            // its scope in the window map.
-            app.manage(Shell {
-                local: Mutex::new(local),
-                tunnels: tokio::sync::Mutex::new(HashMap::new()),
-                connecting: Mutex::new(HashMap::new()),
-                windows: Mutex::new(HashMap::new()),
-                registry: Mutex::new(WindowRegistry::load_default()),
-                quitting: AtomicBool::new(false),
-            });
-            // Reopen last session's windows; first launch (or an all-remote
-            // set that is still connecting) gets the home window so the app
-            // never comes up invisible.
-            if !restore::restore_windows(&handle, port, &token) {
-                open_ui_window(&handle, port, &token, &WindowRecord::new(None, None))?;
-                tracing::info!("home window open on 127.0.0.1:{port}");
-            }
-            restore::spawn_health_monitor(handle.clone());
-            crate::update::spawn_update_watch(handle.clone());
-            // Slow flush for the geometry dirty flag (window drags).
-            let flush = handle.clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    let Some(shell) = flush.try_state::<Shell>() else {
-                        break;
-                    };
-                    lock(&shell.registry).save_if_dirty();
-                }
-            });
+            finish_startup(&handle, local)?;
             Ok(())
         })
         .build(tauri::generate_context!())

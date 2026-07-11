@@ -1,10 +1,11 @@
 # Native app (the Tauri shell)
 
-A native macOS app that wraps the same web UI in **real OS windows** onto a local or
-ssh-tunnelled daemon. It adds what a browser tab can't: real windows that survive quit/crash,
-a window set that restores itself, in-app SSH auth, and a signed one-click updater for the app
-and its daemon. The app is a *view layer* — the daemon it talks to is a separate, longer-lived
-process (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
+A native app — macOS and Linux today, Windows via WSL2 (beta) — that wraps the same web UI in
+**real OS windows** onto a local or ssh-tunnelled daemon. It adds what a browser tab can't:
+real windows that survive quit/crash, a window set that restores itself, in-app SSH auth, and
+a signed one-click updater for the app and its daemon. The app is a *view layer* — the daemon
+it talks to is a separate, longer-lived process (see
+[lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
@@ -18,8 +19,8 @@ app-build` (never the root `cargo`).
 ## Three-role binary
 
 - **What & when.** One executable, three roles selected by argv: default = the Tauri shell;
-  `--daemon` = a headless `chimaera_server::run` (**the .app *is* the daemon**); `--askpass <prompt>`
-  = the tiny `SSH_ASKPASS` relay.
+  `--daemon` = a headless `chimaera_server::run` (**the .app *is* the daemon** — unix only, see
+  the Windows section); `--askpass <prompt>` = the tiny `SSH_ASKPASS` relay.
 - **Where it lives.** `main.rs` (dispatch order is load-bearing), `daemon.rs::run_headless`,
   `askpass.rs`.
 - **Key behaviors.** `--askpass` must stay lightweight — it must never spawn a daemon or window. The
@@ -77,10 +78,34 @@ app-build` (never the root `cargo`).
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
 
+## Windows: the WSL2 engine (beta)
+
+- **What & when.** On Windows the local daemon is **never the app exe** — it is the same Linux
+  musl release binary, provisioned into and spawned inside the user's WSL2 distro; the UI
+  reaches it over WSL's NAT localhost forwarding, so windows/tokens/health work unchanged. On a
+  machine without WSL (or a distro), startup opens a shell-local **first-run wizard**
+  (`assets/setup.html` — there is no daemon origin to serve the real UI yet) that walks
+  enable-WSL2 → install-Ubuntu → install-daemon, then finishes normal startup.
+- **Where it lives.** `wsl.rs` (registry-first detection, hardened `wsl.exe` spawns, provision/
+  spawn/probe/stop — module header documents the researched constraints), `daemon.rs` (windows
+  half of `ensure_local_daemon`), `shell.rs::finish_startup` (the startup the wizard resumes),
+  commands `wsl_status`/`wsl_install`/`wsl_install_distro`/`wsl_setup_daemon`. Deep design +
+  evidence: [docs/windows-wsl-plan.md](../windows-wsl-plan.md).
+- **Key behaviors.** The daemon start line is the Podman persistence pattern (`setsid nohup` in
+  a wsl.exe session) so sessions survive closing the app; `wsl --shutdown` is treated as a
+  normal event (health-check + re-adopt/respawn); adoption always requires the token health
+  handshake (a bare TCP accept can be a stranger's port under NAT forwarding). Verified live by
+  the `wsl-smoke` workflow — a real WSL2 Ubuntu on a Windows runner runs the full
+  provision→spawn→session→shutdown→revive loop. **Not yet on Windows:** remote-host `connect`
+  and the askpass relay (the next milestone); the site deliberately doesn't advertise the
+  Windows download until then.
+
 ## Status: partial
 
 - The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
   discovery pass — treat it as under-documented.
+- **Windows is beta**: local WSL2 sessions only; `connect` + askpass land next. Wizard flow
+  verified in CI + visually, not yet hand-driven on retail Windows hardware.
 
 ---
 

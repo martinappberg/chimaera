@@ -12,6 +12,7 @@ mod menu;
 mod shell;
 mod update;
 mod windows;
+mod wsl;
 
 fn main() {
     // Triple role. `--askpass <prompt>` is the tiny SSH_ASKPASS helper ssh

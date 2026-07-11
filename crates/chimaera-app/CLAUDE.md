@@ -1,12 +1,13 @@
 # chimaera-app — the Tauri 2 native shell
 
-Orientation for coding agents. A native macOS wrapper around the *same* daemon +
-web UI the browser loads: it opens real OS windows pointed at
-`http://127.0.0.1:{port}/#…` (a local daemon, or an ssh-tunnelled remote one) and
-adds native affordances (remote-host management, in-app SSH askpass, a signed
-auto-updater). Parent map: repo-root [CLAUDE.md](../../CLAUDE.md).
+Orientation for coding agents. A native wrapper (macOS + Linux; Windows via the
+WSL2 engine) around the *same* daemon + web UI the browser loads: it opens real
+OS windows pointed at `http://127.0.0.1:{port}/#…` (a local daemon, or an
+ssh-tunnelled remote one) and adds native affordances (remote-host management,
+in-app SSH askpass, a signed auto-updater). Parent map: repo-root
+[CLAUDE.md](../../CLAUDE.md).
 
-## The two things to know first
+## The three things to know first
 
 1. **This is its OWN standalone cargo workspace.** Tauri is deliberately kept out
    of the daemon workspace so musl/HPC builds stay lean. Consequence: the daemon
@@ -17,6 +18,15 @@ auto-updater). Parent map: repo-root [CLAUDE.md](../../CLAUDE.md).
    default = the Tauri shell; `--daemon` = a headless `chimaera_server::run` (the
    .app is self-contained — the daemon IS the app binary); `--askpass <prompt>` =
    the tiny `SSH_ASKPASS` relay (must stay lightweight — never spawn a daemon/window).
+3. **Windows is different by design: the daemon is NEVER this exe there** — it is
+   the Linux musl release binary inside the user's WSL2 distro (`wsl.rs` owns
+   detect/provision/spawn/adopt; `--daemon` and `chimaera-server` are cfg'd out of
+   that build). No WSL yet → startup opens the shell-local wizard
+   (`assets/setup.html`) instead of failing. Design + research evidence:
+   [docs/windows-wsl-plan.md](../../docs/windows-wsl-plan.md); live gate:
+   `.github/workflows/wsl-smoke.yml` (real WSL2 on a Windows runner). macOS
+   cannot compile the Windows target locally — app.yml's `windows` job is the
+   compile gate.
 
 ## File map
 
@@ -27,8 +37,10 @@ auto-updater). Parent map: repo-root [CLAUDE.md](../../CLAUDE.md).
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |
 | `shell/connect.rs` | The `connect` flight state machine (one coalesced ssh attempt per host) + the host-row wire vocabulary (`HostState`/`HostStatus`). |
 | `shell/restore.rs` | `open_ui_window`, the tunnel health monitor, and launch-time window restore. |
-| `daemon.rs` | Launch/adopt the local daemon; version/parity policy. |
-| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). |
+| `daemon.rs` | Launch/adopt the local daemon; version/parity policy (unix: spawn-self; windows: delegates to `wsl.rs`). |
+| `wsl.rs` | The WSL2 engine: registry-first detection, hardened wsl.exe spawns, provision/spawn/probe/stop, the wizard's state machine (pure parts unit-tested on any host; e2e via wsl-smoke). |
+| `assets/setup.html` | The Windows first-run wizard (shell-local page — no daemon origin exists yet to serve the real UI). |
+| `askpass.rs` | The `SSH_ASKPASS` ↔ shell wire protocol (in-app password/Duo prompts). Unix-socket transport is unix-only; the Windows TCP/interop variant is a planned milestone. |
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
 | `update.rs` | The auto-updater intent chain (consume-once, expiry). |
 | `menu.rs` | The menu bar. |

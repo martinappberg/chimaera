@@ -12,7 +12,6 @@
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -127,16 +126,17 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     ensure_local_daemon().await
 }
 
-// Local sessions on Windows live inside WSL2; until the WSL engine lands the
-// shell reports that plainly instead of pretending a host daemon can exist.
+// On Windows the local daemon is the Linux musl binary inside WSL2; the wsl
+// module owns detect/provision/spawn/adopt. Errors carrying WslNotReady make
+// startup open the setup wizard instead of failing.
 #[cfg(windows)]
 pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
-    anyhow::bail!("local sessions on Windows run inside WSL2 — WSL support is not wired up yet")
+    crate::wsl::ensure_daemon(None, &|_| {}).await
 }
 
 #[cfg(windows)]
 pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
-    ensure_local_daemon().await
+    crate::wsl::update_daemon(&|_| {}).await
 }
 
 #[cfg(unix)]
@@ -165,9 +165,9 @@ async fn probe() -> Option<Manifest> {
     ok.then_some(m)
 }
 
-/// GET /api/v1/health with the manifest token; any 200 counts.
-#[cfg(unix)]
-fn health_ok(port: u16, token: &str) -> bool {
+/// GET /api/v1/health with the manifest token; any 200 counts. Shared with
+/// the WSL probe, where passing it also proves the NAT localhost forward.
+pub(crate) fn health_ok(port: u16, token: &str) -> bool {
     ureq::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
         .set("Authorization", &format!("Bearer {token}"))
         .timeout(Duration::from_secs(2))
@@ -178,8 +178,7 @@ fn health_ok(port: u16, token: &str) -> bool {
 /// Live session count straight off the local daemon (loopback + manifest
 /// token, no ssh). `None` = could not determine; callers treat that as
 /// busy, never as zero.
-#[cfg(unix)]
-async fn live_session_count(port: u16, token: &str) -> Option<usize> {
+pub(crate) async fn live_session_count(port: u16, token: &str) -> Option<usize> {
     let token = token.to_string();
     tokio::task::spawn_blocking(move || {
         let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/sessions"))

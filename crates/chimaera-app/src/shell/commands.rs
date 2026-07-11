@@ -414,3 +414,60 @@ pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
         }
     }
 }
+
+// --- WSL setup (the Windows first-run wizard; clean errors elsewhere) -----
+
+/// Detection report for the wizard. Registry-only — never blocks on wsl.exe.
+#[tauri::command]
+pub(super) async fn wsl_status() -> Result<crate::wsl::WslReport, String> {
+    tracing::debug!("ipc: wsl_status");
+    Ok(crate::wsl::detect())
+}
+
+/// One-time WSL enablement (UAC prompt; a reboot usually follows).
+#[tauri::command]
+pub(super) async fn wsl_install() -> Result<(), String> {
+    tracing::info!("ipc: wsl_install");
+    crate::wsl::launch_wsl_install()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Kick off the Ubuntu distro install; the wizard polls `wsl_status` until
+/// the distro registers (the image download runs minutes).
+#[tauri::command]
+pub(super) async fn wsl_install_distro() -> Result<(), String> {
+    tracing::info!("ipc: wsl_install_distro");
+    crate::wsl::launch_distro_install()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Provision + start + adopt the daemon in `distro` (None = default), then
+/// complete the startup the wizard interrupted and close the wizard window.
+/// Emits `wsl-setup` phase events (checking/downloading/installing/starting/
+/// adopting) for the wizard's progress line.
+#[tauri::command]
+pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> Result<(), String> {
+    tracing::info!("ipc: wsl_setup_daemon ({distro:?})");
+    // Skip setup when startup already finished (stale wizard, double click)
+    // — but still retire the wizard window below.
+    if app.try_state::<Shell>().is_none() {
+        let progress = {
+            let app = app.clone();
+            move |phase: &str| {
+                let _ = app.emit("wsl-setup", phase.to_string());
+            }
+        };
+        let local = crate::wsl::ensure_daemon(distro, &progress)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        super::finish_startup(&app, local).map_err(|e| format!("{e:#}"))?;
+    }
+    for (label, w) in app.webview_windows() {
+        if label.starts_with("wsl-setup") {
+            let _ = w.close();
+        }
+    }
+    Ok(())
+}
