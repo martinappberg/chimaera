@@ -75,13 +75,30 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
-  captures focus on arrival; Enter = first allow-once, Esc = first reject.
+  captures focus on arrival; Enter = first allow-once, Esc = first reject (or closes the feedback
+  row first when it's open).
+- **Deny with feedback.** Every permission card has a "deny with feedback…" affordance: the typed
+  reason rides the deny so the agent reacts to it instead of aborting. Claude: the reason is
+  appended to the deny directive with `interrupt:false` — the tool errors but the turn runs on;
+  codex: the decline answers the rpc, then the reason steers into the running turn (`turn/steer`).
+  Either way the reason is journaled as a user message (it's transcript truth — the model received
+  it).
+- **Plan approval.** Claude's `ExitPlanMode` renders a dedicated card instead of the generic
+  permission prompt: the plan markdown itself (sanitized, file references clickable) plus the
+  official three answers — "Yes, and auto-accept edits" / "Yes, manually approve" / "No, keep
+  planning" — and an optional comment that rides the decision (approvals:
+  `updatedInput.userFeedback`/`userComments`; keep-planning: the feedback-denial). Auto-accept
+  follows the allow with a `set_permission_mode acceptEdits`, so the mode chip flips with it.
+  Enter (card focused) = auto-accept, Esc = keep planning; Enter inside the comment field is
+  deliberately inert (a comment can accompany any of the three answers).
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
-- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`, `QuestionCard.svelte`;
-  commands `permission` / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
-  / `permission_resolved`, `question_request` / `question_resolved`.
+- **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
+  `PlanApprovalCard.svelte`, `QuestionCard.svelte`; commands `permission` (optional `destination`,
+  `feedback`) / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
+  (optional `plan` = the plan-approval marker + markdown) / `permission_resolved`,
+  `question_request` / `question_resolved`. Wire facts: `crates/chimaera-agent/PROTOCOL.md` pass 8.
 
 ## Inline artifacts
 
