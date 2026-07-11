@@ -32,6 +32,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             workspace_root: dir.clone(),
             kind: agents::AgentKind::Claude,
             bin: tui.clone(),
+            version: None,
             settings: Some(settings),
             mcp_config: Some(mcp),
             model: None,
@@ -65,7 +66,129 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
         crate::lock(&state.agents).contains_key(&id),
         "agent record survives the degrade"
     );
+
+    // The journal must tell the story a reattach replays: the startup failure
+    // (fatal Error, from the driver harness), then the degrade stamped as a
+    // ModeSwitch(term) — not a bare fatal tail. The stamp lands right after
+    // the PTY registers, so poll briefly.
+    let journal = state.chat.journal_dir().join(format!("{id}.jsonl"));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let content = std::fs::read_to_string(&journal).unwrap_or_default();
+        if content.contains(r#""type":"mode_switch""#) {
+            assert!(
+                content.contains(r#""fatal":true"#) && content.contains("failed to start"),
+                "startup failure must be journaled before the switch: {content}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "degrade never journaled a mode_switch; journal: {}",
+            std::fs::read_to_string(&journal).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The degrade-in-progress marker (the WS "degraded" classification) is
+    // cleaned up once the successor exists.
+    assert!(
+        crate::lock(&state.chat_switching).is_empty(),
+        "degrade marker must not outlive the degrade"
+    );
     let _ = state.sessions.kill(&id);
+}
+
+/// A handshake failure with NO respawn recipe must not silently retire the
+/// session: it stays registered (dead) with the record Errored — the same
+/// keep-visible contract as ProtocolError — so the rail shows the failure
+/// and the journaled diagnostic is reachable.
+#[tokio::test]
+async fn chat_handshake_failure_without_recipe_stays_visible_errored() {
+    let state = test_state();
+    chat::spawn_signal_task(state.clone());
+
+    let dir = test_dir("chat-norecipe");
+    let id = "s-norecipe".to_string();
+    crate::lock(&state.agents).insert(
+        id.clone(),
+        agents::AgentRecord::new("key".into(), agents::AgentKind::Claude),
+    );
+
+    let mut spec = chimaera_agent::driver::SpawnSpec::new(
+        id.clone(),
+        vec!["/bin/cat".to_string()],
+        dir.clone(),
+    );
+    spec.handshake_timeout = std::time::Duration::from_millis(300);
+    state
+        .chat
+        .spawn(&chimaera_agent::claude::ClaudeAdapter, spec)
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let errored = crate::lock(&state.agents)
+            .get(&id)
+            .is_some_and(|r| r.state == agent_state::AgentState::Errored);
+        if errored {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "record never turned Errored"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let info = state.chat.get(&id).expect("session stays registered, dead");
+    assert!(!info.alive);
+    assert!(
+        state.sessions.get(&id).is_none(),
+        "no PTY successor without a recipe"
+    );
+}
+
+/// An agent updated IN PLACE (same path, new binary) must be noticed by the
+/// next spawn-time detect: the cached version is re-probed from the new
+/// binary without a full re-resolution — the login shell is never consulted,
+/// because the path still executes.
+#[tokio::test]
+async fn detect_reprobes_version_when_binary_changes_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = test_state();
+    let dir = test_dir("detect-reprobe");
+    let bin = dir.join("claude");
+    std::fs::write(&bin, "#!/bin/sh\necho '9.9.9 (Updated Code)'\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The cache as the daemon left it BEFORE the update: same path, the old
+    // version, an mtime stamp that no longer matches the file.
+    lock(&state.agent_bins).insert(
+        agents::AgentKind::Claude,
+        launcher::AgentDetection {
+            path: Ok(bin.clone()),
+            version: Some("2.1.204 (Claude Code)".into()),
+            managed: false,
+            explicit: false,
+            mtime: Some(std::time::UNIX_EPOCH),
+        },
+    );
+
+    let detection = launcher::detect(&state, agents::AgentKind::Claude, false).await;
+    assert_eq!(detection.path.unwrap(), bin);
+    assert_eq!(
+        detection.version.as_deref(),
+        Some("9.9.9 (Updated Code)"),
+        "the in-place update's version must be re-probed"
+    );
+    // The refreshed entry (new version + current stamp) is what the cache
+    // serves from now on.
+    let cached = lock(&state.agent_bins)
+        .get(&agents::AgentKind::Claude)
+        .cloned()
+        .unwrap();
+    assert_eq!(cached.version.as_deref(), Some("9.9.9 (Updated Code)"));
+    assert!(cached.mtime.is_some_and(|m| m != std::time::UNIX_EPOCH));
 }
 
 #[tokio::test]

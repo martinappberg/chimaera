@@ -159,6 +159,10 @@ pub(super) fn preset_agent(
             version: version.map(str::to_string),
             managed,
             explicit: false,
+            // No staleness stamp: preset paths are often symbolic
+            // (nonexistent), and `mtime: None` entries skip cache validation
+            // — presets must never fall through to the real login shell.
+            mtime: None,
         },
     );
 }

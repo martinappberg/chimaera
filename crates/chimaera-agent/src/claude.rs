@@ -298,6 +298,14 @@ struct ClaudeDriver;
 impl Driver for ClaudeDriver {
     type Mapper = ClaudeMapper;
 
+    fn kind(&self) -> &'static str {
+        "claude"
+    }
+
+    fn tested_version(&self) -> &'static str {
+        TESTED_CLAUDE_VERSION
+    }
+
     fn env_extra(&self) -> Vec<(String, String)> {
         vec![
             ("DISABLE_AUTOUPDATER".to_string(), "1".to_string()),
@@ -324,7 +332,11 @@ impl Driver for ClaudeDriver {
         }
         let commands_catalog = await_initialize(stream).await?;
 
-        let mut mapper = ClaudeMapper::new(spec.pinned_native_id.clone(), &commands_catalog);
+        let mut mapper = ClaudeMapper::new(
+            spec.pinned_native_id.clone(),
+            spec.agent_version.clone(),
+            &commands_catalog,
+        );
         let mut initial: Vec<DriverStep> = Vec::new();
         // Seed the effort/ultracode chips with the CLI's applied settings.
         let mut step = DriverStep::default();
@@ -405,6 +417,9 @@ enum PendingControl {
 /// thin delegator below.
 struct ClaudeMapper {
     native_session_id: Option<String>,
+    /// Launcher-probed `--version` line, echoed on every Init (journal truth,
+    /// and the harness's drift-notice source). `None` = the probe failed.
+    agent_version: Option<String>,
     model: Option<String>,
     current_mode: Option<String>,
     slash_commands: Vec<SlashCommand>,
@@ -453,7 +468,11 @@ struct ClaudeMapper {
 }
 
 impl ClaudeMapper {
-    fn new(pinned_native_id: Option<String>, commands_catalog: &Value) -> Self {
+    fn new(
+        pinned_native_id: Option<String>,
+        agent_version: Option<String>,
+        commands_catalog: &Value,
+    ) -> Self {
         let slash_commands = commands_catalog["commands"]
             .as_array()
             .map(|cmds| {
@@ -500,6 +519,7 @@ impl ClaudeMapper {
             .unwrap_or_default();
         Self {
             native_session_id: pinned_native_id,
+            agent_version,
             model: None,
             current_mode: None,
             slash_commands,
@@ -532,6 +552,7 @@ impl ClaudeMapper {
             current_mode: self.current_mode.clone(),
             slash_commands: self.slash_commands.clone(),
             models: self.models.clone(),
+            agent_version: self.agent_version.clone(),
         }
     }
 
@@ -1948,6 +1969,7 @@ mod tests {
     fn mapper() -> ClaudeMapper {
         ClaudeMapper::new(
             Some("native-1".into()),
+            None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
     }

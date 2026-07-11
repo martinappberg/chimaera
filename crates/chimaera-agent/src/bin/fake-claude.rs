@@ -5,7 +5,9 @@
 //! tool_use, a can_use_tool permission round-trip, and result frames.
 //!
 //! Modes (argv[1]): `normal` (default), `silent` (never answers — handshake
-//! watchdog tests), `die` (exit 3 immediately — spawn-crash tests).
+//! watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
+//! `die-after-handshake` (answer initialize, print a diagnostic on stderr,
+//! exit 2 — the post-update failure-at-birth tests).
 
 use std::io::{BufRead, Write};
 
@@ -50,6 +52,13 @@ fn main() {
                     ]},
                 },
             }));
+            // Failure-at-birth: the handshake succeeds, then the "updated"
+            // binary crashes before serving anything — stderr is the only
+            // diagnostic (the driver must preserve it).
+            if mode == "die-after-handshake" {
+                eprintln!("fake-claude: post-update crash (kaboom)");
+                std::process::exit(2);
+            }
         } else if frame["type"] == "user" {
             run_canned_turn();
         } else if frame["type"] == "control_response" {

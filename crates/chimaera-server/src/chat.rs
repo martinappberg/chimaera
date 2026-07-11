@@ -41,6 +41,12 @@ pub(crate) struct ChatRecipe {
     pub(crate) workspace_root: PathBuf,
     pub(crate) kind: AgentKind,
     pub(crate) bin: PathBuf,
+    /// The `--version` line the launcher probed for `bin` at resolution
+    /// (`None` = probe failed). Threaded into the driver's `SpawnSpec` so the
+    /// harness can journal it on `Init` and emit the non-fatal drift notice
+    /// when it differs from the driver's `TESTED_*_VERSION`. Carried on the
+    /// recipe so a view-switch/rewind respawn keeps the same provenance.
+    pub(crate) version: Option<String>,
     pub(crate) settings: Option<PathBuf>,
     pub(crate) mcp_config: Option<PathBuf>,
     pub(crate) model: Option<String>,
@@ -269,7 +275,6 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             stderr_tail,
         } => {
             tracing::warn!(%id, %reason, %stderr_tail, "chat handshake failed; degrading to terminal");
-            state.chat.remove(id);
             match recipe {
                 Some(recipe) => {
                     // Carry any pinned name onto the fallback PTY (usually none
@@ -277,9 +282,46 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
                     let pinned = crate::lock(&state.agents)
                         .get(id)
                         .and_then(|r| r.custom_title.clone());
-                    degrade_to_pty(state, id, recipe, pinned).await
+                    // Degrade-in-progress marker, BEFORE the remove: chat.remove
+                    // closes the broadcast, waking every attached /ws/chat
+                    // handler while the successor PTY does not exist yet —
+                    // without the marker that point-in-time read reports a
+                    // successful degrade as a bare "exited" (and the client
+                    // never reconnects). "term" is the same value a deliberate
+                    // chat→term switch uses, so the WS Closed arm reports
+                    // `degraded` and a concurrent user switch 409s instead of
+                    // racing the respawn.
+                    crate::lock(&state.chat_switching).insert(id.to_string(), "term".to_string());
+                    state.chat.remove(id);
+                    if degrade_to_pty(state, id, recipe, pinned).await {
+                        // Stamp the transition like a deliberate switch so a
+                        // later chat reattach replays "continued in terminal"
+                        // instead of ending on the fatal-error tail. The
+                        // journal is settled: the pump syncs before this exit
+                        // hook fires, and the registry entry is gone.
+                        if let Err(err) = chimaera_agent::journal::append_marker(
+                            state.chat.journal_dir(),
+                            id,
+                            AgentEvent::ModeSwitch {
+                                to: chimaera_agent::model::SessionUi::Term,
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(%id, %err, "failed to journal the degrade");
+                        }
+                    }
+                    crate::lock(&state.chat_switching).remove(id);
                 }
-                None => crate::recents::retire(state, id, None, None),
+                // No respawn recipe: keep the dead session registered and
+                // visible (like the ProtocolError arm) rather than silently
+                // retiring — the journal now carries the startup failure the
+                // user needs to see; closing it is their call (DELETE).
+                None => {
+                    if let Some(record) = crate::lock(&state.agents).get_mut(id) {
+                        record.state = AgentState::Errored;
+                    }
+                }
             }
         }
         DriverExit::ProtocolError(reason) => {
@@ -300,13 +342,35 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
 
 /// Respawn the session as a Tier A PTY TUI with the same identity: same
 /// session id, same AgentRecord (hooks/links/titles keep working), same
-/// settings/mcp files, original resume target.
+/// settings/mcp files, original resume target. Returns whether the PTY
+/// successor actually spawned (a failure retires the session).
 async fn degrade_to_pty(
     state: &Arc<AppState>,
     id: &str,
     recipe: ChatRecipe,
     pinned_name: Option<String>,
-) {
+) -> bool {
+    // A degrade often follows an agent update: the recipe's bin was resolved
+    // at chat spawn and may have been replaced/moved since (the npm-reinstall
+    // window). Re-detect a dangling path before building the argv, or the
+    // fallback dies the same death the chat just did. One stat on the happy
+    // path; the full (login-shell) re-resolution runs on the failure path only.
+    let bin = if crate::launcher::is_executable(&recipe.bin) {
+        recipe.bin.clone()
+    } else {
+        match crate::launcher::detect(state, recipe.kind, true).await.path {
+            Ok(fresh) => {
+                tracing::info!(%id, stale = %recipe.bin.display(), fresh = %fresh.display(),
+                    "degrade re-resolved a stale agent binary");
+                fresh
+            }
+            Err(err) => {
+                tracing::error!(%id, %err, "degrade respawn failed: agent binary missing");
+                crate::recents::retire(state, id, None, None);
+                return false;
+            }
+        }
+    };
     // The scheme theme needs AppState (the user's codex config), so resolve it
     // here; the pure argv assembly (codex-resume subcommand, claude fork/mcp
     // appends) lives in `launcher` where it is unit-tested. Parity with the TUI
@@ -317,7 +381,7 @@ async fn degrade_to_pty(
     .then(|| crate::runtimes::codex_theme_name(&recipe.theme));
     let argv = crate::launcher::build_agent_resume_command(
         recipe.kind,
-        &recipe.bin,
+        &bin,
         recipe.settings.as_deref(),
         recipe.model.as_deref(),
         recipe.resume.as_deref(),
@@ -345,10 +409,12 @@ async fn degrade_to_pty(
     match state.sessions.spawn(opts) {
         Ok(_) => {
             tracing::info!(%id, "chat session degraded to PTY TUI");
+            true
         }
         Err(err) => {
             tracing::error!(%id, %err, "degrade respawn failed");
             crate::recents::retire(state, id, None, None);
+            false
         }
     }
 }
@@ -485,14 +551,14 @@ async fn resolve_respawn_inputs(
     state: &Arc<AppState>,
     id: &str,
     kind: AgentKind,
-) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf), String> {
+) -> Result<(Option<PathBuf>, Option<PathBuf>, PathBuf, Option<String>), String> {
     let settings = Some(crate::agents::settings_path(id)).filter(|p| p.exists());
     let mcp_config = Some(crate::agents::mcp_config_path(id)).filter(|p| p.exists());
-    let bin = crate::launcher::detect(state, kind, false)
-        .await
-        .path
-        .map_err(|e| e.to_string())?;
-    Ok((settings, mcp_config, bin))
+    // Take the path and its probed version from the SAME detection so the
+    // respawn's version matches the binary it will actually run.
+    let detection = crate::launcher::detect(state, kind, false).await;
+    let bin = detection.path.map_err(|e| e.to_string())?;
+    Ok((settings, mcp_config, bin, detection.version))
 }
 
 /// Truncate a rewound session's journal at the conversation-fork point.
@@ -744,7 +810,8 @@ async fn perform_switch(
 
     // Resolve every respawn precondition BEFORE killing the old process (see
     // `resolve_respawn_inputs`).
-    let (settings, mcp_config, bin) = resolve_respawn_inputs(state, id, record.kind).await?;
+    let (settings, mcp_config, bin, version) =
+        resolve_respawn_inputs(state, id, record.kind).await?;
     // The claude chat driver needs both per-session files; fail now, not
     // after the kill (spawn_chat_session would otherwise bail post-kill).
     if target_chat
@@ -782,6 +849,7 @@ async fn perform_switch(
             workspace_root: workspace_root.clone(),
             kind: record.kind,
             bin: bin.clone(),
+            version: version.clone(),
             settings: settings.clone(),
             mcp_config: mcp_config.clone(),
             model: None,
@@ -795,6 +863,7 @@ async fn perform_switch(
             workspace_root,
             kind: record.kind,
             bin,
+            version,
             settings,
             mcp_config,
             model: None,
@@ -873,10 +942,11 @@ pub(crate) async fn rewind_session(
     // Resolve every respawn precondition BEFORE the kill (same discipline as
     // the view switch): a post-kill failure would strand the session. Rewind
     // is claude-only, which needs both per-session files.
-    let (settings, mcp_config, bin) = match resolve_respawn_inputs(&state, &id, record.kind).await {
-        Ok(inputs) => inputs,
-        Err(msg) => return err(StatusCode::CONFLICT, msg),
-    };
+    let (settings, mcp_config, bin, version) =
+        match resolve_respawn_inputs(&state, &id, record.kind).await {
+            Ok(inputs) => inputs,
+            Err(msg) => return err(StatusCode::CONFLICT, msg),
+        };
     if settings.is_none() || mcp_config.is_none() {
         return err(
             StatusCode::CONFLICT,
@@ -926,6 +996,7 @@ pub(crate) async fn rewind_session(
             workspace_root,
             kind: record.kind,
             bin,
+            version,
             settings,
             mcp_config,
             model: None,
@@ -1099,6 +1170,11 @@ pub(crate) fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::launcher_context_env();
     spec.pinned_native_id = pinned;
+    // The binary version the launcher resolved alongside `recipe.bin`: the
+    // harness journals it on Init and warns (non-fatally) when it drifts from
+    // the driver's tested pin. `None` when the probe failed — the harness then
+    // simply skips the drift check.
+    spec.agent_version = recipe.version.clone();
 
     // Resuming a finished conversation mints a NEW chimaera session id, and the
     // agents replay no history over the wire — seed the new journal so attach

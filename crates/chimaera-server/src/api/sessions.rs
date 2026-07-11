@@ -252,7 +252,11 @@ async fn spawn_chat_ui(
     }
 
     let id = crate::agents::fresh_session_id();
-    let bin = match crate::launcher::detect(state, agent_kind, false).await.path {
+    // Take the path AND its probed version from one detection so the chat
+    // driver's version notice reflects the binary it actually spawns.
+    let detection = crate::launcher::detect(state, agent_kind, false).await;
+    let agent_version = detection.version.clone();
+    let bin = match detection.path {
         Ok(path) => path,
         Err(msg) => return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response(),
     };
@@ -311,6 +315,7 @@ async fn spawn_chat_ui(
         workspace_root: workspace.root.clone(),
         kind: agent_kind,
         bin,
+        version: agent_version,
         settings,
         mcp_config,
         model: body.model.clone(),

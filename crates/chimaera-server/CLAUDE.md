@@ -47,9 +47,13 @@ decides **which** driver runs and **what happens around** its lifecycle.
 - **`spawn_chat_session`** is the one spawn recipe (create, view-switch, rewind
   all route through it). It assembles argv via `launcher`, seeds the journal
   from a previous life on resume, and hands a `SpawnSpec` to `state.chat.spawn`.
-- **`handle_chat_exit`** degrades a failed handshake to a PTY TUI, or retires the
-  session — EXCEPT during a deliberate view switch (`chat_switching`), which it
-  leaves intact for the respawn.
+- **`handle_chat_exit`** degrades a failed handshake to a PTY TUI (marking the
+  in-flight degrade in `chat_switching` so attached chat sockets report
+  `degraded`, not `exited`, and stamping a `ModeSwitch` in the journal on
+  success), keeps a handshake failure with no recipe visible-and-Errored (like
+  `ProtocolError`), or retires a clean exit — EXCEPT during a deliberate view
+  switch (`chat_switching`), which it leaves intact for the respawn. Startup
+  failures are already journaled by the driver harness before this runs.
 - **`switch_view` / `rewind_session`** stop the current process and respawn the
   SAME chimaera session id in the other surface / at a fork point.
 
@@ -63,7 +67,7 @@ the lifecycle, keep them consistent:
 | `state.chat` (the `ChatManager`) | the live driver registry | dead `ProtocolError` entries are kept visible — presence ≠ alive. |
 | `state.agents` | `AgentRecord` (state, title, files, `custom_title`) | survives a view switch; the identity that both surfaces share. |
 | `state.chat_recipes` | respawn recipe per id | must be removed when the session ends or toggles (else it leaks). |
-| `state.chat_switching` | ids mid view-switch | serialize entry (one switch per id); the exit path keys on it. |
+| `state.chat_switching` | ids mid view-switch (or mid auto-degrade) | serialize entry (one switch per id); the exit path keys on it; the degrade inserts "term" around its respawn window. |
 | `state.session_workspaces` | id → workspace | resolve the workspace root from here. |
 
 ## Invariants / gotchas

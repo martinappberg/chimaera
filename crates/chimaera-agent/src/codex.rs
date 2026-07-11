@@ -210,6 +210,14 @@ struct CodexDriver;
 impl Driver for CodexDriver {
     type Mapper = CodexMapper;
 
+    fn kind(&self) -> &'static str {
+        "codex"
+    }
+
+    fn tested_version(&self) -> &'static str {
+        TESTED_CODEX_VERSION
+    }
+
     // Handshake covers initialize AND thread start/resume — a driver that
     // cannot open a thread is as dead as one that cannot speak at all.
     async fn handshake<'a>(
@@ -220,7 +228,7 @@ impl Driver for CodexDriver {
     ) -> std::result::Result<Handshake<CodexMapper>, String> {
         let (thread_id, models) = codex_handshake(sink, stream, spec).await?;
         Ok(Handshake {
-            mapper: CodexMapper::new(thread_id, models),
+            mapper: CodexMapper::new(thread_id, models, spec.agent_version.clone()),
             initial: Vec::new(),
         })
     }
@@ -352,6 +360,8 @@ enum PendingRpc {
 struct CodexMapper {
     thread_id: String,
     models: Vec<crate::model::ModelInfo>,
+    /// Launcher-probed `--version` line, echoed on every Init (journal truth).
+    agent_version: Option<String>,
     model: Option<String>,
     /// Model override for subsequent turns (set_model).
     pending_model: Option<String>,
@@ -408,10 +418,15 @@ fn codex_modes() -> Vec<crate::model::ModeInfo> {
 }
 
 impl CodexMapper {
-    fn new(thread_id: String, models: Vec<crate::model::ModelInfo>) -> Self {
+    fn new(
+        thread_id: String,
+        models: Vec<crate::model::ModelInfo>,
+        agent_version: Option<String>,
+    ) -> Self {
         Self {
             thread_id,
             models,
+            agent_version,
             model: None,
             pending_model: None,
             pending_effort: None,
@@ -444,6 +459,7 @@ impl CodexMapper {
             current_mode: Some(self.current_mode.clone()),
             slash_commands: Vec::new(),
             models: self.models.clone(),
+            agent_version: self.agent_version.clone(),
         }
     }
 
@@ -1741,7 +1757,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new())
+        CodexMapper::new("thr-1".into(), Vec::new(), None)
     }
 
     fn active_turn(m: &mut CodexMapper) {
