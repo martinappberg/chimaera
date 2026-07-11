@@ -130,3 +130,7 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Linux + Windows(WSL2) apps — intent capture PENDING
+_The 2026-07-10 `feat:` shipped both platforms; the maintainer's why/deliberate answers have
+not been captured yet — run **capture-feature-intent** before treating any of it as locked._
