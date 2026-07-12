@@ -1347,10 +1347,11 @@ pub(crate) async fn resurrect_chat(
         .path
         .map_err(|e| anyhow::anyhow!("agent unavailable: {e}"))?;
 
+    // One agent key for both the per-session files and the AgentRecord below.
+    let key = crate::agents::fresh_agent_key();
     // Regenerate the per-session hook/mcp files (claude only) against THIS
     // daemon's port — the runtime dir is not durable across a restart.
     let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
-        let key = crate::agents::fresh_agent_key();
         let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
             .then_some(entry.theme.as_str());
         let s = crate::agents::write_settings(&entry.id, &key, state.port, settings_theme)?;
@@ -1382,16 +1383,22 @@ pub(crate) async fn resurrect_chat(
         other => other.clone(),
     };
 
-    // Keep the session addressable: the workspace mapping is read by every
-    // workspace-scoped op AND by the next ledger snapshot — without it a
-    // resurrected chat would be dropped from the following snapshot and lost on
-    // the NEXT restart. Carry the user's pinned title too, when a record exists.
-    crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
-    if let Some(name) = &entry.pinned_name {
-        if let Some(rec) = crate::lock(&state.agents).get_mut(&entry.id) {
-            rec.custom_title = Some(name.clone());
-        }
+    // Seed the AgentRecord BEFORE the spawn. `apply_chat_event` only UPDATES an
+    // existing record — on a fresh boot there is none, so a `get_mut` here would
+    // no-op and the row would come back as a bare "claude". Mirror create_session:
+    // carry the user's pinned name (`custom_title`), and absent one the ledger's
+    // display title as the soft `ai_title` (a new turn still refines it), plus the
+    // conversation we resumed from. The workspace mapping is read by every
+    // workspace-scoped op AND the next ledger snapshot — without it a resurrected
+    // chat is dropped from the following snapshot and lost on the NEXT restart.
+    let mut record = crate::agents::AgentRecord::new(key, agent.kind);
+    record.resumed_from = resume.clone();
+    record.custom_title = entry.pinned_name.clone();
+    if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
+        record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
     }
+    crate::lock(&state.agents).insert(entry.id.clone(), record);
+    crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
 
     let recipe = ChatRecipe {
         workspace_root: root,

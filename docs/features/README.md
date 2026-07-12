@@ -68,10 +68,8 @@ Cross-cutting *infrastructure* — not user features — lives with the code, no
 Some behavior can't be documented from code alone — it needs product intent — and a few
 capabilities are half-built. Rather than guess, the pages flag these inline
 (**Intent: pending** for the former; **Status: partial** for the latter). Known
-half-built items today: a resurrected chat loses its user-pinned title (the conversation
-resumes intact — see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)); Codex
-chat drops the create-time model; Gemini/Antigravity aren't first-class agents yet (see
-[agents.md](agents.md)).
+half-built items today: Codex chat drops the create-time model; Gemini/Antigravity aren't
+first-class agents yet (see [agents.md](agents.md)).
 
 ## Keeping this catalog current
 

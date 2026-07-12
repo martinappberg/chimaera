@@ -82,13 +82,6 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   overrides; users can disable with `update.autoCheck`. Test knobs: `CHIMAERA_RELEASES_API`,
   `CHIMAERA_UPDATE_CURRENT`.
 
-## Status: partial
-
-- **A resurrected chat loses its user-pinned title** (the renamed name resets to the agent-derived
-  default) — the pinned `custom_title` is only carried onto a resurrected chat when an `AgentRecord`
-  already exists, which it does not on a fresh boot. The conversation itself resumes intact; only the
-  custom label is lost.
-
 ---
 
 ## Intent — human-authored ground truth
@@ -122,8 +115,8 @@ _Captured 2026-07-12 (from the maintainer)._
 - **How settled it is:** the *behavior* — a restart brings your chats back — is the aim and a
   promise (*"yes, that is what I am aiming for"*). The specific mechanics are *"more just a UX,"*
   not a contract.
-- **Deliberately open / where it may go:** the resurrect-resumable-live / retire-the-rest policy
-  and the currently-lost pinned title are UX details, free to improve toward a smoother experience.
+- **Deliberately open / where it may go:** the resurrect-resumable-live / retire-the-rest policy is
+  a UX detail, free to improve toward a smoother experience.
 - **Do not change (or: open to change):** *"keep a smooth UX for the user"* — don't regress the
   core "never silently lose a chat" property (the daemon-owns-everything bet above). Grade: an
   **addition** — the exact resurrect-vs-retire mechanics can change if improved.
