@@ -110,13 +110,32 @@
     });
   });
 
-  /** Slash popover: draft is a single "/prefix" token being typed. */
+  /** Escape-dismissed slash token text — suppresses the popover for exactly
+   *  that token so Escape closes it without clearing a mid-draft message;
+   *  typing on (the token text changes) brings it back. */
+  let slashDismissed = $state<string | null>(null);
+
+  /** A line-leading "/command" token under the caret. Unlike the old
+   *  draft-start-only rule, a command begun on a fresh line mid-draft (a
+   *  follow-up like "/meeting-notes") completes too. Line-leading ONLY (start
+   *  of the box or right after a newline) so ordinary path text — "cd /usr" —
+   *  is never hijacked. Captured from the pre-focus caret (like the @ token),
+   *  since a popover click steals selectionStart. */
+  function slashToken(): { start: number; text: string } | null {
+    const caret = el !== null ? el.selectionStart : draft.length;
+    const match = /(^|\n)(\/[\w:-]*)$/.exec(draft.slice(0, caret));
+    if (match === null) return null;
+    return { start: caret - match[2].length, text: match[2] };
+  }
+  const slashTok = $derived.by(() => {
+    void draft;
+    return slashToken();
+  });
   const slashMatches = $derived.by(() => {
-    if (!draft.startsWith("/") || /\s/.test(draft)) return [];
-    const q = draft.slice(1).toLowerCase();
-    return slashCommands
-      .filter((c) => c.name.toLowerCase().startsWith(q))
-      .slice(0, 8);
+    const token = slashTok;
+    if (token === null || token.text === slashDismissed) return [];
+    const q = token.text.slice(1).toLowerCase();
+    return slashCommands.filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 8);
   });
 
   /** The @token under the caret, if any (mention autocomplete). */
@@ -195,11 +214,23 @@
   });
 
   function pickSlash(name: string) {
-    if (onSlash(name)) {
+    const token = slashTok;
+    // A slash that IS the whole draft takes the command path: dialog-only
+    // commands open native UI (onSlash), the rest become "/name " ready to
+    // send. A slash begun MID-draft is a typing aid — complete the token in
+    // place and leave the surrounding message intact.
+    const wholeDraft =
+      token !== null && token.start === 0 && draft.slice(token.text.length).trim() === "";
+    if (wholeDraft && onSlash(name)) {
       draft = "";
       return;
     }
-    draft = `/${name} `;
+    if (token === null) {
+      draft = `/${name} `;
+    } else {
+      draft = `${draft.slice(0, token.start)}/${name} ${draft.slice(token.start + token.text.length)}`;
+    }
+    slashDismissed = null;
     el?.focus();
   }
 
@@ -275,9 +306,18 @@
       }
       if (e.key === "Escape") {
         e.preventDefault();
-        fileMatches = [];
-        fileToken = null;
-        draft = draft.startsWith("/") ? "" : draft;
+        if (popover === "slash") {
+          // Dismiss the popover in place (never wipe a mid-draft message); a
+          // whole-draft "/cmd" still clears, matching the old quick-escape.
+          if (slashTok !== null && slashTok.start === 0 && draft.trim() === slashTok.text) {
+            draft = "";
+          } else {
+            slashDismissed = slashTok?.text ?? null;
+          }
+        } else {
+          fileMatches = [];
+          fileToken = null;
+        }
         return;
       }
     }
