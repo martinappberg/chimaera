@@ -32,9 +32,20 @@
     onOpenFile?: (path: string) => void;
     /** Kind-aware open: files → viewer pane, dirs → the Finder. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
+    /** Flip this session to its real TUI (the pane-bar view toggle). Used for
+     *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
+     *  above all — so the native auth flow runs where it belongs. */
+    onSwitchToTerminal?: () => void;
   }
 
-  let { session, focused, terminals = [], onOpenFile, onOpenPath }: Props = $props();
+  let {
+    session,
+    focused,
+    terminals = [],
+    onOpenFile,
+    onOpenPath,
+    onSwitchToTerminal,
+  }: Props = $props();
 
   // The component is {#key}ed on session id by its parent: one instance per
   // session. The store + socket come from the session-keyed chat pool, so a
@@ -291,6 +302,17 @@
           toggleUltracode();
         }
         return true;
+      case "login":
+        // /login is an interactive OAuth / setup-token / SSO flow the `-p`
+        // stream-json CLI can't run ("/login isn't available in this
+        // environment") — so an expired session dead-ends in chat with no way
+        // back. Flip to the real TUI, where claude's own /login handles every
+        // auth method safely (chimaera never sees the credentials); sign in
+        // there, then toggle back to chat with the pane-bar button. Claude
+        // only for now — codex's auth flow (`codex login`) is a follow-up.
+        if (agentKind !== "claude" || onSwitchToTerminal === undefined) return false;
+        onSwitchToTerminal();
+        return true;
       default:
         return false;
     }
@@ -346,6 +368,7 @@
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
     if (agentKind === "claude") {
       native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
+      native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
     }
     if (agentKind === "codex") {
       native.push({ name: "compact", description: "compact conversation context" });
