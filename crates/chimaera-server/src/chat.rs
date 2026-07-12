@@ -1413,8 +1413,24 @@ pub(crate) async fn resurrect_chat(
         rollback_turns: None,
         theme: entry.theme.clone(),
     };
-    spawn_chat_session(state, entry.id.clone(), recipe, None)?;
-    Ok(())
+    match spawn_chat_session(state, entry.id.clone(), recipe, None) {
+        Ok(_) => {
+            // Same lifetime watcher every freshly-created chat gets (see
+            // create_session): it tails the transcript for title records and is
+            // the death → Recents backstop once the session finally goes (e.g.
+            // a degrade-to-TUI that then exits). Without it a resurrected chat
+            // would diverge from a created one.
+            crate::agents::spawn_agent_watch(state.clone(), entry.id.clone());
+            Ok(())
+        }
+        Err(e) => {
+            // Mirror the create path's failure arm: don't leave an orphan
+            // AgentRecord + workspace mapping for a session that never spawned.
+            crate::lock(&state.agents).remove(&entry.id);
+            crate::lock(&state.session_workspaces).remove(&entry.id);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

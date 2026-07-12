@@ -67,7 +67,13 @@
   const probe = $derived.by<TextProbe>(() => {
     if (kind !== "text") return { state: "loading" };
     const e = entry;
-    if (e === null || (e.chunk === null && e.chunkError === null)) return { state: "loading" };
+    // `entry` is assigned in the effect below (which runs AFTER this derived
+    // re-evaluates on a path change), so on a switch it briefly still points at
+    // the PREVIOUS path. Treat a mismatched entry as loading, forcing the
+    // {#key path} block to unmount/remount CodeView with the correct chunk
+    // rather than seeding it from the old file's bytes.
+    if (e === null || e.path !== path || (e.chunk === null && e.chunkError === null))
+      return { state: "loading" };
     if (e.chunkError !== null) return { state: "error", message: e.chunkError };
     const chunk = e.chunk;
     if (chunk === null) return { state: "loading" };

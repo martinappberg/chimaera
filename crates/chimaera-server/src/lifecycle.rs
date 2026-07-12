@@ -5,7 +5,7 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 
 use crate::{app, lock, AppState, ServerConfig};
-use crate::{git, ledger, runtimes, update};
+use crate::{git, ledger, recents, runtimes, update};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
@@ -122,10 +122,29 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // process — the ledger written here is exactly what resurrects them, and
     // `ledger::snapshot` now covers chat sessions too, so a successor brings
     // them back (resumable ones live, the rest into Recents at boot). We must
-    // NOT retire chats here: that removes their workspace mapping, so the
-    // reconciler's next snapshot would drop them and they'd never resurrect.
+    // NOT retire the LIVE chats here: that removes their workspace mapping, so
+    // the reconciler's next snapshot would drop them and they'd never resurrect.
     let (entries, links) = ledger::snapshot(&state);
     lock(&state.ledger).write_if_changed(&entries, &links);
+
+    // Dead-but-visible chats (a ProtocolError entry the ChatManager keeps in
+    // the registry with alive=false) are excluded from the snapshot above, so
+    // resurrection never touches them. They're still resumable conversations
+    // (codex has no transcript-store backstop), so retire them into Recents now
+    // — exactly what the old blanket retire loop did — or they'd vanish on the
+    // restart. Only the dead ones: retiring a live chat would strip the mapping
+    // the reconciler already captured.
+    for info in state.chat.list() {
+        if !info.alive {
+            recents::retire(
+                &state,
+                &info.id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+            );
+        }
+    }
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");

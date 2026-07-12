@@ -126,6 +126,13 @@
       rows = page.rows;
       loadedOffset = page.offset;
       numericCols = detectNumeric(page.columns, page.rows.slice(0, 50));
+      // A fresh first page also RESETS pagination — this runs not only on the
+      // initial load but on a live refresh after a disk change, where atEnd /
+      // total / error may carry over from the previous (fully-loaded) content
+      // and would otherwise strand the grown file at its first page.
+      atEnd = false;
+      total = null;
+      error = null;
     } else {
       rows = rows.concat(page.rows);
     }

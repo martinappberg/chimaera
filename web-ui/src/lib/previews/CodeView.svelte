@@ -68,6 +68,11 @@
   let truncated = $state(false);
   let loadingMore = $state(false);
   let loadError = $state<string | null>(null);
+  // Bumped whenever the doc is authoritatively replaced (a reload). A
+  // background `fillToEnd`/`loadMore` captures it before its await and bails if
+  // it changed, so an external-change reload can't interleave appended chunks
+  // (fetched at a now-stale offset) into the freshly replaced document.
+  let loadGen = 0;
 
   // Editing state.
   let editable = $state(false);
@@ -277,10 +282,11 @@
 
   /** Load remaining chunks (silently) so an under-cap file becomes editable. */
   async function fillToEnd(v: EditorView): Promise<void> {
-    while (view === v && truncated) {
+    const gen = loadGen;
+    while (view === v && gen === loadGen && truncated) {
       try {
         const chunk = await fsFile(path, loadedBytes, FILE_CHUNK);
-        if (view !== v) return;
+        if (view !== v || gen !== loadGen) return; // a reload superseded us
         const text = decoder.decode(chunk.bytes, { stream: true });
         v.dispatch({ changes: { from: v.state.doc.length, insert: text } });
         loadedBytes += chunk.bytes.length;
@@ -291,7 +297,7 @@
         return; // leave it read-only-ish; user can still view
       }
     }
-    if (view === v && !truncated && totalBytes <= EDIT_MAX_BYTES && !editable) {
+    if (view === v && gen === loadGen && !truncated && totalBytes <= EDIT_MAX_BYTES && !editable) {
       editable = true;
       // The background fill shouldn't leave the doc marked dirty.
       v.dispatch({ effects: editCompartment.reconfigure(editExtensions(true)) });
@@ -304,9 +310,10 @@
     if (v === null || loadingMore) return;
     loadingMore = true;
     loadError = null;
+    const gen = loadGen;
     try {
       const chunk = await fsFile(path, loadedBytes, FILE_CHUNK);
-      if (view !== v) return;
+      if (view !== v || gen !== loadGen) return; // a reload superseded us
       const text = decoder.decode(chunk.bytes, { stream: true });
       v.dispatch({ changes: { from: v.state.doc.length, insert: text } });
       loadedBytes += chunk.bytes.length;
@@ -360,23 +367,47 @@
     flashTimer = setTimeout(() => (savedFlash = false), 1600);
   }
 
-  /** Conflict → reload: discard local edits, take the on-disk version. */
-  async function reloadFromDisk(): Promise<void> {
+  /**
+   * Take the on-disk version. `force` = the user pressed "reload" and accepts
+   * losing local edits; without it (the live-watch auto-reload) an edit typed
+   * DURING the fetch must not be clobbered — re-check dirty after the await and
+   * fall back to the conflict bar instead.
+   */
+  async function reloadFromDisk(force = false): Promise<void> {
     const v = view;
     if (v === null) return;
+    const gen = ++loadGen; // supersede any in-flight fillToEnd/loadMore
     try {
       const chunk = await fsFile(path, 0, EDIT_MAX_BYTES);
-      if (view !== v) return;
-      const fresh = new TextDecoder("utf-8", { fatal: false }).decode(chunk.bytes);
+      if (view !== v || gen !== loadGen) return;
+      // Adopt the on-disk mtime regardless of the branches below, so the
+      // live-watch doesn't re-fire for the same version on every fs bump.
+      savedMtime = chunk.mtime;
+      // A keystroke landed while we were fetching: don't discard it silently.
+      if (!force && dirty) {
+        conflict = true;
+        return;
+      }
       if (looksBinary(chunk.bytes)) return;
+      const fresh = new TextDecoder("utf-8", { fatal: false }).decode(chunk.bytes);
       v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: fresh } });
       loadedBytes = chunk.bytes.length;
       totalBytes = chunk.size;
       truncated = chunk.truncated;
-      savedMtime = chunk.mtime;
       conflict = false;
       saveError = null;
       clearDirty();
+      // Editability can flip when the file crosses the 1MB cap on disk (an
+      // external rewrite): recompute it (mirror onMount) so a now-oversized
+      // file drops to read-only — otherwise a later save would write only the
+      // truncated 1MB buffer over the full file — and a now-small file becomes
+      // editable, with the same background fill for an under-cap truncated tail.
+      const canEdit = totalBytes <= EDIT_MAX_BYTES && !truncated;
+      if (canEdit !== editable) {
+        editable = canEdit;
+        v.dispatch({ effects: editCompartment.reconfigure(editExtensions(canEdit)) });
+      }
+      if (totalBytes <= EDIT_MAX_BYTES && truncated) void fillToEnd(v);
     } catch (e) {
       saveError = e instanceof Error ? e.message : "reload failed";
     }
@@ -391,7 +422,7 @@
     <!-- Quiet concurrent-modification bar: the file changed on disk under us. -->
     <div class="conflict" role="alert">
       <span class="conflict-msg">changed on disk</span>
-      <button class="conflict-btn" onclick={() => void reloadFromDisk()}>reload</button>
+      <button class="conflict-btn" onclick={() => void reloadFromDisk(true)}>reload</button>
       <button class="conflict-btn danger" onclick={() => void save(true)}>overwrite</button>
     </div>
   {/if}

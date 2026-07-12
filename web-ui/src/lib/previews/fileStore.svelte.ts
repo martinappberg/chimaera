@@ -57,6 +57,13 @@ export class FileEntry {
   rawUrl = $state<string | null>(null);
   rawError = $state<string | null>(null);
 
+  /** Whether any payload is cached — i.e. the entry is "warm", not cold. */
+  get hasPayload(): boolean {
+    return (
+      this.chunk !== null || this.markdown !== null || this.table !== null || this.rawUrl !== null
+    );
+  }
+
   // --- non-reactive bookkeeping -------------------------------------------
   /** Mounted views holding this entry; an entry with refs>0 is "on screen". */
   refs = 0;
@@ -143,35 +150,56 @@ export class FileEntry {
    * not react to it (it live-updates via the mtime watch instead).
    */
   private async refreshPayloads(): Promise<void> {
+    // The populated payloads are independent reads — refetch them concurrently
+    // so a live refresh costs one round-trip, not the sum. Each keeps its
+    // last-known value on failure.
+    const jobs: Promise<void>[] = [];
     if (this.chunk !== null) {
-      try {
-        this.chunk = await fsFile(this.path);
-      } catch {
-        /* keep the last-known chunk */
-      }
+      jobs.push(
+        fsFile(this.path)
+          .then((c) => {
+            this.chunk = c;
+          })
+          .catch(() => {
+            /* keep the last-known chunk */
+          }),
+      );
     }
     if (this.markdown !== null) {
-      try {
-        this.markdown = await fsMarkdown(this.path);
-      } catch {
-        /* keep the last-known html */
-      }
+      jobs.push(
+        fsMarkdown(this.path)
+          .then((h) => {
+            this.markdown = h;
+          })
+          .catch(() => {
+            /* keep the last-known html */
+          }),
+      );
     }
     if (this.table !== null) {
-      try {
-        this.table = await fsTable(this.path, 0, getSetting("files.tableRowsPerPage"));
-      } catch {
-        /* keep the last-known page */
-      }
+      jobs.push(
+        fsTable(this.path, 0, getSetting("files.tableRowsPerPage"))
+          .then((t) => {
+            this.table = t;
+          })
+          .catch(() => {
+            /* keep the last-known page */
+          }),
+      );
     }
     if (this.rawUrl !== null) {
-      try {
-        this.rawUrl = await fsRawUrl(this.path);
-        this.rawMintedAt = Date.now();
-      } catch {
-        /* keep the last-known url */
-      }
+      jobs.push(
+        fsRawUrl(this.path)
+          .then((u) => {
+            this.rawUrl = u;
+            this.rawMintedAt = Date.now();
+          })
+          .catch(() => {
+            /* keep the last-known url */
+          }),
+      );
     }
+    await Promise.all(jobs);
   }
 
   /**
@@ -238,6 +266,14 @@ export function retain(path: string): FileEntry {
   const e = entryFor(path);
   e.refs += 1;
   evict();
+  // A warm entry reclaimed after time off-screen may have missed a disk change
+  // (scheduleRevalidate only covers entries that were on screen when the bump
+  // fired). Re-probe on claim so reopening a file reflects edits made while it
+  // sat on another tab. Keyed on any cached payload — NOT on `mtime`, which only
+  // the chunk fetch populates (a table/markdown/image/pdf entry is warm with a
+  // null mtime, and would otherwise never revalidate on reopen). A cold entry
+  // has nothing to revalidate — its ensure*() fetches fresh.
+  if (e.hasPayload) void e.revalidate();
   return e;
 }
 
@@ -254,6 +290,14 @@ export function noteWrite(path: string, mtime: string | null): void {
 
 /** Forget a path entirely (deleted/renamed away — nothing left to cache). */
 function forget(path: string): void {
+  const e = cache.get(path);
+  if (e === undefined) return;
+  // A mounted view still holds this entry (refs>0): dropping it now would
+  // orphan that view — a later retain() of the same path would mint a SECOND
+  // entry while the orphan's release() decrements the new one, driving a live
+  // entry's refs to 0. Leave it; a re-created file heals via retain()'s
+  // revalidate, and once unreferenced the LRU reaps it.
+  if (e.refs > 0) return;
   cache.delete(path);
 }
 
