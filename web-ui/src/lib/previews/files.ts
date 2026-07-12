@@ -247,6 +247,29 @@ export async function fsTable(path: string, offsetRows = 0, limitRows = 200): Pr
   return json(await api(`/fs/table?${q.toString()}`));
 }
 
+/** One page of a spreadsheet sheet: the CSV `TablePage` shape plus the
+ *  workbook's sheet names and which one this page is from. */
+export interface XlsxPage extends TablePage {
+  sheets: string[];
+  sheet: string;
+}
+
+/** A page of a spreadsheet (xlsx/xls/xlsm/ods). `sheet` null = the first sheet. */
+export async function fsXlsx(
+  path: string,
+  sheet: string | null,
+  offsetRows = 0,
+  limitRows = 200,
+): Promise<XlsxPage> {
+  const q = new URLSearchParams({
+    path,
+    offset_rows: String(offsetRows),
+    limit_rows: String(limitRows),
+  });
+  if (sheet !== null) q.set("sheet", sheet);
+  return json(await api(`/fs/xlsx?${q.toString()}`));
+}
+
 /**
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
@@ -471,6 +494,7 @@ export type FileViewKind =
   | "markdown"
   | "html"
   | "table"
+  | "xlsx"
   | "pdf"
   | "binary"
   | "text";
@@ -484,6 +508,8 @@ export function isImagePath(path: string): boolean {
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
 const TABLE_EXTS = new Set(["csv", "tsv"]);
+/** Spreadsheets parsed server-side (calamine) into the same paged table grid. */
+const SPREADSHEET_EXTS = new Set(["xlsx", "xls", "xlsm", "ods"]);
 /**
  * Extensions we know are binary up front — straight to the info card, no
  * fetch. Everything not listed anywhere goes down the text path, which
@@ -499,7 +525,7 @@ const BINARY_EXTS = new Set([
   "woff", "woff2", "ttf", "otf", "eot",
   "ico", "bmp", "tif", "tiff", "heic", "psd",
   "sqlite", "db", "parquet", "feather", "h5", "hdf5",
-  "xlsx", "xls", "docx", "doc", "pptx", "ppt",
+  "docx", "doc", "pptx", "ppt",
   "bam", "bai", "cram", "crai", "bcf", "csi", "tbi", "bigwig", "bw", "bigbed", "bb",
 ]);
 
@@ -520,6 +546,7 @@ export function viewKindFor(path: string): FileViewKind {
   if (MARKDOWN_EXTS.has(ext)) return "markdown";
   if (HTML_EXTS.has(ext)) return "html";
   if (TABLE_EXTS.has(ext)) return "table";
+  if (SPREADSHEET_EXTS.has(ext)) return "xlsx";
   if (ext === "pdf") return "pdf";
   if (BINARY_EXTS.has(ext)) return "binary";
   return "text";
