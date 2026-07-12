@@ -11,6 +11,7 @@
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
+  import AgentsTray from "./AgentsTray.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
@@ -31,9 +32,20 @@
     onOpenFile?: (path: string) => void;
     /** Kind-aware open: files → viewer pane, dirs → the Finder. */
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
+    /** Flip this session to its real TUI (the pane-bar view toggle). Used for
+     *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
+     *  above all — so the native auth flow runs where it belongs. */
+    onSwitchToTerminal?: () => void;
   }
 
-  let { session, focused, terminals = [], onOpenFile, onOpenPath }: Props = $props();
+  let {
+    session,
+    focused,
+    terminals = [],
+    onOpenFile,
+    onOpenPath,
+    onSwitchToTerminal,
+  }: Props = $props();
 
   // The component is {#key}ed on session id by its parent: one instance per
   // session. The store + socket come from the session-keyed chat pool, so a
@@ -290,6 +302,17 @@
           toggleUltracode();
         }
         return true;
+      case "login":
+        // /login is an interactive OAuth / setup-token / SSO flow the `-p`
+        // stream-json CLI can't run ("/login isn't available in this
+        // environment") — so an expired session dead-ends in chat with no way
+        // back. Flip to the real TUI, where claude's own /login handles every
+        // auth method safely (chimaera never sees the credentials); sign in
+        // there, then toggle back to chat with the pane-bar button. Claude
+        // only for now — codex's auth flow (`codex login`) is a follow-up.
+        if (agentKind !== "claude" || onSwitchToTerminal === undefined) return false;
+        onSwitchToTerminal();
+        return true;
       default:
         return false;
     }
@@ -345,6 +368,7 @@
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
     if (agentKind === "claude") {
       native.push({ name: "mcp", description: "MCP servers — chimaera panel" });
+      native.push({ name: "login", description: "sign in — opens the terminal for Claude's native auth" });
     }
     if (agentKind === "codex") {
       native.push({ name: "compact", description: "compact conversation context" });
@@ -446,15 +470,34 @@
     codex: "reasoning effort — applies from the next message",
   };
 
-  /** Extended-thinking toggle (claude). Client-held — the CLI has no read-back,
-   *  so we track it locally and start from claude's unset default (off); the
-   *  chip shows an explicit on/off and tints when on, so its state is legible. */
-  let thinking = $state(false);
+  /** Extended-thinking toggle (claude). ON by default — chimaera's chat is a
+   *  workbench for real coding work, where the reasoning pass earns its keep;
+   *  the chip shows an explicit on/off and tints when on, so the state (and the
+   *  cost) is never hidden, and one click turns it off. The preference lives in
+   *  the pooled store, not here, so a tab remount keeps it. */
   const hasThinking = $derived(agentKind === "claude");
+  /** Effective thinking state: the user's explicit choice, or ON by default
+   *  (the reasoning pass earns its keep in a coding workbench). `null` in the
+   *  store means "unchosen" — so a toggle-off (a real `false`) is never
+   *  mistaken for the default and re-forced on. */
+  const thinkingOn = $derived(store.thinkingEnabled ?? true);
   function toggleThinking() {
-    thinking = !thinking;
-    socket.send({ type: "set_thinking", enabled: thinking });
+    const next = !thinkingOn;
+    store.setThinking(next);
+    socket.send({ type: "set_thinking", enabled: next });
   }
+  // Push the effective preference to the live driver, once per driver process.
+  // It pushes whatever the user's effective choice IS (never forces a value),
+  // so it can't override a toggle-off; `thinkingPushed` is reset on each `init`
+  // (a fresh process defaults thinking OFF) so a respawn/resume/view-toggle
+  // re-syncs, and is marked only once the send actually leaves so an
+  // undelivered push retries instead of stranding the chip out of sync.
+  $effect(() => {
+    if (!hasThinking || !store.connected || store.thinkingPushed) return;
+    if (socket.send({ type: "set_thinking", enabled: thinkingOn })) {
+      store.markThinkingPushed();
+    }
+  });
 
   const modeLabel = $derived(
     store.modes.find((m) => m.id === store.currentMode)?.label ?? store.currentMode,
@@ -527,6 +570,20 @@
   });
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
+  /** The step the agent is on now — surfaced in the plan summary so the
+   *  current goal is legible without expanding the panel. */
+  const planActive = $derived(store.plan.find((p) => p.status === "in_progress")?.content ?? null);
+
+  /** Subagents in flight right now — promoted into the live tray above the
+   *  composer. They also keep their in-place "Agent:" rows in the transcript
+   *  (the history); the tray is the glanceable live monitor. Reconciled shut
+   *  at turn end like any tool, so a finished/abandoned run never lingers. */
+  const activeAgents = $derived(
+    store.blocks.filter(
+      (b): b is Extract<ChatBlock, { kind: "tool" }> =>
+        b.kind === "tool" && b.tool === "agent" && b.status === "in_progress",
+    ),
+  );
 
   /** Render list: consecutive tool blocks coalesce into one ToolGroup so a
    *  long run reads as a single condensed line, not a wall of cards. Every
@@ -588,7 +645,7 @@
     effortHint={EFFORT_HINT[agentKind] ?? "reasoning effort"}
     {hasUltracode}
     {hasThinking}
-    {thinking}
+    thinking={thinkingOn}
     onPickModel={pickModel}
     onPickMode={pickMode}
     onPickEffort={pickEffort}
@@ -759,9 +816,22 @@
     </div>
   </div>
 
+  {#if activeAgents.length > 0}
+    <AgentsTray
+      agents={activeAgents}
+      onStop={agentKind === "claude"
+        ? (id) => socket.send({ type: "stop_task", task_id: id })
+        : undefined}
+    />
+  {/if}
+
   {#if store.plan.length > 0}
     <details class="plan">
-      <summary>plan · {planDone}/{store.plan.length}</summary>
+      <summary
+        >plan · {planDone}/{store.plan.length}{#if planActive !== null}<span class="plan-active"
+            > · ◐ {planActive}</span
+          >{/if}</summary
+      >
       {#each store.plan as entry, i (i)}
         <div class="plan-row" class:done={entry.status === "done"}>
           <span class="plan-mark">
@@ -1126,6 +1196,11 @@
     user-select: none;
     list-style-position: inside;
     padding: 2px 0;
+  }
+  /* The current step, shown right in the summary so the active goal is legible
+     without expanding — clipped so a long todo can't wrap the header. */
+  .plan-active {
+    color: color-mix(in srgb, var(--accent) 85%, var(--fg));
   }
   .plan-row {
     display: flex;

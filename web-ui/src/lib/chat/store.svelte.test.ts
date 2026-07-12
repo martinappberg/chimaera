@@ -187,6 +187,67 @@ describe("ChatStore pending-send ordering", () => {
     expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
   });
 
+  it("reconciles a tool whose completion update never arrived at turn end", () => {
+    // The stuck-"running" bug: a big image Read's result frame blows the
+    // transport's per-line cap and is dropped below the event layer, so the
+    // tool_call_update never lands. When the turn completes, the row must not
+    // keep spinning "in_progress" (its ToolGroup would never collapse).
+    const events = [
+      { type: "user_message", text: "review the figures", id: "u1", queued: false },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call", id: "r1", kind: "read", title: "Read: fig.png", status: "in_progress" },
+      // No tool_call_update for r1 — its result frame was dropped.
+      { type: "message_chunk", turn_id: "t1", text: "looks good" },
+      { type: "turn_completed", turn_id: "t1", usage: { output_tokens: 2 } },
+    ];
+    const store = fold(events);
+    const tool = store.blocks.find((b) => b.kind === "tool");
+    expect(tool).toMatchObject({ kind: "tool", id: "r1", status: "completed" });
+    // Replay agrees — the reconciliation is a pure reducer over the journal.
+    expect(fold(events).blocks).toEqual(store.blocks);
+  });
+
+  it("reconciles a dangling tool when the driver dies with a fatal error", () => {
+    // A fatal error is a terminal path like turn end: a kept-visible
+    // ProtocolError session emits no `exited`, so a tool left in_progress must
+    // not keep spinning.
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call", id: "r1", kind: "read", title: "Read: fig.png", status: "in_progress" },
+      { type: "error", message: "driver protocol error", fatal: true },
+    ]);
+    const tool = store.blocks.find((b) => b.kind === "tool");
+    expect(tool).toMatchObject({ kind: "tool", id: "r1", status: "completed" });
+    expect(store.running).toBe(false);
+  });
+
+  it("re-arms the thinking push on a fresh driver init", () => {
+    // The pooled thinking preference must be re-pushed to each new driver
+    // process (a fresh CLI defaults thinking off) — `init` resets the flag.
+    const store = fold([{ type: "turn_started", turn_id: "t1" }]);
+    store.markThinkingPushed();
+    expect(store.thinkingPushed).toBe(true);
+    store.apply({ seq: 99, ts: 99, ev: { type: "init", model: "claude-x" } } as SeqEvent);
+    expect(store.thinkingPushed).toBe(false);
+  });
+
+  it("leaves an already-completed tool from a prior turn untouched on a later turn end", () => {
+    // The scan stops at the previous turn_end, so reconciliation only closes
+    // the CURRENT turn's dangling rows — it never rewrites settled history.
+    const store = fold([
+      { type: "tool_call", id: "a1", kind: "execute", title: "ls", status: "in_progress" },
+      { type: "tool_call_update", id: "a1", status: "failed" },
+      { type: "turn_completed", turn_id: "t1", usage: { output_tokens: 1 } },
+      { type: "turn_started", turn_id: "t2" },
+      { type: "tool_call", id: "b1", kind: "read", title: "Read: x.png", status: "in_progress" },
+      { type: "turn_completed", turn_id: "t2", usage: { output_tokens: 1 } },
+    ]);
+    const a1 = store.blocks.find((b) => b.kind === "tool" && b.id === "a1");
+    const b1 = store.blocks.find((b) => b.kind === "tool" && b.id === "b1");
+    expect(a1).toMatchObject({ status: "failed" }); // prior turn's outcome preserved
+    expect(b1).toMatchObject({ status: "completed" }); // this turn's dangling row closed
+  });
+
   it("a fresh (turn-opening) send goes straight into the transcript", () => {
     const store = fold([
       { type: "user_message", text: "hi", id: "u1", queued: false },

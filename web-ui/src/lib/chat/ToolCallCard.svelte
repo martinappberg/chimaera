@@ -354,11 +354,8 @@
   .dot.bad {
     background: var(--err);
   }
-  @keyframes pulse {
-    50% {
-      opacity: 0.35;
-    }
-  }
+  /* `pulse` (the live-dot / cursor opacity pulse) is the shared keyframe in
+     app.css — reused by the subagents tray dot too. */
   @media (prefers-reduced-motion: reduce) {
     .dot.run,
     .cursor {

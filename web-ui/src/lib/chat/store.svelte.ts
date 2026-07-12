@@ -242,6 +242,29 @@ export class ChatStore {
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
 
+  /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
+   *  no read-back — but kept HERE (pooled per session, surviving a ChatView
+   *  tab remount) rather than in the view, so switching tabs can neither reset
+   *  the chip nor override a choice the user already made. `null` = the user
+   *  hasn't chosen, so the default (on for claude) applies; a bool is explicit.
+   *  The view reads the EFFECTIVE value, toggles it, and pushes it to the live
+   *  driver — it never re-forces a value, so a toggle-off always sticks. */
+  thinkingEnabled = $state<boolean | null>(null);
+  /** Whether the current preference has been pushed to the CURRENT driver
+   *  process. Reset on every `init` (a fresh process — respawn/resume/rewind/
+   *  view-toggle round-trip — starts with thinking OFF), so the view re-syncs
+   *  it to that driver; the view only marks it once the `set_thinking` frame
+   *  actually left the socket, so an undelivered push isn't silently lost. A
+   *  plain reconnect (same process, no new `init`) keeps it, so it isn't
+   *  re-pushed needlessly. */
+  thinkingPushed = $state(false);
+  setThinking(enabled: boolean): void {
+    this.thinkingEnabled = enabled;
+  }
+  markThinkingPushed(): void {
+    this.thinkingPushed = true;
+  }
+
   /** Queued/undelivered user messages, in order — rendered in a holding stack
    *  pinned above the composer (the send point), NEVER inline in history: a
    *  queued message is one you've typed and are waiting on. This is its OWN
@@ -297,6 +320,9 @@ export class ChatStore {
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
+    // The rebuilt replay re-drives the driver's `init`, but reset here too so
+    // the preference is re-pushed even if this reset races ahead of it.
+    this.thinkingPushed = false;
   }
 
   apply(entry: SeqEvent): void {
@@ -309,6 +335,10 @@ export class ChatStore {
         // replayed exit said (toggle round-trips, resumes).
         this.exited = null;
         this.degraded = false;
+        // This is a NEW driver process — the CLI defaults thinking OFF, so the
+        // view must re-push the user's preference to it (seq-dedupe means only
+        // a genuinely-new init re-applies here; a plain reconnect doesn't).
+        this.thinkingPushed = false;
         // Any ask still pending predates this driver process — its reply
         // route died with the old one, so an answer could never land. Seq
         // ordering makes this safe: a live driver's Init is journaled BEFORE
@@ -644,6 +674,10 @@ export class ChatStore {
       case "turn_completed": {
         this.running = false;
         this.activity = null;
+        // Close any tool row this turn left dangling (a dropped result frame)
+        // BEFORE the turn_end block lands, so the scan stops at the previous
+        // boundary and the end-of-turn artifact scan sees their final state.
+        this.reconcileOpenTools();
         const usage = ev.usage as {
           cost_usd?: number;
           output_tokens?: number;
@@ -661,6 +695,7 @@ export class ChatStore {
       case "turn_aborted": {
         this.running = false;
         this.activity = null;
+        this.reconcileOpenTools();
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
@@ -694,11 +729,16 @@ export class ChatStore {
           // the "starting…" row waiting on a turn end that can't come.
           this.running = false;
           this.activity = null;
+          // A fatal error is a terminal path like the others — a tool left
+          // in_progress must not spin forever when no `exited` follows (a kept-
+          // visible ProtocolError session emits no exit).
+          this.reconcileOpenTools();
         }
         break;
       case "exited":
         this.running = false;
         this.activity = null;
+        this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
@@ -763,6 +803,29 @@ export class ChatStore {
       this.notice(`${p.title} — no longer active`, "info");
     }
     this.pending = [];
+  }
+
+  /** A turn (or the session) has ended, so nothing it launched is still
+   *  running — reconcile any tool row still `in_progress`/`pending` to a
+   *  terminal state. Such a row never got its completion update: most often
+   *  the result frame was too large to parse and was dropped BELOW the event
+   *  layer (a big image `Read` blows the transport's per-line byte cap, so its
+   *  `tool_result` never reaches the driver), and nothing else ever closes it.
+   *  Left alone it spins "running…" forever and keeps its ToolGroup from
+   *  collapsing — the phantom the user sees after the turn is plainly over.
+   *  Scans back only over the just-ended turn (stopping at the previous
+   *  `turn_end`), and is a pure reducer over `blocks`, so replay rebuilds the
+   *  identical transcript. Marks `completed`, not `failed`: the tool most
+   *  likely DID finish (we simply never captured its output), and inventing a
+   *  red failure would be the louder lie. */
+  private reconcileOpenTools(): void {
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const b = this.blocks[i];
+      if (b.kind === "turn_end") break; // previous turn boundary — older turns already reconciled at their own end
+      if (b.kind === "tool" && (b.status === "in_progress" || b.status === "pending")) {
+        b.status = "completed";
+      }
+    }
   }
 
   /** The previewable files THIS turn produced, for the end-of-turn gallery.
