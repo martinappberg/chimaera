@@ -278,6 +278,17 @@ _Captured 2026-07-10 (from the maintainer, PR #43)._
   clamping on overcount, hence the exact journal-derived count — is recorded as a wire fact in
   PROTOCOL.md pass 10 rather than frozen here.)
 
+### Chat tab keep-alive (the chat pool) — why it exists
+_Captured 2026-07-11 (from the maintainer)._
+
+- **Problem it solves.** Switching chat tabs must not refetch the journal or drop the socket. A
+  session-keyed chat pool holds a warm store + open socket per session, so transcript, scroll, and the
+  live stream survive the remount (mirrors the terminal `termPool`; the turn timer's start lives in
+  the pool so it survives a mid-turn switch).
+- **The promise (the load-bearing bit).** **Chat tabs are as durable as terminal tabs** — a view
+  switch is a view switch, never a reload. Keep that parity.
+- **Grade — addition** otherwise: the pool mechanics are implementation, free to improve.
+
 ### Chat-UX batch (tool-state · subagents tray · thinking-default · slash-anywhere · /login) — why it exists
 _Captured 2026-07-12 (from the maintainer, in-session)._
 

@@ -192,3 +192,16 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
   I press the whole button thing it should open it in the UI"**.
 - **How settled:** chat-by-default from the launcher row and the explicit per-spawn terminal
   affordance are deliberate; the exact visuals can evolve.
+
+### Busy/idle session status — why it exists
+_Captured 2026-07-11 (from the maintainer)._
+
+- **Problem it solves.** An active (accent) dot should **mean something is actually happening** — not
+  a perpetual green. A session is "active" only while a foreground command runs (OSC 133 / an agent
+  turn); idle shells and between-turn agents read as a quiet dot.
+- **Where it pays off.** It makes the update flow honest: the local-daemon update button warns only
+  about **busy** sessions ("N busy will restart") — idle ones restore across the stateful restart.
+  See also [terminals.md](terminals.md) (the terminal dot) and
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md) (restart).
+- **Grade — addition:** the keeper is the *principle* (status must be honest), not the specific state
+  machine.

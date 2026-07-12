@@ -6,7 +6,7 @@ constraints) and three competing architecture proposals, each adversarially crit
 
 ## One-liner
 
-**Chimaera is an agent workbench, not an IDE.** A single static Rust binary runs as a
+**Chimaera is an agent workbench.** A single static Rust binary runs as a
 tmux-grade session daemon on whatever host owns the work — a remote server, an HPC login node,
 or your laptop — and serves a workspace-oriented UI where the primary objects are *agent
 sessions* living inside *folders*, surrounded by the file previews, terminals, and git state

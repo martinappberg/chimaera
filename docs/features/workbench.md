@@ -167,3 +167,12 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   improvable, not sacred.
 - **Do not change:** the workspace-first inversion. Everything else in the workbench can change if
   it's a clear improvement.
+
+### VS Code preview tabs — why they exist
+_Captured 2026-07-11 (from the maintainer)._
+
+- **Problem it solves.** Browsing files shouldn't litter a pane with permanent tabs. A file open is a
+  transient **preview** tab (one preview slot per pane, replaced by the next preview open); editing,
+  double-clicking a tab or tree row, or moving a tab **pins** it — muscle-memory parity with VS Code.
+- **Grade — addition, improvable.** Deliberate today (the preview flag persists in the layout blob),
+  but not a core bet — rework it freely if a better shape appears.

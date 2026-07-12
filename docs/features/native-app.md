@@ -144,6 +144,30 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
 
-### Linux + Windows(WSL2) apps — intent capture PENDING
-_The 2026-07-10 `feat:` shipped both platforms; the maintainer's why/deliberate answers have
-not been captured yet — run **capture-feature-intent** before treating any of it as locked._
+### Linux + Windows(WSL2) apps — why they exist
+_Captured 2026-07-11 (from the maintainer, confirming a draft read from the #44 commit body + code)._
+
+- **Problem it solves.** chimaera should be a first-class *native* app wherever developers are —
+  Linux workstations and Windows laptops, not macOS-only — built from **one codebase**. The
+  maintainer's framing is deliberately plain: *"just want it to work cross-platform."*
+- **How settled it is (intended vs provisional).** The **purpose** (works natively on all three
+  desktops, one codebase) is the settled part. The **mechanism is not frozen** — the Windows model
+  where the *daemon is never the app exe but the same Linux musl binary provisioned into WSL2*
+  (reached over NAT localhost) is *"today's best approach,"* explicitly **not** a core bet. Nothing
+  about the first-run wizard or the askpass interop chain is a promise either — it's how it works for
+  now.
+- **Deliberate / non-obvious.** **Linux is advertised & shipped** (AppImage/deb/rpm, auto-updating);
+  **Windows is beta and deliberately unadvertised** until a real-hardware pass of the wizard + the
+  interop/Duo askpass chain — a quality gate, not a permanent stance. Release jobs are **serialized**
+  because parallel bundle jobs race on `latest.json` and a platform silently loses auto-update. A
+  standing gotcha: on Windows ssh runs *inside the distro*, so aliases/keys resolve against the
+  **distro's** `~/.ssh`, not the Windows-side config the user's terminal uses.
+- **Do not change (or: open to change):** **open to change** — the whole cross-platform mechanism is
+  today's best approach, not a contract. A future agent should preserve the **purpose** (a native app
+  that works across macOS/Linux/Windows from one codebase) but is free to rework the WSL2 engine, the
+  wizard, or the daemon-provisioning model if there's a better cross-platform path. The one thing to
+  respect is **beta honesty**: a not-yet-hand-verified platform must be **clearly labeled beta**
+  wherever it's offered. (Update 2026-07-11: the maintainer chose to *surface* the Windows download
+  on the site as an explicitly-labeled beta — OS-detected primary button included — rather than
+  withhold it. Honesty via labeling, not hiding; don't re-hide the Windows download thinking you're
+  honoring the gate.)

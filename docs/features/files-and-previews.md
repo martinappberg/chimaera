@@ -165,3 +165,8 @@ _Captured 2026-07-10 (from the maintainer)._
   **addition**, not a core bet — improve freely if a better shape appears.
 - **Do not change (or: open to change):** open to change (*"can change"*). Nothing in this
   capability is frozen; only the remote→local retrieval *why* is settled.
+- **Folded in 2026-07-11 (#46):** copy/cut/paste of files & folders (server-side — bytes never
+  round-trip the browser), symlink marking (+ visible broken symlinks), and OS-desktop drops **into a
+  folder** are the same capability rounding out the file surfaces — same *why*, same **addition**
+  grade (open to change). The download-hidden-on-local / shown-on-remote rule follows directly from
+  the remote→local retrieval *why* above.
