@@ -17,6 +17,7 @@
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { basename, fsDownload, midTruncate, viewKindFor } from "../previews/files";
+  import { isRemoteHost } from "../net/api";
   import { fsRenameOp } from "../workspace/fsEvents";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
@@ -35,6 +36,9 @@
     node: PaneNode;
     /** True while this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
+    /** True when this is the only pane — the grip (which moves a pane between
+     *  splits) has nowhere to go, so it hides. */
+    soloPane?: boolean;
     sessions: Map<string, Session>;
     names: Map<string, string>;
     /** Open-file tab titles (basename, disambiguated), keyed by path. */
@@ -51,6 +55,7 @@
   let {
     node,
     zoomed = false,
+    soloPane = false,
     sessions,
     names,
     fileNames,
@@ -337,6 +342,9 @@
     if (tab.surface === "file") {
       const dirty = $dirtyFiles.has(tab.path);
       return [
+        ...(tab.preview === true
+          ? [{ label: "Keep Open", onSelect: () => ctrl.pinTab(node.id, i) } as ContextMenuEntry, "separator" as const]
+          : []),
         {
           label: "Rename…",
           disabled: dirty,
@@ -345,7 +353,9 @@
         },
         { label: "Reveal in File Tree", onSelect: () => ctrl.revealPathInTree(tab.path) },
         "separator",
-        { label: "Download", onSelect: () => void fsDownload(tab.path) },
+        ...(isRemoteHost()
+          ? [{ label: "Download", onSelect: () => void fsDownload(tab.path) } as ContextMenuEntry]
+          : []),
         { label: "Copy Path", onSelect: () => void copyPath(tab.path) },
         "separator",
         close,
@@ -356,6 +366,22 @@
 </script>
 
 <div class="bar" bind:this={el} onpointerdowncapture={onBarPointerDown}>
+  {#if !zoomed && !soloPane}
+    <!-- Pane grip: fades in on bar hover; drag it to move the WHOLE pane (all
+         tabs) to another split. A plain click focuses the pane. Being a
+         <button>, the bar's active-tab drag ignores it (closest("button")). -->
+    <button
+      class="pane-grip"
+      title="drag to move this pane"
+      aria-label="move pane"
+      onpointerdown={(e) => ctrl.dragPane(e, node.id)}
+    >
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+        <rect x="2.5" y="3" width="11" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3" />
+        <line x1="2.5" y1="6" x2="13.5" y2="6" stroke="currentColor" stroke-width="1.3" />
+      </svg>
+    </button>
+  {/if}
   <div class="tabs" role="tablist">
     {#each node.tabs as tab, i (tabKey(tab))}
       {@const sid = tab.surface === "terminal" ? tab.sessionId : null}
@@ -396,7 +422,13 @@
         }}
         ondblclick={() => {
           if (renamingTab === tabKey(tab)) return;
-          ctrl.zoomPane(node.id);
+          // VS Code: double-clicking a PREVIEW (italic) file tab pins it;
+          // otherwise the pane zooms (the long-standing gesture).
+          if (tab.surface === "file" && tab.preview === true) {
+            ctrl.pinTab(node.id, i);
+          } else {
+            ctrl.zoomPane(node.id);
+          }
         }}
         oncontextmenu={(e) => contextMenu.openAt(e, tabMenu(tab, i))}
       >
@@ -487,7 +519,11 @@
             onblur={() => void commitTabRename(tab, true)}
           />
         {:else}
-          <span class="tab-name" style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span>
+          <span
+            class="tab-name"
+            class:preview={tab.surface === "file" && tab.preview === true}
+            style:color={fDeco ? fDeco.color : undefined}>{label(tab)}</span
+          >
         {/if}
         <button
           class="tab-close"
@@ -774,6 +810,47 @@
     overflow: hidden;
   }
 
+  /* Pane grip: same hover-fade recipe as the right-edge .controls, so the bar
+     height never shifts (opacity, not display). cursor: grab reads as a
+     draggable handle. */
+  .pane-grip {
+    flex: none;
+    align-self: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 18px;
+    margin-right: 2px;
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: 4px;
+    color: var(--muted);
+    cursor: grab;
+    opacity: 0;
+    pointer-events: none;
+    transition:
+      opacity 0.12s ease,
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .bar:hover .pane-grip,
+  .pane-grip:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .pane-grip:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .pane-grip:active {
+    cursor: grabbing;
+  }
+
   .tab {
     position: relative;
     display: flex;
@@ -858,6 +935,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* A VS Code preview tab: italic until it is pinned (dbl-click / edit). */
+  .tab-name.preview {
+    font-style: italic;
   }
 
   /* Inline tab rename, sized like the name it replaces. */

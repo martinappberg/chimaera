@@ -43,8 +43,12 @@
     block.content !== null &&
       !(block.content.kind === "output" && (block.content.text ?? "").trim() === ""),
   );
+  /** A permission the user ALLOWED — a quiet inline "allowed" mark beside the
+   *  command, never the denied/failed red. A genuinely failed or denied command
+   *  wins (an allowed exec can still exit non-zero), so those stay distinct. */
+  const allowed = $derived(block.allowed && block.status !== "failed" && !block.denied);
   const statusTitle = $derived(
-    block.denied ? "denied" : block.status.replace("_", " "),
+    block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " "),
   );
 
   // Live output follows its own tail (terminal-style) while streaming.
@@ -151,6 +155,23 @@
           />
         </svg>
       </button>
+    {/if}
+    {#if allowed}
+      <!-- Compact "allowed" mark: the command stays on its one collapsed line
+           (the title), an explicit allowed state instead of dumping it below. -->
+      <span class="allowed" title="you allowed this command">
+        <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+          <path
+            d="M3.5 8.5l3 3 6-6.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        allowed
+      </span>
     {/if}
     <span
       class="dot"
@@ -304,6 +325,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono, monospace);
+  }
+  /* Quiet "allowed" affordance: an accent check, not the red of denied/failed
+     — a permission-gated command the user let through reads calmly. */
+  .allowed {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    color: color-mix(in srgb, var(--accent) 85%, var(--fg));
+    font-family: var(--mono, monospace);
+    font-size: var(--text-xs);
   }
   .dot {
     flex: none;

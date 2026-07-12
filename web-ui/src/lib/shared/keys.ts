@@ -428,6 +428,22 @@ export const PINNED = {
   fontReset: isMac ? "⌘0" : "Ctrl+0",
 } as const;
 
+/**
+ * The native app's menu-bar accelerators (⌘ on macOS, Ctrl elsewhere — fixed by
+ * the menu bar, independent of the base-modifier setting). These fire only
+ * inside the chimaera app, because a browser reserves ⌘W/⌘T/⌘N for itself; the
+ * shell "finally owns" them (see crates/chimaera-app/src/menu.rs). ⌘W/⌘T/⇧⌘T
+ * are a second, browser-reserved way to reach a rebindable action above (Close
+ * View / New Terminal / New Agent). Listed so the settings surface can show the
+ * full map in one place — keep in sync with menu.rs.
+ */
+export const APP_MENU = {
+  closeView: isMac ? "⌘W" : "Ctrl+W",
+  newTerminal: isMac ? "⌘T" : "Ctrl+T",
+  newAgent: isMac ? "⇧⌘T" : "Ctrl+Shift+T",
+  newWindow: isMac ? "⇧⌘N" : "Ctrl+Shift+N",
+} as const;
+
 /** The pinned reference chord as a parsed matcher. */
 export const REFERENCE_CHORD: ParsedChord = {
   meta: isMac,

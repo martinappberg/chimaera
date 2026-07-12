@@ -53,8 +53,25 @@ async function json<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** Memoized catalog: repeated ChatView mounts (and the launcher) share ONE
+ *  in-flight/resolved fetch instead of re-hitting GET /agents each time, which
+ *  reflashed the header model chip. `refresh` bypasses it and replaces it (App
+ *  re-probes after the install flow); a rejected fetch is dropped so a transient
+ *  error can't poison later calls. */
+let agentsCache: Promise<AgentInfo[]> | null = null;
+
 /** GET /api/v1/agents — what this host has, per known agent. */
-export async function listAgents(refresh = false): Promise<AgentInfo[]> {
+export function listAgents(refresh = false): Promise<AgentInfo[]> {
+  if (!refresh && agentsCache !== null) return agentsCache;
+  const pending = fetchAgents(refresh);
+  agentsCache = pending;
+  void pending.catch(() => {
+    if (agentsCache === pending) agentsCache = null;
+  });
+  return pending;
+}
+
+async function fetchAgents(refresh: boolean): Promise<AgentInfo[]> {
   const body = await json<unknown>(await api(`/agents${refresh ? "?refresh=true" : ""}`));
   if (!Array.isArray(body)) return [];
   return body.flatMap((raw): AgentInfo[] => {
@@ -131,8 +148,12 @@ export interface LaunchPick {
   agent: string;
   resume?: string;
   /** Which surface the user explicitly chose in the launcher — "open" (chat)
-   *  vs the terminal button. Omitted = the agents.defaultView setting. */
+   *  vs the terminal button. Omitted = follow the agents.defaultView setting. */
   ui?: "chat" | "term";
+  /** True when the user picked the surface deliberately (the "open"/terminal
+   *  buttons, ⌘↵) — that choice becomes the sticky default. A plain row press
+   *  is NOT explicit: it follows the current default without changing it. */
+  explicit?: boolean;
 }
 
 // --- the rail Recents section ------------------------------------------------
@@ -146,6 +167,10 @@ export interface RecentConvo {
   resume: string | null;
   /** When the session ended, unix seconds. */
   lastActive: number;
+  /** The surface it last ran on ("chat"/"term"), so reopening the row lands in
+   *  the same mode. Null for pre-`ui` entries and scanned transcripts → the
+   *  launcher's sticky default decides. */
+  ui: "chat" | "term" | null;
 }
 
 /** GET /api/v1/recents — the workspace's ended agent conversations. */
@@ -163,6 +188,7 @@ export async function listRecents(workspaceId: string): Promise<RecentConvo[]> {
         title: r.title,
         resume: typeof r.resume === "string" ? r.resume : null,
         lastActive: typeof r.last_active === "number" ? r.last_active : 0,
+        ui: r.ui === "chat" || r.ui === "term" ? r.ui : null,
       },
     ];
   });

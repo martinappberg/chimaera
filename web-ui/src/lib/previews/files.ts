@@ -18,6 +18,14 @@ export interface FsEntry {
   kind: "dir" | "file";
   size: number;
   mtime: number;
+  /** This entry is a symlink. Absent on older daemons → treat as not a link.
+   *  `kind` still reflects the resolved target (a symlink-to-dir is "dir"). */
+  symlink?: boolean;
+  /** Raw link text (readlink), for the "→ target" hover. Present on symlinks. */
+  target?: string;
+  /** A symlink whose target does not resolve. `kind` is "file" (wire union),
+   *  but the UI shows it distinctly and refuses to open it. */
+  broken?: boolean;
 }
 
 export interface FsListing {
@@ -289,6 +297,43 @@ export async function fsRename(from: string, to: string): Promise<string> {
 }
 
 /**
+ * Copy a file/dir/symlink (POST /fs/copy). `to` is the full destination path.
+ * `unique` picks a free "name copy" sibling instead of a 409 on collision.
+ * Resolves to the canonical new path. Prefer fsCopyOp (workspace/fsEvents) so
+ * open surfaces refresh.
+ */
+export async function fsCopy(
+  from: string,
+  to: string,
+  onConflict: "fail" | "unique" = "fail",
+): Promise<string> {
+  const body = await json<{ path: string }>(
+    await api("/fs/copy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, to, on_conflict: onConflict }),
+    }),
+  );
+  return body.path;
+}
+
+/**
+ * Move a file/dir/symlink (POST /fs/move). `to` is the full destination path;
+ * an existing target is a 409. Resolves to the canonical new path. Prefer
+ * fsMoveOp (workspace/fsEvents) so open surfaces refresh + tabs follow.
+ */
+export async function fsMove(from: string, to: string): Promise<string> {
+  const body = await json<{ path: string }>(
+    await api("/fs/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, to }),
+    }),
+  );
+  return body.path;
+}
+
+/**
  * Permanently delete a file or directory (POST /fs/delete; recursive, no
  * trash). The UI fronts this with an explicit confirmation. Prefer
  * fsDeleteOp (workspace/fsEvents) so open surfaces refresh.
@@ -329,6 +374,12 @@ export async function fsDownload(path: string): Promise<void> {
   const a = document.createElement("a");
   a.href = `/download/${body.ticket}`;
   a.rel = "noopener";
+  // The `download` attribute forces a download even for a showable MIME (a
+  // .md is text/*): without it the Tauri WKWebView navigates the main webview
+  // to the raw file body (the "opens in the native window" bug) because its
+  // response policy keys on canShowMIMEType, never on Content-Disposition.
+  // Same-origin, so the server's Content-Disposition filename still wins.
+  a.download = "";
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -374,6 +425,18 @@ export function parentName(path: string): string {
   const i = path.lastIndexOf("/");
   if (i <= 0) return "/";
   return basename(path.slice(0, i));
+}
+
+/** Absolute path of the containing directory ("/" at the top). */
+export function dirname(path: string): string {
+  const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
+  const i = trimmed.lastIndexOf("/");
+  return i > 0 ? trimmed.slice(0, i) : "/";
+}
+
+/** Join a directory and a leaf into an absolute path. */
+export function joinPath(dir: string, leaf: string): string {
+  return dir.endsWith("/") ? `${dir}${leaf}` : `${dir}/${leaf}`;
 }
 
 export function extension(path: string): string {

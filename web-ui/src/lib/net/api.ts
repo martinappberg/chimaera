@@ -90,6 +90,18 @@ export function getHostLabel(): string {
   return sessionStorage.getItem(HOST_KEY) ?? "local";
 }
 
+/**
+ * True when this window is connected to a REMOTE daemon (over an ssh tunnel),
+ * false for a local daemon. Both remote producers set `host=` in the URL hash
+ * — the native shell for tunnelled windows and `chimaera connect` for the
+ * browser — so its absence means local. Gates remote-only affordances like the
+ * Download menu entries (downloading a file to the machine it already lives on
+ * is pointless).
+ */
+export function isRemoteHost(): boolean {
+  return getHostLabel() !== "local";
+}
+
 /** The workspace id this tab is scoped to, if any (window = workspace). */
 export function getActiveWorkspaceId(): string | null {
   return sessionStorage.getItem(WS_KEY);

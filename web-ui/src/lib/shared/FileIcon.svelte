@@ -15,9 +15,13 @@
     size?: number;
     /** Override the tint (e.g. inherit the active-tab color). */
     plain?: boolean;
+    /** Draw the symlink alias-arrow badge (an entry that is a symlink). */
+    link?: boolean;
+    /** A broken (dangling) symlink: badge + glyph tinted with the error color. */
+    broken?: boolean;
   }
 
-  let { path, size = 15, plain = false }: Props = $props();
+  let { path, size = 15, plain = false, link = false, broken = false }: Props = $props();
 
   const glyph = $derived<Glyph | null>(iconFor(path));
   const cat = $derived(glyph?.c ?? "generic");
@@ -26,6 +30,7 @@
 <svg
   class="ficon cat-{cat}"
   class:plain
+  class:broken
   viewBox="0 0 24 24"
   width={size}
   height={size}
@@ -44,6 +49,14 @@
     <!-- generic file: a quiet folded-corner sheet -->
     <path d="M14 3v4a1 1 0 0 0 1 1h4" />
     <path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2z" />
+  {/if}
+  {#if link}
+    <!-- Symlink alias arrow, bottom-left: a knockout disc (so the glyph
+         behind doesn't muddle it) + a tiny up-right arrow. -->
+    <g class="link-badge">
+      <circle cx="6" cy="18" r="5" class="link-knockout" stroke="none" />
+      <path d="M4 20l4 -4M8 16h-2.6M8 16v2.6" stroke-width="1.6" />
+    </g>
   {/if}
 </svg>
 
@@ -85,5 +98,21 @@
   .ficon.plain {
     color: currentColor;
     opacity: 0.85;
+  }
+
+  /* The symlink badge knockout uses the surface behind the glyph so the arrow
+     reads cleanly over the file outline. */
+  .link-knockout {
+    fill: var(--pane-bg, var(--bg));
+  }
+  .link-badge {
+    color: var(--muted);
+  }
+  /* A broken symlink: whole glyph + badge in the error color. */
+  .ficon.broken {
+    color: var(--err);
+  }
+  .ficon.broken .link-badge {
+    color: var(--err);
   }
 </style>

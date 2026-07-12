@@ -105,11 +105,32 @@ function unintegrated(s: Session): boolean {
 }
 
 /**
+ * True when a session is doing ACTIVE work right now: a shell running a
+ * foreground command (OSC 133) or hosting an agent exec, or an agent mid-turn.
+ * An idle shell (at the prompt) or a waiting/finished agent is NOT busy — the
+ * daemon can restart around it, and the status dot should say so.
+ */
+export function isBusy(s: Session): boolean {
+  if (!s.alive) return false;
+  if (s.kind !== "agent") {
+    return s.phase === "running" || s.exec_stage === "executing";
+  }
+  return s.agent_state === "running" || s.exec_stage === "executing";
+}
+
+/**
  * Dot modifier class for a session (shared by the rail, pane tabs, and the
- * session strip; see the global .dot.* styles in app.css).
+ * session strip; see the SessionGlyph state styles).
  */
 export function dotState(s: Session): string {
-  if (s.kind !== "agent") return s.alive ? "alive" : "";
+  if (s.kind !== "agent") {
+    if (!s.alive) return "";
+    // A terminal is "active" (accent) ONLY while a foreground command runs —
+    // an OSC 133 "running" phase, or an agent exec against this shell. At the
+    // prompt (or with no shell integration) it is idle: a quiet dot, never a
+    // perpetual green.
+    return s.phase === "running" || s.exec_stage === "executing" ? "alive" : "idle";
+  }
   switch (s.agent_state) {
     case "running":
       return "alive";
@@ -133,7 +154,12 @@ export function dotState(s: Session): string {
 
 /** Hover tooltip naming the state behind a session dot. */
 export function dotTitle(s: Session): string {
-  if (s.kind !== "agent") return s.alive ? "shell running" : "exited";
+  if (s.kind !== "agent") {
+    if (!s.alive) return "exited";
+    if (s.phase === "running") return "running a command";
+    if (s.exec_stage === "executing") return "agent is running a command here";
+    return "at the prompt"; // idle: alive but not doing work
+  }
   switch (s.agent_state) {
     case "running":
       return "agent working";

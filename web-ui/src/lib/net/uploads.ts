@@ -80,6 +80,44 @@ export async function uploadToSession(
   return (await res.json()) as UploadResult;
 }
 
+/** POST the blob to the folder-upload route (an OS-desktop drop onto a Finder
+ *  pane or the FILES tree lands in `dir`). Streams the body; returns the
+ *  daemon-absolute path it landed at. */
+export async function uploadToDir(dir: string, blob: Blob, name: string): Promise<UploadResult> {
+  const q = `dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`;
+  const res = await api(`/fs/upload?${q}`, { method: "POST", body: blob });
+  if (!res.ok) {
+    let message = `upload failed (${res.status})`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (typeof body.error === "string") message = body.error;
+    } catch {
+      // non-JSON error body: keep the status message
+    }
+    throw new Error(message);
+  }
+  return (await res.json()) as UploadResult;
+}
+
+/**
+ * Run a file operation (copy/move/folder-upload) behind a transient chip in
+ * the same chrome as uploads: `label` shows while it runs, clears on success,
+ * lingers with the error on failure. Returns the result, or null on failure
+ * (the chip already surfaced why). Never throws.
+ */
+export async function trackFileOp<T>(label: string, run: () => Promise<T>): Promise<T | null> {
+  const id = ++jobSeq;
+  uploadJobs.update((jobs) => [...jobs, { id, name: label, error: null }]);
+  try {
+    const result = await run();
+    finishJob(id, null);
+    return result;
+  } catch (e) {
+    finishJob(id, e instanceof Error ? e.message : "operation failed");
+    return null;
+  }
+}
+
 type PathInserter = (sessionId: string, absPath: string) => void;
 let pathInserter: PathInserter | null = null;
 

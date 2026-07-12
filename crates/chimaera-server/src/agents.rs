@@ -282,11 +282,15 @@ pub(crate) fn spawn_agent_watch(state: Arc<AppState>, session_id: String) {
             // alone would kill every chat session ~2s after spawn.
             let info = state.sessions.get(&session_id);
             if info.is_none() && !crate::chat::session_alive(&state, &session_id) {
+                // This loop only retires on PTY absence — a chat driver keeps
+                // the session alive via `session_alive`, and its own exit path
+                // retires first — so the surface here is always the terminal.
                 crate::recents::retire(
                     &state,
                     &session_id,
                     last_pin.as_deref(),
                     last_osc.as_deref(),
+                    chimaera_agent::model::SessionUi::Term,
                 );
                 return;
             }

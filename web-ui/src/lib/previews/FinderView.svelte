@@ -14,10 +14,10 @@
    * `onOpenFile` — every file viewer is reused unchanged.
    */
   import { untrack } from "svelte";
-  import { fsDownload, fsList, type FsEntry, humanSize } from "./files";
+  import { basename, fsDownload, fsList, type FsEntry, humanSize } from "./files";
   import { fsHome } from "../workspace/sessions";
   import { getSetting } from "../settings/store.svelte";
-  import { ApiError } from "../net/api";
+  import { ApiError, isRemoteHost } from "../net/api";
   import {
     fsCreateOp,
     fsEpoch,
@@ -25,11 +25,23 @@
     lastFsMutation,
     requestDelete,
   } from "../workspace/fsEvents";
+  import {
+    clearClip,
+    copyFile,
+    cutFile,
+    fileClip,
+    isCutPending,
+    pasteInto,
+  } from "../workspace/fileClipboard.svelte";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { writeClipboard } from "../net/native";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
+  import Spinner from "./Spinner.svelte";
+
+  /** Local-daemon windows hide Download (the file already lives here). */
+  const remote = isRemoteHost();
 
   interface Props {
     /** The Finder's current directory (seed + external-nav channel). */
@@ -66,6 +78,9 @@
   /** Target of an in-flight navigation, so the reconcile effect stays quiet
    *  while we resolve it (canonicalization can rename the destination). */
   let pending: string | null = null;
+  /** An in-flight DESCEND: a placeholder "incoming column" spinner shows to the
+   *  right of column `afterIndex` until its listing settles (macOS Finder). */
+  let pendingCol = $state<{ afterIndex: number; seq: number } | null>(null);
 
   const wsNorm = $derived(
     wsRoot !== null && wsRoot.length > 1 && wsRoot.endsWith("/") ? wsRoot.slice(0, -1) : wsRoot,
@@ -118,6 +133,7 @@
     const hidden = getSetting("files.showHidden");
     const seq = ++navSeq;
     pending = target;
+    pendingCol = null; // a full navigation supersedes any in-flight descend
     loading = true;
     try {
       const head = await fsList(target, hidden);
@@ -149,10 +165,12 @@
 
   /** Descend into (or switch to) `dir` shown in column `colIndex`. */
   async function openDir(colIndex: number, entry: FsEntry): Promise<void> {
+    if (entry.broken) return; // a dangling symlink leads nowhere
     const seq = ++navSeq;
     columns = columns.map((c, i) => (i === colIndex ? { ...c, selected: entry.path } : c));
     location = entry.path; // optimistic; corrected to canonical below
     activeCol = colIndex + 1;
+    pendingCol = { afterIndex: colIndex, seq };
     try {
       const listing = await fsList(entry.path, getSetting("files.showHidden"));
       if (seq !== navSeq) return;
@@ -171,6 +189,8 @@
       location = columns[colIndex]?.dir ?? location;
       activeCol = colIndex;
       error = message(e);
+    } finally {
+      if (pendingCol?.seq === seq) pendingCol = null;
     }
   }
 
@@ -185,6 +205,7 @@
   }
 
   function onRowClick(colIndex: number, entry: FsEntry, e: MouseEvent): void {
+    if (entry.broken) return; // a dangling symlink opens nothing
     if (entry.kind === "dir") void openDir(colIndex, entry);
     else openFile(colIndex, entry, e.metaKey || e.ctrlKey);
   }
@@ -219,6 +240,30 @@
     const col = columns[activeCol];
     if (col === undefined) return;
     const cur = colSelectedIndex(col);
+    // Copy / cut / paste, scoped to the focused Finder so terminals and the
+    // composer keep their own Cmd+C/X/V.
+    if (e.metaKey || e.ctrlKey) {
+      const entry = col.entries[cur];
+      if (e.key === "c" && entry !== undefined && !entry.broken) {
+        e.preventDefault();
+        copyFile(entry.path, entry.kind);
+        return;
+      }
+      if (e.key === "x" && entry !== undefined && !entry.broken) {
+        e.preventDefault();
+        cutFile(entry.path, entry.kind);
+        return;
+      }
+      if (e.key === "v" && fileClip() !== null) {
+        e.preventDefault();
+        void pasteInto(col.dir);
+        return;
+      }
+    }
+    if (e.key === "Escape" && fileClip() !== null) {
+      clearClip();
+      return;
+    }
     if (e.key === "ArrowDown") {
       e.preventDefault();
       if (col.entries.length > 0) selectInColumn(activeCol, cur < 0 ? 0 : Math.min(cur + 1, col.entries.length - 1));
@@ -335,8 +380,27 @@
     }
   }
 
+  /** Paste target for a row: into the dir itself, else its parent column. */
+  function pasteDirFor(colIndex: number, entry: FsEntry): string {
+    return entry.kind === "dir" && !entry.broken ? entry.path : (columns[colIndex]?.dir ?? "");
+  }
+
   function menuFor(colIndex: number, entry: FsEntry): ContextMenuEntry[] {
     const col = columns[colIndex];
+    const clip = fileClip();
+    // A broken symlink can't be opened, downloaded, or created inside — only
+    // its link renamed/copied/deleted (all act on the link itself).
+    if (entry.broken) {
+      return [
+        { label: "Copy", onSelect: () => copyFile(entry.path, entry.kind) },
+        { label: "Cut", onSelect: () => cutFile(entry.path, entry.kind) },
+        "separator",
+        { label: "Rename…", onSelect: () => beginRename(colIndex, entry) },
+        { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+        "separator",
+        { label: "Delete…", danger: true, onSelect: () => requestDelete(entry.path, entry.kind) },
+      ];
+    }
     const open: ContextMenuEntry =
       entry.kind === "dir"
         ? { label: "Open", onSelect: () => void openDir(colIndex, entry) }
@@ -356,9 +420,20 @@
       "separator",
       ...createTarget,
       "separator",
+      { label: "Copy", onSelect: () => copyFile(entry.path, entry.kind) },
+      { label: "Cut", onSelect: () => cutFile(entry.path, entry.kind) },
+      {
+        label: clip === null ? "Paste" : `Paste ${basename(clip.path)}`,
+        disabled: clip === null,
+        hint: clip === null ? "nothing copied" : undefined,
+        onSelect: () => void pasteInto(pasteDirFor(colIndex, entry)),
+      },
+      "separator",
       { label: "Rename…", onSelect: () => beginRename(colIndex, entry) },
       "separator",
-      { label: "Download", onSelect: () => void fsDownload(entry.path) },
+      ...(remote
+        ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
+        : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
       "separator",
       {
@@ -372,9 +447,17 @@
   function columnMenu(colIndex: number): ContextMenuEntry[] {
     const dir = columns[colIndex]?.dir;
     if (dir === undefined) return [];
+    const clip = fileClip();
     return [
       { label: "New File…", onSelect: () => beginCreate("file", colIndex, dir) },
       { label: "New Folder…", onSelect: () => beginCreate("dir", colIndex, dir) },
+      "separator",
+      {
+        label: clip === null ? "Paste" : `Paste ${basename(clip.path)}`,
+        disabled: clip === null,
+        hint: clip === null ? "nothing copied" : undefined,
+        onSelect: () => void pasteInto(dir),
+      },
     ];
   }
 
@@ -489,6 +572,7 @@
         class:active={ci === activeCol}
         role="group"
         aria-label={col.dir}
+        data-finder-dir={col.dir}
         oncontextmenu={(e) => contextMenu.openAt(e, columnMenu(ci))}
       >
         {#if edit?.mode === "create" && edit.colIndex === ci}
@@ -551,19 +635,22 @@
             <button
               class="row"
               class:sel={entry.path === col.selected}
-              title={entry.path}
+              class:cut={isCutPending(entry.path)}
+              title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
               onclick={(e) => onRowClick(ci, entry, e)}
               oncontextmenu={(e) => contextMenu.openAt(e, menuFor(ci, entry))}
             >
               <span class="glyph">
                 {#if entry.kind === "dir"}
-                  <FolderIcon size={14} />
+                  <FolderIcon size={14} link={entry.symlink} />
                 {:else}
-                  <FileIcon path={entry.path} size={14} />
+                  <FileIcon path={entry.path} size={14} link={entry.symlink} broken={entry.broken} />
                 {/if}
               </span>
-              <span class="name">{entry.name}</span>
-              {#if entry.kind === "dir"}
+              <span class="name" class:symlink={entry.symlink} class:broken={entry.broken}>{entry.name}</span>
+              {#if entry.broken}
+                <span class="meta broken-meta">broken link</span>
+              {:else if entry.kind === "dir"}
                 <svg class="chev" viewBox="0 0 16 16" width="9" height="9" aria-hidden="true">
                   <path
                     d="M6 4l4 4-4 4"
@@ -582,7 +669,16 @@
         {/each}
       </div>
     {/each}
-    {#if columns.length === 0 && error === null && !loading}
+    {#if pendingCol !== null}
+      <!-- The incoming column while a descend lists (macOS Finder). Delayed so
+           a fast local open never flickers. -->
+      <div class="col col-pending" role="group" aria-label="loading">
+        <Spinner delay={150} />
+      </div>
+    {/if}
+    {#if loading && columns.length === 0 && error === null}
+      <Spinner delay={150} label="listing files…" />
+    {:else if columns.length === 0 && error === null && !loading}
       <div class="empty pad">nothing to show</div>
     {/if}
   </div>
@@ -702,6 +798,7 @@
   }
 
   .cols {
+    position: relative;
     flex: 1;
     min-height: 0;
     display: flex;
@@ -721,6 +818,12 @@
     padding: 4px;
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--fg) 18%, transparent) transparent;
+  }
+
+  /* The incoming-column placeholder while a descend lists: same width, its own
+     positioning context so the delayed Spinner centers inside it. */
+  .col-pending {
+    position: relative;
   }
 
   /* The focused column gets a whisper of emphasis so keyboard nav is legible. */
@@ -769,6 +872,22 @@
     font-size: var(--text-sm);
   }
 
+  /* A symlink name reads one step quieter and italic (the alias convention). */
+  .name.symlink {
+    font-style: italic;
+    color: var(--muted);
+  }
+
+  /* A broken symlink is tinted with the error color. */
+  .name.broken {
+    color: var(--err);
+  }
+
+  /* A cut-pending row dims until the paste lands (or Escape clears it). */
+  .row.cut {
+    opacity: 0.5;
+  }
+
   .chev {
     flex: none;
     color: var(--muted);
@@ -781,6 +900,11 @@
     font-size: var(--text-xs);
     color: var(--muted);
     opacity: 0.75;
+  }
+
+  .broken-meta {
+    color: var(--err);
+    opacity: 0.85;
   }
 
   .row.editing {
