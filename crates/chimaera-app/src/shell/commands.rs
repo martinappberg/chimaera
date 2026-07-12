@@ -104,6 +104,17 @@ pub(super) async fn connect_host(
     alias: String,
     update_daemon: Option<bool>,
 ) -> Result<HostState, String> {
+    // On Windows ssh MUST run inside the WSL distro (Win32-OpenSSH has no
+    // ControlMaster). If the transport never got wired, fail with the real
+    // reason instead of letting host ssh produce baffling per-host errors.
+    #[cfg(windows)]
+    if !chimaera_remote::wsl_transport_ready() {
+        return Err(
+            "remote hosts need the WSL2 daemon running (its distro carries ssh); \
+             restart chimaera or finish WSL setup first"
+                .to_string(),
+        );
+    }
     do_connect(&app, alias, update_daemon.unwrap_or(false)).await
 }
 
@@ -413,4 +424,90 @@ pub(super) async fn begin_update(app: AppHandle) -> Result<(), String> {
             Err(e.to_string())
         }
     }
+}
+
+// --- WSL setup (the Windows first-run wizard; clean errors elsewhere) -----
+
+/// Detection report for the wizard: registry facts plus the async WSL
+/// version gate (never blocks on wsl.exe when the package is absent).
+#[tauri::command]
+pub(super) async fn wsl_status() -> Result<crate::wsl::WslReport, String> {
+    tracing::debug!("ipc: wsl_status");
+    Ok(crate::wsl::full_report().await)
+}
+
+/// One-time WSL enablement (UAC prompt; a reboot usually follows).
+#[tauri::command]
+pub(super) async fn wsl_install() -> Result<(), String> {
+    tracing::info!("ipc: wsl_install");
+    crate::wsl::launch_wsl_install()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// `wsl --update` for the needs-update wizard state (pre-2.1.1 WSL breaks
+/// daemonized processes after sleep/resume).
+#[tauri::command]
+pub(super) async fn wsl_update() -> Result<(), String> {
+    tracing::info!("ipc: wsl_update");
+    crate::wsl::launch_wsl_update()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Kick off the Ubuntu distro install; the wizard polls `wsl_status` until
+/// the distro registers (the image download runs minutes).
+#[tauri::command]
+pub(super) async fn wsl_install_distro() -> Result<(), String> {
+    tracing::info!("ipc: wsl_install_distro");
+    crate::wsl::launch_distro_install()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Provision + start + adopt the daemon in `distro` (None = persisted/
+/// default), then complete the startup the wizard interrupted and close the
+/// wizard window. Emits `wsl-setup` phase events for the wizard's progress
+/// line. Concurrency and retries are governed by the shell's startup gate —
+/// `try_state::<Shell>()` alone can neither exclude a concurrent invocation
+/// (minutes-long await) nor distinguish "done" from "failed after manage".
+#[tauri::command]
+pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> Result<(), String> {
+    tracing::info!("ipc: wsl_setup_daemon ({distro:?})");
+    let claimed = match super::claim_startup() {
+        super::StartupClaim::Claimed => true,
+        super::StartupClaim::InFlight => {
+            return Err("setup is already running".to_string());
+        }
+        // Startup already finished — recover any missing home window (a
+        // partial finish can leave Shell managed with zero real windows),
+        // then just retire the wizard below.
+        super::StartupClaim::Done => {
+            super::recover_windows(&app);
+            false
+        }
+    };
+    if claimed {
+        let progress = {
+            let app = app.clone();
+            move |phase: &str| {
+                let _ = app.emit("wsl-setup", phase.to_string());
+            }
+        };
+        let result = async {
+            let local = crate::wsl::ensure_daemon(distro, false, &progress)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            super::finish_startup(&app, local).map_err(|e| format!("{e:#}"))
+        }
+        .await;
+        super::release_startup(result.is_ok());
+        result?;
+    }
+    for (label, w) in app.webview_windows() {
+        if label.starts_with("wsl-setup") {
+            let _ = w.close();
+        }
+    }
+    Ok(())
 }

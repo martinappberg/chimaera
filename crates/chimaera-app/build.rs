@@ -25,6 +25,11 @@ fn main() {
             "write_clipboard",
             "answer_askpass",
             "list_askpass",
+            "wsl_status",
+            "wsl_install",
+            "wsl_update",
+            "wsl_install_distro",
+            "wsl_setup_daemon",
         ]),
     ))
     .expect("failed to run tauri-build");

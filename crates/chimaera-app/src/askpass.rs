@@ -16,8 +16,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -27,11 +30,13 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 
 /// Env var carrying the askpass socket path to the helper (and to ssh, which
 /// passes its environment through to the askpass program it runs).
+#[cfg(unix)]
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
 
 /// How long a prompt waits for the UI before giving up. A dropped window or
@@ -110,6 +115,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The leaf name of the askpass relay socket.
+#[cfg(unix)]
 const SOCK_LEAF: &str = "askpass.sock";
 
 /// The askpass socket DIRECTORY for a given runtime dir: the runtime dir
@@ -120,6 +126,7 @@ const SOCK_LEAF: &str = "askpass.sock";
 /// `control_dir` in chimaera-remote (same cap, same fallback shape, still
 /// distinct per home so a dev app's relay never collides with the real
 /// app's); keep the two in step. Pure so the length invariant is testable.
+#[cfg(unix)]
 fn socket_dir(runtime_dir: &Path) -> PathBuf {
     /// Headroom under the ~104-byte `sun_path` cap.
     const SUN_PATH_SAFE: usize = 100;
@@ -135,6 +142,7 @@ fn socket_dir(runtime_dir: &Path) -> PathBuf {
     PathBuf::from(format!("/tmp/chimaera-{:08x}", h.finish() as u32)).join("run")
 }
 
+#[cfg(unix)]
 fn socket_path() -> PathBuf {
     let dir = socket_dir(&chimaera_core::runtime_dir());
     // The /tmp fallback dir is ours alone — same 0700 as the runtime dir it
@@ -148,6 +156,7 @@ fn socket_path() -> PathBuf {
     dir.join(SOCK_LEAF)
 }
 
+#[cfg(unix)]
 fn shim_path() -> PathBuf {
     chimaera_core::runtime_dir().join("askpass.sh")
 }
@@ -155,6 +164,7 @@ fn shim_path() -> PathBuf {
 /// Wire ssh/scp spawned from this process (and their ControlMaster children)
 /// to prompt through the app: write the askpass shim, export the ssh env, and
 /// start the socket listener. Called once at startup, before any connect.
+#[cfg(unix)]
 pub fn install(app: &AppHandle) -> Result<()> {
     let sock = socket_path();
     // A stale socket from a previous run would refuse the bind.
@@ -210,15 +220,124 @@ pub fn install(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// Windows: a token-gated loopback TCP listener. ssh runs INSIDE WSL and
+/// execs a distro-side wrapper script (installed by `wsl::wire_connect`,
+/// which bakes this listener's port + token in); the wrapper pipes the
+/// prompt to `chimaera.exe --askpass` over interop, and that helper connects
+/// back here — Windows-side loopback, never WSL→Windows TCP (firewalled by
+/// default under NAT). The token exists because loopback TCP lacks the unix
+/// socket's 0700-dir confidentiality: without it any local process could
+/// present a fake prompt and be handed a typed password.
+#[cfg(windows)]
+static RELAY: std::sync::OnceLock<(u16, String)> = std::sync::OnceLock::new();
+
+/// The relay's `(port, token)` for the WSL wrapper script to embed.
+#[cfg(windows)]
+pub fn relay_endpoint() -> Option<(u16, String)> {
+    RELAY.get().cloned()
+}
+
+#[cfg(windows)]
+pub fn install(app: &AppHandle) -> Result<()> {
+    let token = chimaera_core::generate_token();
+    let std_listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind askpass relay")?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+    let _ = RELAY.set((port, token.clone()));
+
+    let app = app.clone();
+    // Same reactor rule as the unix listener: convert inside the runtime.
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("askpass relay unavailable: {e}");
+                return;
+            }
+        };
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let app = app.clone();
+                    let token = token.clone();
+                    tauri::async_runtime::spawn(async move {
+                        serve_one_tcp(app, stream, token).await;
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("askpass relay stopped: {e}");
+                    break;
+                }
+            }
+        }
+    });
+    tracing::info!("askpass relay on 127.0.0.1:{port}");
+    Ok(())
+}
+
+/// One relay request: first line is the auth token, the rest (to the
+/// client's half-close) is the prompt; reply secret + newline. The read is
+/// SIZE-CAPPED and TIMED: unlike the unix socket (gated by a 0700 dir), any
+/// local process can connect to this loopback port — without bounds one
+/// could stream gigabytes into this String or hold a task open forever.
+/// The token protects secrecy; these bounds protect availability.
+#[cfg(windows)]
+async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token: String) {
+    /// Token line + a generous ceiling for any real ssh prompt.
+    const MAX_REQUEST: u64 = 64 * 1024;
+    const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let mut input = String::new();
+    let read = tokio::time::timeout(
+        READ_TIMEOUT,
+        (&mut stream).take(MAX_REQUEST).read_to_string(&mut input),
+    )
+    .await;
+    match read {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!("askpass: could not read relay request: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("askpass: relay request timed out");
+            return;
+        }
+    }
+    let Some((client_token, prompt)) = input.split_once('\n') else {
+        tracing::warn!("askpass: malformed relay request");
+        return;
+    };
+    if client_token.trim() != token {
+        tracing::warn!("askpass: relay request with a bad token refused");
+        return;
+    }
+    let answer = resolve_prompt(&app, prompt.to_string()).await;
+    let _ = stream.write_all(answer.as_bytes()).await;
+    let _ = stream.write_all(b"\n").await;
+    let _ = stream.shutdown().await;
+}
+
 /// Serve one askpass request: read the prompt (the helper half-closes its
 /// write side to mark the end), ask the UI, write the answer back.
+#[cfg(unix)]
 async fn serve_one(app: AppHandle, mut stream: UnixStream) {
     let mut prompt = String::new();
     if let Err(e) = stream.read_to_string(&mut prompt).await {
         tracing::warn!("askpass: could not read prompt: {e}");
         return;
     }
+    let answer = resolve_prompt(&app, prompt).await;
+    // ssh reads the secret up to the first newline; terminate with exactly one.
+    let _ = stream.write_all(answer.as_bytes()).await;
+    let _ = stream.write_all(b"\n").await;
+    let _ = stream.shutdown().await;
+}
 
+/// Register the prompt, ask the UI, wait out the timeout — the transport-
+/// agnostic middle both the unix socket and the Windows TCP relay feed.
+async fn resolve_prompt(app: &AppHandle, prompt: String) -> String {
     let state = app.state::<Askpass>();
     let (tx, rx) = oneshot::channel();
     let prompt = prompt.trim_end().to_string();
@@ -229,10 +348,9 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
     // windows at emit time is therefore fine — not an error.
     if app.emit("ssh-askpass", event).is_err() {
         state.discard(id);
-        return;
+        return String::new();
     }
-
-    let answer = match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
+    match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
         Ok(Ok(Some(secret))) => secret,
         // Cancelled, timed out, or the app dropped the sender: no answer, so
         // ssh moves on and fails cleanly rather than hanging. Windows still
@@ -243,16 +361,13 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
             let _ = app.emit("ssh-askpass-done", id);
             String::new()
         }
-    };
-    // ssh reads the secret up to the first newline; terminate with exactly one.
-    let _ = stream.write_all(answer.as_bytes()).await;
-    let _ = stream.write_all(b"\n").await;
-    let _ = stream.shutdown().await;
+    }
 }
 
 /// `chimaera-app --askpass <prompt>`: the helper ssh execs. Relays the prompt
 /// to the running app and prints the answer for ssh to read. A missing socket
 /// or app yields an empty answer (ssh then fails cleanly, never hangs).
+#[cfg(unix)]
 pub fn run_helper() {
     let prompt = std::env::args()
         .skip_while(|a| a != "--askpass")
@@ -266,6 +381,46 @@ pub fn run_helper() {
     std::io::stdout().flush().ok();
 }
 
+/// Windows `--askpass`: invoked THROUGH WSL interop by the distro-side
+/// wrapper script. Everything arrives on stdin — line 1 `"<port> <token>"`,
+/// then the prompt to EOF — never argv, whose Linux→Windows marshaling for
+/// arbitrary prompt text is unverified. Any failure prints nothing: ssh gets
+/// an empty answer and fails cleanly, never hangs.
+#[cfg(windows)]
+pub fn run_helper() {
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    let Some((head, prompt)) = input.split_once('\n') else {
+        return;
+    };
+    let mut parts = head.split_whitespace();
+    let (Some(port), Some(token)) = (
+        parts.next().and_then(|p| p.parse::<u16>().ok()),
+        parts.next(),
+    ) else {
+        return;
+    };
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return;
+    };
+    if stream.write_all(token.as_bytes()).is_err()
+        || stream.write_all(b"\n").is_err()
+        || stream.write_all(prompt.as_bytes()).is_err()
+        || stream.shutdown(Shutdown::Write).is_err()
+    {
+        return;
+    }
+    let mut answer = String::new();
+    if stream.read_to_string(&mut answer).is_err() {
+        return;
+    }
+    print!("{}", answer.strip_suffix('\n').unwrap_or(&answer));
+    let _ = std::io::stdout().flush();
+}
+
+#[cfg(unix)]
 fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
     stream.write_all(prompt.as_bytes())?;
@@ -277,7 +432,7 @@ fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
     Ok(answer.strip_suffix('\n').unwrap_or(&answer).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;

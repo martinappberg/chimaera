@@ -62,10 +62,17 @@
   if (year) year.textContent = String(new Date().getFullYear());
 
   /* ---- Live downloads from the latest GitHub release ---------------------- */
-  // Match a release asset by substring; returns its browser_download_url.
+  // Asset-name suffix match — NOT substring: updater artifacts share the
+  // installer's name plus a suffix (chimaera_x.AppImage.sig), and the API's
+  // asset order is not guaranteed, so a substring match can hand the hero
+  // button a signature file.
+  function endsWith(name, suffix) {
+    return name.length >= suffix.length && name.indexOf(suffix, name.length - suffix.length) !== -1;
+  }
+  // Match a release asset by name suffix; returns its browser_download_url.
   function find(assets, needle) {
     for (var i = 0; i < assets.length; i++) {
-      if (assets[i].name.indexOf(needle) !== -1)
+      if (endsWith(assets[i].name, needle))
         return assets[i].browser_download_url;
     }
     return null;
@@ -90,30 +97,61 @@
       var tag = rel.tag_name || "";
 
       var dmg = find(assets, ".dmg");
+      var appimage = find(assets, ".AppImage");
       var linuxX64 = find(assets, "x86_64-unknown-linux-musl");
       var linuxArm = find(assets, "aarch64-unknown-linux-musl");
       var macDaemon = find(assets, "aarch64-apple-darwin");
 
       setHref("dl-app", dmg);
+      setHref("dl-linux-app", appimage);
       setHref("dl-linux-x64", linuxX64);
       setHref("dl-linux-arm", linuxArm);
       setHref("dl-macos", macDaemon);
 
+      // Human size for an asset matched by name suffix, e.g. "12.3 MB".
+      function sizeOf(needle) {
+        for (var i = 0; i < assets.length; i++) {
+          if (endsWith(assets[i].name, needle) && assets[i].size)
+            return (assets[i].size / 1048576).toFixed(1) + " MB";
+        }
+        return null;
+      }
+
+      // The primary button follows the visitor's OS; macOS is the shipped
+      // default so an unknown/blocked UA still gets a working button.
+      var ua = navigator.userAgent || "";
+      var isLinux = ua.indexOf("Linux") !== -1 && ua.indexOf("Android") === -1;
+      var label = document.getElementById("dl-app-label");
+      var note = document.getElementById("dl-app-note");
+      if (isLinux && appimage) {
+        setHref("dl-app", appimage);
+        if (label) label.textContent = "Download for Linux";
+        // The shipped default icon is the Apple mark — swap it, or Linux
+        // visitors get "Download for Linux" under an Apple logo.
+        var icon = document.getElementById("dl-app-icon");
+        if (icon) {
+          icon.setAttribute("fill", "none");
+          icon.setAttribute("stroke", "currentColor");
+          icon.setAttribute("stroke-width", "1.8");
+          icon.setAttribute("stroke-linecap", "round");
+          icon.setAttribute("stroke-linejoin", "round");
+          icon.innerHTML = '<path d="M5 16l6-6-6-6M12 18h7"/>';
+        }
+        if (note) {
+          var lsz = sizeOf(".AppImage");
+          note.textContent =
+            "x86_64 · AppImage" + (lsz ? " · " + lsz : "") +
+            " · auto-updates (.deb/.rpm on GitHub)";
+        }
+      } else if (dmg && note) {
+        var msz = sizeOf(".dmg");
+        note.textContent =
+          "Apple Silicon · .dmg" + (msz ? " · " + msz : "") + " · auto-updates";
+      }
+
       if (tag) {
         var relEl = document.getElementById("release-tag");
-        if (relEl)
-          relEl.textContent = tag + " · macOS (Apple Silicon)";
-      }
-      if (dmg) {
-        var note = document.getElementById("dl-app-note");
-        // Surface the human size next to the .dmg when we can.
-        for (var i = 0; i < assets.length; i++) {
-          if (assets[i].name.indexOf(".dmg") !== -1 && assets[i].size) {
-            var mb = (assets[i].size / 1048576).toFixed(1);
-            if (note) note.textContent = "Apple Silicon · .dmg · " + mb + " MB · auto-updates";
-            break;
-          }
-        }
+        if (relEl) relEl.textContent = tag + " · native app";
       }
     })
     .catch(function () {

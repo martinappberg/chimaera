@@ -14,6 +14,7 @@
 
 pub mod hosts;
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,11 +38,133 @@ use tokio::process::{Child, Command};
 /// app's master never collides with the real app's. A normal home is
 /// unaffected — it keeps `data_dir()/cm/%C`.
 fn control_path() -> String {
+    if let Some(t) = wsl_transport() {
+        return wsl_control_path(&t.home);
+    }
     let dir = control_dir(&chimaera_core::data_dir());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("failed to create ssh control dir {}: {e}", dir.display());
     }
     dir.join("%C").to_string_lossy().into_owned()
+}
+
+/// On Windows every ssh/scp runs INSIDE the WSL2 distro that hosts the local
+/// daemon: `connect`'s whole architecture rides on ControlMaster, which
+/// Win32-OpenSSH does not implement — Linux OpenSSH in the distro does. The
+/// shell wires this once the distro is known; `None` (always, on unix) means
+/// spawn the system ssh directly.
+#[derive(Clone, Debug)]
+pub struct WslTransport {
+    /// The distro whose ssh (and daemon) we ride.
+    pub distro: String,
+    /// The distro user every spawn pins with `-u` (the default user can
+    /// change under us — Ubuntu's OOBE flips it on first interactive run).
+    pub user: String,
+    /// The distro-side `$HOME`, anchoring the ControlMaster sockets — a
+    /// socket ssh creates inside the distro cannot live on a Windows path.
+    pub home: String,
+}
+
+static WSL_TRANSPORT: std::sync::RwLock<Option<WslTransport>> = std::sync::RwLock::new(None);
+
+pub fn set_wsl_transport(t: Option<WslTransport>) {
+    *WSL_TRANSPORT.write().unwrap_or_else(|p| p.into_inner()) = t;
+}
+
+fn wsl_transport() -> Option<WslTransport> {
+    WSL_TRANSPORT
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Whether the WSL transport is wired and remote connects can work at all
+/// on this host — the shell refuses a connect when wiring failed rather
+/// than silently spawning Win32-OpenSSH (which lacks ControlMaster).
+pub fn wsl_transport_ready() -> bool {
+    wsl_transport().is_some()
+}
+
+/// The ssh/scp process builder, transport-aware. `--exec` bypasses the
+/// distro's login shell; env the ssh children need (`SSH_ASKPASS` et al)
+/// crosses the boundary via `WSLENV`, which the shell exports. The user is
+/// pinned with `-u` so a later change of the distro's default user (Ubuntu
+/// OOBE) can never silently re-home ssh's config/keys/sockets mid-flight.
+fn transport_command(program: &str) -> Command {
+    match wsl_transport() {
+        Some(t) => {
+            let mut c = Command::new("wsl.exe");
+            c.args(["-d", &t.distro, "-u", &t.user, "--exec", program]);
+            // wsl.exe's own diagnostics are UTF-16LE without this; every
+            // caller decodes stderr as UTF-8 (legacy inbox WSL ignores the
+            // var — its errors stay mojibake, acceptably rare).
+            c.env("WSL_UTF8", "1");
+            #[cfg(windows)]
+            c.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+            c
+        }
+        None => Command::new(program),
+    }
+}
+
+/// A `curl` invocation with the same no-console discipline as every other
+/// child this GUI-adjacent crate spawns on Windows.
+fn curl_command() -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new("curl");
+    #[cfg(windows)]
+    c.creation_flags(chimaera_core::CREATE_NO_WINDOW);
+    c
+}
+
+/// Collect a command's output with a hard deadline. Under the WSL transport
+/// a wedged wsl.exe would otherwise hang forever — ssh's own
+/// `ConnectTimeout` only bounds the TCP connect *inside* the distro, not the
+/// relay process. Applied to every one-shot ssh/scp `.output()`.
+async fn output_bounded(
+    cmd: &mut Command,
+    secs: u64,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(secs), cmd.output())
+        .await
+        .with_context(|| format!("{what} timed out after {secs}s"))?
+        .with_context(|| format!("failed to run {what}"))
+}
+
+/// ssh runs inside the distro, so its ControlMaster socket must live on a
+/// distro-side path (the shell `mkdir -p`s the dir when wiring the
+/// transport). Deliberately the same `~/.chimaera/cm` an in-distro `connect`
+/// would use: the app and the distro share one authenticated master per
+/// host. Pure so the shape is testable without touching the global.
+fn wsl_control_path(home: &str) -> String {
+    format!("{home}/.chimaera/cm/%C")
+}
+
+/// How a local file path is spelled for a process inside WSL (`C:\x\y` →
+/// `/mnt/c/x/y`) — scp's "local" side runs in the distro under the transport.
+pub fn local_path_for_scp(path: &std::path::Path) -> String {
+    if wsl_transport().is_none() {
+        return path.to_string_lossy().into_owned();
+    }
+    windows_path_as_wsl(&path.to_string_lossy())
+}
+
+/// How a Windows path is spelled for a process inside WSL: drive-letter
+/// absolutes (including `\\?\`-verbatim ones, which `current_exe`/
+/// canonicalize can produce) become `/mnt/<drive>/…`; UNC and other shapes
+/// pass through untouched — callers must treat an un-translated result as
+/// "not reachable from the distro", not silently use it. Shared by scp's
+/// local side AND the shell's askpass-wrapper exe path, so the two can't
+/// drift.
+pub fn windows_path_as_wsl(s: &str) -> String {
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s).replace('\\', "/");
+    if s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/' {
+        format!("/mnt/{}{}", s[..1].to_ascii_lowercase(), &s[2..])
+    } else {
+        s
+    }
 }
 
 /// The ControlMaster socket DIRECTORY for a given state dir: `<data_dir>/cm`
@@ -109,7 +232,7 @@ fn ssh_opts() -> [String; 14] {
 /// flag-heavy invocations where the destination must come last
 /// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
 fn ssh_base() -> Command {
-    let mut c = Command::new("ssh");
+    let mut c = transport_command("ssh");
     c.args(ssh_opts());
     c
 }
@@ -128,7 +251,7 @@ fn ssh_cmd(host: &str) -> Command {
 /// reuses the connection the probe already authenticated instead of prompting
 /// again.
 fn scp_cmd() -> Command {
-    let mut c = Command::new("scp");
+    let mut c = transport_command("scp");
     c.args(ssh_opts());
     c
 }
@@ -354,15 +477,18 @@ impl Tunnel {
     /// and other windows on this host keep their authenticated connection.
     pub async fn close(mut self) {
         self.child.kill().await.ok();
-        let _ = ssh_base()
-            .args(["-O", "cancel", "-L"])
-            .arg(format!(
-                "{}:127.0.0.1:{}",
-                self.local_port, self.manifest.port
-            ))
-            .arg(&self.host)
-            .output()
-            .await;
+        let _ = output_bounded(
+            ssh_base()
+                .args(["-O", "cancel", "-L"])
+                .arg(format!(
+                    "{}:127.0.0.1:{}",
+                    self.local_port, self.manifest.port
+                ))
+                .arg(&self.host),
+            30,
+            "ssh -O cancel",
+        )
+        .await;
     }
 }
 
@@ -598,10 +724,26 @@ pub async fn connect(
     };
     let (manifest, outdated, live_sessions) = resolve_daemon(&ops, host, &opts, &progress).await?;
 
-    let local_port = pick_local_port(opts.local_port, manifest.port)?;
+    let mut local_port = pick_local_port(opts.local_port, manifest.port)?;
     progress(Phase::Tunneling { local_port });
     let mut child = spawn_tunnel(host, local_port, manifest.port)?;
-    let mux_delegated = wait_for_port(local_port, &mut child).await?;
+    let mux_delegated = match wait_for_port(local_port, &mut child).await {
+        Ok(m) => m,
+        // The availability probe binds on OUR side, but under the WSL
+        // transport ssh's -L binds inside the distro — a different port
+        // namespace — so the first pick can collide with an in-distro
+        // listener the probe cannot see. One retry on a fresh OS-assigned
+        // port covers it; an EXPLICITLY requested port stays a hard error.
+        Err(e) if opts.local_port.is_none() => {
+            child.kill().await.ok();
+            tracing::warn!("tunnel on 127.0.0.1:{local_port} failed ({e:#}); retrying fresh");
+            local_port = ephemeral_port()?;
+            progress(Phase::Tunneling { local_port });
+            child = spawn_tunnel(host, local_port, manifest.port)?;
+            wait_for_port(local_port, &mut child).await?
+        }
+        Err(e) => return Err(e),
+    };
     tracing::info!(
         "tunnel up: 127.0.0.1:{local_port} -> {host}:{}",
         manifest.port
@@ -621,11 +763,14 @@ pub async fn connect(
 
 /// Fetch and parse the remote manifest from `home`, if any.
 pub async fn remote_manifest(host: &str, home: RemoteHome) -> anyhow::Result<Option<Manifest>> {
-    let output = ssh_cmd(host)
-        .arg(format!("cat {} 2>/dev/null", home.manifest_path()))
-        .output()
-        .await
-        .context("failed to run ssh")?;
+    // SSH_ONESHOT_SECS, not shorter: the first call to a host raises the
+    // ControlMaster and may sit in an askpass password/Duo prompt.
+    let output = output_bounded(
+        ssh_cmd(host).arg(format!("cat {} 2>/dev/null", home.manifest_path())),
+        SSH_ONESHOT_SECS,
+        "ssh",
+    )
+    .await?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -724,11 +869,7 @@ pub async fn stop_remote(host: &str, pid: u32) -> anyhow::Result<()> {
 
 /// `uname -sm` on the host, lowercased: e.g. `("linux", "x86_64")`.
 pub async fn remote_target(host: &str) -> anyhow::Result<(String, String)> {
-    let output = ssh_cmd(host)
-        .arg("uname -sm")
-        .output()
-        .await
-        .context("failed to run ssh")?;
+    let output = output_bounded(ssh_cmd(host).arg("uname -sm"), SSH_ONESHOT_SECS, "ssh").await?;
     if !output.status.success() {
         bail!(
             "could not detect the OS/arch of {host}: {}",
@@ -811,11 +952,24 @@ async fn release_asset(
     let api = format!("https://api.github.com/repos/{repo}/releases/{release_ref}");
     // No `-f`: a missing release answers 404 with a JSON body we detect below,
     // which we want to treat as "fall back", not as a curl error.
-    let out = Command::new("curl")
-        .args(["-sSL", "-H", "Accept: application/vnd.github+json", &api])
-        .output()
+    let mut cmd = curl_command();
+    cmd.args(["-sSL", "--max-time", "30"]).args([
+        "-H",
+        "Accept: application/vnd.github+json",
+        &api,
+    ]);
+    // Unauthenticated api.github.com is rate-limited PER IP — CI runners
+    // share pool IPs and hit it constantly. Ride a token when the
+    // environment has one (GITHUB_TOKEN in workflows); end-user machines do
+    // fine on the anonymous quota.
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        if !token.is_empty() {
+            cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
+        }
+    }
+    let out = output_bounded(&mut cmd, 45, "curl (release metadata)")
         .await
-        .context("failed to run curl (is it installed?)")?;
+        .context("is curl installed?")?;
     if !out.status.success() {
         bail!(
             "release metadata request failed: {}",
@@ -825,8 +979,18 @@ async fn release_asset(
     let meta: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("bad release metadata payload")?;
     // A missing release is `{"message": "Not Found", ...}` — no `tag_name`.
+    // Anything ELSE without a tag (rate limit, auth failure) is a transient
+    // API error and must surface as one: falling back would misreport it as
+    // "no release provides <asset>" and strand provisioning with a lie.
     let Some(tag) = meta.get("tag_name").and_then(serde_json::Value::as_str) else {
-        return Ok(None);
+        let message = meta
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unrecognized payload");
+        if message == "Not Found" {
+            return Ok(None);
+        }
+        bail!("GitHub API refused the release lookup: {message}");
     };
     let Some(asset) = meta
         .get("assets")
@@ -870,13 +1034,15 @@ fn download_cache_path(triple: &str, version: &str) -> PathBuf {
 /// Fetch the daemon binary matching `(os, arch)` from GitHub releases (see
 /// [`resolve_release_asset`] for version-vs-latest selection), caching it under
 /// [`download_cache_path`] keyed by the resolved version. This is the end-user
-/// auto-install path — the app ships no repo and no `just dist` stash.
+/// auto-install path — the app ships no repo and no `just dist` stash. Public
+/// for the Windows shell, which provisions a WSL distro exactly the way
+/// `connect` provisions a remote host: same assets, same cache, same verify.
 ///
 /// Downloads with the system `curl` (kept dependency-free, like every other
 /// ssh/scp/curl shell-out here) and verifies the bytes against the release's
 /// published sha256 before trusting them — we're about to run this on the
 /// user's login-node account.
-async fn fetch_release_binary(
+pub async fn fetch_release_binary(
     os: &str,
     arch: &str,
     progress: &impl Fn(Phase),
@@ -899,13 +1065,18 @@ async fn fetch_release_binary(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     tracing::info!("downloading daemon {} from {}", asset.version, asset.url);
-    let out = Command::new("curl")
-        .args(["-fSL", "--retry", "2", "-o"])
-        .arg(&tmp)
-        .arg(&asset.url)
-        .output()
-        .await
-        .context("failed to run curl (is it installed?)")?;
+    // --max-time bounds the download so a stalled connection can't pin a
+    // caller (the Windows shell provisions BEFORE its first window opens).
+    let out = output_bounded(
+        curl_command()
+            .args(["-fSL", "--retry", "2", "--max-time", "300", "-o"])
+            .arg(&tmp)
+            .arg(&asset.url),
+        330,
+        "curl (daemon download)",
+    )
+    .await
+    .context("is curl installed?")?;
     if !out.status.success() {
         std::fs::remove_file(&tmp).ok();
         bail!(
@@ -924,9 +1095,15 @@ async fn fetch_release_binary(
         );
     }
 
-    let mut perms = std::fs::metadata(&tmp)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&tmp, perms)?;
+    // The exec bit only matters where the cached binary runs in place (unix);
+    // on Windows the cache is transfer-only — the mode is set at install time
+    // inside the distro/host.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms)?;
+    }
     std::fs::rename(&tmp, &cached)
         .with_context(|| format!("failed to finalize {}", cached.display()))?;
     tracing::info!("cached daemon at {}", cached.display());
@@ -941,20 +1118,31 @@ fn repo_slug() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Hex sha256 of `file`, via `sha256sum` (linux) or `shasum -a 256` (macOS).
+/// Hex sha256 of `file`, computed in-process — a Windows host has neither
+/// `sha256sum` nor `shasum`, and the verify step must never depend on
+/// platform hash tools. Streamed in fixed chunks: this crate ships inside
+/// the daemon binary run on RSS-policed login nodes, so the hash must never
+/// buffer a whole (growing) release asset.
 async fn sha256_file(file: &Path) -> anyhow::Result<String> {
-    for (bin, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
-        let out = Command::new(bin).args(args).arg(file).output().await;
-        if let Ok(out) = out {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(hex) = text.split_whitespace().next() {
-                    return Ok(hex.to_string());
-                }
-            }
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(file)
+        .await
+        .with_context(|| format!("failed to open {} for checksum", file.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buf[..n]);
     }
-    bail!("could not compute a sha256 (neither sha256sum nor shasum is available)")
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Resolve the LOCAL binary to deploy to a host of the target inferred from
@@ -1042,12 +1230,16 @@ async fn deploy_binary(
     });
     tracing::info!("installing {} on {host} ({})", path.display(), home.dir());
     ssh_run(host, &format!("mkdir -p {}", home.bin_dir())).await?;
-    let output = scp_cmd()
-        .arg(path)
-        .arg(format!("{host}:{}", home.scp_staged_bin()))
-        .output()
-        .await
-        .context("failed to run scp")?;
+    let output = output_bounded(
+        scp_cmd()
+            // Under the WSL transport scp itself runs in the distro, so the
+            // "local" side must be spelled as a /mnt path.
+            .arg(local_path_for_scp(path))
+            .arg(format!("{host}:{}", home.scp_staged_bin())),
+        600,
+        "scp",
+    )
+    .await?;
     if !output.status.success() {
         bail!(
             "scp to {host} failed: {}",
@@ -1105,11 +1297,12 @@ async fn ensure_remote_binary(
 /// `X.Y.Z`), or `None` when it is missing, not executable, or prints
 /// something unrecognizable — all "not usable, redeploy" to the caller.
 async fn remote_binary_version(host: &str, home: RemoteHome) -> anyhow::Result<Option<String>> {
-    let output = ssh_cmd(host)
-        .arg(format!("{} --version 2>/dev/null", home.bin_path()))
-        .output()
-        .await
-        .context("failed to run ssh")?;
+    let output = output_bounded(
+        ssh_cmd(host).arg(format!("{} --version 2>/dev/null", home.bin_path())),
+        SSH_ONESHOT_SECS,
+        "ssh",
+    )
+    .await?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -1169,9 +1362,18 @@ fn pick_local_port(requested: Option<u16>, remote_port: u16) -> anyhow::Result<u
     if let Some(port) = requested {
         return Ok(port);
     }
-    if std::net::TcpListener::bind(("127.0.0.1", remote_port)).is_ok() {
+    // Under the WSL transport the -L bind happens inside the distro, where
+    // the remote port number is often ALREADY taken (the WSL-hosted local
+    // daemon) — and this Windows-side probe can't see that. Skip straight to
+    // an ephemeral pick there; matching the remote port is only a nicety.
+    if wsl_transport().is_none() && std::net::TcpListener::bind(("127.0.0.1", remote_port)).is_ok()
+    {
         return Ok(remote_port);
     }
+    ephemeral_port()
+}
+
+fn ephemeral_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .context("failed to find a free local port")?;
     Ok(listener.local_addr()?.port())
@@ -1228,23 +1430,21 @@ async fn wait_for_port(port: u16, tunnel: &mut Child) -> anyhow::Result<bool> {
     }
 }
 
+/// One-shot ssh/scp deadline. Generous on purpose: the FIRST call to a host
+/// raises the ControlMaster, and that may sit in an in-app askpass prompt
+/// (password / Duo) for up to its 180s window — a tighter bound here would
+/// cut users off mid-typing.
+const SSH_ONESHOT_SECS: u64 = 240;
+
 /// Run a remote command, treating its exit status as a boolean.
 async fn ssh_check(host: &str, cmd: &str) -> anyhow::Result<bool> {
-    let output = ssh_cmd(host)
-        .arg(cmd)
-        .output()
-        .await
-        .context("failed to run ssh")?;
+    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
     Ok(output.status.success())
 }
 
 /// Run a remote command, failing loudly if it does not exit 0.
 async fn ssh_run(host: &str, cmd: &str) -> anyhow::Result<()> {
-    let output = ssh_cmd(host)
-        .arg(cmd)
-        .output()
-        .await
-        .context("failed to run ssh")?;
+    let output = output_bounded(ssh_cmd(host).arg(cmd), SSH_ONESHOT_SECS, "ssh").await?;
     if !output.status.success() {
         bail!(
             "ssh {host} {cmd:?} failed: {}",
@@ -1291,6 +1491,33 @@ mod tests {
             "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev-app/data",
         ));
         assert_ne!(other, deep);
+    }
+
+    /// The WSL transport's path vocabulary, pure halves only (the global
+    /// transport switch is never flipped in tests — other tests exercise the
+    /// direct-ssh path concurrently).
+    #[test]
+    fn wsl_transport_path_spelling() {
+        // scp's "local" side runs in the distro: drive-letter absolutes
+        // become /mnt paths, spaces survive, non-drive paths pass through.
+        assert_eq!(
+            windows_path_as_wsl(r"C:\Users\First Last\bin\chimaera.exe"),
+            "/mnt/c/Users/First Last/bin/chimaera.exe"
+        );
+        assert_eq!(windows_path_as_wsl(r"D:\x"), "/mnt/d/x");
+        // \\?\-verbatim paths (current_exe / canonicalize can produce them).
+        assert_eq!(
+            windows_path_as_wsl(r"\\?\C:\Users\x\chimaera.exe"),
+            "/mnt/c/Users/x/chimaera.exe"
+        );
+        // UNC passes through — callers must treat that as unreachable.
+        assert_eq!(windows_path_as_wsl(r"\\server\share\f"), "//server/share/f");
+        assert_eq!(windows_path_as_wsl("/already/unixy"), "/already/unixy");
+        // The in-distro master socket: same ~/.chimaera/cm shape an
+        // in-distro connect uses, comfortably under the sun_path cap.
+        let cp = wsl_control_path("/home/someuser");
+        assert_eq!(cp, "/home/someuser/.chimaera/cm/%C");
+        assert!(cp.len() <= 100);
     }
 
     #[test]

@@ -1,0 +1,60 @@
+name: wsl-smoke
+
+# The Windows app's live-verification net: GitHub's Windows runners have
+# nested virtualization, so a REAL WSL2 distro runs in CI. This drives the
+# whole WSL engine end to end — provision the release daemon into the distro,
+# spawn it daemonized, adopt it over the NAT localhost forward, create a real
+# PTY session through the API, survive `wsl --shutdown`. It is the "verify
+# live" gate for code no macOS dev machine can execute.
+#
+# Scoped to the files that can break the engine; runs on demand otherwise.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Everything the smoke actually exercises: the engine itself, plus the
+    # crates it drives live (fetch/transport/Manifest) and the askpass relay
+    # whose wiring the e2e asserts — a breaking change there must not skip
+    # the only live Windows gate.
+    paths:
+      - "crates/chimaera-app/src/wsl.rs"
+      - "crates/chimaera-app/src/daemon.rs"
+      - "crates/chimaera-app/src/askpass.rs"
+      - "crates/chimaera-app/Cargo.toml"
+      - "crates/chimaera-remote/**"
+      - "crates/chimaera-core/**"
+      - ".github/workflows/wsl-smoke.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # A real WSL2 Ubuntu (registered via rootfs import — no reboot needed).
+      - uses: Vampire/setup-wsl@v6
+        with:
+          wsl-version: 2
+          distribution: Ubuntu-24.04
+      - run: wsl.exe --status
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/chimaera-app
+          shared-key: app
+          save-if: false
+      # The ignored e2e test IS the smoke; --nocapture streams its phase log.
+      # --release, not the default test profile: the shared "app" cache holds
+      # `tauri build` RELEASE artifacts (release.yml writes it on main) — a
+      # dev-profile build restores nothing and cold-compiles the tauri tree
+      # every run. GITHUB_TOKEN authenticates the release-asset lookup —
+      # anonymous api.github.com from pool-IP runners rate-limits routinely.
+      - run: cargo test --release wsl_end_to_end -- --ignored --nocapture
+        working-directory: crates/chimaera-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

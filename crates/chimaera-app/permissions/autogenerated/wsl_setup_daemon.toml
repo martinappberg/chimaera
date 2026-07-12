@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-wsl-setup-daemon"
+description = "Enables the wsl_setup_daemon command without any pre-configured scope."
+commands.allow = ["wsl_setup_daemon"]
+
+[[permission]]
+identifier = "deny-wsl-setup-daemon"
+description = "Denies the wsl_setup_daemon command without any pre-configured scope."
+commands.deny = ["wsl_setup_daemon"]

@@ -10,11 +10,14 @@
 //! update. Same rules as the remote flow, no ssh: the manifest is on disk
 //! and the session count comes straight off 127.0.0.1.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
+#[cfg(unix)]
 use anyhow::{bail, Context};
 use chimaera_core::Manifest;
+#[cfg(unix)]
 use chimaera_remote::Decision;
 
 /// A reachable local daemon.
@@ -31,7 +34,9 @@ pub struct LocalDaemon {
     pub live_sessions: Option<usize>,
 }
 
-/// Headless entry point for `chimaera-app --daemon`.
+/// Headless entry point for `chimaera-app --daemon`. Unix-only: on Windows
+/// the daemon is the Linux musl binary inside WSL2, never this executable.
+#[cfg(unix)]
 pub fn run_headless() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -53,6 +58,7 @@ pub fn run_headless() {
 /// A running daemon of a different build is replaced when idle (same
 /// decision policy as the remote connect flow) and attached as `outdated`
 /// when live sessions make replacing it unsafe.
+#[cfg(unix)]
 pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
     if let Some(m) = probe().await {
         let local_build = chimaera_core::BUILD_ID;
@@ -107,6 +113,7 @@ pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
 /// Explicit local-daemon update (the home screen affordance): gracefully
 /// stop whatever is running — regardless of session count; the affordance
 /// says what it ends — and bring up a fresh daemon of our build.
+#[cfg(unix)]
 pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     if let Some(m) = probe().await {
         if chimaera_core::builds_match(chimaera_core::BUILD_ID, m.build.as_deref()) {
@@ -118,7 +125,23 @@ pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
     ensure_local_daemon().await
 }
 
-fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
+// On Windows the local daemon is the Linux musl binary inside WSL2; the wsl
+// module owns detect/provision/spawn/adopt. Startup only ADOPTS here —
+// anything that would provision, replace, or install runs in the wizard
+// window instead, so minutes of download/setup are never invisible. Errors
+// carrying WslNotReady make startup open that wizard rather than fail.
+#[cfg(windows)]
+pub async fn ensure_local_daemon() -> anyhow::Result<LocalDaemon> {
+    crate::wsl::adopt_daemon().await
+}
+
+#[cfg(windows)]
+pub async fn update_local_daemon() -> anyhow::Result<LocalDaemon> {
+    crate::wsl::update_daemon(&|_| {}).await
+}
+
+/// Manifest → LocalDaemon, shared by the unix adopt path and the WSL engine.
+pub(crate) fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalDaemon {
     LocalDaemon {
         port: m.port,
         token: m.token,
@@ -129,6 +152,7 @@ fn attached(m: Manifest, outdated: bool, live_sessions: Option<usize>) -> LocalD
 }
 
 /// Manifest → live pid → authenticated health check, all three or nothing.
+#[cfg(unix)]
 async fn probe() -> Option<Manifest> {
     let m = Manifest::load().ok()??;
     if !m.is_alive() {
@@ -142,8 +166,9 @@ async fn probe() -> Option<Manifest> {
     ok.then_some(m)
 }
 
-/// GET /api/v1/health with the manifest token; any 200 counts.
-fn health_ok(port: u16, token: &str) -> bool {
+/// GET /api/v1/health with the manifest token; any 200 counts. Shared with
+/// the WSL probe, where passing it also proves the NAT localhost forward.
+pub(crate) fn health_ok(port: u16, token: &str) -> bool {
     ureq::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
         .set("Authorization", &format!("Bearer {token}"))
         .timeout(Duration::from_secs(2))
@@ -154,7 +179,7 @@ fn health_ok(port: u16, token: &str) -> bool {
 /// Live session count straight off the local daemon (loopback + manifest
 /// token, no ssh). `None` = could not determine; callers treat that as
 /// busy, never as zero.
-async fn live_session_count(port: u16, token: &str) -> Option<usize> {
+pub(crate) async fn live_session_count(port: u16, token: &str) -> Option<usize> {
     let token = token.to_string();
     tokio::task::spawn_blocking(move || {
         let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
@@ -173,6 +198,7 @@ async fn live_session_count(port: u16, token: &str) -> Option<usize> {
 /// Gracefully stop the local daemon: SIGTERM, then poll for exit for up to
 /// ~10s. Never escalates to SIGKILL — a daemon that will not die may be
 /// holding sessions that must not be torn out from under their owner.
+#[cfg(unix)]
 async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
     tracing::info!("stopping local daemon (pid {})", m.pid);
     nix::sys::signal::kill(
@@ -193,12 +219,14 @@ async fn stop_local(m: &Manifest) -> anyhow::Result<()> {
     )
 }
 
+#[cfg(unix)]
 fn log_path() -> std::path::PathBuf {
     chimaera_core::data_dir().join("logs").join("serve.log")
 }
 
 /// Spawn our own executable as `--daemon`, in a new session with stdio on
 /// the serve log, so it survives the shell quitting.
+#[cfg(unix)]
 fn spawn_detached() -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let log = log_path();

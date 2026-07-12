@@ -1,10 +1,11 @@
 # Native app (the Tauri shell)
 
-A native macOS app that wraps the same web UI in **real OS windows** onto a local or
-ssh-tunnelled daemon. It adds what a browser tab can't: real windows that survive quit/crash,
-a window set that restores itself, in-app SSH auth, and a signed one-click updater for the app
-and its daemon. The app is a *view layer* — the daemon it talks to is a separate, longer-lived
-process (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
+A native app — macOS and Linux today, Windows via WSL2 (beta) — that wraps the same web UI in
+**real OS windows** onto a local or ssh-tunnelled daemon. It adds what a browser tab can't:
+real windows that survive quit/crash, a window set that restores itself, in-app SSH auth, and
+a signed one-click updater for the app and its daemon. The app is a *view layer* — the daemon
+it talks to is a separate, longer-lived process (see
+[lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 
 **Where it lives:** `crates/chimaera-app/src/` — its own **standalone cargo workspace** (Tauri is
 kept out of the daemon workspace so musl/HPC builds stay lean). `main.rs` (three-role argv
@@ -18,8 +19,8 @@ app-build` (never the root `cargo`).
 ## Three-role binary
 
 - **What & when.** One executable, three roles selected by argv: default = the Tauri shell;
-  `--daemon` = a headless `chimaera_server::run` (**the .app *is* the daemon**); `--askpass <prompt>`
-  = the tiny `SSH_ASKPASS` relay.
+  `--daemon` = a headless `chimaera_server::run` (**the .app *is* the daemon** — unix only, see
+  the Windows section); `--askpass <prompt>` = the tiny `SSH_ASKPASS` relay.
 - **Where it lives.** `main.rs` (dispatch order is load-bearing), `daemon.rs::run_headless`,
   `askpass.rs`.
 - **Key behaviors.** `--askpass` must stay lightweight — it must never spawn a daemon or window. The
@@ -77,10 +78,47 @@ app-build` (never the root `cargo`).
   self-apply). Body copy states the consequence plainly (layouts/tabs/sessions come back; running terminal
   programs restart). "later" snoozes ~20h; "skip this version" mutes it — both origin-wide in localStorage.
 
+## Windows: the WSL2 engine (beta)
+
+- **What & when.** On Windows the local daemon is **never the app exe** — it is the same Linux
+  musl release binary, provisioned into and spawned inside the user's WSL2 distro; the UI
+  reaches it over WSL's NAT localhost forwarding, so windows/tokens/health work unchanged.
+  Startup only ever **adopts** a healthy daemon; anything needing provisioning (no WSL, no
+  distro, WSL older than the 2.1.1 gate, no/stale daemon) routes through the shell-local
+  **wizard** (`assets/setup.html` — no daemon origin exists to serve the real UI yet), which
+  shows every download/install phase and auto-starts when there is nothing to choose. The
+  distro + a **pinned user** are persisted (`wsl.json`); a wizard-installed Ubuntu gets a real
+  account created up front (with `--no-launch` OOBE never runs, so it would otherwise be
+  root-owned and orphaned when OOBE later flips the default user).
+- **Where it lives.** `wsl.rs` (registry-first detection, hardened `wsl.exe` spawns, provision/
+  spawn/probe/stop — module header documents the researched constraints), `daemon.rs` (windows
+  half of `ensure_local_daemon`), `shell.rs::finish_startup` (the startup the wizard resumes),
+  commands `wsl_status`/`wsl_install`/`wsl_install_distro`/`wsl_setup_daemon`. Deep design +
+  evidence: [docs/windows-wsl-plan.md](../windows-wsl-plan.md).
+- **Key behaviors.** The daemon start line is the Podman persistence pattern (`setsid nohup` in
+  a wsl.exe session) so sessions survive closing the app; `wsl --shutdown` is treated as a
+  normal event (health-check + re-adopt/respawn); adoption always requires the token health
+  handshake (a bare TCP accept can be a stranger's port under NAT forwarding). Verified live by
+  the `wsl-smoke` workflow — a real WSL2 Ubuntu on a Windows runner runs the full
+  provision→spawn→session→shutdown→revive loop. **Remote hosts:** `connect`'s ssh runs INSIDE
+  the distro (`chimaera_remote::WslTransport` — Linux OpenSSH has the ControlMaster mux
+  Win32-OpenSSH lacks), and password/2FA prompts ride a distro-side `SSH_ASKPASS` wrapper →
+  WSL interop → `chimaera.exe --askpass` → a token-gated loopback TCP relay back to the shell
+  (`wsl::wire_connect` installs all of it on every successful adopt/ensure; a wiring failure
+  degrades like unix — key hosts work, password hosts fail cleanly — and `connect_host`
+  refuses with the real reason if the transport is absent). **Gotcha that needs UX copy
+  wherever hosts surface:** ssh runs in the distro, so aliases/keys resolve against the
+  DISTRO's `~/.ssh`, not the Windows-side config the user's terminal uses. The interop
+  prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
+  Windows download until then.
+
 ## Status: partial
 
 - The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
   discovery pass — treat it as under-documented.
+- **Windows is beta**: engine + connect transport + askpass relay are implemented and
+  CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
+  retail Windows hardware.
 
 ---
 
@@ -105,3 +143,7 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Linux + Windows(WSL2) apps — intent capture PENDING
+_The 2026-07-10 `feat:` shipped both platforms; the maintainer's why/deliberate answers have
+not been captured yet — run **capture-feature-intent** before treating any of it as locked._

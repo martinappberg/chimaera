@@ -34,13 +34,24 @@ tauri-plugin-updater = "2"
 # non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so
 # those writes run in the Rust process instead, where there is no gesture gate.
 tauri-plugin-clipboard-manager = "2"
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
-nix = { version = "0.29", features = ["signal"] }
 
 chimaera-core = { path = "../chimaera-core" }
 chimaera-remote = { path = "../chimaera-remote" }
+
+# Unix-only: `--daemon` embeds the server (the .app is self-contained), and
+# nix delivers the graceful SIGTERM in stop_local. On Windows neither exists —
+# the daemon is the Linux musl binary inside WSL2, so the whole server stack
+# (and its PTY/unix surface) must stay out of that build.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
 chimaera-server = { path = "../chimaera-server" }
+
+# Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
+# 24H2 stub can block 60s interactively when WSL is absent).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [profile.release]
 lto = true

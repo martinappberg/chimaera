@@ -1,0 +1,14 @@
+{
+  "identifier": "wsl-setup",
+  "description": "The shell-local WSL first-run wizard ONLY. wsl_install pops a UAC elevation and wsl_setup_daemon drives startup — least privilege demands these never reach daemon-served pages (a REMOTE host's daemon serves those on the same loopback origins daemon-ui grants).",
+  "windows": ["wsl-setup*"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    "allow-wsl-status",
+    "allow-wsl-install",
+    "allow-wsl-update",
+    "allow-wsl-install-distro",
+    "allow-wsl-setup-daemon"
+  ]
+}

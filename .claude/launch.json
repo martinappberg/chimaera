@@ -15,6 +15,13 @@
       "autoPort": true
     },
     {
+      "comment": "The public GitHub Pages site (site/) as plain static files.",
+      "name": "site",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "4173", "--directory", "site"],
+      "port": 4173
+    },
+    {
       "name": "web-ui",
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "web-ui", "run", "dev", "--", "--port", "5173", "--strictPort"],
