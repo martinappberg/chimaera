@@ -161,6 +161,11 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                             tracing::info!(%id, %note, "chat @term mention linked");
                         }
                     }
+                    // An agent editing a file is the signature preview-refresh
+                    // trigger — nudge the git epoch so a preview you have open
+                    // updates live. Runs OUTSIDE apply_chat_event: it is async
+                    // and the std-mutex agents guard is already dropped.
+                    nudge_edited_paths(&state, &entry.ev).await;
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
@@ -170,6 +175,29 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// Nudge the git epoch for every path an agent's Edit tool call touched, so a
+/// preview you have open refreshes live the moment the agent writes the file.
+///
+/// In chat mode this protocol `Edit` event is the *reliable* signal: codex has
+/// no PostToolUse hook at all, and claude's `-p stream-json` hook can misfire —
+/// only the TUI path (`agents.rs`) gets the hook cleanly. This drives the SAME
+/// `mark_path_dirty` mechanism from the protocol event, closing the gap for both
+/// chat agents. Called from the async signal pump AFTER `apply_chat_event`
+/// returns, so no `std::sync` guard is held across its `.await`s.
+pub(crate) async fn nudge_edited_paths(state: &Arc<AppState>, ev: &AgentEvent) {
+    let AgentEvent::ToolCall {
+        kind: chimaera_agent::model::ToolKind::Edit,
+        locations,
+        ..
+    } = ev
+    else {
+        return;
+    };
+    for path in locations {
+        crate::git::mark_path_dirty(state, path).await;
+    }
 }
 
 /// Fold a protocol event into the AgentRecord state machine.
