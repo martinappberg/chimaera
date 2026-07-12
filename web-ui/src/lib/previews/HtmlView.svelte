@@ -7,7 +7,8 @@
    * Returning to Preview re-mints the /raw/ ticket so a saved edit shows
    * immediately. Editing is offered only for files under the 1MB cap.
    */
-  import { fsRawUrl, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import CodeView from "./CodeView.svelte";
   import Spinner from "./Spinner.svelte";
 
@@ -18,12 +19,25 @@
   let { path }: Props = $props();
 
   let mode = $state<"preview" | "edit">("preview");
-  let url = $state<string | null>(null);
-  let error = $state<string | null>(null);
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Null until the first fetch tells us whether the file fits the edit cap. */
   let editable = $state<boolean | null>(null);
+
+  // The shared store entry holds the ticketed /raw/ URL: cached across a tab
+  // switch and re-minted in place when the file changes on disk (a save on the
+  // edit side, or an agent write) — so preview reflects it without reopening.
+  // The daemon serves HTML under CSP "sandbox allow-scripts" and the iframe
+  // repeats the sandbox — the bearer token never appears in a URL.
+  let entry = $state<FileEntry | null>(null);
+  $effect(() => {
+    const e = retain(path);
+    entry = e;
+    void e.ensureRawUrl();
+    return () => release(path);
+  });
+  const url = $derived(entry?.rawUrl ?? null);
+  const error = $derived(entry?.rawError ?? null);
 
   // Reset per path.
   $effect(() => {
@@ -34,39 +48,18 @@
     editable = null;
   });
 
-  // Ticketed /raw/ URL: the daemon serves HTML under CSP "sandbox
-  // allow-scripts" and the iframe repeats the sandbox — no same-origin
-  // access, no top-navigation, and the bearer token never appears in a URL.
-  // (Re)minted whenever we enter/return to preview, so a save on the edit
-  // side is reflected without reopening the tab.
-  $effect(() => {
-    if (mode !== "preview") return;
-    const p = path;
-    url = null;
-    error = null;
-    let stale = false;
-    fsRawUrl(p)
-      .then((u) => {
-        if (!stale) url = u;
-      })
-      .catch((e) => {
-        if (!stale) error = e instanceof Error ? e.message : "failed to load page";
-      });
-    return () => {
-      stale = true;
-    };
-  });
-
   async function enterEdit(): Promise<void> {
-    // Fetch the raw source once; CodeView handles the rest (incl. background
-    // fill for under-cap truncated files and the save/dirty/conflict flow).
+    // Read the raw source from the shared store (cached with the preview URL);
+    // CodeView handles the rest (background fill + save/dirty/conflict flow).
+    const e = entry;
+    if (e === null) return;
     if (chunk === null && chunkError === null) {
-      try {
-        const c = await fsFile(path);
-        chunk = c;
-        editable = c.size <= EDIT_MAX_BYTES;
-      } catch (e) {
-        chunkError = e instanceof Error ? e.message : "failed to load source";
+      await e.ensureChunk();
+      if (e.chunk !== null) {
+        chunk = e.chunk;
+        editable = e.chunk.size <= EDIT_MAX_BYTES;
+      } else {
+        chunkError = e.chunkError ?? "failed to load source";
         return;
       }
     }

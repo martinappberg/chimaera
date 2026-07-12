@@ -45,6 +45,7 @@
     type FileChunk,
   } from "./files";
   import { ApiError } from "../net/api";
+  import { retain, release, noteWrite, type FileEntry } from "./fileStore.svelte";
   import { setDirty, forgetDirty } from "../shared/editing";
   import { getSetting } from "../settings/store.svelte";
   import { isMac } from "../shared/keys";
@@ -189,6 +190,26 @@
     setDirty(path, false);
   }
 
+  // Live disk-change awareness. The shared file store re-probes this path's
+  // mtime whenever the fs/git bus signals a change; when the on-disk version
+  // moves past what we last saved/loaded, adopt it if the buffer is clean, or
+  // raise the conflict bar (never clobber unsaved edits) if it is dirty. This
+  // turns save-time-only conflict detection into a live one. Retaining pins the
+  // shared entry so it is revalidated while this editor is on screen.
+  let entry = $state<FileEntry | null>(null);
+  $effect(() => {
+    entry = retain(path);
+    return () => release(path);
+  });
+  $effect(() => {
+    const e = entry;
+    if (e === null || savedMtime === null) return; // not yet initialized
+    const diskMtime = e.mtime;
+    if (diskMtime === null || diskMtime === savedMtime) return; // our version, or unknown
+    if (dirty || saving) conflict = true;
+    else void reloadFromDisk();
+  });
+
   onMount(() => {
     const el = host;
     if (el === null) return;
@@ -314,6 +335,7 @@
       const mtime = await fsWrite(path, bytes, force ? null : savedMtime);
       if (view !== v) return;
       savedMtime = mtime;
+      noteWrite(path, mtime); // keep the shared entry coherent (and self-quiet)
       conflict = false;
       saveError = null;
       clearDirty();

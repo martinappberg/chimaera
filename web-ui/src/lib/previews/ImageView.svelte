@@ -11,7 +11,8 @@
 </script>
 
 <script lang="ts">
-  import { fsRawUrl, innerExtension } from "./files";
+  import { innerExtension } from "./files";
+  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -45,22 +46,26 @@
   /** Pixel grid only helps for raster pixels; SVG stays vector-crisp. */
   const showGrid = $derived(!isSvg && scale >= GRID_SCALE && natural !== null);
 
+  // The ticketed /raw/ URL comes from the shared store: cached across a tab
+  // switch (no re-mint), and re-minted in place when the file changes on disk.
+  // url/error stay local $state so the <img>'s onerror can still flag a broken
+  // ticket; the store sync below feeds them and clears a stale error on re-mint.
+  let entry = $state<FileEntry | null>(null);
   $effect(() => {
-    const p = path;
-    url = null;
-    error = null;
-    natural = null;
-    let stale = false;
-    fsRawUrl(p)
-      .then((u) => {
-        if (!stale) url = u;
-      })
-      .catch((e) => {
-        if (!stale) error = e instanceof Error ? e.message : "failed to load image";
-      });
-    return () => {
-      stale = true;
-    };
+    const e = retain(path);
+    entry = e;
+    void e.ensureRawUrl();
+    return () => release(path);
+  });
+  $effect(() => {
+    const e = entry;
+    if (e === null) return;
+    if (e.rawUrl !== null) {
+      url = e.rawUrl;
+      error = null;
+    } else if (e.rawError !== null) {
+      error = e.rawError;
+    }
   });
 
   // Track the viewport size for fit-scaling and pan clamping.

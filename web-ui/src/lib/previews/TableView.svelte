@@ -1,5 +1,6 @@
 <script lang="ts">
   import { fsTable, type TablePage } from "./files";
+  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { getSetting } from "../settings/store.svelte";
   import { copyText } from "../shared/clipboard";
   import Spinner from "./Spinner.svelte";
@@ -42,6 +43,10 @@
   let anchor: { r: number; c: number } | null = null;
   let selecting = false;
 
+  // The shared store entry holds the FIRST page (cached across tab switches,
+  // re-fetched in place when the file changes on disk). Subsequent pages load
+  // on scroll via loadMore and are not cached.
+  let entry = $state<FileEntry | null>(null);
   $effect(() => {
     const p = path;
     // reset everything for the new file
@@ -55,7 +60,28 @@
     numericCols = new Set();
     sel = null;
     anchor = null;
-    void loadFirst(p);
+    loading = true;
+    const e = retain(p);
+    entry = e;
+    void e.ensureTable();
+    return () => release(p);
+  });
+
+  // Apply the store's first page whenever it (re)loads — initial fetch, an
+  // instant cache hit on return, or a live refresh after a disk change (which
+  // resets to the fresh first page, dropping any scrolled-in extra pages).
+  $effect(() => {
+    const e = entry;
+    if (e === null) return;
+    const page = e.table;
+    if (page !== null) {
+      apply(page, true);
+      loading = false;
+      scroller?.scrollTo({ top: 0 });
+    } else if (e.tableError !== null) {
+      error = e.tableError;
+      loading = false;
+    }
   });
 
   const NUMERIC_RE = /^-?(?:\d[\d,]*)(?:\.\d+)?(?:[eE][-+]?\d+)?%?$/;
@@ -74,21 +100,6 @@
       if (seen > 0 && numeric / seen >= 0.8) out.add(c);
     }
     return out;
-  }
-
-  async function loadFirst(p: string): Promise<void> {
-    loading = true;
-    try {
-      const page = await fsTable(p, 0, pageRows());
-      if (p !== path) return;
-      apply(page, true);
-      scroller?.scrollTo({ top: 0 });
-    } catch (e) {
-      if (p !== path) return;
-      error = e instanceof Error ? e.message : "failed to load table";
-    } finally {
-      if (p === path) loading = false;
-    }
   }
 
   /** Append the next page without disturbing the current scroll position. */
