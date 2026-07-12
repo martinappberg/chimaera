@@ -1,4 +1,5 @@
 mod agents;
+mod chat;
 mod download;
 mod exec;
 mod fs;
