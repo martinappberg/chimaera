@@ -103,14 +103,22 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 ## Rendered previews
 
 - **Markdown.** `GET /api/v1/fs/markdown?path=` renders GFM → **ammonia-sanitized** HTML
-  (source cap 4 MB). `MarkdownView.svelte`.
+  (source cap 4 MB). `MarkdownView.svelte`. The mode toggle is **preview | split | edit**:
+  `split` shows the CodeMirror editor beside a **live** preview that re-renders the editor's
+  buffer *client-side* as you type (marked + DOMPurify, `mdRender.ts`) — the file is still
+  only written on Cmd/Ctrl+S, and plain `preview` stays the authoritative server render. The
+  editor mounts once and survives every toggle (CSS-hidden in preview), so no mode flip drops
+  an unsaved buffer. The split geometry is the shared `SplitEditPreview.svelte`.
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.
-  `PdfView`/`ImageView`/`HtmlView`.
+  `PdfView`/`ImageView`/`HtmlView`. `HtmlView` carries the same **preview | split | edit** toggle;
+  its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
+  buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
+  preview, so that mode stays the fidelity reference.
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
 
