@@ -121,11 +121,25 @@ selection references (see [terminals.md](terminals.md)).
 > be "helpfully" changed without asking.
 
 ### Drag-to-reference & uploads — why it exists
-_Intent: **pending.** Not yet captured from the maintainer._
+_Captured 2026-07-11 (from the maintainer, confirming a draft read from code + the open-questions list)._
 
-Open questions for capture: whether the **reference-not-copy** stance for tree drags (paths, never
-bytes) is a firm bet or provisional; whether **OS drops should ever bypass the upload** for a local
-window (insert the native path directly) or always stream for uniformity; the per-file/per-session
-**caps** (32 MB / 256 MB) and the **8-files-per-drop** limit; whether **folder** OS-drops should
-gain recursive upload; and whether chat image drops should keep **dual-writing** (pixels to the
-model *and* an uploaded path) or pick one.
+- **Problem it solves.** Get a **path** or a **file** into the session you're talking to by dragging —
+  and do it **remote-transparently**: bytes stream to the daemon that *owns* the session, so an agent
+  (or shell) on a remote host can read a file you dragged off your laptop. Two intake edges, one
+  destination: a tree drag **references** (paths, no bytes move — the file is already on the host); an
+  OS-desktop drop **uploads then references**.
+- **How settled it is (resolved with the maintainer).**
+  - **Reference-not-copy for tree drags** (paths, never bytes) — **core**: it is the point of a
+    workbench that lives *on* the host. Firm.
+  - A local-window OS-drop **always streams** through the upload — it never bypasses to insert a raw
+    native path — for uniformity and remote-correctness.
+  - **Chat image drops keep dual-writing** — the pixels go to the model *now*, and the uploaded
+    host-side path stays as the durable artifact the agent can re-read later. Keep both.
+  - The **caps** (32 MB/file · 256 MB/session · 8 files/drop) are **provisional** guardrails for
+    login-node RSS — free to tune.
+  - **Folder OS-drops → recursive upload** is a **deliberate follow-up**, not a non-goal (folders are
+    rejected with a toast for now).
+- **Do not change:** the **remote-transparent** streaming (bytes to the *owning* daemon, so remote
+  windows land files on the remote host) and the **never-in-RAM** streaming (the daemon lives on
+  shared login nodes). Everything else here — caps, limits, the folder follow-up — is an improvable
+  addition.
