@@ -697,6 +697,9 @@
           case "new-agent":
             newAgentPrimary();
             break;
+          case "settings":
+            openSettingsSurface();
+            break;
         }
       }).then((u) => (unlistenMenu = u));
       // The local daemon was replaced (self-update). With the restart

@@ -273,6 +273,12 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             crate::menu::install(app)?;
+            // The menu-bar / system-tray status item. Installed before the
+            // daemon is up (its click handlers read Shell.local, populated by
+            // runtime); non-fatal if the platform tray is unavailable.
+            if let Err(e) = crate::tray::install(app) {
+                tracing::warn!("system tray unavailable: {e:#}");
+            }
             // Route ssh auth prompts (password / 2FA) to the UI. Managed
             // before the listener starts so an early prompt finds the state.
             app.manage(crate::askpass::Askpass::default());

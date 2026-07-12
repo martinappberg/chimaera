@@ -10,6 +10,7 @@ mod askpass;
 mod daemon;
 mod menu;
 mod shell;
+mod tray;
 mod update;
 mod windows;
 mod wsl;
