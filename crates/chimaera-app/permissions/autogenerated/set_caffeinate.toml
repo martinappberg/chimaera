@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-caffeinate"
+description = "Enables the set_caffeinate command without any pre-configured scope."
+commands.allow = ["set_caffeinate"]
+
+[[permission]]
+identifier = "deny-set-caffeinate"
+description = "Denies the set_caffeinate command without any pre-configured scope."
+commands.deny = ["set_caffeinate"]

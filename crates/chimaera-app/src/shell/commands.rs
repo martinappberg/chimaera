@@ -372,6 +372,48 @@ pub(super) fn report_window_scope(
     }
 }
 
+/// Arm/disarm the "caffeinate" power assertion for THIS machine (the app host):
+/// while armed it won't idle-, display-, or system-sleep — including with the
+/// lid closed on macOS, though only on AC power (Apple blocks clamshell-awake on
+/// battery, which no app can override). Global to the app, not per window; the
+/// resulting state broadcasts so every window's toggle stays in sync. Idempotent
+/// — re-arming keeps the single held guard; the guard drops on quit.
+#[tauri::command]
+pub(super) fn set_caffeinate(
+    app: AppHandle,
+    state: State<'_, Shell>,
+    on: bool,
+) -> Result<bool, String> {
+    let mut guard = lock(&state.caffeinate);
+    if on {
+        if guard.is_none() {
+            let awake = keepawake::Builder::default()
+                .display(true)
+                .idle(true)
+                .sleep(true)
+                .app_name("Chimaera")
+                .app_reverse_domain("com.chimaera.app")
+                .reason("Caffeinate")
+                .create()
+                .map_err(|e| format!("{e:#}"))?;
+            *guard = Some(awake);
+        }
+    } else {
+        *guard = None; // dropping the guard releases the assertion
+    }
+    let armed = guard.is_some();
+    drop(guard);
+    let _ = app.emit("caffeinate-changed", armed);
+    Ok(armed)
+}
+
+/// Whether the caffeinate assertion is currently held. Each window reads this on
+/// mount to render its toggle; live changes ride the `caffeinate-changed` event.
+#[tauri::command]
+pub(super) fn caffeinate_state(state: State<'_, Shell>) -> bool {
+    lock(&state.caffeinate).is_some()
+}
+
 /// This app binary's build id, for daemon-skew detection in the UI (the
 /// daemon's own build rides GET /api/v1/health).
 #[tauri::command]
