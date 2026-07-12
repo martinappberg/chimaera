@@ -86,14 +86,16 @@ export interface LayoutCtrl {
   /** Close the pane's active view; an empty pane collapses. */
   closeView(paneId: string): void;
   /**
-   * Open a file surfaced FROM `paneId` (terminal path link, touched-files
-   * popover): lands in the adjacent pane, or a fresh split when the window
-   * has one pane / `newSplit` (Cmd/Ctrl) is set.
+   * Open a file surfaced FROM `paneId` (terminal/chat path link, Finder row,
+   * session-changes row, touched-files popover): reuses an already-open tab
+   * wherever it lives, else lands in the ACTIVE (focused) pane — the same
+   * "opens where you are" rule the FILES tree and quick-open follow. `newSplit`
+   * (Cmd/Ctrl) forces a fresh split to the right instead, to place it beside.
    */
   openFileFrom(paneId: string, path: string, newSplit: boolean): void;
   /**
-   * Open a VALIDATED path from `paneId` by kind: files land in a viewer
-   * pane, directories open in the Finder and reveal in the file tree
+   * Open a VALIDATED path from `paneId` by kind: files land in the active pane
+   * (openFileFrom), directories open in the Finder and reveal in the file tree
    * (chat prose links — the terminal-link semantics).
    */
   openPathFrom(paneId: string, path: string, kind: "file" | "dir", newSplit: boolean): void;
@@ -112,8 +114,9 @@ export interface LayoutCtrl {
   navigateFinder(id: string, path: string): void;
   /**
    * Open a side-by-side diff surfaced FROM `paneId` (a changes-panel row):
-   * same adjacent-pane / fresh-split grammar as `openFileFrom`, so the panel
-   * stays visible beside the diff it opened.
+   * lands in the adjacent pane, or a fresh split when the window has one pane /
+   * `newSplit` (Cmd/Ctrl) is set — so the panel stays visible BESIDE the diff it
+   * opened (deliberately unlike `openFileFrom`, which opens in the active pane).
    */
   openDiffFrom(paneId: string, path: string, mode: DiffMode, newSplit: boolean): void;
   /**

@@ -118,8 +118,9 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **How it's used.** Zoom a pane: bar button, double-click a tab, or `Mod2+Enter` (a "restore"
   badge appears). Focus mode (hide the left rail): `Mod+B` (a slim session strip keeps `Mod+1–9`
   reachable). `Mod+Arrow` moves pane focus spatially; `Mod2+Arrow` carries the active tab into
-  the neighbor; `Mod+1–9` opens the Nth rail session; `⌘±`/`⌘0` bump one pane's terminal/markdown
-  font.
+  the neighbor — or, when there is no pane in that direction, **auto-splits a new one** on that
+  side (capped at `MAX_PANES` and a minimum pane size); `Mod+1–9` opens the Nth rail session;
+  `⌘±`/`⌘0` bump one pane's terminal/markdown font.
 - **Where it lives.** `layout.ts` (`toggleZoom`, `focusMode`, `moveFocus`, `moveTabDirection`,
   `setPaneFont` with `FONT_MIN 9`/`FONT_MAX 28`), `App.svelte` chords, `keys.ts`.
 - **Key behaviors.** Zoom always tracks the focused pane (focusing elsewhere clears it, so you

@@ -24,6 +24,10 @@ import {
   pinPaths,
   movePane,
   movePaneToRootEdge,
+  moveTabDirection,
+  toggleZoom,
+  sessionPaneId,
+  MAX_PANES,
   findPane,
 } from "./layout";
 
@@ -247,5 +251,56 @@ describe("whole-pane moves", () => {
     l = splitPane(l, only, "row");
     const before = l;
     expect(movePane(l, l.focusedPaneId, l.focusedPaneId, "center")).toBe(before); // self
+  });
+});
+
+describe("moveTabDirection (shift+cmd+arrow)", () => {
+  it("auto-splits a single-tab pane into a fresh empty pane on that side, focused", () => {
+    let l = openSession(defaultLayout(), "s1");
+    const src = l.focusedPaneId;
+    l = moveTabDirection(l, "right");
+    expect(panes(l.root)).toHaveLength(2);
+    expect(l.focusedPaneId).not.toBe(src); // the new pane is focused
+    expect(findPane(l.root, l.focusedPaneId)?.tabs).toHaveLength(0); // and empty
+    expect(sessionPaneId(l, "s1")).toBe(src); // the sole tab stayed put
+  });
+
+  it("tears the ACTIVE tab of a multi-tab pane into the new pane", () => {
+    let l = openSession(defaultLayout(), "t1");
+    l = openSession(l, "t2"); // both in one pane; t2 is active
+    const src = l.focusedPaneId;
+    l = moveTabDirection(l, "right");
+    expect(panes(l.root)).toHaveLength(2);
+    expect(sessionPaneId(l, "t2")).toBe(l.focusedPaneId); // t2 moved into the new pane
+    expect(sessionPaneId(l, "t1")).toBe(src); // t1 stayed behind
+  });
+
+  it("moves into an existing neighbor instead of splitting", () => {
+    let l = openSession(defaultLayout(), "a");
+    const paneA = l.focusedPaneId;
+    l = splitPane(l, paneA, "row"); // A | B (empty, focused)
+    l = openSession(l, "b1");
+    l = openSession(l, "b2"); // B = [b1, b2], b2 active
+    const count = panes(l.root).length; // 2
+    l = moveTabDirection(l, "left"); // neighbor A exists → move b2 into A (B keeps b1)
+    expect(panes(l.root)).toHaveLength(count); // no new pane
+    expect(sessionPaneId(l, "b2")).toBe(paneA); // moved into the neighbor
+  });
+
+  it("never auto-splits past MAX_PANES", () => {
+    let l = openSession(defaultLayout(), "c0");
+    for (let i = 0; i < MAX_PANES + 3; i++) l = moveTabDirection(l, "right");
+    expect(panes(l.root).length).toBeLessThanOrEqual(MAX_PANES);
+  });
+
+  it("is a no-op while zoomed", () => {
+    let l = openSession(defaultLayout(), "z1");
+    l = toggleZoom(l);
+    expect(moveTabDirection(l, "right")).toBe(l);
+  });
+
+  it("is a no-op when the focused pane is empty", () => {
+    const l = defaultLayout(); // one empty pane
+    expect(moveTabDirection(l, "right")).toBe(l);
   });
 });
