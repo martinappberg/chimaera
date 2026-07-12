@@ -16,7 +16,7 @@ the module you need and read its header doc.
 | `state.rs` | `AppState` (every shared handle) + `lock()`. |
 | `router.rs` | `app()` — the axum route table. |
 | `lifecycle.rs` | The daemon `run()` lifecycle (bind/handoff/manifest/serve/graceful-shutdown) + the listener helpers. |
-| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. (Note: chat sessions are not yet in the snapshot — see the chat-mode seam.) |
+| `ledger.rs` | The session ledger: snapshot/restore for restart handoff + resurrection. Covers **both** surfaces — PTY sessions and chat sessions (via `state.chat`); a chat resurrects through `chat::resurrect_chat`. |
 | `api/` | REST, split by resource: `workspaces`/`sessions`/`exec`/`shutdown`/`env` + `mod.rs` (auth+health+re-exports). |
 | `exec.rs` | `run_exec` — the transport-neutral "type a command into a live shell, with sentinel policy" helper, shared by `api::exec_session` (REST) and `mcp::run_in_terminal` (so `mcp` doesn't depend on `api`). |
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
@@ -81,11 +81,15 @@ the lifecycle, keep them consistent:
   (binary, settings files) *before* killing the old process — a post-kill
   failure leaves the session in no registry and the watcher retires it. Serialize
   concurrent switches on `chat_switching`.
-- **Chat sessions survive disconnect, die with the daemon.** By design they are
-  daemon-owned (a closed laptop doesn't kill them) but they are NOT (yet)
-  resurrected across a daemon restart — the journal + native-id index preserve
-  the conversation for a manual resume. (Extending the ledger to resurrect them
-  is a known follow-up.)
+- **Chat sessions survive disconnect AND a daemon restart.** They are
+  daemon-owned (a closed laptop / window doesn't kill them — the WS handler just
+  exits on client disconnect), and a daemon restart now resurrects them like
+  PTYs: `ledger::snapshot` records the chat (surface + native id + model),
+  `ledger::restore` resurrects the resumable ones live under the same id via
+  `chat::resurrect_chat` (regenerate settings/mcp, `--resume`/thread, reuse the
+  journal) and retires the rest into Recents (`ui=Chat`). The graceful-shutdown
+  path must **not** retire chats (that drops their workspace mapping and the
+  reconciler would lose them) — the snapshot carries them.
 - **`close-all` / `shutdown` must stop chat drivers too** (`kill_all` only
   covers PTYs).
 - **Resource discipline is a review criterion.** ~150 MB RSS, no unbounded
