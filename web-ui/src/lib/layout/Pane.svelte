@@ -165,6 +165,7 @@
                 .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
               onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
               onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
+              onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
             />
           {/key}
         {:else}

@@ -110,25 +110,55 @@
     });
   });
 
-  /** Slash popover: draft is a single "/prefix" token being typed. */
-  const slashMatches = $derived.by(() => {
-    if (!draft.startsWith("/") || /\s/.test(draft)) return [];
-    const q = draft.slice(1).toLowerCase();
-    return slashCommands
-      .filter((c) => c.name.toLowerCase().startsWith(q))
-      .slice(0, 8);
-  });
+  /** Escape-dismissed slash token text — suppresses the popover for exactly
+   *  that token so Escape closes it without clearing a mid-draft message;
+   *  typing on (the token text changes) brings it back. */
+  let slashDismissed = $state<string | null>(null);
 
-  /** The @token under the caret, if any (mention autocomplete). */
-  function atToken(): { start: number; text: string } | null {
-    const textarea = el;
-    if (textarea === null) return null;
-    const caret = textarea.selectionStart;
-    const before = draft.slice(0, caret);
-    // ":" admits @term:NAME (linked-terminal grants) alongside file paths.
-    const match = /(^|\s)(@[\w./:-]*)$/.exec(before);
+  /** The token under the caret matching `re` — group 1 is the leading boundary,
+   *  group 2 the token itself. Shared core of the `/`-command and `@`-mention
+   *  scanners. Read from the PRE-focus caret (a popover click steals
+   *  selectionStart), so both popovers survive a mouse pick. */
+  function caretToken(re: RegExp): { start: number; text: string } | null {
+    if (el === null) return null;
+    const caret = el.selectionStart;
+    const match = re.exec(draft.slice(0, caret));
     if (match === null) return null;
     return { start: caret - match[2].length, text: match[2] };
+  }
+
+  /** A line-leading "/command" token under the caret. Unlike the old
+   *  draft-start-only rule, a command begun on a fresh line mid-draft (a
+   *  follow-up like "/meeting-notes") completes too. Line-leading ONLY (start
+   *  of the box or right after a newline) so ordinary path text — "cd /usr" —
+   *  is never hijacked. */
+  function slashToken(): { start: number; text: string } | null {
+    return caretToken(/(^|\n)(\/[\w:-]*)$/);
+  }
+  const slashTok = $derived.by(() => {
+    void draft;
+    return slashToken();
+  });
+  const slashMatches = $derived.by(() => {
+    const token = slashTok;
+    if (token === null || token.text === slashDismissed) return [];
+    const q = token.text.slice(1).toLowerCase();
+    return slashCommands.filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 8);
+  });
+  // Forget an Escape-dismissal once its token is edited away (the draft cleared
+  // or sent, or the token changed) — otherwise re-typing the same command later
+  // stays suppressed for the rest of the session. Settles: after the reset the
+  // guard is false.
+  $effect(() => {
+    if (slashDismissed !== null && slashTok?.text !== slashDismissed) {
+      slashDismissed = null;
+    }
+  });
+
+  /** The @token under the caret, if any (mention autocomplete). ":" admits
+   *  @term:NAME (linked-terminal grants) alongside file paths. */
+  function atToken(): { start: number; text: string } | null {
+    return caretToken(/(^|\s)(@[\w./:-]*)$/);
   }
 
   // Debounced quick-open lookup for the @token.
@@ -195,11 +225,23 @@
   });
 
   function pickSlash(name: string) {
-    if (onSlash(name)) {
+    const token = slashTok;
+    // A slash that IS the whole draft takes the command path: dialog-only
+    // commands open native UI (onSlash), the rest become "/name " ready to
+    // send. A slash begun MID-draft is a typing aid — complete the token in
+    // place and leave the surrounding message intact.
+    const wholeDraft =
+      token !== null && token.start === 0 && draft.slice(token.text.length).trim() === "";
+    if (wholeDraft && onSlash(name)) {
       draft = "";
       return;
     }
-    draft = `/${name} `;
+    if (token === null) {
+      draft = `/${name} `;
+    } else {
+      draft = `${draft.slice(0, token.start)}/${name} ${draft.slice(token.start + token.text.length)}`;
+    }
+    slashDismissed = null;
     el?.focus();
   }
 
@@ -275,9 +317,18 @@
       }
       if (e.key === "Escape") {
         e.preventDefault();
-        fileMatches = [];
-        fileToken = null;
-        draft = draft.startsWith("/") ? "" : draft;
+        if (popover === "slash") {
+          // Dismiss the popover in place (never wipe a mid-draft message); a
+          // whole-draft "/cmd" still clears, matching the old quick-escape.
+          if (slashTok !== null && slashTok.start === 0 && draft.trim() === slashTok.text) {
+            draft = "";
+          } else {
+            slashDismissed = slashTok?.text ?? null;
+          }
+        } else {
+          fileMatches = [];
+          fileToken = null;
+        }
         return;
       }
     }

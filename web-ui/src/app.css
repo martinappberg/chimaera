@@ -195,6 +195,15 @@
   }
 }
 
+/* The "live / running" opacity pulse shared by the tool-call status dot, the
+   streaming cursor, and the subagents-tray dot. Each component keeps its own
+   prefers-reduced-motion override on the specific animated element. */
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
 html,
 body {
   margin: 0;

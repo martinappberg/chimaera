@@ -43,6 +43,15 @@ TUI (see [view switch](#view-switch-and-rewind)).
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
   is native for codex (`thread/compact/start`; the compaction runs as its own turn and lands a
   "context compacted" notice) — claude's `/compact` rides its own CLI catalog as prompt text.
+  The slash popover triggers for a **line-leading** `/command` anywhere in the draft (a follow-up
+  begun on a fresh line), not only when the slash is the first character — a mid-draft pick
+  completes the token in place; only a whole-draft slash takes the command path. Ordinary path
+  text ("cd /usr") is never hijacked.
+- **`/login` recovery (claude).** An expired-auth chat session dead-ends — the `-p stream-json`
+  CLI answers "/login isn't available in this environment". `/login` (palette + intercepted on
+  send) instead flips the session to its real TUI (the [view switch](#view-switch-and-rewind)),
+  where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
+  never touches the credentials. Sign in there, toggle back to chat.
 - **Where.** `Composer.svelte`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
 
@@ -53,7 +62,12 @@ TUI (see [view switch](#view-switch-and-rewind)).
   `model/list`) beats the daemon's curated list. Effort is per-model (codex falls back to the
   `minimal…xhigh` ladder; **`xhigh` is never relabeled** — canonical vocabulary is sacred).
   Thinking (claude) and ultracode (claude, gated to an xhigh-capable model) are client-held toggles
-  reconciled from `effort_state` read-backs.
+  reconciled from `effort_state` read-backs. **Thinking defaults ON** for claude sessions (the
+  reasoning pass earns its keep in a coding workbench; the chip shows it explicitly and one click
+  turns it off) — the preference lives in the pooled store (`null` = unchosen ⇒ default on; a bool is
+  an explicit choice) and is pushed to the live driver once per driver process, re-synced on each
+  respawn (a fresh CLI defaults thinking off) but never re-forced, so a tab remount can't reset it and
+  a toggle-off always sticks.
 - **Live telemetry chips.** A rate-limit chip appears at ≥80% / reached; a context chip shows "42%
   ctx". Subscription usage (`/usage`, `/cost`) shows **percentages, never dollars**.
 - **Where.** `ChatHeader.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`; store fields fed by
@@ -88,12 +102,25 @@ TUI (see [view switch](#view-switch-and-rewind)).
   output/diff, a `↗` to open the touched file). Consecutive calls condense into a group ("6 commands
   · 2 files"); groups auto-collapse once every tool finished cleanly, stay open while anything runs
   or failed. Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
-  pending); `tool_output_delta` streams live output ahead of the authoritative result.
+  pending); `tool_output_delta` streams live output ahead of the authoritative result. **Dangling
+  rows reconcile at turn end:** on `turn_completed`/`turn_aborted`/`exited` any tool still
+  in_progress/pending in the just-ended turn is closed to `completed` (a pure reducer scan back to
+  the previous turn boundary). This kills the phantom "running…" a dropped result frame would leave —
+  most often a large image `Read` whose `tool_result` exceeds the transport's per-line byte cap and
+  is skipped below the event layer, so its completion never arrives and the group never collapses.
 - **Background / stop a running row (claude).** A running tool row offers a ⤓ "continue in the
   background" affordance (`background_tool` → the CLI's `background_tasks`, Ctrl-B parity; a
   refusal lands an honest notice), and a running **Agent** (subagent) row offers a ■ stop
   (`stop_task`; the driver resolves the row id to the CLI's opaque task key). Codex has no
   equivalents — the buttons are omitted there.
+- **Live subagents tray + active plan step.** Subagents running *right now* are promoted out of the
+  (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
+  glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"
+  summary, expandable to each agent's progress line (tools · tokens, from `task_progress`) + stop.
+  They keep their in-place "Agent:" row in history; a finished/abandoned run drops from the tray
+  (reconciled shut at turn end). The plan/todo panel likewise surfaces the current step in its
+  summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
+  (`AgentsTray.svelte`).
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
@@ -172,7 +199,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
   between chat and TUI on the same id (same AgentRecord, resume target). Kill-then-respawn is **not
   atomic** — every respawn precondition is resolved before the kill; concurrent toggles serialize on
   `chat_switching` (double-click → 409). A busy `Running` agent needs `force` (409). **Billing note:**
-  the TUI side bills like an interactive session; the chat side drives the structured protocol.
+  the TUI side bills like an interactive session; the chat side drives the structured protocol. This
+  is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
+  expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Rewind + fork (claude).** Hover a user message → "↺" → a dry-run report → a dialog listing the
   files that will revert → "restore files" or "restore + rewind conversation". File-restore rides the
   chat socket (`rewind`); the conversation fork is `POST /api/v1/sessions/{id}/rewind {resume_at}`,
@@ -261,3 +290,24 @@ _Captured 2026-07-11 (from the maintainer)._
 - **The promise (the load-bearing bit).** **Chat tabs are as durable as terminal tabs** — a view
   switch is a view switch, never a reload. Keep that parity.
 - **Grade — addition** otherwise: the pool mechanics are implementation, free to improve.
+
+### Chat-UX batch (tool-state · subagents tray · thinking-default · slash-anywhere · /login) — why it exists
+_Captured 2026-07-12 (from the maintainer, in-session)._
+
+- **Problem it solves:** rough edges that made chat mode feel less than the workbench it should be —
+  phantom "running…" tool rows that outlived their turn, subagents buried in scrolled-off tool groups,
+  and no way to recover an expired login from chat. The framing the maintainer set: chimaera is a
+  **workbench, not a chat window** (unlike the Claude desktop app) — so long-lived, *monitorable* work
+  (subagents, the plan) should be promoted OUT of the transcript into calm pinned surfaces, while the
+  transcript stays for the conversation. Don't copy vendor chrome; use chimaera's own idioms.
+- **Deliberate defaults:** thinking defaults ON for claude ("the reasoning pass earns its keep in a
+  coding workbench") — shown on the chip, one click off, and easy to reverse if it's the wrong call.
+  The subagents tray is collapsed by default (a quiet one-line indicator, expand for detail).
+- **Auth is native-only, by decision:** `/login` routes to the CLI's own auth flow (in the TUI);
+  chimaera **never** builds credential entry or handles secrets — auth methods vary (OAuth,
+  `setup-token`, SSO) and a custom in-app flow was judged too risky. The `/login`→TUI flip is the
+  minimal unblock; the fuller auth UX (auth-fail card, `/logout`, `/auth status`, codex parity, and
+  the stuck-`Running`-after-auth-fail state) is a conscious follow-up.
+- **Grade — additions, open to change:** all improvable; the load-bearing bits are the
+  **native-auth-only** rule and the **workbench-promotion** principle (pin long-lived work, keep the
+  transcript for conversation).

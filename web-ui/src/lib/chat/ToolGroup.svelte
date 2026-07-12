@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Chevron from "../shared/Chevron.svelte";
   import type { ChatBlock } from "./store.svelte";
   import ToolCallCard from "./ToolCallCard.svelte";
 
@@ -82,18 +83,7 @@
     onclick={() => (userOpen = !open)}
     title={open ? "collapse tool activity" : "expand tool activity"}
   >
-    <span class="chev" class:open aria-hidden="true">
-      <svg viewBox="0 0 16 16" width="10" height="10">
-        <path
-          d="M6 4l4 4-4 4"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      </svg>
-    </span>
+    <Chevron {open} />
     <span class="label">{summary}</span>
     {#if failed}
       <span class="badge bad">failed</span>
@@ -148,20 +138,6 @@
   }
   .summary:hover {
     background: color-mix(in srgb, var(--fg) 4%, transparent);
-  }
-  .chev {
-    display: inline-flex;
-    flex: none;
-    color: var(--muted);
-    transition: transform 0.14s ease;
-  }
-  .chev.open {
-    transform: rotate(90deg);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .chev {
-      transition: none;
-    }
   }
   .label {
     flex: 1;
