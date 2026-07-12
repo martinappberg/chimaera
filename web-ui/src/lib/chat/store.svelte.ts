@@ -245,18 +245,24 @@ export class ChatStore {
   /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
    *  no read-back — but kept HERE (pooled per session, surviving a ChatView
    *  tab remount) rather than in the view, so switching tabs can neither reset
-   *  the chip nor re-force the CLI over a choice the user already made. The
-   *  view seeds the default (on for claude) and pushes it to the CLI once per
-   *  session; the header chip reads it and toggles it. */
-  thinkingEnabled = $state(false);
-  /** True once the view has pushed the initial default to the CLI — the guard
-   *  that keeps a remount/reconnect from re-forcing thinking on. */
-  thinkingSeeded = $state(false);
+   *  the chip nor override a choice the user already made. `null` = the user
+   *  hasn't chosen, so the default (on for claude) applies; a bool is explicit.
+   *  The view reads the EFFECTIVE value, toggles it, and pushes it to the live
+   *  driver — it never re-forces a value, so a toggle-off always sticks. */
+  thinkingEnabled = $state<boolean | null>(null);
+  /** Whether the current preference has been pushed to the CURRENT driver
+   *  process. Reset on every `init` (a fresh process — respawn/resume/rewind/
+   *  view-toggle round-trip — starts with thinking OFF), so the view re-syncs
+   *  it to that driver; the view only marks it once the `set_thinking` frame
+   *  actually left the socket, so an undelivered push isn't silently lost. A
+   *  plain reconnect (same process, no new `init`) keeps it, so it isn't
+   *  re-pushed needlessly. */
+  thinkingPushed = $state(false);
   setThinking(enabled: boolean): void {
     this.thinkingEnabled = enabled;
   }
-  markThinkingSeeded(): void {
-    this.thinkingSeeded = true;
+  markThinkingPushed(): void {
+    this.thinkingPushed = true;
   }
 
   /** Queued/undelivered user messages, in order — rendered in a holding stack
@@ -314,6 +320,9 @@ export class ChatStore {
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
+    // The rebuilt replay re-drives the driver's `init`, but reset here too so
+    // the preference is re-pushed even if this reset races ahead of it.
+    this.thinkingPushed = false;
   }
 
   apply(entry: SeqEvent): void {
@@ -326,6 +335,10 @@ export class ChatStore {
         // replayed exit said (toggle round-trips, resumes).
         this.exited = null;
         this.degraded = false;
+        // This is a NEW driver process — the CLI defaults thinking OFF, so the
+        // view must re-push the user's preference to it (seq-dedupe means only
+        // a genuinely-new init re-applies here; a plain reconnect doesn't).
+        this.thinkingPushed = false;
         // Any ask still pending predates this driver process — its reply
         // route died with the old one, so an answer could never land. Seq
         // ordering makes this safe: a live driver's Init is journaled BEFORE
@@ -716,6 +729,10 @@ export class ChatStore {
           // the "starting…" row waiting on a turn end that can't come.
           this.running = false;
           this.activity = null;
+          // A fatal error is a terminal path like the others — a tool left
+          // in_progress must not spin forever when no `exited` follows (a kept-
+          // visible ProtocolError session emits no exit).
+          this.reconcileOpenTools();
         }
         break;
       case "exited":

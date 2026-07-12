@@ -137,6 +137,15 @@
     const q = token.text.slice(1).toLowerCase();
     return slashCommands.filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 8);
   });
+  // Forget an Escape-dismissal once its token is edited away (the draft cleared
+  // or sent, or the token changed) — otherwise re-typing the same command later
+  // stays suppressed for the rest of the session. Settles: after the reset the
+  // guard is false.
+  $effect(() => {
+    if (slashDismissed !== null && slashTok?.text !== slashDismissed) {
+      slashDismissed = null;
+    }
+  });
 
   /** The @token under the caret, if any (mention autocomplete). */
   function atToken(): { start: number; text: string } | null {

@@ -476,19 +476,27 @@
    *  cost) is never hidden, and one click turns it off. The preference lives in
    *  the pooled store, not here, so a tab remount keeps it. */
   const hasThinking = $derived(agentKind === "claude");
+  /** Effective thinking state: the user's explicit choice, or ON by default
+   *  (the reasoning pass earns its keep in a coding workbench). `null` in the
+   *  store means "unchosen" — so a toggle-off (a real `false`) is never
+   *  mistaken for the default and re-forced on. */
+  const thinkingOn = $derived(store.thinkingEnabled ?? true);
   function toggleThinking() {
-    store.setThinking(!store.thinkingEnabled);
-    socket.send({ type: "set_thinking", enabled: store.thinkingEnabled });
+    const next = !thinkingOn;
+    store.setThinking(next);
+    socket.send({ type: "set_thinking", enabled: next });
   }
-  // Seed the default and push it to the CLI once the session is live, so the
-  // chip's "on" is honest (the CLI starts thinking OFF until told otherwise).
-  // `thinkingSeeded` is pooled, so a remount/reconnect never re-forces it over
-  // a later user toggle.
+  // Push the effective preference to the live driver, once per driver process.
+  // It pushes whatever the user's effective choice IS (never forces a value),
+  // so it can't override a toggle-off; `thinkingPushed` is reset on each `init`
+  // (a fresh process defaults thinking OFF) so a respawn/resume/view-toggle
+  // re-syncs, and is marked only once the send actually leaves so an
+  // undelivered push retries instead of stranding the chip out of sync.
   $effect(() => {
-    if (!hasThinking || !store.connected || store.thinkingSeeded) return;
-    store.setThinking(true);
-    socket.send({ type: "set_thinking", enabled: true });
-    store.markThinkingSeeded();
+    if (!hasThinking || !store.connected || store.thinkingPushed) return;
+    if (socket.send({ type: "set_thinking", enabled: thinkingOn })) {
+      store.markThinkingPushed();
+    }
   });
 
   const modeLabel = $derived(
@@ -637,7 +645,7 @@
     effortHint={EFFORT_HINT[agentKind] ?? "reasoning effort"}
     {hasUltracode}
     {hasThinking}
-    thinking={store.thinkingEnabled}
+    thinking={thinkingOn}
     onPickModel={pickModel}
     onPickMode={pickMode}
     onPickEffort={pickEffort}

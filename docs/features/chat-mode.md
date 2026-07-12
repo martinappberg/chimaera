@@ -64,8 +64,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   Thinking (claude) and ultracode (claude, gated to an xhigh-capable model) are client-held toggles
   reconciled from `effort_state` read-backs. **Thinking defaults ON** for claude sessions (the
   reasoning pass earns its keep in a coding workbench; the chip shows it explicitly and one click
-  turns it off) — the preference lives in the pooled store and is seeded to the CLI once per session,
-  so a tab remount can't reset it or re-force it over a later toggle.
+  turns it off) — the preference lives in the pooled store (`null` = unchosen ⇒ default on; a bool is
+  an explicit choice) and is pushed to the live driver once per driver process, re-synced on each
+  respawn (a fresh CLI defaults thinking off) but never re-forced, so a tab remount can't reset it and
+  a toggle-off always sticks.
 - **Live telemetry chips.** A rate-limit chip appears at ≥80% / reached; a context chip shows "42%
   ctx". Subscription usage (`/usage`, `/cost`) shows **percentages, never dollars**.
 - **Where.** `ChatHeader.svelte`, `EffortPopover.svelte`, `UsagePanel.svelte`; store fields fed by

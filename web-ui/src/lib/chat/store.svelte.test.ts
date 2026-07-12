@@ -207,6 +207,30 @@ describe("ChatStore pending-send ordering", () => {
     expect(fold(events).blocks).toEqual(store.blocks);
   });
 
+  it("reconciles a dangling tool when the driver dies with a fatal error", () => {
+    // A fatal error is a terminal path like turn end: a kept-visible
+    // ProtocolError session emits no `exited`, so a tool left in_progress must
+    // not keep spinning.
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call", id: "r1", kind: "read", title: "Read: fig.png", status: "in_progress" },
+      { type: "error", message: "driver protocol error", fatal: true },
+    ]);
+    const tool = store.blocks.find((b) => b.kind === "tool");
+    expect(tool).toMatchObject({ kind: "tool", id: "r1", status: "completed" });
+    expect(store.running).toBe(false);
+  });
+
+  it("re-arms the thinking push on a fresh driver init", () => {
+    // The pooled thinking preference must be re-pushed to each new driver
+    // process (a fresh CLI defaults thinking off) — `init` resets the flag.
+    const store = fold([{ type: "turn_started", turn_id: "t1" }]);
+    store.markThinkingPushed();
+    expect(store.thinkingPushed).toBe(true);
+    store.apply({ seq: 99, ts: 99, ev: { type: "init", model: "claude-x" } } as SeqEvent);
+    expect(store.thinkingPushed).toBe(false);
+  });
+
   it("leaves an already-completed tool from a prior turn untouched on a later turn end", () => {
     // The scan stops at the previous turn_end, so reconciliation only closes
     // the CURRENT turn's dangling rows — it never rewrites settled history.
