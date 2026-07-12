@@ -11,6 +11,7 @@
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
+  import AgentsTray from "./AgentsTray.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
@@ -538,6 +539,20 @@
   });
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
+  /** The step the agent is on now — surfaced in the plan summary so the
+   *  current goal is legible without expanding the panel. */
+  const planActive = $derived(store.plan.find((p) => p.status === "in_progress")?.content ?? null);
+
+  /** Subagents in flight right now — promoted into the live tray above the
+   *  composer. They also keep their in-place "Agent:" rows in the transcript
+   *  (the history); the tray is the glanceable live monitor. Reconciled shut
+   *  at turn end like any tool, so a finished/abandoned run never lingers. */
+  const activeAgents = $derived(
+    store.blocks.filter(
+      (b): b is Extract<ChatBlock, { kind: "tool" }> =>
+        b.kind === "tool" && b.tool === "agent" && b.status === "in_progress",
+    ),
+  );
 
   /** Render list: consecutive tool blocks coalesce into one ToolGroup so a
    *  long run reads as a single condensed line, not a wall of cards. Every
@@ -770,9 +785,22 @@
     </div>
   </div>
 
+  {#if activeAgents.length > 0}
+    <AgentsTray
+      agents={activeAgents}
+      onStop={agentKind === "claude"
+        ? (id) => socket.send({ type: "stop_task", task_id: id })
+        : undefined}
+    />
+  {/if}
+
   {#if store.plan.length > 0}
     <details class="plan">
-      <summary>plan · {planDone}/{store.plan.length}</summary>
+      <summary
+        >plan · {planDone}/{store.plan.length}{#if planActive !== null}<span class="plan-active"
+            > · ◐ {planActive}</span
+          >{/if}</summary
+      >
       {#each store.plan as entry, i (i)}
         <div class="plan-row" class:done={entry.status === "done"}>
           <span class="plan-mark">
@@ -1137,6 +1165,11 @@
     user-select: none;
     list-style-position: inside;
     padding: 2px 0;
+  }
+  /* The current step, shown right in the summary so the active goal is legible
+     without expanding — clipped so a long todo can't wrap the header. */
+  .plan-active {
+    color: color-mix(in srgb, var(--accent) 85%, var(--fg));
   }
   .plan-row {
     display: flex;
