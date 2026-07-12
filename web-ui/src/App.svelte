@@ -1112,25 +1112,25 @@
   }
 
   /**
-   * Open a file surfaced FROM a pane (terminal link, touched-files popover):
-   * an already-open tab is focused wherever it lives (no duplicates);
-   * otherwise it lands in the adjacent pane, or a fresh split to the right
-   * when the window has one pane or Cmd/Ctrl forced a new split.
+   * Open a file surfaced FROM a pane (terminal/chat link, Finder row, session-
+   * changes row, touched-files popover): an already-open tab is focused wherever
+   * it lives (reuse existing, no duplicates); otherwise it lands in the ACTIVE
+   * (focused) pane — the same "opens in the pane you're in" rule the FILES tree
+   * and quick-open already follow. Cmd/Ctrl (newSplit) forces a fresh split to
+   * the right instead, the escape hatch when you want it beside the source.
    */
   function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
+    } else if (newSplit) {
+      layout = splitPane(layout, paneId, "row");
+      layout = openFile(layout, path, !pinned);
     } else {
-      // Opens are PREVIEW tabs (italic, replaced by the next preview open)
-      // unless the caller pinned them (a tree double-click, a created file).
-      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
-      if (neighbor !== null) {
-        layout = openFile(focusPane(layout, neighbor), path, !pinned);
-      } else {
-        layout = splitPane(layout, paneId, "row");
-        layout = openFile(layout, path, !pinned);
-      }
+      // Open in the active pane (the source pane the click just focused). Opens
+      // are PREVIEW tabs (italic, replaced by the next preview open) unless the
+      // caller pinned them (a tree double-click, a created file).
+      layout = openFile(focusPane(layout, paneId), path, !pinned);
     }
     // A file surface took focus: pull DOM focus off the terminal so plain
     // keys stop reaching a PTY that is no longer the focused view.

@@ -69,8 +69,9 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 
 - **What & when.** File/dir paths printed by any process become underlined links: click a file
   to open it in a pane, a directory to reveal it in the Finder + file tree.
-- **How it's used.** Hover a path; if the daemon confirms it exists, it underlines. Click opens
-  in the adjacent pane; Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is carried.
+- **How it's used.** Hover a path; if the daemon confirms it exists, it underlines. A file opens
+  in the **active pane** (reusing an already-open tab); a directory opens/reuses the Finder beside
+  the terminal. Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is carried.
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), validation via
   `POST /api/v1/fs/validate` (`fsValidate` in `web-ui/src/lib/previews/files.ts`).
 - **Key behaviors.** **URLs are deliberately *not* linkified** (no `web-links` addon loaded).
