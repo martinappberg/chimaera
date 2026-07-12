@@ -5,7 +5,7 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 
 use crate::{app, lock, AppState, ServerConfig};
-use crate::{git, ledger, recents, runtimes, update};
+use crate::{git, ledger, runtimes, update};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
@@ -119,26 +119,13 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Graceful stop = planned: flush the ledger (the reconciler's last write
     // may be a few seconds stale) and leave a handoff so a successor within
     // the freshness window keeps this port + token. Sessions die with this
-    // process — the ledger written here is exactly what resurrects them.
+    // process — the ledger written here is exactly what resurrects them, and
+    // `ledger::snapshot` now covers chat sessions too, so a successor brings
+    // them back (resumable ones live, the rest into Recents at boot). We must
+    // NOT retire chats here: that removes their workspace mapping, so the
+    // reconciler's next snapshot would drop them and they'd never resurrect.
     let (entries, links) = ledger::snapshot(&state);
     lock(&state.ledger).write_if_changed(&entries, &links);
-
-    // Chat sessions are daemon-owned drivers that die with this process, and
-    // the ledger does not yet resurrect them (sv-11: real resurrection is a
-    // follow-up in `ledger` — snapshot()/restore() cover only PTY sessions).
-    // So at a graceful stop (update / restart), retire their conversations
-    // into Recents here, so a survivor is offered for manual resume instead of
-    // vanishing. Idempotent: a session already retired by an in-band
-    // `close-all`/`shutdown` has no AgentRecord left, and `retire` no-ops.
-    for info in state.chat.list() {
-        recents::retire(
-            &state,
-            &info.id,
-            None,
-            None,
-            chimaera_agent::model::SessionUi::Chat,
-        );
-    }
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {
         tracing::warn!(%err, "failed to write restart handoff");

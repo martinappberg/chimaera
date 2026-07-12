@@ -1319,6 +1319,97 @@ pub(crate) fn spawn_chat_session(
     info
 }
 
+/// Resurrect a chat session from the ledger under its ORIGINAL id (the boot
+/// path, called from `ledger::respawn`). Because the daemon preserves session
+/// ids across a restart, the on-disk journal (`{id}.jsonl`) is reused as-is —
+/// `spawn_chat_session`'s seed is a no-op when it already exists — so the whole
+/// transcript replays and the driver resumes the recorded native conversation.
+///
+/// What is NOT durable across a restart is the per-session settings/mcp file
+/// (it lives in the night-scrubbed runtime dir and its hook URL must point at
+/// the NEW daemon), so it is regenerated here exactly as `spawn.rs` writes it
+/// for a fresh agent.
+pub(crate) async fn resurrect_chat(
+    state: &Arc<AppState>,
+    entry: &crate::ledger::LedgerEntry,
+    workspace: crate::workspaces::Workspace,
+) -> anyhow::Result<()> {
+    let agent = entry
+        .agent
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("chat resurrection requires an agent entry"))?;
+    // Chats spawn (and resolve their transcript) at the workspace root — the
+    // same cwd the create/toggle path uses.
+    let root = workspace.root.clone();
+    // Resolve the binary + the version it was probed at from the SAME detection.
+    let detection = crate::launcher::detect(state, agent.kind, false).await;
+    let bin = detection
+        .path
+        .map_err(|e| anyhow::anyhow!("agent unavailable: {e}"))?;
+
+    // Regenerate the per-session hook/mcp files (claude only) against THIS
+    // daemon's port — the runtime dir is not durable across a restart.
+    let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
+        let key = crate::agents::fresh_agent_key();
+        let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
+            .then_some(entry.theme.as_str());
+        let s = crate::agents::write_settings(&entry.id, &key, state.port, settings_theme)?;
+        let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
+        (Some(s), Some(m))
+    } else {
+        (None, None)
+    };
+
+    // Only resume with a handle the agent can actually reopen: claude needs its
+    // transcript on disk (else `--resume` dies "No conversation found"); codex
+    // resumes its thread in-protocol, so its id passes straight through. Without
+    // a usable handle the chat boots fresh — the journal still replays for the
+    // reader (the same "nothing to lose" fallback the TUI path takes).
+    let resume = match &agent.resume {
+        Some(uuid) if agent.kind == AgentKind::Claude => {
+            let path = state
+                .claude_projects_dir
+                .join(crate::launcher::encode_cwd(&root))
+                .join(format!("{uuid}.jsonl"));
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                Some(uuid.clone())
+            } else {
+                tracing::info!(session = %entry.id, "chat transcript is gone; resurrecting fresh");
+                None
+            }
+        }
+        // Codex thread id (or a claude handle already validated elsewhere).
+        other => other.clone(),
+    };
+
+    // Keep the session addressable: the workspace mapping is read by every
+    // workspace-scoped op AND by the next ledger snapshot — without it a
+    // resurrected chat would be dropped from the following snapshot and lost on
+    // the NEXT restart. Carry the user's pinned title too, when a record exists.
+    crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
+    if let Some(name) = &entry.pinned_name {
+        if let Some(rec) = crate::lock(&state.agents).get_mut(&entry.id) {
+            rec.custom_title = Some(name.clone());
+        }
+    }
+
+    let recipe = ChatRecipe {
+        workspace_root: root,
+        kind: agent.kind,
+        bin,
+        version: detection.version,
+        settings,
+        mcp_config,
+        model: agent.model.clone(),
+        resume,
+        fork_at: None,
+        rollback_turns: None,
+        theme: entry.theme.clone(),
+    };
+    spawn_chat_session(state, entry.id.clone(), recipe, None)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
