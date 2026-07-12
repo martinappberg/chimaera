@@ -644,6 +644,10 @@ export class ChatStore {
       case "turn_completed": {
         this.running = false;
         this.activity = null;
+        // Close any tool row this turn left dangling (a dropped result frame)
+        // BEFORE the turn_end block lands, so the scan stops at the previous
+        // boundary and the end-of-turn artifact scan sees their final state.
+        this.reconcileOpenTools();
         const usage = ev.usage as {
           cost_usd?: number;
           output_tokens?: number;
@@ -661,6 +665,7 @@ export class ChatStore {
       case "turn_aborted": {
         this.running = false;
         this.activity = null;
+        this.reconcileOpenTools();
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
@@ -699,6 +704,7 @@ export class ChatStore {
       case "exited":
         this.running = false;
         this.activity = null;
+        this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
@@ -763,6 +769,29 @@ export class ChatStore {
       this.notice(`${p.title} — no longer active`, "info");
     }
     this.pending = [];
+  }
+
+  /** A turn (or the session) has ended, so nothing it launched is still
+   *  running — reconcile any tool row still `in_progress`/`pending` to a
+   *  terminal state. Such a row never got its completion update: most often
+   *  the result frame was too large to parse and was dropped BELOW the event
+   *  layer (a big image `Read` blows the transport's per-line byte cap, so its
+   *  `tool_result` never reaches the driver), and nothing else ever closes it.
+   *  Left alone it spins "running…" forever and keeps its ToolGroup from
+   *  collapsing — the phantom the user sees after the turn is plainly over.
+   *  Scans back only over the just-ended turn (stopping at the previous
+   *  `turn_end`), and is a pure reducer over `blocks`, so replay rebuilds the
+   *  identical transcript. Marks `completed`, not `failed`: the tool most
+   *  likely DID finish (we simply never captured its output), and inventing a
+   *  red failure would be the louder lie. */
+  private reconcileOpenTools(): void {
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const b = this.blocks[i];
+      if (b.kind === "turn_end") break; // previous turn boundary — older turns already reconciled at their own end
+      if (b.kind === "tool" && (b.status === "in_progress" || b.status === "pending")) {
+        b.status = "completed";
+      }
+    }
   }
 
   /** The previewable files THIS turn produced, for the end-of-turn gallery.
