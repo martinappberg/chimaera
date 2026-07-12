@@ -3,16 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Docs · chimaera</title>
+    <title>Docs · Chimaera</title>
     <meta
       name="description"
-      content="Install and run chimaera: serve locally, connect to a remote host over SSH, use the workbench, and keep everything up to date."
+      content="Install and run Chimaera: serve locally, connect to a remote host over SSH, use the workbench, and keep everything up to date."
     />
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="assets/css/styles.css" />
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="Docs · chimaera" />
-    <meta property="og:description" content="Install and run chimaera: serve locally, connect over SSH, use the workbench, keep it up to date." />
+    <meta property="og:title" content="Docs · Chimaera" />
+    <meta property="og:description" content="Install and run Chimaera: serve locally, connect over SSH, use the workbench, keep it up to date." />
     <meta property="og:url" content="https://martinappberg.github.io/chimaera/docs.html" />
     <meta property="og:image" content="https://martinappberg.github.io/chimaera/assets/img/og.png" />
     <script>
@@ -90,10 +90,12 @@
         <a href="#agents">Agents</a>
         <a href="#chat">Chat mode &amp; the TUI</a>
         <a href="#previews">File previews</a>
+        <a href="#files">Files &amp; uploads</a>
         <a href="#git">Git &amp; worktrees</a>
         <a href="#linked">Linked terminals</a>
         <h4>Operating</h4>
         <a href="#updates">Staying current</a>
+        <a href="#settings">Settings</a>
         <a href="#platforms">Platforms</a>
         <a href="#faq">Troubleshooting</a>
         <a href="#license">License</a>
@@ -103,22 +105,22 @@
       <main class="docs__main">
         <h1>Documentation</h1>
         <p class="docs__lede">
-          Everything you need to install chimaera, run it locally or on a remote
+          Everything you need to install Chimaera, run it locally or on a remote
           host, and drive your agents from one window.
         </p>
 
         <div class="note">
-          <p><strong>Early software.</strong> chimaera is pre-release and moving fast. Interfaces, storage formats, and the wire protocol can change without notice. Pin your version if you depend on it.</p>
+          <p><strong>Early software.</strong> Chimaera is pre-release and moving fast. Interfaces, storage formats, and the wire protocol can change without notice. Pin your version if you depend on it.</p>
         </div>
 
         <h2 id="what">What it is</h2>
         <p>
-          chimaera is an <strong>agent workbench</strong>. One static Rust binary
-          (<code>chimaera</code>) is the whole server: it owns your coding-agent
+          Chimaera is an <strong>agent workbench</strong>. One static Rust binary
+          (<code>chimaera</code>) is the whole server. It owns your coding-agent
           sessions as persistent, daemon-owned PTY processes on whatever host owns
-          the work, whether that is your laptop, a dev server, or an HPC login
-          node, and serves a workspace-first web UI around them (file previews,
-          terminals, git state).
+          the work: your laptop, a dev server, or a remote box. Around them it
+          serves a workspace-first web UI with file previews, terminals, and git
+          state.
         </p>
         <p>
           Each agent runs one of two ways on the same session, a toggle apart: a
@@ -132,11 +134,13 @@
         <h2 id="install">Install</h2>
         <h3>Native app (recommended)</h3>
         <p>
-          Grab the macOS app from the
+          Grab the macOS, Linux, or Windows app from the
           <a href="index.html#download">download section</a> or the
-          <a href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener">latest release</a>.
-          It bundles the daemon, gives you a home screen of workspaces and remote
-          hosts, and auto-updates itself (signature-verified) on launch.
+          <a href="https://github.com/martinappberg/chimaera/releases/latest" target="_blank" rel="noopener">latest release</a>
+          (macOS <code>.dmg</code>; Linux AppImage / <code>.deb</code> / <code>.rpm</code>;
+          Windows <code>.exe</code> installer, beta). It bundles the daemon, gives
+          you a home screen of workspaces and remote hosts, and auto-updates itself
+          (signature-verified) on launch.
         </p>
 
         <h3>Build from source</h3>
@@ -190,7 +194,7 @@
   <span class="c">→ opening workbench ✓</span></code></pre>
         </div>
         <div class="note">
-          <p><strong>Host key:</strong> <code>&lt;host&gt;</code> is any name your ssh knows, such as an alias from <code>~/.ssh/config</code> or <code>user@host</code>. chimaera never reimplements the ssh client; whatever <code>ssh &lt;host&gt;</code> does on your machine is what <code>connect</code> does.</p>
+          <p><strong>Host key:</strong> <code>&lt;host&gt;</code> is any name your ssh knows, such as an alias from <code>~/.ssh/config</code> or <code>user@host</code>. Chimaera never reimplements the ssh client; whatever <code>ssh &lt;host&gt;</code> does on your machine is what <code>connect</code> does.</p>
         </div>
         <p>
           No root and no containers are needed on the remote. The daemon is a
@@ -285,12 +289,24 @@
           dirty indicator), enough to fix a script, not a full IDE.
         </p>
 
+        <h2 id="files">Files &amp; uploads</h2>
+        <p>
+          The file tree and a Finder-style column browser are full file managers,
+          not just a read-only tree.
+        </p>
+        <ul>
+          <li><strong>Manage files.</strong> Create, rename, delete, and copy / cut / paste files and folders from a right-click menu or the keyboard. Copies and moves run server-side, so bytes never round-trip the browser. Symlinks are marked (broken ones too).</li>
+          <li><strong>Reference by drag.</strong> Drag a file or folder from the tree onto a session to type its path: an <code>@mention</code> for an agent, a shell-quoted path for a terminal. Nothing is copied; the file is already on the host.</li>
+          <li><strong>Bring files in.</strong> Drop a file from your desktop onto a session or a folder, or paste a screenshot. The bytes stream to the daemon that owns the session, so a file you drag from your laptop lands on the remote host the agent can read. Uploads are capped and streamed, never buffered in RAM.</li>
+          <li><strong>Take outputs out.</strong> On a remote workspace, download any file back to your local machine from its row menu: the outputs an agent produced on the cluster, brought home.</li>
+        </ul>
+
         <h2 id="git">Git &amp; worktrees</h2>
         <p>
           A source-control panel for the workspace's repo: a branch header with
           ahead/behind counts, and every changed path grouped into conflicts,
           staged, changes, and untracked. Click any row to open a side-by-side diff
-          in an adjacent pane. It is <strong>review-first</strong> — status and diff,
+          in an adjacent pane. It is <strong>review-first</strong>: status and diff,
           not stage / commit / push; those stay in a terminal for now.
         </p>
         <ul>
@@ -333,12 +349,22 @@
           </li>
         </ul>
 
+        <h2 id="settings">Settings</h2>
+        <p>
+          Everything is meant to be customizable. Settings live in a single
+          <code>settings.json</code> the daemon owns; the in-app Settings panel and
+          hand-editing the file (over SSH with vim, say) are both first-class
+          against it, and a change shows up live. Curated light and dark themes are
+          injected into the agents' own TUIs too, so the terminals match the
+          workbench.
+        </p>
+
         <h2 id="platforms">Platforms</h2>
-        <p>macOS and Linux.</p>
+        <p>macOS and Linux, with Windows in beta.</p>
         <ul>
-          <li><strong>Daemon:</strong> fully static musl binaries for <code>x86_64</code> and <code>aarch64</code> Linux that run on old-glibc HPC systems (verified on glibc 2.17, no root), plus an <code>aarch64</code> macOS build.</li>
-          <li><strong>Native app:</strong> macOS on Apple Silicon.</li>
-          <li><strong>Windows:</strong> untested.</li>
+          <li><strong>Daemon:</strong> fully static musl binaries for <code>x86_64</code> and <code>aarch64</code> Linux that run on old-glibc systems (verified on glibc 2.17, no root), plus an <code>aarch64</code> macOS build.</li>
+          <li><strong>Native app:</strong> macOS on Apple Silicon, and Linux as an AppImage / <code>.deb</code> / <code>.rpm</code>.</li>
+          <li><strong>Windows (beta):</strong> a native app whose daemon runs the Linux musl binary inside WSL2, reached over localhost. The engine and the SSH-connect path are CI-tested; the first-run wizard and the interop askpass chain haven't had a hands-on pass on retail hardware yet, so it ships as a clearly-labeled <strong>beta</strong> download. Expect to walk through a couple of setup steps on first launch.</li>
         </ul>
         <p>
           The daemon is built to live on shared login nodes: bounded allocations,
@@ -366,15 +392,15 @@
         <p>
           If your cluster requires interactive 2FA (e.g. Duo) and forbids
           pubkeys, keep a live <code>ControlMaster</code> connection open (the way
-          you normally SSH in); chimaera reuses it for non-interactive commands.
+          you normally SSH in); Chimaera reuses it for non-interactive commands.
         </p>
 
         <h2 id="license">License</h2>
         <p>
-          chimaera is licensed under the
+          Chimaera is licensed under the
           <a href="https://github.com/martinappberg/chimaera/blob/main/LICENSE" target="_blank" rel="noopener">GNU AGPL-3.0</a>,
           free for everyone to use, self-host, and modify. If you want to build a
-          closed-source product or service on chimaera, a commercial license is
+          closed-source product or service on Chimaera, a commercial license is
           available: <a href="mailto:mkjberg@gmail.com">contact the author</a>.
           Contributions require a CLA (see
           <a href="https://github.com/martinappberg/chimaera/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">CONTRIBUTING.md</a>).

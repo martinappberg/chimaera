@@ -98,12 +98,16 @@
 
       var dmg = find(assets, ".dmg");
       var appimage = find(assets, ".AppImage");
+      // Windows NSIS installer. Suffix-match "-setup.exe" so the updater
+      // signature "…-setup.exe.sig" (ends in .sig) is never handed out instead.
+      var winSetup = find(assets, "-setup.exe");
       var linuxX64 = find(assets, "x86_64-unknown-linux-musl");
       var linuxArm = find(assets, "aarch64-unknown-linux-musl");
       var macDaemon = find(assets, "aarch64-apple-darwin");
 
       setHref("dl-app", dmg);
       setHref("dl-linux-app", appimage);
+      setHref("dl-windows-app", winSetup);
       setHref("dl-linux-x64", linuxX64);
       setHref("dl-linux-arm", linuxArm);
       setHref("dl-macos", macDaemon);
@@ -118,25 +122,44 @@
       }
 
       // The primary button follows the visitor's OS; macOS is the shipped
-      // default so an unknown/blocked UA still gets a working button.
+      // default so an unknown/blocked UA still gets a working button. The
+      // shipped default icon is the Apple mark — swap it for Linux/Windows or
+      // those visitors get the wrong logo above the right label.
       var ua = navigator.userAgent || "";
-      var isLinux = ua.indexOf("Linux") !== -1 && ua.indexOf("Android") === -1;
+      var isWindows = ua.indexOf("Windows") !== -1;
+      var isLinux =
+        !isWindows && ua.indexOf("Linux") !== -1 && ua.indexOf("Android") === -1;
       var label = document.getElementById("dl-app-label");
       var note = document.getElementById("dl-app-note");
-      if (isLinux && appimage) {
+      var icon = document.getElementById("dl-app-icon");
+      function strokeIcon(pathD) {
+        if (!icon) return;
+        icon.setAttribute("fill", "none");
+        icon.setAttribute("stroke", "currentColor");
+        icon.setAttribute("stroke-width", "1.8");
+        icon.setAttribute("stroke-linecap", "round");
+        icon.setAttribute("stroke-linejoin", "round");
+        icon.innerHTML = pathD;
+      }
+      if (isWindows && winSetup) {
+        setHref("dl-app", winSetup);
+        if (label) label.textContent = "Download for Windows";
+        if (icon) {
+          icon.setAttribute("fill", "currentColor");
+          icon.setAttribute("stroke", "none");
+          icon.innerHTML =
+            '<path d="M3 5.6l7.2-1v7.1H3zM11 4.5l10-1.4v8.6H11zM3 12.7h7.2v6.9L3 18.6zM11 12.7h10v8.6l-10-1.4z"/>';
+        }
+        if (note) {
+          var wsz = sizeOf("-setup.exe");
+          // Honest label: the Windows engine runs in WSL2 and is beta.
+          note.textContent =
+            "x64 · installer" + (wsz ? " · " + wsz : "") + " · beta (runs in WSL2)";
+        }
+      } else if (isLinux && appimage) {
         setHref("dl-app", appimage);
         if (label) label.textContent = "Download for Linux";
-        // The shipped default icon is the Apple mark — swap it, or Linux
-        // visitors get "Download for Linux" under an Apple logo.
-        var icon = document.getElementById("dl-app-icon");
-        if (icon) {
-          icon.setAttribute("fill", "none");
-          icon.setAttribute("stroke", "currentColor");
-          icon.setAttribute("stroke-width", "1.8");
-          icon.setAttribute("stroke-linecap", "round");
-          icon.setAttribute("stroke-linejoin", "round");
-          icon.innerHTML = '<path d="M5 16l6-6-6-6M12 18h7"/>';
-        }
+        strokeIcon('<path d="M5 16l6-6-6-6M12 18h7"/>');
         if (note) {
           var lsz = sizeOf(".AppImage");
           note.textContent =
