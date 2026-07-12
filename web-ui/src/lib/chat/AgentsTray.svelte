@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Chevron from "../shared/Chevron.svelte";
   import type { ChatBlock } from "./store.svelte";
 
   /**
@@ -42,18 +43,7 @@
     onclick={() => (open = !open)}
     title={open ? "collapse" : "expand"}
   >
-    <span class="chev" class:open aria-hidden="true">
-      <svg viewBox="0 0 16 16" width="10" height="10">
-        <path
-          d="M6 4l4 4-4 4"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      </svg>
-    </span>
+    <Chevron {open} />
     <span class="spark" aria-hidden="true">✳</span>
     <span class="head-label"
       >{agents.length === 1 ? "subagent working" : `${agents.length} subagents working`}</span
@@ -111,20 +101,6 @@
     padding: 1px 0 3px;
     cursor: pointer;
   }
-  .chev {
-    display: inline-flex;
-    flex: none;
-    color: var(--muted);
-    transition: transform 0.14s ease;
-  }
-  .chev.open {
-    transform: rotate(90deg);
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .chev {
-      transition: none;
-    }
-  }
   .head-label {
     flex: 1;
     min-width: 0;
@@ -150,7 +126,7 @@
     height: 6px;
     border-radius: 50%;
     background: var(--accent);
-    animation: tray-pulse 1.4s ease-in-out infinite;
+    animation: pulse 1.4s ease-in-out infinite; /* shared keyframe in app.css */
   }
   .body {
     flex: 1;
@@ -190,11 +166,6 @@
   }
   .stop:hover {
     color: var(--err);
-  }
-  @keyframes tray-pulse {
-    50% {
-      opacity: 0.35;
-    }
   }
   @keyframes tray-breathe {
     0%,

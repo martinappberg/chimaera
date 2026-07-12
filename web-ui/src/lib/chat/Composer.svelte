@@ -115,17 +115,25 @@
    *  typing on (the token text changes) brings it back. */
   let slashDismissed = $state<string | null>(null);
 
+  /** The token under the caret matching `re` — group 1 is the leading boundary,
+   *  group 2 the token itself. Shared core of the `/`-command and `@`-mention
+   *  scanners. Read from the PRE-focus caret (a popover click steals
+   *  selectionStart), so both popovers survive a mouse pick. */
+  function caretToken(re: RegExp): { start: number; text: string } | null {
+    if (el === null) return null;
+    const caret = el.selectionStart;
+    const match = re.exec(draft.slice(0, caret));
+    if (match === null) return null;
+    return { start: caret - match[2].length, text: match[2] };
+  }
+
   /** A line-leading "/command" token under the caret. Unlike the old
    *  draft-start-only rule, a command begun on a fresh line mid-draft (a
    *  follow-up like "/meeting-notes") completes too. Line-leading ONLY (start
    *  of the box or right after a newline) so ordinary path text — "cd /usr" —
-   *  is never hijacked. Captured from the pre-focus caret (like the @ token),
-   *  since a popover click steals selectionStart. */
+   *  is never hijacked. */
   function slashToken(): { start: number; text: string } | null {
-    const caret = el !== null ? el.selectionStart : draft.length;
-    const match = /(^|\n)(\/[\w:-]*)$/.exec(draft.slice(0, caret));
-    if (match === null) return null;
-    return { start: caret - match[2].length, text: match[2] };
+    return caretToken(/(^|\n)(\/[\w:-]*)$/);
   }
   const slashTok = $derived.by(() => {
     void draft;
@@ -147,16 +155,10 @@
     }
   });
 
-  /** The @token under the caret, if any (mention autocomplete). */
+  /** The @token under the caret, if any (mention autocomplete). ":" admits
+   *  @term:NAME (linked-terminal grants) alongside file paths. */
   function atToken(): { start: number; text: string } | null {
-    const textarea = el;
-    if (textarea === null) return null;
-    const caret = textarea.selectionStart;
-    const before = draft.slice(0, caret);
-    // ":" admits @term:NAME (linked-terminal grants) alongside file paths.
-    const match = /(^|\s)(@[\w./:-]*)$/.exec(before);
-    if (match === null) return null;
-    return { start: caret - match[2].length, text: match[2] };
+    return caretToken(/(^|\s)(@[\w./:-]*)$/);
   }
 
   // Debounced quick-open lookup for the @token.
