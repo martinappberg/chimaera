@@ -1,17 +1,23 @@
 <script lang="ts">
   /**
-   * Markdown preview (server-rendered comrak GFM, sanitized) with an
-   * Edit/Preview toggle. The edit side is the shared CodeMirror editor in
-   * markdown mode (Cmd/Ctrl+S saves; dirty dot + conflict handling all come
-   * from CodeView). Switching back to Preview re-renders from disk so saved
-   * edits show immediately. Editing is offered only for files under the 1MB
-   * cap; larger markdown stays preview-only.
+   * Markdown preview (server-rendered comrak GFM, sanitized) with a
+   * preview | split | edit toggle. The edit side is the shared CodeMirror editor
+   * in markdown mode (Cmd/Ctrl+S saves; dirty dot + conflict handling all come
+   * from CodeView). SPLIT shows the editor beside a live preview that re-renders
+   * the editor's buffer client-side as you type — the file is still only written
+   * on save; the plain Preview mode stays the authoritative server render, which
+   * refreshes from disk on save (or an agent write). The editor mounts once and
+   * survives every toggle, so flipping modes never drops an unsaved buffer.
+   * Editing is offered only for files under the 1MB cap; larger markdown stays
+   * preview-only.
    */
   import { EDIT_MAX_BYTES, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
+  import { renderMarkdown } from "./mdRender";
   import CodeView from "./CodeView.svelte";
+  import SplitEditPreview from "./SplitEditPreview.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
 
@@ -28,11 +34,18 @@
   // same value the A−/A+ steps start from, so the first step never jumps).
   const bodyFont = $derived(fontSize ?? getSetting("terminal.fontSize"));
 
-  let mode = $state<"preview" | "edit">("preview");
+  type Mode = "preview" | "split" | "edit";
+  let mode = $state<Mode>("preview");
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Null until the first fetch tells us whether the file fits the edit cap. */
   let editable = $state<boolean | null>(null);
+  /** The editor mounts on the first split/edit and then persists (CSS-hidden in
+   *  preview) so no toggle drops the unsaved buffer. */
+  let entered = $state(false);
+  /** The editor's live buffer, mirrored client-side for the split preview. */
+  let liveSource = $state("");
+  const liveHtml = $derived(mode === "split" ? renderMarkdown(liveSource) : "");
 
   // The shared store entry: preview HTML lives here (cached across tab switches,
   // and re-rendered in place when the file changes on disk — a save on the edit
@@ -54,6 +67,8 @@
     chunk = null;
     chunkError = null;
     editable = null;
+    entered = false;
+    liveSource = "";
   });
 
   // --- context bridge: selection in the RENDERED preview ---------------------
@@ -110,7 +125,7 @@
     };
   });
 
-  async function enterEdit(): Promise<void> {
+  async function enterEditor(target: "split" | "edit"): Promise<void> {
     // Read the raw source from the shared store (cached with the preview HTML);
     // CodeView handles the rest (background fill for under-cap truncated files
     // and the save/dirty/conflict flow).
@@ -127,7 +142,8 @@
       }
     }
     if (editable === false) return; // too large; stay in preview
-    mode = "edit";
+    entered = true;
+    mode = target;
   }
 </script>
 
@@ -143,35 +159,64 @@
       >
       <button
         class="seg"
+        class:on={mode === "split"}
+        role="tab"
+        aria-selected={mode === "split"}
+        title={editable === false ? "over 1 MB — preview only" : "edit with a live preview"}
+        disabled={editable === false}
+        onclick={() => void enterEditor("split")}>split</button
+      >
+      <button
+        class="seg"
         class:on={mode === "edit"}
         role="tab"
         aria-selected={mode === "edit"}
         title={editable === false ? "over 1 MB — preview only" : "edit source"}
         disabled={editable === false}
-        onclick={() => void enterEdit()}>edit</button
+        onclick={() => void enterEditor("edit")}>edit</button
       >
     </div>
     {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
   </div>
 
   <div class="md-content" bind:this={contentEl}>
-    {#if mode !== "edit" && chipPos !== null}
+    {#if mode === "preview" && chipPos !== null}
       <ReferenceChip x={chipPos.x} y={chipPos.y} />
     {/if}
-    {#if mode === "edit" && chunk !== null}
-      <CodeView {path} first={chunk} />
-    {:else}
-      <div class="md-scroll" onscroll={syncPreviewSelection}>
-        {#if error !== null}
-          <div class="file-error">{error}</div>
-        {:else if html !== null}
-          <article class="md-body" style:font-size="{bodyFont}px">
-            <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
-            {@html html}
-          </article>
-        {:else}
-          <Spinner />
-        {/if}
+
+    <!-- Authoritative server render (comrak). Shown in preview mode; kept in the
+         DOM (just hidden) so re-entering preview needs no re-render. -->
+    <div class="md-scroll" class:hidden={mode !== "preview"} onscroll={syncPreviewSelection}>
+      {#if error !== null}
+        <div class="file-error">{error}</div>
+      {:else if html !== null}
+        <article class="md-body" style:font-size="{bodyFont}px">
+          <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized server-side -->
+          {@html html}
+        </article>
+      {:else}
+        <Spinner />
+      {/if}
+    </div>
+
+    <!-- Editor (+ live preview in split). Mounts on the first split/edit and
+         then persists, CSS-hidden in preview, so no toggle drops the buffer. -->
+    {#if entered && chunk !== null}
+      {@const first = chunk}
+      <div class="edit-layer" class:hidden={mode === "preview"}>
+        <SplitEditPreview split={mode === "split"}>
+          {#snippet editor()}
+            <CodeView {path} {first} onDoc={(t) => (liveSource = t)} />
+          {/snippet}
+          {#snippet preview()}
+            <div class="md-scroll">
+              <article class="md-body" style:font-size="{bodyFont}px">
+                <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized in renderMarkdown -->
+                {@html liveHtml}
+              </article>
+            </div>
+          {/snippet}
+        </SplitEditPreview>
       </div>
     {/if}
   </div>
@@ -248,6 +293,15 @@
     inset: 0;
     overflow-y: auto;
     overflow-x: hidden;
+  }
+
+  .edit-layer {
+    position: absolute;
+    inset: 0;
+  }
+
+  .hidden {
+    display: none;
   }
 
   .file-error {
