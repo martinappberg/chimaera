@@ -188,9 +188,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
 
 ## Status: partial
 
-- Chat sessions survive a *disconnect* but **die with the daemon and are not yet resurrected across a
-  restart** — they retire to Recents for manual resume (see
-  [lifecycle-and-persistence.md](lifecycle-and-persistence.md); `sv-11` follow-up).
+- Chat sessions survive a *disconnect* **and now a daemon restart** — the ledger resurrects them
+  live (resuming the native conversation), retiring the non-resumable to Recents (see
+  [lifecycle-and-persistence.md](lifecycle-and-persistence.md)). Remaining gap: a resurrected chat
+  loses its user-pinned title (the conversation itself resumes intact).
 - Codex **create-time model** is dropped in chat mode (a `TODO(seam)` in `chat.rs`).
 - Codex **guardian** auto-approval reviewer is parsed but not rendered.
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns

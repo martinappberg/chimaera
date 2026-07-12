@@ -18,9 +18,9 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   Close a window → the session keeps running; reopen → it re-attaches exactly where it was.
 - **Key behaviors.** The **manifest** (`~/.chimaera/manifest.json`, 0600, carries the bearer token) is
   the single source of truth for "is a local daemon running". Terminals rebuild from a server-side
-  snapshot; chat rebuilds by replaying the journal gap. Chat sessions survive a *disconnect* but **die
-  with the daemon** (they're live drivers) — their journal + native-id index preserve the conversation
-  for a manual resume.
+  snapshot; chat rebuilds by replaying the journal gap. Chat sessions survive a *disconnect* — the chat
+  WS handler just exits the socket task when the client leaves, never killing the driver — **and** a
+  daemon restart, which the ledger now resurrects them across (see below).
 - **One daemon per state dir.** `serve` refuses to start when the manifest's daemon is provably
   alive (live pid **and** an HTTP answer on its port — a crash leftover or recycled pid doesn't
   block startup): a second daemon over the same ledger would respawn every session again as
@@ -30,16 +30,20 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
 
 - **What & when.** A daemon restart ends its children — the ledger makes it survivable. A
   continuously-reconciled `sessions.json` records each session's *semantic* identity (workspace, cwd,
-  agent kind, claude conversation id + transcript path, pinned name, dims, theme, linked-terminal
-  edges). On boot the daemon **resurrects**: shells respawn at their last cwd, claude agents respawn
-  with `--resume`, non-resumable agents retire into Recents.
+  agent kind, **surface** (term/chat), native conversation/thread id + transcript path, chat model,
+  pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
+  their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** — both
+  agents, via `chat::resurrect_chat`, resuming the native conversation (claude `--resume`, codex
+  `thread/resume`) and replaying the on-disk journal — and the non-resumable retire into Recents (a TUI
+  codex, or a chat when `restoreSessions` is off) so a survivor is offered for manual resume.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain
   reconnect.
-- **Where it lives.** `ledger.rs` (`LedgerEntry`, `BootLedger`, `plan_restore`, `resolve_resume`,
-  `respawn`, `retire_to_recents`), `lifecycle.rs` (`Handoff::consume`/`rebind`), `state.rs` (the
-  `restored` watch gate).
+- **Where it lives.** `ledger.rs` (`LedgerEntry`/`LedgerAgent` incl. `ui`+`model`, `snapshot` — now
+  enumerating `state.chat` alongside the PTY roster — `plan_restore`, `resolve_resume`, `respawn`,
+  `retire_to_recents`), `chat.rs::resurrect_chat` (the chat spawn recipe), `lifecycle.rs`
+  (`Handoff::consume`/`rebind`), `state.rs` (the `restored` watch gate).
 - **Key behaviors.** The ledger stores **no argv** — resurrection rebuilds commands through the normal
   spawn path so hook URLs / shims / themes match the *new* daemon. **Session ids are preserved**, so
   every persisted layout tab, linked-terminal edge, and open window rebinds with no client migration. A
@@ -60,7 +64,9 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   agents would otherwise keep running and billing). `shutdown` SIGHUPs everything, replies at once (the
   caller's tunnel is about to drop with the daemon), then outlasts the kill-escalation grace before
   tripping the graceful-stop future so a session that ignores SIGHUP isn't orphaned. A graceful stop
-  flushes the ledger, retires live chat sessions to Recents, writes the handoff, and removes the manifest.
+  flushes the ledger (which now carries chats for resurrection), writes the handoff, and removes the
+  manifest — it must **not** retire chats here (that would strip their workspace mapping and the
+  reconciler would drop them). The *deliberate* close-all/`shutdown` above still kills chat drivers.
 
 ## Update awareness (daemon-side)
 
@@ -78,9 +84,10 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
 
 ## Status: partial
 
-- **Chat sessions are not yet resurrected across a daemon restart.** The ledger's snapshot/restore
-  covers PTY sessions only (`sv-11` follow-up); at a graceful stop, live chat sessions are **retired
-  into Recents** (idempotent) so a survivor is offered for manual resume instead of vanishing.
+- **A resurrected chat loses its user-pinned title** (the renamed name resets to the agent-derived
+  default) — the pinned `custom_title` is only carried onto a resurrected chat when an `AgentRecord`
+  already exists, which it does not on a fresh boot. The conversation itself resumes intact; only the
+  custom label is lost.
 
 ---
 
