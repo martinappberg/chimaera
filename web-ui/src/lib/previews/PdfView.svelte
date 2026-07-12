@@ -23,7 +23,7 @@
   import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
   // Vite bundles the worker as a local asset; nothing is fetched from a CDN.
   import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-  import { fsRawUrl } from "./files";
+  import { retain, release } from "./fileStore.svelte";
 
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -72,10 +72,16 @@
     let cancelled = false;
     const mem = memory.get(path);
     if (mem !== undefined) zoom = mem.zoom;
+    // Pin + share the ticketed /raw/ URL through the store (cached across a tab
+    // switch — no re-mint). pdf.js still re-parses on remount; the URL cache and
+    // the per-tab scroll/zoom memory are what make the return feel instant.
+    const fileEntry = retain(path);
     void (async () => {
       try {
-        const url = await fsRawUrl(path);
+        await fileEntry.ensureRawUrl();
         if (cancelled) return;
+        const url = fileEntry.rawUrl;
+        if (url === null) throw new Error(fileEntry.rawError ?? "failed to open pdf");
         task = pdfjs.getDocument({ url });
         const d = await task.promise;
         if (cancelled) {
@@ -104,6 +110,7 @@
 
     return () => {
       cancelled = true;
+      release(path);
       saveMemory();
       observer?.disconnect();
       rendered.clear();

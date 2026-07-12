@@ -65,6 +65,8 @@ async fn ledger_resurrects_sessions_across_restart() {
             resume: None,
             transcript: None,
             title: "port the parser".to_string(),
+            ui: chimaera_agent::model::SessionUi::Term,
+            model: None,
         }),
     });
     ledger::restore(&state2, boot).await;
@@ -160,6 +162,8 @@ async fn ledger_restore_disabled_still_lands_recents() {
                     resume: Some("conv-1".to_string()),
                     transcript: Some(transcript),
                     title: "fix the flaky tests".to_string(),
+                    ui: chimaera_agent::model::SessionUi::Term,
+                    model: None,
                 }),
             },
         ],

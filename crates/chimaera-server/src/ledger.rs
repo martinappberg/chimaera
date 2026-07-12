@@ -29,6 +29,7 @@ use serde_json::json;
 
 use crate::agents::AgentKind;
 use crate::AppState;
+use chimaera_agent::model::SessionUi;
 
 /// One live session, as much of it as can be rebuilt after a restart.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +64,14 @@ pub(crate) struct LedgerAgent {
     /// Current display title — carried onto the successor session (or a
     /// Recents row) so the conversation stays recognizable either way.
     pub(crate) title: String,
+    /// Which surface the session last ran as: `Term` = a PTY TUI, `Chat` = the
+    /// structured chat driver. Chat sessions resurrect as chat (and retire into
+    /// Recents as chat); TUI agents as a PTY. Additive — an older ledger without
+    /// the field defaults to `Term`, matching the pre-chat-resurrection behavior.
+    pub(crate) ui: SessionUi,
+    /// The chat model in use, so a resurrected chat re-selects it. `None` for a
+    /// TUI agent (the model is the CLI's own concern there).
+    pub(crate) model: Option<String>,
 }
 
 /// What the previous daemon left behind.
@@ -91,6 +100,8 @@ impl LedgerEntry {
                 "resume": a.resume,
                 "transcript": a.transcript,
                 "title": a.title,
+                "ui": a.ui,
+                "model": a.model,
             })),
         })
     }
@@ -106,6 +117,12 @@ impl LedgerEntry {
                     .and_then(|t| t.as_str())
                     .map(PathBuf::from),
                 title: a.get("title")?.as_str()?.to_string(),
+                // Additive: an older ledger has no "ui" — default Term.
+                ui: a
+                    .get("ui")
+                    .and_then(|u| serde_json::from_value::<SessionUi>(u.clone()).ok())
+                    .unwrap_or(SessionUi::Term),
+                model: a.get("model").and_then(|m| m.as_str()).map(str::to_string),
             }),
         };
         Some(LedgerEntry {
@@ -261,9 +278,19 @@ pub(crate) async fn run(state: Arc<AppState>) {
 /// Also called once at graceful shutdown for the final flush.
 pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, String>) {
     let infos = state.sessions.list();
-    let live_ids: std::collections::HashSet<&str> = infos.iter().map(|i| i.id.as_str()).collect();
+    // Chat-mode sessions live in a SEPARATE registry (`state.chat`), not the PTY
+    // roster above. Snapshot them too — otherwise a restart resurrects terminals
+    // but silently drops every chat.
+    let chats = state.chat.list();
+    // Live ids across BOTH surfaces: the theme map is pruned to these, and a
+    // session id belongs to at most one surface at a time.
+    let live_ids: std::collections::HashSet<String> = infos
+        .iter()
+        .map(|i| i.id.clone())
+        .chain(chats.iter().map(|c| c.id.clone()))
+        .collect();
     // The theme map has no other reaper: prune it to live sessions here.
-    crate::lock(&state.session_themes).retain(|id, _| live_ids.contains(id.as_str()));
+    crate::lock(&state.session_themes).retain(|id, _| live_ids.contains(id));
 
     let install_ids: std::collections::HashSet<String> = crate::lock(&state.installs)
         .values()
@@ -274,7 +301,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
     let cwds = crate::lock(&state.current_cwds);
     let themes = crate::lock(&state.session_themes);
 
-    let entries = infos
+    let mut entries: Vec<LedgerEntry> = infos
         .iter()
         .filter(|info| info.alive && !install_ids.contains(&info.id))
         .filter_map(|info| {
@@ -284,6 +311,8 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 resume: record.resume_id().or_else(|| record.resumed_from.clone()),
                 transcript: record.transcript_path.clone(),
                 title: record.display_name(info.title.as_deref()),
+                ui: SessionUi::Term,
+                model: None,
             });
             Some(LedgerEntry {
                 id: info.id.clone(),
@@ -303,6 +332,44 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
             })
         })
         .collect();
+
+    // Chat sessions: same identity model, but the resume handle is the driver's
+    // OWN native session/thread id (ChatInfo::native_session_id), the surface is
+    // `Chat`, and there is no PTY grid (defaults). Dedup by id against the PTY
+    // entries above (a mid-view-switch could momentarily list both; the PTY wins
+    // — a live terminal is the current truth).
+    let pty_ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    let chat_entries: Vec<LedgerEntry> = chats
+        .iter()
+        .filter(|c| c.alive && !install_ids.contains(&c.id) && !pty_ids.contains(c.id.as_str()))
+        .filter_map(|c| {
+            let workspace_id = workspaces.get(&c.id)?.clone();
+            let kind = AgentKind::parse(c.agent.as_str())?;
+            let record = agents.get(&c.id);
+            let title = record
+                .map(|r| r.display_name(None))
+                .unwrap_or_else(|| kind.as_str().to_string());
+            Some(LedgerEntry {
+                id: c.id.clone(),
+                workspace_id,
+                cwd: cwds.get(&c.id).cloned().unwrap_or_else(|| c.cwd.clone()),
+                pinned_name: record.and_then(|r| r.custom_title.clone()),
+                cols: 120,
+                rows: 40,
+                theme: themes.get(&c.id).cloned().unwrap_or_else(|| "dark".into()),
+                agent: Some(LedgerAgent {
+                    kind,
+                    resume: c.native_session_id.clone(),
+                    transcript: None,
+                    title,
+                    ui: SessionUi::Chat,
+                    model: c.model.clone(),
+                }),
+            })
+        })
+        .collect();
+    drop(pty_ids);
+    entries.extend(chat_entries);
 
     let links = crate::lock(&state.links)
         .iter()
@@ -384,13 +451,26 @@ enum RestorePlan {
 
 /// Pure restore policy, split out for tests: shells and claude respawn
 /// (claude resumes its conversation; a claude that never got a transcript
-/// has nothing to lose and boots fresh). Other agents have no *verified*
-/// resume mechanism — respawning a fresh TUI while pretending it is the
-/// same conversation would be a lie, so they retire into Recents instead.
+/// has nothing to lose and boots fresh). A TUI codex has no *verified* resume
+/// mechanism — respawning a fresh TUI while pretending it is the same
+/// conversation would be a lie, so it retires into Recents instead.
+///
+/// A **chat** session respawns for BOTH agents: the chat drivers resume
+/// in-band (claude `--resume`, codex `thread/resume`) and the on-disk journal
+/// replays regardless, so a chat always comes back as a chat when restore is
+/// on. The transcript-existence check that gates a claude resume lives in
+/// `chat::resurrect_chat` (a fresh boot is the honest fallback there).
 fn plan_restore(entry: &LedgerEntry, restore_enabled: bool, workspace_exists: bool) -> RestorePlan {
     match &entry.agent {
         None if restore_enabled && workspace_exists => RestorePlan::Respawn,
         None => RestorePlan::Drop,
+        Some(agent) if agent.ui == SessionUi::Chat => {
+            if restore_enabled && workspace_exists {
+                RestorePlan::Respawn
+            } else {
+                RestorePlan::Retire
+            }
+        }
         Some(agent) => {
             if restore_enabled && workspace_exists && agent.kind == AgentKind::Claude {
                 RestorePlan::Respawn
@@ -427,6 +507,17 @@ async fn respawn(
     entry: &LedgerEntry,
     workspace: crate::workspaces::Workspace,
 ) -> anyhow::Result<()> {
+    // Chat sessions resurrect through the chat spawn path (regenerate the
+    // per-session settings/mcp files against THIS daemon, resume the native
+    // conversation, reuse the existing on-disk journal) — a wholly different
+    // recipe from the PTY path below.
+    if entry
+        .agent
+        .as_ref()
+        .is_some_and(|a| a.ui == SessionUi::Chat)
+    {
+        return crate::chat::resurrect_chat(state, entry, workspace).await;
+    }
     // A cwd deleted while the daemon was down falls back to the workspace
     // root — a shell somewhere beats no shell.
     let cwd = if entry.cwd.is_dir() {
@@ -486,20 +577,32 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
     if agent.kind == AgentKind::Claude && title == agent.kind.as_str() {
         return false;
     }
+    let is_chat = agent.ui == SessionUi::Chat;
     let recent = crate::recents::RecentEntry {
         kind: agent.kind,
         title,
-        // Only promise resumption the transcript can actually deliver; a
-        // row without `resume` honestly starts fresh (existing UI rule).
-        resume: resolve_resume(&state.claude_projects_dir, entry),
+        // Only promise resumption the handle can actually deliver. Codex chat
+        // resumes its thread in-protocol (no transcript file to check), so its
+        // native id passes straight through; claude (chat or TUI) needs the
+        // transcript on disk (`resolve_resume`), else the row honestly starts
+        // fresh (existing UI rule).
+        resume: if is_chat && agent.kind == AgentKind::Codex {
+            agent.resume.clone()
+        } else {
+            resolve_resume(&state.claude_projects_dir, entry)
+        },
         supersedes: Vec::new(),
         last_active: if last_active > 0 {
             last_active
         } else {
             unix_now()
         },
-        // The ledger snapshots PTY sessions; a boot retirement is a terminal.
-        ui: Some(chimaera_agent::model::SessionUi::Term),
+        // Reopen in the surface it last ran as, so a chat reopens as chat.
+        ui: Some(if is_chat {
+            SessionUi::Chat
+        } else {
+            SessionUi::Term
+        }),
     };
     crate::lock(&state.recents).push(&entry.workspace_id, recent, None);
     true
@@ -529,9 +632,18 @@ mod tests {
                 resume: resume.map(str::to_string),
                 transcript: None,
                 title: "fix the tests".into(),
+                ui: SessionUi::Term,
+                model: None,
             }),
             ..shell_entry()
         }
+    }
+
+    /// A chat-surface agent entry (resurrects as chat).
+    fn chat_entry(kind: AgentKind, resume: Option<&str>) -> LedgerEntry {
+        let mut e = agent_entry(kind, resume);
+        e.agent.as_mut().unwrap().ui = SessionUi::Chat;
+        e
     }
 
     /// `--resume` is only passed when the conversation's transcript exists —
@@ -593,6 +705,21 @@ mod tests {
         );
         assert_eq!(
             plan_restore(&agent_entry(AgentKind::Codex, None), true, true),
+            RestorePlan::Retire
+        );
+        // Chat sessions respawn for BOTH agents (both chat drivers resume
+        // in-band; the journal replays regardless) — unlike the TUI codex above.
+        assert_eq!(
+            plan_restore(&chat_entry(AgentKind::Claude, Some("abc")), true, true),
+            RestorePlan::Respawn
+        );
+        assert_eq!(
+            plan_restore(&chat_entry(AgentKind::Codex, Some("thread-1")), true, true),
+            RestorePlan::Respawn
+        );
+        // Chat with restore disabled retires (reopen still replays the journal).
+        assert_eq!(
+            plan_restore(&chat_entry(AgentKind::Codex, Some("thread-1")), false, true),
             RestorePlan::Retire
         );
         // Restore disabled: conversations must still be findable, shells go.

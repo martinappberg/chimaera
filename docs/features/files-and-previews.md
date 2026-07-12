@@ -7,9 +7,10 @@ tables, PDFs, images, sandboxed HTML, or a hex/binary summary — plus a light s
 editor. Everything streams (never whole-file loads) to hold the daemon's ~150 MB RSS
 budget on shared login nodes.
 
-**Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders, `CodeView`,
-`MarkdownView`, `TableView`, `PdfView`, `ImageView`, `HtmlView`, `BinaryView`, `FinderView`,
-`cm.ts`) + `web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
+**Where it lives (shared):** UI `web-ui/src/lib/previews/` (`files.ts` loaders,
+`fileStore.svelte.ts` the content store, `CodeView`, `MarkdownView`, `TableView`, `PdfView`,
+`ImageView`, `HtmlView`, `BinaryView`, `FinderView`, `cm.ts`) +
+`web-ui/src/lib/workspace/FileTree.svelte` + glyphs in `web-ui/src/lib/shared/`
 (`FileIcon`, `FolderIcon`, `icons.ts`). Daemon: **all preview endpoints are in
 `crates/chimaera-server/src/fs.rs`** (there is no separate previews module). The file diff
 viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
@@ -27,9 +28,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`), not recursive
   components. Respects `files.showHidden`. Re-lists the root + every expanded dir when the
   workspace's git **epoch** bumps (a new untracked file gets a row to carry its status badge)
-  and when the client **fs epoch** bumps (any create/rename/delete from any surface — see
-  "File management" below). Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!)
-  and a recolored name; a collapsed dir containing changes shows a rollup dot.
+  or the client **fs epoch** bumps (any create/rename/delete from any surface — see "File
+  management" below) — **coalesced**: a working agent bumps both epochs on every file it writes,
+  so the re-list is debounced (~250 ms) into one pass, sparing a remote link a storm of `fs/list`
+  calls. Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!) and a recolored name; a
+  collapsed dir containing changes shows a rollup dot.
 
 ## File management (create / rename / copy / paste / delete / download)
 
@@ -110,6 +113,23 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `PdfView`/`ImageView`/`HtmlView`.
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
+
+## Preview caching & live-update
+
+- **What & when.** Every preview reads its content through a shared, LRU-capped content store
+  (`previews/fileStore.svelte.ts`) keyed by path — the file-side analogue of the terminal pool.
+  A view `retain`s its entry on mount, `release`s on unmount.
+- **Where it lives.** `previews/fileStore.svelte.ts` (`FileEntry`, `retain`/`release`/`noteWrite`);
+  every `*View.svelte` reads from it. It subscribes to `workspace/fsEvents.ts` (`fsEpoch`/
+  `lastFsMutation`) + `workspace/git.ts` (`gitStatus.epoch`).
+- **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is instant and
+  re-hits **no** route — the cached first 256 KB chunk / rendered markdown / first table page /
+  `/raw` ticket render immediately (the LRU caps browser memory; large files still stream
+  per-view). On a coalesced fs/git bump the store re-probes the **on-screen** paths' mtime (a
+  1-byte read carries `X-Mtime`) and, when it moved, refreshes their payloads **in place** (never
+  nulling — a null chunk would unmount a live `CodeView`) — so an agent or external edit to a file
+  you have open updates the view live. An **unsaved** `CodeView` buffer is never clobbered: a disk
+  change while dirty raises the "changed on disk" conflict bar instead of reloading.
 
 ## File & folder glyphs
 

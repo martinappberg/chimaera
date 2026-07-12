@@ -38,11 +38,15 @@ export async function loadViewState(key: string): Promise<unknown> {
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;
-let pending: { key: string; state: unknown } | null = null;
+// Pending writes keyed BY view-state key: a single flush window may target more
+// than one key (e.g. the window-scoped key AND the workspace-scoped mirror), so
+// a single slot would let the later call clobber the earlier one and only the
+// last key would ever be persisted. Same-key rewrites still coalesce (Map.set).
+const pending = new Map<string, unknown>();
 
-/** Debounced PUT (500ms): coalesces divider drags into one write. */
+/** Debounced PUT (500ms): coalesces divider drags into one write per key. */
 export function saveViewState(key: string, state: unknown): void {
-  pending = { key, state };
+  pending.set(key, state);
   if (timer !== null) clearTimeout(timer);
   timer = setTimeout(() => {
     timer = null;
@@ -50,23 +54,25 @@ export function saveViewState(key: string, state: unknown): void {
   }, DEBOUNCE_MS);
 }
 
-/** Send the pending write now (used on pagehide so a close never loses state). */
+/** Send the pending writes now (used on pagehide so a close never loses state). */
 export async function flushViewState(): Promise<void> {
-  if (pending === null) return;
-  const { key, state } = pending;
-  pending = null;
+  if (pending.size === 0) return;
+  const writes = [...pending.entries()];
+  pending.clear();
   if (timer !== null) {
     clearTimeout(timer);
     timer = null;
   }
-  try {
-    await api(`/view-state/${key}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state),
-      keepalive: true,
-    });
-  } catch {
-    // daemon unreachable; the next layout change retries
-  }
+  await Promise.all(
+    writes.map(([key, state]) =>
+      api(`/view-state/${key}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state),
+        keepalive: true,
+      }).catch(() => {
+        // daemon unreachable; the next layout change retries
+      }),
+    ),
+  );
 }

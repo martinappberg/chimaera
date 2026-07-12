@@ -119,25 +119,31 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // Graceful stop = planned: flush the ledger (the reconciler's last write
     // may be a few seconds stale) and leave a handoff so a successor within
     // the freshness window keeps this port + token. Sessions die with this
-    // process — the ledger written here is exactly what resurrects them.
+    // process — the ledger written here is exactly what resurrects them, and
+    // `ledger::snapshot` now covers chat sessions too, so a successor brings
+    // them back (resumable ones live, the rest into Recents at boot). We must
+    // NOT retire the LIVE chats here: that removes their workspace mapping, so
+    // the reconciler's next snapshot would drop them and they'd never resurrect.
     let (entries, links) = ledger::snapshot(&state);
     lock(&state.ledger).write_if_changed(&entries, &links);
 
-    // Chat sessions are daemon-owned drivers that die with this process, and
-    // the ledger does not yet resurrect them (sv-11: real resurrection is a
-    // follow-up in `ledger` — snapshot()/restore() cover only PTY sessions).
-    // So at a graceful stop (update / restart), retire their conversations
-    // into Recents here, so a survivor is offered for manual resume instead of
-    // vanishing. Idempotent: a session already retired by an in-band
-    // `close-all`/`shutdown` has no AgentRecord left, and `retire` no-ops.
+    // Dead-but-visible chats (a ProtocolError entry the ChatManager keeps in
+    // the registry with alive=false) are excluded from the snapshot above, so
+    // resurrection never touches them. They're still resumable conversations
+    // (codex has no transcript-store backstop), so retire them into Recents now
+    // — exactly what the old blanket retire loop did — or they'd vanish on the
+    // restart. Only the dead ones: retiring a live chat would strip the mapping
+    // the reconciler already captured.
     for info in state.chat.list() {
-        recents::retire(
-            &state,
-            &info.id,
-            None,
-            None,
-            chimaera_agent::model::SessionUi::Chat,
-        );
+        if !info.alive {
+            recents::retire(
+                &state,
+                &info.id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+            );
+        }
     }
 
     if let Err(err) = chimaera_core::Handoff::new(port, state.token.clone()).write() {

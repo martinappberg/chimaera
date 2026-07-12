@@ -399,6 +399,18 @@
     return wsId === null ? winKey : `${winKey}_${wsId}`;
   }
 
+  /**
+   * Workspace-only view-state key (no window id). The layout is mirrored here so
+   * a window that reopens a workspace with a FRESH id — after a deliberate close
+   * (the native shell discards the window's identity by macOS convention), or a
+   * plain browser reopen — still restores that workspace's last-active layout
+   * instead of falling back to the empty default. Consulted only when the
+   * window-keyed blob is absent; last-active window on a workspace wins.
+   */
+  function wsKey(wsId: string): string {
+    return `ws_${wsId}`;
+  }
+
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
 
@@ -585,6 +597,9 @@
     const blob = { v: 1, ws: activeWsId, layout: serializeLayout(layout) };
     if (!layoutReady) return;
     saveViewState(stateKey(activeWsId), blob);
+    // Mirror under the workspace-only key so a reopened window (fresh id)
+    // restores this workspace instead of the empty default (see wsKey).
+    if (activeWsId !== null) saveViewState(wsKey(activeWsId), blob);
   });
 
   // Persist rail chrome (width + FILES section) locally on any change. Drags
@@ -1258,6 +1273,11 @@
     if (!matches(raw) && wsAtBoot !== null) {
       // pre-composite-key blob migration
       raw = await Promise.race([loadViewState(winKey), timeout]);
+    }
+    if (!matches(raw) && wsAtBoot !== null) {
+      // No layout for THIS window yet (a reopened/fresh window): fall back to
+      // this workspace's last-active layout so a reopen restores, not resets.
+      raw = await Promise.race([loadViewState(wsKey(wsAtBoot)), timeout]);
     }
     if (seq !== bootSeq) return; // a later switch superseded this boot
     if (matches(raw)) {

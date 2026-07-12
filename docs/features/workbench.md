@@ -132,19 +132,24 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **What & when.** The entire pane tree (splits, ratios, tabs, active tab, focus, zoom, focus
   mode, per-pane fonts) is saved on the daemon and restored on reload — separately for each
   workspace within each window. The rail width + FILES section are remembered too.
-- **How it's used.** Automatic. Reload the page (or reopen a native window) and the exact layout
-  returns; a brand-new browser tab starts clean.
+- **How it's used.** Automatic. Reload the page — or **reopen a window on the same workspace**
+  (even a brand-new one, e.g. after a deliberate close) — and the exact layout returns.
 - **Where it lives.** `web-ui/src/lib/layout/viewState.ts` (`windowKey` via `sessionStorage`,
-  `serializeLayout`/`deserializeLayout`), `railState.ts` (localStorage). Route:
+  `serializeLayout`/`deserializeLayout`), `railState.ts` (localStorage); the per-window and
+  workspace-only keys (`stateKey`/`wsKey`) + boot fallback are in `web-ui/src/App.svelte`. Route:
   `GET/PUT /api/v1/view-state/{key}` (server `view_state.rs`, opaque blobs, key
   `[A-Za-z0-9_-]{1,64}`, ≤64KB).
-- **Key behaviors.** The window id lives in `sessionStorage` (a reload restores this window; a
-  fresh tab is clean). Writes debounce 500ms and flush on `pagehide` with `keepalive` so a close
-  never loses state. Restore has a 3s timeout so a hung daemon never leaves a blank stage; it
-  prunes dead sessions and 404 files, and a record-shaped tab of an unknown kind (a newer build's
-  tab, then a rollback) is skipped rather than nulling the whole pane. Session ids survive a
-  daemon restart (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)), which is what
-  lets persisted tabs rebind with no client migration.
+- **Key behaviors.** The layout is keyed per (window id, workspace) — the window id lives in
+  `sessionStorage` — **and mirrored under a workspace-only key** (`ws_<wsId>`). A reopened window
+  mints a fresh id (the native shell discards a closed window's identity by macOS convention), so
+  boot tries the window key, then the legacy key, then falls back to the workspace key — restoring
+  that workspace's last-active layout instead of the empty default (last-active window wins the
+  mirror). Writes debounce 500ms and flush on `pagehide` with `keepalive` so a close never loses
+  state. Restore has a 3s timeout so a hung daemon never leaves a blank stage; it prunes dead
+  sessions and 404 files, and a record-shaped tab of an unknown kind (a newer build's tab, then a
+  rollback) is skipped rather than nulling the whole pane. Session ids survive a daemon restart
+  (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)), which is what lets persisted
+  tabs rebind with no client migration.
 
 ---
 
@@ -176,3 +181,17 @@ _Captured 2026-07-11 (from the maintainer)._
   double-clicking a tab or tree row, or moving a tab **pins** it — muscle-memory parity with VS Code.
 - **Grade — addition, improvable.** Deliberate today (the preview flag persists in the layout blob),
   but not a core bet — rework it freely if a better shape appears.
+
+### Workspace-keyed window restore — why it's shaped this way
+_Captured 2026-07-12 (from the maintainer)._
+
+- **Problem it solves.** Native feel — a reopened window should come back to where you left it,
+  not the empty default.
+- **Why workspace-keyed.** *"Workspace keyed is good because we work primarily in workspaces"* —
+  restoring by workspace (a reopened window resumes that workspace's last-active layout) fits how
+  the app is actually used, and rides the workspace-first core bet above rather than tying restore
+  to a throwaway window identity.
+- **How settled it is.** *"More just a UX"* — settled as the right default for the workspace-first
+  workflow, but an **addition**, not a frozen contract.
+- **Do not change (or: open to change):** *"keep a smooth UX for the user"* — the keying mechanics
+  are open to improve; only the workspace-first framing (above) is the core bet.

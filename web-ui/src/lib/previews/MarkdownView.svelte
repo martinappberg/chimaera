@@ -7,7 +7,8 @@
    * edits show immediately. Editing is offered only for files under the 1MB
    * cap; larger markdown stays preview-only.
    */
-  import { fsMarkdown, fsFile, EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { EDIT_MAX_BYTES, type FileChunk } from "./files";
+  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
   import CodeView from "./CodeView.svelte";
@@ -28,12 +29,23 @@
   const bodyFont = $derived(fontSize ?? getSetting("terminal.fontSize"));
 
   let mode = $state<"preview" | "edit">("preview");
-  let html = $state<string | null>(null);
-  let error = $state<string | null>(null);
   let chunk = $state<FileChunk | null>(null);
   let chunkError = $state<string | null>(null);
   /** Null until the first fetch tells us whether the file fits the edit cap. */
   let editable = $state<boolean | null>(null);
+
+  // The shared store entry: preview HTML lives here (cached across tab switches,
+  // and re-rendered in place when the file changes on disk — a save on the edit
+  // side, or an agent write, both flow through the store's revalidation).
+  let entry = $state<FileEntry | null>(null);
+  $effect(() => {
+    const e = retain(path);
+    entry = e;
+    void e.ensureMarkdown();
+    return () => release(path);
+  });
+  const html = $derived(entry?.markdown ?? null);
+  const error = $derived(entry?.markdownError ?? null);
 
   // Reset per path.
   $effect(() => {
@@ -42,26 +54,6 @@
     chunk = null;
     chunkError = null;
     editable = null;
-  });
-
-  // Preview HTML: (re)rendered from disk whenever we enter/return to preview,
-  // so a save on the edit side is reflected without reopening the tab.
-  $effect(() => {
-    if (mode !== "preview") return;
-    const p = path;
-    html = null;
-    error = null;
-    let stale = false;
-    fsMarkdown(p)
-      .then((h) => {
-        if (!stale) html = h;
-      })
-      .catch((e) => {
-        if (!stale) error = e instanceof Error ? e.message : "failed to render markdown";
-      });
-    return () => {
-      stale = true;
-    };
   });
 
   // --- context bridge: selection in the RENDERED preview ---------------------
@@ -119,15 +111,18 @@
   });
 
   async function enterEdit(): Promise<void> {
-    // Fetch the raw source once; CodeView handles the rest (incl. background
-    // fill for under-cap truncated files and the save/dirty/conflict flow).
+    // Read the raw source from the shared store (cached with the preview HTML);
+    // CodeView handles the rest (background fill for under-cap truncated files
+    // and the save/dirty/conflict flow).
+    const e = entry;
+    if (e === null) return;
     if (chunk === null && chunkError === null) {
-      try {
-        const c = await fsFile(path);
-        chunk = c;
-        editable = c.size <= EDIT_MAX_BYTES;
-      } catch (e) {
-        chunkError = e instanceof Error ? e.message : "failed to load source";
+      await e.ensureChunk();
+      if (e.chunk !== null) {
+        chunk = e.chunk;
+        editable = e.chunk.size <= EDIT_MAX_BYTES;
+      } else {
+        chunkError = e.chunkError ?? "failed to load source";
         return;
       }
     }

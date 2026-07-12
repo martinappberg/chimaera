@@ -202,8 +202,7 @@
       const first = lastGitEpoch < 0;
       lastGitEpoch = epoch;
       if (first) return; // the initial fetch's listing is already current
-      void load(root);
-      for (const dir of expanded) void load(dir);
+      scheduleRelistVisible();
     });
   });
 
@@ -230,6 +229,26 @@
       loading = n;
     }
   }
+
+  // Coalesce re-list requests. A working agent bumps the git AND fs epoch on
+  // every file it writes; without this, each bump re-lists root + every expanded
+  // dir immediately, so a burst of writes becomes a storm of /fs/list calls that
+  // never lets the tree settle over a remote (ssh) link. Debounced + coalesced,
+  // a whole burst collapses into ONE re-list pass (and the git+fs double-fire for
+  // an in-repo mutation collapses too, since both share this timer).
+  const RELIST_DEBOUNCE_MS = 250;
+  let relistTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleRelistVisible(): void {
+    if (relistTimer !== null) return; // a pass is already pending; fold into it
+    relistTimer = setTimeout(() => {
+      relistTimer = null;
+      void load(root);
+      for (const dir of expanded) void load(dir);
+    }, RELIST_DEBOUNCE_MS);
+  }
+  $effect(() => () => {
+    if (relistTimer !== null) clearTimeout(relistTimer);
+  });
 
   /** Row briefly highlighted after a reveal (fades on its own). */
   let flashPath = $state<string | null>(null);
@@ -508,8 +527,7 @@
       if (epoch === lastFsEpoch) return;
       lastFsEpoch = epoch;
       if (epoch === 0) return;
-      void load(root);
-      for (const dir of expanded) void load(dir);
+      scheduleRelistVisible();
     });
   });
 </script>

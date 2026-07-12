@@ -7,7 +7,8 @@
    * binaries and .gz never render as garbage.
    */
   import type { Component } from "svelte";
-  import { fsFile, looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
+  import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
+  import { retain, release, type FileEntry } from "./fileStore.svelte";
   import ImageView from "./ImageView.svelte";
   import MarkdownView from "./MarkdownView.svelte";
   import HtmlView from "./HtmlView.svelte";
@@ -50,28 +51,35 @@
     | { state: "binary"; size: number }
     | { state: "error"; message: string };
 
-  let probe = $state<TextProbe>({ state: "loading" });
-
+  // The store entry for this path: retaining pins it warm across a tab switch
+  // (no refetch on return) and marks it on-screen, so a disk change revalidates
+  // it live. Only the "text" kind reads its first chunk here; the other kinds
+  // mount a sub-view that reads its own payload from the same entry.
+  let entry = $state<FileEntry | null>(null);
   $effect(() => {
     const p = path;
-    if (viewKindFor(p) !== "text") return;
-    probe = { state: "loading" };
-    let stale = false;
-    fsFile(p)
-      .then((chunk) => {
-        if (stale) return;
-        probe = looksBinary(chunk.bytes)
-          ? { state: "binary", size: chunk.size }
-          : { state: "text", chunk };
-      })
-      .catch((e) => {
-        if (!stale) {
-          probe = { state: "error", message: e instanceof Error ? e.message : "failed to load file" };
-        }
-      });
-    return () => {
-      stale = true;
-    };
+    const e = retain(p);
+    entry = e;
+    if (viewKindFor(p) === "text") void e.ensureChunk();
+    return () => release(p);
+  });
+
+  const probe = $derived.by<TextProbe>(() => {
+    if (kind !== "text") return { state: "loading" };
+    const e = entry;
+    // `entry` is assigned in the effect below (which runs AFTER this derived
+    // re-evaluates on a path change), so on a switch it briefly still points at
+    // the PREVIOUS path. Treat a mismatched entry as loading, forcing the
+    // {#key path} block to unmount/remount CodeView with the correct chunk
+    // rather than seeding it from the old file's bytes.
+    if (e === null || e.path !== path || (e.chunk === null && e.chunkError === null))
+      return { state: "loading" };
+    if (e.chunkError !== null) return { state: "error", message: e.chunkError };
+    const chunk = e.chunk;
+    if (chunk === null) return { state: "loading" };
+    return looksBinary(chunk.bytes)
+      ? { state: "binary", size: chunk.size }
+      : { state: "text", chunk };
   });
 </script>
 
