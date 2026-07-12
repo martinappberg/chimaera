@@ -29,6 +29,10 @@ tauri = { version = "2", features = [] }
 # Self-update: check GitHub releases, verify against the embedded minisign
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().
+# Cross-platform "keep awake" power assertion for the caffeinate toggle
+# (macOS IOKit / Windows SetThreadExecutionState / Linux systemd-inhibit).
+# App-only — never in the musl daemon.
+keepawake = "0.6"
 tauri-plugin-updater = "2"
 # OS clipboard backend for the `write_clipboard` command: WKWebView rejects a
 # non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so

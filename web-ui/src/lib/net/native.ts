@@ -203,6 +203,33 @@ export async function writeClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * Arm/disarm the "caffeinate" power assertion on the local app host — while on,
+ * the machine won't idle/display/system-sleep (incl. lid-closed on macOS, but
+ * only on AC power). Global to the app; the change broadcasts (see
+ * {@link onCaffeinateChanged}). Returns the resulting armed state; a plain
+ * browser (no shell) is a no-op that reports false.
+ */
+export async function setCaffeinate(on: boolean): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  return t.core.invoke<boolean>("set_caffeinate", { on });
+}
+
+/** Whether the caffeinate assertion is currently held (read on mount). */
+export async function caffeinateState(): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  return t.core.invoke<boolean>("caffeinate_state");
+}
+
+/** The caffeinate state changed (from any window) — keep this window in sync. */
+export function onCaffeinateChanged(handler: (on: boolean) => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.event.listen<boolean>("caffeinate-changed", (e) => handler(e.payload));
+}
+
+/**
  * A newer signed app build exists (the shell's periodic updater check).
  * Broadcast to every window; presentation and snoozing are the UI's job.
  */

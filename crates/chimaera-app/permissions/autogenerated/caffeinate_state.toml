@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-caffeinate-state"
+description = "Enables the caffeinate_state command without any pre-configured scope."
+commands.allow = ["caffeinate_state"]
+
+[[permission]]
+identifier = "deny-caffeinate-state"
+description = "Denies the caffeinate_state command without any pre-configured scope."
+commands.deny = ["caffeinate_state"]

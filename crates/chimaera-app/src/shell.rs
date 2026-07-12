@@ -53,6 +53,10 @@ pub struct Shell {
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// The held power assertion for the "caffeinate" toggle — Some = armed
+    /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
+    /// guard drops on quit, so the assertion never outlives the app.
+    caffeinate: Mutex<Option<keepawake::KeepAwake>>,
 }
 
 /// The (host, workspace) a window is showing. `alias` None = the local
@@ -150,6 +154,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             windows: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
+            caffeinate: Mutex::new(None),
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
@@ -216,6 +221,8 @@ pub fn run() {
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,
+            commands::set_caffeinate,
+            commands::caffeinate_state,
             commands::answer_askpass,
             commands::list_askpass,
             commands::report_window_scope,

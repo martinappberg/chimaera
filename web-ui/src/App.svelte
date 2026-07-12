@@ -157,14 +157,17 @@
   import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
   import {
     askpassActive,
+    caffeinateState,
     closeThisWindow,
     connectHost,
     isNativeShell,
     onAppUpdate,
+    onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
     onMenu,
     reportWindowScope,
+    setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
   } from "./lib/net/native";
@@ -208,6 +211,14 @@
   let health = $state<Health | null>(null);
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
+  /** Caffeinate (native, LOCAL window only): whole-machine keep-awake. Shown
+   *  only on a local native window — a remote window's work runs on the remote
+   *  host, so caffeinating this laptop would be pointless. */
+  let caffeinated = $state(false);
+  const canCaffeinate = isNativeShell() && getHostLabel() === "local";
+  async function toggleCaffeinate(): Promise<void> {
+    caffeinated = await setCaffeinate(!caffeinated);
+  }
   /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
@@ -679,9 +690,16 @@
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
+    let unlistenCaffeinate: (() => void) | null = null;
     if (isNativeShell()) {
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
+      // Caffeinate state: read once, then follow the cross-window broadcast so
+      // toggling from any local window keeps every window's button in sync.
+      if (canCaffeinate) {
+        void caffeinateState().then((on) => (caffeinated = on));
+        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => (unlistenCaffeinate = u));
+      }
       void onAppUpdate((version) => (updateState.appVersion = version)).then(
         (u) => (unlistenAppUpdate = u),
       );
@@ -755,6 +773,7 @@
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
+      unlistenCaffeinate?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -3272,6 +3291,40 @@
             <span class="dg-branch">can’t read repo</span>
           </button>
         {/if}
+        {#if canCaffeinate}
+          <button
+            class="daemon-settings caffeinate"
+            class:on={caffeinated}
+            title={caffeinated
+              ? "caffeinate on — this Mac won’t sleep (lid-closed needs AC power)"
+              : "caffeinate — keep this Mac awake"}
+            aria-label="caffeinate"
+            aria-pressed={caffeinated}
+            onclick={() => void toggleCaffeinate()}
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+              <path
+                d="M3 6.2h7.5v3.3a2.6 2.6 0 0 1-2.6 2.6H5.6A2.6 2.6 0 0 1 3 9.5V6.2z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M10.5 7.1h1.3a1.6 1.6 0 0 1 0 3.2h-1.3"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M4.9 2.5c0 .8-.7.8-.7 1.6M7 2.5c0 .8-.7.8-.7 1.6M9.1 2.5c0 .8-.7.8-.7 1.6"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.1"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        {/if}
         {#if activeWsId !== null}
           <button
             class="daemon-settings"
@@ -4344,6 +4397,18 @@
   .daemon-settings:hover {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  /* When both the caffeinate toggle and the gear show, only the first claims
+     the auto-margin; the gear sits just after it instead of splitting the gap. */
+  .caffeinate + .daemon-settings {
+    margin-left: 4px;
+  }
+
+  /* Armed = accented, so the "keeping this Mac awake" state reads at a glance. */
+  .caffeinate.on,
+  .caffeinate.on:hover {
+    color: var(--accent);
   }
 
   .stage {

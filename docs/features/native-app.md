@@ -112,6 +112,18 @@ app-build` (never the root `cargo`).
   prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
   Windows download until then.
 
+## Caffeinate
+
+- A **local-only** whole-machine keep-awake toggle (a coffee-cup button in the rail's bottom bar,
+  shown only when `isNativeShell() && getHostLabel() === "local"` — a remote window's work runs on the
+  remote host, so caffeinating this laptop is pointless). Armed = the machine won't idle-, display-,
+  or system-sleep. IPC commands `set_caffeinate(on)` / `caffeinate_state()` hold a cross-platform
+  power assertion (the **keepawake** crate: macOS IOKit / Windows `SetThreadExecutionState` / Linux
+  `systemd-inhibit`) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the
+  app. The state broadcasts (`caffeinate-changed`) so every window's toggle stays in sync. **macOS
+  caveat, surfaced in the tooltip:** lid-closed-awake additionally requires **AC power** — Apple hard-
+  blocks clamshell wake on battery, which no app can override.
+
 ## Status: partial
 
 - The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
