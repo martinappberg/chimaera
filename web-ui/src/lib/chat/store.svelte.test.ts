@@ -145,6 +145,48 @@ describe("ChatStore pending-send ordering", () => {
     expect(delivered.blocks[0]).toMatchObject({ kind: "user", id: "q2", text: "made it" });
   });
 
+  it("a codex-style allow (option 'accept') marks the tool allowed, never denied", () => {
+    // The bug: codex allow ids are `accept*`, not `allow_*`, so the old
+    // id-prefix check marked every ALLOWED codex command denied → "1 command
+    // failed". The mapping now reads the resolved option's KIND.
+    const store = fold([
+      { type: "tool_call", id: "c1", kind: "execute", title: "sed -i …", status: "in_progress" },
+      {
+        type: "permission_request",
+        request_id: "r1",
+        tool_call_id: "c1",
+        title: "Run command",
+        options: [
+          { id: "accept", label: "Allow", kind: "allow_once" },
+          { id: "decline", label: "Deny", kind: "reject_once" },
+        ],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "accept" },
+      { type: "tool_call_update", id: "c1", status: "completed" },
+    ]);
+    const tool = store.blocks.find((b) => b.kind === "tool");
+    expect(tool).toMatchObject({ kind: "tool", allowed: true, denied: false, status: "completed" });
+  });
+
+  it("a deny (option 'decline') marks the tool denied, not allowed", () => {
+    const store = fold([
+      { type: "tool_call", id: "c1", kind: "execute", title: "rm -rf …", status: "in_progress" },
+      {
+        type: "permission_request",
+        request_id: "r1",
+        tool_call_id: "c1",
+        title: "Run command",
+        options: [
+          { id: "accept", label: "Allow", kind: "allow_once" },
+          { id: "decline", label: "Deny", kind: "reject_once" },
+        ],
+      },
+      { type: "permission_resolved", request_id: "r1", option_id: "decline" },
+    ]);
+    const tool = store.blocks.find((b) => b.kind === "tool");
+    expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
+  });
+
   it("a fresh (turn-opening) send goes straight into the transcript", () => {
     const store = fold([
       { type: "user_message", text: "hi", id: "u1", queued: false },

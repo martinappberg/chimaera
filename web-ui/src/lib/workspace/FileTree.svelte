@@ -6,11 +6,20 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { basename, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
   import { gitIndex, gitStatus } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import { fsCreateOp, fsEpoch, fsRenameOp, requestDelete } from "./fsEvents";
+  import {
+    clearClip,
+    copyFile,
+    cutFile,
+    fileClip,
+    isCutPending,
+    pasteInto,
+  } from "./fileClipboard.svelte";
+  import { isRemoteHost } from "../net/api";
   import { stemLength, validateEntryName } from "../shared/fsNames";
   import { contextMenu, type ContextMenuEntry } from "../shared/contextMenu.svelte";
   import { writeClipboard } from "../net/native";
@@ -18,11 +27,16 @@
   import FolderIcon from "../shared/FolderIcon.svelte";
   import Spinner from "../previews/Spinner.svelte";
 
+  /** Local-daemon windows hide Download (the file already lives here). */
+  const remote = isRemoteHost();
+
   interface Props {
     /** Workspace root on the daemon's filesystem. */
     root: string;
-    /** Open a file surface in the layout. */
+    /** Open a file surface in the layout (single click → a PREVIEW tab). */
     onOpen(path: string): void;
+    /** Open a file as a PERMANENT tab (double click, or a just-created file). */
+    onOpenPinned(path: string): void;
     /** Begin a pointer drag of a tree entry — file OR dir (same grammar as
      *  rail rows and pane tabs). `onEntryClick` is the sub-threshold action
      *  (open for files, expand/collapse for dirs), routed through the drag so
@@ -40,15 +54,19 @@
      * workspace root). The nonce distinguishes repeats.
      */
     createRequest?: { kind: "file" | "dir"; nonce: number } | null;
+    /** An OS-desktop file drag is hovering the tree (highlight the drop zone). */
+    dropActive?: boolean;
   }
 
   let {
     root,
     onOpen,
+    onOpenPinned,
     onDragStart,
     activePath,
     reveal = null,
     createRequest = null,
+    dropActive = false,
   }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
@@ -59,6 +77,12 @@
   interface Row {
     entry: FsEntry;
     depth: number;
+    /** Tree-position key, unique even when two rows share a path — a symlinked
+     *  dir's children come back with the target's CANONICAL paths, so the same
+     *  `entry.path` can appear under both the real dir and the symlink. Keying
+     *  the `{#each}` on this (parent-scoped) avoids the duplicate-key breakage
+     *  that stranded the "listing…" row and made rows jump. */
+    key: string;
   }
 
   // Quiet client-side filter over the LOADED tree: narrows visible entries by
@@ -74,33 +98,35 @@
     const q = filterQuery;
     const out: Row[] = [];
     // Returns true when this subtree contributed at least one visible row.
-    const walk = (dir: string, depth: number): boolean => {
+    // `keyPrefix` scopes each row's key by its tree position (see Row.key).
+    const walk = (dir: string, depth: number, keyPrefix: string): boolean => {
       const entries = listings.get(dir);
       if (entries === undefined) return false;
       let any = false;
       for (const e of entries) {
+        const key = `${keyPrefix}/${e.name}`;
         const selfMatch = q === "" || e.name.toLowerCase().includes(q);
         if (e.kind === "dir") {
           // A filtered dir is shown when it (or a loaded descendant) matches;
           // expand into it while filtering even if collapsed, so matches surface.
           const descend = q !== "" || expanded.has(e.path);
-          const marker: Row = { entry: e, depth };
+          const marker: Row = { entry: e, depth, key };
           const before = out.length;
           out.push(marker);
-          const childMatched = descend ? walk(e.path, depth + 1) : false;
+          const childMatched = descend ? walk(e.path, depth + 1, key) : false;
           if (q !== "" && !selfMatch && !childMatched) {
             out.length = before; // prune a dir with no matches under it
           } else {
             any = true;
           }
         } else if (selfMatch) {
-          out.push({ entry: e, depth });
+          out.push({ entry: e, depth, key });
           any = true;
         }
       }
       return any;
     };
-    walk(root, 0);
+    walk(root, 0, "");
     return out;
   });
 
@@ -273,10 +299,38 @@
     }
   }
 
+  /** Paste target for an entry: into the dir itself, else its parent. */
+  function pasteDirFor(entry: FsEntry): string {
+    return entry.kind === "dir" && !entry.broken ? entry.path : parentOf(entry.path);
+  }
+
   function onRowKey(e: KeyboardEvent, entry: FsEntry): void {
     if (edit?.mode === "rename" && edit.path === entry.path) return; // the input owns keys
+    // Copy / cut / paste, scoped to the focused tree row.
+    if (e.metaKey || e.ctrlKey) {
+      if (e.key === "c" && !entry.broken) {
+        e.preventDefault();
+        copyFile(entry.path, entry.kind);
+        return;
+      }
+      if (e.key === "x" && !entry.broken) {
+        e.preventDefault();
+        cutFile(entry.path, entry.kind);
+        return;
+      }
+      if (e.key === "v" && fileClip() !== null) {
+        e.preventDefault();
+        void pasteInto(pasteDirFor(entry));
+        return;
+      }
+    }
+    if (e.key === "Escape" && fileClip() !== null) {
+      clearClip();
+      return;
+    }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
+      if (entry.broken) return; // a dangling symlink opens nothing
       if (entry.kind === "dir") toggle(entry.path);
       else onOpen(entry.path);
     } else if (e.key === "F2") {
@@ -357,7 +411,8 @@
         // doReveal refreshes every ancestor listing (nested a/b/c names just
         // work), expands the chain, scrolls + flashes the new row.
         await doReveal(created);
-        if (cur.kind === "file") onOpen(created);
+        // A just-created file is for editing → open it as a permanent tab.
+        if (cur.kind === "file") onOpenPinned(created);
       } else {
         if (name === cur.name) {
           cancelEdit();
@@ -393,14 +448,38 @@
   }
 
   function menuFor(entry: FsEntry): ContextMenuEntry[] {
+    const clip = fileClip();
+    // A broken symlink can only be renamed/copied/deleted (all on the link).
+    if (entry.broken) {
+      return [
+        { label: "Copy", onSelect: () => copyFile(entry.path, entry.kind) },
+        { label: "Cut", onSelect: () => cutFile(entry.path, entry.kind) },
+        "separator",
+        { label: "Rename…", onSelect: () => beginRename(entry) },
+        { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
+        "separator",
+        { label: "Delete…", danger: true, onSelect: () => requestDelete(entry.path, entry.kind) },
+      ];
+    }
     const dirTarget = entry.kind === "dir" ? entry.path : parentOf(entry.path);
     return [
       { label: "New File…", onSelect: () => beginCreate("file", dirTarget) },
       { label: "New Folder…", onSelect: () => beginCreate("dir", dirTarget) },
       "separator",
+      { label: "Copy", onSelect: () => copyFile(entry.path, entry.kind) },
+      { label: "Cut", onSelect: () => cutFile(entry.path, entry.kind) },
+      {
+        label: clip === null ? "Paste" : `Paste ${basename(clip.path)}`,
+        disabled: clip === null,
+        hint: clip === null ? "nothing copied" : undefined,
+        onSelect: () => void pasteInto(pasteDirFor(entry)),
+      },
+      "separator",
       { label: "Rename…", onSelect: () => beginRename(entry) },
       "separator",
-      { label: "Download", onSelect: () => void fsDownload(entry.path) },
+      ...(remote
+        ? [{ label: "Download", onSelect: () => void fsDownload(entry.path) } as ContextMenuEntry]
+        : []),
       { label: "Copy Path", onSelect: () => void copyPath(entry.path) },
       "separator",
       {
@@ -464,14 +543,23 @@
   </div>
   <div
     class="tree"
+    class:drop-active={dropActive}
     role="tree"
     tabindex="-1"
     bind:this={treeEl}
+    data-tree-root={root}
     onkeydown={onTreeKeydown}
     oncontextmenu={(e) =>
       contextMenu.openAt(e, [
         { label: "New File…", onSelect: () => beginCreate("file", root) },
         { label: "New Folder…", onSelect: () => beginCreate("dir", root) },
+        "separator",
+        {
+          label: fileClip() === null ? "Paste" : `Paste ${basename(fileClip()!.path)}`,
+          disabled: fileClip() === null,
+          hint: fileClip() === null ? "nothing copied" : undefined,
+          onSelect: () => void pasteInto(root),
+        },
       ])}
   >
   {#if rootError !== null}
@@ -518,7 +606,7 @@
   {#if edit?.mode === "create" && createAfterIndex === -1}
     {@render createRow(0)}
   {/if}
-  {#each rows as { entry, depth }, i (entry.path)}
+  {#each rows as { entry, depth, key }, i (key)}
     {@const gEntry = entry.kind === "file" ? $gitIndex.files.get(entry.path) : undefined}
     {@const gDeco = gEntry ? decoFor(gEntry) : null}
     {@const gDir = entry.kind === "dir" ? $gitIndex.dirs.get(entry.path) : undefined}
@@ -526,12 +614,14 @@
       class="node"
       class:active={entry.path === activePath}
       class:flash={entry.path === flashPath}
+      class:cut={isCutPending(entry.path)}
       role="treeitem"
       aria-expanded={entry.kind === "dir" ? expanded.has(entry.path) : undefined}
       aria-selected={entry.path === activePath}
       tabindex="0"
-      title={entry.path}
+      title={entry.symlink ? `${entry.path} → ${entry.target ?? ""}${entry.broken ? " (missing)" : ""}` : entry.path}
       data-path={entry.path}
+      data-drop-dir={entry.broken ? undefined : entry.kind === "dir" ? entry.path : parentOf(entry.path)}
       style:padding-left={`${8 + depth * 13}px`}
       onpointerdowncapture={(e) => {
         // The rename input stays a plain interactive target (rail-row idiom).
@@ -541,9 +631,17 @@
         // the click back to this row) and double-act. Skip while renaming.
         onDragStart(e, entry.path, entry.kind, () => {
           if (edit?.mode === "rename" && edit.path === entry.path) return;
+          if (entry.broken) return; // a dangling symlink opens nothing
           if (entry.kind === "dir") toggle(entry.path);
           else onOpen(entry.path);
         });
+      }}
+      ondblclick={() => {
+        // VS Code: double-click a file PINS it (the two single-clicks already
+        // opened it as a preview; this promotes). Dirs are unaffected.
+        if (entry.kind === "file" && !entry.broken && !(edit?.mode === "rename" && edit.path === entry.path)) {
+          onOpenPinned(entry.path);
+        }
       }}
       onkeydown={(e) => onRowKey(e, entry)}
       oncontextmenu={(e) => contextMenu.openAt(e, menuFor(entry))}
@@ -572,9 +670,9 @@
       {/if}
       <span class="row-glyph">
         {#if entry.kind === "dir"}
-          <FolderIcon open={expanded.has(entry.path)} size={14} />
+          <FolderIcon open={expanded.has(entry.path)} size={14} link={entry.symlink} />
         {:else}
-          <FileIcon path={entry.path} size={14} />
+          <FileIcon path={entry.path} size={14} link={entry.symlink} broken={entry.broken} />
         {/if}
       </span>
       {#if edit?.mode === "rename" && edit.path === entry.path}
@@ -594,7 +692,9 @@
         <span
           class="node-name"
           class:dir={entry.kind === "dir"}
-          style:color={gDeco ? gDeco.color : undefined}>{entry.name}</span>
+          class:symlink={entry.symlink}
+          class:broken={entry.broken}
+          style:color={entry.broken ? undefined : gDeco ? gDeco.color : undefined}>{entry.name}</span>
         {#if gDeco}
           <span class="git-badge" style:color={gDeco.color} title={gDeco.label}
             >{gDeco.letter}</span>
@@ -608,6 +708,17 @@
         {/if}
       {/if}
     </div>
+    {#if entry.kind === "dir" && expanded.has(entry.path) && loading.has(entry.path) && listings.get(entry.path) === undefined}
+      <!-- First listing of a freshly-expanded dir is in flight: a delayed
+           "listing…" row (pure CSS delay, no per-row timer) so a slow remote
+           expand shows progress while a fast local one never flickers. A
+           re-list of an already-listed dir keeps its stale rows, no spinner. -->
+      <div class="node loading-row" style:padding-left={`${8 + (depth + 1) * 13}px`} role="presentation">
+        <span class="chev-spacer" aria-hidden="true"></span>
+        <span class="mini-spinner" aria-hidden="true"></span>
+        <span class="loading-label">listing…</span>
+      </div>
+    {/if}
     {#if edit?.mode === "rename" && edit.path === entry.path && editError !== null}
       <div class="edit-error" style:padding-left={`${8 + depth * 13}px`}>{editError}</div>
     {/if}
@@ -623,6 +734,7 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    flex: 1; /* fill .files-body so the tree's empty area is right-clickable */
   }
 
   /* Quiet filter affordance: a small magnifier that expands into an input.
@@ -701,6 +813,18 @@
     flex-direction: column;
     padding: 2px 0.45rem 0.5rem;
     outline: none;
+    /* Fill the FILES area so a right-click BELOW the last row still hits the
+       tree's context menu (Paste into the root) instead of the browser's. */
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* An OS-desktop file drag is hovering the tree: a quiet accent frame marks
+     it as a drop zone (dropping uploads into the folder under the pointer). */
+  .tree.drop-active {
+    box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--accent) 55%, transparent);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
   }
 
   .tree-error,
@@ -846,8 +970,72 @@
     color: var(--fg);
   }
 
+  /* A symlink reads italic (alias convention); it keeps its dir/file color. */
+  .node-name.symlink {
+    font-style: italic;
+  }
+
+  /* A broken symlink is tinted with the error color. */
+  .node-name.broken {
+    color: var(--err);
+  }
+
   .node.active .node-name {
     color: var(--fg);
+  }
+
+  /* A cut-pending row dims until the paste lands (or Escape clears it). */
+  .node.cut {
+    opacity: 0.5;
+  }
+
+  /* Per-node "listing…" row: a small spinner + label, delayed in via CSS so a
+     fast local expand never flickers. No handlers, no tab stop. */
+  .loading-row {
+    cursor: default;
+    color: var(--muted);
+    opacity: 0;
+    animation: node-load-fade 0.15s ease 0.15s forwards;
+    pointer-events: none;
+  }
+
+  .mini-spinner {
+    flex: none;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    animation: node-spin 0.7s linear infinite;
+  }
+
+  .loading-label {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  @keyframes node-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes node-load-fade {
+    to {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mini-spinner {
+      animation-duration: 1.4s;
+    }
+    /* Keep it VISIBLE under reduced motion (don't animate it away). */
+    .loading-row {
+      animation: none;
+      opacity: 1;
+    }
   }
 
   /* Git status: a single-letter badge (files) or a rollup dot (collapsed dirs),

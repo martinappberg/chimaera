@@ -20,6 +20,11 @@ import {
   pruneFiles,
   serializeLayout,
   deserializeLayout,
+  pinTab,
+  pinPaths,
+  movePane,
+  movePaneToRootEdge,
+  findPane,
 } from "./layout";
 
 // Pure layout-tree logic — the single most refactor-fragile pure module in the
@@ -149,5 +154,98 @@ describe("serialize / deserialize round-trip", () => {
     expect(deserializeLayout(42)).toBeNull();
     expect(deserializeLayout({ nope: true })).toBeNull();
     expect(deserializeLayout("not a layout")).toBeNull();
+  });
+});
+
+function isPreview(l: Layout, path: string): boolean {
+  for (const p of panes(l.root))
+    for (const t of p.tabs)
+      if (t.surface === "file" && t.path === path) return t.preview === true;
+  return false;
+}
+
+describe("preview (italic) file tabs", () => {
+  it("a preview open replaces the pane's existing preview tab in place", () => {
+    let l = openFile(defaultLayout(), "/a.txt", true);
+    l = openFile(l, "/b.txt", true);
+    // One preview slot: /a.txt was replaced by /b.txt, not stacked.
+    expect(allFilePaths(l)).toEqual(["/b.txt"]);
+    expect(isPreview(l, "/b.txt")).toBe(true);
+  });
+
+  it("dedupe wins over replace: focusing an already-open path never duplicates", () => {
+    let l = openFile(defaultLayout(), "/a.txt", false); // pinned
+    l = openFile(l, "/a.txt", true); // preview-open the same path
+    expect(allFilePaths(l)).toEqual(["/a.txt"]);
+    expect(isPreview(l, "/a.txt")).toBe(false); // stays pinned
+  });
+
+  it("a pinned open never replaces a preview tab", () => {
+    let l = openFile(defaultLayout(), "/a.txt", true);
+    l = openFile(l, "/b.txt", false);
+    expect(new Set(allFilePaths(l))).toEqual(new Set(["/a.txt", "/b.txt"]));
+  });
+
+  it("pinTab promotes a preview tab to permanent", () => {
+    let l = openFile(defaultLayout(), "/a.txt", true);
+    const p = panes(l.root)[0];
+    l = pinTab(l, p.id, 0);
+    expect(isPreview(l, "/a.txt")).toBe(false);
+  });
+
+  it("pinPaths promotes matching preview tabs (dirty edit)", () => {
+    let l = openFile(defaultLayout(), "/a.txt", true);
+    l = pinPaths(l, new Set(["/a.txt"]));
+    expect(isPreview(l, "/a.txt")).toBe(false);
+    // Same reference when nothing matches.
+    expect(pinPaths(l, new Set(["/nope"]))).toBe(l);
+  });
+
+  it("the preview flag round-trips through serialization", () => {
+    let l = openFile(defaultLayout(), "/a.txt", true);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    expect(isPreview(restored!, "/a.txt")).toBe(true);
+  });
+
+  it("an old blob without pv deserializes as a pinned tab", () => {
+    const blob = { v: 1, focused: "p", root: { t: "p", id: "p", active: 0, tabs: [{ f: "/a.txt" }] } };
+    const restored = deserializeLayout(blob);
+    expect(restored).not.toBeNull();
+    expect(isPreview(restored!, "/a.txt")).toBe(false);
+  });
+});
+
+describe("whole-pane moves", () => {
+  it("movePane center merges the source pane's tabs into the target", () => {
+    let l = openSession(defaultLayout(), "s1");
+    const left = l.focusedPaneId;
+    l = splitPane(l, left, "row");
+    const right = l.focusedPaneId;
+    l = openSession(l, "s2");
+    l = movePane(l, right, left, "center");
+    expect(panes(l.root)).toHaveLength(1);
+    expect(new Set(allSessionIds(l))).toEqual(new Set(["s1", "s2"]));
+  });
+
+  it("movePane to an edge re-parents the pane keeping its id and tabs", () => {
+    let l = openSession(defaultLayout(), "s1");
+    const left = l.focusedPaneId;
+    l = splitPane(l, left, "row");
+    const right = l.focusedPaneId;
+    l = openSession(l, "s2");
+    l = movePane(l, right, left, "bottom");
+    expect(panes(l.root)).toHaveLength(2);
+    // The moved pane kept its id (it was re-parented, not recreated).
+    expect(findPane(l.root, right)).not.toBeNull();
+  });
+
+  it("self-drop and single-pane moves are no-ops", () => {
+    let l = openSession(defaultLayout(), "s1");
+    const only = l.focusedPaneId;
+    expect(movePaneToRootEdge(l, only, "left")).toBe(l); // last pane never moves
+    l = splitPane(l, only, "row");
+    const before = l;
+    expect(movePane(l, l.focusedPaneId, l.focusedPaneId, "center")).toBe(before); // self
   });
 });

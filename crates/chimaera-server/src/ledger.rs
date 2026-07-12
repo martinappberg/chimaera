@@ -498,6 +498,8 @@ fn retire_to_recents(state: &Arc<AppState>, entry: &LedgerEntry, last_active: u6
         } else {
             unix_now()
         },
+        // The ledger snapshots PTY sessions; a boot retirement is a terminal.
+        ui: Some(chimaera_agent::model::SessionUi::Term),
     };
     crate::lock(&state.recents).push(&entry.workspace_id, recent, None);
     true

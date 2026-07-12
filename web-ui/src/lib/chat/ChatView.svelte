@@ -5,8 +5,7 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer } from "./composerBus";
-  import { ChatSocket } from "./chatWs";
-  import { ChatStore } from "./store.svelte";
+  import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
@@ -36,23 +35,15 @@
 
   let { session, focused, terminals = [], onOpenFile, onOpenPath }: Props = $props();
 
-  const store = new ChatStore();
-  // The component is {#key}ed on session id by its parent: one instance, one
-  // session, one socket — the initial capture is the contract.
+  // The component is {#key}ed on session id by its parent: one instance per
+  // session. The store + socket come from the session-keyed chat pool, so a
+  // tab switch (which remounts this component) reuses the warm store and the
+  // open socket instead of re-fetching the whole journal. Release keeps them
+  // warm; the pool disposes them when the session ends or toggles to a PTY.
   // svelte-ignore state_referenced_locally
-  const socket = new ChatSocket(session.id, {
-    onReady: (info, replayFrom, head) => store.onReady(info, replayFrom, head),
-    onEvent: (entry) => store.apply(entry),
-    onDegraded: () => (store.degraded = true),
-    onExited: (status) => (store.exited = { status }),
-    onError: (message) => (store.fatalError = message),
-    // A refused command is a notice, not a dead pane — the socket keeps
-    // reconnecting and the user keeps their transcript.
-    onCommandFailed: (message) => store.notice(message, "error"),
-    onDisconnected: () => store.onDisconnected(),
-    lastSeq: () => store.lastSeq,
-  });
-  onDestroy(() => socket.close());
+  const { store, socket } = acquireChat(session.id);
+  // svelte-ignore state_referenced_locally
+  onDestroy(() => releaseChat(session.id));
 
   // Curated model choices for this agent's picker (daemon-cached catalog).
   let models = $state<{ id: string; label: string }[]>([]);
@@ -73,7 +64,10 @@
   });
 
   let transcriptEl = $state<HTMLElement | null>(null);
-  let atBottom = $state(true);
+  // Seed scroll intent from the pool so a remount restores the reading
+  // position instead of snapping to the bottom.
+  // svelte-ignore state_referenced_locally
+  let atBottom = $state(chatScroll(session.id).atBottom);
   let menu = $state<"model" | "mode" | "effort" | "mcp" | null>(null);
 
   /** Model picker: the agent's own catalog (claude initialize.models /
@@ -83,13 +77,13 @@
    *  picker values ("opus[1m]"), catalog resolvedModel
    *  ("claude-opus-4-8[1m]"), and the BARE api id assistant messages report
    *  ("claude-opus-4-8") — match all three, preferring named entries over
-   *  "Default (recommended)" (both resolve to the same model). Before the
-   *  first turn the "default" entry IS the truth. */
+   *  "Default (recommended)" (both resolve to the same model). While the real
+   *  model is not yet known (store.model === null, before init/ready resolves)
+   *  this is undefined so the header shows a neutral loading chip — NOT a
+   *  concrete "default" that would flash the wrong name (slow on remote). */
   const currentModel = $derived.by(() => {
     const target = store.model;
-    if (target === null) {
-      return store.models.find((m) => m.id === "default") ?? store.models[0];
-    }
+    if (target === null) return undefined;
     const exact = store.models.find((m) => m.id === target || m.resolved === target);
     if (exact !== undefined) return exact;
     const norm = (s: string) => s.replace(/\[[^\]]*\]$/, "");
@@ -126,11 +120,29 @@
     const el = transcriptEl;
     if (el === null) return;
     atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    // Persist into the pool so the next remount restores this position.
+    saveChatScroll(session.id, el.scrollTop, atBottom);
   }
 
   function scrollToBottom() {
     transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
   }
+
+  // On (re)mount, restore the saved reading position ONCE: bottom-pinned
+  // sessions stick to the bottom, otherwise jump back to where the user was
+  // reading. Guarded so it never re-fires mid-stream and fights the autoscroll.
+  let didRestore = false;
+  $effect(() => {
+    const el = transcriptEl;
+    if (el === null || didRestore) return;
+    didRestore = true;
+    const saved = chatScroll(session.id);
+    void tick().then(() => {
+      if (transcriptEl === null) return;
+      if (saved.atBottom) scrollToBottom();
+      else transcriptEl.scrollTop = saved.scrollTop;
+    });
+  });
 
   // Stick to the bottom while new content streams, unless the user scrolled
   // up to read history. Guarded on atBottom so a background stream never forces
@@ -452,7 +464,14 @@
   const modelLabel = $derived.by(() => {
     if (currentModel !== undefined) return currentModel.label;
     const m = store.model;
-    if (m === null) return null;
+    if (m === null) {
+      // A fresh session never reports a model until its first turn — don't
+      // skeleton forever. Once the catalog is loaded, show the DEFAULT it will
+      // use (correct for a new chat); only the brief pre-catalog window (no
+      // choices yet) stays null → skeleton.
+      const def = modelChoices.find((c) => c.id === "default") ?? modelChoices[0];
+      return def?.label ?? null;
+    }
     const match = /claude-(\w+)-(\d+)-(\d+)/.exec(m);
     return match !== null ? `${match[1]} ${match[2]}.${match[3]}` : m;
   });
@@ -473,6 +492,38 @@
       default:
         return a.detail === "starting" ? "starting" : "working";
     }
+  });
+
+  // Elapsed-turn timer: a quiet counter that surfaces once a turn passes 5s and
+  // ticks each second. The START is held in the chat pool (per session), so
+  // switching away mid-turn and back keeps counting from the real turn start
+  // instead of resetting — and performance.now() never leaks into replay. The
+  // interval tears down when the turn ends or the component unmounts.
+  let turnElapsedMs = $state(0);
+  $effect(() => {
+    const start = chatTurnStart(session.id, store.running, performance.now());
+    if (start === null) {
+      turnElapsedMs = 0;
+      return;
+    }
+    turnElapsedMs = performance.now() - start;
+    const iv = setInterval(() => {
+      turnElapsedMs = performance.now() - start;
+    }, 1000);
+    return () => clearInterval(iv);
+  });
+  /** Upward "1h 2m 13s"-style elapsed, leading zero-units dropped: "7s",
+   *  "1m 04s", "1h 02m 03s". Null below 5s so quick turns stay uncluttered. */
+  const turnElapsedLabel = $derived.by(() => {
+    const total = Math.floor(turnElapsedMs / 1000);
+    if (total < 5) return null;
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    if (h > 0) return `${h}h ${pad(m)}m ${pad(s)}s`;
+    if (m > 0) return `${m}m ${pad(s)}s`;
+    return `${s}s`;
   });
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
@@ -683,6 +734,9 @@
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
         </span>
         <span class="status-label">{activityLabel}</span>
+        {#if turnElapsedLabel !== null}
+          <span class="status-elapsed">{turnElapsedLabel}</span>
+        {/if}
       </div>
     {/if}
 
@@ -1024,6 +1078,13 @@
   /* Ellipsis that breathes with the spark, without layout shift. */
   .status-label::after {
     content: "…";
+  }
+  /* Elapsed counter: a still, muted number beside the pulsing label (only
+     appears past 5s). No animation — reduced-motion safe by construction. */
+  .status-elapsed {
+    font-family: var(--mono, monospace);
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--muted) 80%, transparent);
   }
   @keyframes spark-pulse {
     0%,

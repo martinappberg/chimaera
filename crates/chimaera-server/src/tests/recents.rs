@@ -20,7 +20,13 @@ async fn recents_retire_round_trips_and_persists() {
         Some(transcript.to_str().unwrap()),
     );
 
-    recents::retire(&state, "s-1", None, None);
+    recents::retire(
+        &state,
+        "s-1",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
 
     let entries = recents_of(&state, &ws).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
@@ -28,6 +34,8 @@ async fn recents_retire_round_trips_and_persists() {
     assert_eq!(entries[0]["title"], "fix the flaky test");
     assert_eq!(entries[0]["resume"], "abc-123");
     assert!(entries[0]["last_active"].as_u64().unwrap() > 0);
+    // The last-used surface rode along, so the row reopens in the same mode.
+    assert_eq!(entries[0]["ui"], "chat");
     // The record and its workspace mapping are gone (retire IS the
     // cleanup path).
     assert!(lock(&state.agents).get("s-1").is_none());
@@ -39,6 +47,8 @@ async fn recents_retire_round_trips_and_persists() {
     let entries = recents_of(&reloaded, &ws).await;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["resume"], "abc-123");
+    // The `ui` field persists through the store file across a restart.
+    assert_eq!(entries[0]["ui"], "chat");
 }
 
 #[tokio::test]
@@ -55,17 +65,35 @@ async fn recents_skip_untitled_claude_keep_codex_and_pins_win() {
         None,
         None,
     );
-    recents::retire(&state, "s-empty", None, None);
+    recents::retire(
+        &state,
+        "s-empty",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
     assert!(recents_of(&state, &ws).await.is_empty());
 
     // Codex has no title machinery: its bare-name row still counts.
     plant_agent_record(&state, "s-cdx", &ws, agents::AgentKind::Codex, None, None);
-    recents::retire(&state, "s-cdx", None, None);
+    recents::retire(
+        &state,
+        "s-cdx",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
 
     // A user-renamed claude keeps its pinned name, and an OSC title
     // beats the ai title (same precedence as live display names).
     plant_agent_record(&state, "s-pin", &ws, agents::AgentKind::Claude, None, None);
-    recents::retire(&state, "s-pin", Some("bio-evolve run"), None);
+    recents::retire(
+        &state,
+        "s-pin",
+        Some("bio-evolve run"),
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
 
     let entries = recents_of(&state, &ws).await;
     assert_eq!(entries.len(), 2, "{entries:?}");
@@ -93,7 +121,13 @@ async fn recents_hide_live_conversations_and_dedupe_resumes() {
         Some("hooks online"),
         Some(transcript),
     );
-    recents::retire(&state, "s-a", None, None);
+    recents::retire(
+        &state,
+        "s-a",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
     assert_eq!(recents_of(&state, &ws).await.len(), 1);
 
     // The same conversation resumed in a live session: hidden, not lost.
@@ -110,7 +144,13 @@ async fn recents_hide_live_conversations_and_dedupe_resumes() {
     // It ends again with a newer title: back in the list, still one entry.
     crate::lock(&state.agents).get_mut("s-b").unwrap().ai_title =
         Some("hooks online v2".to_string());
-    recents::retire(&state, "s-b", None, None);
+    recents::retire(
+        &state,
+        "s-b",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
     let entries = recents_of(&state, &ws).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["title"], "hooks online v2");
@@ -135,7 +175,13 @@ async fn recents_hide_live_conversations_and_dedupe_resumes() {
         record.ai_title = Some("hooks online v3".to_string());
         record.transcript_path = Some(continuation);
     }
-    recents::retire(&state, "s-c", None, None);
+    recents::retire(
+        &state,
+        "s-c",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
     let entries = recents_of(&state, &ws).await;
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0]["title"], "hooks online v3");
@@ -195,7 +241,13 @@ async fn recents_merge_daemon_history_with_transcript_store() {
         Some("fresh daemon title"),
         Some(both_path.to_str().unwrap()),
     );
-    recents::retire(&state, "s-both", None, None);
+    recents::retire(
+        &state,
+        "s-both",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
     // And one daemon-only codex conversation (no transcript machinery).
     plant_agent_record(
         &state,
@@ -205,7 +257,13 @@ async fn recents_merge_daemon_history_with_transcript_store() {
         None,
         None,
     );
-    recents::retire(&state, "s-cdx", None, None);
+    recents::retire(
+        &state,
+        "s-cdx",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
 
     let entries = recents_of(&state, &ws_id).await;
     let titles: Vec<&str> = entries
@@ -264,7 +322,13 @@ async fn recents_merge_daemon_history_with_transcript_store() {
         .get_mut("s-resumed")
         .unwrap()
         .resumed_from = Some("both-2".to_string());
-    recents::retire(&state, "s-resumed", None, None);
+    recents::retire(
+        &state,
+        "s-resumed",
+        None,
+        None,
+        chimaera_agent::model::SessionUi::Chat,
+    );
 
     let entries = recents_of(&state, &ws_id).await;
     let lineage: Vec<&serde_json::Value> = entries

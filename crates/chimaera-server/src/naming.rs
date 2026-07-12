@@ -147,8 +147,15 @@ fn resolve_shell_name(
     let fg = state.sessions.foreground_pid(&info.id).unwrap_or(child);
 
     // A foreground process group other than the shell's own means a command
-    // is running — its name is the most specific thing we know.
-    if fg != child {
+    // is running — its name is the most specific thing we know. But trust it
+    // ONLY when `fg` is genuinely a descendant of this shell: `tcgetpgrp` can
+    // transiently (right after spawn) report a pgid that, read back as a pid,
+    // lands on an unrelated process — including one of the daemon's OWN tokio
+    // worker THREADS (on Linux tids and pids share a namespace, so a stray
+    // tid reads a "tokio-runtime-worker" comm). The descendant check keeps a
+    // real foreground job ("snakemake") while rejecting those aliases, which
+    // otherwise leaked as the session title.
+    if fg != child && is_descendant(fg, child) {
         if let Some(comm) = proc_info::comm(fg) {
             return Some(comm);
         }
@@ -165,6 +172,28 @@ fn resolve_shell_name(
         },
         None => Some(shell),
     }
+}
+
+/// Is `pid` the shell `child`, or a descendant of it? Walk the ppid chain up
+/// from `pid` (bounded, so a cycle from a recycled pid can't loop). A real
+/// foreground job always traces back to the shell; a stray pid/tid the tty
+/// briefly reported (e.g. a daemon tokio worker thread) does not. When ppid
+/// lookups are unavailable (unsupported platform), assume true so naming
+/// degrades to today's behavior rather than losing every command name.
+fn is_descendant(pid: i32, child: i32) -> bool {
+    if pid == child {
+        return true;
+    }
+    let mut cur = pid;
+    for _ in 0..32 {
+        match proc_info::ppid(cur) {
+            Some(parent) if parent == child => return true,
+            Some(parent) if parent <= 1 => return false, // reached init/kernel
+            Some(parent) => cur = parent,
+            None => return true, // unknowable → don't discard a real name
+        }
+    }
+    false
 }
 
 /// Workspace root for a session, via the session -> workspace map.
@@ -217,6 +246,16 @@ mod proc_info {
     pub(super) fn cwd(pid: i32) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
+
+    /// Parent pid (`/proc/<pid>/stat` field 4). The comm field (2) is
+    /// parenthesized and may itself contain spaces/parens, so split on the
+    /// LAST ')' before reading the space-separated fields after it.
+    pub(super) fn ppid(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = &stat[stat.rfind(')')? + 1..];
+        // Fields after comm: state ppid ... — ppid is the 2nd token here.
+        after.split_whitespace().nth(1)?.parse().ok()
+    }
 }
 
 /// Process name + cwd lookups, macOS flavor: libproc (`proc_name` for the
@@ -225,6 +264,7 @@ mod proc_info {
 mod proc_info {
     use std::path::PathBuf;
 
+    use libproc::libproc::bsd_info::BSDInfo;
     use libproc::libproc::proc_pid::{name, pidinfo, PIDInfo, PidInfoFlavor};
 
     const MAXPATHLEN: usize = 1024;
@@ -268,6 +308,12 @@ mod proc_info {
         let path = std::str::from_utf8(&path[..len]).ok()?;
         (!path.is_empty()).then(|| PathBuf::from(path))
     }
+
+    /// Parent pid of `pid` (libproc `PROC_PIDTBSDINFO` → `pbi_ppid`).
+    pub(super) fn ppid(pid: i32) -> Option<i32> {
+        let info = pidinfo::<BSDInfo>(pid, 0).ok()?;
+        i32::try_from(info.pbi_ppid).ok()
+    }
 }
 
 /// Fallback for other platforms: no foreground introspection; the watcher
@@ -281,6 +327,10 @@ mod proc_info {
     }
 
     pub(super) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn ppid(_pid: i32) -> Option<i32> {
         None
     }
 }

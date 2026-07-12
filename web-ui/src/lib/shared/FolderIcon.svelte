@@ -14,9 +14,11 @@
     /** Inherit the surrounding text color (active tab / hover) instead of the
      *  folder tint. */
     plain?: boolean;
+    /** Draw the symlink alias-arrow badge (a symlinked directory). */
+    link?: boolean;
   }
 
-  let { open = false, size = 15, plain = false }: Props = $props();
+  let { open = false, size = 15, plain = false, link = false }: Props = $props();
 </script>
 
 <svg
@@ -41,6 +43,13 @@
       d="M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2"
     />
   {/if}
+  {#if link}
+    <!-- Symlink alias arrow, bottom-left: knockout disc + tiny up-right arrow. -->
+    <g class="link-badge">
+      <circle cx="6" cy="18" r="5" class="link-knockout" stroke="none" />
+      <path d="M4 20l4 -4M8 16h-2.6M8 16v2.6" stroke-width="1.6" />
+    </g>
+  {/if}
 </svg>
 
 <style>
@@ -54,5 +63,12 @@
   .folder.plain {
     color: currentColor;
     opacity: 0.85;
+  }
+
+  .link-knockout {
+    fill: var(--pane-bg, var(--bg));
+  }
+  .link-badge {
+    color: var(--muted);
   }
 </style>

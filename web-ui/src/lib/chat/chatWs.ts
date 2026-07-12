@@ -175,6 +175,16 @@ export class ChatSocket {
     }
   }
 
+  /**
+   * True while this socket is still a going concern: not deliberately closed,
+   * not fatally errored, and not ended (exited/degraded). A pooled socket that
+   * is no longer healthy is recreated on the next acquire (its store's lastSeq
+   * is preserved, so the re-attach gap-replays from the ring, not from 0).
+   */
+  get healthy(): boolean {
+    return !this.closed && !this.fatal && !this.ended;
+  }
+
   /** Send an AgentCommand frame; false when the socket is not open. */
   send(command: Record<string, unknown>): boolean {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;

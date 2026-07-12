@@ -79,7 +79,17 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/mkdir", post(fs::mkdir))
         .route("/fs/create", post(fs::create))
         .route("/fs/rename", post(fs::rename))
+        .route("/fs/copy", post(fs::copy))
+        .route("/fs/move", post(fs::move_))
         .route("/fs/delete", post(fs::delete))
+        // OS-desktop drop into a chosen folder; same streaming + body-limit
+        // override as the session upload route.
+        .route(
+            "/fs/upload",
+            post(upload::upload_to_dir).layer(axum::extract::DefaultBodyLimit::max(
+                upload::MAX_UPLOAD_BYTES as usize + 64 * 1024,
+            )),
+        )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route(

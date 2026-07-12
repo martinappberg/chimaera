@@ -11,7 +11,7 @@
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
-  import { PINNED } from "../shared/keys";
+  import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
   /** Nav sections come straight from the schema categories. */
@@ -98,6 +98,19 @@
     { label: "Terminal text smaller", chord: PINNED.fontMinus },
     { label: "Terminal text reset", chord: PINNED.fontReset },
   ]);
+
+  /**
+   * The native app's menu-bar chords — fixed accelerators that fire only in the
+   * chimaera app (a browser reserves ⌘W/⌘T/⌘N). Shown so the full map lives in
+   * one place: ⌘W is why a view closes when the rebindable Close View chord is
+   * elsewhere. Not reactive to keys.modifier — the menu owns concrete chords.
+   */
+  const appMenuRows = [
+    { label: "Close view", chord: APP_MENU.closeView },
+    { label: "New terminal", chord: APP_MENU.newTerminal },
+    { label: "New agent", chord: APP_MENU.newAgent },
+    { label: "New window", chord: APP_MENU.newWindow },
+  ];
 </script>
 
 <div class="settings">
@@ -187,6 +200,23 @@
             </p>
             <ul class="kbd-list">
               {#each pinnedRows as row (row.label)}
+                <li class="kbd-row">
+                  <span class="kbd-label">{row.label}</span>
+                  <kbd class="kbd-pill">{row.chord}</kbd>
+                </li>
+              {/each}
+            </ul>
+          </div>
+
+          <div class="kbd-group">
+            <h3 class="kbd-group-title">chimaera app menu</h3>
+            <p class="kbd-note">
+              The native app's menu bar owns the chords a browser reserves, so these fire only in
+              the chimaera app. Several are a second way to reach a rebindable action above —
+              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
+            </p>
+            <ul class="kbd-list">
+              {#each appMenuRows as row (row.label)}
                 <li class="kbd-row">
                   <span class="kbd-label">{row.label}</span>
                   <kbd class="kbd-pill">{row.chord}</kbd>

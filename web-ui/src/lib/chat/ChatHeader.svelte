@@ -88,12 +88,19 @@
   <div class="menu-host">
     <button
       class="chip pick"
-      title="model — click to switch"
+      title={modelLabel === null ? "resolving model…" : "model — click to switch"}
       aria-haspopup="menu"
       aria-expanded={menu === "model"}
       onclick={() => (menu = menu === "model" ? null : "model")}
     >
-      {modelLabel ?? "model"}
+      <!-- Skeleton only in the brief window before the model catalog loads
+           (modelLabel null). Once it's loaded, modelLabel is the session's real
+           model — or the default a fresh chat will use — never a wrong flash. -->
+      {#if modelLabel === null}
+        <span class="model-skel" aria-label="loading model"></span>
+      {:else}
+        {modelLabel}
+      {/if}
       {@render caret()}
     </button>
     {#if menu === "model"}
@@ -277,6 +284,31 @@
   .caret {
     display: inline-flex;
     opacity: 0.7;
+  }
+  /* Neutral loading placeholder for the model chip: a short muted bar that
+     breathes, so the header reads "resolving" rather than flashing a wrong
+     default. Static (no pulse) under reduced-motion — it's just a placeholder. */
+  .model-skel {
+    display: inline-block;
+    width: 42px;
+    height: 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg) 22%, transparent);
+    animation: skel-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes skel-pulse {
+    0%,
+    100% {
+      opacity: 0.5;
+    }
+    50% {
+      opacity: 0.9;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .model-skel {
+      animation: none;
+    }
   }
   /* .overlay-surface / .overlay-row live in app.css; .menu / .menu-row add the
      dropdown anchor and the menu-item specifics. */

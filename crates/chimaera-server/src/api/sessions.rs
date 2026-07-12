@@ -461,7 +461,13 @@ pub(crate) async fn delete_session(
             state.chat.kill(&id);
         } else {
             state.chat.remove(&id);
-            crate::recents::retire(&state, &id, None, None);
+            crate::recents::retire(
+                &state,
+                &id,
+                None,
+                None,
+                chimaera_agent::model::SessionUi::Chat,
+            );
         }
         state.changes.notify_waiters();
         return StatusCode::NO_CONTENT.into_response();

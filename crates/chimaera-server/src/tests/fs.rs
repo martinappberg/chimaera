@@ -242,6 +242,115 @@ async fn fs_delete_removes_files_dirs_symlinks_and_refuses_home() {
 }
 
 #[tokio::test]
+async fn fs_copy_files_dirs_symlinks_unique_and_guards() {
+    let state = test_state();
+    let root = test_dir("fs-copy");
+    let copy = |from: &std::path::Path, to: &std::path::Path, on_conflict: Option<&str>| {
+        let mut body = serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy(),
+        });
+        if let Some(oc) = on_conflict {
+            body["on_conflict"] = serde_json::json!(oc);
+        }
+        let state = state.clone();
+        async move { request(&state, Method::POST, "/api/v1/fs/copy", Some(body)).await }
+    };
+
+    // File copy: source survives, target is a byte-for-byte duplicate.
+    let src = root.join("a.txt");
+    std::fs::write(&src, "data").unwrap();
+    let dst = root.join("b.txt");
+    let (status, json) = copy(&src, &dst, None).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), "data");
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "data");
+
+    // Directory copy recurses; the source tree is untouched.
+    let dir = root.join("proj");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/f.txt"), "x").unwrap();
+    let dir_dst = root.join("proj-copy");
+    let (status, _) = copy(&dir, &dir_dst, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        std::fs::read_to_string(dir_dst.join("sub/f.txt")).unwrap(),
+        "x"
+    );
+    assert!(dir.join("sub/f.txt").is_file());
+
+    // A symlink is copied AS a link, never followed.
+    let target = root.join("t.txt");
+    std::fs::write(&target, "t").unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link_copy = root.join("link-copy");
+    let (status, _) = copy(&link, &link_copy, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(link_copy.symlink_metadata().unwrap().is_symlink());
+
+    // Copy onto an existing path: 409 by default, a free " copy" sibling with
+    // on_conflict=unique.
+    let (status, _) = copy(&src, &dst, None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, json) = copy(&src, &dst, Some("unique")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["path"].as_str().unwrap(),
+        std::fs::canonicalize(root.join("b copy.txt"))
+            .unwrap()
+            .to_string_lossy()
+    );
+
+    // Refuse copying a directory into its own subtree.
+    let (status, json) = copy(&dir, &dir.join("nested"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("into itself"));
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn fs_move_relocates_and_guards() {
+    let state = test_state();
+    let root = test_dir("fs-move");
+    let mv = |from: &std::path::Path, to: &std::path::Path| {
+        let body = serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy(),
+        });
+        let state = state.clone();
+        async move { request(&state, Method::POST, "/api/v1/fs/move", Some(body)).await }
+    };
+
+    // Same-filesystem move: source gone, target has the bytes.
+    let src = root.join("a.txt");
+    std::fs::write(&src, "data").unwrap();
+    let dst = root.join("sub").join("a.txt");
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    let (status, json) = mv(&src, &dst).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(!src.exists());
+    assert_eq!(std::fs::read_to_string(&dst).unwrap(), "data");
+
+    // Moving onto an existing path is a conflict; both files survive.
+    let keep = root.join("keep.txt");
+    std::fs::write(&keep, "keep").unwrap();
+    let (status, _) = mv(&dst, &keep).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), "keep");
+
+    // Home and dir-into-itself are refused; a missing source is a 400.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let (status, _) = mv(&home, &root.join("x")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = mv(&root.join("nope"), &root.join("y")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn fs_dirs_lists_only_directories_sorted() {
     let state = test_state();
     let root = test_dir("fs-list");
@@ -641,6 +750,10 @@ async fn fs_list_dirs_first_sorted_with_metadata() {
     std::fs::write(root.join("README.md"), "hello").unwrap();
     std::fs::write(root.join("app.rs"), "fn main() {}").unwrap();
     std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+    // A symlink to a dir (kind "dir", symlink true), one to a file (kind
+    // "file"), and a dangling one (kind "file", broken true) — all marked.
+    std::os::unix::fs::symlink(root.join("src"), root.join("link-dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("app.rs"), root.join("link-file")).unwrap();
     std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
 
     let canonical = std::fs::canonicalize(&root).unwrap();
@@ -653,24 +766,54 @@ async fn fs_list_dirs_first_sorted_with_metadata() {
         canonical.parent().unwrap().to_str().unwrap()
     );
 
-    // Dirs first (case-insensitive), then files; dot entries and broken
-    // symlinks excluded.
+    // Dirs first (case-insensitive), then files; dot entries excluded. A
+    // symlink-to-dir sorts with the dirs (its resolved kind), links and the
+    // broken one sort among the files.
     let entries = json["entries"].as_array().unwrap();
+    let by_name = |n: &str| entries.iter().find(|e| e["name"] == n).unwrap();
     let names: Vec<&str> = entries
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["Docs", "src", "app.rs", "README.md"]);
-    assert_eq!(entries[0]["kind"], "dir");
-    assert_eq!(entries[1]["kind"], "dir");
-    assert_eq!(entries[2]["kind"], "file");
-    assert_eq!(entries[3]["kind"], "file");
-    assert_eq!(entries[3]["size"], 5); // "hello"
-    assert!(entries[3]["mtime"].as_u64().unwrap() > 0);
     assert_eq!(
-        entries[2]["path"].as_str().unwrap(),
-        canonical.join("app.rs").to_str().unwrap()
+        names,
+        [
+            "Docs",
+            "link-dir",
+            "src",
+            "app.rs",
+            "dangling",
+            "link-file",
+            "README.md"
+        ]
     );
+    assert_eq!(by_name("README.md")["kind"], "file");
+    assert_eq!(by_name("README.md")["size"], 5); // "hello"
+                                                 // A symlink-to-dir keeps kind "dir" (navigation is unchanged) but is
+                                                 // marked, with its raw target text for the "→" hover.
+    assert_eq!(by_name("link-dir")["kind"], "dir");
+    assert_eq!(by_name("link-dir")["symlink"], true);
+    // `target` is the raw readlink text, exactly as it was created (not
+    // canonicalized), so it's the pre-/private path we passed to symlink().
+    assert_eq!(
+        by_name("link-dir")["target"].as_str().unwrap(),
+        root.join("src").to_str().unwrap()
+    );
+    assert!(!by_name("link-dir")["broken"].as_bool().unwrap_or(false));
+    // A symlink-to-file: kind "file", marked, not broken.
+    assert_eq!(by_name("link-file")["kind"], "file");
+    assert_eq!(by_name("link-file")["symlink"], true);
+    // A dangling symlink is now VISIBLE (so it can be removed from the UI):
+    // kind "file", symlink true, broken true, its target text preserved.
+    assert_eq!(by_name("dangling")["kind"], "file");
+    assert_eq!(by_name("dangling")["symlink"], true);
+    assert_eq!(by_name("dangling")["broken"], true);
+    assert_eq!(
+        by_name("dangling")["target"].as_str().unwrap(),
+        root.join("nowhere").to_str().unwrap()
+    );
+    // A plain file omits the additive symlink fields entirely.
+    assert!(by_name("README.md").get("symlink").is_none());
 
     // hidden=true adds the dot entries in their sorted spots.
     let uri = format!(
@@ -687,7 +830,17 @@ async fn fs_list_dirs_first_sorted_with_metadata() {
         .collect();
     assert_eq!(
         names,
-        [".git", "Docs", "src", ".env", "app.rs", "README.md"]
+        [
+            ".git",
+            "Docs",
+            "link-dir",
+            "src",
+            ".env",
+            "app.rs",
+            "dangling",
+            "link-file",
+            "README.md"
+        ]
     );
 }
 

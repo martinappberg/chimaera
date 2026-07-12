@@ -58,8 +58,10 @@
   import {
     reportUploadError,
     setUploadPathInserter,
+    trackFileOp,
     uploadAndInsert,
     uploadJobs,
+    uploadToDir,
   } from "./lib/net/uploads";
   import { get } from "svelte/store";
   import {
@@ -93,9 +95,14 @@
     focusedSession as focusedSessionOf,
     moveFocus,
     moveTabToIndex,
+    movePane,
+    movePaneToIndex,
+    movePaneToRootEdge,
     openChanges,
     openDiff,
     openFile,
+    pinTab,
+    pinPaths,
     openFinder,
     findFinder,
     freshFinderTab,
@@ -164,10 +171,12 @@
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
+  import * as chatPool from "./lib/chat/chatPool";
   import {
     applyRemoteSettings,
     flushSettings,
     loadSettings,
+    setSetting,
   } from "./lib/settings/store.svelte";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
   import {
@@ -186,7 +195,7 @@
   import ContextMenuHost from "./lib/shared/ContextMenuHost.svelte";
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
-  import { fsDeleteOp, lastFsMutation, pendingDelete } from "./lib/workspace/fsEvents";
+  import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
@@ -323,6 +332,17 @@
   // --- the rail's Recents section (ended agent conversations) ---
   let recents = $state<RecentConvo[]>([]);
   let recentsExpanded = $state(false);
+  /** Recents to SHOW: drop any whose conversation is currently LIVE (a live
+   *  agent with the same title). A running conversation belongs under AGENTS,
+   *  not RECENT — and the server's live-exclusion can briefly miss a fresh
+   *  session whose transcript id isn't recorded yet, so a row would otherwise
+   *  appear in both sections at once. */
+  const visibleRecents = $derived.by(() => {
+    const liveTitles = new Set(
+      sessions.filter((s) => s.kind === "agent" && s.alive).map((s) => displayName(s)),
+    );
+    return recents.filter((r) => r.title === "" || !liveTitles.has(r.title));
+  });
   /** Rail row currently showing the inline kill confirmation. */
   let confirmKillId = $state<string | null>(null);
   /** Rail row currently in inline rename (double-click or F2). */
@@ -581,11 +601,13 @@
     return () => unregisterStage(el);
   });
 
-  // Dispose pooled terminals for sessions that no longer exist.
+  // Dispose pooled terminals AND pooled chat sessions for sessions that no
+  // longer exist (a killed session, a workspace switch).
   $effect(() => {
     const ids = sessions.map((s) => s.id);
     if (!gotSessions) return;
     pool.syncSessions(ids);
+    chatPool.syncChatSessions(new Set(ids));
   });
 
   onMount(() => {
@@ -728,6 +750,7 @@
       setUploadPathInserter(null);
       events.close();
       pool.disposePool();
+      chatPool.disposeAllChats();
     };
   });
 
@@ -879,6 +902,32 @@
     return s !== undefined && s.alive ? s : null;
   }
 
+  /** The FOLDER an OS-desktop file drop at (x, y) should land in — a Finder
+   *  column, a FILES-tree dir row, or the tree root — or null when the point
+   *  is over neither. Hit-tests the data attributes those surfaces stamp
+   *  (elementFromPoint is valid during an HTML5 drag; there is no in-DOM ghost
+   *  to occlude). `paneId` is the Finder pane to wash (null for the rail tree). */
+  function osFolderTargetAt(x: number, y: number): { paneId: string | null; dir: string } | null {
+    const el = document.elementFromPoint(x, y);
+    if (!(el instanceof Element)) return null;
+    // A FILES-tree dir row (files target their parent; broken links have none).
+    const row = el.closest<HTMLElement>("[data-drop-dir]");
+    if (row?.dataset.dropDir != null && el.closest(".tree") !== null) {
+      return { paneId: null, dir: row.dataset.dropDir };
+    }
+    // The tree background → the workspace root.
+    const treeRoot = el.closest<HTMLElement>("[data-tree-root]");
+    if (treeRoot?.dataset.treeRoot != null) {
+      return { paneId: null, dir: treeRoot.dataset.treeRoot };
+    }
+    // A Finder column → that column's directory.
+    const col = el.closest<HTMLElement>("[data-finder-dir]");
+    if (col?.dataset.finderDir != null) {
+      return { paneId: paneIdAt(x, y), dir: col.dataset.finderDir };
+    }
+    return null;
+  }
+
   /** Depth-counted dragenter/leave so child enter/leave churn never flickers
    *  the drop overlay off mid-drag. */
   let osDragDepth = 0;
@@ -901,6 +950,14 @@
     // breaks text/URL drop into the composer and every other input).
     if (!isOsFileDrag(e)) return;
     e.preventDefault();
+    // A folder target (Finder column / FILES-tree dir) wins over the session
+    // pane it may sit inside — dropping onto the file manager uploads THERE.
+    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    if (folder !== null) {
+      if (e.dataTransfer !== null) e.dataTransfer.dropEffect = "copy";
+      dropSpot = { kind: "uploadDir", paneId: folder.paneId, dir: folder.dir };
+      return;
+    }
     const paneId = paneIdAt(e.clientX, e.clientY);
     const ok = paneId !== null && osDropSession(paneId) !== null;
     if (e.dataTransfer !== null) e.dataTransfer.dropEffect = ok ? "copy" : "none";
@@ -912,7 +969,9 @@
   function onWindowDragLeave(e: DragEvent): void {
     if (!isOsFileDrag(e)) return;
     osDragDepth = Math.max(0, osDragDepth - 1);
-    if (osDragDepth === 0 && dropSpot?.kind === "upload") dropSpot = null;
+    if (osDragDepth === 0 && (dropSpot?.kind === "upload" || dropSpot?.kind === "uploadDir")) {
+      dropSpot = null;
+    }
   }
 
   function onWindowDrop(e: DragEvent): void {
@@ -921,18 +980,53 @@
     if (!isOsFileDrag(e)) return;
     e.preventDefault();
     osDragDepth = 0;
-    if (dropSpot?.kind === "upload") dropSpot = null;
+    const spot = dropSpot;
+    if (spot?.kind === "upload" || spot?.kind === "uploadDir") dropSpot = null;
     const dt = e.dataTransfer;
     if (dt === null) return;
-    const paneId = paneIdAt(e.clientX, e.clientY);
-    const s = paneId !== null ? osDropSession(paneId) : null;
-    if (s === null) return;
     // Read files AND directory-ness synchronously — webkitGetAsEntry is only
     // valid while the drop event dispatches.
     const picked = [...dt.items]
       .filter((i) => i.kind === "file")
       .map((i) => ({ file: i.getAsFile(), dir: i.webkitGetAsEntry?.()?.isDirectory === true }));
+    // A folder target (file manager) uploads INTO that directory; otherwise
+    // fall back to the live-session upload+reference flow.
+    const folder = osFolderTargetAt(e.clientX, e.clientY);
+    if (folder !== null) {
+      void dropFilesInDir(folder.dir, picked);
+      return;
+    }
+    const paneId = paneIdAt(e.clientX, e.clientY);
+    const s = paneId !== null ? osDropSession(paneId) : null;
+    if (s === null) return;
     void dropFilesOnSession(s.id, picked);
+  }
+
+  /** Upload each dropped file INTO `dir` (a file-manager folder target), then
+   *  nudge the fs bus so the tree/Finder re-list. Same 8-file cap + folders-
+   *  rejected rule as the session drop. */
+  async function dropFilesInDir(
+    dir: string,
+    picked: { file: File | null; dir: boolean }[],
+  ): Promise<void> {
+    let accepted = 0;
+    for (const { file, dir: isDir } of picked) {
+      if (isDir) {
+        reportUploadError(`${file?.name ?? "folder"}: drop files, not folders`);
+        continue;
+      }
+      if (file === null) continue;
+      if (accepted >= OS_DROP_MAX_FILES) {
+        reportUploadError(`${file.name}: skipped (max ${OS_DROP_MAX_FILES} files per drop)`);
+        continue;
+      }
+      accepted += 1;
+      const result = await trackFileOp(`Uploading ${file.name}…`, () =>
+        uploadToDir(dir, file, file.name),
+      );
+      // Re-list the destination so the new file appears without a manual refresh.
+      if (result !== null) notifyCreated(result.path);
+    }
   }
 
   /** How many files one drop gesture will accept. */
@@ -1008,17 +1102,19 @@
    * otherwise it lands in the adjacent pane, or a fresh split to the right
    * when the window has one pane or Cmd/Ctrl forced a new split.
    */
-  function openFileFromPane(paneId: string, path: string, newSplit: boolean): void {
+  function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
     } else {
+      // Opens are PREVIEW tabs (italic, replaced by the next preview open)
+      // unless the caller pinned them (a tree double-click, a created file).
       const neighbor = newSplit ? null : adjacentPane(layout, paneId);
       if (neighbor !== null) {
-        layout = openFile(focusPane(layout, neighbor), path);
+        layout = openFile(focusPane(layout, neighbor), path, !pinned);
       } else {
         layout = splitPane(layout, paneId, "row");
-        layout = openFile(layout, path);
+        layout = openFile(layout, path, !pinned);
       }
     }
     // A file surface took focus: pull DOM focus off the terminal so plain
@@ -1447,6 +1543,18 @@
     return () => window.removeEventListener("beforeunload", handler);
   });
 
+  // A file that became dirty must never be a PREVIEW tab: an unsaved edit
+  // that the next preview open silently replaced would be lost. Promote any
+  // dirty preview tab to a permanent one. untrack() so writing `layout` here
+  // doesn't loop with the read; pinPaths returns the same reference when
+  // nothing matched, so this is inert until an edit actually lands.
+  $effect(() => {
+    const dirty = $dirtyFiles;
+    untrack(() => {
+      layout = pinPaths(layout, dirty);
+    });
+  });
+
   /** Open workspace `w` in THIS window — the launcher click, the folder
    *  picker's "open here", and worktree-session reveal all mean "here". A
    *  workspace already open in another window is deliberately NOT diverted to:
@@ -1502,6 +1610,10 @@
   const lastCreatedAt = new Map<string, number>();
 
   function applySessions(list: Session[]): void {
+    // A session being optimistically killed is tombstoned: never re-add it
+    // from an intervening snapshot (the server hasn't finished the stop yet),
+    // so the row can't flicker back before it's really gone.
+    if (killing.size > 0) list = list.filter((s) => !killing.has(s.id));
     for (const s of list) {
       if (s.created_at !== 0) lastCreatedAt.set(s.id, s.created_at);
     }
@@ -1515,9 +1627,12 @@
     // A session now running as chat has no PTY: dispose any warm terminal
     // for it in THIS window (every window sees the flip on the bus), so a
     // later toggle back to terminal mounts fresh instead of replaying a
-    // dead socket's screen.
+    // dead socket's screen. Symmetrically, a session now running as a TUI has
+    // no chat driver — drop its pooled chat socket (it flagged `ended` on the
+    // degrade frame and stopped reconnecting; it's dead weight).
     for (const s of list) {
       if (s.ui === "chat") pool.disposeSession(s.id);
+      else if (s.ui === "term") chatPool.disposeChat(s.id);
     }
     // An install session that has exited (gone from the roster, or alive:false)
     // means the catalog may have changed: re-probe so the button reflects it.
@@ -1545,6 +1660,10 @@
    */
   const recentlyCreated = new Map<string, number>();
   const RECENT_MS = 10_000;
+  /** Sessions being optimistically killed: dropped locally at once, tombstoned
+   *  so an in-flight snapshot can't re-add the dying row before the daemon's
+   *  stop completes. Cleared when the kill request resolves. */
+  const killing = new Set<string>();
 
   /**
    * Once both the persisted layout and the first session snapshot are in:
@@ -1647,9 +1766,14 @@
     }
   });
 
-  /** Open/focus a file preview tab (FILES tree click). */
-  function openFilePath(path: string): void {
-    layout = openFile(layout, path);
+  /** Open/focus a file tab (FILES tree / quick-open). A single click opens a
+   *  PREVIEW tab (italic, reused by the next preview open); `pinned` (a tree
+   *  double-click, a just-created file) makes it a permanent tab. */
+  function openFilePath(path: string, pinned = false): void {
+    // Guard unsaved edits: pin any dirty preview tab before a replace can drop
+    // it (belt-and-braces with the dirty-edit promotion effect).
+    layout = pinPaths(layout, get(dirtyFiles));
+    layout = openFile(layout, path, !pinned);
     // The pane now shows a file: pull DOM focus off any terminal so plain
     // keys stop reaching a PTY that is no longer visible.
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
@@ -1842,11 +1966,18 @@
     }
   }
 
-  /** Every launcher selection becomes the new default agent and spawns. */
+  /** Every launcher selection becomes the new default agent and spawns. An
+   *  EXPLICIT surface pick (the "open"/terminal buttons, ⌘↵) also becomes the
+   *  sticky default view, so the split button and the next plain row press
+   *  follow it until the user picks the other surface again. */
   function launcherPick(pick: LaunchPick): void {
     launcherOpen = false;
     agentDefault = { agent: pick.agent };
     setAgentDefault(agentDefault);
+    if (pick.explicit === true && pick.ui !== undefined) {
+      // The setting's vocabulary is "terminal"; the wire/pick term is "term".
+      setSetting("agents.defaultView", pick.ui === "term" ? "terminal" : "chat");
+    }
     void spawnSession("agent", pick);
   }
 
@@ -1928,11 +2059,16 @@
    *  showing a bare "claude" until a new turn regenerates one. */
   function openRecent(r: RecentConvo): void {
     const titleHint = r.title !== "" ? r.title : undefined;
+    // Reopen in the SURFACE it last ran on (TUI vs chat). Null (old entries,
+    // scanned transcripts) leaves `ui` undefined so createSession falls back
+    // to the launcher's sticky default. createSession's own guards
+    // (claude/codex-only + chatCapable) keep a "chat" row honest.
+    const ui = r.ui ?? undefined;
     void spawnSession(
       "agent",
       r.resume !== null
-        ? { agent: r.kind, resume: r.resume, titleHint }
-        : { agent: r.kind, titleHint },
+        ? { agent: r.kind, resume: r.resume, titleHint, ui }
+        : { agent: r.kind, titleHint, ui },
     );
   }
 
@@ -1942,15 +2078,24 @@
       : `${r.kind} can't resume a finished conversation yet — starts a fresh one`;
   }
 
-  /** Kill the session's process on the daemon and drop it locally. */
+  /** Kill the session's process on the daemon and drop it locally — OPTIMISTIC:
+   *  the row/tab vanishes at once and the ChatView tears down immediately,
+   *  while the daemon's stop + retire-to-recents runs in the background. The
+   *  tombstone keeps an in-flight snapshot from re-adding the dying row, so
+   *  there's no lingering half-dead state, and the recents entry appears once
+   *  (via the recents epoch) instead of the row "popping up weirdly". */
   async function killSession(id: string): Promise<void> {
     confirmKillId = null;
+    killing.add(id);
+    chatPool.disposeChat(id); // stop its socket reconnecting right away
+    applySessions(sessions.filter((s) => s.id !== id));
     try {
       await deleteSession(id);
     } catch {
-      // already gone or unreachable; fall through and drop it locally
+      // already gone or unreachable — it's already dropped locally.
+    } finally {
+      killing.delete(id);
     }
-    applySessions(sessions.filter((s) => s.id !== id));
   }
 
   /** End every live session in a workspace — the home-screen "stop". The
@@ -2047,6 +2192,12 @@
     },
     dragTab(e, paneId, index, tab) {
       beginDrag(e, tab, () => ctrl.activateTab(paneId, index));
+    },
+    dragPane(e, paneId) {
+      beginPaneDrag(e, paneId);
+    },
+    pinTab(paneId, index) {
+      layout = pinTab(layout, paneId, index);
     },
     dragSurface(e, tab, onClick) {
       // The link icon: a link-intent drag — dropping anywhere but an agent
@@ -2146,6 +2297,7 @@
       const s = sessions.find((x) => x.id === sessionId);
       if (s !== undefined) s.ui = target;
       if (target === "chat") pool.disposeSession(sessionId);
+      else chatPool.disposeChat(sessionId); // the chat driver is gone now
     } finally {
       switchingViews.update((s) => {
         const next = new Set(s);
@@ -2304,6 +2456,63 @@
       },
       { linkTargets, linkSessions, linkIntent },
     );
+  }
+
+  /** The pane grip's whole-pane drag: move the ENTIRE pane (all tabs) to
+   *  another split position, reusing the tab-drag drop zones. A plain click
+   *  focuses the pane. No refPath/link arming — only tab/edge/zone spots fire,
+   *  and any spot targeting the dragged pane itself is suppressed. */
+  function beginPaneDrag(e: PointerEvent, paneId: string): void {
+    const pane = findPane(layout.root, paneId);
+    if (pane === null || panesOf(layout.root).length < 2) return; // last pane never moves
+    const active = pane.tabs[pane.active];
+    const base = active !== undefined ? tabLabel(active) : "pane";
+    const extra = pane.tabs.length > 1 ? ` +${pane.tabs.length - 1}` : "";
+    startDrag(
+      e,
+      { label: `${base}${extra}` },
+      {
+        onSpot: (s) => {
+          // Never advertise a drop onto the pane being dragged (self-move).
+          dropSpot = s !== null && "paneId" in s && s.paneId === paneId ? null : s;
+        },
+        onDrop: (spot) => {
+          if ("paneId" in spot && spot.paneId === paneId) return;
+          layout =
+            spot.kind === "tab"
+              ? movePaneToIndex(layout, paneId, spot.paneId, spot.index)
+              : spot.kind === "edge"
+                ? movePaneToRootEdge(layout, paneId, spot.edge)
+                : spot.kind === "zone"
+                  ? movePane(layout, paneId, spot.paneId, spot.zone)
+                  : layout;
+          const sid = focusedSessionOf(layout);
+          if (sid !== null) pool.focusTerminal(sid);
+        },
+        onClick: () => ctrl.focusPane(paneId),
+        onEnd: () => {
+          dropSpot = null;
+          bandPanes = new Set();
+        },
+      },
+    );
+  }
+
+  /** A tab's display label (shared by tab and whole-pane drags). */
+  function tabLabel(tab: Tab): string {
+    return tab.surface === "terminal"
+      ? (displayNames.get(tab.sessionId) ?? sessionsById.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8))
+      : tab.surface === "file"
+        ? (fileTitles.get(tab.path) ?? basename(tab.path))
+        : tab.surface === "finder"
+          ? (basename(tab.path) || "Finder")
+          : tab.surface === "diff"
+            ? `${basename(tab.path)} (diff)`
+            : tab.surface === "git"
+              ? "Source Control"
+              : tab.surface === "changes"
+                ? "Changes"
+                : "Settings";
   }
 
   // --- linked terminals ------------------------------------------------------
@@ -2844,11 +3053,11 @@
         <!-- Recents: ended agent conversations, any agent type, newest
              first — the daemon remembers them across restarts. Click
              resumes (claude) or honestly starts fresh (the tooltip says). -->
-        {#if recents.length > 0}
+        {#if visibleRecents.length > 0}
           <div class="recents">
             <div class="recents-head">recent</div>
             <div class="recents-list" class:expanded={recentsExpanded}>
-              {#each recentsExpanded ? recents : recents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
+              {#each recentsExpanded ? visibleRecents : visibleRecents.slice(0, 3) as r (r.resume ?? `${r.kind}:${r.title}`)}
                 <button class="recent-row" title={recentTooltip(r)} onclick={() => openRecent(r)}>
                   <SessionGlyph kind="agent" agentKind={r.kind} size={11} />
                   <span class="recent-title">{r.title}</span>
@@ -2856,12 +3065,12 @@
                 </button>
               {/each}
             </div>
-            {#if recents.length > 3}
+            {#if visibleRecents.length > 3}
               <button
                 class="recents-more"
                 onclick={() => (recentsExpanded = !recentsExpanded)}
               >
-                {recentsExpanded ? "show less" : `all ${recents.length}`}
+                {recentsExpanded ? "show less" : `all ${visibleRecents.length}`}
               </button>
             {/if}
           </div>
@@ -2944,10 +3153,12 @@
               <FileTree
                 root={workspace.root}
                 onOpen={openFilePath}
+                onOpenPinned={(p) => openFilePath(p, true)}
                 onDragStart={onTreeEntryDown}
                 activePath={focusedFilePath}
                 reveal={treeReveal}
                 createRequest={treeCreate}
+                dropActive={dropSpot?.kind === "uploadDir" && dropSpot.paneId === null}
               />
             </div>
           {/if}
@@ -3108,6 +3319,7 @@
             wsRoot={workspace?.root ?? null}
             wsId={activeWsId}
             {bandPanes}
+            soloPane={panesOf(layout.root).length === 1}
             {ctrl}
           />
         {/if}
@@ -3983,6 +4195,10 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* Column so the tree can grow to fill — a right-click in the empty area
+       below the last row then still lands on the tree's context menu. */
+    display: flex;
+    flex-direction: column;
   }
 
   .daemon {

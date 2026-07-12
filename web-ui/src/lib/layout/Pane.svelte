@@ -20,6 +20,8 @@
     focusedPaneId: string;
     /** True when this pane is rendered zoomed (fullscreen in the window). */
     zoomed?: boolean;
+    /** True when this is the only pane (hides the move-pane grip). */
+    soloPane?: boolean;
     dropSpot: DropSpot | null;
     sessions: Map<string, Session>;
     names: Map<string, string>;
@@ -40,6 +42,7 @@
     node,
     focusedPaneId,
     zoomed = false,
+    soloPane = false,
     dropSpot,
     sessions,
     names,
@@ -69,6 +72,9 @@
    *  is the upload-and-reference target (HTML5 dnd — no tile gesture to
    *  partition against). */
   const uploadPane = $derived(dropSpot?.kind === "upload" && dropSpot.paneId === node.id);
+  /** An OS-desktop file drag hovering a Finder pane: upload INTO the folder
+   *  under the pointer (the whole Finder pane washes; `dir` names the target). */
+  const uploadDir = $derived(dropSpot?.kind === "uploadDir" && dropSpot.paneId === node.id ? dropSpot.dir : null);
   /** This pane's bottom band is reserved for the current drag: the center
    *  (adopt) preview stops above it instead of flashing the full pane. */
   const bandArmed = $derived(bandPanes.has(node.id));
@@ -123,6 +129,7 @@
   <PaneTabs
     {node}
     {zoomed}
+    {soloPane}
     {sessions}
     {names}
     {fileNames}
@@ -138,21 +145,24 @@
         <!-- The surface follows server truth: which process actually runs
              behind the session id (a chat driver or a PTY). Same tab, same
              identity — the view toggle just flips this field on the bus. -->
-        {#if sessions.get(activeTab.sessionId)?.ui === "chat"}
+        {@const s = sessions.get(activeTab.sessionId)}
+        {#if s === undefined}
+          <!-- The session is gone (mid-teardown, before pruneSessions drops the
+               tab): render nothing, never a fresh TerminalView against a dead
+               id — that blank-cursor "ghost terminal" was the close-flicker. -->
+          <div class="hint"><span>closing…</span></div>
+        {:else if s.ui === "chat"}
           <!-- Keyed: a ChatView owns one socket+store for one session; tab
                switches must remount, never rebind. -->
           {#key activeTab.sessionId}
             <ChatView
-              session={sessions.get(activeTab.sessionId)!}
+              session={s}
               {focused}
               terminals={[...sessions.values()]
                 .filter(
-                  (s) =>
-                    s.kind === "shell" &&
-                    s.alive &&
-                    s.workspace_id === sessions.get(activeTab.sessionId)?.workspace_id,
+                  (t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id,
                 )
-                .map((s) => ({ id: s.id, name: names.get(s.id) ?? s.name }))}
+                .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
               onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
               onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
             />
@@ -246,6 +256,12 @@
       <span class="drop-ref-label"
         ><span class="drop-ref-at">@</span> drop to upload &amp; reference</span
       >
+    </div>
+  {:else if uploadDir !== null}
+    <!-- OS-desktop drop onto a Finder pane: upload INTO the folder under the
+         pointer (no @-reference — this is a file-manager drop). -->
+    <div class="drop-upload">
+      <span class="drop-ref-label">drop to upload here</span>
     </div>
   {/if}
 </section>

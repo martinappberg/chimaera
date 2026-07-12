@@ -11,7 +11,7 @@
  */
 
 import { writable } from "svelte/store";
-import { fsCreate, fsDelete, fsRename } from "../previews/files";
+import { fsCopy, fsCreate, fsDelete, fsMove, fsRename } from "../previews/files";
 
 export type FsMutation =
   | { seq: number; kind: "create"; path: string }
@@ -37,6 +37,12 @@ function notify(mutation: FsMutationInput): void {
   fsEpoch.update((n) => n + 1);
 }
 
+/** Announce that `path` appeared by some other route (an OS-desktop drop that
+ *  already streamed to disk) so every listing surface re-lists. */
+export function notifyCreated(path: string): void {
+  notify({ kind: "create", path });
+}
+
 /** Create + notify. Resolves to the canonical created path. */
 export async function fsCreateOp(path: string, kind: "file" | "dir"): Promise<string> {
   const created = await fsCreate(path, kind);
@@ -49,6 +55,26 @@ export async function fsRenameOp(from: string, to: string): Promise<string> {
   const renamed = await fsRename(from, to);
   notify({ kind: "rename", from, to: renamed });
   return renamed;
+}
+
+/** Copy + notify. Published as a `create` (a new path appeared) so listings
+ *  re-list; nothing follows a copy's source. Resolves to the new path. */
+export async function fsCopyOp(
+  from: string,
+  to: string,
+  onConflict: "fail" | "unique" = "fail",
+): Promise<string> {
+  const created = await fsCopy(from, to, onConflict);
+  notify({ kind: "create", path: created });
+  return created;
+}
+
+/** Move + notify. Published as a `rename` so open tabs FOLLOW the moved path
+ *  (App's tab rewrite keys on rename). Resolves to the new path. */
+export async function fsMoveOp(from: string, to: string): Promise<string> {
+  const moved = await fsMove(from, to);
+  notify({ kind: "rename", from, to: moved });
+  return moved;
 }
 
 /** Delete + notify. */
