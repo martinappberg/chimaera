@@ -107,6 +107,16 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Tables (CSV/TSV, incl. gzip).** `GET /api/v1/fs/table?path=&offset_rows=&limit_rows=&delim=auto`
   returns one page (header row + string cells; rows cap 1000/page; delimiter auto-sniffed; `.gz`/`.bgz`
   transparent). `TableView.svelte`. Bioinformatics reality — big delimited files are the norm.
+- **Spreadsheets (xlsx/xls/xlsm/ods).** `GET /api/v1/fs/xlsx?path=&sheet=&offset_rows=&limit_rows=`
+  parses the workbook server-side (**calamine**) into the same paged `TablePage` (first row = header),
+  plus the workbook's `sheets` list. `XlsxView.svelte` renders a sheet picker over the shared
+  `TableView` grid — so selection/resize/paging come for free. calamine loads a whole sheet into
+  memory, so the SOURCE file is size-capped (`MAX_XLSX_BYTES`, 8 MB) before parsing, off the reactor
+  (`spawn_blocking`); over-cap files get an honest "too large" message. No live-on-disk refresh (no
+  store entry) and no editing (a spreadsheet isn't a text file). **Gotcha:** XlsxView must NOT hand
+  its own `$state` page object to `TableView` — the shared deeply-reactive proxy cross-links the two
+  components' reactive graphs into a freeze; `TableView` fetches its own plain page via a *stable*
+  `fetchPage`.
 - **PDF / image / HTML.** Fetched via a short-lived **ticket**: `POST /api/v1/fs/ticket {path}` →
   `GET /raw/{ticket}` (no bearer header — iframes/`<img>`/pdf.js can't send one; ticket TTL 600s,
   range-aware). HTML is sandboxed (`CSP: sandbox allow-scripts`, no-referrer); SVG is sandboxed too.

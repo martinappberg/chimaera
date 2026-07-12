@@ -40,6 +40,12 @@ const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard cap on `fs/table` rows per page.
 const MAX_TABLE_ROWS: usize = 1000;
+/// Largest spreadsheet `fs/xlsx` will parse. calamine loads a whole sheet into
+/// memory (no lazy row streaming), so the SOURCE size is the ceiling that keeps
+/// a preview from blowing the daemon's RSS budget — an over-cap file gets an
+/// honest "too large" message rather than a memory spike. Typical result-table
+/// spreadsheets are well under this; huge ones belong in a CSV export.
+const MAX_XLSX_BYTES: u64 = 8 * 1024 * 1024;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one
 /// request per visible-viewport scan).
 const MAX_VALIDATE_CANDIDATES: usize = 50;
@@ -830,6 +836,120 @@ fn page_records<R: Read>(
     }
 
     Ok((columns, rows, truncated, reader.into_inner()))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct XlsxQuery {
+    path: String,
+    #[serde(default)]
+    sheet: Option<String>,
+    #[serde(default)]
+    offset_rows: usize,
+    #[serde(default)]
+    limit_rows: Option<usize>,
+}
+
+/// GET /api/v1/fs/xlsx?path=&sheet=&offset_rows=0&limit_rows=200 — one page of a
+/// spreadsheet sheet (xlsx/xls/xlsm/ods), shaped like `fs/table` (a header
+/// `columns` row + string `rows`) PLUS the workbook's `sheets` list and the
+/// resolved `sheet`, so the UI can offer a sheet picker and reuse the CSV grid.
+/// The first row is the header (parity with the CSV viewer). Runs on a blocking
+/// worker (calamine parses the whole file) after a source-size gate.
+pub(crate) async fn xlsx(Query(query): Query<XlsxQuery>) -> Response {
+    let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
+    let result = tokio::task::spawn_blocking(move || {
+        read_xlsx(
+            &query.path,
+            query.sheet.as_deref(),
+            query.offset_rows,
+            limit,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(err)) => bad_request(&err),
+        Err(_) => bad_request(&anyhow::anyhow!("spreadsheet read task panicked")),
+    }
+}
+
+/// One xlsx cell → the string the grid shows. Empty cells become "" (not the
+/// literal "Empty" that `Data`'s Display would print); everything else uses the
+/// canonical Display (numbers, bools, dates, errors).
+fn xlsx_cell(cell: &calamine::Data) -> String {
+    match cell {
+        calamine::Data::Empty => String::new(),
+        calamine::Data::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse one page of a spreadsheet sheet into the `fs/table` JSON shape (plus
+/// `sheets`/`sheet`). calamine has no lazy row iterator, so the whole sheet is
+/// materialized once per request — the [`MAX_XLSX_BYTES`] gate keeps that
+/// bounded, and the caller runs us off the reactor.
+fn read_xlsx(
+    raw: &str,
+    sheet: Option<&str>,
+    offset_rows: usize,
+    limit_rows: usize,
+) -> anyhow::Result<serde_json::Value> {
+    use calamine::Reader;
+
+    let path = canonical_file(raw)?;
+    let size = std::fs::metadata(&path)
+        .with_context(|| format!("{}: failed to stat", path.display()))?
+        .len();
+    if size > MAX_XLSX_BYTES {
+        anyhow::bail!(
+            "spreadsheet is {} MB — over the {} MB preview cap (export to CSV for larger data)",
+            size / (1024 * 1024),
+            MAX_XLSX_BYTES / (1024 * 1024),
+        );
+    }
+
+    let mut workbook = calamine::open_workbook_auto(&path)
+        .with_context(|| format!("{}: not a readable spreadsheet", path.display()))?;
+    let sheets: Vec<String> = workbook.sheet_names().to_vec();
+    let sheet_name = match sheet {
+        Some(s) if sheets.iter().any(|x| x == s) => s.to_string(),
+        Some(s) => anyhow::bail!("no sheet named {s:?}"),
+        None => sheets
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("spreadsheet has no sheets"))?,
+    };
+    let range = workbook
+        .worksheet_range(&sheet_name)
+        .with_context(|| format!("failed to read sheet {sheet_name:?}"))?;
+
+    let mut row_iter = range.rows();
+    // First row is the header, matching the CSV table viewer.
+    let columns: Vec<String> = match row_iter.next() {
+        Some(header) => header.iter().map(xlsx_cell).collect(),
+        None => Vec::new(),
+    };
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut truncated = false;
+    for (index, row) in row_iter.enumerate() {
+        if index < offset_rows {
+            continue;
+        }
+        if rows.len() >= limit_rows {
+            truncated = true;
+            break;
+        }
+        rows.push(row.iter().map(xlsx_cell).collect());
+    }
+
+    Ok(json!({
+        "sheets": sheets,
+        "sheet": sheet_name,
+        "columns": columns,
+        "rows": rows,
+        "offset": offset_rows,
+        "truncated": truncated,
+    }))
 }
 
 /// `.tsv` -> tab, `.csv` -> comma, judged from the end of a file name.

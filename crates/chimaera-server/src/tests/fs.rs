@@ -987,6 +987,68 @@ async fn fs_markdown_renders_gfm_and_sanitizes() {
     );
 }
 
+/// `fs/xlsx` parses a spreadsheet into the same paged `TablePage` shape the CSV
+/// viewer renders, plus the workbook's sheet list — the first row is the header,
+/// a named sheet is selectable, paging past the data is an empty (not error)
+/// page, and an unknown sheet is a 400. Reads a committed 2-sheet fixture.
+#[tokio::test]
+async fn fs_xlsx_pages_sheets_of_a_workbook() {
+    let state = test_state();
+    let fixture = format!(
+        "{}/src/tests/fixtures/sample.xlsx",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    // Default sheet (the first) carries the whole sheet list.
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/fs/xlsx?path={fixture}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["sheets"], serde_json::json!(["Alpha", "Beta"]));
+    assert_eq!(json["sheet"], "Alpha");
+    assert_eq!(json["columns"], serde_json::json!(["id", "value"]));
+    assert_eq!(json["rows"], serde_json::json!([["a", "1"], ["b", "2"]]));
+    assert_eq!(json["truncated"], false);
+
+    // A named sheet.
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/fs/xlsx?path={fixture}&sheet=Beta"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["sheet"], "Beta");
+    assert_eq!(json["columns"], serde_json::json!(["k"]));
+    assert_eq!(json["rows"], serde_json::json!([["x"]]));
+
+    // Paging past the data is an empty page, not an error (the grid stops).
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/fs/xlsx?path={fixture}&sheet=Alpha&offset_rows=100"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["rows"], serde_json::json!([]));
+
+    // An unknown sheet is a 400.
+    let (status, _) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/fs/xlsx?path={fixture}&sheet=Nope"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn fs_markdown_rejects_oversize_dirs_and_missing() {
     let state = test_state();

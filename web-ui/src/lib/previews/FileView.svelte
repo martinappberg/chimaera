@@ -13,6 +13,7 @@
   import MarkdownView from "./MarkdownView.svelte";
   import HtmlView from "./HtmlView.svelte";
   import TableView from "./TableView.svelte";
+  import XlsxView from "./XlsxView.svelte";
   import BinaryView from "./BinaryView.svelte";
   import PdfView from "./PdfView.svelte";
   import Spinner from "./Spinner.svelte";
@@ -105,6 +106,8 @@
         <HtmlView {path} />
       {:else if kind === "table"}
         <TableView {path} />
+      {:else if kind === "xlsx"}
+        <XlsxView {path} />
       {:else if kind === "pdf"}
         <PdfView {path} />
       {:else if kind === "binary"}
