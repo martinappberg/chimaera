@@ -25,7 +25,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tauri = { version = "2", features = [] }
+# `tray-icon`: the macOS menu-bar / Windows-Linux system-tray status item
+# (tray.rs). On Linux this pulls libayatana-appindicator into the bundle — a
+# packaging dependency, accepted deliberately for the tray affordance.
+tauri = { version = "2", features = ["tray-icon"] }
 # Self-update: check GitHub releases, verify against the embedded minisign
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().

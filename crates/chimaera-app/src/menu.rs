@@ -16,6 +16,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .separator()
+        .item(
+            &MenuItemBuilder::with_id("settings", "Settings…")
+                .accelerator("CmdOrCtrl+,")
+                .build(handle)?,
+        )
+        .separator()
         .item(&PredefinedMenuItem::services(handle, None)?)
         .separator()
         .item(&PredefinedMenuItem::hide(handle, None)?)
@@ -54,6 +60,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
         )?);
     #[cfg(not(target_os = "macos"))]
     let file = file
+        .separator()
+        .item(
+            &MenuItemBuilder::with_id("settings", "Settings…")
+                .accelerator("CmdOrCtrl+,")
+                .build(handle)?,
+        )
         .separator()
         .item(&PredefinedMenuItem::quit(handle, None)?);
     let file = file.build()?;
@@ -110,10 +122,10 @@ pub fn install(app: &App) -> tauri::Result<()> {
                     );
                 }
             }
-            "close-view" | "new-terminal" | "new-agent" => {
-                // The page knows what "close the focused view" means; the
-                // shell only knows which window is focused. emit_to, not
-                // emit: a broadcast would close a view in EVERY window.
+            "close-view" | "new-terminal" | "new-agent" | "settings" => {
+                // The page knows what "close the focused view" / "open settings"
+                // means; the shell only knows which window is focused. emit_to,
+                // not emit: a broadcast would act in EVERY window.
                 if let Some(window) = app
                     .webview_windows()
                     .into_values()

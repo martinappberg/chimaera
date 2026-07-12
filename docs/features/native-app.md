@@ -112,10 +112,23 @@ app-build` (never the root `cargo`).
   prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
   Windows download until then.
 
+## Menu bar & tray
+
+- **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
+  Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
+  Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
+  **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
+  owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
+  focused window (`onMenu` in `App.svelte`, via `native.ts`); `new-window` is handled shell-side.
+  **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
+  remote window → the remote daemon's settings), same as the in-UI gear.
+- **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon with a
+  Show Chimaera / New Window / Quit menu — the entry point when all windows are closed but the app is
+  still resident. macOS tints the app icon to the menu-bar theme (`icon_as_template`). Enabling the
+  feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
+
 ## Status: partial
 
-- The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
-  discovery pass — treat it as under-documented.
 - **Windows is beta**: engine + connect transport + askpass relay are implemented and
   CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
   retail Windows hardware.
