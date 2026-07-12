@@ -446,15 +446,26 @@
     codex: "reasoning effort — applies from the next message",
   };
 
-  /** Extended-thinking toggle (claude). Client-held — the CLI has no read-back,
-   *  so we track it locally and start from claude's unset default (off); the
-   *  chip shows an explicit on/off and tints when on, so its state is legible. */
-  let thinking = $state(false);
+  /** Extended-thinking toggle (claude). ON by default — chimaera's chat is a
+   *  workbench for real coding work, where the reasoning pass earns its keep;
+   *  the chip shows an explicit on/off and tints when on, so the state (and the
+   *  cost) is never hidden, and one click turns it off. The preference lives in
+   *  the pooled store, not here, so a tab remount keeps it. */
   const hasThinking = $derived(agentKind === "claude");
   function toggleThinking() {
-    thinking = !thinking;
-    socket.send({ type: "set_thinking", enabled: thinking });
+    store.setThinking(!store.thinkingEnabled);
+    socket.send({ type: "set_thinking", enabled: store.thinkingEnabled });
   }
+  // Seed the default and push it to the CLI once the session is live, so the
+  // chip's "on" is honest (the CLI starts thinking OFF until told otherwise).
+  // `thinkingSeeded` is pooled, so a remount/reconnect never re-forces it over
+  // a later user toggle.
+  $effect(() => {
+    if (!hasThinking || !store.connected || store.thinkingSeeded) return;
+    store.setThinking(true);
+    socket.send({ type: "set_thinking", enabled: true });
+    store.markThinkingSeeded();
+  });
 
   const modeLabel = $derived(
     store.modes.find((m) => m.id === store.currentMode)?.label ?? store.currentMode,
@@ -588,7 +599,7 @@
     effortHint={EFFORT_HINT[agentKind] ?? "reasoning effort"}
     {hasUltracode}
     {hasThinking}
-    {thinking}
+    thinking={store.thinkingEnabled}
     onPickModel={pickModel}
     onPickMode={pickMode}
     onPickEffort={pickEffort}

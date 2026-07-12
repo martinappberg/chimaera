@@ -242,6 +242,23 @@ export class ChatStore {
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
 
+  /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
+   *  no read-back — but kept HERE (pooled per session, surviving a ChatView
+   *  tab remount) rather than in the view, so switching tabs can neither reset
+   *  the chip nor re-force the CLI over a choice the user already made. The
+   *  view seeds the default (on for claude) and pushes it to the CLI once per
+   *  session; the header chip reads it and toggles it. */
+  thinkingEnabled = $state(false);
+  /** True once the view has pushed the initial default to the CLI — the guard
+   *  that keeps a remount/reconnect from re-forcing thinking on. */
+  thinkingSeeded = $state(false);
+  setThinking(enabled: boolean): void {
+    this.thinkingEnabled = enabled;
+  }
+  markThinkingSeeded(): void {
+    this.thinkingSeeded = true;
+  }
+
   /** Queued/undelivered user messages, in order — rendered in a holding stack
    *  pinned above the composer (the send point), NEVER inline in history: a
    *  queued message is one you've typed and are waiting on. This is its OWN
