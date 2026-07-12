@@ -181,3 +181,17 @@ _Captured 2026-07-11 (from the maintainer)._
   double-clicking a tab or tree row, or moving a tab **pins** it — muscle-memory parity with VS Code.
 - **Grade — addition, improvable.** Deliberate today (the preview flag persists in the layout blob),
   but not a core bet — rework it freely if a better shape appears.
+
+### Workspace-keyed window restore — why it's shaped this way
+_Captured 2026-07-12 (from the maintainer)._
+
+- **Problem it solves.** Native feel — a reopened window should come back to where you left it,
+  not the empty default.
+- **Why workspace-keyed.** *"Workspace keyed is good because we work primarily in workspaces"* —
+  restoring by workspace (a reopened window resumes that workspace's last-active layout) fits how
+  the app is actually used, and rides the workspace-first core bet above rather than tying restore
+  to a throwaway window identity.
+- **How settled it is.** *"More just a UX"* — settled as the right default for the workspace-first
+  workflow, but an **addition**, not a frozen contract.
+- **Do not change (or: open to change):** *"keep a smooth UX for the user"* — the keying mechanics
+  are open to improve; only the workspace-first framing (above) is the core bet.

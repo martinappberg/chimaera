@@ -108,7 +108,22 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   **force-kills sessions first, then waits the SIGKILL grace** (a HUP-ignoring agent would otherwise
   reparent to init and survive); the ledger stores no argv (it rebuilds via the normal spawn path so
   the new daemon's hooks/shims/themes match).
-- **Improvable.** Chat-session resurrection across a restart is a known follow-up (`sv-11`;
-  retire-to-Recents for now).
+- **Improvable.** Chat-session resurrection across a restart (the former `sv-11` follow-up) now
+  ships — see the capture below; its resurrect-vs-retire mechanics remain an improvable UX detail.
 - **Do not change:** never-silently-kill; daemon-owns-everything / windows-are-views; the
   force-kill-then-grace shutdown mechanism.
+
+### Chat resurrection across a daemon restart — why it exists
+_Captured 2026-07-12 (from the maintainer)._
+
+- **Problem it solves:** native feel — nothing more. A restart (update / crash / `kill`) that lost
+  your chats would break "close the laptop, nothing dies"; chats must be daemon-owned and come back
+  like the TUI because *"it should be the native workspace."*
+- **How settled it is:** the *behavior* — a restart brings your chats back — is the aim and a
+  promise (*"yes, that is what I am aiming for"*). The specific mechanics are *"more just a UX,"*
+  not a contract.
+- **Deliberately open / where it may go:** the resurrect-resumable-live / retire-the-rest policy
+  and the currently-lost pinned title are UX details, free to improve toward a smoother experience.
+- **Do not change (or: open to change):** *"keep a smooth UX for the user"* — don't regress the
+  core "never silently lose a chat" property (the daemon-owns-everything bet above). Grade: an
+  **addition** — the exact resurrect-vs-retire mechanics can change if improved.
