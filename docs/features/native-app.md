@@ -122,22 +122,30 @@ app-build` (never the root `cargo`).
   focused window (`onMenu` in `App.svelte`, via `native.ts`); `new-window` is handled shell-side.
   **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
   remote window → the remote daemon's settings), same as the in-UI gear.
-- **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon with a
-  Show Chimaera / New Window / Quit menu — the entry point when all windows are closed but the app is
-  still resident. macOS tints the app icon to the menu-bar theme (`icon_as_template`). Enabling the
-  feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
+- **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
+  menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
+  entry point when all windows are closed but the app is still resident. The icon is a real **brand-mark
+  template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
+  (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob. On
+  macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt via
+  `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
+  Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
 
 ## Caffeinate
 
-- A **local-only** whole-machine keep-awake toggle (a coffee-cup button in the rail's bottom bar,
-  shown only when `isNativeShell() && getHostLabel() === "local"` — a remote window's work runs on the
-  remote host, so caffeinating this laptop is pointless). Armed = the machine won't idle-, display-,
-  or system-sleep. IPC commands `set_caffeinate(on)` / `caffeinate_state()` hold a cross-platform
-  power assertion (the **keepawake** crate: macOS IOKit / Windows `SetThreadExecutionState` / Linux
-  `systemd-inhibit`) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the
-  app. The state broadcasts (`caffeinate-changed`) so every window's toggle stays in sync. **macOS
-  caveat, surfaced in the tooltip:** lid-closed-awake additionally requires **AC power** — Apple hard-
-  blocks clamshell wake on battery, which no app can override.
+- A **macOS-only, local-only** whole-machine keep-awake toggle, reachable from **two surfaces** kept in
+  sync: a coffee-cup button in the rail's bottom bar (shown only when
+  `isNativeShell() && isMac && getHostLabel() === "local"` — a remote window's work runs on the remote
+  host, so caffeinating this laptop is pointless; and macOS is where the lid-close keep-awake it exists
+  for applies) **and** the tray's **Keep Awake** check item + the icon filling in when armed. Armed =
+  the machine won't idle-, display-, or system-sleep. Both surfaces call one shared core
+  (`shell::apply_caffeinate`) that holds a single power assertion (the **keepawake** crate: macOS
+  IOKit) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the app. The
+  state broadcasts (`caffeinate-changed`), which the in-window toggle and the tray (`tray::rebuild`)
+  both listen to, so flipping it from either surface updates the other. IPC commands remain
+  `set_caffeinate(on)` / `caffeinate_state()`. **macOS caveat, surfaced in the tooltip:**
+  lid-closed-awake additionally requires **AC power** — Apple hard-blocks clamshell wake on battery,
+  which no app can override.
 
 ## Status: partial
 
