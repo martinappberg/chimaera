@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use chimaera_remote::Tunnel;
-use tauri::Manager;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
@@ -74,6 +74,50 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether the "caffeinate" power assertion is currently held. Reads the
+/// managed `Shell` off the app handle so the tray (a sibling module that can't
+/// see `Shell`'s private field) can reflect the state; false before startup.
+pub(crate) fn caffeinate_armed(app: &AppHandle) -> bool {
+    app.try_state::<Shell>()
+        .map(|s| lock(&s.caffeinate).is_some())
+        .unwrap_or(false)
+}
+
+/// Arm/disarm the caffeinate assertion for THIS machine, the shared core behind
+/// both the UI command (`commands::set_caffeinate`) and the tray's "Keep Awake"
+/// item. While armed the app host won't idle-, display-, or system-sleep —
+/// including lid-closed on macOS, though only on AC power (Apple blocks
+/// clamshell-awake on battery; no app can override that). Idempotent: re-arming
+/// keeps the single held guard, disarming drops it. The resulting state
+/// broadcasts on `caffeinate-changed` so every window's toggle AND the tray
+/// (icon + menu check) stay in sync regardless of which surface flipped it.
+pub(crate) fn apply_caffeinate(app: &AppHandle, on: bool) -> Result<bool, String> {
+    let shell = app
+        .try_state::<Shell>()
+        .ok_or_else(|| "the app is not ready yet".to_string())?;
+    let mut guard = lock(&shell.caffeinate);
+    if on {
+        if guard.is_none() {
+            let awake = keepawake::Builder::default()
+                .display(true)
+                .idle(true)
+                .sleep(true)
+                .app_name("Chimaera")
+                .app_reverse_domain("com.chimaera.app")
+                .reason("Caffeinate")
+                .create()
+                .map_err(|e| format!("{e:#}"))?;
+            *guard = Some(awake);
+        }
+    } else {
+        *guard = None; // dropping the guard releases the assertion
+    }
+    let armed = guard.is_some();
+    drop(guard);
+    let _ = app.emit("caffeinate-changed", armed);
+    Ok(armed)
 }
 
 /// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
@@ -250,6 +294,9 @@ pub fn run() {
                         if let Some(scope) = scope {
                             lock(&shell.registry).remove(&scope.stable_id);
                         }
+                        // The tray lists open windows; drop the closed one.
+                        // Skipped during quit (every window is tearing down).
+                        crate::tray::rebuild(window.app_handle());
                     }
                 }
                 // Track geometry in memory on every move/resize; a slow tick

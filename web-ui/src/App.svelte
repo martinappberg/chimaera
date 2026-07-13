@@ -153,7 +153,7 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/layout/dnd";
-  import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
+  import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
   import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
   import {
     askpassActive,
@@ -211,11 +211,12 @@
   let health = $state<Health | null>(null);
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
-  /** Caffeinate (native, LOCAL window only): whole-machine keep-awake. Shown
-   *  only on a local native window — a remote window's work runs on the remote
-   *  host, so caffeinating this laptop would be pointless. */
+  /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
+   *  Shown only on a local native window — a remote window's work runs on the
+   *  remote host, so caffeinating this laptop would be pointless — and only on
+   *  macOS, where the clamshell/lid-close keep-awake it exists for applies. */
   let caffeinated = $state(false);
-  const canCaffeinate = isNativeShell() && getHostLabel() === "local";
+  const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
   async function toggleCaffeinate(): Promise<void> {
     caffeinated = await setCaffeinate(!caffeinated);
   }

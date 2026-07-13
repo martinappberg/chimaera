@@ -370,41 +370,16 @@ pub(super) fn report_window_scope(
     if !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, alias, ws);
     }
+    // The window's title tracks its workspace; refresh the tray's list of it.
+    crate::tray::rebuild(webview.app_handle());
 }
 
-/// Arm/disarm the "caffeinate" power assertion for THIS machine (the app host):
-/// while armed it won't idle-, display-, or system-sleep — including with the
-/// lid closed on macOS, though only on AC power (Apple blocks clamshell-awake on
-/// battery, which no app can override). Global to the app, not per window; the
-/// resulting state broadcasts so every window's toggle stays in sync. Idempotent
-/// — re-arming keeps the single held guard; the guard drops on quit.
+/// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`
+/// broadcast the tray's "Keep Awake" item drives — lives in `apply_caffeinate`
+/// so both surfaces share one guard and stay in sync.
 #[tauri::command]
-pub(super) fn set_caffeinate(
-    app: AppHandle,
-    state: State<'_, Shell>,
-    on: bool,
-) -> Result<bool, String> {
-    let mut guard = lock(&state.caffeinate);
-    if on {
-        if guard.is_none() {
-            let awake = keepawake::Builder::default()
-                .display(true)
-                .idle(true)
-                .sleep(true)
-                .app_name("Chimaera")
-                .app_reverse_domain("com.chimaera.app")
-                .reason("Caffeinate")
-                .create()
-                .map_err(|e| format!("{e:#}"))?;
-            *guard = Some(awake);
-        }
-    } else {
-        *guard = None; // dropping the guard releases the assertion
-    }
-    let armed = guard.is_some();
-    drop(guard);
-    let _ = app.emit("caffeinate-changed", armed);
-    Ok(armed)
+pub(super) fn set_caffeinate(app: AppHandle, on: bool) -> Result<bool, String> {
+    super::apply_caffeinate(&app, on)
 }
 
 /// Whether the caffeinate assertion is currently held. Each window reads this on

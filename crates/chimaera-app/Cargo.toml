@@ -28,7 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `tray-icon`: the macOS menu-bar / Windows-Linux system-tray status item
 # (tray.rs). On Linux this pulls libayatana-appindicator into the bundle — a
 # packaging dependency, accepted deliberately for the tray affordance.
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # Self-update: check GitHub releases, verify against the embedded minisign
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().

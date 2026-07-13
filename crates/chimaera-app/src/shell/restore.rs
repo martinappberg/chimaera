@@ -75,6 +75,8 @@ pub fn open_ui_window(
         );
         lock(&shell.registry).upsert(record.clone());
     }
+    // A new window changes the tray's open-windows list.
+    crate::tray::rebuild(app);
     Ok(())
 }
 
