@@ -76,6 +76,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Explicit quit (menu / tray / ⌘Q): flag `quitting` BEFORE exiting so the
+/// last window's `CloseRequested` skips the drop-to-home reopen, and its
+/// `Destroyed` keeps the window in the registry for next launch. Distinguishes
+/// "the user asked to quit" from "the user closed the last window".
+pub(crate) fn request_quit(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        shell.quitting.store(true, Ordering::Relaxed);
+        lock(&shell.registry).save_if_dirty();
+    }
+    app.exit(0);
+}
+
 /// Whether the currently-focused window has a workspace open (vs the home
 /// screen or no window focused). Drives the menu's Settings item, which is
 /// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
@@ -305,6 +317,43 @@ pub fn run() {
                 return;
             };
             match event {
+                // Closing the LAST window drops you back to the home screen
+                // instead of quitting the app — you exit only by closing the
+                // home screen itself (or an explicit Quit / ⌘Q, which sets
+                // `quitting` and terminates without reaching here). We don't
+                // veto the close; we open a fresh home window *first* so the
+                // window count never hits zero (which is what fires the exit),
+                // then let this one close. When the window being closed already
+                // IS the local home screen, we don't reopen — the count falls
+                // to zero and the app exits, as intended.
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    if shell.quitting.load(Ordering::Relaxed) {
+                        return; // an explicit quit is already in progress
+                    }
+                    let app = window.app_handle();
+                    let others = app
+                        .webview_windows()
+                        .into_keys()
+                        .filter(|l| l.as_str() != window.label() && !l.starts_with("wsl-setup"))
+                        .count();
+                    if others > 0 {
+                        return; // not the last window — an ordinary close
+                    }
+                    let is_home = lock(&shell.windows)
+                        .get(window.label())
+                        .is_some_and(|s| s.alias.is_none() && s.ws.is_none());
+                    if !is_home {
+                        let (port, token) = {
+                            let local = lock(&shell.local);
+                            (local.port, local.token.clone())
+                        };
+                        if let Err(e) =
+                            open_ui_window(app, port, &token, &WindowRecord::new(None, None))
+                        {
+                            tracing::error!("could not open home window on last-window close: {e}");
+                        }
+                    }
+                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The

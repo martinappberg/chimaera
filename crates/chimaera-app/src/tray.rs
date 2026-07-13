@@ -15,7 +15,7 @@
 //! caffeinate state flips from any surface — via [`rebuild`].
 
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Listener, Manager, Wry};
 
@@ -30,6 +30,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .icon_as_template(true)
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id().0.as_str() {
+            "quit" => crate::shell::request_quit(app),
             "tray-new-window" => open_new_window(app),
             // Toggle the shared assertion; the resulting `caffeinate-changed`
             // broadcast is what rebuilds the tray (icon + check) below.
@@ -113,10 +114,10 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     }
 
     let new_window = MenuItemBuilder::with_id("tray-new-window", "New Window").build(app)?;
-    b = b
-        .item(&new_window)
-        .separator()
-        .item(&PredefinedMenuItem::quit(app, Some("Quit Chimaera"))?);
+    // Custom Quit (not predefined) so it flags the quit intent via
+    // `request_quit` — see menu.rs and the CloseRequested handler.
+    let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera").build(app)?;
+    b = b.item(&new_window).separator().item(&quit);
     b.build()
 }
 

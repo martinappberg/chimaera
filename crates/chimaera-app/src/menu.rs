@@ -26,6 +26,13 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .enabled(false)
         .build(handle)?;
 
+    // A custom Quit (not the predefined one) so it routes through
+    // `request_quit`, which flags the intent — otherwise the shell can't tell
+    // an explicit quit from closing the last window (which drops to home).
+    let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera")
+        .accelerator("CmdOrCtrl+Q")
+        .build(handle)?;
+
     // The application menu (services/hide/show) is a macOS concept; Windows
     // and Linux menubars start at File, where Quit must live instead.
     #[cfg(target_os = "macos")]
@@ -40,7 +47,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::hide_others(handle, None)?)
         .item(&PredefinedMenuItem::show_all(handle, None)?)
         .separator()
-        .item(&PredefinedMenuItem::quit(handle, None)?)
+        .item(&quit)
         .build()?;
 
     let file = SubmenuBuilder::new(handle, "File")
@@ -71,11 +78,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
             Some("Close Window"),
         )?);
     #[cfg(not(target_os = "macos"))]
-    let file = file
-        .separator()
-        .item(&settings)
-        .separator()
-        .item(&PredefinedMenuItem::quit(handle, None)?);
+    let file = file.separator().item(&settings).separator().item(&quit);
     let file = file.build()?;
 
     let edit = SubmenuBuilder::new(handle, "Edit")
@@ -131,6 +134,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
                     );
                 }
             }
+            "quit" => crate::shell::request_quit(app),
             "close-view" | "new-terminal" | "new-agent" | "settings" => {
                 // The page knows what "close the focused view" / "open settings"
                 // means; the shell only knows which window is focused. emit_to,
