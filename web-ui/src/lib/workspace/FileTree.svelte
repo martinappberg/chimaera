@@ -6,11 +6,11 @@
    * no recursive components, trivial scrolling.
    */
   import { tick, untrack } from "svelte";
-  import { basename, fsDownload, fsList, type FsEntry } from "../previews/files";
+  import { basename, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
   import { gitIndex, gitStatus } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
-  import { fsCreateOp, fsEpoch, fsRenameOp, requestDelete } from "./fsEvents";
+  import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
   import {
     clearClip,
     copyFile,
@@ -189,20 +189,34 @@
     });
   });
 
-  // A git epoch bump means files may have APPEARED or vanished (an agent wrote
-  // a new file, a checkout removed one). Re-list every visible dir so the tree
-  // matches the status overlay — otherwise a brand-new untracked file carries a
-  // status the tree has no row to show it on. Plain `let` (not $state): written
-  // inside the effect that reads the epoch.
+  // A git epoch bump means files may have APPEARED or vanished (an agent wrote a
+  // new file, a checkout removed one). Re-list ONLY the dirs whose direct
+  // listing could have changed — the parents of paths that entered or left the
+  // dirty set — instead of the whole tree. A file that merely stayed modified
+  // changes no listing (its row is there; its badge updates reactively via
+  // gitIndex), and a change deep under a collapsed dir needs no relist (its
+  // rollup dot is reactive too). This stops a write-burst from re-listing every
+  // expanded folder on each tick. Plain `let` (not $state): written inside the
+  // effect that reads the epoch.
   let lastGitEpoch = -1;
+  let prevDirty = new Set<string>();
   $effect(() => {
-    const epoch = $gitStatus?.epoch ?? -1;
+    const status = $gitStatus;
+    const epoch = status?.epoch ?? -1;
     untrack(() => {
       if (epoch < 0 || epoch === lastGitEpoch) return;
       const first = lastGitEpoch < 0;
       lastGitEpoch = epoch;
-      if (first) return; // the initial fetch's listing is already current
-      scheduleRelistVisible();
+      const cur = new Set((status?.entries ?? []).map((e) => e.path));
+      if (first) {
+        prevDirty = cur; // the initial fetch's listing is already current
+        return;
+      }
+      const dirs = new Set<string>();
+      for (const p of cur) if (!prevDirty.has(p)) dirs.add(dirname(p));
+      for (const p of prevDirty) if (!cur.has(p)) dirs.add(dirname(p));
+      prevDirty = cur;
+      if (dirs.size > 0) scheduleRelist(dirs);
     });
   });
 
@@ -230,20 +244,25 @@
     }
   }
 
-  // Coalesce re-list requests. A working agent bumps the git AND fs epoch on
-  // every file it writes; without this, each bump re-lists root + every expanded
-  // dir immediately, so a burst of writes becomes a storm of /fs/list calls that
-  // never lets the tree settle over a remote (ssh) link. Debounced + coalesced,
-  // a whole burst collapses into ONE re-list pass (and the git+fs double-fire for
-  // an in-repo mutation collapses too, since both share this timer).
+  // Coalesce targeted re-list requests. A working agent bumps the git/fs epoch
+  // on every file it writes; each bump contributes only the DIRS that changed
+  // (see the epoch effects), which accumulate here and flush in ONE debounced
+  // pass — so a write-burst re-lists just the touched folders, not every
+  // expanded dir, and the git+fs double-fire for an in-repo mutation collapses
+  // into the same pass. Only currently-visible dirs (root or expanded) list.
   const RELIST_DEBOUNCE_MS = 250;
   let relistTimer: ReturnType<typeof setTimeout> | null = null;
-  function scheduleRelistVisible(): void {
+  let relistDirs = new Set<string>();
+  function scheduleRelist(dirs: Iterable<string>): void {
+    for (const d of dirs) relistDirs.add(d);
     if (relistTimer !== null) return; // a pass is already pending; fold into it
     relistTimer = setTimeout(() => {
       relistTimer = null;
-      void load(root);
-      for (const dir of expanded) void load(dir);
+      const targets = relistDirs;
+      relistDirs = new Set();
+      for (const dir of targets) {
+        if (dir === root || expanded.has(dir)) void load(dir);
+      }
     }, RELIST_DEBOUNCE_MS);
   }
   $effect(() => () => {
@@ -517,17 +536,28 @@
     untrack(() => beginCreate(req.kind, root));
   });
 
-  // Any fs mutation (this tree, the Finder, a tab rename) re-lists every
-  // visible dir — same shape as the git-epoch refresh above, and the only
+  // Any fs mutation (this tree, the Finder, a tab rename) re-lists the affected
+  // dir(s): the mutation names the exact path, so we relist its parent — both
+  // parents for a rename/move — rather than the whole tree. The only refresh
   // channel for paths outside a git repo.
   let lastFsEpoch = 0;
   $effect(() => {
     const epoch = $fsEpoch;
+    const m = $lastFsMutation;
     untrack(() => {
       if (epoch === lastFsEpoch) return;
       lastFsEpoch = epoch;
       if (epoch === 0) return;
-      scheduleRelistVisible();
+      const dirs = new Set<string>();
+      if (m?.kind === "rename") {
+        dirs.add(dirname(m.from));
+        dirs.add(dirname(m.to));
+      } else if (m?.kind === "create" || m?.kind === "delete") {
+        dirs.add(dirname(m.path));
+      } else {
+        dirs.add(root); // no precise path — fall back to the root listing
+      }
+      scheduleRelist(dirs);
     });
   });
 </script>
