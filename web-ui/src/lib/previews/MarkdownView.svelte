@@ -43,9 +43,17 @@
   /** The editor mounts on the first split/edit and then persists (CSS-hidden in
    *  preview) so no toggle drops the unsaved buffer. */
   let entered = $state(false);
-  /** The editor's live buffer, mirrored client-side for the split preview. */
+  /** The editor's live buffer, and its debounced mirror for the split preview —
+   *  marked.parse + DOMPurify.sanitize over the whole buffer is too heavy to run
+   *  on every keystroke (HtmlView debounces its iframe for the same reason). */
   let liveSource = $state("");
-  const liveHtml = $derived(mode === "split" ? renderMarkdown(liveSource) : "");
+  let liveDebounced = $state("");
+  $effect(() => {
+    const src = liveSource;
+    const t = setTimeout(() => (liveDebounced = src), 200);
+    return () => clearTimeout(t);
+  });
+  const liveHtml = $derived(mode === "split" ? renderMarkdown(liveDebounced) : "");
 
   // The shared store entry: preview HTML lives here (cached across tab switches,
   // and re-rendered in place when the file changes on disk — a save on the edit
@@ -69,6 +77,7 @@
     editable = null;
     entered = false;
     liveSource = "";
+    liveDebounced = "";
   });
 
   // --- context bridge: selection in the RENDERED preview ---------------------

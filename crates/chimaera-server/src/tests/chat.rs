@@ -1,24 +1,36 @@
+use std::collections::HashMap;
+
 use super::support::*;
 use chimaera_agent::model::{AgentEvent, ToolKind, ToolStatus};
 
-fn tool_call(kind: ToolKind, path: &str) -> AgentEvent {
+fn edit_call(id: &str, path: &str, status: ToolStatus) -> AgentEvent {
     AgentEvent::ToolCall {
-        id: "t".into(),
-        kind,
-        title: "tool".into(),
+        id: id.into(),
+        kind: ToolKind::Edit,
+        title: "edit".into(),
         locations: vec![path.to_string()],
-        status: ToolStatus::Completed,
+        status,
     }
 }
 
-/// A chat agent's `Edit` tool call must bump the workspace git epoch — the same
-/// live-refresh nudge the TUI path gets from its PostToolUse hook. codex chat
-/// has no such hook (and claude's stream-json hook can misfire), so this
-/// protocol event is the reliable trigger that lets a preview you have open
-/// refresh the moment the agent writes the file. A non-Edit tool call must NOT
-/// bump the epoch (a Read touches no disk).
+fn tool_update(id: &str, status: ToolStatus) -> AgentEvent {
+    AgentEvent::ToolCallUpdate {
+        id: id.into(),
+        status,
+        content: None,
+    }
+}
+
+/// A chat agent's `Edit` must bump the workspace git epoch — the same
+/// live-refresh nudge the TUI gets from its PostToolUse hook (codex chat has no
+/// such hook and claude's stream-json hook can misfire). The subtlety this test
+/// pins: the bump must fire on the WRITE's COMPLETION, not on the edit's
+/// announcement. Both drivers emit the Edit `ToolCall` with `InProgress` BEFORE
+/// the file is written (often behind an approval prompt); the write's
+/// completion arrives as a `ToolCallUpdate` with no `locations`. Nudging on the
+/// announcement would re-probe an unchanged mtime and then miss the real write.
 #[tokio::test]
-async fn chat_edit_event_bumps_the_git_epoch() {
+async fn chat_edit_nudges_on_write_completion_not_announcement() {
     let root = test_dir("chat-edit-epoch");
     std::fs::write(root.join("file.rs"), "x").unwrap();
 
@@ -47,17 +59,52 @@ async fn chat_edit_event_bumps_the_git_epoch() {
             .unwrap_or(0)
     };
 
-    // A Read tool call touches no disk → no nudge.
+    let mut pending = HashMap::new();
+    let sid = "sess-1";
     let before = epoch();
-    crate::chat::nudge_edited_paths(&state, &tool_call(ToolKind::Read, &edited)).await;
+
+    // A Read tool call touches no disk → never nudges.
+    crate::chat::nudge_on_edit(
+        &state,
+        &mut pending,
+        sid,
+        &AgentEvent::ToolCall {
+            id: "r".into(),
+            kind: ToolKind::Read,
+            title: "read".into(),
+            locations: vec![edited.clone()],
+            status: ToolStatus::Completed,
+        },
+    )
+    .await;
     assert_eq!(epoch(), before, "a Read tool call must not bump the epoch");
 
-    // The Edit tool call bumps the epoch for the touched in-workspace path, so
-    // the client is nudged to re-probe its open previews' mtime.
-    crate::chat::nudge_edited_paths(&state, &tool_call(ToolKind::Edit, &edited)).await;
+    // The Edit ANNOUNCEMENT (InProgress) must NOT bump yet — nothing is written.
+    crate::chat::nudge_on_edit(
+        &state,
+        &mut pending,
+        sid,
+        &edit_call("e1", &edited, ToolStatus::InProgress),
+    )
+    .await;
+    assert_eq!(
+        epoch(),
+        before,
+        "an announced-but-unwritten edit must not bump the epoch"
+    );
+
+    // The write's COMPLETION (a ToolCallUpdate carrying no locations) nudges the
+    // remembered path, so the client re-probes its open preview's mtime.
+    crate::chat::nudge_on_edit(
+        &state,
+        &mut pending,
+        sid,
+        &tool_update("e1", ToolStatus::Completed),
+    )
+    .await;
     assert!(
         epoch() > before,
-        "an Edit tool call must bump the workspace git epoch (before={before}, after={})",
+        "the edit's completion must bump the workspace git epoch (before={before}, after={})",
         epoch()
     );
 }

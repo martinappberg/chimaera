@@ -14,6 +14,7 @@
 //! events that change what it shows — a window opens/closes/renames, or the
 //! caffeinate state flips from any surface — via [`rebuild`].
 
+#[cfg(target_os = "macos")]
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
@@ -24,26 +25,37 @@ const TRAY_ID: &str = "chimaera-tray";
 pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
     let menu = build_menu(handle)?;
-    TrayIconBuilder::with_id(TRAY_ID)
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(tooltip(false))
-        .icon(icon(false))
-        .icon_as_template(true)
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id().0.as_str() {
             "quit" => crate::shell::request_quit(app),
             "tray-new-window" => open_new_window(app),
-            // Toggle the shared assertion; the resulting `caffeinate-changed`
-            // broadcast is what rebuilds the tray (icon + check) below.
             "tray-caffeinate" => {
                 let _ = crate::shell::apply_caffeinate(app, !crate::shell::caffeinate_armed(app));
+                // On success the `caffeinate-changed` listener rebuilds the tray
+                // (harmless double); on FAILURE nothing is broadcast, so this is
+                // what stops the auto-toggled check/icon diverging from reality.
+                rebuild(app);
             }
             other => {
                 if let Some(label) = other.strip_prefix("tray-win:") {
                     focus_window(app, label);
                 }
             }
-        })
-        .build(app)?;
+        });
+    // macOS tints a template glyph to the menu-bar theme. Off macOS, template
+    // tinting doesn't apply — a black-on-transparent glyph vanishes on a dark
+    // taskbar/panel — so use the full-colour app icon there instead.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.icon(icon(false)).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(app_icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(app_icon);
+    }
+    builder.build(app)?;
     // Keep the icon + "Keep Awake" check in sync when caffeinate flips from the
     // in-window toggle (the tray-driven flip lands here too, harmlessly).
     let sync = app.handle().clone();
@@ -67,10 +79,15 @@ pub fn rebuild(app: &AppHandle) {
             }
             Err(e) => tracing::warn!("tray menu rebuild failed: {e:#}"),
         }
-        let armed = crate::shell::caffeinate_armed(&app);
-        let _ = tray.set_icon(Some(icon(armed)));
-        let _ = tray.set_icon_as_template(true);
-        let _ = tray.set_tooltip(Some(tooltip(armed)));
+        // Only macOS shows the caffeinate state IN the bar (template idle/awake
+        // + tooltip); elsewhere the app icon set at install stays put.
+        #[cfg(target_os = "macos")]
+        {
+            let armed = crate::shell::caffeinate_armed(&app);
+            let _ = tray.set_icon(Some(icon(armed)));
+            let _ = tray.set_icon_as_template(true);
+            let _ = tray.set_tooltip(Some(tooltip(armed)));
+        }
     });
 }
 
@@ -120,7 +137,10 @@ fn seq_of(label: &str) -> u64 {
 
 /// The template icon: outline monogram idle, filled hexagon while caffeinated —
 /// a menu-bar-legible "on" indicator. Both are black-on-transparent so macOS
-/// tints them to the bar theme (`icon_as_template`).
+/// tints them to the bar theme (`icon_as_template`). macOS-only: off macOS the
+/// tray uses the full-colour app icon (a template glyph wouldn't be tinted and
+/// would vanish on a dark taskbar).
+#[cfg(target_os = "macos")]
 fn icon(armed: bool) -> Image<'static> {
     if armed {
         tauri::include_image!("icons/tray-awake.png")

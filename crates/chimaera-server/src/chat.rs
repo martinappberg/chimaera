@@ -10,6 +10,7 @@
 //! with full async access to `AppState` (degrading a session respawns a PTY,
 //! which no sync hook could do).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -147,6 +148,10 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
         return; // already running (app() called twice only in tests)
     };
     tokio::spawn(async move {
+        // Announced-but-unwritten edits, (session, tool id) → locations, bridged
+        // to their completion event (which carries no locations). See
+        // `nudge_on_edit`. Owned by this single pump task, so no lock needed.
+        let mut pending_edits: HashMap<(String, String), Vec<String>> = HashMap::new();
         while let Some(signal) = rx.recv().await {
             match signal {
                 ChatSignal::Event(id, entry) => {
@@ -162,13 +167,16 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
                         }
                     }
                     // An agent editing a file is the signature preview-refresh
-                    // trigger — nudge the git epoch so a preview you have open
-                    // updates live. Runs OUTSIDE apply_chat_event: it is async
-                    // and the std-mutex agents guard is already dropped.
-                    nudge_edited_paths(&state, &entry.ev).await;
+                    // trigger — nudge the git epoch (on write COMPLETION) so a
+                    // preview you have open updates live. Runs OUTSIDE
+                    // apply_chat_event: it is async and the std-mutex agents
+                    // guard is already dropped.
+                    nudge_on_edit(&state, &mut pending_edits, &id, &entry.ev).await;
                     state.changes.notify_waiters();
                 }
                 ChatSignal::Exit(id, exit) => {
+                    // A dead session's un-completed edits will never land.
+                    pending_edits.retain(|(s, _), _| s != &id);
                     handle_chat_exit(&state, &id, exit).await;
                     state.changes.notify_waiters();
                 }
@@ -177,25 +185,76 @@ pub(crate) fn spawn_signal_task(state: Arc<AppState>) {
     });
 }
 
-/// Nudge the git epoch for every path an agent's Edit tool call touched, so a
-/// preview you have open refreshes live the moment the agent writes the file.
+/// Nudge the git epoch for every path an agent's Edit tool call WROTE, so a
+/// preview you have open refreshes live the moment the file changes on disk.
 ///
-/// In chat mode this protocol `Edit` event is the *reliable* signal: codex has
-/// no PostToolUse hook at all, and claude's `-p stream-json` hook can misfire —
-/// only the TUI path (`agents.rs`) gets the hook cleanly. This drives the SAME
-/// `mark_path_dirty` mechanism from the protocol event, closing the gap for both
-/// chat agents. Called from the async signal pump AFTER `apply_chat_event`
-/// returns, so no `std::sync` guard is held across its `.await`s.
-pub(crate) async fn nudge_edited_paths(state: &Arc<AppState>, ev: &AgentEvent) {
-    let AgentEvent::ToolCall {
-        kind: chimaera_agent::model::ToolKind::Edit,
-        locations,
-        ..
-    } = ev
-    else {
-        return;
-    };
-    for path in locations {
+/// Timing is the subtlety: both drivers ANNOUNCE the edit as a
+/// `ToolCall{status:InProgress}` BEFORE the write — and, by default, before the
+/// user has even approved it — then report the write's completion as a
+/// `ToolCallUpdate` that carries no `locations`. Nudging on the announcement
+/// bumps the epoch too early (the client re-probes an unchanged mtime and gives
+/// up, then never hears about the real write). So we remember the announced
+/// locations, keyed by (session, tool id), and nudge when the matching
+/// completion lands. A driver that reports an edit already-done (`Completed` on
+/// the `ToolCall` itself) nudges immediately; a `Failed` edit nudges never.
+///
+/// In chat mode this protocol path is the *reliable* signal: codex has no
+/// PostToolUse hook at all, and claude's `-p stream-json` hook can misfire —
+/// only the TUI path (`agents.rs`) gets the hook cleanly. Called from the async
+/// signal pump AFTER `apply_chat_event` returns, so no `std::sync` guard is held
+/// across its `.await`s. `pending` is the pump's own map (single task, no lock).
+pub(crate) async fn nudge_on_edit(
+    state: &Arc<AppState>,
+    pending: &mut HashMap<(String, String), Vec<String>>,
+    sid: &str,
+    ev: &AgentEvent,
+) {
+    use chimaera_agent::model::{ToolKind, ToolStatus};
+    match ev {
+        AgentEvent::ToolCall {
+            kind: ToolKind::Edit,
+            id,
+            locations,
+            status,
+            ..
+        } => match status {
+            // Already written — nudge now.
+            ToolStatus::Completed => nudge_paths(state, locations).await,
+            // Announced, not yet written (possibly behind an approval prompt) —
+            // remember it; the completion `ToolCallUpdate` has no locations.
+            ToolStatus::Pending | ToolStatus::InProgress if !locations.is_empty() => {
+                // Turn/exit boundaries clear this; the cap is a backstop only.
+                if pending.len() >= 1024 {
+                    pending.clear();
+                }
+                pending.insert((sid.to_string(), id.clone()), locations.clone());
+            }
+            ToolStatus::Failed => {
+                pending.remove(&(sid.to_string(), id.clone()));
+            }
+            _ => {}
+        },
+        AgentEvent::ToolCallUpdate { id, status, .. } => match status {
+            ToolStatus::Completed => {
+                if let Some(paths) = pending.remove(&(sid.to_string(), id.clone())) {
+                    nudge_paths(state, &paths).await;
+                }
+            }
+            ToolStatus::Failed => {
+                pending.remove(&(sid.to_string(), id.clone()));
+            }
+            _ => {}
+        },
+        // An edit not completed by the turn's end never will be — bound the map.
+        AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. } => {
+            pending.retain(|(s, _), _| s != sid);
+        }
+        _ => {}
+    }
+}
+
+async fn nudge_paths(state: &Arc<AppState>, paths: &[String]) {
+    for path in paths {
         crate::git::mark_path_dirty(state, path).await;
     }
 }

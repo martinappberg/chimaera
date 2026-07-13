@@ -40,10 +40,13 @@ const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard cap on `fs/table` rows per page.
 const MAX_TABLE_ROWS: usize = 1000;
-/// Largest spreadsheet `fs/xlsx` will parse. calamine loads a whole sheet into
-/// memory (no lazy row streaming), so the SOURCE size is the ceiling that keeps
-/// a preview from blowing the daemon's RSS budget — an over-cap file gets an
-/// honest "too large" message rather than a memory spike. Typical result-table
+/// Largest spreadsheet `fs/xlsx` will parse, measured on the **on-disk
+/// (zip-compressed) source**. Note this is NOT a hard RSS bound: calamine has no
+/// lazy streaming, so it decompresses and materializes the whole sheet plus the
+/// shared-strings table, and peak memory is a multiple of this figure (a highly
+/// repetitive sheet compresses well and expands a lot). The cap keeps that
+/// multiple bounded and the transient spike off the reactor (`spawn_blocking`);
+/// an over-cap file gets an honest "too large" message. Typical result-table
 /// spreadsheets are well under this; huge ones belong in a CSV export.
 const MAX_XLSX_BYTES: u64 = 8 * 1024 * 1024;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one

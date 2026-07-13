@@ -218,7 +218,18 @@
   let caffeinated = $state(false);
   const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
   async function toggleCaffeinate(): Promise<void> {
-    caffeinated = await setCaffeinate(!caffeinated);
+    try {
+      caffeinated = await setCaffeinate(!caffeinated);
+    } catch (e) {
+      // The power assertion can fail to acquire; don't leave the button lying
+      // about the state — resync from the real one, and surface the reason.
+      console.error("caffeinate toggle failed", e);
+      try {
+        caffeinated = await caffeinateState();
+      } catch {
+        /* best-effort resync */
+      }
+    }
   }
   /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
   let lastRecentsEpoch: number | null = null;
@@ -708,11 +719,14 @@
     if (isNativeShell()) {
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
-      // Caffeinate state: read once, then follow the cross-window broadcast so
-      // toggling from any local window keeps every window's button in sync.
+      // Caffeinate state: attach the cross-window broadcast FIRST, then read
+      // the current value — so an event fired during startup isn't missed, and
+      // the initial read can't clobber a fresher value the listener applied.
       if (canCaffeinate) {
-        void caffeinateState().then((on) => (caffeinated = on));
-        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => (unlistenCaffeinate = u));
+        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => {
+          unlistenCaffeinate = u;
+          void caffeinateState().then((on) => (caffeinated = on));
+        });
       }
       void onAppUpdate((version) => (updateState.appVersion = version)).then(
         (u) => (unlistenAppUpdate = u),
