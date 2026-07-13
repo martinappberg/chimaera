@@ -8,7 +8,7 @@
   import { tick, untrack } from "svelte";
   import { basename, dirname, fsDownload, fsList, type FsEntry } from "../previews/files";
   import { getSetting } from "../settings/store.svelte";
-  import { gitIndex, gitStatus } from "./git";
+  import { gitIndex, gitStatus, type GitEntry } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
   import {
@@ -172,6 +172,9 @@
       expanded = new Set();
       listings = new Map();
       rootError = null;
+      lastGitEpoch = -1;
+      prevGitEntries = new Map();
+      relistDirs = new Set();
       void load(r);
     });
   });
@@ -190,16 +193,41 @@
   });
 
   // A git epoch bump means files may have APPEARED or vanished (an agent wrote a
-  // new file, a checkout removed one). Re-list ONLY the dirs whose direct
-  // listing could have changed — the parents of paths that entered or left the
-  // dirty set — instead of the whole tree. A file that merely stayed modified
-  // changes no listing (its row is there; its badge updates reactively via
-  // gitIndex), and a change deep under a collapsed dir needs no relist (its
-  // rollup dot is reactive too). This stops a write-burst from re-listing every
-  // expanded folder on each tick. Plain `let` (not $state): written inside the
-  // effect that reads the epoch.
+  // new file, a checkout removed one). Re-list ONLY dirs whose direct listing
+  // could have changed, instead of the whole tree. A file that merely stays
+  // modified changes no listing (its row is there; its badge updates reactively
+  // via gitIndex). Plain `let` (not $state): written inside the effect that
+  // reads the epoch.
+  interface GitListingSig {
+    sig: string;
+    paths: string[];
+  }
+
   let lastGitEpoch = -1;
-  let prevDirty = new Set<string>();
+  let prevGitEntries = new Map<string, GitListingSig>();
+
+  function gitListingSig(e: GitEntry): GitListingSig {
+    return {
+      // Status-code transitions can change filesystem presence (M -> D, D -> M)
+      // even when the path stays in the dirty set.
+      sig: `${e.x}${e.y}:${e.orig ?? ""}`,
+      // A clean-file rename enters the dirty set only at the destination; the
+      // source parent must still relist so its stale row disappears.
+      paths: e.orig === null ? [e.path] : [e.path, e.orig],
+    };
+  }
+
+  function addRelistAncestors(dirs: Set<string>, path: string): void {
+    const r = root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
+    let dir = dirname(path);
+    while (true) {
+      dirs.add(dir);
+      if (dir === r || dir === "/") break;
+      if (r !== "/" && !dir.startsWith(`${r}/`)) break;
+      dir = dirname(dir);
+    }
+  }
+
   $effect(() => {
     const status = $gitStatus;
     const epoch = status?.epoch ?? -1;
@@ -207,15 +235,23 @@
       if (epoch < 0 || epoch === lastGitEpoch) return;
       const first = lastGitEpoch < 0;
       lastGitEpoch = epoch;
-      const cur = new Set((status?.entries ?? []).map((e) => e.path));
+      const cur = new Map((status?.entries ?? []).map((e) => [e.path, gitListingSig(e)]));
       if (first) {
-        prevDirty = cur; // the initial fetch's listing is already current
+        prevGitEntries = cur; // the initial fetch's listing is already current
         return;
       }
       const dirs = new Set<string>();
-      for (const p of cur) if (!prevDirty.has(p)) dirs.add(dirname(p));
-      for (const p of prevDirty) if (!cur.has(p)) dirs.add(dirname(p));
-      prevDirty = cur;
+      for (const [path, next] of cur) {
+        if (prevGitEntries.get(path)?.sig !== next.sig) {
+          for (const p of next.paths) addRelistAncestors(dirs, p);
+        }
+      }
+      for (const [path, prev] of prevGitEntries) {
+        if (!cur.has(path)) {
+          for (const p of prev.paths) addRelistAncestors(dirs, p);
+        }
+      }
+      prevGitEntries = cur;
       if (dirs.size > 0) scheduleRelist(dirs);
     });
   });

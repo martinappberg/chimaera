@@ -27,7 +27,7 @@
 import { get } from "svelte/store";
 import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
-import { gitStatus } from "../workspace/git";
+import { gitStatus, type GitStatus } from "../workspace/git";
 import { getSetting } from "../settings/store.svelte";
 
 /** Max cached paths. Small: only a handful are ever open, the rest is history. */
@@ -73,6 +73,8 @@ export class FileEntry {
   lastUsed = 0;
   /** When the current rawUrl ticket was minted (for TTL re-mint). */
   rawMintedAt = 0;
+  /** Last global unknown-change generation this entry has checked against. */
+  seenAllStaleEpoch = 0;
   /** In-flight guards so concurrent readers don't double-fetch. */
   private loading = { chunk: false, md: false, table: false, raw: false };
 
@@ -211,15 +213,17 @@ export class FileEntry {
    * views update in place. Unchanged → no fetch, no view disturbance.
    */
   async revalidate(): Promise<void> {
-    let probed: string | null;
     try {
-      probed = (await fsFile(this.path, 0, 1)).mtime;
+      const probed = (await fsFile(this.path, 0, 1)).mtime;
+      if (probed === null || probed === this.mtime) return;
+      this.mtime = probed;
+      await this.refreshPayloads();
     } catch {
       return; // unreachable/deleted — leave content; the tab-prune path handles death
+    } finally {
+      this.seenAllStaleEpoch = allStaleEpoch;
+      stalePaths.delete(this.path);
     }
-    if (probed === null || probed === this.mtime) return;
-    this.mtime = probed;
-    await this.refreshPayloads();
   }
 
   /**
@@ -258,6 +262,7 @@ function evict(): void {
     }
     if (oldest === null) break; // everything is pinned on screen
     cache.delete(oldest.path);
+    stalePaths.delete(oldest.path); // the stale mark dies with the entry
   }
 }
 
@@ -271,10 +276,9 @@ export function retain(path: string): FileEntry {
   evict();
   // A warm entry reclaimed after time off-screen (the keep-alive live set
   // evicted its view, but the bytes are still cached) may have missed a change.
-  // Re-probe on claim ONLY when the repo says this path is dirty — a file git
-  // reports clean cannot have moved, so reopening it is instant with no
-  // round-trip. This is the eviction-reopen complement to view keep-alive.
-  if (e.hasPayload && dirtyPaths.has(path)) void e.revalidate();
+  // Re-probe only when this exact path was marked stale, is currently dirty, or
+  // an unknown-path change happened while it was away.
+  if (e.hasPayload && shouldRevalidateOnRetain(e)) void e.revalidate();
   return e;
 }
 
@@ -300,42 +304,78 @@ function forget(path: string): void {
   // revalidate, and once unreferenced the LRU reaps it.
   if (e.refs > 0) return;
   cache.delete(path);
+  stalePaths.delete(path); // the stale mark dies with the entry
 }
 
 // --- invalidation: revalidate on-screen paths when the disk changes ----------
 
 let revalidateTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingRevalidatePaths = new Set<string>();
+let pendingRevalidateAll = false;
 
-/** Coalesced revalidation of every on-screen entry (refs>0). */
-function scheduleRevalidate(): void {
+/**
+ * Paths with warm payloads that may have changed while no view was mounted.
+ * They stay marked until the entry revalidates, so an evicted keep-alive view
+ * reopens fresh even after the debounce already flushed.
+ */
+const stalePaths = new Set<string>();
+let allStaleEpoch = 0;
+
+function shouldRevalidateOnRetain(e: FileEntry): boolean {
+  return (
+    dirtyPaths.has(e.path) || stalePaths.has(e.path) || e.seenAllStaleEpoch < allStaleEpoch
+  );
+}
+
+function markStale(paths: Iterable<string> | "all"): void {
+  if (paths === "all") {
+    allStaleEpoch += 1;
+    pendingRevalidateAll = true;
+    return;
+  }
+  for (const path of paths) {
+    if (cache.has(path)) stalePaths.add(path);
+    pendingRevalidatePaths.add(path);
+  }
+}
+
+/** Coalesced revalidation of mounted entries that may have changed. */
+function scheduleRevalidate(paths: Iterable<string> | "all"): void {
+  markStale(paths);
   if (revalidateTimer !== null) return;
   revalidateTimer = setTimeout(() => {
     revalidateTimer = null;
-    // Only re-probe on-screen entries the repo says actually changed. A file
-    // git reports clean cannot have moved on disk, so it is never probed — this
-    // is what stops the per-tick mass-probe storm across every open preview
-    // while an agent writes (the file it edits IS dirty; the ones you are just
-    // reading are not). Precise client mutations to non-repo paths still route
-    // through applyMutation.
+    const all = pendingRevalidateAll;
+    const paths = pendingRevalidatePaths;
+    pendingRevalidateAll = false;
+    pendingRevalidatePaths = new Set();
     for (const e of cache.values()) {
-      if (e.refs > 0 && dirtyPaths.has(e.path)) void e.revalidate();
+      if (e.refs > 0 && (all || paths.has(e.path) || stalePaths.has(e.path))) {
+        void e.revalidate();
+      }
     }
   }, REVALIDATE_DEBOUNCE_MS);
 }
 
 /** Apply a precise mutation (create/rename/delete gives us the exact path). */
 function applyMutation(m: FsMutation): void {
-  if (m.kind === "delete") forget(m.path);
-  else if (m.kind === "rename") forget(m.from);
-  // create/rename-target: nothing to invalidate (no stale entry yet); the
-  // coarse epoch below revalidates anything on screen under a changed dir.
-  scheduleRevalidate();
+  if (m.kind === "delete") {
+    forget(m.path);
+    scheduleRevalidate([m.path]);
+  } else if (m.kind === "rename") {
+    forget(m.from);
+    scheduleRevalidate([m.from, m.to]);
+  } else {
+    scheduleRevalidate([m.path]);
+  }
 }
 
 let wired = false;
 let lastEpoch = 0;
 let lastGitEpoch = -1;
 let lastMutationSeq = 0;
+let fsMutationPendingEpoch = false;
+let lastGitPaths = new Set<string>();
 /**
  * Absolute paths the repo currently reports dirty — the gate for revalidation.
  * Captured straight from each git-status snapshot's entries (the same source the
@@ -344,6 +384,15 @@ let lastMutationSeq = 0;
  * what stops the per-git-tick mass-probe across every open preview.
  */
 let dirtyPaths = new Set<string>();
+
+function gitStatusPaths(s: GitStatus): Set<string> {
+  const out = new Set<string>();
+  for (const e of s.entries) {
+    out.add(e.path);
+    if (e.orig !== null) out.add(e.orig);
+  }
+  return out;
+}
 
 /**
  * Subscribe once to the fs + git change buses. Idempotent — the first mount that
@@ -356,22 +405,46 @@ function ensureWired(): void {
   fsEpoch.subscribe((n) => {
     if (n === lastEpoch) return;
     lastEpoch = n;
-    if (n !== 0) scheduleRevalidate();
+    if (n === 0) return;
+    if (fsMutationPendingEpoch) {
+      fsMutationPendingEpoch = false;
+      return;
+    }
+    // Defensive fallback for any future fsEpoch producer that does not publish
+    // lastFsMutation with exact paths.
+    scheduleRevalidate("all");
   });
   lastFsMutation.subscribe((m) => {
     if (m === null || m.seq === lastMutationSeq) return;
     lastMutationSeq = m.seq;
+    fsMutationPendingEpoch = true;
     applyMutation(m);
   });
   gitStatus.subscribe((s) => {
     // Refresh the dirty set on every status (even a same-epoch replay), so the
     // gate below always reflects the latest snapshot.
-    dirtyPaths = new Set((s?.entries ?? []).map((e) => e.path));
+    dirtyPaths = s === null ? new Set() : gitStatusPaths(s);
     const epoch = s?.epoch ?? -1;
-    if (epoch < 0 || epoch === lastGitEpoch) return;
+    if (epoch < 0) {
+      lastGitEpoch = -1;
+      lastGitPaths = new Set();
+      return;
+    }
+    if (s === null) return;
+    if (epoch === lastGitEpoch) return;
     const first = lastGitEpoch < 0;
     lastGitEpoch = epoch;
-    if (!first) scheduleRevalidate(); // the first status is already current
+    const nextPaths = gitStatusPaths(s);
+    if (first) {
+      lastGitPaths = nextPaths; // the first status is already current
+      return;
+    }
+    const paths = new Set([...lastGitPaths, ...nextPaths]);
+    lastGitPaths = nextPaths;
+    // When git says the dirty path set is empty but the epoch moved, the write
+    // may have been ignored/untracked-by-config; without a path payload from the
+    // daemon, mounted previews must fall back to a bounded all-open recheck.
+    scheduleRevalidate(paths.size > 0 ? paths : "all");
   });
 }
 
