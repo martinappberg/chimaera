@@ -23,6 +23,8 @@ fn main() {
             "begin_update",
             "shell_build",
             "write_clipboard",
+            "set_caffeinate",
+            "caffeinate_state",
             "answer_askpass",
             "list_askpass",
             "wsl_status",

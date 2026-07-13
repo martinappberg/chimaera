@@ -153,18 +153,21 @@
     type DropSpot,
     type LayoutCtrl,
   } from "./lib/layout/dnd";
-  import { chordDigit, fontChord, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
+  import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
   import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
   import {
     askpassActive,
+    caffeinateState,
     closeThisWindow,
     connectHost,
     isNativeShell,
     onAppUpdate,
+    onCaffeinateChanged,
     onHostStatus,
     onLocalDaemonUpdated,
     onMenu,
     reportWindowScope,
+    setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
   } from "./lib/net/native";
@@ -208,6 +211,26 @@
   let health = $state<Health | null>(null);
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
+  /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
+   *  Shown only on a local native window — a remote window's work runs on the
+   *  remote host, so caffeinating this laptop would be pointless — and only on
+   *  macOS, where the clamshell/lid-close keep-awake it exists for applies. */
+  let caffeinated = $state(false);
+  const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
+  async function toggleCaffeinate(): Promise<void> {
+    try {
+      caffeinated = await setCaffeinate(!caffeinated);
+    } catch (e) {
+      // The power assertion can fail to acquire; don't leave the button lying
+      // about the state — resync from the real one, and surface the reason.
+      console.error("caffeinate toggle failed", e);
+      try {
+        caffeinated = await caffeinateState();
+      } catch {
+        /* best-effort resync */
+      }
+    }
+  }
   /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
   let lastRecentsEpoch: number | null = null;
   let workspaces = $state<Workspace[]>([]);
@@ -302,7 +325,7 @@
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
   // the shell can't see the change otherwise).
   $effect(() => {
-    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId);
+    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId, windowLabel || null);
   });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
@@ -413,6 +436,19 @@
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+
+  /** How this window is named in the shell's tray window-list: the workspace
+   *  name (with the host on a remote window), or "Home" for the home screen —
+   *  NOT the OS titlebar (which appends "| chimaera"). Reported with the scope
+   *  so the tray never falls back to the generic app title. Empty while the
+   *  workspace is still loading; the tray shows a placeholder until it lands. */
+  const windowLabel = $derived(
+    activeWsId === null
+      ? isRemoteWindow
+        ? `Home •${hostAlias}`
+        : "Home"
+      : (workspace?.name ?? "") + (isRemoteWindow ? ` •${hostAlias}` : ""),
+  );
 
   /** The daemon-wide events socket (created in onMount); used to register the
    *  workspace this window watches, which gates the daemon's git backstop. */
@@ -679,9 +715,19 @@
     let unlistenDaemonMoved: (() => void) | null = null;
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
+    let unlistenCaffeinate: (() => void) | null = null;
     if (isNativeShell()) {
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
+      // Caffeinate state: attach the cross-window broadcast FIRST, then read
+      // the current value — so an event fired during startup isn't missed, and
+      // the initial read can't clobber a fresher value the listener applied.
+      if (canCaffeinate) {
+        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => {
+          unlistenCaffeinate = u;
+          void caffeinateState().then((on) => (caffeinated = on));
+        });
+      }
       void onAppUpdate((version) => (updateState.appVersion = version)).then(
         (u) => (unlistenAppUpdate = u),
       );
@@ -696,6 +742,9 @@
             break;
           case "new-agent":
             newAgentPrimary();
+            break;
+          case "settings":
+            openSettingsSurface();
             break;
         }
       }).then((u) => (unlistenMenu = u));
@@ -755,6 +804,7 @@
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
+      unlistenCaffeinate?.();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -1112,25 +1162,25 @@
   }
 
   /**
-   * Open a file surfaced FROM a pane (terminal link, touched-files popover):
-   * an already-open tab is focused wherever it lives (no duplicates);
-   * otherwise it lands in the adjacent pane, or a fresh split to the right
-   * when the window has one pane or Cmd/Ctrl forced a new split.
+   * Open a file surfaced FROM a pane (terminal/chat link, Finder row, session-
+   * changes row, touched-files popover): an already-open tab is focused wherever
+   * it lives (reuse existing, no duplicates); otherwise it lands in the ACTIVE
+   * (focused) pane — the same "opens in the pane you're in" rule the FILES tree
+   * and quick-open already follow. Cmd/Ctrl (newSplit) forces a fresh split to
+   * the right instead, the escape hatch when you want it beside the source.
    */
   function openFileFromPane(paneId: string, path: string, newSplit: boolean, pinned = false): void {
     const existing = paneForTab(layout.root, { surface: "file", path });
     if (existing !== null) {
       layout = activateTab(layout, existing.paneId, existing.index);
+    } else if (newSplit) {
+      layout = splitPane(layout, paneId, "row");
+      layout = openFile(layout, path, !pinned);
     } else {
-      // Opens are PREVIEW tabs (italic, replaced by the next preview open)
-      // unless the caller pinned them (a tree double-click, a created file).
-      const neighbor = newSplit ? null : adjacentPane(layout, paneId);
-      if (neighbor !== null) {
-        layout = openFile(focusPane(layout, neighbor), path, !pinned);
-      } else {
-        layout = splitPane(layout, paneId, "row");
-        layout = openFile(layout, path, !pinned);
-      }
+      // Open in the active pane (the source pane the click just focused). Opens
+      // are PREVIEW tabs (italic, replaced by the next preview open) unless the
+      // caller pinned them (a tree double-click, a created file).
+      layout = openFile(focusPane(layout, paneId), path, !pinned);
     }
     // A file surface took focus: pull DOM focus off the terminal so plain
     // keys stop reaching a PTY that is no longer the focused view.
@@ -3272,6 +3322,40 @@
             <span class="dg-branch">can’t read repo</span>
           </button>
         {/if}
+        {#if canCaffeinate}
+          <button
+            class="daemon-settings caffeinate"
+            class:on={caffeinated}
+            title={caffeinated
+              ? "caffeinate on — this Mac won’t sleep (lid-closed needs AC power)"
+              : "caffeinate — keep this Mac awake"}
+            aria-label="caffeinate"
+            aria-pressed={caffeinated}
+            onclick={() => void toggleCaffeinate()}
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+              <path
+                d="M3 6.2h7.5v3.3a2.6 2.6 0 0 1-2.6 2.6H5.6A2.6 2.6 0 0 1 3 9.5V6.2z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M10.5 7.1h1.3a1.6 1.6 0 0 1 0 3.2h-1.3"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+              <path
+                d="M4.9 2.5c0 .8-.7.8-.7 1.6M7 2.5c0 .8-.7.8-.7 1.6M9.1 2.5c0 .8-.7.8-.7 1.6"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.1"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        {/if}
         {#if activeWsId !== null}
           <button
             class="daemon-settings"
@@ -4344,6 +4428,18 @@
   .daemon-settings:hover {
     background: var(--row-hover);
     color: var(--fg);
+  }
+
+  /* When both the caffeinate toggle and the gear show, only the first claims
+     the auto-margin; the gear sits just after it instead of splitting the gap. */
+  .caffeinate + .daemon-settings {
+    margin-left: 4px;
+  }
+
+  /* Armed = accented, so the "keeping this Mac awake" state reads at a glance. */
+  .caffeinate.on,
+  .caffeinate.on:hover {
+    color: var(--accent);
   }
 
   .stage {

@@ -74,6 +74,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/fs/file", get(fs::file).put(fs::put_file))
         .route("/fs/markdown", get(fs::markdown))
         .route("/fs/table", get(fs::table))
+        .route("/fs/xlsx", get(fs::xlsx))
         .route("/fs/quickopen", get(quickopen::quickopen))
         .route("/fs/validate", post(fs::validate))
         .route("/fs/mkdir", post(fs::mkdir))

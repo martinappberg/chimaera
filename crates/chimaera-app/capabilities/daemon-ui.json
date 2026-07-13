@@ -26,6 +26,8 @@
     "allow-begin-update",
     "allow-shell-build",
     "allow-write-clipboard",
+    "allow-set-caffeinate",
+    "allow-caffeinate-state",
     "allow-answer-askpass",
     "allow-list-askpass"
   ]

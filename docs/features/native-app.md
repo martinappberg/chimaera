@@ -112,10 +112,43 @@ app-build` (never the root `cargo`).
   prompt chain still needs a real-hardware pass; the site deliberately doesn't advertise the
   Windows download until then.
 
+## Menu bar & tray
+
+- **Menu bar** (`menu.rs`): the macOS **Chimaera** submenu (About · **Settings…** ⌘, · Services ·
+  Hide/Hide Others/Show All · Quit), **File** (New Window ⇧⌘N · New Terminal ⌘T · New Agent ⇧⌘T ·
+  Close View ⌘W · Close Window; +Settings…/Quit on Windows/Linux, which have no app submenu),
+  **Edit**, **View** (fullscreen), **Window**, and **Help** (About, non-macOS only). Items the page
+  owns — `close-view`/`new-terminal`/`new-agent`/`settings` — are `emit_to`'d as a `menu` event to the
+  focused window (`onMenu` in `App.svelte`, via `native.ts`); `new-window` is handled shell-side.
+  **Settings** is daemon-scoped: it opens the settings surface for the focused window's daemon (a
+  remote window → the remote daemon's settings), same as the in-UI gear.
+- **System tray / menu-bar status item** (`tray.rs`, `tray-icon` feature): a persistent icon whose
+  menu lists the **open workspace windows** (click one to raise it), then New Window and Quit — the
+  entry point when all windows are closed but the app is still resident. The icon is a real **brand-mark
+  template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
+  (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob. On
+  macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt via
+  `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
+  Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
+
+## Caffeinate
+
+- A **macOS-only, local-only** whole-machine keep-awake toggle, reachable from **two surfaces** kept in
+  sync: a coffee-cup button in the rail's bottom bar (shown only when
+  `isNativeShell() && isMac && getHostLabel() === "local"` — a remote window's work runs on the remote
+  host, so caffeinating this laptop is pointless; and macOS is where the lid-close keep-awake it exists
+  for applies) **and** the tray's **Keep Awake** check item + the icon filling in when armed. Armed =
+  the machine won't idle-, display-, or system-sleep. Both surfaces call one shared core
+  (`shell::apply_caffeinate`) that holds a single power assertion (the **keepawake** crate: macOS
+  IOKit) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the app. The
+  state broadcasts (`caffeinate-changed`), which the in-window toggle and the tray (`tray::rebuild`)
+  both listen to, so flipping it from either surface updates the other. IPC commands remain
+  `set_caffeinate(on)` / `caffeinate_state()`. **macOS caveat, surfaced in the tooltip:**
+  lid-closed-awake additionally requires **AC power** — Apple hard-blocks clamshell wake on battery,
+  which no app can override.
+
 ## Status: partial
 
-- The native **menu bar** (`menu.rs`) is installed at setup but its contents weren't enumerated in the
-  discovery pass — treat it as under-documented.
 - **Windows is beta**: engine + connect transport + askpass relay are implemented and
   CI-smoked; the wizard flow and the interop askpass chain have not yet been hand-driven on
   retail Windows hardware.

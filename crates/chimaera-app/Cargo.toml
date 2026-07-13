@@ -25,10 +25,17 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tauri = { version = "2", features = [] }
+# `tray-icon`: the macOS menu-bar / Windows-Linux system-tray status item
+# (tray.rs). On Linux this pulls libayatana-appindicator into the bundle — a
+# packaging dependency, accepted deliberately for the tray affordance.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 # Self-update: check GitHub releases, verify against the embedded minisign
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().
+# Cross-platform "keep awake" power assertion for the caffeinate toggle
+# (macOS IOKit / Windows SetThreadExecutionState / Linux systemd-inhibit).
+# App-only — never in the musl daemon.
+keepawake = "0.6"
 tauri-plugin-updater = "2"
 # OS clipboard backend for the `write_clipboard` command: WKWebView rejects a
 # non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so

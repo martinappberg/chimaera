@@ -4,11 +4,34 @@
 //! window. Items the page handles are forwarded as a "menu" event to the
 //! focused window (see onMenu in native.ts).
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{App, AppHandle, Emitter, Manager};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::{App, AppHandle, Emitter, Manager, Wry};
+
+/// Handles to menu items whose enabled state tracks runtime context, so
+/// [`sync_settings_enabled`] can toggle them. Managed on the app at install.
+pub(crate) struct MenuState {
+    /// Settings is workspace/daemon-scoped, so it's greyed out unless the
+    /// focused window actually has a workspace open (not the home screen).
+    settings: MenuItem<Wry>,
+}
 
 pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
+
+    // One Settings item, shared between the platform submenus below and the
+    // managed handle. Starts disabled; the first focused workspace window
+    // enables it (see `sync_settings_enabled`).
+    let settings = MenuItemBuilder::with_id("settings", "Settings…")
+        .accelerator("CmdOrCtrl+,")
+        .enabled(false)
+        .build(handle)?;
+
+    // A custom Quit (not the predefined one) so it routes through
+    // `request_quit`, which flags the intent — otherwise the shell can't tell
+    // an explicit quit from closing the last window (which drops to home).
+    let quit = MenuItemBuilder::with_id("quit", "Quit Chimaera")
+        .accelerator("CmdOrCtrl+Q")
+        .build(handle)?;
 
     // The application menu (services/hide/show) is a macOS concept; Windows
     // and Linux menubars start at File, where Quit must live instead.
@@ -16,13 +39,15 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .separator()
+        .item(&settings)
+        .separator()
         .item(&PredefinedMenuItem::services(handle, None)?)
         .separator()
         .item(&PredefinedMenuItem::hide(handle, None)?)
         .item(&PredefinedMenuItem::hide_others(handle, None)?)
         .item(&PredefinedMenuItem::show_all(handle, None)?)
         .separator()
-        .item(&PredefinedMenuItem::quit(handle, None)?)
+        .item(&quit)
         .build()?;
 
     let file = SubmenuBuilder::new(handle, "File")
@@ -53,9 +78,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
             Some("Close Window"),
         )?);
     #[cfg(not(target_os = "macos"))]
-    let file = file
-        .separator()
-        .item(&PredefinedMenuItem::quit(handle, None)?);
+    let file = file.separator().item(&settings).separator().item(&quit);
     let file = file.build()?;
 
     let edit = SubmenuBuilder::new(handle, "Edit")
@@ -92,6 +115,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let menu = menu.items(&[&file, &edit, &view, &window, &help]);
     let menu = menu.build()?;
     app.set_menu(menu)?;
+    app.manage(MenuState { settings });
 
     app.on_menu_event(|app: &AppHandle, event| {
         let id = event.id().0.as_str();
@@ -110,10 +134,11 @@ pub fn install(app: &App) -> tauri::Result<()> {
                     );
                 }
             }
-            "close-view" | "new-terminal" | "new-agent" => {
-                // The page knows what "close the focused view" means; the
-                // shell only knows which window is focused. emit_to, not
-                // emit: a broadcast would close a view in EVERY window.
+            "quit" => crate::shell::request_quit(app),
+            "close-view" | "new-terminal" | "new-agent" | "settings" => {
+                // The page knows what "close the focused view" / "open settings"
+                // means; the shell only knows which window is focused. emit_to,
+                // not emit: a broadcast would act in EVERY window.
                 if let Some(window) = app
                     .webview_windows()
                     .into_values()
@@ -126,4 +151,17 @@ pub fn install(app: &App) -> tauri::Result<()> {
         }
     });
     Ok(())
+}
+
+/// Enable the Settings menu item only when the focused window has a workspace
+/// open — it's daemon/workspace-scoped, so on the home screen (or with no window
+/// focused) it has nothing to act on and would open an empty surface. Called
+/// whenever focus or the focused window's workspace changes. Cheap; a no-op
+/// before the menu is managed.
+pub(crate) fn sync_settings_enabled(app: &AppHandle) {
+    if let Some(state) = app.try_state::<MenuState>() {
+        let _ = state
+            .settings
+            .set_enabled(crate::shell::focused_ws_open(app));
+    }
 }

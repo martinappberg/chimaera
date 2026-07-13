@@ -7,9 +7,16 @@
 
   interface Props {
     path: string;
+    /** Override the page source. Default (CSV/TSV) reads the shared store's
+     *  cached first page + `fsTable` for more. A caller that supplies this (the
+     *  xlsx viewer, per sheet) bypasses the store and drives the grid directly —
+     *  same shape, so selection/resize/paging are unchanged. Pass a STABLE
+     *  reference (e.g. a `$derived`); a fresh inline closure each render churns
+     *  this component's effect. */
+    fetchPage?: (offset: number, limit: number) => Promise<TablePage>;
   }
 
-  let { path }: Props = $props();
+  let { path, fetchPage = undefined }: Props = $props();
 
   /** Rows per fetched page (settings ground truth, read per request). */
   const pageRows = () => getSetting("files.tableRowsPerPage");
@@ -61,6 +68,26 @@
     sel = null;
     anchor = null;
     loading = true;
+    if (fetchPage !== undefined) {
+      // Store-bypass source (xlsx): no shared store entry (so no instant cache /
+      // live-on-disk refresh) — the caller remounts us per sheet, which resets
+      // everything above, then we fetch that sheet's first page directly.
+      entry = null;
+      const fp = fetchPage;
+      void (async () => {
+        try {
+          const page = await fp(0, pageRows());
+          if (p !== path) return;
+          apply(page, true);
+        } catch (e) {
+          if (p !== path) return;
+          error = e instanceof Error ? e.message : "failed to load the sheet";
+        } finally {
+          if (p === path) loading = false;
+        }
+      })();
+      return;
+    }
     const e = retain(p);
     entry = e;
     void e.ensureTable();
@@ -109,7 +136,7 @@
     const p = path;
     const off = loadedOffset + rows.length;
     try {
-      const page = await fsTable(p, off, pageRows());
+      const page = fetchPage !== undefined ? await fetchPage(off, pageRows()) : await fsTable(p, off, pageRows());
       if (p !== path) return;
       apply(page, false);
     } catch (e) {

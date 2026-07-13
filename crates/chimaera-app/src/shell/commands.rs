@@ -352,6 +352,7 @@ pub(super) fn report_window_scope(
     state: State<'_, Shell>,
     alias: Option<String>,
     ws: Option<String>,
+    label: Option<String>,
 ) {
     let mut windows = lock(&state.windows);
     let stable_id = windows
@@ -364,12 +365,33 @@ pub(super) fn report_window_scope(
             alias: alias.clone(),
             ws: ws.clone(),
             stable_id: stable_id.clone(),
+            label: label.unwrap_or_default(),
         },
     );
     drop(windows);
     if !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, alias, ws);
     }
+    // The reported label names this window in the tray's list; rebuild so it
+    // shows the fresh name (the store above happened before this call).
+    crate::tray::rebuild(webview.app_handle());
+    // Its workspace also decides whether Settings applies (home screen = no).
+    crate::menu::sync_settings_enabled(webview.app_handle());
+}
+
+/// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`
+/// broadcast the tray's "Keep Awake" item drives — lives in `apply_caffeinate`
+/// so both surfaces share one guard and stay in sync.
+#[tauri::command]
+pub(super) fn set_caffeinate(app: AppHandle, on: bool) -> Result<bool, String> {
+    super::apply_caffeinate(&app, on)
+}
+
+/// Whether the caffeinate assertion is currently held. Each window reads this on
+/// mount to render its toggle; live changes ride the `caffeinate-changed` event.
+#[tauri::command]
+pub(super) fn caffeinate_state(state: State<'_, Shell>) -> bool {
+    lock(&state.caffeinate).is_some()
 }
 
 /// This app binary's build id, for daemon-skew detection in the UI (the

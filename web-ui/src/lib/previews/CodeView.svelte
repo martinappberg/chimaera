@@ -58,9 +58,14 @@
     path: string;
     /** First chunk, already fetched (and sniffed as text) by FileView. */
     first: FileChunk;
+    /** Live buffer sink: called with the current editor text on mount and on
+     *  every change (a keystroke, a background fill, a reload). The split
+     *  edit|preview shell uses it to re-render the preview as you type — the
+     *  file is still only written on Cmd/Ctrl+S. */
+    onDoc?: (text: string) => void;
   }
 
-  let { path, first }: Props = $props();
+  let { path, first, onDoc = undefined }: Props = $props();
 
   let host = $state<HTMLDivElement | null>(null);
   let loadedBytes = $state(0);
@@ -236,16 +241,21 @@
         bracketMatching(),
         syntaxHighlighting(highlight, { fallback: true }),
         // Context bridge: track the selection in both read-only and editable
-        // modes (this listener lives outside the edit compartment).
+        // modes (this listener lives outside the edit compartment). It also
+        // feeds the live-buffer sink (split preview) on every doc change.
         EditorView.updateListener.of((u) => {
           if (u.selectionSet || u.docChanged) syncSelection(u.view);
           else if (u.geometryChanged) placeChip(u.view);
+          if (u.docChanged) onDoc?.(u.state.doc.toString());
         }),
         editCompartment.of(editExtensions(editable)),
       ],
     });
     const v = new EditorView({ state, parent: el });
     view = v;
+    // Seed the live-buffer sink with the initial text (the split preview shows
+    // current content before the first keystroke).
+    onDoc?.(text);
 
     // Keep the chip pinned to the selection end while the code scrolls.
     const onScroll = () => placeChip(v);

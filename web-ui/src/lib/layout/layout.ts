@@ -137,6 +137,17 @@ export interface Layout {
 export const MIN_RATIO = 0.05;
 const MAX_DEPTH = 32;
 
+/**
+ * Ceiling on the auto-split that shift+cmd+arrow performs when there is no pane
+ * to move into yet: never grow a window past `MAX_PANES` panes, and never split
+ * a pane so tight that the two halves fall below `MIN_PANE_FRAC` of the window
+ * on the split axis. Both guard the auto-split only — an explicit split chord or
+ * a drag-tear is still unbounded (deliberate manual placement). ("max 4, or some
+ * percentage of the window", per the request.)
+ */
+export const MAX_PANES = 4;
+const MIN_PANE_FRAC = 0.12;
+
 let counter = 0;
 function uid(): string {
   counter += 1;
@@ -569,18 +580,36 @@ export function toggleZoom(l: Layout): Layout {
 }
 
 /**
- * Carry the focused pane's active tab into the neighboring pane in `dir`,
- * focus following the tab. No-op without a neighbor, and while zoomed —
- * the other panes aren't visible, so a silent move would be disorienting.
+ * Carry the focused pane's active tab into the neighboring pane in `dir`, focus
+ * following the tab. With no neighbor there, AUTO-SPLIT a new pane on that side
+ * (rather than the old no-op): a pane holding other tabs tears its active tab
+ * into the fresh pane; a single-tab pane — nothing to tear without collapsing
+ * itself — opens an empty pane on that side and focuses it (the "split that way"
+ * outcome). The auto-split is capped at MAX_PANES and a minimum pane size. No-op
+ * while zoomed — the other panes aren't visible, so a silent move/split would be
+ * disorienting.
  */
 export function moveTabDirection(l: Layout, dir: FocusDir): Layout {
   if (l.zoomedPaneId !== null) return l;
   const p = findPane(l.root, l.focusedPaneId);
   if (p === null || p.tabs.length === 0) return l;
   const probe = moveFocus(l, dir);
-  if (probe.focusedPaneId === l.focusedPaneId) return l;
-  // center drop detaches from the source pane and focuses the target
-  return dropTab(l, p.tabs[p.active], probe.focusedPaneId, "center");
+  if (probe.focusedPaneId !== l.focusedPaneId) {
+    // A neighbor exists in that direction: carry the tab into it (a center drop
+    // detaches from the source pane and focuses the target).
+    return dropTab(l, p.tabs[p.active], probe.focusedPaneId, "center");
+  }
+  // No neighbor in `dir`: auto-split a new pane there, within the caps.
+  if (panes(l.root).length >= MAX_PANES) return l;
+  if (wouldUndersizeSplit(l, l.focusedPaneId, dir)) return l;
+  if (p.tabs.length === 1) {
+    const sdir: SplitDir = dir === "left" || dir === "right" ? "row" : "col";
+    const before = dir === "left" || dir === "up";
+    return splitPane(l, l.focusedPaneId, sdir, before);
+  }
+  const zone: Zone =
+    dir === "left" ? "left" : dir === "right" ? "right" : dir === "up" ? "top" : "bottom";
+  return dropTab(l, p.tabs[p.active], l.focusedPaneId, zone);
 }
 
 /**
@@ -917,6 +946,21 @@ function collectRects(node: LayoutNode, r: Rect, out: Map<string, Rect>): void {
     collectRects(node.a, { x: r.x, y: r.y, w: r.w, h: r.h * ratio }, out);
     collectRects(node.b, { x: r.x, y: r.y + r.h * ratio, w: r.w, h: r.h * (1 - ratio) }, out);
   }
+}
+
+/**
+ * Would auto-splitting `paneId` along `dir` push a pane below MIN_PANE_FRAC of
+ * the window on that axis? Splitting halves the pane on its split axis (a
+ * left/right split shrinks width, up/down shrinks height), so guard on half the
+ * pane's current normalized extent.
+ */
+function wouldUndersizeSplit(l: Layout, paneId: string, dir: FocusDir): boolean {
+  const rects = new Map<string, Rect>();
+  collectRects(l.root, { x: 0, y: 0, w: 1, h: 1 }, rects);
+  const r = rects.get(paneId);
+  if (r === undefined) return false;
+  const axis = dir === "left" || dir === "right" ? r.w : r.h;
+  return axis / 2 < MIN_PANE_FRAC;
 }
 
 /**
@@ -1331,4 +1375,52 @@ if (import.meta.env.DEV) {
   dl = pruneDeletedPath(dl, "/w/gone");
   ok(allFilePaths(dl).join() === "/w/stay.txt", "delete closes file tabs under the path");
   ok(findFinder(dl, dlf.id)?.tab.path === "/w", "delete retargets finders to the parent");
+
+  // shift+cmd+arrow auto-split: with no neighbor in `dir`, a single-tab pane
+  // splits into a fresh empty pane on that side and focuses it.
+  let ms = defaultLayout();
+  ms = openSession(ms, "m1");
+  const msSrc = ms.focusedPaneId;
+  ms = moveTabDirection(ms, "right");
+  ok(panes(ms.root).length === 2, "auto-split creates a second pane when none is there");
+  ok(ms.focusedPaneId !== msSrc, "auto-split focuses the new pane");
+  ok(findPane(ms.root, ms.focusedPaneId)?.tabs.length === 0, "the new auto-split pane is empty");
+  ok(sessionPaneId(ms, "m1") === msSrc, "a single-tab pane keeps its tab in place");
+
+  // a multi-tab pane tears its ACTIVE tab into the new pane instead.
+  let mt = defaultLayout();
+  mt = openSession(mt, "t1");
+  mt = openSession(mt, "t2"); // both in one pane; t2 active
+  const mtSrc = mt.focusedPaneId;
+  mt = moveTabDirection(mt, "right");
+  ok(panes(mt.root).length === 2, "multi-tab auto-split creates a second pane");
+  ok(sessionPaneId(mt, "t2") === mt.focusedPaneId, "the active tab moved into the new pane");
+  ok(sessionPaneId(mt, "t1") === mtSrc, "the other tab stayed in the source pane");
+
+  // an existing neighbor is reused (no new split): a pane with a spare tab moves
+  // one INTO the neighbor and keeps the rest — pane count unchanged.
+  let mn = defaultLayout();
+  mn = openSession(mn, "n0");
+  const mnA = mn.focusedPaneId;
+  mn = splitPane(mn, mnA, "row"); // A | B (empty, focused)
+  mn = openSession(mn, "n1");
+  mn = openSession(mn, "n2"); // B = [n1, n2]
+  const mnCount = panes(mn.root).length; // 2
+  mn = moveTabDirection(mn, "left"); // neighbor A exists → move n2 into A
+  ok(panes(mn.root).length === mnCount, "moving into an existing neighbor makes no new pane");
+  ok(sessionPaneId(mn, "n2") === mnA, "the moved tab lands in the neighbor");
+
+  // the pane-count cap holds: never auto-split past MAX_PANES.
+  let mc = defaultLayout();
+  mc = openSession(mc, "c0");
+  for (let i = 0; i < MAX_PANES + 2; i++) mc = moveTabDirection(mc, "right");
+  ok(panes(mc.root).length <= MAX_PANES, "auto-split never exceeds MAX_PANES");
+
+  // zoomed windows never auto-split (the other panes aren't visible).
+  let mz = defaultLayout();
+  mz = openSession(mz, "z1");
+  mz = toggleZoom(mz);
+  const mzBefore = mz;
+  mz = moveTabDirection(mz, "right");
+  ok(mz === mzBefore, "moveTabDirection is a no-op while zoomed");
 }

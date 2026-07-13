@@ -44,6 +44,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `windows.rs` | The per-window registry (round-trips window↔workspace). |
 | `update.rs` | The auto-updater intent chain (consume-once, expiry). |
 | `menu.rs` | The menu bar. |
+| `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
 
 ## Invariants / gotchas
 

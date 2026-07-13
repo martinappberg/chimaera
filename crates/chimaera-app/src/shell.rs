@@ -9,13 +9,13 @@
 //! - [`restore`] — opening UI windows, the live-tunnel health monitor, and
 //!   reopening the persisted window set at launch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use chimaera_remote::Tunnel;
-use tauri::Manager;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::daemon::LocalDaemon;
 use crate::windows::{WindowRecord, WindowRegistry};
@@ -53,6 +53,16 @@ pub struct Shell {
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// Labels whose `CloseRequested` has fired but whose `Destroyed` has not.
+    /// The drop-to-home check counts OTHER live windows; without this, a
+    /// batched "close all windows" (both CloseRequested delivered before either
+    /// Destroyed, so each still sees the other in `webview_windows()`) would
+    /// miscount and let the app quit. Cleared on Destroyed. macOS-only path.
+    closing: Mutex<HashSet<String>>,
+    /// The held power assertion for the "caffeinate" toggle — Some = armed
+    /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
+    /// guard drops on quit, so the assertion never outlives the app.
+    caffeinate: Mutex<Option<keepawake::KeepAwake>>,
 }
 
 /// The (host, workspace) a window is showing. `alias` None = the local
@@ -64,12 +74,127 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
+    /// Human name for the tray's window list ("Home", or the workspace name),
+    /// reported by the SPA alongside the scope so the tray never has to read the
+    /// racy OS titlebar. Empty until the first scope report lands.
+    pub label: String,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The open windows for the tray's window list: `(window label, display
+/// name)`, restricted to windows that still exist. The name is the SPA-reported
+/// `label` (workspace name / "Home"); a window not yet mounted falls back to
+/// "Home" (home screen) or "Loading…" (a workspace still resolving its name) —
+/// never the generic OS title. Ordering is left to the caller.
+pub(crate) fn tray_windows(app: &AppHandle) -> Vec<(String, String)> {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return Vec::new();
+    };
+    let live: HashSet<String> = app.webview_windows().into_keys().collect();
+    let windows = lock(&shell.windows);
+    let out = windows
+        .iter()
+        .filter(|(label, _)| live.contains(*label))
+        .map(|(label, scope)| {
+            let name = if !scope.label.is_empty() {
+                scope.label.clone()
+            } else if scope.ws.is_none() {
+                "Home".to_string()
+            } else {
+                "Loading…".to_string()
+            };
+            (label.clone(), name)
+        })
+        .collect();
+    drop(windows);
+    out
+}
+
+/// Explicit quit (menu / tray / ⌘Q): flag `quitting` BEFORE exiting so the
+/// last window's `CloseRequested` skips the drop-to-home reopen, and its
+/// `Destroyed` keeps the window in the registry for next launch. Distinguishes
+/// "the user asked to quit" from "the user closed the last window".
+pub(crate) fn request_quit(app: &AppHandle) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        // Idempotent: Tauri delivers a tray menu event to BOTH the tray's own
+        // handler and the global app handler, so "quit" can arrive twice — do
+        // the exit once.
+        if shell.quitting.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        lock(&shell.registry).save_if_dirty();
+    }
+    app.exit(0);
+}
+
+/// Whether the currently-focused window has a workspace open (vs the home
+/// screen or no window focused). Drives the menu's Settings item, which is
+/// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
+/// and `report_window_scope`); false before startup or for the WSL wizard.
+pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
+    let Some(focused) = app
+        .webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
+    else {
+        return false;
+    };
+    app.try_state::<Shell>()
+        .map(|shell| {
+            lock(&shell.windows)
+                .get(focused.label())
+                .is_some_and(|s| s.ws.is_some())
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the "caffeinate" power assertion is currently held. Reads the
+/// managed `Shell` off the app handle so the tray (a sibling module that can't
+/// see `Shell`'s private field) can reflect the state; false before startup.
+pub(crate) fn caffeinate_armed(app: &AppHandle) -> bool {
+    app.try_state::<Shell>()
+        .map(|s| lock(&s.caffeinate).is_some())
+        .unwrap_or(false)
+}
+
+/// Arm/disarm the caffeinate assertion for THIS machine, the shared core behind
+/// both the UI command (`commands::set_caffeinate`) and the tray's "Keep Awake"
+/// item. While armed the app host won't idle-, display-, or system-sleep —
+/// including lid-closed on macOS, though only on AC power (Apple blocks
+/// clamshell-awake on battery; no app can override that). Idempotent: re-arming
+/// keeps the single held guard, disarming drops it. The resulting state
+/// broadcasts on `caffeinate-changed` so every window's toggle AND the tray
+/// (icon + menu check) stay in sync regardless of which surface flipped it.
+pub(crate) fn apply_caffeinate(app: &AppHandle, on: bool) -> Result<bool, String> {
+    let shell = app
+        .try_state::<Shell>()
+        .ok_or_else(|| "the app is not ready yet".to_string())?;
+    let mut guard = lock(&shell.caffeinate);
+    if on {
+        if guard.is_none() {
+            let awake = keepawake::Builder::default()
+                .display(true)
+                .idle(true)
+                .sleep(true)
+                .app_name("Chimaera")
+                .app_reverse_domain("com.chimaera.app")
+                .reason("Caffeinate")
+                .create()
+                .map_err(|e| format!("{e:#}"))?;
+            *guard = Some(awake);
+        }
+    } else {
+        *guard = None; // dropping the guard releases the assertion
+    }
+    let armed = guard.is_some();
+    drop(guard);
+    let _ = app.emit("caffeinate-changed", armed);
+    Ok(armed)
 }
 
 /// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
@@ -150,6 +275,8 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             windows: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
+            closing: Mutex::new(HashSet::new()),
+            caffeinate: Mutex::new(None),
         });
     } else {
         *lock(&handle.state::<Shell>().local) = local;
@@ -176,6 +303,9 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             }
         });
     }
+    // Seed the Settings item's enabled state for the windows just opened, in
+    // case a restored workspace window doesn't emit an early Focused event.
+    crate::menu::sync_settings_enabled(handle);
     Ok(())
 }
 
@@ -216,6 +346,8 @@ pub fn run() {
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,
+            commands::set_caffeinate,
+            commands::caffeinate_state,
             commands::answer_askpass,
             commands::list_askpass,
             commands::report_window_scope,
@@ -230,6 +362,71 @@ pub fn run() {
                 return;
             };
             match event {
+                // macOS convention: closing the LAST window drops you back to
+                // the home screen instead of quitting the app — you exit only by
+                // closing the home screen itself (or an explicit Quit / ⌘Q,
+                // which sets `quitting` and terminates without reaching here).
+                // We open a fresh home window (inheriting this one's geometry)
+                // *before* letting this one close, so the window count never
+                // hits zero — which is what fires the exit. When the window
+                // being closed already IS the local home screen, we don't
+                // reopen; the count falls to zero and the app exits, as
+                // intended. Not on Windows/Linux, where closing the last window
+                // conventionally quits (and their tray/wizard change the math).
+                #[cfg(target_os = "macos")]
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if shell.quitting.load(Ordering::Relaxed) {
+                        return; // an explicit quit is already in progress
+                    }
+                    let app = window.app_handle();
+                    // Mark this one closing first, then count the windows NOT
+                    // already on their way out — so a batched "close all" (both
+                    // CloseRequested before either Destroyed) still recognises
+                    // the true last window instead of each seeing the other.
+                    lock(&shell.closing).insert(window.label().to_string());
+                    let others = {
+                        let closing = lock(&shell.closing);
+                        app.webview_windows()
+                            .into_keys()
+                            .filter(|l| {
+                                l.as_str() != window.label()
+                                    && !l.starts_with("wsl-setup")
+                                    && !closing.contains(l)
+                            })
+                            .count()
+                    };
+                    if others > 0 {
+                        return; // not the last window — an ordinary close
+                    }
+                    let is_home = lock(&shell.windows)
+                        .get(window.label())
+                        .is_some_and(|s| s.alias.is_none() && s.ws.is_none());
+                    if is_home {
+                        return; // closing the home screen itself exits the app
+                    }
+                    let (port, token) = {
+                        let local = lock(&shell.local);
+                        (local.port, local.token.clone())
+                    };
+                    // Reopen home where this window sat, so it doesn't jump.
+                    let mut record = WindowRecord::new(None, None);
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
+                        let pos = pos.to_logical::<f64>(scale);
+                        let size = size.to_logical::<f64>(scale);
+                        record.x = Some(pos.x);
+                        record.y = Some(pos.y);
+                        record.width = Some(size.width);
+                        record.height = Some(size.height);
+                    }
+                    if let Err(e) = open_ui_window(app, port, &token, &record) {
+                        // Couldn't open home — keep THIS window rather than
+                        // exiting into nothing. Veto the close and forget it.
+                        tracing::error!("could not open home window on last-window close: {e}");
+                        lock(&shell.closing).remove(window.label());
+                        api.prevent_close();
+                    }
+                }
                 // Forget a window's scope once it's gone, so focus-existing
                 // never raises a dead label. Destroyed (not CloseRequested,
                 // which can be vetoed) fires after teardown completes. The
@@ -238,12 +435,23 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
+                    lock(&shell.closing).remove(window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
                             lock(&shell.registry).remove(&scope.stable_id);
                         }
+                        // The tray lists open windows; drop the closed one, and
+                        // resync Settings for whatever window is focused now
+                        // (or none). Skipped during quit (all windows tear down).
+                        crate::tray::rebuild(window.app_handle());
+                        crate::menu::sync_settings_enabled(window.app_handle());
                     }
+                }
+                // Focus moved to this window — Settings tracks whether the now-
+                // focused window has a workspace open.
+                tauri::WindowEvent::Focused(true) => {
+                    crate::menu::sync_settings_enabled(window.app_handle());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
                 // (and exit) persists — never a file write per drag event.
@@ -273,6 +481,12 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             crate::menu::install(app)?;
+            // The menu-bar / system-tray status item. Installed before the
+            // daemon is up (its click handlers read Shell.local, populated by
+            // runtime); non-fatal if the platform tray is unavailable.
+            if let Err(e) = crate::tray::install(app) {
+                tracing::warn!("system tray unavailable: {e:#}");
+            }
             // Route ssh auth prompts (password / 2FA) to the UI. Managed
             // before the listener starts so an early prompt finds the state.
             app.manage(crate::askpass::Askpass::default());

@@ -71,10 +71,15 @@ pub fn open_ui_window(
                 alias: record.alias.clone(),
                 ws: record.ws.clone(),
                 stable_id: record.id.clone(),
+                // Named by the SPA once it mounts (report_window_scope); until
+                // then the tray falls back to "Home"/"Loading…" by scope.
+                label: String::new(),
             },
         );
         lock(&shell.registry).upsert(record.clone());
     }
+    // A new window changes the tray's open-windows list.
+    crate::tray::rebuild(app);
     Ok(())
 }
 
