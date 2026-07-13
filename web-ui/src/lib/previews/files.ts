@@ -264,6 +264,26 @@ export async function fsRawUrl(path: string): Promise<string> {
 }
 
 /**
+ * Per-path `/raw/` URL memo (write-once artifacts). A ticket is valid ~10 min;
+ * re-minting one on every mount — as the chat artifact cards did — spends a
+ * round-trip AND changes the `<img>` src, forcing the browser to re-fetch and
+ * re-decode an image it already has (the flash). Memoizing the URL per path
+ * keeps the src STABLE across re-renders/remounts, so a cached image just shows.
+ * Safe for write-once outputs (plots, result tables) whose bytes don't change;
+ * live-updating previews mint their own fresh tickets on change (see fileStore).
+ */
+const ticketUrls = new Map<string, { url: string; at: number }>();
+const TICKET_MEMO_MS = 8 * 60 * 1000;
+
+export async function rawTicketUrl(path: string): Promise<string> {
+  const hit = ticketUrls.get(path);
+  if (hit !== undefined && Date.now() - hit.at < TICKET_MEMO_MS) return hit.url;
+  const url = await fsRawUrl(path);
+  ticketUrls.set(path, { url, at: Date.now() });
+  return url;
+}
+
+/**
  * Create an empty file or directory (POST /fs/create), making any missing
  * parents — the inline "new file" input accepts nested a/b/c.txt names.
  * 409 (already exists) surfaces as ApiError with the server's message.
