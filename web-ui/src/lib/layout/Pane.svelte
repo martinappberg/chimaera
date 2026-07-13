@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { PaneNode } from "./layout";
+  import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { untrack } from "svelte";
   import type { Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane } from "./dnd";
@@ -100,6 +101,51 @@
       sessions.get(activeTab.sessionId)?.exec_stage === "executing",
   );
 
+  // --- view keep-alive (the "keep tabs in RAM" model) -----------------------
+  //
+  // A pane renders EVERY tab in its live set, the active one visible and the
+  // rest hidden (never destroyed), so switching back is instant with scroll,
+  // image decode, and listings all intact. The live set is a per-pane MRU
+  // capped at LIVE_CAP: the active tab is always in it (and at the front), a
+  // revisited tab is promoted, and the tail unmounts past the cap (re-mounting
+  // fresh on return). This is the file/finder/chat/diff analogue of what the
+  // terminal already gets from termPool — a tab's view never mounts while
+  // hidden (it enters the set as the active tab), so nothing is measured at a
+  // degenerate size. Bounded RAM, no daemon cost (client-only DOM).
+  const LIVE_CAP = 8;
+  let liveKeys = $state<string[]>([]);
+
+  $effect(() => {
+    const active = activeTab;
+    if (active === null) return;
+    const key = tabKey(active);
+    untrack(() => {
+      const i = liveKeys.indexOf(key);
+      if (i !== 0) {
+        liveKeys =
+          i < 0 ? [key, ...liveKeys] : [key, ...liveKeys.slice(0, i), ...liveKeys.slice(i + 1)];
+      }
+      if (liveKeys.length > LIVE_CAP) liveKeys = liveKeys.slice(0, LIVE_CAP);
+    });
+  });
+
+  // Drop live keys whose tab has closed (or moved to another pane), so the cap
+  // counts only tabs this pane still holds.
+  $effect(() => {
+    const present = new Set(node.tabs.map(tabKey));
+    untrack(() => {
+      if (liveKeys.some((k) => !present.has(k))) {
+        liveKeys = liveKeys.filter((k) => present.has(k));
+      }
+    });
+  });
+
+  // The tabs whose views are mounted right now: the active tab (always) plus
+  // the rest of the live set, in tab-bar order.
+  const mountedTabs = $derived(
+    node.tabs.filter((t) => t === activeTab || liveKeys.includes(tabKey(t))),
+  );
+
   let rootEl = $state<HTMLElement | null>(null);
   let contentEl = $state<HTMLDivElement | null>(null);
   let tabbarEl = $state<HTMLElement | null>(null);
@@ -113,6 +159,55 @@
     return () => unregisterPane(node.id, root);
   });
 </script>
+
+{#snippet surface(tab: Tab, active: boolean)}
+  {#if tab.surface === "terminal"}
+    <!-- The surface follows server truth: which process runs behind the session
+         id (a chat driver or a PTY). Same tab, same identity — the view toggle
+         just flips this field on the bus. -->
+    {@const s = sessions.get(tab.sessionId)}
+    {#if s === undefined}
+      <!-- The session is gone (mid-teardown, before pruneSessions drops the
+           tab): render nothing, never a fresh TerminalView against a dead id. -->
+      <div class="hint"><span>closing…</span></div>
+    {:else if s.ui === "chat"}
+      <ChatView
+        session={s}
+        focused={focused && active}
+        terminals={[...sessions.values()]
+          .filter((t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id)
+          .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
+        onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
+        onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
+        onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
+      />
+    {:else}
+      <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
+    {/if}
+  {:else if tab.surface === "file"}
+    <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} />
+  {:else if tab.surface === "finder"}
+    <FinderView
+      path={tab.path}
+      {wsRoot}
+      onOpenFile={(p, split) => ctrl.openFileFrom(node.id, p, split)}
+      onNavigate={(p) => ctrl.navigateFinder(tab.id, p)}
+    />
+  {:else if tab.surface === "diff"}
+    <DiffView path={tab.path} mode={tab.mode} {wsId} />
+  {:else if tab.surface === "git"}
+    <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
+  {:else if tab.surface === "changes"}
+    {@const cs = sessions.get(tab.sessionId)}
+    {#if cs !== undefined}
+      <SessionChangesView session={cs} {wsRoot} paneId={node.id} {ctrl} />
+    {:else}
+      <div class="hint"><span>session closed</span></div>
+    {/if}
+  {:else if tab.surface === "settings"}
+    <SettingsView />
+  {/if}
+{/snippet}
 
 <section
   class="pane"
@@ -140,88 +235,31 @@
     bind:el={tabbarEl}
   />
   <div class="content" bind:this={contentEl}>
-    {#if activeTab !== null}
-      {#if activeTab.surface === "terminal"}
-        <!-- The surface follows server truth: which process actually runs
-             behind the session id (a chat driver or a PTY). Same tab, same
-             identity — the view toggle just flips this field on the bus. -->
-        {@const s = sessions.get(activeTab.sessionId)}
-        {#if s === undefined}
-          <!-- The session is gone (mid-teardown, before pruneSessions drops the
-               tab): render nothing, never a fresh TerminalView against a dead
-               id — that blank-cursor "ghost terminal" was the close-flicker. -->
-          <div class="hint"><span>closing…</span></div>
-        {:else if s.ui === "chat"}
-          <!-- Keyed: a ChatView owns one socket+store for one session; tab
-               switches must remount, never rebind. -->
-          {#key activeTab.sessionId}
-            <ChatView
-              session={s}
-              {focused}
-              terminals={[...sessions.values()]
-                .filter(
-                  (t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id,
-                )
-                .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
-              onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
-              onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
-              onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
-            />
-          {/key}
-        {:else}
-          <TerminalView sessionId={activeTab.sessionId} {focused} fontSize={node.fontSize} />
-        {/if}
-      {:else if activeTab.surface === "file"}
-        <FileView path={activeTab.path} {wsRoot} fontSize={node.fontSize} />
-      {:else if activeTab.surface === "finder"}
-        <FinderView
-          path={activeTab.path}
-          {wsRoot}
-          onOpenFile={(p, split) => ctrl.openFileFrom(node.id, p, split)}
-          onNavigate={(p) => ctrl.navigateFinder(activeTab.id, p)}
-        />
-      {:else if activeTab.surface === "diff"}
-        <!-- Keyed per (path, mode): switching between two diff tabs in one pane
-             must remount, never reuse the view with a stale comparison. -->
-        {#key `${activeTab.mode}:${activeTab.path}`}
-          <DiffView path={activeTab.path} mode={activeTab.mode} {wsId} />
-        {/key}
-      {:else if activeTab.surface === "git"}
-        <GitView
-          {wsId}
-          paneId={node.id}
-          {ctrl}
-          {sessions}
-          {names}
-          onOpenSession={ctrl.revealWorktreeSession}
-        />
-      {:else if activeTab.surface === "changes"}
-        {#if sessions.get(activeTab.sessionId) !== undefined}
-          <SessionChangesView
-            session={sessions.get(activeTab.sessionId)!}
-            {wsRoot}
-            paneId={node.id}
-            {ctrl}
-          />
-        {:else}
-          <div class="hint"><span>session closed</span></div>
-        {/if}
+    <!-- Every mounted tab keeps its live view — the active one visible, the rest
+         hidden (not destroyed), so a switch-back is instant with scroll, image
+         decode, and listings all preserved. Terminals layer their pooled xterm
+         on top of this via termPool the same way. -->
+    {#each mountedTabs as tab (tabKey(tab))}
+      {@const active = tab === activeTab}
+      <div class="layer" class:active inert={!active}>
+        {@render surface(tab, active)}
+      </div>
+    {/each}
+    {#if activeTab === null}
+      {#if names.size === 0}
+        <!-- No sessions to open or drag yet: point at creating one. -->
+        <div class="hint">
+          <span><kbd>{keyHint("newAgent")}</kbd> new agent</span>
+          <span class="hint-sep">·</span>
+          <span><kbd>{keyHint("newTerminal")}</kbd> new terminal</span>
+        </div>
       {:else}
-        <SettingsView />
+        <div class="hint">
+          <span><kbd>{activeModLabel()}1–9</kbd> opens a session</span>
+          <span class="hint-sep">·</span>
+          <span>drag one here</span>
+        </div>
       {/if}
-    {:else if names.size === 0}
-      <!-- No sessions to open or drag yet: point at creating one. -->
-      <div class="hint">
-        <span><kbd>{keyHint("newAgent")}</kbd> new agent</span>
-        <span class="hint-sep">·</span>
-        <span><kbd>{keyHint("newTerminal")}</kbd> new terminal</span>
-      </div>
-    {:else}
-      <div class="hint">
-        <span><kbd>{activeModLabel()}1–9</kbd> opens a session</span>
-        <span class="hint-sep">·</span>
-        <span>drag one here</span>
-      </div>
     {/if}
   </div>
 
@@ -322,6 +360,20 @@
     position: relative;
     min-height: 0;
     min-width: 0;
+  }
+
+  /* Keep-alive layers: every mounted tab fills the content box; only the active
+     one is visible. visibility:hidden (not display:none) leaves inactive views
+     laid out at full size, so xterm/CodeMirror stay correctly measured and a
+     switch-back needs no reflow — the DOM, scroll, and image decode are intact.
+     inert keeps hidden inputs/editors out of the focus + tab order. */
+  .layer {
+    position: absolute;
+    inset: 0;
+  }
+
+  .layer:not(.active) {
+    visibility: hidden;
   }
 
   .hint {

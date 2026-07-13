@@ -1,8 +1,8 @@
 <script lang="ts">
   import {
     basename,
-    fsRawUrl,
     fsTable,
+    rawTicketUrl,
     viewKindFor,
     type TablePage,
   } from "../previews/files";
@@ -36,7 +36,7 @@
     table = null;
     let stale = false;
     if (kind === "image" || kind === "pdf") {
-      void fsRawUrl(path)
+      void rawTicketUrl(path)
         .then((url) => {
           if (!stale) rawUrl = url;
         })

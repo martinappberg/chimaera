@@ -26,13 +26,17 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Where it lives.** `FileTree.svelte`; `fsList()` in `files.ts`. Route
   `GET /api/v1/fs/list?path=&hidden=` (server `fs.rs`).
 - **Key behaviors.** Rendered as a flat list of rows (indent = `depth * 13px`), not recursive
-  components. Respects `files.showHidden`. Re-lists the root + every expanded dir when the
-  workspace's git **epoch** bumps (a new untracked file gets a row to carry its status badge)
-  or the client **fs epoch** bumps (any create/rename/delete from any surface — see "File
-  management" below) — **coalesced**: a working agent bumps both epochs on every file it writes,
-  so the re-list is debounced (~250 ms) into one pass, sparing a remote link a storm of `fs/list`
-  calls. Changed files show a right-aligned letter badge (M/A/D/R/C/T/U/!) and a recolored name; a
-  collapsed dir containing changes shows a rollup dot.
+  components. Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
+  have changed** — not the whole tree — when the workspace's git **epoch** bumps (parents of
+  paths that entered/left the git dirty set: a symmetric diff, so both a new untracked file and a
+  removal are caught) or the client **fs epoch** bumps (the exact parent of that
+  create/rename/delete — both parents for a rename; see "File management" below). **Targeted +
+  debounced (~250 ms) + coalesced** into one pass, so a working agent re-lists just the folder it
+  touched, not every expanded dir — sparing a remote link a storm of `fs/list` calls. A
+  modified-in-place file changes no listing (its badge updates reactively via `gitIndex`); a
+  change under a collapsed dir needs no relist (its rollup dot is reactive too). Changed files show
+  a right-aligned letter badge (M/A/D/R/C/T/U/!) and a recolored name; a collapsed dir containing
+  changes shows a rollup dot.
 
 ## File management (create / rename / copy / paste / delete / download)
 
@@ -132,22 +136,29 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
 
-## Preview caching & live-update
+## Preview keep-alive & live-update
 
-- **What & when.** Every preview reads its content through a shared, LRU-capped content store
-  (`previews/fileStore.svelte.ts`) keyed by path — the file-side analogue of the terminal pool.
-  A view `retain`s its entry on mount, `release`s on unmount.
-- **Where it lives.** `previews/fileStore.svelte.ts` (`FileEntry`, `retain`/`release`/`noteWrite`);
-  every `*View.svelte` reads from it. It subscribes to `workspace/fsEvents.ts` (`fsEpoch`/
-  `lastFsMutation`) + `workspace/git.ts` (`gitStatus.epoch`).
-- **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is instant and
-  re-hits **no** route — the cached first 256 KB chunk / rendered markdown / first table page /
-  `/raw` ticket render immediately (the LRU caps browser memory; large files still stream
-  per-view). On a coalesced fs/git bump the store re-probes the **on-screen** paths' mtime (a
-  1-byte read carries `X-Mtime`) and, when it moved, refreshes their payloads **in place** (never
-  nulling — a null chunk would unmount a live `CodeView`) — so an agent or external edit to a file
-  you have open updates the view live. An **unsaved** `CodeView` buffer is never clobbered: a disk
-  change while dirty raises the "changed on disk" conflict bar instead of reloading.
+- **What & when.** A pane keeps every recently-viewed tab's **rendered view alive** (hidden, not
+  destroyed) across a tab switch — the same keep-alive model the terminal (`termPool`) and chat
+  (`chatPool`) surfaces use, bounded by a per-pane LRU (cap 8). A shared, LRU-capped content store
+  (`previews/fileStore.svelte.ts`, keyed by path) additionally caches the *bytes* so re-opening a
+  view the live-set evicted re-renders warm rather than re-fetching.
+- **Where it lives.** `layout/Pane.svelte` (the live-set — renders active + recently-visited tabs,
+  inactive ones `visibility:hidden` + `inert`); `previews/fileStore.svelte.ts` (`FileEntry`,
+  `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
+  `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`).
+- **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is **instant with
+  scroll position, image decode, finder columns, and editor state all preserved** — the DOM is
+  never rebuilt, and no route is re-hit (a view only mounts while active, so nothing is measured at
+  a degenerate size). Live-on-disk update is **git-dirty-gated**: on a git-status change the store
+  re-probes the mtime (a 1-byte read carries `X-Mtime`) of **only** the on-screen entries the repo
+  reports dirty (a clean file cannot have moved), never every open preview on every tick — so an
+  agent editing a file you have open still updates it live, without the per-tick mass-probe storm
+  that made the workbench feel slow over ssh. A moved mtime refreshes payloads **in place** (never
+  nulling — a null chunk would unmount a live `CodeView`). An **unsaved** `CodeView` buffer is
+  never clobbered: a disk change while dirty raises the "changed on disk" conflict bar instead of
+  reloading. Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
+  image doesn't re-fetch and re-decode (the flash) on re-render.
 
 ## File & folder glyphs
 
