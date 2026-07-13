@@ -76,6 +76,27 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether the currently-focused window has a workspace open (vs the home
+/// screen or no window focused). Drives the menu's Settings item, which is
+/// workspace/daemon-scoped. Reads the scope map (populated by `open_ui_window`
+/// and `report_window_scope`); false before startup or for the WSL wizard.
+pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
+    let Some(focused) = app
+        .webview_windows()
+        .into_values()
+        .find(|w| w.is_focused().unwrap_or(false))
+    else {
+        return false;
+    };
+    app.try_state::<Shell>()
+        .map(|shell| {
+            lock(&shell.windows)
+                .get(focused.label())
+                .is_some_and(|s| s.ws.is_some())
+        })
+        .unwrap_or(false)
+}
+
 /// Whether the "caffeinate" power assertion is currently held. Reads the
 /// managed `Shell` off the app handle so the tray (a sibling module that can't
 /// see `Shell`'s private field) can reflect the state; false before startup.
@@ -225,6 +246,9 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             }
         });
     }
+    // Seed the Settings item's enabled state for the windows just opened, in
+    // case a restored workspace window doesn't emit an early Focused event.
+    crate::menu::sync_settings_enabled(handle);
     Ok(())
 }
 
@@ -294,10 +318,17 @@ pub fn run() {
                         if let Some(scope) = scope {
                             lock(&shell.registry).remove(&scope.stable_id);
                         }
-                        // The tray lists open windows; drop the closed one.
-                        // Skipped during quit (every window is tearing down).
+                        // The tray lists open windows; drop the closed one, and
+                        // resync Settings for whatever window is focused now
+                        // (or none). Skipped during quit (all windows tear down).
                         crate::tray::rebuild(window.app_handle());
+                        crate::menu::sync_settings_enabled(window.app_handle());
                     }
+                }
+                // Focus moved to this window — Settings tracks whether the now-
+                // focused window has a workspace open.
+                tauri::WindowEvent::Focused(true) => {
+                    crate::menu::sync_settings_enabled(window.app_handle());
                 }
                 // Track geometry in memory on every move/resize; a slow tick
                 // (and exit) persists — never a file write per drag event.

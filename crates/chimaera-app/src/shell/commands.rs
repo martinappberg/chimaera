@@ -372,6 +372,8 @@ pub(super) fn report_window_scope(
     }
     // The window's title tracks its workspace; refresh the tray's list of it.
     crate::tray::rebuild(webview.app_handle());
+    // Its workspace also decides whether Settings applies (home screen = no).
+    crate::menu::sync_settings_enabled(webview.app_handle());
 }
 
 /// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`

@@ -4,11 +4,27 @@
 //! window. Items the page handles are forwarded as a "menu" event to the
 //! focused window (see onMenu in native.ts).
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{App, AppHandle, Emitter, Manager};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::{App, AppHandle, Emitter, Manager, Wry};
+
+/// Handles to menu items whose enabled state tracks runtime context, so
+/// [`sync_settings_enabled`] can toggle them. Managed on the app at install.
+pub(crate) struct MenuState {
+    /// Settings is workspace/daemon-scoped, so it's greyed out unless the
+    /// focused window actually has a workspace open (not the home screen).
+    settings: MenuItem<Wry>,
+}
 
 pub fn install(app: &App) -> tauri::Result<()> {
     let handle = app.handle();
+
+    // One Settings item, shared between the platform submenus below and the
+    // managed handle. Starts disabled; the first focused workspace window
+    // enables it (see `sync_settings_enabled`).
+    let settings = MenuItemBuilder::with_id("settings", "Settings…")
+        .accelerator("CmdOrCtrl+,")
+        .enabled(false)
+        .build(handle)?;
 
     // The application menu (services/hide/show) is a macOS concept; Windows
     // and Linux menubars start at File, where Quit must live instead.
@@ -16,11 +32,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let app_menu = SubmenuBuilder::new(handle, "Chimaera")
         .item(&PredefinedMenuItem::about(handle, None, None)?)
         .separator()
-        .item(
-            &MenuItemBuilder::with_id("settings", "Settings…")
-                .accelerator("CmdOrCtrl+,")
-                .build(handle)?,
-        )
+        .item(&settings)
         .separator()
         .item(&PredefinedMenuItem::services(handle, None)?)
         .separator()
@@ -61,11 +73,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     #[cfg(not(target_os = "macos"))]
     let file = file
         .separator()
-        .item(
-            &MenuItemBuilder::with_id("settings", "Settings…")
-                .accelerator("CmdOrCtrl+,")
-                .build(handle)?,
-        )
+        .item(&settings)
         .separator()
         .item(&PredefinedMenuItem::quit(handle, None)?);
     let file = file.build()?;
@@ -104,6 +112,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let menu = menu.items(&[&file, &edit, &view, &window, &help]);
     let menu = menu.build()?;
     app.set_menu(menu)?;
+    app.manage(MenuState { settings });
 
     app.on_menu_event(|app: &AppHandle, event| {
         let id = event.id().0.as_str();
@@ -138,4 +147,17 @@ pub fn install(app: &App) -> tauri::Result<()> {
         }
     });
     Ok(())
+}
+
+/// Enable the Settings menu item only when the focused window has a workspace
+/// open — it's daemon/workspace-scoped, so on the home screen (or with no window
+/// focused) it has nothing to act on and would open an empty surface. Called
+/// whenever focus or the focused window's workspace changes. Cheap; a no-op
+/// before the menu is managed.
+pub(crate) fn sync_settings_enabled(app: &AppHandle) {
+    if let Some(state) = app.try_state::<MenuState>() {
+        let _ = state
+            .settings
+            .set_enabled(crate::shell::focused_ws_open(app));
+    }
 }
