@@ -352,6 +352,7 @@ pub(super) fn report_window_scope(
     state: State<'_, Shell>,
     alias: Option<String>,
     ws: Option<String>,
+    label: Option<String>,
 ) {
     let mut windows = lock(&state.windows);
     let stable_id = windows
@@ -364,13 +365,15 @@ pub(super) fn report_window_scope(
             alias: alias.clone(),
             ws: ws.clone(),
             stable_id: stable_id.clone(),
+            label: label.unwrap_or_default(),
         },
     );
     drop(windows);
     if !stable_id.is_empty() {
         lock(&state.registry).set_scope(&stable_id, alias, ws);
     }
-    // The window's title tracks its workspace; refresh the tray's list of it.
+    // The reported label names this window in the tray's list; rebuild so it
+    // shows the fresh name (the store above happened before this call).
     crate::tray::rebuild(webview.app_handle());
     // Its workspace also decides whether Settings applies (home screen = no).
     crate::menu::sync_settings_enabled(webview.app_handle());

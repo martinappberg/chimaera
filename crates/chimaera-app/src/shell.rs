@@ -9,7 +9,7 @@
 //! - [`restore`] — opening UI windows, the live-tunnel health monitor, and
 //!   reopening the persisted window set at launch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -53,6 +53,12 @@ pub struct Shell {
     /// Set on ExitRequested: window teardown during quit must NOT remove
     /// records from the registry, or quitting would forget every window.
     quitting: AtomicBool,
+    /// Labels whose `CloseRequested` has fired but whose `Destroyed` has not.
+    /// The drop-to-home check counts OTHER live windows; without this, a
+    /// batched "close all windows" (both CloseRequested delivered before either
+    /// Destroyed, so each still sees the other in `webview_windows()`) would
+    /// miscount and let the app quit. Cleared on Destroyed. macOS-only path.
+    closing: Mutex<HashSet<String>>,
     /// The held power assertion for the "caffeinate" toggle — Some = armed
     /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
     /// guard drops on quit, so the assertion never outlives the app.
@@ -68,6 +74,10 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
+    /// Human name for the tray's window list ("Home", or the workspace name),
+    /// reported by the SPA alongside the scope so the tray never has to read the
+    /// racy OS titlebar. Empty until the first scope report lands.
+    pub label: String,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -76,13 +86,47 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The open windows for the tray's window list: `(window label, display
+/// name)`, restricted to windows that still exist. The name is the SPA-reported
+/// `label` (workspace name / "Home"); a window not yet mounted falls back to
+/// "Home" (home screen) or "Loading…" (a workspace still resolving its name) —
+/// never the generic OS title. Ordering is left to the caller.
+pub(crate) fn tray_windows(app: &AppHandle) -> Vec<(String, String)> {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return Vec::new();
+    };
+    let live: HashSet<String> = app.webview_windows().into_keys().collect();
+    let windows = lock(&shell.windows);
+    let out = windows
+        .iter()
+        .filter(|(label, _)| live.contains(*label))
+        .map(|(label, scope)| {
+            let name = if !scope.label.is_empty() {
+                scope.label.clone()
+            } else if scope.ws.is_none() {
+                "Home".to_string()
+            } else {
+                "Loading…".to_string()
+            };
+            (label.clone(), name)
+        })
+        .collect();
+    drop(windows);
+    out
+}
+
 /// Explicit quit (menu / tray / ⌘Q): flag `quitting` BEFORE exiting so the
 /// last window's `CloseRequested` skips the drop-to-home reopen, and its
 /// `Destroyed` keeps the window in the registry for next launch. Distinguishes
 /// "the user asked to quit" from "the user closed the last window".
 pub(crate) fn request_quit(app: &AppHandle) {
     if let Some(shell) = app.try_state::<Shell>() {
-        shell.quitting.store(true, Ordering::Relaxed);
+        // Idempotent: Tauri delivers a tray menu event to BOTH the tray's own
+        // handler and the global app handler, so "quit" can arrive twice — do
+        // the exit once.
+        if shell.quitting.swap(true, Ordering::Relaxed) {
+            return;
+        }
         lock(&shell.registry).save_if_dirty();
     }
     app.exit(0);
@@ -231,6 +275,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             windows: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
+            closing: Mutex::new(HashSet::new()),
             caffeinate: Mutex::new(None),
         });
     } else {
@@ -317,41 +362,69 @@ pub fn run() {
                 return;
             };
             match event {
-                // Closing the LAST window drops you back to the home screen
-                // instead of quitting the app — you exit only by closing the
-                // home screen itself (or an explicit Quit / ⌘Q, which sets
-                // `quitting` and terminates without reaching here). We don't
-                // veto the close; we open a fresh home window *first* so the
-                // window count never hits zero (which is what fires the exit),
-                // then let this one close. When the window being closed already
-                // IS the local home screen, we don't reopen — the count falls
-                // to zero and the app exits, as intended.
-                tauri::WindowEvent::CloseRequested { .. } => {
+                // macOS convention: closing the LAST window drops you back to
+                // the home screen instead of quitting the app — you exit only by
+                // closing the home screen itself (or an explicit Quit / ⌘Q,
+                // which sets `quitting` and terminates without reaching here).
+                // We open a fresh home window (inheriting this one's geometry)
+                // *before* letting this one close, so the window count never
+                // hits zero — which is what fires the exit. When the window
+                // being closed already IS the local home screen, we don't
+                // reopen; the count falls to zero and the app exits, as
+                // intended. Not on Windows/Linux, where closing the last window
+                // conventionally quits (and their tray/wizard change the math).
+                #[cfg(target_os = "macos")]
+                tauri::WindowEvent::CloseRequested { api, .. } => {
                     if shell.quitting.load(Ordering::Relaxed) {
                         return; // an explicit quit is already in progress
                     }
                     let app = window.app_handle();
-                    let others = app
-                        .webview_windows()
-                        .into_keys()
-                        .filter(|l| l.as_str() != window.label() && !l.starts_with("wsl-setup"))
-                        .count();
+                    // Mark this one closing first, then count the windows NOT
+                    // already on their way out — so a batched "close all" (both
+                    // CloseRequested before either Destroyed) still recognises
+                    // the true last window instead of each seeing the other.
+                    lock(&shell.closing).insert(window.label().to_string());
+                    let others = {
+                        let closing = lock(&shell.closing);
+                        app.webview_windows()
+                            .into_keys()
+                            .filter(|l| {
+                                l.as_str() != window.label()
+                                    && !l.starts_with("wsl-setup")
+                                    && !closing.contains(l)
+                            })
+                            .count()
+                    };
                     if others > 0 {
                         return; // not the last window — an ordinary close
                     }
                     let is_home = lock(&shell.windows)
                         .get(window.label())
                         .is_some_and(|s| s.alias.is_none() && s.ws.is_none());
-                    if !is_home {
-                        let (port, token) = {
-                            let local = lock(&shell.local);
-                            (local.port, local.token.clone())
-                        };
-                        if let Err(e) =
-                            open_ui_window(app, port, &token, &WindowRecord::new(None, None))
-                        {
-                            tracing::error!("could not open home window on last-window close: {e}");
-                        }
+                    if is_home {
+                        return; // closing the home screen itself exits the app
+                    }
+                    let (port, token) = {
+                        let local = lock(&shell.local);
+                        (local.port, local.token.clone())
+                    };
+                    // Reopen home where this window sat, so it doesn't jump.
+                    let mut record = WindowRecord::new(None, None);
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    if let (Ok(pos), Ok(size)) = (window.outer_position(), window.inner_size()) {
+                        let pos = pos.to_logical::<f64>(scale);
+                        let size = size.to_logical::<f64>(scale);
+                        record.x = Some(pos.x);
+                        record.y = Some(pos.y);
+                        record.width = Some(size.width);
+                        record.height = Some(size.height);
+                    }
+                    if let Err(e) = open_ui_window(app, port, &token, &record) {
+                        // Couldn't open home — keep THIS window rather than
+                        // exiting into nothing. Veto the close and forget it.
+                        tracing::error!("could not open home window on last-window close: {e}");
+                        lock(&shell.closing).remove(window.label());
+                        api.prevent_close();
                     }
                 }
                 // Forget a window's scope once it's gone, so focus-existing
@@ -362,6 +435,7 @@ pub fn run() {
                 // teardown destroys every window and forgetting them would
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
+                    lock(&shell.closing).remove(window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {

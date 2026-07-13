@@ -314,7 +314,7 @@
   // this window instead of duplicating it (the SPA swaps `ws` client-side, so
   // the shell can't see the change otherwise).
   $effect(() => {
-    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId);
+    if (isNativeShell()) void reportWindowScope(scopeAlias, activeWsId, windowLabel || null);
   });
   // --- the agent launcher (split button + popover) ---
   /** The persisted default agent the split button's main surface spawns. */
@@ -425,6 +425,19 @@
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
   const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+
+  /** How this window is named in the shell's tray window-list: the workspace
+   *  name (with the host on a remote window), or "Home" for the home screen —
+   *  NOT the OS titlebar (which appends "| chimaera"). Reported with the scope
+   *  so the tray never falls back to the generic app title. Empty while the
+   *  workspace is still loading; the tray shows a placeholder until it lands. */
+  const windowLabel = $derived(
+    activeWsId === null
+      ? isRemoteWindow
+        ? `Home •${hostAlias}`
+        : "Home"
+      : (workspace?.name ?? "") + (isRemoteWindow ? ` •${hostAlias}` : ""),
+  );
 
   /** The daemon-wide events socket (created in onMount); used to register the
    *  workspace this window watches, which gates the daemon's git backstop. */

@@ -89,24 +89,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         b = b.item(&keep).separator();
     }
 
-    // Open windows, oldest first (labels are "win-N"), excluding the WSL wizard.
-    let mut wins: Vec<(String, String)> = app
-        .webview_windows()
-        .into_iter()
-        .filter(|(label, _)| !label.starts_with("wsl-setup"))
-        .map(|(label, win)| {
-            let title = win.title().unwrap_or_default();
-            let title = if title.trim().is_empty() {
-                "Chimaera".to_string()
-            } else {
-                title
-            };
-            (label, title)
-        })
-        .collect();
+    // Open windows, oldest first (labels are "win-N"), each named by the
+    // SPA-reported label (the workspace name, or "Home") — never the racy OS
+    // titlebar, which lags the async setTitle and falls back to "chimaera".
+    let mut wins = crate::shell::tray_windows(app);
     wins.sort_by_key(|(label, _)| seq_of(label));
-    for (label, title) in &wins {
-        let item = MenuItemBuilder::with_id(format!("tray-win:{label}"), title).build(app)?;
+    for (label, name) in &wins {
+        let item = MenuItemBuilder::with_id(format!("tray-win:{label}"), name).build(app)?;
         b = b.item(&item);
     }
     if !wins.is_empty() {

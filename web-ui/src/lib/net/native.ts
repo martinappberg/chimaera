@@ -319,8 +319,9 @@ export function onHostStatus(
 export async function reportWindowScope(
   alias: string | null,
   ws: string | null,
+  label: string | null,
 ): Promise<void> {
-  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws });
+  await tauri()?.core.invoke<void>("report_window_scope", { alias, ws, label });
 }
 
 /**
