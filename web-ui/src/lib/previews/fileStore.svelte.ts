@@ -1,24 +1,27 @@
 /**
  * The file-content store: one reactive `FileEntry` per open path, keyed in a
- * module-level LRU. It is the file-side analogue of `terminal/termPool` and the
- * `git.ts` store — durable state that lives OUTSIDE the Svelte component tree, so
- * a preview surviving a pane-tab switch (which unmounts its component,
- * `layout/Pane.svelte`) re-attaches to warm content instead of re-hitting the
- * network. This is what makes "switching back to a file you were just on" instant
- * over an ssh daemon.
+ * module-level LRU. Durable state that lives OUTSIDE the Svelte component tree.
  *
- * It also closes a real gap: today no open preview ever reflects a disk change
- * (every view depends only on `path`). The store subscribes to the fs/git change
- * buses and, on a coalesced bump, re-probes the mtime of the paths that are
- * currently ON SCREEN and refreshes their payloads in place — so an agent editing
- * a file you have open updates the view live. The editor guards its own unsaved
- * buffer (see CodeView); the store only carries the last-known-on-disk content.
+ * With `layout/Pane.svelte` now keeping preview VIEWS alive across a tab switch
+ * (hidden, not destroyed — the terminal/chat keep-alive model, bounded by its
+ * own live-set LRU), this store is no longer what makes switching back instant;
+ * the mounted view already holds its rendered DOM. What it still earns:
+ *   1. Instant REOPEN of a view the keep-alive set evicted — its bytes are
+ *      cached here (CACHE_CAP > the view live-set), so re-mounting re-renders
+ *      warm instead of re-hitting the network. The complement to view
+ *      keep-alive in the Chrome-tabs model.
+ *   2. Live-on-disk update: an agent editing a file you have open updates the
+ *      view in place. This is now PRECISE — the store re-probes only entries the
+ *      repo reports DIRTY (see scheduleRevalidate / retain), never every
+ *      on-screen preview on every git tick. A clean file cannot have moved, so
+ *      it is never probed; that removed the per-tick mass-probe storm that made
+ *      the workbench feel slow while an agent wrote. The editor guards its own
+ *      unsaved buffer (see CodeView); the store carries last-known-on-disk only.
  *
  * Memory lives in the browser tab, not the daemon: each entry holds at most the
- * first 256KB chunk (+ small rendered payloads), and the LRU caps the count — so
- * this is ~single-digit MB, not the multi-MB-per-tab cost of keeping heavy
- * CodeMirror/PDF views mounted. Large files stay streamed: CodeView/TableView
- * still page beyond the first chunk on their own.
+ * first 256KB chunk (+ small rendered payloads), and the LRU caps the count.
+ * Large files stay streamed: CodeView/TableView still page beyond the first
+ * chunk on their own.
  */
 
 import { get } from "svelte/store";
@@ -266,14 +269,12 @@ export function retain(path: string): FileEntry {
   const e = entryFor(path);
   e.refs += 1;
   evict();
-  // A warm entry reclaimed after time off-screen may have missed a disk change
-  // (scheduleRevalidate only covers entries that were on screen when the bump
-  // fired). Re-probe on claim so reopening a file reflects edits made while it
-  // sat on another tab. Keyed on any cached payload — NOT on `mtime`, which only
-  // the chunk fetch populates (a table/markdown/image/pdf entry is warm with a
-  // null mtime, and would otherwise never revalidate on reopen). A cold entry
-  // has nothing to revalidate — its ensure*() fetches fresh.
-  if (e.hasPayload) void e.revalidate();
+  // A warm entry reclaimed after time off-screen (the keep-alive live set
+  // evicted its view, but the bytes are still cached) may have missed a change.
+  // Re-probe on claim ONLY when the repo says this path is dirty — a file git
+  // reports clean cannot have moved, so reopening it is instant with no
+  // round-trip. This is the eviction-reopen complement to view keep-alive.
+  if (e.hasPayload && dirtyPaths.has(path)) void e.revalidate();
   return e;
 }
 
@@ -310,8 +311,14 @@ function scheduleRevalidate(): void {
   if (revalidateTimer !== null) return;
   revalidateTimer = setTimeout(() => {
     revalidateTimer = null;
+    // Only re-probe on-screen entries the repo says actually changed. A file
+    // git reports clean cannot have moved on disk, so it is never probed — this
+    // is what stops the per-tick mass-probe storm across every open preview
+    // while an agent writes (the file it edits IS dirty; the ones you are just
+    // reading are not). Precise client mutations to non-repo paths still route
+    // through applyMutation.
     for (const e of cache.values()) {
-      if (e.refs > 0) void e.revalidate();
+      if (e.refs > 0 && dirtyPaths.has(e.path)) void e.revalidate();
     }
   }, REVALIDATE_DEBOUNCE_MS);
 }
@@ -329,6 +336,14 @@ let wired = false;
 let lastEpoch = 0;
 let lastGitEpoch = -1;
 let lastMutationSeq = 0;
+/**
+ * Absolute paths the repo currently reports dirty — the gate for revalidation.
+ * Captured straight from each git-status snapshot's entries (the same source the
+ * file tree's badges read), so only files an agent/tool ACTUALLY changed are
+ * ever re-probed; a clean file cannot have moved and is never touched. This is
+ * what stops the per-git-tick mass-probe across every open preview.
+ */
+let dirtyPaths = new Set<string>();
 
 /**
  * Subscribe once to the fs + git change buses. Idempotent — the first mount that
@@ -349,6 +364,9 @@ function ensureWired(): void {
     applyMutation(m);
   });
   gitStatus.subscribe((s) => {
+    // Refresh the dirty set on every status (even a same-epoch replay), so the
+    // gate below always reflects the latest snapshot.
+    dirtyPaths = new Set((s?.entries ?? []).map((e) => e.path));
     const epoch = s?.epoch ?? -1;
     if (epoch < 0 || epoch === lastGitEpoch) return;
     const first = lastGitEpoch < 0;
