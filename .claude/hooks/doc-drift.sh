@@ -47,6 +47,7 @@ check 'crates/chimaera-server/src/runtimes.rs' 'docs/features/agents.md'        
 check 'crates/chimaera-remote/src/'   'docs/features/remote-connect.md'            'feature: remote connect'
 check 'crates/chimaera-app/src/'      'docs/features/native-app.md'                'feature: native app'
 check 'crates/chimaera-server/src/ledger.rs' 'docs/features/lifecycle-and-persistence.md' 'feature: lifecycle'
+check 'web-ui/src/lib/dashboard/'     'docs/features/dashboard.md'                 'feature: dashboard'
 check 'web-ui/src/lib/settings/'      'docs/features/settings.md'                  'feature: settings'
 check 'crates/chimaera/src/'          'docs/features/cli.md'                       'feature: CLI'
 
