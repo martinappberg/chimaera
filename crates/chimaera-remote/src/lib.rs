@@ -172,13 +172,15 @@ pub fn windows_path_as_wsl(s: &str) -> String {
 /// expanded socket path past the `sun_path` limit (a deep isolated
 /// `CHIMAERA_HOME`). Pure so the length invariant can be tested without env.
 fn control_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
-    /// `%C` expands to a 40-hex-char hash; reserve for it.
-    const C_LEAF: usize = 40;
+    /// `%C` expands to a 40-hex-char hash. OpenSSH appends a temporary
+    /// `.XXXXXXXXXXXX...` suffix while creating the mux listener, and macOS
+    /// applies the same `sun_path` limit to that transient path.
+    const C_LEAF_WITH_OPENSSH_TMP_SUFFIX: usize = 40 + 1 + 16;
     /// Headroom under the ~104-byte `sun_path` cap.
     const SUN_PATH_SAFE: usize = 100;
 
     let preferred = data_dir.join("cm");
-    if preferred.as_os_str().len() + 1 + C_LEAF <= SUN_PATH_SAFE {
+    if preferred.as_os_str().len() + 1 + C_LEAF_WITH_OPENSSH_TMP_SUFFIX <= SUN_PATH_SAFE {
         preferred
     } else {
         use std::hash::{Hash, Hasher};
@@ -1496,13 +1498,31 @@ mod tests {
         ));
         assert!(deep.starts_with("/tmp/"), "{}", deep.display());
         assert!(deep.ends_with("cm"), "{}", deep.display());
-        // dir + '/' + the 40-char %C expansion must clear the ~104-byte cap.
-        assert!(deep.as_os_str().len() + 1 + 40 <= 104, "{}", deep.display());
+        // dir + '/' + the 40-char %C expansion + OpenSSH's temporary suffix
+        // must clear the ~104-byte cap.
+        assert!(
+            deep.as_os_str().len() + 1 + 40 + 1 + 16 <= 104,
+            "{}",
+            deep.display()
+        );
         // A different deep home resolves to a different socket dir.
         let other = control_dir(Path::new(
             "/Users/martinkjellberg/dev/chimaera/.claude/worktrees/some-other-worktree-abcdef/.chimaera-dev-app/data",
         ));
         assert_ne!(other, deep);
+
+        // The isolated native app's normal state dir is shorter than a deep
+        // worktree but still too long once OpenSSH's temporary suffix is
+        // included.
+        let app_home = control_dir(Path::new(
+            "/Users/martinkjellberg/.chimaera-dev-app/chimaera/data",
+        ));
+        assert!(app_home.starts_with("/tmp/"), "{}", app_home.display());
+        assert!(
+            app_home.as_os_str().len() + 1 + 40 + 1 + 16 <= 104,
+            "{}",
+            app_home.display()
+        );
     }
 
     /// The WSL transport's path vocabulary, pure halves only (the global
