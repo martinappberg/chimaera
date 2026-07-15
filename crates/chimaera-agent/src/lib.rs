@@ -382,7 +382,10 @@ impl ChatManager {
     }
 }
 
-fn now_ms() -> u64 {
+/// Wall-clock epoch ms — shared by the pump's timestamps and the claude
+/// driver's background-task start stamps (journal.rs keeps its own private
+/// copy to stay self-contained).
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

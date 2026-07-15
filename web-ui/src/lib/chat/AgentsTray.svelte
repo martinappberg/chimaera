@@ -114,7 +114,7 @@
   .spark {
     flex: none;
     color: var(--accent);
-    /* Presence, not alarm — the same slow breathe as the composer stop ring. */
+    /* Presence, not alarm — shared keyframe in app.css, same as BackgroundTray. */
     animation: tray-breathe 1.8s ease-in-out infinite;
   }
   .agent {
@@ -169,15 +169,6 @@
   }
   .stop:hover {
     color: var(--err);
-  }
-  @keyframes tray-breathe {
-    0%,
-    100% {
-      opacity: 0.9;
-    }
-    50% {
-      opacity: 0.5;
-    }
   }
   @media (prefers-reduced-motion: reduce) {
     .tray,

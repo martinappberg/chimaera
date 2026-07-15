@@ -12,6 +12,7 @@
   import UserText from "./UserText.svelte";
   import ToolGroup from "./ToolGroup.svelte";
   import AgentsTray from "./AgentsTray.svelte";
+  import BackgroundTray from "./BackgroundTray.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
@@ -849,6 +850,15 @@
 
   {#if activeAgents.length > 0}
     <AgentsTray agents={activeAgents} onStop={agentKind === "claude" ? stopTask : undefined} />
+  {/if}
+
+  {#if store.backgroundTasks.length > 0}
+    <!-- Background work (backgrounded Bash / workflows) — stopTask sends the
+         native task key the wire gave us; the driver passes it through. -->
+    <BackgroundTray
+      tasks={store.backgroundTasks}
+      onStop={agentKind === "claude" ? stopTask : undefined}
+    />
   {/if}
 
   {#if store.plan.length > 0}

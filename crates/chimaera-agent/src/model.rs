@@ -20,6 +20,15 @@ pub const TOOL_OUTPUT_TAIL: usize = 4 * 1024;
 pub const DIFF_FILE_BUDGET: usize = 64 * 1024;
 /// All diff content admitted per turn.
 pub const DIFF_TURN_BUDGET: usize = 256 * 1024;
+/// Background-task set bound: beyond this the oldest entries drop (the tray
+/// is a glance surface; every `BackgroundTasks` event carries the whole set,
+/// so the set size is the event size).
+pub const BG_TASKS_CAP: usize = 32;
+/// One-line cap for background-task descriptions and close summaries.
+pub const BG_LABEL_MAX: usize = 200;
+/// Bound for a close's output-file PATH — never ellipsized (a truncated
+/// path is a corrupt path); an oversized one is dropped whole.
+pub const BG_PATH_MAX: usize = 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -281,6 +290,55 @@ pub enum AgentEvent {
         id: String,
         state: UserMessageState,
     },
+    /// The live set of the agent's BACKGROUND tasks — claude's backgrounded
+    /// Bash / workflows riding the `task_*` system frames with a
+    /// non-`local_agent` task_type (plus anything `background_tasks_changed`
+    /// reports, including a backgrounded subagent). LEVEL-SET semantics:
+    /// every event carries the WHOLE set (empty = none running), so consumers
+    /// replace rather than patch and replay's final state is simply the last
+    /// event seen. `closed` rides the tasks that left the set at this event
+    /// WITH a verdict — the task_notification close, the only frame that
+    /// carries one (set-removals and terminal task_updated patches don't;
+    /// they just shrink `tasks`) — one-shot notice material, not state.
+    /// APPENDED last: strictly additive, so old journals never carry it and
+    /// old clients skip the unknown tag.
+    BackgroundTasks {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tasks: Vec<BackgroundTask>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closed: Vec<BackgroundTaskClose>,
+    },
+}
+
+/// One running background task (a `BackgroundTasks` set member).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundTask {
+    /// The agent's own task key — what a `StopTask` sends back verbatim.
+    pub id: String,
+    /// The agent's lane name, verbatim (`local_bash`, `local_workflow`, …).
+    pub task_type: String,
+    pub description: String,
+    /// The agent's own status word (`running` until a task_updated patch).
+    pub status: String,
+    /// Driver-stamped epoch ms at first sight — the elapsed display's
+    /// anchor, journaled so replay shows honest ages (there is no
+    /// start-time on the wire).
+    pub started_at_ms: u64,
+}
+
+/// A background task leaving the set with a verdict.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundTaskClose {
+    pub id: String,
+    pub description: String,
+    /// completed | failed | stopped — the task_notification verdict,
+    /// verbatim.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// File holding the task's full output, when the agent reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
 }
 
 /// Final delivery state of a queued user message.
@@ -375,7 +433,8 @@ pub enum AgentCommand {
     BackgroundTool {
         tool_call_id: String,
     },
-    /// Stop a running subagent (claude stop_task).
+    /// Stop a running task — a subagent row id or a background task's
+    /// native key (claude stop_task, generic over its task registry).
     StopTask {
         task_id: String,
     },

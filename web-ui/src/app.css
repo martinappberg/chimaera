@@ -204,6 +204,19 @@
   }
 }
 
+/* The slow "presence, not alarm" breathe shared by the work-tray header
+   glyphs (subagents + background tasks) — one rhythm so the sibling trays
+   read as one family. Reduced-motion overrides live in the components. */
+@keyframes tray-breathe {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
 html,
 body {
   margin: 0;
