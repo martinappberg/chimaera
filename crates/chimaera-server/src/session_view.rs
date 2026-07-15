@@ -189,3 +189,64 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     rows.sort_by_key(|(created, _)| *created);
     rows.into_iter().map(|(_, row)| row).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_state::{AgentKind, AgentRecord};
+
+    fn info(alive: bool, last_output_at: u64) -> chimaera_pty::SessionInfo {
+        chimaera_pty::SessionInfo {
+            id: "s1".to_string(),
+            name: "codex".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            created_at: 0,
+            alive,
+            exit_status: None,
+            title: None,
+            pid: None,
+            renamed: false,
+            phase: chimaera_pty::ShellPhase::Unknown,
+            last_output_at,
+        }
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// `output_active` is part of the wire contract: a boolean only for a
+    /// LIVE agent row still in state Unknown (the hook-less TUIs), null
+    /// everywhere a better signal exists. The UI has no tests of its own —
+    /// keep the key name and gating pinned here.
+    #[test]
+    fn output_active_gates_on_unknown_live_agent_rows() {
+        let active = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
+            session_json(&info, None, agent, None, None, None)["output_active"].clone()
+        };
+
+        // Shell rows (no agent record): null.
+        assert_eq!(active(info(true, now_ms()), None), json!(null));
+
+        // Unknown-state agent, fresh output: true. Long quiet: false.
+        let unknown = AgentRecord::new("k".into(), AgentKind::Codex);
+        assert_eq!(active(info(true, now_ms()), Some(&unknown)), json!(true));
+        assert_eq!(
+            active(info(true, now_ms() - 60_000), Some(&unknown)),
+            json!(false)
+        );
+
+        // A dead session is never "active", whatever it last wrote.
+        assert_eq!(active(info(false, now_ms()), Some(&unknown)), json!(null));
+
+        // A row with real hook/protocol state carries null (the state wins).
+        let mut running = AgentRecord::new("k".into(), AgentKind::Claude);
+        running.state = AgentState::Running;
+        assert_eq!(active(info(true, now_ms()), Some(&running)), json!(null));
+    }
+}
