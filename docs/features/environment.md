@@ -69,4 +69,21 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_pending_
+### Environment preludes — why they exist
+_Captured 2026-07-15 (from the maintainer; drafted from his design-session words, confirmed by him)._
+
+- **Problem it solves:** on HPC (and locally) every terminal and agent needs environment
+  setup — `ml`, `micromamba`, `conda` — that you'd otherwise retype in every session; set it
+  once per host/workspace instead. Also the foundation for the bigger placement vision
+  (compute-node sessions; eventually the premium synced-workspace idea).
+- **How settled (intent grade: the invariants are core to this feature; the rest is
+  addition):** the *concepts* are promises — preludes stay opaque shell text (never
+  tool-specific), scopes concatenate. The *mechanics* — storage shape, panel design, caps,
+  file-injection details — are "how it works for now," improvable.
+- **Non-obvious decision / deliberately left out:** the crucial decision is being **not
+  specific to any env tool** — opaque commands run in the user's own shell IS the design
+  ("should crucially _not_ be in terms of some sort of specific thing"). Deliberately
+  deferred: capture mode, named profiles, the per-launch launcher UI.
+- **Do not change:** never parse or interpret prelude text — tool-agnosticism is the
+  product decision. The host ⊕ workspace ⊕ launch concatenation model and everything else
+  are deliberate-today additions, open to improvement.

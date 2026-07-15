@@ -54,4 +54,22 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
-_pending_
+### Slurm awareness — why it exists
+_Captured 2026-07-15 (from the maintainer; drafted from his design-session words, confirmed by him)._
+
+- **Problem it solves:** the cluster should be visible in the workbench — detect Slurm,
+  show your queue. First step of the placement axis: Mode 1 (login-node job control via an
+  agent skill) and Mode 2 (own the full session on a compute node — chosen as second-hop
+  daemon over srun-prefixing for isolation and ownership) build on this seam, toward the
+  premium synced-workspace vision.
+- **How settled (intent grade: the invariants are core to this feature; the rest is
+  addition):** promises — cluster behavior is **probed per cluster, never assumed**
+  ("not all environments are the same"; "no shame in saying not supported"), and the
+  compute surface stays invisible/quiet off-cluster. The chip/popover design, polling
+  cadence, caps, and wire shape are mechanics, improvable.
+- **Non-obvious decision / deliberately left out:** the staging is deliberate — detection
+  first, then job↔session linking, the Mode 1 skill, and Mode 2 compute-node sessions.
+  "Not supported on this cluster" is an acceptable, honest end state where the tunnel
+  ladder finds no path.
+- **Do not change:** the probe-and-degrade-honestly posture, and hidden-off-cluster.
+  Everything else is an addition, open to improvement.
