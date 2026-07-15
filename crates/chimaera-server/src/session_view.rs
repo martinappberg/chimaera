@@ -13,6 +13,15 @@ use crate::AppState;
 /// the dot settles soon after the turn ends. Tuned against a live codex TUI.
 const OUTPUT_ACTIVITY_QUIET: Duration = Duration::from_secs(2);
 
+/// Milliseconds since the Unix epoch (0 if the clock reads before it) —
+/// the same clock the PTY reader stamps `last_output_at` with.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
 /// `agent_kind`, `agent_state`, `agent_title`, `files_touched`,
 /// `display_name` and `cwd_current` fields.
@@ -78,11 +87,7 @@ pub(crate) fn session_json(
     let output_active = agent
         .filter(|a| a.state == AgentState::Unknown && info.alive)
         .map(|_| {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            now_ms.saturating_sub(info.last_output_at) <= OUTPUT_ACTIVITY_QUIET.as_millis() as u64
+            now_ms().saturating_sub(info.last_output_at) <= OUTPUT_ACTIVITY_QUIET.as_millis() as u64
         });
     map.insert(
         "output_active".to_string(),
@@ -211,13 +216,6 @@ mod tests {
             phase: chimaera_pty::ShellPhase::Unknown,
             last_output_at,
         }
-    }
-
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
     }
 
     /// `output_active` is part of the wire contract: a boolean only for a

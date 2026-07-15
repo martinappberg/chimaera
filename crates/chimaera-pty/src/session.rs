@@ -20,8 +20,8 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    lock_unpoisoned, marks::Marks, marks::ShellPhase, snapshot, Attachment, SessionEvent,
-    SessionId, SessionInfo, SpawnOpts,
+    lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, Attachment,
+    SessionEvent, SessionId, SessionInfo, SpawnOpts,
 };
 
 /// How long `kill()` waits after SIGHUP before force-killing a still-living
@@ -40,14 +40,6 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 4096;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of the stdin mpsc channel.
 const INPUT_CHANNEL_CAPACITY: usize = 256;
-
-/// Milliseconds since the Unix epoch (0 if the clock is before it).
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// Minimal `Dimensions` impl for constructing/resizing the headless `Term`.
 struct TermDimensions {

@@ -124,12 +124,15 @@ export function isBusy(s: Session): boolean {
   if (s.kind !== "agent") {
     return s.phase === "running" || s.exec_stage === "executing";
   }
-  // Hook-less agent TUIs never reach agent_state "running"; the daemon's
-  // output-recency flag is their busy signal (absent on old daemons).
-  if (unintegrated(s)) {
-    return s.output_active === true || s.exec_stage === "executing";
-  }
-  return s.agent_state === "running" || s.exec_stage === "executing";
+  // Hook/protocol state is primary wherever it exists; hook-less agent TUIs
+  // never reach agent_state "running", so the daemon's output-recency flag
+  // is their busy signal — additive, so a future real state for these
+  // agents wins the moment it exists (and absent on old daemons).
+  return (
+    s.agent_state === "running" ||
+    s.exec_stage === "executing" ||
+    (unintegrated(s) && s.output_active === true)
+  );
 }
 
 /**
