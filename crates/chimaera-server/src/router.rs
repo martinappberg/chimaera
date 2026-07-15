@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, assets, chat, compute, download, environment, fs, git, launcher, links, mcp,
-    quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    agents, api, assets, chat, compute, compute_jobs, download, environment, fs, git, launcher,
+    links, mcp, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -96,6 +96,14 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             )),
         )
         .route("/compute", get(compute::get_compute))
+        .route(
+            "/compute/sessions",
+            get(compute_jobs::list_compute_sessions).post(compute_jobs::launch_compute_session),
+        )
+        .route(
+            "/compute/sessions/{job_id}",
+            delete(compute_jobs::cancel_compute_session),
+        )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))
         .route(

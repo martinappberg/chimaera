@@ -37,7 +37,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     let (listener, token) = match chimaera_core::Handoff::consume()
         .filter(|h| cfg.port.is_none() || cfg.port == Some(h.port))
     {
-        Some(handoff) => match listener_after_handoff(handoff.port).await? {
+        Some(handoff) => match listener_after_handoff(handoff.port, cfg.routable_bind).await? {
             (listener, true) => (listener, handoff.token),
             (listener, false) => {
                 tracing::warn!(
@@ -48,7 +48,7 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
             }
         },
         None => (
-            fresh_listener(cfg.port).await?,
+            fresh_listener(cfg.port, cfg.routable_bind).await?,
             chimaera_core::generate_token(),
         ),
     };
@@ -185,10 +185,13 @@ async fn port_answers_http(port: u16) -> bool {
         .is_some()
 }
 
-async fn fresh_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
-    TcpListener::bind(("127.0.0.1", port.unwrap_or(0)))
+async fn fresh_listener(port: Option<u16>, routable: bool) -> anyhow::Result<TcpListener> {
+    // Loopback is the rule; 0.0.0.0 is the explicit Mode 2 rung-A opt-in
+    // (compute-node daemon reached by a login-node forward; token-gated).
+    let host = if routable { "0.0.0.0" } else { "127.0.0.1" };
+    TcpListener::bind((host, port.unwrap_or(0)))
         .await
-        .context("failed to bind 127.0.0.1")
+        .with_context(|| format!("failed to bind {host}"))
 }
 
 /// Acquire the startup listener when a handoff was consumed: rebind the
@@ -199,10 +202,13 @@ async fn fresh_listener(port: Option<u16>) -> anyhow::Result<TcpListener> {
 /// its budget on it, so re-binding it would just fail and take the daemon
 /// down. This is why the fallback binds `None`, not the requested port —
 /// staying up on a fresh port beats dying on a transient clash.
-async fn listener_after_handoff(handoff_port: u16) -> anyhow::Result<(TcpListener, bool)> {
+async fn listener_after_handoff(
+    handoff_port: u16,
+    routable: bool,
+) -> anyhow::Result<(TcpListener, bool)> {
     match rebind(handoff_port).await {
         Some(listener) => Ok((listener, true)),
-        None => Ok((fresh_listener(None).await?, false)),
+        None => Ok((fresh_listener(None, routable).await?, false)),
     }
 }
 
@@ -266,7 +272,7 @@ mod tests {
         let occupied = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let busy_port = occupied.local_addr().unwrap().port();
 
-        let (listener, reused) = listener_after_handoff(busy_port)
+        let (listener, reused) = listener_after_handoff(busy_port, false)
             .await
             .expect("must stay up on a fresh port, not error");
         assert!(!reused, "a busy handoff port cannot be reused");
@@ -324,7 +330,7 @@ mod tests {
         let port = free.local_addr().unwrap().port();
         drop(free); // release it so rebind can take it
 
-        let (listener, reused) = listener_after_handoff(port).await.expect("rebind");
+        let (listener, reused) = listener_after_handoff(port, false).await.expect("rebind");
         assert!(reused, "a free handoff port is reused");
         assert_eq!(listener.local_addr().unwrap().port(), port);
     }

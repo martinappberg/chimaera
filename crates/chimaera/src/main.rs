@@ -33,6 +33,11 @@ enum Command {
         /// POSIX remote (Linux, macOS, the BSDs).
         #[arg(long)]
         daemonize: bool,
+        /// Bind 0.0.0.0 instead of loopback — Mode 2 rung A only (a
+        /// compute-node daemon reached by a direct login-node forward on
+        /// clusters without ssh-to-node); the bearer token is the gate.
+        #[arg(long)]
+        bind_routable: bool,
     },
     /// Show daemon status, locally or on a remote ssh host. A dev build
     /// reports the dev daemon (~/.chimaera-dev) on both ends — dev-ness is
@@ -110,11 +115,19 @@ fn main() -> anyhow::Result<()> {
 
 async fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Serve { port, .. } => {
+        Command::Serve {
+            port,
+            bind_routable,
+            ..
+        } => {
             // `--port` wins; else honor $PORT (twelve-factor) so autoPort dev
             // tooling and PaaS can assign it; else the OS picks a free port.
             let port = port.or_else(|| parse_port(std::env::var("PORT").ok()));
-            chimaera_server::run(chimaera_server::ServerConfig { port }).await
+            chimaera_server::run(chimaera_server::ServerConfig {
+                port,
+                routable_bind: bind_routable,
+            })
+            .await
         }
         Command::Status { host } => status::run(host.as_deref()).await,
         Command::Kill => kill::run().await,

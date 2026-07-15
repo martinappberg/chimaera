@@ -60,6 +60,18 @@ pub(crate) struct Partition {
     pub(crate) nodes: u64,
 }
 
+/// The daemon's OWN allocation, when it runs inside a Slurm job (a Mode 2
+/// compute-node daemon): the window's bottom bar wears `time_left` — the
+/// honest "this workspace lives until walltime" indicator.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SelfAllocation {
+    pub(crate) job_id: String,
+    pub(crate) node: String,
+    pub(crate) partition: String,
+    pub(crate) state: String,
+    pub(crate) time_left: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ComputeSnapshot {
     /// "slurm" | "none". The extensibility seam: a future scheduler adds a
@@ -67,6 +79,9 @@ pub(crate) struct ComputeSnapshot {
     pub(crate) scheduler: String,
     pub(crate) jobs: Vec<Job>,
     pub(crate) partitions: Vec<Partition>,
+    /// Present only when the daemon itself runs inside an allocation.
+    #[serde(rename = "self", skip_serializing_if = "Option::is_none")]
+    pub(crate) self_alloc: Option<SelfAllocation>,
     pub(crate) fetched_at_ms: u64,
     pub(crate) truncated: bool,
 }
@@ -77,17 +92,26 @@ impl ComputeSnapshot {
             scheduler: "none".to_string(),
             jobs: Vec::new(),
             partitions: Vec::new(),
+            self_alloc: None,
             fetched_at_ms: now_ms(),
             truncated: false,
         }
     }
 }
 
-/// Where the scheduler binaries live once detected.
+/// Where the scheduler binaries live once detected. All four client tools
+/// are required together: the snapshot needs squeue/sinfo, Mode 2's
+/// launch/cancel routes need sbatch/scancel — a cluster with a partial
+/// toolset is not one we can operate on.
 #[derive(Clone, Debug)]
-enum Detection {
+pub(crate) enum Detection {
     None,
-    Slurm { squeue: PathBuf, sinfo: PathBuf },
+    Slurm {
+        sbatch: PathBuf,
+        scancel: PathBuf,
+        squeue: PathBuf,
+        sinfo: PathBuf,
+    },
 }
 
 pub(crate) struct ComputeService {
@@ -97,6 +121,10 @@ pub(crate) struct ComputeService {
     inner: tokio::sync::Mutex<Inner>,
     /// Test knob dir (`CHIMAERA_SLURM_BINDIR`), read once at construction.
     bindir: Option<PathBuf>,
+    /// Set when THIS daemon runs inside a Slurm allocation (a Mode 2
+    /// compute-node daemon): `SLURM_JOB_ID` at construction. Drives the
+    /// snapshot's `self` block.
+    self_job: Option<String>,
 }
 
 #[derive(Default)]
@@ -110,6 +138,7 @@ impl ComputeService {
         ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from),
+            self_job: std::env::var("SLURM_JOB_ID").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -118,7 +147,27 @@ impl ComputeService {
         ComputeService {
             inner: tokio::sync::Mutex::new(Inner::default()),
             bindir: Some(dir),
+            self_job: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bindir_and_job(dir: PathBuf, job: &str) -> Self {
+        ComputeService {
+            inner: tokio::sync::Mutex::new(Inner::default()),
+            bindir: Some(dir),
+            self_job: Some(job.to_string()),
+        }
+    }
+
+    /// The detected scheduler toolset (for the Mode 2 launch/cancel routes);
+    /// runs detection if it hasn't happened yet.
+    pub(crate) async fn detection(&self) -> Detection {
+        let mut inner = self.inner.lock().await;
+        if inner.detection.is_none() {
+            inner.detection = Some(self.detect().await);
+        }
+        inner.detection.clone().expect("just set")
     }
 
     /// The current snapshot: cached, single-flight, never an error (a
@@ -136,7 +185,7 @@ impl ComputeService {
         let detection = inner.detection.clone().expect("just set");
         let (squeue, sinfo) = match &detection {
             Detection::None => return ComputeSnapshot::none(),
-            Detection::Slurm { squeue, sinfo } => (squeue.clone(), sinfo.clone()),
+            Detection::Slurm { squeue, sinfo, .. } => (squeue.clone(), sinfo.clone()),
         };
         if let Some((at, snap)) = &inner.cache {
             if at.elapsed() < SNAPSHOT_TTL {
@@ -145,7 +194,7 @@ impl ComputeService {
         }
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
-        let snap = fetch_snapshot(&squeue, &sinfo).await;
+        let snap = fetch_snapshot(&squeue, &sinfo, self.self_job.as_deref()).await;
         inner.cache = Some((Instant::now(), snap.clone()));
         snap
     }
@@ -159,12 +208,18 @@ impl ComputeService {
     /// the only form that works identically under bash/zsh/fish.
     async fn detect(&self) -> Detection {
         if let Some(dir) = &self.bindir {
-            let (squeue, sinfo) = (dir.join("squeue"), dir.join("sinfo"));
-            if dir.join("sbatch").is_file() && squeue.is_file() && sinfo.is_file() {
+            let tools = ["sbatch", "scancel", "squeue", "sinfo"].map(|n| dir.join(n));
+            if tools.iter().all(|p| p.is_file()) {
                 tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
-                return Detection::Slurm { squeue, sinfo };
+                let [sbatch, scancel, squeue, sinfo] = tools;
+                return Detection::Slurm {
+                    sbatch,
+                    scancel,
+                    squeue,
+                    sinfo,
+                };
             }
-            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but sbatch/squeue/sinfo not all present");
+            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but sbatch/scancel/squeue/sinfo not all present");
             return Detection::None;
         }
         let shell = chimaera_core::login_shell();
@@ -175,15 +230,19 @@ impl ComputeService {
         // The walk stats PATH entries that may live on slow network mounts —
         // off the reactor with it (detection runs once per daemon lifetime).
         let found = tokio::task::spawn_blocking(move || {
-            let find = |name: &str| find_on_path(path.trim(), name);
-            (find("sbatch"), find("squeue"), find("sinfo"))
+            ["sbatch", "scancel", "squeue", "sinfo"].map(|n| find_on_path(path.trim(), n))
         })
         .await
-        .unwrap_or((None, None, None));
+        .unwrap_or([None, None, None, None]);
         match found {
-            (Some(_sbatch), Some(squeue), Some(sinfo)) => {
+            [Some(sbatch), Some(scancel), Some(squeue), Some(sinfo)] => {
                 tracing::info!(squeue = %squeue.display(), "slurm detected");
-                Detection::Slurm { squeue, sinfo }
+                Detection::Slurm {
+                    sbatch,
+                    scancel,
+                    squeue,
+                    sinfo,
+                }
             }
             _ => Detection::None,
         }
@@ -213,7 +272,28 @@ fn is_executable(p: &std::path::Path) -> bool {
     p.is_file()
 }
 
-async fn fetch_snapshot(squeue: &std::path::Path, sinfo: &std::path::Path) -> ComputeSnapshot {
+async fn fetch_snapshot(
+    squeue: &std::path::Path,
+    sinfo: &std::path::Path,
+    self_job: Option<&str>,
+) -> ComputeSnapshot {
+    // The daemon's own allocation, when it has one: one bounded squeue -j.
+    let self_alloc = match self_job {
+        Some(id) => run_capped(
+            &squeue.to_string_lossy(),
+            &[
+                "-j".into(),
+                id.to_string(),
+                "--noheader".into(),
+                "-o".into(),
+                "%i|%P|%T|%L|%N".into(),
+            ],
+        )
+        .await
+        .as_deref()
+        .and_then(parse_self_allocation),
+        None => None,
+    };
     // `-u <user>`, not `--me`: --me is newer than the Slurm versions real
     // clusters still run. No USER (exotic) → skip the queue rather than
     // listing the whole cluster's jobs.
@@ -245,9 +325,28 @@ async fn fetch_snapshot(squeue: &std::path::Path, sinfo: &std::path::Path) -> Co
         scheduler: "slurm".to_string(),
         jobs,
         partitions,
+        self_alloc,
         fetched_at_ms: now_ms(),
         truncated: jobs_truncated || parts_truncated,
     }
+}
+
+/// `squeue -j <id> --noheader -o "%i|%P|%T|%L|%N"` → the daemon's own
+/// allocation. None on noise/absence (job already gone = no block).
+fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
+    let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut f = line.splitn(5, '|').map(str::trim);
+    let (id, partition, state, time_left) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    if !id.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(SelfAllocation {
+        job_id: id.to_string(),
+        node: f.next().unwrap_or("").to_string(),
+        partition: partition.to_string(),
+        state: state.to_string(),
+        time_left: time_left.to_string(),
+    })
 }
 
 /// `squeue --noheader -o "%i|%j|%P|%T|%L|%N"` → jobs. Unparseable lines are
@@ -324,8 +423,9 @@ fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
 }
 
 /// Run one child with the timeout + output cap; None on spawn failure,
-/// non-zero exit, or timeout (the caller degrades, never errors).
-async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
+/// non-zero exit, or timeout (the caller degrades, never errors). Shared
+/// with `compute_jobs` (sbatch/scancel ride the same discipline).
+pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -355,7 +455,7 @@ fn now_ms() -> u64 {
 #[derive(Deserialize)]
 pub(crate) struct ComputeQuery {
     #[serde(default)]
-    refresh: bool,
+    pub(crate) refresh: bool,
 }
 
 /// GET /api/v1/compute — scheduler detection + the user's queue snapshot.
@@ -447,13 +547,15 @@ mod tests {
         let svc = ComputeService::with_bindir(empty.clone());
         assert_eq!(svc.snapshot(false).await.scheduler, "none");
 
-        // Fake tools → slurm, parsed snapshot, cached second read.
+        // Fake tools → slurm, parsed snapshot, cached second read. squeue
+        // answers both forms: -u (the queue) and -j (the self allocation).
         let dir = test_dir("fake");
         for (name, body) in [
             ("sbatch", "#!/bin/sh\nexit 0\n"),
+            ("scancel", "#!/bin/sh\nexit 0\n"),
             (
                 "squeue",
-                "#!/bin/sh\necho '1|myjob|normal|RUNNING|59:00|node1'\n",
+                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|myjob|normal|RUNNING|59:00|node1'; fi\n",
             ),
             ("sinfo", "#!/bin/sh\necho 'normal*|up|10'\n"),
         ] {
@@ -472,9 +574,22 @@ mod tests {
         assert_eq!(snap.jobs[0].name, "myjob");
         assert_eq!(snap.partitions.len(), 1);
         assert!(snap.partitions[0].default);
+        // No SLURM_JOB_ID → no self block, and the wire omits the key.
+        assert!(snap.self_alloc.is_none());
+        assert!(!serde_json::to_string(&snap).unwrap().contains("\"self\""));
         // Cached: a second call inside the TTL returns the same fetch.
         let again = svc.snapshot(false).await;
         assert_eq!(again.fetched_at_ms, snap.fetched_at_ms);
+
+        // Inside an allocation: the self block rides the snapshot.
+        let svc = ComputeService::with_bindir_and_job(dir.clone(), "4242");
+        let snap = svc.snapshot(false).await;
+        assert!(serde_json::to_string(&snap).unwrap().contains("\"self\""));
+        let own = snap.self_alloc.expect("self allocation");
+        assert_eq!(own.job_id, "4242");
+        assert_eq!(own.node, "node7");
+        assert_eq!(own.time_left, "3:59:00");
+
         std::fs::remove_dir_all(&empty).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
