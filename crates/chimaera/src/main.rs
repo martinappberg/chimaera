@@ -1,3 +1,4 @@
+mod compute;
 mod connect;
 mod daemonize;
 mod doctor;
@@ -78,6 +79,52 @@ enum Command {
     Doctor,
     /// Print the shell-integration snippet (for remote hosts' rc files).
     ShellIntegration,
+    /// Mode 2: chimaera sessions running AS Slurm jobs on a cluster.
+    Compute {
+        #[command(subcommand)]
+        cmd: ComputeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComputeCmd {
+    /// List compute sessions (chimaera-named Slurm jobs) on a host.
+    List { host: String },
+    /// Submit a chimaera daemon as a Slurm job on a host.
+    Launch {
+        host: String,
+        /// Display name (slugged into the job name `chimaera-<slug>`).
+        #[arg(long, default_value = "session")]
+        name: String,
+        /// Walltime, e.g. 4:00:00 or 1-00:00:00.
+        #[arg(long, default_value = "2:00:00")]
+        time: String,
+        #[arg(long)]
+        partition: Option<String>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        #[arg(long)]
+        mem: Option<String>,
+        /// GPUs etc., e.g. gpu:1.
+        #[arg(long)]
+        gres: Option<String>,
+        /// Workspace id whose environment prelude applies.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Launch with a routable bind (rung A clusters only; token-gated).
+        #[arg(long)]
+        routable: bool,
+    },
+    /// Tunnel to a running compute session and open its UI.
+    Connect {
+        host: String,
+        job_id: String,
+        /// Do not open the UI in a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// scancel a compute session.
+    Cancel { host: String, job_id: String },
 }
 
 /// Parse a `$PORT`-style listen port. An unset, empty, or unparsable value
@@ -143,6 +190,39 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             print!("{}", chimaera_core::shellint::snippet());
             Ok(())
         }
+        Command::Compute { cmd } => match cmd {
+            ComputeCmd::List { host } => compute::list(&host).await,
+            ComputeCmd::Launch {
+                host,
+                name,
+                time,
+                partition,
+                cpus,
+                mem,
+                gres,
+                workspace,
+                routable,
+            } => {
+                compute::launch(
+                    &host,
+                    &name,
+                    &time,
+                    partition.as_deref(),
+                    cpus,
+                    mem.as_deref(),
+                    gres.as_deref(),
+                    workspace.as_deref(),
+                    routable,
+                )
+                .await
+            }
+            ComputeCmd::Connect {
+                host,
+                job_id,
+                no_open,
+            } => compute::connect(&host, &job_id, no_open).await,
+            ComputeCmd::Cancel { host, job_id } => compute::cancel(&host, &job_id).await,
+        },
     }
 }
 

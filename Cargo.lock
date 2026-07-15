@@ -352,6 +352,7 @@ dependencies = [
  "mimalloc",
  "nix 0.29.0",
  "open",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
