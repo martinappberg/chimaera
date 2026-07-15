@@ -113,6 +113,21 @@ TUI (see [view switch](#view-switch-and-rewind)).
   refusal lands an honest notice), and a running **Agent** (subagent) row offers a ■ stop
   (`stop_task`; the driver resolves the row id to the CLI's opaque task key). Codex has no
   equivalents — the buttons are omitted there.
+- **Background-work tray (claude).** Backgrounded Bash commands and workflows (`run_in_background`,
+  Ctrl-B parity, `/workflows`) get their own pinned monitor strip, sibling to the subagents tray:
+  collapsed to a one-line "N background tasks running" count, expandable to each task's description,
+  live elapsed (anchored on a driver-journaled start stamp, so replay shows honest ages), status,
+  and a ■ stop. Background work is **cross-turn** — the tray persists after the turn that started it
+  ends, and dies with the CLI process (cleared on `init`/`exited`). When a task settles, its verdict
+  folds into the transcript as a quiet notice ("background “…” completed — … (exit code 0)"; failed
+  renders as an error). The driver ingests the CLI's task lanes — `task_started` (non-`local_agent`)
+  + `task_updated` (patch) + `background_tasks_changed` (the authoritative REPLACE-the-set signal) +
+  `task_notification` (the only frame carrying the verdict summary) — into one level-set
+  `background_tasks` event; tasks the set-change removes before their verdict park in a bounded
+  departed buffer so the notification arriving ~ms later still closes them (the live-verified settle
+  order). The ■ stop sends `stop_task` with the native task key — the CLI's stop is generic over its
+  task registry and acks a raced not-found as success. Codex has no background lane — the tray never
+  renders there.
 - **Live subagents tray + active plan step.** Subagents running *right now* are promoted out of the
   (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
   glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"
@@ -147,10 +162,12 @@ TUI (see [view switch](#view-switch-and-rewind)).
   official client's behavior) with a visible "question timed out" notice; claude's question
   timeouts run CLI-side.
 - **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
-  `PlanApprovalCard.svelte`, `QuestionCard.svelte`; commands `permission` (optional `destination`,
-  `feedback`) / `answer`; events `tool_call`(`_update`/`_output_delta`), `permission_request`
-  (optional `plan` = the plan-approval marker + markdown) / `permission_resolved`,
-  `question_request` / `question_resolved`. Wire facts: `crates/chimaera-agent/PROTOCOL.md` pass 8.
+  `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
+  commands `permission` (optional `destination`, `feedback`) / `answer` / `stop_task`; events
+  `tool_call`(`_update`/`_output_delta`), `permission_request` (optional `plan` = the plan-approval
+  marker + markdown) / `permission_resolved`, `question_request` / `question_resolved`,
+  `background_tasks` (level-set + one-shot `closed` verdicts). Wire facts:
+  `crates/chimaera-agent/PROTOCOL.md` pass 8 and "Claude: subagents + queueing truth".
 
 ## Inline artifacts
 
@@ -311,3 +328,7 @@ _Captured 2026-07-12 (from the maintainer, in-session)._
 - **Grade — additions, open to change:** all improvable; the load-bearing bits are the
   **native-auth-only** rule and the **workbench-promotion** principle (pin long-lived work, keep the
   transcript for conversation).
+
+### Background-work tray — why it exists
+
+_Intent pending — to be captured from the maintainer (capture-feature-intent)._
