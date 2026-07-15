@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agents, chat, environment, fs, git, launcher, ledger, quickopen, recents, settings, update,
-    view_state, workspaces,
+    agents, chat, compute, environment, fs, git, launcher, ledger, quickopen, recents, settings,
+    update, view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -88,6 +88,9 @@ pub(crate) struct AppState {
     /// Read-only git service (status/diff): discovery cache, per-workspace nudge
     /// epochs, and a bounded pool for `git` child processes. Never persisted.
     pub(crate) git: git::GitService,
+    /// Compute-scheduler awareness (Slurm detection + the user's queue),
+    /// cached + single-flight; empty-tagged on a laptop. Never persisted.
+    pub(crate) compute: compute::ComputeService,
     /// Signalled whenever the session list / agent state / titles change;
     /// wakes /ws/events subscribers (a 1s tick catches anything missed).
     pub(crate) changes: tokio::sync::Notify,
@@ -194,6 +197,7 @@ impl AppState {
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             git: git::GitService::new(),
+            compute: compute::ComputeService::new(),
             changes: tokio::sync::Notify::new(),
             restored: tokio::sync::watch::channel(true).0,
             shutdown: tokio::sync::Notify::new(),

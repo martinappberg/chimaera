@@ -1,0 +1,431 @@
+//! Compute-scheduler awareness (M5 HPC layer, detection slice): detect Slurm
+//! on THIS host and serve a bounded snapshot of the user's queue — the
+//! daemon-side, git-service-style answer to "is this an HPC, and what do I
+//! have running?". A remote daemon detects its own cluster locally, so the
+//! feature lights up on HPC and is a no-op on a laptop; nothing is probed
+//! over ssh at connect time.
+//!
+//! Resource discipline is the design (shared login nodes; sysadmins ban
+//! tools that hammer `squeue`): detection runs once per daemon lifetime
+//! (`?refresh=true` re-detects), every child process gets a hard
+//! kill-on-timeout and an output cap, snapshots are cached ~30s, and
+//! concurrent requests coalesce on one refresh. Nothing is persisted.
+//!
+//! Command output is format-string based (`squeue -o`, `sinfo -o`), not
+//! `--json`: the format flags are stable across the old Slurm versions real
+//! clusters run, and the output is bounded by construction.
+//!
+//! Test knob: `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
+//! `sbatch`/`squeue`/`sinfo` executables so the whole surface can be driven
+//! live without a cluster (the `CHIMAERA_RELEASES_API` pattern).
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+
+use crate::AppState;
+
+/// Hard runtime cap per scheduler command (squeue on a busy cluster can be
+/// slow, but a wedged controller must never wedge the daemon).
+const CMD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Output cap per command; queues are line-capped far below this anyway.
+const MAX_OUTPUT: usize = 256 * 1024;
+/// Row caps (the UI shows a strip, not a dashboard); `truncated` says so.
+const MAX_JOBS: usize = 50;
+const MAX_PARTITIONS: usize = 50;
+/// Snapshot TTL: fresh enough for a queue strip, polite to the controller.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Job {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) partition: String,
+    pub(crate) state: String,
+    pub(crate) time_left: String,
+    pub(crate) nodes: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Partition {
+    pub(crate) name: String,
+    pub(crate) default: bool,
+    pub(crate) avail: bool,
+    pub(crate) nodes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ComputeSnapshot {
+    /// "slurm" | "none". The extensibility seam: a future scheduler adds a
+    /// tag here, not a new route.
+    pub(crate) scheduler: String,
+    pub(crate) jobs: Vec<Job>,
+    pub(crate) partitions: Vec<Partition>,
+    pub(crate) fetched_at_ms: u64,
+    pub(crate) truncated: bool,
+}
+
+impl ComputeSnapshot {
+    fn none() -> Self {
+        ComputeSnapshot {
+            scheduler: "none".to_string(),
+            jobs: Vec::new(),
+            partitions: Vec::new(),
+            fetched_at_ms: now_ms(),
+            truncated: false,
+        }
+    }
+}
+
+/// Where the scheduler binaries live once detected.
+#[derive(Clone, Debug)]
+enum Detection {
+    None,
+    Slurm { squeue: PathBuf, sinfo: PathBuf },
+}
+
+pub(crate) struct ComputeService {
+    /// One async lock covers detection + the snapshot cache: refreshes are
+    /// single-flight (concurrent GETs await the first refresher and then
+    /// read its cache), and nothing here is hot enough to shard.
+    inner: tokio::sync::Mutex<Inner>,
+    /// Test knob dir (`CHIMAERA_SLURM_BINDIR`), read once at construction.
+    bindir: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct Inner {
+    detection: Option<Detection>,
+    cache: Option<(Instant, ComputeSnapshot)>,
+}
+
+impl ComputeService {
+    pub(crate) fn new() -> Self {
+        ComputeService {
+            inner: tokio::sync::Mutex::new(Inner::default()),
+            bindir: std::env::var_os("CHIMAERA_SLURM_BINDIR").map(PathBuf::from),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bindir(dir: PathBuf) -> Self {
+        ComputeService {
+            inner: tokio::sync::Mutex::new(Inner::default()),
+            bindir: Some(dir),
+        }
+    }
+
+    /// The current snapshot: cached, single-flight, never an error (a
+    /// cluster hiccup degrades to an empty-but-tagged snapshot, not a 500 —
+    /// the strip is orientation, not ground truth).
+    pub(crate) async fn snapshot(&self, refresh: bool) -> ComputeSnapshot {
+        let mut inner = self.inner.lock().await;
+        if refresh {
+            inner.detection = None;
+            inner.cache = None;
+        }
+        if inner.detection.is_none() {
+            inner.detection = Some(self.detect().await);
+        }
+        let detection = inner.detection.clone().expect("just set");
+        let (squeue, sinfo) = match &detection {
+            Detection::None => return ComputeSnapshot::none(),
+            Detection::Slurm { squeue, sinfo } => (squeue.clone(), sinfo.clone()),
+        };
+        if let Some((at, snap)) = &inner.cache {
+            if at.elapsed() < SNAPSHOT_TTL {
+                return snap.clone();
+            }
+        }
+        // Holding the lock across the fetch IS the single-flight: concurrent
+        // requests queue here briefly instead of stampeding the controller.
+        let snap = fetch_snapshot(&squeue, &sinfo).await;
+        inner.cache = Some((Instant::now(), snap.clone()));
+        snap
+    }
+
+    /// Find the Slurm client tools. The knob dir wins (tests / unusual
+    /// installs); otherwise resolve through the user's login shell — the
+    /// same reasoning as the git resolution: on some clusters the tools
+    /// arrive via a profile-managed PATH the daemon's own env never sourced.
+    async fn detect(&self) -> Detection {
+        if let Some(dir) = &self.bindir {
+            let (squeue, sinfo) = (dir.join("squeue"), dir.join("sinfo"));
+            if dir.join("sbatch").is_file() && squeue.is_file() && sinfo.is_file() {
+                tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
+                return Detection::Slurm { squeue, sinfo };
+            }
+            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but sbatch/squeue/sinfo not all present");
+            return Detection::None;
+        }
+        // One login-shell round-trip resolves all three; absolute paths are
+        // cached so polls never re-source the profile.
+        let shell = chimaera_core::login_shell();
+        let script = "command -v sbatch && command -v squeue && command -v sinfo";
+        let out = run_capped(&shell, &["-lc".into(), script.into()]).await;
+        let Some(out) = out else {
+            return Detection::None;
+        };
+        let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+        match (lines.next(), lines.next(), lines.next()) {
+            // `&&` chains: three hits or the whole probe exits non-zero.
+            (Some(_sbatch), Some(squeue), Some(sinfo)) => {
+                tracing::info!(%squeue, "slurm detected");
+                Detection::Slurm {
+                    squeue: PathBuf::from(squeue),
+                    sinfo: PathBuf::from(sinfo),
+                }
+            }
+            _ => Detection::None,
+        }
+    }
+}
+
+async fn fetch_snapshot(squeue: &std::path::Path, sinfo: &std::path::Path) -> ComputeSnapshot {
+    // `-u <user>`, not `--me`: --me is newer than the Slurm versions real
+    // clusters still run. No USER (exotic) → skip the queue rather than
+    // listing the whole cluster's jobs.
+    let jobs_out = match std::env::var("USER") {
+        Ok(user) => {
+            run_capped(
+                &squeue.to_string_lossy(),
+                &[
+                    "-u".into(),
+                    user,
+                    "--noheader".into(),
+                    "-o".into(),
+                    "%i|%j|%P|%T|%L|%N".into(),
+                ],
+            )
+            .await
+        }
+        Err(_) => None,
+    };
+    let parts_out = run_capped(
+        &sinfo.to_string_lossy(),
+        &["--noheader".into(), "-o".into(), "%P|%a|%D".into()],
+    )
+    .await;
+
+    let (jobs, jobs_truncated) = parse_squeue(jobs_out.as_deref().unwrap_or(""));
+    let (partitions, parts_truncated) = parse_sinfo(parts_out.as_deref().unwrap_or(""));
+    ComputeSnapshot {
+        scheduler: "slurm".to_string(),
+        jobs,
+        partitions,
+        fetched_at_ms: now_ms(),
+        truncated: jobs_truncated || parts_truncated,
+    }
+}
+
+/// `squeue --noheader -o "%i|%j|%P|%T|%L|%N"` → jobs. Unparseable lines are
+/// skipped, never fatal (Slurm banners/warnings sometimes precede output).
+fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
+    let mut jobs = Vec::new();
+    let mut truncated = false;
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut f = line.splitn(6, '|').map(str::trim);
+        let (Some(id), Some(name), Some(partition), Some(state), Some(time_left)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        if id.is_empty() || !id.starts_with(|c: char| c.is_ascii_digit()) {
+            continue; // not a job row
+        }
+        if jobs.len() >= MAX_JOBS {
+            truncated = true;
+            break;
+        }
+        jobs.push(Job {
+            id: id.to_string(),
+            name: name.to_string(),
+            partition: partition.to_string(),
+            state: state.to_string(),
+            time_left: time_left.to_string(),
+            // %N is empty while pending — an empty string is the honest value.
+            nodes: f.next().unwrap_or("").to_string(),
+        });
+    }
+    (jobs, truncated)
+}
+
+/// `sinfo --noheader -o "%P|%a|%D"` → partitions. sinfo groups rows by the
+/// non-numeric format fields, so this yields one row per (partition, avail);
+/// the default partition carries a `*` suffix on its name.
+fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
+    let mut partitions: Vec<Partition> = Vec::new();
+    let mut truncated = false;
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let mut f = line.splitn(3, '|').map(str::trim);
+        let (Some(raw_name), Some(avail)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if raw_name.is_empty() {
+            continue;
+        }
+        let (name, default) = match raw_name.strip_suffix('*') {
+            Some(base) => (base, true),
+            None => (raw_name, false),
+        };
+        let nodes: u64 = f.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        // A partition briefly listed under two avail states: keep one row,
+        // sum the nodes, "up" wins (orientation, not accounting).
+        if let Some(existing) = partitions.iter_mut().find(|p| p.name == name) {
+            existing.nodes += nodes;
+            existing.avail |= avail == "up";
+            existing.default |= default;
+            continue;
+        }
+        if partitions.len() >= MAX_PARTITIONS {
+            truncated = true;
+            break;
+        }
+        partitions.push(Partition {
+            name: name.to_string(),
+            default,
+            avail: avail == "up",
+            nodes,
+        });
+    }
+    (partitions, truncated)
+}
+
+/// Run one child with the timeout + output cap; None on spawn failure,
+/// non-zero exit, or timeout (the caller degrades, never errors).
+async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // Timeout drops the future, dropping the child; this reaps it.
+        .kill_on_drop(true);
+    let fut = async {
+        let out = cmd.output().await.ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    let bytes = tokio::time::timeout(CMD_TIMEOUT, fut).await.ok()??;
+    let mut s = String::from_utf8_lossy(&bytes).into_owned();
+    if s.len() > MAX_OUTPUT {
+        s.truncate(MAX_OUTPUT);
+    }
+    Some(s)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ComputeQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// GET /api/v1/compute — scheduler detection + the user's queue snapshot.
+pub(crate) async fn get_compute(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ComputeQuery>,
+) -> Response {
+    Json(state.compute.snapshot(q.refresh).await).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-compute-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_squeue_rows_caps_and_skips_noise() {
+        // Shapes measured on Sherlock 2026-07-14 (`%i %j %N %T %L`).
+        let out = "34022541|chimaera-test|normal|RUNNING|9:54|sh02-01n58\n\
+                   34022542|align.sh|owners|PENDING|8:00:00|\n\
+                   slurm_load_jobs: Warning: something\n";
+        let (jobs, truncated) = parse_squeue(out);
+        assert!(!truncated);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, "34022541");
+        assert_eq!(jobs[0].name, "chimaera-test");
+        assert_eq!(jobs[0].state, "RUNNING");
+        assert_eq!(jobs[0].time_left, "9:54");
+        assert_eq!(jobs[0].nodes, "sh02-01n58");
+        assert_eq!(jobs[1].nodes, "", "pending job has no nodes yet");
+
+        let many: String = (0..60)
+            .map(|i| format!("{i}|j{i}|p|RUNNING|1:00|n{i}\n"))
+            .collect();
+        let (jobs, truncated) = parse_squeue(&many);
+        assert_eq!(jobs.len(), MAX_JOBS);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn parse_sinfo_default_star_dedupe_and_avail() {
+        let out = "normal*|up|123\nowners|up|1200\ngpu|down|48\nnormal*|up|7\n";
+        let (parts, truncated) = parse_sinfo(out);
+        assert!(!truncated);
+        assert_eq!(parts.len(), 3);
+        let normal = &parts[0];
+        assert_eq!(normal.name, "normal");
+        assert!(normal.default);
+        assert!(normal.avail);
+        assert_eq!(normal.nodes, 130, "duplicate avail-state rows sum");
+        assert!(!parts[2].avail);
+        assert!(!parts[1].default);
+    }
+
+    #[tokio::test]
+    async fn snapshot_none_without_slurm_and_slurm_with_bindir() {
+        // A bindir missing the binaries → none (and no login-shell probe).
+        let empty = test_dir("empty");
+        let svc = ComputeService::with_bindir(empty.clone());
+        assert_eq!(svc.snapshot(false).await.scheduler, "none");
+
+        // Fake tools → slurm, parsed snapshot, cached second read.
+        let dir = test_dir("fake");
+        for (name, body) in [
+            ("sbatch", "#!/bin/sh\nexit 0\n"),
+            (
+                "squeue",
+                "#!/bin/sh\necho '1|myjob|normal|RUNNING|59:00|node1'\n",
+            ),
+            ("sinfo", "#!/bin/sh\necho 'normal*|up|10'\n"),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let svc = ComputeService::with_bindir(dir.clone());
+        let snap = svc.snapshot(false).await;
+        assert_eq!(snap.scheduler, "slurm");
+        assert_eq!(snap.jobs.len(), 1);
+        assert_eq!(snap.jobs[0].name, "myjob");
+        assert_eq!(snap.partitions.len(), 1);
+        assert!(snap.partitions[0].default);
+        // Cached: a second call inside the TTL returns the same fetch.
+        let again = svc.snapshot(false).await;
+        assert_eq!(again.fetched_at_ms, snap.fetched_at_ms);
+        std::fs::remove_dir_all(&empty).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
