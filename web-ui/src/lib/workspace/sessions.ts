@@ -70,6 +70,15 @@ export interface Session {
   /** Stage of an in-flight agent exec against this terminal, else null. */
   exec_stage?: "queued" | "executing" | null;
   /**
+   * Output-recency activity, the busy signal for hook-less agent TUIs
+   * (codex/gemini/agy): true while the PTY produced output within the
+   * daemon's quiet window (a working TUI streams and animates its spinner
+   * continuously), false once it has gone quiet. Null/absent whenever a
+   * better signal exists (claude's hooks, chat protocol state) or on old
+   * daemons.
+   */
+  output_active?: boolean | null;
+  /**
    * Which surface the session's process runs behind: "chat" (structured
    * stream-json driver) or "term" (a PTY). Server truth — the pane renders
    * whichever the daemon says. Optional on old daemons (= "term").
@@ -115,6 +124,11 @@ export function isBusy(s: Session): boolean {
   if (s.kind !== "agent") {
     return s.phase === "running" || s.exec_stage === "executing";
   }
+  // Hook-less agent TUIs never reach agent_state "running"; the daemon's
+  // output-recency flag is their busy signal (absent on old daemons).
+  if (unintegrated(s)) {
+    return s.output_active === true || s.exec_stage === "executing";
+  }
   return s.agent_state === "running" || s.exec_stage === "executing";
 }
 
@@ -145,10 +159,17 @@ export function dotState(s: Session): string {
       return "rate";
     default:
       if (!s.alive) return "";
-      // Hook-less agents (codex, gemini) never learn their state: a muted
-      // filled dot — honestly unknown, not perpetually "starting". Claude's
-      // pre-hook moment stays the hollow provisional ring.
-      return unintegrated(s) ? "unk" : "starting";
+      // Hook-less agents (codex, gemini) never learn a hook state, but the
+      // daemon derives busy/quiet from PTY output recency: working gets the
+      // live accent, quiet the calm idle dot (likely at its prompt). Only an
+      // old daemon without the signal keeps the muted "honestly unknown"
+      // dot. Claude's pre-hook moment stays the hollow provisional ring.
+      if (unintegrated(s)) {
+        if (s.output_active === true) return "alive";
+        if (s.output_active === false) return "idle";
+        return "unk";
+      }
+      return "starting";
   }
 }
 
@@ -175,7 +196,12 @@ export function dotTitle(s: Session): string {
       return "rate limited";
     default:
       if (!s.alive) return "exited";
-      return unintegrated(s) ? `state unknown (no ${agentKind(s)} integration yet)` : "starting…";
+      if (unintegrated(s)) {
+        if (s.output_active === true) return "agent working (terminal activity)";
+        if (s.output_active === false) return "quiet — no recent output";
+        return `state unknown (no ${agentKind(s)} integration yet)`;
+      }
+      return "starting…";
   }
 }
 

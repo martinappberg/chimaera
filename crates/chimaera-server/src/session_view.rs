@@ -1,8 +1,17 @@
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::agent_state::AgentState;
 use crate::AppState;
+
+/// Quiet window after the last PTY output chunk before a hook-less agent TUI
+/// reads as idle. Must sit ABOVE the ~1 Hz repaint cadence of a working TUI
+/// (codex/gemini animate a spinner + elapsed counter while a turn runs) so a
+/// mid-turn agent never flaps to idle between repaints, and low enough that
+/// the dot settles soon after the turn ends. Tuned against a live codex TUI.
+const OUTPUT_ACTIVITY_QUIET: Duration = Duration::from_secs(2);
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
 /// `agent_kind`, `agent_state`, `agent_title`, `files_touched`,
@@ -58,6 +67,26 @@ pub(crate) fn session_json(
     map.insert(
         "files_touched".to_string(),
         agent.map_or(serde_json::Value::Null, |a| json!(a.files_touched)),
+    );
+    // Hook-less agent TUIs (codex/gemini/agy) never populate `agent_state` —
+    // it stays "unknown" for the session's whole life. Derive a busy signal
+    // from PTY output recency instead: a working TUI streams tokens and
+    // animates its spinner continuously; one that has gone quiet is waiting.
+    // Emitted only while the state is Unknown (a claude row past its first
+    // hook carries real state), and as a boolean that flips at busy<->idle
+    // boundaries so the events-bus snapshot dedupe stays quiet in between.
+    let output_active = agent
+        .filter(|a| a.state == AgentState::Unknown && info.alive)
+        .map(|_| {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            now_ms.saturating_sub(info.last_output_at) <= OUTPUT_ACTIVITY_QUIET.as_millis() as u64
+        });
+    map.insert(
+        "output_active".to_string(),
+        output_active.map_or(serde_json::Value::Null, |b| json!(b)),
     );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the
@@ -150,6 +179,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 "agent_state": record.state.as_str(),
                 "agent_title": record.title(),
                 "files_touched": record.files_touched,
+                "output_active": null,
                 "display_name": record.display_name(None),
                 "ui": target,
                 "chat_capable": true,

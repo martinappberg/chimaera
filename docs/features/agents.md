@@ -97,13 +97,18 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   modifier fades in `⌘1–9` badges for direct switching. Double-click a label or `F2` to rename
   (an inline pin). Click `×` to end a session (a live one asks an inline confirm first).
 - **Where it lives.** `App.svelte` (the `sessionRow` snippet, `startRename`/`requestKill`); session
-  model + state helpers in `sessions.ts` (`dotState`, `displayName`, `needsAttention`). Roster:
-  `GET /api/v1/sessions` polled every 5s + `/ws/events` snapshots. Rename `PATCH /api/v1/sessions/{id}`;
-  kill `DELETE /api/v1/sessions/{id}`.
+  model + state helpers in `sessions.ts` (`dotState`, `isBusy`, `displayName`, `needsAttention`).
+  Roster: `GET /api/v1/sessions` polled every 5s + `/ws/events` snapshots. Rename
+  `PATCH /api/v1/sessions/{id}`; kill `DELETE /api/v1/sessions/{id}`.
 - **Key behaviors.** State dot: running=accent "alive", needs_permission/idle_prompt=amber "attn",
-  finished="done", errored="err", rate_limited="rate"; hook-less agents (codex/gemini TUIs) read a
-  muted "unk" (honestly unknown). `needsAttention` = needs_permission | idle_prompt | errored feeds
-  the home-screen amber rollup. Chimaera owns renaming for **all** session kinds (only claude has an
+  finished="done", errored="err", rate_limited="rate". Hook-less agent TUIs (codex/gemini/agy)
+  never get hook state — their busy signal is **output recency**: the PTY reader stamps
+  `last_output_at` per chunk (`chimaera-pty`, kept off the wire), and `session_view.rs` derives a
+  boolean `output_active` for agent rows still in state `unknown` (a working TUI streams tokens /
+  animates its spinner continuously; quiet ≥2s = idle — the window sits above a working TUI's ~1 Hz
+  repaint so a mid-turn agent never flaps). The dot reads accent "alive" while active, calm "idle"
+  when quiet; only an old daemon without the field keeps the muted "unk". `needsAttention` =
+  needs_permission | idle_prompt | errored feeds the home-screen amber rollup. Chimaera owns renaming for **all** session kinds (only claude has an
   in-TUI `/rename`); the pin outranks every derived name on every surface. Kill drops the row locally
   even if the DELETE fails (already-gone/unreachable). Rail rows are drag sources.
 
@@ -145,7 +150,8 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 
 - **Gemini / Antigravity** are detected but not first-class: gemini has no managed install (400),
   antigravity's `agy` is refused, neither has hook-driven attention state.
-- **Attention state** is claude-only for TUIs.
+- **Attention state** is claude-only for TUIs. Hook-less TUIs do get an honest busy/idle dot from
+  output recency (see the session rail), but no needs_permission/idle_prompt/finished states.
 
 ---
 
