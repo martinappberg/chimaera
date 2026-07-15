@@ -935,7 +935,10 @@ your shell/agent) and **placement** (where it runs). Keeping them apart is what 
 extendable instead of a pile of per-scheduler special-cases; they compose (a compute-node job
 still applies your prelude).*
 
-**Axis A — the environment prelude.** A *prelude* is opaque shell text run before a shell or
+**Axis A — the environment prelude** *(slice 1 SHIPPED 2026-07-15: host/workspace/launch
+scopes, the spawn-seam injection, the Environment settings panel — see
+[features/environment.md](../features/environment.md); capture mode and named profiles
+remain).* A *prelude* is opaque shell text run before a shell or
 agent starts: `micromamba activate env`, `ml bcftools`, `source setup.sh`, `export FOO=bar`.
 Chimaera **never parses it** — it is the user's own commands in the user's own login shell, so
 conda/lmod/spack/venv/nix all "just work" with zero tool-specific code (the not-too-specific

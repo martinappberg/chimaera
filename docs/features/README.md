@@ -52,6 +52,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | [remote-connect.md](remote-connect.md) | `chimaera connect` — SSH orchestration, daemon auto-deploy, tunnels, in-app SSH/2FA auth, remote host management |
 | [native-app.md](native-app.md) | The Tauri shell: real OS windows, window restore, the signed app+daemon self-updater, the update toast |
 | [lifecycle-and-persistence.md](lifecycle-and-persistence.md) | "Close the laptop, nothing dies" — daemon-owned sessions, the session ledger + restart handoff, graceful shutdown, update awareness |
+| [environment.md](environment.md) | Environment preludes — per-host/workspace/launch startup commands (`module load`, `conda activate`) run once per session before the shell or agent |
 | [settings.md](settings.md) | The dotted-key `settings.json` model (hand-edit-aware), the settings UI, theme palettes |
 | [cli.md](cli.md) | The `chimaera` binary: `serve`, `connect`, `status`, `kill`, `doctor`, `shell-integration` |
 

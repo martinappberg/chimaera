@@ -32,6 +32,7 @@ the module you need and read its header doc.
 | `download.rs` | `GET /download/{ticket}` — browser downloads via the ticket pattern: files stream as attachments, folders stream a zip built on the fly (bounded memory, symlinks never followed). |
 | `upload.rs` | `POST /sessions/{id}/upload?name=` — the landing pad for OS-desktop drops + pasted screenshots. STREAMS the body to `uploads_root/<session-id>/` (hidden-tmp-then-rename), capped 32 MB/file + 256 MB/session + 256 files, strict basename sanitize (no traversal), bearer-authed; the per-session dir is pruned on session delete/retire/shutdown/boot-sweep. |
 | `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |
+| `environment.rs` | Environment preludes: the `env-profiles.json` store + `GET/PUT /environment`, per-session prelude materialization (host ⊕ workspace ⊕ launch → `CHIMAERA_PRELUDE`). Injection rides `api::session_env`/`spawn_env_remove` — keep those two lists disjoint (the PTY and chat transports apply env/env_remove in opposite orders). |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. |
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
