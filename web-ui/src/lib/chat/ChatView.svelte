@@ -208,6 +208,17 @@
     socket.send({ type: "interrupt" });
   }
 
+  // Stop/background ride the same never-lose-a-click contract as decide():
+  // a send into a closed socket says why nothing happened.
+  function stopTask(id: string) {
+    const sent = socket.send({ type: "stop_task", task_id: id });
+    if (!sent) store.notice("not connected — stop not sent, try again in a moment", "error");
+  }
+  function backgroundTool(id: string) {
+    const sent = socket.send({ type: "background_tool", tool_call_id: id });
+    if (!sent) store.notice("not connected — try again in a moment", "error");
+  }
+
   /** Pull back a still-queued message before the agent consumes it. The store
    *  removes it on the resulting `user_message_update{cancelled}` (deterministic
    *  from the wire, so replay agrees). Respect the closed-socket rule: if it
@@ -459,6 +470,16 @@
     socket.send({ type: "set_mode", mode_id: id });
   }
 
+  /** Shift+Tab from the composer advances to the next permission mode, wrapping
+   *  round — the same cycle the agent TUIs offer. No-op when the agent exposes
+   *  no modes; an unknown current mode starts the cycle at the first entry. */
+  function cycleMode() {
+    if (store.modes.length === 0) return;
+    const cur = store.modes.findIndex((m) => m.id === store.currentMode);
+    const next = store.modes[(cur + 1) % store.modes.length];
+    if (next.id !== store.currentMode) socket.send({ type: "set_mode", mode_id: next.id });
+  }
+
   function pickEffort(id: string) {
     menu = null;
     effort = id;
@@ -568,6 +589,19 @@
     if (m > 0) return `${m}m ${pad(s)}s`;
     return `${s}s`;
   });
+  /** A completed turn's duration for the turn-end badge. Sub-minute keeps one
+   *  decimal ("2.4s"); a minute or more switches to "44m 24s" / "1h 02m 03s"
+   *  so a long turn never renders as a raw "2664.6s". */
+  function formatDurationMs(ms: number): string {
+    const totalSec = ms / 1000;
+    if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+    const total = Math.floor(totalSec);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return h > 0 ? `${h}h ${pad(m)}m ${pad(s)}s` : `${m}m ${pad(s)}s`;
+  }
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
   /** The step the agent is on now — surfaced in the plan summary so the
@@ -678,13 +712,10 @@
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
+          active={store.running && item === renderItems[renderItems.length - 1]}
           {onOpenFile}
-          onBackground={agentKind === "claude"
-            ? (id) => socket.send({ type: "background_tool", tool_call_id: id })
-            : undefined}
-          onStopTask={agentKind === "claude"
-            ? (id) => socket.send({ type: "stop_task", task_id: id })
-            : undefined}
+          onBackground={agentKind === "claude" ? backgroundTool : undefined}
+          onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
@@ -757,7 +788,7 @@
              "0.0s" ruler is noise, not information. -->
         {#if block.durationMs >= 100}
           <div class="turn-end">
-            <span>{(block.durationMs / 1000).toFixed(1)}s</span>
+            <span>{formatDurationMs(block.durationMs)}</span>
           </div>
         {/if}
       {:else if item.block.kind === "usage"}
@@ -817,12 +848,7 @@
   </div>
 
   {#if activeAgents.length > 0}
-    <AgentsTray
-      agents={activeAgents}
-      onStop={agentKind === "claude"
-        ? (id) => socket.send({ type: "stop_task", task_id: id })
-        : undefined}
-    />
+    <AgentsTray agents={activeAgents} onStop={agentKind === "claude" ? stopTask : undefined} />
   {/if}
 
   {#if store.plan.length > 0}
@@ -934,6 +960,7 @@
     {focused}
     {onSubmit}
     onInterrupt={interrupt}
+    onCycleMode={cycleMode}
     {onSlash}
   />
 </div>

@@ -47,6 +47,14 @@
    *  command, never the denied/failed red. A genuinely failed or denied command
    *  wins (an allowed exec can still exit non-zero), so those stay distinct. */
   const allowed = $derived(block.allowed && block.status !== "failed" && !block.denied);
+  /** A running subagent's latest progress line ("reading foo.rs · 12 tools ·
+   *  48k tokens"), surfaced on the COLLAPSED head so a minutes-long agent
+   *  shows life without expanding. Hidden once open (the body has it). */
+  const liveLine = $derived(
+    block.tool === "agent" && running && !open && block.content?.kind === "output"
+      ? (block.content.text ?? "").trim() || null
+      : null,
+  );
   const statusTitle = $derived(
     block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " "),
   );
@@ -111,7 +119,10 @@
       title={statusTitle}
     >
       <span class="glyph">{glyph}</span>
-      <span class="title">{block.title}</span>
+      <span class="title" class:with-live={liveLine !== null}>{block.title}</span>
+      {#if liveLine !== null}
+        <span class="live">{liveLine}</span>
+      {/if}
     </button>
     {#if running && block.tool !== "agent" && onBackground !== undefined}
       <!-- Ctrl-B parity: the tool keeps running while the agent moves on;
@@ -325,6 +336,21 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--mono, monospace);
+  }
+  /* When a subagent's live progress rides the head, the title yields room —
+     same split as the AgentsTray rows. */
+  .title.with-live {
+    flex: none;
+    max-width: 55%;
+  }
+  .live {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-size: var(--text-xs);
   }
   /* Quiet "allowed" affordance: an accent check, not the red of denied/failed
      — a permission-gated command the user let through reads calmly. */

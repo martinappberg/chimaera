@@ -264,4 +264,52 @@ describe("ChatStore pending-send ordering", () => {
       checkpoint: { id: "u1", preceding: null },
     });
   });
+
+  it("a late in_progress update never walks a finished tool back to running", () => {
+    // The driver's per-turn map wipe makes this unreachable today; the guard
+    // keeps it that way once cross-turn background tasks start streaming.
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "tool_call", id: "a1", kind: "agent", title: "Task: probe", status: "in_progress" },
+      { type: "tool_call_update", id: "a1", status: "completed" },
+      {
+        type: "tool_call_update",
+        id: "a1",
+        status: "in_progress",
+        content: { kind: "output", text: "straggler line" },
+      },
+    ]);
+    const a1 = store.blocks.find((b) => b.kind === "tool" && b.id === "a1");
+    // Status holds; the straggler's content still lands.
+    expect(a1).toMatchObject({ status: "completed" });
+    expect(a1).toMatchObject({ content: { kind: "output", text: "straggler line" } });
+  });
+
+  it("a journal reset clears the plan and turn state with the transcript", () => {
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "plan", entries: [{ content: "step 1", status: "in_progress" }] },
+    ]);
+    expect(store.plan).toHaveLength(1);
+    expect(store.running).toBe(true);
+    // The journal was pruned/recreated server-side: head below our lastSeq.
+    store.onReady(
+      {
+        id: "s1",
+        agent: "claude",
+        alive: true,
+        exit_status: null,
+        native_session_id: null,
+        model: null,
+        current_mode: null,
+        pending_permission: false,
+      },
+      0,
+      0,
+    );
+    expect(store.blocks).toHaveLength(0);
+    expect(store.plan).toHaveLength(0);
+    expect(store.running).toBe(false);
+    expect(store.activity).toBeNull();
+  });
 });

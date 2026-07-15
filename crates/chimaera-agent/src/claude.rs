@@ -715,7 +715,8 @@ impl ClaudeMapper {
                     }
                 }
             }
-            // thinking_tokens etc. are telemetry the chat surface skips.
+            // keep_alive and other unrecognized top-level frame types are
+            // protocol chatter the chat surface skips.
             _ => {}
         }
         step
@@ -738,7 +739,15 @@ impl ClaudeMapper {
             // matches a Task tool_use id the updates land on that card;
             // otherwise a standalone agent row is synthesized.
             Some("task_started") => {
-                if frame["task_type"] != "local_agent" {
+                // Only the subagent lane renders here. Newer CLIs also route
+                // background bash/workflows through task_* with other
+                // task_type values (local_bash, local_workflow, …) — those are
+                // a separate surface, not Agent rows. An ABSENT task_type
+                // stays a subagent (older wire shape).
+                if frame["task_type"]
+                    .as_str()
+                    .is_some_and(|t| t != "local_agent")
+                {
                     return;
                 }
                 let task_id = frame["task_id"].as_str().unwrap_or_default().to_string();
@@ -746,14 +755,22 @@ impl ClaudeMapper {
                     return;
                 }
                 let description = frame["description"].as_str().unwrap_or("subagent");
-                // Prefer landing progress on the Task tool card that spawned
-                // this agent (same description string, not yet claimed).
+                // Prefer landing progress on the Task/Agent tool card that
+                // spawned this agent. Newer CLIs name it exactly
+                // (`tool_use_id`) — trust it OUTRIGHT, even before the
+                // assistant frame carrying the tool_use lands (task_started
+                // can outrun it; an update for a not-yet-rendered id is
+                // dropped by the client, which beats a duplicate row).
+                // Older CLIs fall back to the description heuristic (same
+                // string, not yet claimed) — which misbinds
+                // visually-identical parallel agents, so the exact key wins.
                 let claimed: std::collections::HashSet<&String> = self.task_rows.values().collect();
-                let existing = self
-                    .agent_tools
-                    .iter()
-                    .find(|(id, desc)| desc.as_str() == description && !claimed.contains(*id))
-                    .map(|(id, _)| id.clone());
+                let existing = frame["tool_use_id"].as_str().map(String::from).or_else(|| {
+                    self.agent_tools
+                        .iter()
+                        .find(|(id, desc)| desc.as_str() == description && !claimed.contains(*id))
+                        .map(|(id, _)| id.clone())
+                });
                 match existing {
                     Some(id) => {
                         self.task_rows.insert(task_id, id);
@@ -795,6 +812,19 @@ impl ClaudeMapper {
                         line.push_str(" · ");
                     }
                     line.push_str(&format!("{tok} tokens"));
+                }
+                // Elapsed keeps a minutes-long agent legible at a glance;
+                // driver-built (not a client timer) so replay reproduces it.
+                if let Some(ms) = usage["duration_ms"].as_u64().filter(|ms| *ms >= 1000) {
+                    if !line.is_empty() {
+                        line.push_str(" · ");
+                    }
+                    let s = ms / 1000;
+                    if s >= 60 {
+                        line.push_str(&format!("{}m {:02}s", s / 60, s % 60));
+                    } else {
+                        line.push_str(&format!("{s}s"));
+                    }
                 }
                 step.events.push(AgentEvent::ToolCallUpdate {
                     id: row,
@@ -892,13 +922,52 @@ impl ClaudeMapper {
             Some("task_notification") => {
                 let task_id = frame["task_id"].as_str().unwrap_or_default();
                 if let Some(row) = self.task_rows.remove(task_id) {
-                    // Only close synthesized rows: a real Task tool card gets
-                    // its authoritative completion from the tool_result.
-                    if row.starts_with("task:") {
+                    // The close carries a verdict (live-verified 2.1.207:
+                    // status completed|failed|stopped + summary + usage).
+                    // Synthesized rows always close here. A real Task tool
+                    // card gets its authoritative completion from the
+                    // tool_result — EXCEPT a failed/stopped verdict, which
+                    // must land now so a killed agent never renders green
+                    // (the later tool_result, if any, simply re-confirms).
+                    let status = frame["status"].as_str().unwrap_or("completed");
+                    let ok = status != "failed";
+                    if row.starts_with("task:") || !ok || status == "stopped" {
+                        let mut line = String::new();
+                        if let Some(s) = frame["summary"].as_str() {
+                            line.push_str(s);
+                        } else if status == "stopped" {
+                            line.push_str("stopped");
+                        }
+                        let usage = &frame["usage"];
+                        for part in [
+                            usage["tool_uses"].as_u64().map(|n| format!("{n} tools")),
+                            usage["total_tokens"]
+                                .as_u64()
+                                .map(|n| format!("{n} tokens")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            if !line.is_empty() {
+                                line.push_str(" · ");
+                            }
+                            line.push_str(&part);
+                        }
                         step.events.push(AgentEvent::ToolCallUpdate {
                             id: row,
-                            status: ToolStatus::Completed,
-                            content: None,
+                            status: if ok {
+                                ToolStatus::Completed
+                            } else {
+                                ToolStatus::Failed
+                            },
+                            content: if line.is_empty() {
+                                None
+                            } else {
+                                Some(ToolContent::Output {
+                                    text: line,
+                                    truncated: false,
+                                })
+                            },
                         });
                     }
                 }
@@ -1075,7 +1144,8 @@ impl ClaudeMapper {
 
         let kind = tool_kind(name);
         self.tool_kinds.insert(id.clone(), kind);
-        if name == "Task" {
+        // Subagent spawns (Task/Agent) register for task_started correlation.
+        if kind == ToolKind::Agent {
             if let Some(desc) = input["description"].as_str() {
                 self.agent_tools.insert(id.clone(), desc.to_string());
             }
@@ -1559,6 +1629,23 @@ impl ClaudeMapper {
         }
     }
 
+    /// Close every still-open subagent row as failed: the turn died with them
+    /// (error or interrupt), so their task_notification / tool_result will
+    /// never arrive — and the UI's turn-end reconcile would otherwise flip
+    /// them to a green "completed". Clears the map it drains.
+    fn fail_dangling_tasks(&mut self, step: &mut DriverStep) {
+        for row in std::mem::take(&mut self.task_rows).into_values() {
+            step.events.push(AgentEvent::ToolCallUpdate {
+                id: row,
+                status: ToolStatus::Failed,
+                content: Some(ToolContent::Output {
+                    text: "subagent stopped with the turn".into(),
+                    truncated: false,
+                }),
+            });
+        }
+    }
+
     fn on_result(&mut self, frame: &Value, step: &mut DriverStep) {
         if let Some(flushed) = self.coalescer.flush() {
             step.events.push(flushed);
@@ -1576,8 +1663,14 @@ impl ClaudeMapper {
         self.turn_active = false;
         self.tool_kinds.clear();
         self.streamed.clear();
-        // Task maps live per turn (the extension wipes its map on result).
-        self.task_rows.clear();
+        // Task maps live per turn (the extension wipes its map on result) —
+        // but an errored turn first closes its still-open subagent rows as
+        // failed, so they never reconcile green.
+        if frame["is_error"] == json!(true) && was_active {
+            self.fail_dangling_tasks(step);
+        } else {
+            self.task_rows.clear();
+        }
         self.agent_tools.clear();
         self.thinking_emitted = 0;
         // A real result is the turn end — disarm the interrupt watchdog (the
@@ -2004,14 +2097,22 @@ impl ClaudeMapper {
                 // The client sends the transcript ROW id (all it ever sees).
                 // Resolve it to the native task key: task_rows maps task_id →
                 // row for both synthesized ("task:{id}") and Task-tool-card
-                // rows; the prefix strip covers a row whose map entry is gone.
+                // rows; the prefix strip covers a synthesized row whose map
+                // entry is gone. A bound-card row with NO map entry cannot be
+                // resolved (the tool_use id is unrelated to the task key) —
+                // say so instead of firing a stop at a made-up key.
                 let native = self
                     .task_rows
                     .iter()
                     .find(|(_, row)| **row == task_id)
                     .map(|(key, _)| key.clone())
-                    .or_else(|| task_id.strip_prefix("task:").map(String::from))
-                    .unwrap_or(task_id);
+                    .or_else(|| task_id.strip_prefix("task:").map(String::from));
+                let Some(native) = native else {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that subagent already finished — nothing to stop".into(),
+                    });
+                    return step;
+                };
                 let id = self.ctl_id();
                 self.pending_controls
                     .insert(id.clone(), PendingControl::StopTask);
@@ -2176,10 +2277,11 @@ impl ClaudeMapper {
         let turn_id = self.turn_id();
         self.turn_active = false;
         self.interrupt_requested = false;
-        // Same per-turn cleanup a real result performs.
+        // Same per-turn cleanup a real result performs — including closing
+        // still-open subagent rows as failed (the interrupt killed them).
         self.tool_kinds.clear();
         self.streamed.clear();
-        self.task_rows.clear();
+        self.fail_dangling_tasks(&mut step);
         self.agent_tools.clear();
         self.thinking_emitted = 0;
         step.events.push(AgentEvent::TurnAborted {
@@ -2263,7 +2365,9 @@ pub(crate) fn tool_kind(name: &str) -> ToolKind {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => ToolKind::Edit,
         "Grep" | "Glob" => ToolKind::Search,
         "WebFetch" | "WebSearch" => ToolKind::Fetch,
-        "Task" => ToolKind::Agent,
+        // The subagent tool: "Task" through 2.1.206, renamed "Agent" at
+        // 2.1.207 (live-verified — the old name stays for older CLIs).
+        "Task" | "Agent" => ToolKind::Agent,
         _ => ToolKind::Other,
     }
 }
@@ -2276,7 +2380,13 @@ pub(crate) fn tool_title(name: &str, input: &Value) -> String {
         "Grep" | "Glob" => input["pattern"].as_str(),
         "WebFetch" => input["url"].as_str(),
         "WebSearch" => input["query"].as_str(),
-        "Task" => input["description"].as_str(),
+        "Task" | "Agent" => input["description"].as_str(),
+        // Harness task-list + monitor tools: surface the subject so the card
+        // reads as what it does, not a bare internal name.
+        "TaskCreate" => input["subject"].as_str(),
+        "TaskUpdate" | "TaskGet" | "TaskStop" => input["taskId"].as_str(),
+        "TaskOutput" => input["task_id"].as_str(),
+        "Monitor" => input["description"].as_str(),
         _ => None,
     };
     match detail {
@@ -3788,6 +3898,199 @@ mod tests {
             task_id: "tu-7".into(),
         });
         assert_eq!(step.outbound[0]["request"]["task_id"], "tk-10");
+    }
+
+    #[test]
+    fn stop_task_unresolvable_row_notices_instead_of_guessing() {
+        // A bound-card row whose map entry is gone (turn ended) CANNOT be
+        // resolved — the tool_use id is unrelated to the native task key, so
+        // firing a stop at a made-up key would be a lie. Say so instead.
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::StopTask {
+            task_id: "tu-gone".into(),
+        });
+        assert!(step.outbound.is_empty(), "no stop fired at a wrong key");
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::Notice { text } if text.contains("already finished")
+        ));
+    }
+
+    #[test]
+    fn task_started_binds_by_tool_use_id_over_description() {
+        let mut m = mapper();
+        // Two parallel Task cards with the SAME description — the classic
+        // description-heuristic ambiguity.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": "tu-a", "name": "Task",
+                  "input": { "description": "explore", "prompt": "…" } },
+                { "type": "tool_use", "id": "tu-b", "name": "Task",
+                  "input": { "description": "explore", "prompt": "…" } },
+            ]},
+        }));
+        // 2.1.207 names the spawning card exactly: bind tu-b even though the
+        // description heuristic would have picked tu-a first.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-b",
+            "tool_use_id": "tu-b", "description": "explore",
+        }));
+        assert!(
+            step.events.is_empty(),
+            "bound to the card, no synthetic row"
+        );
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress",
+            "task_id": "tk-b", "usage": { "tool_uses": 3 },
+        }));
+        match &step.events[0] {
+            AgentEvent::ToolCallUpdate { id, .. } => assert_eq!(id, "tu-b"),
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renamed_agent_tool_binds_like_task() {
+        // 2.1.207 renamed the subagent tool "Task" → "Agent" (live-verified):
+        // it must still make an Agent-kind card and claim its task_started —
+        // the rename regression rendered every subagent TWICE (a bare "Agent"
+        // card plus a synthesized row).
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{
+                "type": "tool_use", "id": "tu-r", "name": "Agent",
+                "input": { "description": "scan crates", "prompt": "…" },
+            }]},
+        }));
+        let call = step
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCall { kind, title, .. } => Some((kind, title)),
+                _ => None,
+            })
+            .expect("a ToolCall for the Agent tool_use");
+        assert_eq!(*call.0, ToolKind::Agent);
+        assert_eq!(call.1, "Agent: scan crates");
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-r",
+            "tool_use_id": "tu-r", "description": "scan crates",
+        }));
+        assert!(step.events.is_empty(), "claims the card, no duplicate row");
+    }
+
+    #[test]
+    fn task_started_tolerates_absent_task_type_and_skips_background_lanes() {
+        let mut m = mapper();
+        // Absent task_type = older wire shape, still a subagent.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_id": "tk-1", "description": "old-style agent",
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ToolCall {
+                kind: ToolKind::Agent,
+                ..
+            }
+        ));
+        // local_bash (a backgrounded shell) is a different surface — no
+        // Agent row until the background-tasks lane is built.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_bash", "task_id": "tk-2",
+            "description": "Sleep 8 seconds then echo",
+        }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn task_notification_verdict_closes_rows_honestly() {
+        // Synthesized row + failed verdict → a red row carrying the summary,
+        // never a silent green.
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-f",
+            "description": "doomed agent",
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "tk-f", "status": "failed", "summary": "hit an error",
+            "usage": { "total_tokens": 500, "tool_uses": 2 },
+        }));
+        match &step.events[0] {
+            AgentEvent::ToolCallUpdate {
+                id,
+                status,
+                content,
+            } => {
+                assert_eq!(id, "task:tk-f");
+                assert_eq!(*status, ToolStatus::Failed);
+                match content {
+                    Some(ToolContent::Output { text, .. }) => {
+                        assert!(text.contains("hit an error") && text.contains("2 tools"));
+                    }
+                    other => panic!("expected output content, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolCallUpdate, got {other:?}"),
+        }
+
+        // A BOUND card with a completed verdict stays silent — the
+        // tool_result is authoritative; a failed verdict overrides early.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{
+                "type": "tool_use", "id": "tu-c", "name": "Task",
+                "input": { "description": "bound agent", "prompt": "…" },
+            }]},
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-c",
+            "tool_use_id": "tu-c", "description": "bound agent",
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "tk-c", "status": "completed", "summary": "ok",
+        }));
+        assert!(
+            step.events.is_empty(),
+            "bound completed defers to tool_result"
+        );
+    }
+
+    #[test]
+    fn errored_turn_fails_dangling_subagent_rows() {
+        let mut m = mapper();
+        // Open a turn, spawn a subagent that never gets its notification.
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{ "type": "text", "text": "working" }] },
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-d",
+            "description": "orphaned agent",
+        }));
+        // The turn dies — the row must close FAILED (its notification will
+        // never arrive; the UI reconcile would otherwise flip it green).
+        let step = m.on_frame(&json!({
+            "type": "result", "is_error": true, "result": "boom",
+        }));
+        assert!(
+            step.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. } if id == "task:tk-d"
+            )),
+            "dangling row closes failed: {:?}",
+            step.events
+        );
     }
 
     #[test]
