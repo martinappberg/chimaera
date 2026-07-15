@@ -251,7 +251,9 @@ struct Inner {
     last_byte_at: Instant,
 }
 
-fn now_ms() -> u64 {
+/// Milliseconds since the Unix epoch (0 if the clock reads before it).
+/// Shared with `session` (the output-recency stamp uses the same clock).
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

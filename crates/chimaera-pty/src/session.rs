@@ -6,6 +6,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,8 +20,8 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    lock_unpoisoned, marks::Marks, marks::ShellPhase, snapshot, Attachment, SessionEvent,
-    SessionId, SessionInfo, SpawnOpts,
+    lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, Attachment,
+    SessionEvent, SessionId, SessionInfo, SpawnOpts,
 };
 
 /// How long `kill()` waits after SIGHUP before force-killing a still-living
@@ -113,6 +114,10 @@ pub(crate) struct Session {
     events_tx: broadcast::Sender<SessionEvent>,
     /// Shell-integration marks: OSC 133 phase + command journal.
     marks: Arc<Marks>,
+    /// Unix ms of the most recent PTY output chunk (the spawn instant until
+    /// the first byte arrives), stamped by the reader thread. Output recency
+    /// is the busy signal for agent TUIs with no deeper integration.
+    last_output_at: Arc<AtomicU64>,
     /// Serializes agent execs against this session's shell.
     exec_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -217,6 +222,9 @@ impl Session {
         }));
 
         let marks = Arc::new(Marks::new());
+        // Seeded with the spawn instant so a TUI reads as active while it
+        // boots (before its first paint) instead of flickering idle->active.
+        let last_output_at = Arc::new(AtomicU64::new(now_ms()));
 
         // Reader thread: pump PTY output into the headless Term and the live
         // broadcast channel. Advancing the parser and broadcasting happen
@@ -229,6 +237,7 @@ impl Session {
             let output_tx = output_tx.clone();
             let events_tx = events_tx.clone();
             let marks = Arc::clone(&marks);
+            let last_output_at = Arc::clone(&last_output_at);
             let id = id.clone();
             std::thread::Builder::new()
                 .name(format!("pty-read-{id}"))
@@ -240,6 +249,7 @@ impl Session {
                         match reader.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
+                                last_output_at.store(now_ms(), Ordering::Relaxed);
                                 marks.feed(&buf[..n]);
                                 {
                                     let mut term = lock_unpoisoned(&term);
@@ -339,6 +349,7 @@ impl Session {
             output_tx,
             events_tx,
             marks,
+            last_output_at,
             exec_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
@@ -368,6 +379,7 @@ impl Session {
             pid: self.child_pid,
             renamed,
             phase: self.marks.phase(),
+            last_output_at: self.last_output_at.load(Ordering::Relaxed),
         }
     }
 

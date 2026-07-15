@@ -1,8 +1,26 @@
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
+use crate::agent_state::AgentState;
 use crate::AppState;
+
+/// Quiet window after the last PTY output chunk before a hook-less agent TUI
+/// reads as idle. Must sit ABOVE the ~1 Hz repaint cadence of a working TUI
+/// (codex/gemini animate a spinner + elapsed counter while a turn runs) so a
+/// mid-turn agent never flaps to idle between repaints, and low enough that
+/// the dot settles soon after the turn ends. Tuned against a live codex TUI.
+const OUTPUT_ACTIVITY_QUIET: Duration = Duration::from_secs(2);
+
+/// Milliseconds since the Unix epoch (0 if the clock reads before it) —
+/// the same clock the PTY reader stamps `last_output_at` with.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Serialize a `SessionInfo` with the extra `workspace_id`, `kind`,
 /// `agent_kind`, `agent_state`, `agent_title`, `files_touched`,
@@ -58,6 +76,22 @@ pub(crate) fn session_json(
     map.insert(
         "files_touched".to_string(),
         agent.map_or(serde_json::Value::Null, |a| json!(a.files_touched)),
+    );
+    // Hook-less agent TUIs (codex/gemini/agy) never populate `agent_state` —
+    // it stays "unknown" for the session's whole life. Derive a busy signal
+    // from PTY output recency instead: a working TUI streams tokens and
+    // animates its spinner continuously; one that has gone quiet is waiting.
+    // Emitted only while the state is Unknown (a claude row past its first
+    // hook carries real state), and as a boolean that flips at busy<->idle
+    // boundaries so the events-bus snapshot dedupe stays quiet in between.
+    let output_active = agent
+        .filter(|a| a.state == AgentState::Unknown && info.alive)
+        .map(|_| {
+            now_ms().saturating_sub(info.last_output_at) <= OUTPUT_ACTIVITY_QUIET.as_millis() as u64
+        });
+    map.insert(
+        "output_active".to_string(),
+        output_active.map_or(serde_json::Value::Null, |b| json!(b)),
     );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the
@@ -150,6 +184,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 "agent_state": record.state.as_str(),
                 "agent_title": record.title(),
                 "files_touched": record.files_touched,
+                "output_active": null,
                 "display_name": record.display_name(None),
                 "ui": target,
                 "chat_capable": true,
@@ -158,4 +193,58 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     }
     rows.sort_by_key(|(created, _)| *created);
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_state::{AgentKind, AgentRecord};
+
+    fn info(alive: bool, last_output_at: u64) -> chimaera_pty::SessionInfo {
+        chimaera_pty::SessionInfo {
+            id: "s1".to_string(),
+            name: "codex".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
+            created_at: 0,
+            alive,
+            exit_status: None,
+            title: None,
+            pid: None,
+            renamed: false,
+            phase: chimaera_pty::ShellPhase::Unknown,
+            last_output_at,
+        }
+    }
+
+    /// `output_active` is part of the wire contract: a boolean only for a
+    /// LIVE agent row still in state Unknown (the hook-less TUIs), null
+    /// everywhere a better signal exists. The UI has no tests of its own —
+    /// keep the key name and gating pinned here.
+    #[test]
+    fn output_active_gates_on_unknown_live_agent_rows() {
+        let active = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
+            session_json(&info, None, agent, None, None, None)["output_active"].clone()
+        };
+
+        // Shell rows (no agent record): null.
+        assert_eq!(active(info(true, now_ms()), None), json!(null));
+
+        // Unknown-state agent, fresh output: true. Long quiet: false.
+        let unknown = AgentRecord::new("k".into(), AgentKind::Codex);
+        assert_eq!(active(info(true, now_ms()), Some(&unknown)), json!(true));
+        assert_eq!(
+            active(info(true, now_ms() - 60_000), Some(&unknown)),
+            json!(false)
+        );
+
+        // A dead session is never "active", whatever it last wrote.
+        assert_eq!(active(info(false, now_ms()), Some(&unknown)), json!(null));
+
+        // A row with real hook/protocol state carries null (the state wins).
+        let mut running = AgentRecord::new("k".into(), AgentKind::Claude);
+        running.state = AgentState::Running;
+        assert_eq!(active(info(true, now_ms()), Some(&running)), json!(null));
+    }
 }
