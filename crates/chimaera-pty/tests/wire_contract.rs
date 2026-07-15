@@ -30,6 +30,9 @@ fn session_info_wire_shape() {
         pid: Some(4242),
         renamed: false,
         phase: ShellPhase::Ready,
+        // serde(skip): output recency stays server-side; the daemon derives
+        // an activity flag for the wire instead. Absent from the JSON below.
+        last_output_at: 1_700_000_000_000,
     };
     assert_eq!(
         serde_json::to_value(&info).unwrap(),

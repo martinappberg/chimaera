@@ -122,6 +122,33 @@ async fn attach_when_snapshot_contains(mgr: &SessionManager, id: &str, needle: &
     }
 }
 
+/// The reader pump must stamp `last_output_at` on output: the daemon derives
+/// the hook-less-agent busy signal from it, and no other test observes the
+/// stamping itself (the server's session_view test only pins the derivation).
+#[tokio::test]
+async fn reader_pump_advances_last_output_at() {
+    let mgr = SessionManager::new();
+    let info = mgr
+        .spawn(opts(Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // The pause separates the spawn-instant seed from the output
+            // stamp by a measurable gap; the trailing sleep keeps the
+            // session alive for the assertion.
+            "sleep 0.3; echo stamped; sleep 30".to_string(),
+        ])))
+        .expect("spawn failed");
+    let seeded = info.last_output_at;
+    assert!(seeded > 0, "spawn must seed the stamp");
+    attach_when_snapshot_contains(&mgr, &info.id, "stamped").await;
+    let stamped = mgr.get(&info.id).expect("session vanished").last_output_at;
+    assert!(
+        stamped > seeded,
+        "output must advance the stamp past the spawn seed ({stamped} vs {seeded})"
+    );
+    mgr.kill(&info.id).expect("kill failed");
+}
+
 // --- snapshot fidelity plumbing ------------------------------------------
 
 struct NoopListener;

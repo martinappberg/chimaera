@@ -353,6 +353,7 @@ mod tests {
             pid: None,
             renamed: false,
             phase: chimaera_pty::ShellPhase::Unknown,
+            last_output_at: 0,
         }
     }
 
