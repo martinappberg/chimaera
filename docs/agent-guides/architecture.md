@@ -913,13 +913,16 @@ setup into a new session. Distinctive, deferred.
     control shows in the UI exactly where the daemon would allow it. All four fences are
     unit-tested, and the create → land-in-session → remove loop was driven live.
 - **Slurm** (design pass 2026-07-14 — detection first, two placement modes; deep spec in
-  *Environment prelude & compute-node sessions* below). The cluster-side daemon detects the
-  scheduler *locally* (`command -v sbatch`) and serves it — the git-service model, not a
-  connect-time ssh probe — so it lights up automatically on HPC and is a no-op off-cluster. A
-  bounded `squeue --me` / `sinfo` poller (git-service resource discipline: `tokio::process` +
-  hard timeout + output cap + coalescing + backoff, never a tight loop on a shared login node),
-  a `GET /api/v1/compute` route, a client store parallel to `gitStatus`, and a job strip in the
-  rail; job↔session linking detects agent-submitted `sbatch`. **Inbound and outbound are
+  *Environment prelude & compute-node sessions* below. *Detection + strip SHIPPED 2026-07-15:
+  [features/compute.md](../features/compute.md)* — implementation note: format-string
+  `squeue -u`/`sinfo`, not `--json`/`--me`, which older cluster Slurms lack). The cluster-side
+  daemon detects the scheduler *locally* (`command -v sbatch`) and serves it — the git-service
+  model, not a connect-time ssh probe — so it lights up automatically on HPC and is a no-op
+  off-cluster. A bounded `squeue` / `sinfo` fetch (git-service resource discipline:
+  `tokio::process` + hard timeout + output cap + single-flight snapshot cache, never a tight
+  loop on a shared login node), a `GET /api/v1/compute` route, a client store parallel to
+  `gitStatus`, and a job strip in the rail; job↔session linking (detect agent-submitted
+  `sbatch`) is still to come on this seam. **Inbound and outbound are
   different facts and must not be conflated** (the earlier note here did): the *login node CAN
   reach a compute node's ports* — verified on Sherlock 2026-07-14, both a direct TCP route and
   `pam_slurm_adopt` ssh — so a daemon *on* a compute node is reachable through the one login-node
