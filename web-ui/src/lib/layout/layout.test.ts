@@ -13,6 +13,7 @@ import {
   openSession,
   openFile,
   openGit,
+  openDashboard,
   openChanges,
   splitPane,
   closePane,
@@ -90,6 +91,16 @@ describe("opening surfaces", () => {
     expect(tabCount(l)).toBe(3);
     expect(allSessionIds(l)).toEqual(["s1"]);
     expect(allFilePaths(l)).toEqual(["/a.txt"]);
+  });
+
+  it("the dashboard is a singleton and round-trips serialization", () => {
+    let l = openDashboard(defaultLayout());
+    l = openDashboard(l);
+    expect(tabCount(l)).toBe(1);
+    const restored = deserializeLayout(serializeLayout(l));
+    expect(restored).not.toBeNull();
+    const pane = panes(restored!.root)[0];
+    expect(pane.tabs[0]).toEqual({ surface: "dashboard" });
   });
 });
 

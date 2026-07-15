@@ -110,6 +110,7 @@
     findFinder,
     freshFinderTab,
     setFinderPath,
+    openDashboard,
     openGit,
     openSession,
     openSettings,
@@ -159,7 +160,13 @@
     type LayoutCtrl,
   } from "./lib/layout/dnd";
   import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
-  import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
+  import {
+    activeModLabel,
+    isCapturing,
+    keyHint,
+    matchAction,
+    modifierSetting,
+  } from "./lib/shared/keybindings";
   import {
     askpassActive,
     caffeinateState,
@@ -184,9 +191,11 @@
   import {
     applyRemoteSettings,
     flushSettings,
+    getSetting,
     loadSettings,
     setSetting,
   } from "./lib/settings/store.svelte";
+  import type { DashCtx } from "./lib/dashboard/dash";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
   import {
     FILES_FRAC_MAX,
@@ -520,6 +529,12 @@
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
 
+  /** The focused pane is showing the dashboard (its rail row highlights). */
+  const dashboardOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "dashboard";
+  });
+
   // --- context bridge: reference target resolution ---------------------------
 
   /** Agent sessions this window focused, most recent first. */
@@ -529,6 +544,19 @@
     if (sid === null || sessionsById.get(sid)?.kind !== "agent") return;
     if (agentMru[0] === sid) return;
     agentMru = [sid, ...agentMru.filter((x) => x !== sid)].slice(0, 16);
+  });
+
+  /** App-level context the dashboard surface needs beyond the pane props. */
+  const dashCtx = $derived<DashCtx>({
+    wsName: workspace?.name ?? "",
+    ready: gotSessions,
+    recents: visibleRecents,
+    mru: agentMru,
+    onOpenRecent: openRecent,
+    onNewTerminal: newShell,
+    onNewAgent: newAgentPrimary,
+    onOpenGit: openGitPanel,
+    onOpenSession: openSess,
   });
 
   /**
@@ -1458,9 +1486,12 @@
         }
         return;
       }
-      // Pinned Mod+1–9: open the Nth rail session.
+      // Pinned Mod+1–9: open the Nth rail session; Mod+0 is the dashboard.
       const n = chordDigit(e, modifierSetting());
-      if (n !== null && n <= railSessions.length) {
+      if (n === 0) {
+        intercept();
+        openDashboardSurface();
+      } else if (n !== null && n <= railSessions.length) {
         intercept();
         openSess(railSessions[n - 1].id);
       }
@@ -1791,8 +1822,16 @@
     layout = pruneSessions(layout, live);
     if (!autoOpened) {
       autoOpened = true;
-      if (tabCount(layout) === 0 && railSessions.length > 0) {
-        layout = openSession(layout, railSessions[0].id);
+      if (tabCount(layout) === 0) {
+        // An empty layout lands on the dashboard — the workspace overview —
+        // unless the setting restores the old first-session behavior. A
+        // NON-empty restored layout is never touched: the dashboard earns
+        // the center only when the stage was empty.
+        if (getSetting("dashboard.landing") !== "never") {
+          layout = openDashboard(layout);
+        } else if (railSessions.length > 0) {
+          layout = openSession(layout, railSessions[0].id);
+        }
       }
     }
   }
@@ -1894,6 +1933,13 @@
   function openSettingsSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openSettings(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
+  function openDashboardSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openDashboard(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
@@ -3115,6 +3161,29 @@
           {/if}
         {/snippet}
 
+        <!-- The workspace dashboard: the fixed home row above the sessions —
+             the overview of everything below it. ⌘0, matching the ⌘1–9 rows. -->
+        <button
+          class="row dash-row"
+          class:dash-active={dashboardOpen}
+          title="workspace dashboard ({activeModLabel()}0)"
+          onclick={openDashboardSurface}
+        >
+          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="dash-label">dashboard</span>
+          {#if hintsActive()}
+            <span class="kbd-badge" aria-hidden="true">0</span>
+          {/if}
+        </button>
+
         <!-- Terminals first (there are few), agents below (there are many);
              this order is also the mod+1–9 order and the strip order. -->
         <div class="rail-sec">terminals</div>
@@ -3541,6 +3610,7 @@
             wsRoot={workspace?.root ?? null}
             wsId={activeWsId}
             {bandPanes}
+            dash={dashCtx}
             {ctrl}
           />
         {:else}
@@ -3557,6 +3627,7 @@
             wsId={activeWsId}
             {bandPanes}
             soloPane={panesOf(layout.root).length === 1}
+            dash={dashCtx}
             {ctrl}
           />
         {/if}
@@ -3946,6 +4017,35 @@
     cursor: pointer;
     user-select: none;
     transition: background-color 0.12s ease;
+  }
+
+  /* The dashboard home row: fixed above the session sections, quiet until
+     hovered or active — furniture, not a session. */
+  .dash-row {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--muted);
+    text-align: left;
+    width: 100%;
+    margin-bottom: 2px;
+  }
+  .dash-row:hover {
+    color: var(--fg);
+  }
+  .dash-row.dash-active {
+    background: var(--row-active);
+    color: var(--fg);
+  }
+  .dash-glyph {
+    flex: none;
+    display: block;
+  }
+  .dash-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .row:hover {

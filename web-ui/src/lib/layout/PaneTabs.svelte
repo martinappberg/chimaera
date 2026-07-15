@@ -184,6 +184,7 @@
       return names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name ?? tab.sessionId.slice(0, 8);
     }
     if (tab.surface === "settings") return "Settings";
+    if (tab.surface === "dashboard") return "Dashboard";
     if (tab.surface === "finder") return basename(tab.path) || "Finder";
     if (tab.surface === "git") return "Source Control";
     if (tab.surface === "diff") return `${basename(tab.path)} (diff)`;
@@ -493,6 +494,18 @@
               stroke="currentColor"
               stroke-width="1.3"
               stroke-linecap="round"
+            />
+          </svg>
+        {:else if tab.surface === "dashboard"}
+          <!-- The workspace mark: the brand hexagon, plain stroke. -->
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>dashboard</title>
+            <path
+              d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
             />
           </svg>
         {:else if $dirtyFiles.has(tab.path)}

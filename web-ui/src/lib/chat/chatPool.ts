@@ -89,6 +89,16 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
   return { store: entry.store, socket: entry.socket };
 }
 
+/**
+ * The warm store for `sessionId` if one exists, WITHOUT creating a socket or
+ * touching LRU order. The dashboard reads through this so a roster card can
+ * show live chat detail for sessions that are already warm (an open tab, an
+ * answered permission) without spending pool slots on every card.
+ */
+export function peekChat(sessionId: string): ChatStore | null {
+  return pool.get(sessionId)?.store ?? null;
+}
+
 /** Release the entry back to the pool, keeping it warm (the socket stays
  *  open). Evicts the least-recently-used warm entries past the cap. */
 export function releaseChat(sessionId: string): void {

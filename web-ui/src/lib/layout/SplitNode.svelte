@@ -4,6 +4,7 @@
   import type { Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import type { LinkCtrl } from "../workspace/agentLinks";
+  import type { DashCtx } from "../dashboard/dash";
   import Pane from "./Pane.svelte";
   import Self from "./SplitNode.svelte";
 
@@ -24,6 +25,8 @@
     bandPanes: ReadonlySet<string>;
     /** True when the window has exactly one pane (hides the move-pane grip). */
     soloPane?: boolean;
+    /** App-level context for the dashboard surface. */
+    dash: DashCtx;
     ctrl: LayoutCtrl;
   }
 
@@ -40,6 +43,7 @@
     wsId,
     bandPanes,
     soloPane = false,
+    dash,
     ctrl,
   }: Props = $props();
 
@@ -127,12 +131,12 @@
 </script>
 
 {#if node.type === "pane"}
-  <Pane {node} {focusedPaneId} {soloPane} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {ctrl} />
+  <Pane {node} {focusedPaneId} {soloPane} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} {dash} {ctrl} />
 {:else}
   <div class="split" class:col={node.dir === "col"} bind:this={el}>
     <div class="cell" style:flex-grow={node.ratio}>
       <!-- Inside a split there are ≥2 panes, so children are never solo. -->
-      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {ctrl} />
+      <Self node={node.a} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {dash} {ctrl} />
     </div>
     <div
       class="divider"
@@ -146,7 +150,7 @@
       }}
     ></div>
     <div class="cell" style:flex-grow={1 - node.ratio}>
-      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {ctrl} />
+      <Self node={node.b} {focusedPaneId} {dropSpot} {sessions} {names} {fileNames} {links} {linkCtrl} {wsRoot} {wsId} {bandPanes} soloPane={false} {dash} {ctrl} />
     </div>
   </div>
 {/if}

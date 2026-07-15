@@ -64,6 +64,11 @@ export interface DiffTab {
 export interface GitTab {
   surface: "git";
 }
+/** The workspace dashboard (agents + activity) — a singleton view like
+ *  settings/git. The workspace's landing surface when a layout is empty. */
+export interface DashboardTab {
+  surface: "dashboard";
+}
 /**
  * A review of the files ONE session changed — a session-scoped changes list
  * built on the same git status/diff APIs as the source-control panel. Keyed by
@@ -81,7 +86,8 @@ export type Tab =
   | FinderTab
   | DiffTab
   | GitTab
-  | ChangesTab;
+  | ChangesTab
+  | DashboardTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
@@ -92,6 +98,7 @@ export function tabKey(t: Tab): string {
   // sharing a key prefix would alias inside the no-duplicates set.
   if (t.surface === "diff") return `g:${t.mode}:${t.path}`;
   if (t.surface === "git") return "v:git";
+  if (t.surface === "dashboard") return "v:dashboard";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
   return "v:settings";
 }
@@ -478,6 +485,11 @@ export function openDiff(l: Layout, path: string, mode: DiffMode): Layout {
 /** Open (or focus) the source-control panel. */
 export function openGit(l: Layout): Layout {
   return openTab(l, { surface: "git" });
+}
+
+/** Open (or focus) the workspace dashboard. */
+export function openDashboard(l: Layout): Layout {
+  return openTab(l, { surface: "dashboard" });
 }
 
 /** Open (or focus) the session-scoped changes review. */
@@ -1044,6 +1056,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "finder") return { d: t.path, di: t.id };
         if (t.surface === "diff") return { gd: t.path, dm: t.mode };
         if (t.surface === "git") return { v: "git" };
+        if (t.surface === "dashboard") return { v: "dashboard" };
         if (t.surface === "changes") return { cs: t.sessionId };
         return { v: "settings" };
       }),
@@ -1100,6 +1113,8 @@ function deserNode(
         tab = { surface: "diff", path: t.gd, mode: diffModeOf(t.dm) };
       } else if (t.v === "git") {
         tab = { surface: "git" };
+      } else if (t.v === "dashboard") {
+        tab = { surface: "dashboard" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
       } else if (t.v === "settings") {
@@ -1250,6 +1265,18 @@ if (import.meta.env.DEV) {
   ok(
     mixed !== null && allFilePaths(mixed).join() === "/tmp/keep.md",
     "the unknown tab is skipped; its sibling tabs survive",
+  );
+
+  // dashboard surface: singleton (dedupes) and survives serialization
+  let db = defaultLayout();
+  db = openDashboard(db);
+  db = openDashboard(db);
+  ok(tabCount(db) === 1, "openDashboard never duplicates");
+  const dbRound = deserializeLayout(JSON.parse(JSON.stringify(serializeLayout(db))));
+  ok(
+    dbRound !== null &&
+      findPane(dbRound.root, dbRound.focusedPaneId)?.tabs[0]?.surface === "dashboard",
+    "dashboard tab round-trips",
   );
 
   // settings surface: singleton (dedupes) and survives serialization

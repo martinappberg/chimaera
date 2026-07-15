@@ -82,6 +82,7 @@ export type SettingsMap = {
   "appearance.darkTheme": string;
   "appearance.accentColor": string;
   "agents.defaultView": "chat" | "terminal";
+  "dashboard.landing": "auto" | "never";
   "terminal.fontSize": number;
   "terminal.fontFamily": string;
   "terminal.lineHeight": number;
@@ -179,6 +180,21 @@ const DEFS = {
     options: [
       { value: "chat", label: "Chat" },
       { value: "terminal", label: "Terminal (TUI)" },
+    ],
+    scope: "client",
+  },
+
+  // --- Dashboard ---------------------------------------------------------------
+  "dashboard.landing": {
+    title: "Workspace Landing",
+    category: "Dashboard",
+    description:
+      "What an empty workspace window opens on. Auto lands on the dashboard — the overview of every agent and terminal in the workspace (⌘0 / the rail's dashboard row open it any time). Never restores the old behavior: the first session opens instead.",
+    type: "enum",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Dashboard" },
+      { value: "never", label: "First session" },
     ],
     scope: "client",
   },
