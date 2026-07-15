@@ -1,4 +1,5 @@
 mod connect;
+mod daemonize;
 mod doctor;
 mod kill;
 mod status;
@@ -25,6 +26,13 @@ enum Command {
         /// Port to listen on (defaults to an OS-assigned free port).
         #[arg(long)]
         port: Option<u16>,
+        /// Detach into a new session and return, so the daemon outlives the
+        /// shell (or SSH channel) that started it. `connect` uses this to start
+        /// a daemon on a remote host without relying on the host having
+        /// util-linux `setsid`/`nohup` — the portable path that works on any
+        /// POSIX remote (Linux, macOS, the BSDs).
+        #[arg(long)]
+        daemonize: bool,
     },
     /// Show daemon status, locally or on a remote ssh host. A dev build
     /// reports the dev daemon (~/.chimaera-dev) on both ends — dev-ness is
@@ -73,8 +81,20 @@ fn parse_port(raw: Option<String>) -> Option<u16> {
     raw?.trim().parse().ok()
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Detach BEFORE the async runtime exists. `fork` is only safe while the
+    // process is single-threaded, and the tokio runtime spawns worker threads —
+    // so the parent must exit (inside `detach`) before we build the runtime.
+    // Only the new session leader returns here to serve.
+    if let Command::Serve {
+        daemonize: true, ..
+    } = &cli.command
+    {
+        daemonize::detach()?;
+    }
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -82,8 +102,15 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
-        Command::Serve { port } => {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(dispatch(cli.command))
+}
+
+async fn dispatch(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Serve { port, .. } => {
             // `--port` wins; else honor $PORT (twelve-factor) so autoPort dev
             // tooling and PaaS can assign it; else the OS picks a free port.
             let port = port.or_else(|| parse_port(std::env::var("PORT").ok()));
@@ -151,6 +178,23 @@ mod tests {
         assert_eq!(parse_port(Some("".into())), None);
         assert_eq!(parse_port(Some("notaport".into())), None);
         assert_eq!(parse_port(Some("99999".into())), None); // out of u16 range
+    }
+
+    /// `connect` starts a remote daemon with `serve --daemonize`; the flag must
+    /// parse, and a plain `serve` must stay foreground (dev preview, native app,
+    /// `just` all run it that way).
+    #[test]
+    fn serve_daemonize_flag_parses_and_defaults_off() {
+        let bg = Cli::try_parse_from(["chimaera", "serve", "--daemonize"]).unwrap();
+        match bg.command {
+            Command::Serve { daemonize, .. } => assert!(daemonize),
+            _ => panic!("expected serve"),
+        }
+        let fg = Cli::try_parse_from(["chimaera", "serve"]).unwrap();
+        match fg.command {
+            Command::Serve { daemonize, .. } => assert!(!daemonize),
+            _ => panic!("expected serve"),
+        }
     }
 
     #[test]

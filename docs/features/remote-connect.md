@@ -34,7 +34,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   only** (a stash build is the `0.0.1` sentinel, which relocates its state to `~/.chimaera-dev` and
   can never serve the real home) — always **before**
   stopping any running daemon (a failed fetch must never strand a host with no daemon). (4) **Deploy**
-  via `scp` (staged `.new` + `mv -f`), **start** (`setsid nohup … chimaera serve … & disown`, poll the
+  via `scp` (staged `.new` + `mv -f`), **start** (`chimaera serve --daemonize`, which forks +
+  `setsid(2)`s in-process so it needs no util-linux `setsid`/`nohup` and works on any POSIX remote —
+  Linux, macOS, BSD; falls back to `setsid nohup … & disown` for a pre-flag remote binary; poll the
   manifest ≤15s). (5) **Tunnel** (`ssh -N -L` with `ExitOnForwardFailure`, poll the port ≤15s) and
   open `http://127.0.0.1:{port}/#token={token}&host={alias}`.
 

@@ -1327,14 +1327,26 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
     tracing::info!("starting chimaera daemon on {host} ({})", home.dir());
     ssh_run(
         host,
-        // `;` not `&&` before setsid: with `&&`, the trailing `&` backgrounds the whole
-        // list and the daemon runs as the foreground child of a subshell whose
-        // stdout/stderr are the ssh channel — sshd then never closes the session and
-        // `connect` hangs forever. Found the hard way on a real cluster.
+        // Detach the daemon so it outlives this one-shot ssh command. Primary
+        // path: `serve --daemonize` forks + `setsid(2)`s IN-PROCESS, so it needs
+        // no util-linux `setsid`/`nohup` (absent on macOS/BSD and minimal Linux
+        // containers) — that is what lets `connect` start a daemon on ANY POSIX
+        // remote. Its parent exits 0 the instant the child owns its new session,
+        // so `&& exit` ends the ssh command promptly and `connect` moves on to
+        // poll the manifest.
+        //
+        // Fallback, reached only when `--daemonize` is rejected (a pre-flag
+        // remote binary — an older release, which by definition sits on a Linux
+        // host already provisioned with one): the proven `setsid nohup … &
+        // disown`. `;` not `&&` after `mkdir`: with `&&` the trailing `&`
+        // backgrounds the whole list and the daemon becomes the foreground child
+        // of a subshell still holding the ssh channel's stdio, so sshd never
+        // closes the session and `connect` hangs. Found the hard way on a real
+        // cluster.
         &format!(
             "mkdir -p {log_dir}; \
-             {env}setsid nohup {bin} serve \
-             >> {log} 2>&1 < /dev/null & disown",
+             {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \
+             {env}setsid nohup {bin} serve >> {log} 2>&1 < /dev/null & disown",
             log_dir = home.log_dir(),
             env = home.serve_env(),
             bin = home.bin_path(),
