@@ -358,6 +358,31 @@ describe("ChatStore background tasks", () => {
     expect((notices[0] as { text: string }).text).toContain("exit 0");
   });
 
+  it("renders a self-contained wire summary alone (no stutter)", () => {
+    // The natural-close summary already names the command AND the verdict
+    // (live shape: 'Background command "…" completed (exit code 0)') —
+    // rendering desc + status + summary would say everything twice.
+    const store = fold([
+      { type: "background_tasks", tasks: [BG()] },
+      {
+        type: "background_tasks",
+        tasks: [],
+        closed: [
+          {
+            id: "bg-1",
+            description: "sleep 30",
+            status: "completed",
+            summary: 'Background command "sleep 30" completed (exit code 0)',
+          },
+        ],
+      },
+    ]);
+    const notices = store.blocks.filter((b) => b.kind === "notice");
+    expect((notices[0] as { text: string }).text).toBe(
+      'Background command "sleep 30" completed (exit code 0)',
+    );
+  });
+
   it("renders a failed verdict as an error notice", () => {
     const store = fold([
       { type: "background_tasks", tasks: [BG()] },

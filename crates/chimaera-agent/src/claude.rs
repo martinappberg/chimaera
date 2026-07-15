@@ -41,7 +41,7 @@ use crate::model::{
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
 /// CLI version these frame shapes were verified against (2026-07-10).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.206";
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.207";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -969,7 +969,7 @@ impl ClaudeMapper {
                     self.park_departed(task);
                     self.emit_background_tasks(Vec::new(), step);
                 } else if self.background_tasks[idx].status != status {
-                    self.background_tasks[idx].status = status.to_string();
+                    self.background_tasks[idx].status = truncate_label(status, BG_LABEL_MAX);
                     self.emit_background_tasks(Vec::new(), step);
                 }
             }
@@ -987,14 +987,20 @@ impl ClaudeMapper {
                     let Some(id) = t["task_id"].as_str().filter(|id| !id.is_empty()) else {
                         continue;
                     };
-                    if next.len() >= BG_TASKS_CAP {
-                        break;
+                    // Dedupe within the frame too: the wire is untrusted, and
+                    // a repeated id would journal a set the client's keyed
+                    // render chokes on.
+                    if next.iter().any(|b| b.id == id) {
+                        continue;
                     }
                     match self.background_tasks.iter().find(|b| b.id == id) {
                         Some(existing) => next.push(existing.clone()),
                         None => next.push(BackgroundTask {
                             id: id.to_string(),
-                            task_type: t["task_type"].as_str().unwrap_or("unknown").to_string(),
+                            task_type: truncate_label(
+                                t["task_type"].as_str().unwrap_or("unknown"),
+                                BG_LABEL_MAX,
+                            ),
                             description: truncate_label(
                                 t["description"].as_str().unwrap_or("background task"),
                                 BG_LABEL_MAX,
@@ -1003,6 +1009,11 @@ impl ClaudeMapper {
                             started_at_ms: now,
                         }),
                     }
+                }
+                // Same eviction policy as the started-path cap: keep the
+                // NEWEST entries (the tray shows recent work).
+                if next.len() > BG_TASKS_CAP {
+                    next.drain(..next.len() - BG_TASKS_CAP);
                 }
                 if next != self.background_tasks {
                     for gone in std::mem::replace(&mut self.background_tasks, next) {
@@ -1040,12 +1051,17 @@ impl ClaudeMapper {
                         vec![BackgroundTaskClose {
                             id: task.id,
                             description: task.description,
-                            status: frame["status"].as_str().unwrap_or("completed").to_string(),
+                            status: truncate_label(
+                                frame["status"].as_str().unwrap_or("completed"),
+                                BG_LABEL_MAX,
+                            ),
                             summary: frame["summary"]
                                 .as_str()
                                 .filter(|s| !s.is_empty())
                                 .map(|s| truncate_label(s, BG_LABEL_MAX)),
-                            output_file: frame["output_file"].as_str().map(String::from),
+                            output_file: frame["output_file"]
+                                .as_str()
+                                .map(|s| truncate_label(s, BG_LABEL_MAX)),
                         }],
                         step,
                     );
@@ -1121,7 +1137,7 @@ impl ClaudeMapper {
         let task_type = frame["task_type"].as_str().unwrap_or("unknown");
         self.background_tasks.push(BackgroundTask {
             id: task_id.to_string(),
-            task_type: task_type.to_string(),
+            task_type: truncate_label(task_type, BG_LABEL_MAX),
             description: truncate_label(
                 frame["description"].as_str().unwrap_or(task_type),
                 BG_LABEL_MAX,
@@ -1130,9 +1146,11 @@ impl ClaudeMapper {
             started_at_ms: epoch_ms(),
         });
         // Set bound: drop the OLDEST beyond the cap — the tray shows recent
-        // work, and the level-set event's size is the set's size.
+        // work, and the level-set event's size is the set's size. The evictee
+        // parks in departed so its eventual verdict still folds.
         if self.background_tasks.len() > BG_TASKS_CAP {
-            self.background_tasks.remove(0);
+            let evicted = self.background_tasks.remove(0);
+            self.park_departed(evicted);
         }
         self.emit_background_tasks(Vec::new(), step);
     }
@@ -2283,8 +2301,12 @@ impl ClaudeMapper {
                 // straight through; the CLI's stop_task is generic over its
                 // task registry (subagents AND background bash/workflows),
                 // and acks not_found/not_running as success, so a stop that
-                // races the task's own finish is harmless.
-                if self.background_tasks.iter().any(|t| t.id == task_id) {
+                // races the task's own finish is harmless. Departed counts
+                // too: a click in the removed-but-unverdicted window is the
+                // same race, not a subagent row.
+                if self.background_tasks.iter().any(|t| t.id == task_id)
+                    || self.departed_background.iter().any(|t| t.id == task_id)
+                {
                     let id = self.ctl_id();
                     self.pending_controls
                         .insert(id.clone(), PendingControl::StopTask);

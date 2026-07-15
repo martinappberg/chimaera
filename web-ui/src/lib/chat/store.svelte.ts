@@ -422,14 +422,21 @@ export class ChatStore {
         }));
         // Tasks that left the set WITH a verdict fold into history as quiet
         // notices — completion is transcript-worthy; a set change alone is
-        // not. A stop's wire summary IS the description (live-verified), so
-        // an echoing summary is dropped rather than said twice.
+        // not. The wire summary shapes (live-verified): a natural close is
+        // self-contained ('Background command "…" completed (exit code 0)')
+        // — render it alone rather than saying everything twice; a stop's
+        // summary is just the description — drop the echo and say the
+        // verdict ourselves.
         for (const c of (ev.closed as Record<string, unknown>[]) ?? []) {
           const desc = (c.description as string) ?? "background task";
           const status = (c.status as string) ?? "completed";
           const summary = (c.summary as string) ?? "";
+          const selfContained =
+            summary.includes(desc) && summary.toLowerCase().includes(status.toLowerCase());
           this.notice(
-            `background “${desc}” ${status}${summary !== "" && summary !== desc ? ` — ${summary}` : ""}`,
+            selfContained
+              ? summary
+              : `background “${desc}” ${status}${summary !== "" && summary !== desc ? ` — ${summary}` : ""}`,
             status === "failed" ? "error" : "info",
           );
         }

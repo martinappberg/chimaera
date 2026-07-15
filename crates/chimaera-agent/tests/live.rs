@@ -220,6 +220,106 @@ async fn claude_permission_roundtrip_allow_then_deny() {
         .expect("shutdown");
 }
 
+/// The background-task lanes (chimaera's background tray rides these): a
+/// backgrounded Bash emits `task_started {task_type:"local_bash",
+/// tool_use_id}` + `background_tasks_changed` (the running set) during the
+/// turn, and settles OUTSIDE any turn with a set-emptying
+/// `background_tasks_changed` plus a `task_notification {status, summary,
+/// output_file}` verdict — the frames the driver's departed buffer exists
+/// for. Order within the settle is deliberately not pinned here (chimaera
+/// tolerates either); presence and shape are the contract.
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn + a 5s background sleep"]
+async fn claude_background_task_lanes_start_and_settle() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Run `sleep 5 && echo done` as a BACKGROUND Bash task (run_in_background: true). \
+         Confirm it started; do not wait for it or poll it.",
+    )
+    .await
+    .expect("send");
+
+    // Drive the turn: allow the (possibly auto-allowed) Bash call, collect
+    // the start-side background frames.
+    let mut started = Value::Null;
+    let mut changed_with_task = false;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            let input = frame["request"]["input"].clone();
+            chat.respond_permission(
+                &frame["request_id"],
+                PermissionDecision::Allow {
+                    updated_input: input,
+                },
+            )
+            .await
+            .expect("respond allow");
+        } else if frame["type"] == "system" && frame["subtype"] == "task_started" {
+            started = frame;
+        } else if frame["type"] == "system" && frame["subtype"] == "background_tasks_changed" {
+            changed_with_task |= frame["tasks"].as_array().is_some_and(|t| !t.is_empty());
+        } else if frame["type"] == "result" {
+            break;
+        }
+    }
+    assert_eq!(
+        started["task_type"],
+        json!("local_bash"),
+        "backgrounded bash rides task_started with task_type local_bash"
+    );
+    assert!(
+        started["tool_use_id"].is_string(),
+        "task_started binds to the spawning tool_use"
+    );
+    assert!(
+        changed_with_task,
+        "background_tasks_changed carried the running set"
+    );
+    let task_id = started["task_id"].as_str().expect("task_id").to_string();
+
+    // The settle arrives outside any turn (~5s): the verdict notification
+    // plus the set-emptying level-set.
+    let mut notification = Value::Null;
+    let mut emptied = false;
+    while notification.is_null() || !emptied {
+        let frame = chat
+            .recv(Duration::from_secs(60))
+            .await
+            .expect("recv")
+            .expect("claude exited before the background settle");
+        if frame["type"] == "system"
+            && frame["subtype"] == "task_notification"
+            && frame["task_id"].as_str() == Some(task_id.as_str())
+        {
+            notification = frame;
+        } else if frame["type"] == "system" && frame["subtype"] == "background_tasks_changed" {
+            emptied |= frame["tasks"].as_array().is_some_and(|t| t.is_empty());
+        }
+    }
+    assert_eq!(notification["status"], json!("completed"));
+    assert!(
+        notification["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("completed")),
+        "the close carries the human summary"
+    );
+    assert!(
+        notification["output_file"].is_string(),
+        "the close names the output file"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// Feedback-denial semantics: `{behavior:"deny", message, interrupt:false}`
 /// must error the tool WITHOUT aborting the turn — the model reads the
 /// reason from the tool error and the turn runs on to a SUCCESS result.
