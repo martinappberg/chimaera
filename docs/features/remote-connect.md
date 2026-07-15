@@ -156,3 +156,26 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
 - **Do not change:** the isolation (a dev connect must never read, stop, or replace the real
   `~/.chimaera` daemon) and the gate above. Everything else here is an **addition** — improvable
   freely.
+
+### Starting on any POSIX remote — why it works this way
+_Captured 2026-07-15 (from the maintainer, in-session)._
+
+- **Problem it solves.** "Runs on the host that owns the work — laptop, dev server, or HPC node"
+  only held on GNU/Linux: the remote start line needed util-linux `setsid`/`nohup`, absent on
+  macOS/BSD and on minimal Linux containers. The daemon binary was already portable (the same one
+  that runs locally on macOS); only the launch incantation wasn't. Now `connect` can bring a daemon
+  up on **any POSIX remote**.
+- **How settled it is (core bet).** That a daemon **starts on any POSIX remote** is a **promise to
+  keep** — host-tool independence in the remote-start path is load-bearing and must not silently
+  regress to Linux-only again.
+- **Deliberately open / where it may go (addition).** *How* it detaches — `chimaera serve
+  --daemonize` forking + `setsid(2)` in-process before the tokio runtime — is the mechanism *for
+  now*, not sacred; a future change may detach differently as long as the portability promise holds.
+  And macOS/BSD remotes are **"don't gratuitously block them," not first-class**: the primary remote
+  is still Linux/HPC login nodes, and no Intel-mac/BSD daemon *assets* are built yet (`release_triple`
+  → `None`; connect asks for `--binary` / `just dist` there).
+- **Do not change:** the **never-regress-a-provisioned-host** guarantee — the start line keeps the
+  proven `setsid nohup … & disown` **fallback** (reached only when a pre-`--daemonize` binary, which
+  by definition sits on a Linux host, rejects the flag) as cheap belt-and-suspenders. The portability
+  promise above is the core bet; the fork+setsid mechanism and the remote-OS scope are additions,
+  improvable freely.
