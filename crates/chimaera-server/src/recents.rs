@@ -239,6 +239,9 @@ pub(crate) fn retire(
     // desktop drops): uploads are session-lifetime state, and leaving them
     // would grow ~/.chimaera without bound on shared login nodes.
     crate::upload::prune_session_uploads(state, session_id);
+    // And its prelude file (runtime tmp — night-scrub would get leftovers,
+    // but tidy is tidy).
+    crate::environment::remove_prelude_file(session_id);
 
     let title = pinned
         .map(str::to_string)

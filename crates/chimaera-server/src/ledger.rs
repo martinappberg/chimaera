@@ -554,6 +554,9 @@ async fn respawn(
         rows: Some(entry.rows),
         theme: entry.theme.clone(),
         title_hint,
+        // Launch text isn't persisted: a resurrected session re-runs the
+        // durable prelude scopes (host ⊕ workspace) only.
+        prelude: None,
         kind,
     };
     match crate::spawn::spawn_session(state, spec).await {

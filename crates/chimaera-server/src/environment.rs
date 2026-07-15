@@ -33,8 +33,9 @@ use serde_json::json;
 use crate::AppState;
 
 /// Per-scope text cap: generous for "commands you'd type into a fresh
-/// terminal", tiny next to the daemon's budgets.
-const MAX_SCOPE_BYTES: usize = 32 * 1024;
+/// terminal", tiny next to the daemon's budgets. Also the cap on the
+/// launch-scope text a session-create request may carry.
+pub(crate) const MAX_SCOPE_BYTES: usize = 32 * 1024;
 /// Raw PUT body / on-disk file cap (matches the settings store).
 const MAX_FILE_BYTES: usize = 256 * 1024;
 

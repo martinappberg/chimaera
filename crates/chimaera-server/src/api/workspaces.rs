@@ -88,7 +88,12 @@ pub(crate) async fn delete_workspace(
     Path(id): Path<String>,
 ) -> Response {
     match crate::lock(&state.workspaces).remove(&id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // Its environment prelude goes with it. Explicit-delete only —
+            // no boot sweep (see `environment::EnvPreludes`).
+            crate::lock(&state.env_preludes).remove_workspace(&id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown workspace"})),

@@ -204,13 +204,26 @@ async fn session_env_reaches_spawned_session() {
 
     // The assembled contract itself: shims first on PATH, session id,
     // scheme, and the wrap's re-prepend handle.
-    let env = api::session_env(&state, "s-envx", "light");
+    let env = api::session_env(&state, "s-envx", "light", None);
     let shims = state.shims_dir.display().to_string();
     assert_eq!(env[0].0, "PATH");
     assert!(env[0].1.starts_with(&format!("{shims}:")), "{env:?}");
     assert!(env.contains(&("CHIMAERA_SESSION".to_string(), "s-envx".to_string())));
     assert!(env.contains(&("CHIMAERA_THEME".to_string(), "light".to_string())));
     assert!(env.contains(&("CHIMAERA_SHIMS".to_string(), shims.clone())));
+    // No prelude → no CHIMAERA_PRELUDE at all (zero-delta contract); with
+    // one, the path rides along and the DONE guard is scrubbed first.
+    assert!(!env.iter().any(|(k, _)| k == "CHIMAERA_PRELUDE"), "{env:?}");
+    let env = api::session_env(
+        &state,
+        "s-envx",
+        "light",
+        Some(std::path::Path::new("/tmp/p.sh")),
+    );
+    assert!(env.contains(&("CHIMAERA_PRELUDE".to_string(), "/tmp/p.sh".to_string())));
+    let remove = api::spawn_env_remove();
+    assert!(remove.iter().any(|n| n == "CHIMAERA_PRELUDE"));
+    assert!(remove.iter().any(|n| n == "CHIMAERA_PRELUDE_DONE"));
 
     // An empty inherited PATH must not leave a trailing colon (an empty
     // member = the cwd on the search path); the fixed system default

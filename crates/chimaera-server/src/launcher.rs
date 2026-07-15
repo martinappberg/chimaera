@@ -665,16 +665,32 @@ pub(crate) fn build_chat_command(
 /// demoted the shim dir from front to position 16 — so the front slot is
 /// reclaimed after the profile has run. A duplicate entry further back is
 /// harmless.
+/// Both scripts also run the user's environment prelude (when the spawn
+/// set `CHIMAERA_PRELUDE`) before the exec — after `-l` sourced the login
+/// profile, so `module load`/`conda activate` behave exactly as typed into
+/// a fresh terminal. The POSIX branch embeds the same guarded snippet the
+/// shell-integration rc sources (one source of truth in chimaera-core);
+/// fish can't source POSIX text, so it execs through a bash trampoline
+/// that sources the prelude and then execs the agent — full bash
+/// semantics, and the exec chain still leaves the agent as the PTY's
+/// direct child. No bash on the host → the prelude is skipped, never a
+/// failed launch.
 pub(crate) fn wrap_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
     let script = if shell.rsplit('/').next() == Some("fish") {
         // fish has no `$0`/`$@`; -c puts trailing args in $argv instead.
         r#"test -n "$CHIMAERA_SHIMS"; and set -gx PATH $CHIMAERA_SHIMS $PATH
+if set -q CHIMAERA_PRELUDE; and not set -q CHIMAERA_PRELUDE_DONE; and test -r "$CHIMAERA_PRELUDE"; and command -sq bash
+    set -gx CHIMAERA_PRELUDE_DONE 1
+    exec bash -c '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv
+end
 exec $argv"#
             .to_string()
     } else {
-        r#"if [ -n "${CHIMAERA_SHIMS:-}" ]; then PATH="$CHIMAERA_SHIMS:$PATH"; export PATH; fi
-exec "$0" "$@""#
-            .to_string()
+        format!(
+            r#"if [ -n "${{CHIMAERA_SHIMS:-}}" ]; then PATH="$CHIMAERA_SHIMS:$PATH"; export PATH; fi
+{}exec "$0" "$@""#,
+            chimaera_core::shellint::PRELUDE_SNIPPET_POSIX
+        )
     };
     let mut cmd = vec![shell.to_string(), "-lc".to_string(), script];
     cmd.extend(argv);
@@ -1190,6 +1206,16 @@ mod tests {
             "{script}"
         );
         assert!(script.ends_with(r#"exec "$0" "$@""#), "{script}");
+        // The guarded prelude block (the core snippet verbatim) runs before
+        // the exec hands over to the agent.
+        assert!(
+            script.contains(chimaera_core::shellint::PRELUDE_SNIPPET_POSIX),
+            "{script}"
+        );
+        assert!(
+            script.find("CHIMAERA_PRELUDE").unwrap() < script.find(r#"exec "$0""#).unwrap(),
+            "{script}"
+        );
         assert_eq!(cmd[3..], ["/Users/x/My Tools/codex", "--model", "o4-mini"]);
 
         // fish has no `$0`/`$@`; trailing -c args land in $argv instead.
@@ -1204,6 +1230,13 @@ mod tests {
             "{script}"
         );
         assert!(script.ends_with("exec $argv"), "{script}");
+        // Prelude path: a guarded bash trampoline (fish can't source POSIX);
+        // no bash → fall through to the plain exec.
+        assert!(script.contains("command -sq bash"), "{script}");
+        assert!(
+            script.contains(r#"exec bash -c '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv"#),
+            "{script}"
+        );
         assert_eq!(cmd[3..], ["/usr/bin/claude"]);
     }
 
