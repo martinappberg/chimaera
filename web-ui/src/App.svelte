@@ -142,6 +142,7 @@
     workspacesChanged,
     type DiffMode,
   } from "./lib/workspace/git";
+  import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
   import {
     paneContentEl,
     paneIdAt,
@@ -203,6 +204,7 @@
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
+  import ComputePopover from "./lib/workspace/ComputePopover.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
@@ -411,6 +413,9 @@
   let daemonEl = $state<HTMLElement | null>(null);
   /** The stage element; its edges are the root-split drop targets. */
   let stageEl = $state<HTMLElement | null>(null);
+  // Slurm queue popover (the daemon bar's compute chip; anchor = chip rect).
+  let computeOpen = $state(false);
+  let computeAnchor = $state<DOMRect | null>(null);
 
   const winKey = windowKey();
 
@@ -591,6 +596,10 @@
       },
     ),
   );
+
+  // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
+  // "scheduler is slurm" + a visible window (see workspace/compute.ts).
+  $effect(() => initCompute());
 
   // Daemon/app build skew (native): the daemon serving this window is a
   // different build than the app — the update toast offers the restart.
@@ -3326,6 +3335,69 @@
             <span class="dg-branch">can’t read repo</span>
           </button>
         {/if}
+        {#if $computeStatus?.scheduler === "slurm"}
+          {@const queued = queuedJobCount($computeStatus)}
+          <!-- Slurm orientation: the scheduler exists here and how much of
+               your work is in its queue; one click opens the queue popover. -->
+          <button
+            class="daemon-compute"
+            class:open={computeOpen}
+            title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
+            aria-expanded={computeOpen}
+            onclick={(e) => {
+              if (computeOpen) {
+                computeOpen = false;
+              } else {
+                computeAnchor = e.currentTarget.getBoundingClientRect();
+                computeOpen = true;
+              }
+            }}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <rect
+                x="2"
+                y="2"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="9"
+                y="2"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="2"
+                y="9"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="9"
+                y="9"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+            </svg>
+            {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
+          </button>
+        {/if}
         {#if canCaffeinate}
           <button
             class="daemon-settings caffeinate"
@@ -3521,6 +3593,10 @@
     onClose={closeLauncher}
     onAgents={(a) => (agents = a)}
   />
+{/if}
+
+{#if computeOpen && computeAnchor !== null}
+  <ComputePopover anchor={computeAnchor} onClose={() => (computeOpen = false)} />
 {/if}
 
 {#if pickerOpen}
@@ -4407,6 +4483,39 @@
 
   .dg-dirty {
     color: var(--git-modified);
+  }
+
+  /* Slurm chip: scheduler presence + your queued-job count, quiet like the
+     git chip (same height/typography); flex:none so a long branch name
+     truncates before this disappears. */
+  .daemon-compute {
+    flex: none;
+    appearance: none;
+    border: none;
+    background: none;
+    display: flex;
+    align-items: center;
+    gap: 0.22rem;
+    height: 20px;
+    padding: 0 0.3rem;
+    border-radius: 5px;
+    color: var(--muted);
+    cursor: pointer;
+    font: inherit;
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .daemon-compute:hover,
+  .daemon-compute.open {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+
+  .dc-count {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */
