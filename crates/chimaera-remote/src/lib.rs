@@ -532,6 +532,48 @@ pub async fn http_alive(port: u16) -> bool {
         .is_some()
 }
 
+/// [`http_alive`] with identity: a bearer-authed request must come back 200.
+/// Liveness alone is not enough on a multi-hop tunnel — a relay port on a
+/// shared login node can be squatted by a stale relay or a foreign process,
+/// and "something answered HTTP" would bless the wrong endpoint (found live:
+/// a health probe passed through a previous connect's leaked relay while the
+/// new tunnel's own forward was already dying). Only the daemon holding THIS
+/// job's token can answer 200.
+pub async fn http_alive_authed(port: u16, token: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        stream
+            .write_all(
+                format!(
+                    "GET /api/v1/workspaces HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                     Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut buf = Vec::with_capacity(16);
+        while buf.len() < 12 {
+            let mut chunk = [0u8; 16];
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        // "HTTP/1.1 200" — status position is fixed by the HTTP/1.x grammar.
+        (buf.starts_with(b"HTTP/") && buf.get(9..12) == Some(b"200")).then_some(())
+    };
+    tokio::time::timeout(Duration::from_secs(2), attempt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 /// The side-effecting host operations the [`connect`] decision phase drives,
 /// behind a trait so [`resolve_daemon`]'s policy is unit-testable with a fake
 /// (this crate can't be live-verified — no remote host in CI). The production
@@ -1688,9 +1730,12 @@ fn spawn_direct_node_tunnel(
 }
 
 /// Build the tunnel to a compute-node daemon: rung B, then rung A when the
-/// job daemon has a routable bind, else an honest error. `http_alive` is
-/// the arbiter on every rung — a forward that binds but can't reach the
-/// daemon end-to-end is a failure, not a success.
+/// job daemon has a routable bind, else an honest error. The arbiter on
+/// every rung is `tunnel_proven`: an authed 200 through OUR forward, from a
+/// child that is still running afterwards — a forward that binds but can't
+/// reach the daemon, answers with the wrong daemon, or dies right after
+/// answering (a bind-clash exit racing a stale relay) is a failure, not a
+/// success.
 pub async fn connect_compute_node(
     host: &str,
     node: &str,
@@ -1717,13 +1762,13 @@ pub async fn connect_compute_node(
     let local = pick_local_port(None, port)?;
     match spawn_node_tunnel(host, &target, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
-            Ok(_) if http_alive_within(local, 10).await => {
+            Ok(_) if tunnel_proven(local, token, 10, &mut child).await => {
                 tracing::info!(%node, %job_id, "compute tunnel up (rung B, ssh-adopt)");
                 return Ok(mk(local, ComputeRung::SshAdopt, false, child));
             }
             Ok(_) => {
                 child.kill().await.ok();
-                tracing::info!(%node, "rung B forwarded but the daemon did not answer");
+                tracing::info!(%node, "rung B forwarded but the job daemon did not answer");
             }
             Err(err) => tracing::info!(%node, %err, "rung B unavailable"),
         },
@@ -1731,23 +1776,25 @@ pub async fn connect_compute_node(
     }
 
     // Rung B2 (chained) — the login node relays to the node's loopback.
-    // The relay port must be free ON THE LOGIN NODE; the daemon's own port
-    // number is the first candidate (both were OS-assigned high ports),
-    // then randomized retries. A bind clash exits the inner ssh, caught by
-    // wait_for_port's early-exit branch — honest, bounded.
-    for relay_port in [port, fastrand_port(), fastrand_port()] {
+    // The relay port must be free ON THE LOGIN NODE — always randomized:
+    // the daemon's own port number is exactly where a previous connect's
+    // relay (or another tenant of a shared login node) already sits, so it
+    // is the one candidate guaranteed to clash with ourselves. A bind clash
+    // exits the inner ssh (ExitOnForwardFailure), caught by wait_for_port's
+    // early-exit branch or by tunnel_proven's still-running check.
+    for relay_port in [fastrand_port(), fastrand_port(), fastrand_port()] {
         let local = pick_local_port(None, port)?;
         let Ok(mut child) = spawn_chained_node_tunnel(host, node, local, relay_port, port) else {
             break;
         };
         match wait_for_port(local, &mut child).await {
-            Ok(_) if http_alive_within(local, 15).await => {
+            Ok(_) if tunnel_proven(local, token, 15, &mut child).await => {
                 tracing::info!(%node, %job_id, relay_port, "compute tunnel up (rung B, chained via login node)");
                 return Ok(mk(local, ComputeRung::Chained, false, child));
             }
             Ok(_) => {
                 child.kill().await.ok();
-                tracing::info!(%node, relay_port, "chained rung forwarded but the daemon did not answer");
+                tracing::info!(%node, relay_port, "chained rung forwarded but the job daemon did not answer");
             }
             Err(err) => tracing::info!(%node, relay_port, %err, "chained rung attempt failed"),
         }
@@ -1758,7 +1805,7 @@ pub async fn connect_compute_node(
         let local = pick_local_port(None, port)?;
         if let Ok(mut child) = spawn_direct_node_tunnel(host, node, local, port) {
             match wait_for_port(local, &mut child).await {
-                Ok(mux) if http_alive_within(local, 10).await => {
+                Ok(mux) if tunnel_proven(local, token, 10, &mut child).await => {
                     tracing::info!(%node, %job_id, "compute tunnel up (rung A, direct)");
                     return Ok(mk(local, ComputeRung::Direct, mux, child));
                 }
@@ -1781,33 +1828,42 @@ pub async fn connect_compute_node(
     )
 }
 
-/// Poll [`http_alive`] until `deadline_secs`: a node tunnel's LOCAL
-/// listener accepts immediately, but the path behind it (the chained
-/// rung's login-resident relay especially) takes seconds to establish —
-/// a single-shot probe reads "still handshaking" as "not supported"
-/// (found live: three chained attempts burned in 900ms total).
-async fn http_alive_within(port: u16, deadline_secs: u64) -> bool {
+/// The compute-rung arbiter: poll [`http_alive_authed`] until
+/// `deadline_secs` (the LOCAL listener accepts immediately, but the path
+/// behind it — the chained rung's login-resident relay especially — takes
+/// seconds to establish; a single-shot probe reads "still handshaking" as
+/// "not supported", found live), then confirm the ssh child ITSELF is still
+/// running. The second check closes a live-found race: a chained relay
+/// whose login-side bind clashed can die (ExitOnForwardFailure) moments
+/// AFTER a stale relay on the same port answered the probe for it.
+async fn tunnel_proven(port: u16, token: &str, deadline_secs: u64, child: &mut Child) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
-        if http_alive(port).await {
-            return true;
+        if http_alive_authed(port, token).await {
+            break;
         }
         if tokio::time::Instant::now() > deadline {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    matches!(child.try_wait(), Ok(None))
 }
 
 /// A pseudo-random high port for the chained relay's login-node bind —
-/// derived from the clock (no rand dependency); collisions just burn one
-/// bounded retry.
+/// clock-derived plus a call counter (no rand dependency; bare subsecond
+/// nanos can repeat across the quick successive calls of one rung loop);
+/// collisions just burn one bounded retry.
 fn fastrand_port() -> u16 {
+    static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    20000 + (nanos % 40000) as u16
+    let salt = SEQ
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_mul(7919) as u32;
+    20000 + ((nanos.wrapping_add(salt)) % 40000) as u16
 }
 
 /// Escape a value for a curl `--config` line (`\` and `"` per curl's

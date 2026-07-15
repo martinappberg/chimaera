@@ -125,29 +125,49 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             let Some(shell) = handle.try_state::<Shell>() else {
                 break;
             };
-            // Snapshot under the lock, then drop it before probing sockets.
-            let snap: Vec<(String, u16, String)> = {
+            // Snapshot under the locks, then drop them before probing
+            // sockets. Compute tunnels ride the same loop under their
+            // composite key ("alias#job{id}") — a job window listens on
+            // that key, NEVER on the login alias (listening on the alias
+            // made every login-tunnel blip re-home job windows onto the
+            // login daemon — found live). Their `token` field stays None
+            // on the wire: compute tokens never leave Rust, and a probe
+            // is authed with the tunnel's own token instead (identity,
+            // not just liveness — a stale relay can answer for the port).
+            let mut snap: Vec<(String, u16, String, bool)> = {
                 let tunnels = shell.tunnels.lock().await;
                 tunnels
                     .iter()
-                    .map(|(a, t)| (a.clone(), t.local_port, t.manifest.token.clone()))
+                    .map(|(a, t)| (a.clone(), t.local_port, t.manifest.token.clone(), false))
                     .collect()
             };
-            // Aliases gone from the map were disconnected by the user; forget
+            {
+                let compute = shell.compute_tunnels.lock().await;
+                snap.extend(
+                    compute
+                        .iter()
+                        .map(|(k, t)| (k.clone(), t.local_port, t.token.clone(), true)),
+                );
+            }
+            // Keys gone from the maps were disconnected by the user; forget
             // them without emitting a spurious `down`.
             prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
-            for (alias, port, token) in &snap {
-                let up = chimaera_remote::http_alive(*port).await;
-                if prev.insert(alias.clone(), up) == Some(up) {
+            for (key, port, token, is_compute) in &snap {
+                let up = if *is_compute {
+                    chimaera_remote::http_alive_authed(*port, token).await
+                } else {
+                    chimaera_remote::http_alive(*port).await
+                };
+                if prev.insert(key.clone(), up) == Some(up) {
                     continue; // no transition
                 }
                 let _ = handle.emit(
                     "host-status",
                     HostStatus {
-                        alias: alias.clone(),
+                        alias: key.clone(),
                         status: if up { "connected" } else { "down" },
                         local_port: Some(*port),
-                        token: up.then(|| token.clone()),
+                        token: (up && !*is_compute).then(|| token.clone()),
                         error: None,
                     },
                 );

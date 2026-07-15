@@ -4,6 +4,7 @@
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
+    getJobContext,
     getToken,
     notifyUnauthorized,
     pollHealth,
@@ -162,6 +163,7 @@
     askpassActive,
     caffeinateState,
     closeThisWindow,
+    connectComputeSession,
     connectHost,
     isNativeShell,
     onAppUpdate,
@@ -252,10 +254,17 @@
   /** This window's host alias ("local" for the local daemon). */
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
+  /** Set when this window sits on a compute-node daemon (Mode 2 job). */
+  const jobCtx = getJobContext();
+  /** The key this window's tunnel reports `host-status` under. A job window
+   *  listens ONLY on its composite key — matching the bare login alias made
+   *  every login-tunnel blip re-home job windows onto the login daemon
+   *  (found live: "opening the session just opens Sherlock"). */
+  const statusAlias = jobCtx !== null ? `${hostAlias}#job${jobCtx.jobId}` : hostAlias;
   /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
   const canReconnect = isRemoteWindow && isNativeShell();
   /** This window's scope key for the shell registry (null alias = local). */
-  const scopeAlias = isRemoteWindow ? hostAlias : null;
+  const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
   /** The reconnect overlay is showing (tunnel dropped, healing). */
   let showReconnect = $state(false);
   /** A connectHost call is in flight. */
@@ -269,13 +278,20 @@
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
    *  navigation. Surfaces the SSH auth modal (mounted app-wide) only if ssh
-   *  actually re-prompts. */
+   *  actually re-prompts. A job window heals through the COMPUTE path — its
+   *  tunnel goes laptop→node, and rebuilding the login tunnel wouldn't touch
+   *  it; the shell probes/rebuilds the job tunnel and pings the composite
+   *  status key with the (possibly new) port. */
   async function attemptReconnect(): Promise<void> {
     if (!canReconnect || reconnecting) return;
     reconnecting = true;
     reconnectError = null;
     try {
-      await connectHost(hostAlias);
+      if (jobCtx !== null) {
+        await connectComputeSession(hostAlias, jobCtx.jobId);
+      } else {
+        await connectHost(hostAlias);
+      }
       // Same-port heal → our WebSocket reconnects and eventsUp clears the
       // overlay; a moved port/token re-homes this window via onHostStatus.
     } catch (e) {
@@ -772,16 +788,23 @@
       }).then((u) => (unlistenDaemonMoved = u));
       // This remote window's tunnel dropped or came back. "down" → reconnect
       // now (the shell confirmed the forward is dead); "connected" → re-home
-      // only if the origin actually moved (daemon restart / update), else the
-      // heal is in place and the WebSocket just reconnects.
+      // only if the origin actually moved (daemon restart / update / rebuilt
+      // job tunnel), else the heal is in place and the WebSocket just
+      // reconnects. Matching is on statusAlias: a job window heeds ONLY its
+      // composite key's events — the login alias's port/token are a
+      // different daemon entirely.
       void onHostStatus((e) => {
-        if (!canReconnect || e.alias !== hostAlias) return;
+        if (!canReconnect || e.alias !== statusAlias) return;
         if (e.status === "down") {
           beginReconnect();
           return;
         }
         const port = e.local_port;
-        const token = e.token ?? null;
+        // Compute-status events carry no token (compute tokens stay in the
+        // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
+        // so this window's own token still holds — carry it across the
+        // origin move ourselves.
+        const token = e.token ?? (jobCtx !== null ? getToken() : null);
         const portMoved = port !== null && String(port) !== location.port;
         const tokenMoved = token !== null && token !== getToken();
         if (portMoved || tokenMoved) {
@@ -790,6 +813,10 @@
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
           params.set("host", hostAlias);
+          if (jobCtx !== null) {
+            params.set("job", jobCtx.jobId);
+            if (jobCtx.node !== null) params.set("node", jobCtx.node);
+          }
           location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
         }
       }).then((u) => (unlistenHostStatus = u));

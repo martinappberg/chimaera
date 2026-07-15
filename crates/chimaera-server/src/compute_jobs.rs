@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::StatusCode;
@@ -314,21 +315,34 @@ pub(crate) async fn launch_compute_session(
 
     // Seed the job daemon's workspace registry over the shared FS: the job
     // will `mkdir -p` this same home, and its WorkspaceStore then boots with
-    // the launch's workspace already registered — the compute window lands
-    // on a ready-to-open workspace instead of a bare "open a folder" page
-    // (the maintainer hit exactly that dead end on first use).
-    if let Some(ws) = spec
-        .workspace_id
-        .as_deref()
-        .and_then(|id| crate::lock(&state.workspaces).get(id))
-    {
+    // this host's WHOLE workspace list already registered (shared-FS roots
+    // are equally valid on the node) — the compute window lands on the same
+    // ready-to-open workspaces as the login window, instead of a bare "open
+    // a folder" page (the maintainer hit exactly that dead end on first
+    // use; launches from the host page carry no workspace_id, so seeding
+    // only the launch workspace left the window empty on second use).
+    let seed: Vec<serde_json::Value> = {
+        let launch_ws = spec.workspace_id.as_deref();
+        crate::lock(&state.workspaces)
+            .list()
+            .into_iter()
+            .map(|ws| {
+                json!({
+                    "id": format!("w-{}", &chimaera_core::generate_token()[..8]),
+                    "root": ws.root,
+                    "name": ws.name,
+                    // The launch's workspace (when there is one) sorts first.
+                    "last_opened_at": if launch_ws == Some(ws.id.as_str()) {
+                        now_secs() + 1
+                    } else {
+                        now_secs()
+                    },
+                })
+            })
+            .collect()
+    };
+    if !seed.is_empty() {
         let seed_dir = root.join(&job_id).join("data");
-        let seed = json!([{
-            "id": format!("w-{}", &chimaera_core::generate_token()[..8]),
-            "root": ws.root,
-            "name": ws.name,
-            "last_opened_at": now_secs(),
-        }]);
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             std::fs::create_dir_all(&seed_dir)?;
             crate::persist::atomic_write_json(
@@ -393,12 +407,19 @@ pub(crate) async fn list_compute_sessions(
         .filter(|j| j.name.starts_with("chimaera-"))
         .cloned()
         .collect();
+    let degraded = snap.degraded;
     // Blocking joins (manifest/caps/record on possibly-NFS) off the reactor.
     let sessions = tokio::task::spawn_blocking(move || {
-        candidates
+        let mut sessions = candidates
             .into_iter()
             .map(|j| join_session(&root, j))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        // A stale-jobs snapshot (squeue failed) must not turn live jobs
+        // into tombstones — skip the orphan sweep on degraded rounds.
+        if !degraded {
+            append_ended_sessions(&root, &mut sessions);
+        }
+        sessions
     })
     .await
     .unwrap_or_default();
@@ -408,6 +429,80 @@ pub(crate) async fn list_compute_sessions(
         "partitions": snap.partitions,
     }))
     .into_response()
+}
+
+/// The listing's second half: launch records whose job has LEFT the queue.
+/// A walltime death otherwise erases the card mid-session with zero trace —
+/// "the job sometimes disappears?" (the maintainer, live). Ended cards are
+/// dismissable tombstones: DELETE marks the record cancelled, and this sweep
+/// removes marked or aged-out (48h) records — self-cleaning, no daemon state.
+fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
+    const ENDED_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
+    const ENDED_CAP: usize = 20;
+    let live: std::collections::HashSet<&str> =
+        sessions.iter().map(|s| s.job_id.as_str()).collect();
+    let Ok(dir) = std::fs::read_dir(root.join("pending")) else {
+        return;
+    };
+    let mut ended: Vec<(std::time::SystemTime, ComputeSession)> = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Some(job_id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        else {
+            continue;
+        };
+        if live.contains(job_id) {
+            continue;
+        }
+        let record: Option<serde_json::Value> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let dismissed = record
+            .as_ref()
+            .and_then(|r| r.get("cancelled").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        let aged_out = mtime.elapsed().map(|e| e > ENDED_MAX_AGE).unwrap_or(false);
+        if dismissed || aged_out || record.is_none() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let rec = |k: &str| record.as_ref().and_then(|r| r.get(k).cloned());
+        ended.push((
+            mtime,
+            ComputeSession {
+                ready: false,
+                name: rec("display_name")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| job_id.to_string()),
+                cpus: rec("cpus").and_then(|v| v.as_u64()).map(|v| v as u32),
+                mem: rec("mem").and_then(|v| v.as_str().map(str::to_string)),
+                gres: rec("gres").and_then(|v| v.as_str().map(str::to_string)),
+                workspace_id: rec("workspace_id").and_then(|v| v.as_str().map(str::to_string)),
+                routable: false,
+                egress: None,
+                port: None,
+                token: None,
+                job_id: job_id.to_string(),
+                state: "ENDED".to_string(),
+                node: String::new(),
+                partition: rec("partition")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                time_left: String::new(),
+            },
+        ));
+    }
+    // Newest deaths first, after the live cards; a bounded tail.
+    ended.sort_by_key(|e| std::cmp::Reverse(e.0));
+    sessions.extend(ended.into_iter().take(ENDED_CAP).map(|(_, s)| s));
 }
 
 fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
@@ -467,6 +562,29 @@ pub(crate) async fn cancel_compute_session(
     };
     let _ =
         crate::compute::run_capped(&scancel.to_string_lossy(), std::slice::from_ref(&job_id)).await;
+    // Mark the launch record cancelled: while the job drains, the live card
+    // keeps its name/resources from the record; once the squeue row is gone
+    // the listing sweep removes marked records instead of raising an "ended"
+    // tombstone — an explicit cancel was watched, only surprise deaths
+    // deserve one. The same DELETE is also how a tombstone is dismissed.
+    let rec_path = compute_root()
+        .join("pending")
+        .join(format!("{job_id}.json"));
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(bytes) = std::fs::read(&rec_path) else {
+            return;
+        };
+        let Ok(mut record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            let _ = std::fs::remove_file(&rec_path);
+            return;
+        };
+        record["cancelled"] = serde_json::Value::Bool(true);
+        let _ = crate::persist::atomic_write_json(
+            &rec_path,
+            serde_json::to_vec_pretty(&record).unwrap_or_default(),
+        );
+    })
+    .await;
     tracing::info!(%job_id, "compute session cancel requested");
     StatusCode::NO_CONTENT.into_response()
 }

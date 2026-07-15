@@ -456,23 +456,23 @@ pub(super) async fn connect_compute_session(
     }
     tracing::info!("ipc: connect_compute_session {alias} job {job_id}");
     let key = compute_key(&alias, &job_id);
-    // A window already on this job → raise it, like `open_window` does.
-    if let Some(label) = find_by_scope(&state.windows, &Some(key.clone()), &None, None) {
-        if let Some(win) = app.get_webview_window(&label) {
-            return win
-                .set_focus()
-                .map_err(|e| format!("could not focus window: {e}"));
-        }
-    }
-    // Reuse a live tunnel, probed end-to-end like `do_connect` (after laptop
-    // sleep the local listener can outlive its dead connection) and without
-    // holding the lock across the probe. A dead one is torn down and rebuilt.
-    let existing_port = {
+    // NOTE: no focus-existing early-return here — the tunnel is ensured
+    // FIRST, so clicking open on a job whose window sits on a dead tunnel
+    // repairs the tunnel instead of just raising a broken window (found
+    // live: the raise-first order made a wedged window unrecoverable from
+    // the card). The raise happens below, once the tunnel is proven.
+    //
+    // Reuse a live tunnel, probed end-to-end WITH identity (authed 200 —
+    // after laptop sleep the local listener can outlive its dead
+    // connection, and a bare liveness probe can be answered by the wrong
+    // daemon through a stale relay) and without holding the lock across
+    // the probe. A dead one is torn down and rebuilt.
+    let existing = {
         let tunnels = state.compute_tunnels.lock().await;
-        tunnels.get(&key).map(|t| t.local_port)
+        tunnels.get(&key).map(|t| (t.local_port, t.token.clone()))
     };
-    if let Some(port) = existing_port {
-        if !chimaera_remote::http_alive(port).await {
+    if let Some((port, token)) = existing {
+        if !chimaera_remote::http_alive_authed(port, &token).await {
             if let Some(tunnel) = state.compute_tunnels.lock().await.remove(&key) {
                 tunnel.close().await;
             }
@@ -545,14 +545,27 @@ pub(super) async fn connect_compute_session(
             .ok_or_else(|| format!("{key} disconnected while connecting"))?;
         (t.url(), t.node.clone(), t.local_port)
     };
-    let mut record = WindowRecord::new(Some(alias.clone()), None);
-    record.compute = Some(ComputeScope {
-        job_id: job_id.clone(),
-        node: node.clone(),
-    });
-    let title = format!("{alias} › {node} — chimaera");
-    open_compute_window(&app, &url, &title, &record, &key)
-        .map_err(|e| format!("could not open window: {e}"))?;
+    // A window already on this job → raise it; the status ping below tells
+    // it the (possibly rebuilt) tunnel's port, and it re-homes itself if
+    // that moved. Otherwise open a fresh window on the tunnel URL.
+    let raised = find_by_scope(&state.windows, &Some(key.clone()), &None, None)
+        .and_then(|label| app.get_webview_window(&label));
+    match raised {
+        Some(win) => {
+            win.set_focus()
+                .map_err(|e| format!("could not focus window: {e}"))?;
+        }
+        None => {
+            let mut record = WindowRecord::new(Some(alias.clone()), None);
+            record.compute = Some(ComputeScope {
+                job_id: job_id.clone(),
+                node: node.clone(),
+            });
+            let title = format!("{alias} › {node} — chimaera");
+            open_compute_window(&app, &url, &title, &record, &key)
+                .map_err(|e| format!("could not open window: {e}"))?;
+        }
+    }
     // Cheap status ping so a home screen can flip the card to "connected".
     // No token: compute tokens stay in Rust — the window URL above is the
     // only carrier, and only for the window that needs it.

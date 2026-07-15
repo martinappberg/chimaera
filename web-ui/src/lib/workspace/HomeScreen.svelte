@@ -33,7 +33,7 @@
     type ComputeSessionList,
     type ComputeSessionView,
   } from "./computeSessions";
-  import { formatSlurmDuration, parseSlurmTimeLeft } from "./compute";
+  import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "./compute";
   import { getJobContext, type Health } from "../net/api";
 
   interface Props {
@@ -124,8 +124,18 @@
   /** Local home: per-connected-host session lists, for the count line. */
   let remoteCompute = $state<Map<string, ComputeSessionList>>(new Map());
 
-  /** True when this home screen IS a host-detail page. */
-  const isHostPage = $derived(native && ownAlias !== null && getJobContext() === null);
+  /** True when this home screen IS a host-detail page. Two "am I job-scoped"
+   *  signals gate the compute hub: the window's own `job=` params AND the
+   *  daemon's `/compute` `self` block — a compute-node daemon detects Slurm
+   *  on its node too, and without the second signal its home page renders
+   *  the launch hub, posing as the login host (a hall of mirrors — the
+   *  maintainer's job window "opened Sherlock with the compute nodes"). */
+  const isHostPage = $derived(
+    native &&
+      ownAlias !== null &&
+      getJobContext() === null &&
+      ($computeStatus?.self ?? null) === null,
+  );
   /** Host page: the daemon's own compute list (null = not fetched / no route). */
   let hostCompute = $state<ComputeSessionList | null>(null);
   /** List-level failure (the fetch itself); card-level errors live below. */
@@ -449,7 +459,8 @@
   // --- card presentation (Slurm's raw vocabulary, styled but never renamed) ---
 
   /** Dot class: transitional client states win, then the raw Slurm state
-   *  maps onto the home screen's dot language. */
+   *  maps onto the home screen's dot language. ENDED (a tombstone card for a
+   *  job that left the queue — walltime, failure) wears the dormant default. */
   function sessionDot(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
     if (isCancelling) return "ending";
     if (connecting) return "booting";
@@ -462,8 +473,9 @@
   /** The mono meta slot: node / raw state / transitional verbs. While
    *  PENDING, squeue's %N carries the pending REASON — shown raw too. */
   function sessionMeta(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
-    if (isCancelling) return "cancelling…";
+    if (isCancelling) return cs.state === "ENDED" ? "dismissing…" : "cancelling…";
     if (connecting) return "connecting…";
+    if (cs.state === "ENDED") return "ended";
     if (cs.state === "RUNNING") {
       if (cs.ready) return cs.node;
       return cs.node === "" ? "starting…" : `${cs.node} · starting…`;
@@ -478,6 +490,9 @@
   function sessionTitle(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
     if (isCancelling) return `cancelling slurm job ${cs.job_id}…`;
     if (connecting) return `connecting to slurm job ${cs.job_id}…`;
+    if (cs.state === "ENDED") {
+      return `slurm job ${cs.job_id} ended (walltime or failure) — dismiss to clear`;
+    }
     if (cs.ready) return `open the session on ${cs.node} (slurm job ${cs.job_id})`;
     if (cs.state === "PENDING") return "starts when the job leaves the queue";
     if (cs.state === "RUNNING") {
@@ -834,20 +849,31 @@
                     >
                   </button>
                   {#if !isCancelling}
-                    <button
-                      class="side"
-                      class:busy={isConnecting}
-                      {title}
-                      disabled={!cs.ready || isConnecting}
-                      onclick={() => void openHostCompute(cs)}
-                      >{isConnecting ? "connecting…" : "open"}</button
-                    >
-                    <button
-                      class="side stop"
-                      title="cancel slurm job {cs.job_id}"
-                      disabled={isConnecting}
-                      onclick={() => (confirmCancel = cs.job_id)}>cancel</button
-                    >
+                    {#if cs.state === "ENDED"}
+                      <!-- A tombstone: nothing to open or cancel — dismissing
+                           clears the record (same DELETE, no confirm; the job
+                           is already gone). -->
+                      <button
+                        class="side"
+                        title="clear this ended session from the list"
+                        onclick={() => void cancelHostCompute(cs)}>dismiss</button
+                      >
+                    {:else}
+                      <button
+                        class="side"
+                        class:busy={isConnecting}
+                        {title}
+                        disabled={!cs.ready || isConnecting}
+                        onclick={() => void openHostCompute(cs)}
+                        >{isConnecting ? "connecting…" : "open"}</button
+                      >
+                      <button
+                        class="side stop"
+                        title="cancel slurm job {cs.job_id}"
+                        disabled={isConnecting}
+                        onclick={() => (confirmCancel = cs.job_id)}>cancel</button
+                      >
+                    {/if}
                   {/if}
                 </div>
                 {#if cerr !== undefined}

@@ -89,6 +89,12 @@ pub(crate) struct ComputeSnapshot {
     pub(crate) self_alloc: Option<SelfAllocation>,
     pub(crate) fetched_at_ms: u64,
     pub(crate) truncated: bool,
+    /// True when this refresh's `squeue` failed (timeout/error) and `jobs`
+    /// carries the previous snapshot forward — "may be stale", not "empty".
+    /// One wedged controller call must not make every card vanish for a
+    /// poll cycle (and must not turn live jobs into "ended" tombstones).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) degraded: bool,
 }
 
 impl ComputeSnapshot {
@@ -100,6 +106,7 @@ impl ComputeSnapshot {
             self_alloc: None,
             fetched_at_ms: now_ms(),
             truncated: false,
+            degraded: false,
         }
     }
 }
@@ -199,7 +206,14 @@ impl ComputeService {
         }
         // Holding the lock across the fetch IS the single-flight: concurrent
         // requests queue here briefly instead of stampeding the controller.
-        let snap = fetch_snapshot(&squeue, &sinfo, self.self_job.as_deref()).await;
+        let mut snap = fetch_snapshot(&squeue, &sinfo, self.self_job.as_deref()).await;
+        if snap.degraded {
+            // squeue failed this round: carry the previous jobs forward
+            // (tagged) rather than serving a false "queue is empty".
+            if let Some((_, prev)) = &inner.cache {
+                snap.jobs = prev.jobs.clone();
+            }
+        }
         inner.cache = Some((Instant::now(), snap.clone()));
         snap
     }
@@ -333,6 +347,9 @@ async fn fetch_snapshot(
         self_alloc,
         fetched_at_ms: now_ms(),
         truncated: jobs_truncated || parts_truncated,
+        // None = the squeue CALL failed (timeout/exit), distinct from an
+        // empty queue (Some("")) — the caller substitutes last-good jobs.
+        degraded: jobs_out.is_none(),
     }
 }
 

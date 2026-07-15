@@ -37,9 +37,11 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   - **Format strings, not `--json`**: `squeue -u <user> --noheader -o "%i|%j|%P|%T|%L|%N"`
     and `sinfo --noheader -o "%P|%a|%D"` work on the old Slurm versions real clusters run,
     and bound the output by construction. `-u <user>` rather than `--me` (older Slurm).
-  - **Degrade, never 500**: a wedged controller or parse noise yields an empty-but-tagged
-    snapshot — the strip is orientation, not ground truth. Unparseable lines are skipped
-    (Slurm warning banners precede output on some clusters).
+  - **Degrade, never 500**: a wedged controller or parse noise never errors. A failed
+    `squeue` CALL (timeout/exit) is distinguished from an empty queue: the snapshot
+    carries the previous jobs forward tagged `degraded` — one slow controller round must
+    not blank every card (or mint false "ended" tombstones). Unparseable lines are
+    skipped (Slurm warning banners precede output on some clusters).
   - The default partition carries sinfo's `*` suffix → surfaced as `"default": true`;
     duplicate (partition, avail) rows are merged, "up" wins.
   - **Test knob:** `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
@@ -71,20 +73,36 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   itself everywhere: title + host label become `{alias} › {node}`, and an accent-washed
   **allocation strip** above the rail's bottom bar carries a live ticking countdown +
   `cpus · mem · gres` (daemon-truth via the snapshot's `self` block, so windows opened
-  later on the same node inherit it). CLI parity + verification harness:
-  `chimaera compute list|launch|connect|cancel <host>`.
+  later on the same node inherit it). Launch **seeds the job daemon's workspace registry
+  with the host's whole list** (shared-FS roots are equally valid on the node), so the
+  compute window opens on the same ready-to-open workspaces as the login window. A job
+  that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
+  **"ended" tombstone card** built from its launch record (explicit cancels clean up
+  silently — the user watched those; tombstones age out after 48h). CLI parity +
+  verification harness: `chimaera compute list|launch|connect|cancel <host>`.
 - **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
   the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident
   `ssh -N -L` relay to the node's loopback, running as the remote command of the same
   laptop ssh that forwards to it (lifetimes coupled; the path on hostbased-only clusters
   like Sherlock — verified live) → **A** direct login→node forward, only for jobs launched
   `--bind-routable` (opt-in 0.0.0.0, token-gated) → else "not supported on this cluster",
-  and the job keeps running for login-node use.
+  and the job keeps running for login-node use. Every rung's arbiter is `tunnel_proven`:
+  a **bearer-authed 200 through our own forward** (identity, not bare liveness — a stale
+  relay or foreign tenant of a shared login-node port can answer a plain probe), from an
+  ssh child still alive afterwards; the chained rung's login-side relay port is **always
+  randomized** (the daemon's own port number is exactly where a previous connect's relay
+  sits — both found live as "sometimes works").
 - **Key constraints.** Tokens/ports never reach the home-screen JS (the app shell scrubs
   them and holds tunnels in Rust, keyed `"{alias}#job{job_id}"`); launch-restore skips
   compute windows (the card is the reconnect path); cluster-vintage tooling is assumed
   hostile-old (login-node OpenSSH without `accept-new`, `%C` needing `%%` escaping inside
-  ProxyCommand — both found live and handled).
+  ProxyCommand — both found live and handled). **A job window's status identity is its
+  composite key** (`{alias}#job{id}`) end-to-end — shell health monitor, `host-status`
+  events, the SPA's listener and scope report: matching on the bare login alias made every
+  login-tunnel blip re-home job windows onto the login daemon (found live: "opening the
+  session just opens Sherlock"), and a compute daemon's home page suppresses the launch
+  hub via the snapshot's `self` block (it detects Slurm on its node too — without the gate
+  it poses as the login host).
 
 ---
 
