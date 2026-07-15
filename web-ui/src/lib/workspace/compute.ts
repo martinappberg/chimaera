@@ -36,7 +36,8 @@ export interface ComputePartition {
 /**
  * The allocation THIS daemon runs inside (Mode 2 compute-node session).
  * Present only when the daemon detects it was launched under a Slurm job —
- * the walltime here is the window's lifetime, so the bottom bar wears it.
+ * the walltime here is the window's lifetime, so the rail's allocation
+ * strip wears it (as a live countdown) and the host label carries the node.
  */
 export interface ComputeSelf {
   job_id: string;
@@ -45,6 +46,10 @@ export interface ComputeSelf {
   /** Raw Slurm state — never relabeled. */
   state: string;
   time_left: string;
+  /** Allocated resources (squeue %C/%m/%b), "" when the wire lacked them. */
+  cpus: string;
+  mem: string;
+  gres: string;
 }
 
 export interface ComputeSnapshot {
@@ -58,6 +63,9 @@ export interface ComputeSnapshot {
   /** The allocation this daemon runs inside, when it IS a compute-node
    *  session (`null` = the wire didn't carry a usable `self` block). */
   self: ComputeSelf | null;
+  /** CLIENT clock at parse time — the countdown's baseline. `time_left`
+   *  only moves per fetch; the strip ticks against this locally. */
+  received_at_ms: number;
 }
 
 // Defensive parsing (the environment-fetcher idiom): drop malformed entries
@@ -99,7 +107,36 @@ function parseSelf(raw: unknown): ComputeSelf | null {
     partition: typeof r.partition === "string" ? r.partition : "",
     state: typeof r.state === "string" ? r.state : "",
     time_left: typeof r.time_left === "string" ? r.time_left : "",
+    cpus: typeof r.cpus === "string" ? r.cpus : "",
+    mem: typeof r.mem === "string" ? r.mem : "",
+    gres: typeof r.gres === "string" ? r.gres : "",
   };
+}
+
+/**
+ * Slurm's TimeLeft rendering (`[days-]hours:minutes:seconds`, short forms
+ * `MM:SS`) → seconds. `null` for the non-durations Slurm also emits here
+ * (UNLIMITED, NOT_SET, INVALID) — callers show the raw string instead.
+ */
+export function parseSlurmTimeLeft(s: string): number | null {
+  const m = s.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d{1,2}):(\d{2})$/);
+  if (m === null) return null;
+  const days = m[1] !== undefined ? Number(m[1]) : 0;
+  const hours = m[2] !== undefined ? Number(m[2]) : 0;
+  return ((days * 24 + hours) * 60 + Number(m[3])) * 60 + Number(m[4]);
+}
+
+/** Seconds → Slurm's own duration style (`1-04:00:00`, `1:57:12`, `04:32`). */
+export function formatSlurmDuration(totalSecs: number): string {
+  const secs = Math.max(0, Math.floor(totalSecs));
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  const rest = secs % 60;
+  const mmss = `${String(mins).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+  if (days > 0) return `${days}-${String(hours).padStart(2, "0")}:${mmss}`;
+  if (hours > 0) return `${hours}:${mmss}`;
+  return mmss;
 }
 
 function parseSnapshot(body: unknown): ComputeSnapshot {
@@ -110,6 +147,7 @@ function parseSnapshot(body: unknown): ComputeSnapshot {
     fetched_at_ms: 0,
     truncated: false,
     self: null,
+    received_at_ms: Date.now(),
   };
   if (typeof body !== "object" || body === null) return none;
   const b = body as Record<string, unknown>;
@@ -125,6 +163,7 @@ function parseSnapshot(body: unknown): ComputeSnapshot {
     fetched_at_ms: typeof b.fetched_at_ms === "number" ? b.fetched_at_ms : 0,
     truncated: b.truncated === true,
     self: parseSelf(b.self),
+    received_at_ms: Date.now(),
   };
 }
 

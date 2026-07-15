@@ -70,6 +70,11 @@ pub(crate) struct SelfAllocation {
     pub(crate) partition: String,
     pub(crate) state: String,
     pub(crate) time_left: String,
+    /// Allocated resources (squeue %C/%m/%b) — the window's allocation
+    /// strip shows what you actually have on this node.
+    pub(crate) cpus: String,
+    pub(crate) mem: String,
+    pub(crate) gres: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -286,7 +291,7 @@ async fn fetch_snapshot(
                 id.to_string(),
                 "--noheader".into(),
                 "-o".into(),
-                "%i|%P|%T|%L|%N".into(),
+                "%i|%P|%T|%L|%N|%C|%m|%b".into(),
             ],
         )
         .await
@@ -331,21 +336,33 @@ async fn fetch_snapshot(
     }
 }
 
-/// `squeue -j <id> --noheader -o "%i|%P|%T|%L|%N"` → the daemon's own
-/// allocation. None on noise/absence (job already gone = no block).
+/// `squeue -j <id> --noheader -o "%i|%P|%T|%L|%N|%C|%m|%b"` → the daemon's
+/// own allocation. None on noise/absence (job already gone = no block).
+/// `%b` (gres) prints "N/A" when none — normalized to empty.
 fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
     let line = out.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let mut f = line.splitn(5, '|').map(str::trim);
+    let mut f = line.splitn(8, '|').map(str::trim);
     let (id, partition, state, time_left) = (f.next()?, f.next()?, f.next()?, f.next()?);
     if !id.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
+    let node = f.next().unwrap_or("").to_string();
+    let cpus = f.next().unwrap_or("").to_string();
+    let mem = f.next().unwrap_or("").to_string();
+    let gres = f.next().unwrap_or("").trim().to_string();
     Some(SelfAllocation {
         job_id: id.to_string(),
-        node: f.next().unwrap_or("").to_string(),
+        node,
         partition: partition.to_string(),
         state: state.to_string(),
         time_left: time_left.to_string(),
+        cpus,
+        mem,
+        gres: if gres.eq_ignore_ascii_case("n/a") {
+            String::new()
+        } else {
+            gres
+        },
     })
 }
 

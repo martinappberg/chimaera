@@ -143,6 +143,7 @@
     type DiffMode,
   } from "./lib/workspace/git";
   import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
+  import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     paneContentEl,
     paneIdAt,
@@ -1517,7 +1518,12 @@
     //   "crc_finish •Sherlock | chimaera"  (remote, in a workspace)
     //   "crc_finish | chimaera"            (local — the host is implicit)
     // Home (no workspace) drops the workspace but keeps the host when remote.
-    const host = isRemoteWindow ? hostAlias : null;
+    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
+    // URL hash) appends its node: "crc_finish •Sherlock › sh02-02n44 | …",
+    // so a job window never poses as its login node.
+    const node = $computeStatus?.self?.node;
+    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
+    const host = isRemoteWindow ? hostWithNode : null;
     const scope = workspace
       ? host
         ? `${workspace.name} •${host}`
@@ -3245,6 +3251,12 @@
         </section>
       {/if}
 
+      {#if $computeStatus?.self}
+        <!-- This whole window lives inside a Slurm allocation (the daemon's
+             own truth, not the URL hash): countdown + resources, stacked
+             ABOVE the daemon bar so neither crowds the other. -->
+        <ComputeStrip self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
+      {/if}
       <div class="daemon" bind:this={daemonEl}>
         <span
           class="daemon-dot"
@@ -3254,8 +3266,13 @@
           title={eventsUp ? "connected" : "disconnected"}
           aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
+        <!-- Inside an allocation the label carries the node ("Sherlock ›
+             sh02-02n44") so a compute-node window never poses as its login
+             node — derived from the daemon's self block, hash-independent. -->
         <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
-          >{getHostLabel()}</span
+          >{$computeStatus?.self
+            ? `${getHostLabel()} › ${$computeStatus.self.node}`
+            : getHostLabel()}</span
         >
         {#if $gitStatus !== null}
           <!-- Always-on orientation: what branch you're on and how dirty the
@@ -3334,20 +3351,16 @@
         {/if}
         {#if $computeStatus?.scheduler === "slurm"}
           {@const queued = queuedJobCount($computeStatus)}
-          {@const selfJob = $computeStatus.self}
           <!-- Slurm orientation, indicator ONLY (maintainer, 2026-07-15):
                the scheduler exists here + how much of your work is queued.
                Queue browsing/management deliberately does NOT live in the
                rail — that arrives with the agent dashboard; launching onto
-               compute nodes belongs to the home screen's Mode 2 flow.
-               Inside an allocation (a Mode 2 compute-node daemon) the chip
-               wears walltime-remaining INSTEAD of the queue count — this
-               window's honest lifetime beats a secondary queue number. -->
+               compute nodes belongs to the home screen's Mode 2 flow. The
+               daemon's OWN allocation is NOT this chip's job — the strip
+               above this bar wears it. -->
           <span
             class="daemon-compute"
-            title={selfJob !== null
-              ? `slurm job ${selfJob.job_id} on ${selfJob.node} — ${selfJob.time_left} left`
-              : `slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
+            title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
           >
             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <rect
@@ -3391,11 +3404,7 @@
                 stroke-width="1.4"
               />
             </svg>
-            {#if selfJob !== null}
-              <span class="dc-count">{selfJob.time_left}</span>
-            {:else if queued > 0}
-              <span class="dc-count">{queued}</span>
-            {/if}
+            {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
           </span>
         {/if}
         {#if canCaffeinate}

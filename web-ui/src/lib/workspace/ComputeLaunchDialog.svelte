@@ -1,14 +1,18 @@
 <script lang="ts">
-  import { launchComputeSession, type ComputeLaunchSpec } from "../net/native";
+  import {
+    launchComputeSession,
+    type ComputeLaunchSpec,
+  } from "./computeSessions";
   import type { ComputePartition } from "./compute";
 
   interface Props {
-    /** The connected host the job submits on. */
+    /** The host the job submits on — display only; the submission goes to
+     *  this window's own (login-node) daemon. */
     alias: string;
     /** Partitions from the host's compute snapshot (empty → free-text field). */
     partitions: ComputePartition[];
     /** The job was accepted — the caller closes this dialog and refetches. */
-    onLaunched: (alias: string) => void;
+    onLaunched: () => void;
     onClose: () => void;
   }
 
@@ -51,8 +55,8 @@
     if (prelude.trim() !== "") spec.prelude = prelude;
     if (routable) spec.routable = true;
     try {
-      await launchComputeSession(alias, spec);
-      onLaunched(alias);
+      await launchComputeSession(spec);
+      onLaunched();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       busy = false;

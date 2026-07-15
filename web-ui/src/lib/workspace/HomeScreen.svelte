@@ -7,7 +7,6 @@
   import {
     addHost,
     beginUpdate,
-    cancelComputeSession,
     checkAppUpdate,
     connectComputeSession,
     connectHost,
@@ -24,13 +23,17 @@
     removeHost,
     shutdownHost,
     updateLocalDaemon,
-    type ComputeSessionView,
     type ConnectProgress,
     type HostState,
     type LocalDaemonState,
-    type RemoteComputeList,
   } from "../net/native";
-  import type { Health } from "../net/api";
+  import {
+    cancelComputeSession,
+    listComputeSessions,
+    type ComputeSessionList,
+    type ComputeSessionView,
+  } from "./computeSessions";
+  import { getJobContext, type Health } from "../net/api";
 
   interface Props {
     workspaces: Workspace[];
@@ -110,17 +113,26 @@
   let confirmShutdown = $state<string | null>(null);
 
   // --- compute-node sessions (Mode 2: Slurm jobs owning a full daemon) --------
-  // Fetched per connected host alongside its workspaces; absent = no scheduler
-  // there (or not asked yet). No polling timer — connect-time + the manual
-  // refresh only (login-node discipline: never a tight loop on squeue).
+  // Two disjoint surfaces (maintainer restructure, 2026-07-15):
+  //  · LOCAL home screen: a per-host indicator COUNT only (shell-proxied),
+  //    fetched at connect time — the cards live on the host, not here.
+  //  · HOST-DETAIL page (a remote window's home): the full group — cards,
+  //    launch dialog, cancel — talking to the login daemon's routes directly.
+  //    Job-scoped windows suppress it (the allocation strip is their UI).
 
-  let remoteCompute = $state<Map<string, RemoteComputeList>>(new Map());
-  /** Quiet inline compute failure per host (refresh/open/cancel). */
-  let computeErrors = $state<Map<string, string>>(new Map());
-  /** In-row two-step confirm target for scancel. */
-  let confirmCancel = $state<{ alias: string; jobId: string } | null>(null);
-  /** Host alias the launch dialog is open for. */
-  let launchFor = $state<string | null>(null);
+  /** Local home: per-connected-host session lists, for the count line. */
+  let remoteCompute = $state<Map<string, ComputeSessionList>>(new Map());
+
+  /** True when this home screen IS a host-detail page. */
+  const isHostPage = $derived(native && ownAlias !== null && getJobContext() === null);
+  /** Host page: the daemon's own compute list (null = not fetched / no route). */
+  let hostCompute = $state<ComputeSessionList | null>(null);
+  let hostComputeError = $state<string | null>(null);
+  /** Job id pending the in-row two-step scancel confirm. */
+  let confirmCancel = $state<string | null>(null);
+  let launchOpen = $state(false);
+  /** Poll gate: the sessions list only refreshes while the page is visible. */
+  let pageVisible = $state(document.visibilityState === "visible");
 
   // --- local daemon build parity (native shell, local window only) ------------
 
@@ -165,6 +177,21 @@
 
   onMount(() => {
     if (!native) return;
+    if (ownAlias !== null) {
+      // A remote window's home: no remote-hosts machinery here (that section
+      // is the LOCAL first screen's). Boot the compute-sessions surface
+      // instead — host pages only; a job-scoped window's compute UI is the
+      // allocation strip.
+      if (!isHostPage) return;
+      void refreshHostCompute();
+      const onVis = (): void => {
+        pageVisible = document.visibilityState === "visible";
+        // Hidden paused the poller; catch up NOW instead of waiting a period.
+        if (pageVisible) void refreshHostCompute();
+      };
+      document.addEventListener("visibilitychange", onVis);
+      return () => document.removeEventListener("visibilitychange", onVis);
+    }
     void refreshHosts();
     // Every native window asks for the shell state: the outdated note renders
     // only on the local window, but the dev-build flag drives the host-row
@@ -292,58 +319,79 @@
     void refreshHosts();
   }
 
-  /** Fetch a connected host's compute-node sessions. Never throws: a shell
-   *  without the command (built in parallel) or a probe failure must not
-   *  blank the host row — the group just stays absent, or keeps its last
-   *  list with a quiet inline error. */
+  /** Local home: fetch a connected host's session list for the count line.
+   *  Never throws — a shell/daemon without the surface just means no count. */
   async function refreshCompute(alias: string): Promise<void> {
-    computeErrors = mapWithout(computeErrors, alias);
     try {
       remoteCompute = new Map(remoteCompute).set(alias, await remoteComputeSessions(alias));
-    } catch (e) {
-      if (remoteCompute.has(alias)) {
-        computeErrors = new Map(computeErrors).set(
-          alias,
-          e instanceof Error ? e.message : String(e),
-        );
-      }
+    } catch {
+      // no scheduler / older shell — the indicator simply doesn't show
     }
   }
 
-  /** Tunnel to a ready compute-node session — the shell opens its window. */
-  async function openCompute(alias: string, jobId: string): Promise<void> {
-    computeErrors = mapWithout(computeErrors, alias);
+  /** RUNNING+PENDING sessions on a connected host — the indicator count. */
+  function computeCount(alias: string): number {
+    const rc = remoteCompute.get(alias);
+    if (rc === undefined || rc.scheduler !== "slurm") return 0;
+    return rc.sessions.filter((s) => s.state === "RUNNING" || s.state === "PENDING").length;
+  }
+
+  // --- host page: the full compute-sessions surface ---------------------------
+
+  /** Refetch this host's sessions from ITS daemon. Keeps the stale list on a
+   *  transient failure (with a quiet inline error) — never blanks the page. */
+  async function refreshHostCompute(): Promise<void> {
     try {
-      await connectComputeSession(alias, jobId);
+      hostCompute = await listComputeSessions();
+      hostComputeError = null;
     } catch (e) {
-      computeErrors = new Map(computeErrors).set(
-        alias,
-        e instanceof Error ? e.message : String(e),
-      );
+      hostComputeError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  /** A session flips PENDING→RUNNING on its own — poll while visible, faster
+   *  while something is queued, and stop once the host says "no scheduler"
+   *  (login-node discipline: bounded, purposeful squeue traffic only). */
+  const anyPending = $derived(
+    hostCompute?.sessions.some((s) => s.state === "PENDING") ?? false,
+  );
+  const schedulerKnownNone = $derived(
+    hostCompute !== null && hostCompute.scheduler !== "slurm",
+  );
+  $effect(() => {
+    if (!isHostPage || !pageVisible || schedulerKnownNone) return;
+    const t = setInterval(() => void refreshHostCompute(), anyPending ? 10_000 : 30_000);
+    return () => clearInterval(t);
+  });
+
+  /** Tunnel to a ready session — the shell builds it and opens the window. */
+  async function openHostCompute(jobId: string): Promise<void> {
+    hostComputeError = null;
+    try {
+      await connectComputeSession(hostLabel, jobId);
+    } catch (e) {
+      hostComputeError = e instanceof Error ? e.message : String(e);
     }
   }
 
   /** scancel the job (Slurm ends everything in the allocation), then refetch. */
-  async function cancelCompute(alias: string, jobId: string): Promise<void> {
+  async function cancelHostCompute(jobId: string): Promise<void> {
     confirmCancel = null;
-    computeErrors = mapWithout(computeErrors, alias);
+    hostComputeError = null;
     try {
-      await cancelComputeSession(alias, jobId);
+      await cancelComputeSession(jobId);
     } catch (e) {
-      computeErrors = new Map(computeErrors).set(
-        alias,
-        e instanceof Error ? e.message : String(e),
-      );
+      hostComputeError = e instanceof Error ? e.message : String(e);
     }
-    void refreshCompute(alias);
+    void refreshHostCompute();
   }
 
   /** "{cpus} cpu · {mem} · {gres}" — omitting whatever the wire didn't carry. */
   function resourceLabel(cs: ComputeSessionView): string {
     const parts: string[] = [];
-    if (cs.cpus !== undefined && cs.cpus !== null) parts.push(`${cs.cpus} cpu`);
-    if (cs.mem !== undefined && cs.mem !== null && cs.mem !== "") parts.push(cs.mem);
-    if (cs.gres !== undefined && cs.gres !== null && cs.gres !== "") parts.push(cs.gres);
+    if (cs.cpus !== null) parts.push(`${cs.cpus} cpu`);
+    if (cs.mem !== null && cs.mem !== "") parts.push(cs.mem);
+    if (cs.gres !== null && cs.gres !== "") parts.push(cs.gres);
     return parts.join(" · ");
   }
 
@@ -594,335 +642,355 @@
       {/if}
     </section>
 
-    <section>
-      <div class="sec-head">
-        <span class="sec-title">remote hosts</span>
-        {#if native}
-          <button
-            class="ghost"
-            onclick={() => {
-              addOpen = !addOpen;
-              addError = null;
-            }}>add a host…</button
-          >
-        {/if}
-      </div>
-
-      {#if !native}
-        <p class="hint">
-          Remote hosts connect from the chimaera app — or run
-          <code>chimaera connect &lt;host&gt;</code> in a terminal and open the printed URL.
-        </p>
-      {:else}
-        {#if addOpen}
-          <form
-            class="add"
-            onsubmit={(e) => {
-              e.preventDefault();
-              void submitAdd();
-            }}
-          >
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
-              class="add-input"
-              bind:value={addAlias}
-              placeholder="ssh alias or user@host (from your ~/.ssh/config)"
-              spellcheck="false"
-              autocomplete="off"
-              autofocus
-              onkeydown={(e) => {
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  addOpen = false;
-                }
-              }}
-            />
-            <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
-              >connect</button
+    {#if isHostPage && hostCompute !== null && hostCompute.scheduler === "slurm"}
+      <!-- Mode 2 (maintainer intent, features/compute.md): chimaera sessions
+           running as Slurm jobs — first-class connectable entities with
+           "x compute and hours left". This host's own page is where they are
+           launched and managed; the local home screen only counts them. -->
+      <section>
+        <div class="sec-head">
+          <span class="sec-title">compute sessions</span>
+          <span class="sec-acts">
+            <button class="ghost" onclick={() => (launchOpen = true)}
+              >new compute session…</button
             >
-          </form>
-          {#if addError !== null}
-            <div class="err-line">{addError}</div>
-          {/if}
-        {/if}
-
-        {#if hosts.length === 0 && !addOpen}
+            <button
+              class="ghost refresh"
+              title="refresh compute sessions"
+              aria-label="refresh compute sessions"
+              onclick={() => void refreshHostCompute()}
+            >
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                <path
+                  d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
+          </span>
+        </div>
+        {#if hostCompute.sessions.length === 0}
           <p class="hint">
-            No remotes yet. Add your cluster's ssh alias — chimaera installs its own daemon in
-            <code>~/.chimaera{localState?.dev_build ? "-dev" : ""}</code> over ssh, no root needed.
+            None running. A compute session is a full chimaera workbench submitted as a Slurm
+            job — its own node and resources, ended cleanly at walltime.
           </p>
         {:else}
           <div class="rows">
-            {#each hosts as h (h.alias)}
-              {@const phase = phases.get(h.alias)}
-              {@const err = hostErrors.get(h.alias)}
-              {@const ws = remoteWs.get(h.alias)}
-              {#if confirmShutdown === h.alias}
-                <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
-                  <span class="name">{h.alias}</span>
+            {#each hostCompute.sessions as cs (cs.job_id)}
+              {@const csState =
+                cs.state === "RUNNING" && cs.ready
+                  ? "alive"
+                  : cs.state === "PENDING"
+                    ? "starting"
+                    : ""}
+              {@const res = resourceLabel(cs)}
+              {#if confirmCancel === cs.job_id}
+                <div class="row confirm" role="alertdialog" aria-label="cancel compute session?">
+                  <span class="name">{cs.name}</span>
                   <span class="confirm-label"
-                    >shut down — end {h.live_sessions ?? 0} session{h.live_sessions === 1
-                      ? ""
-                      : "s"} and stop the daemon?</span
+                    >cancel job {cs.job_id}? everything in the allocation ends</span
                   >
-                  <button class="confirm-yes" onclick={() => void shutdown(h.alias)}>shut down</button
+                  <button class="confirm-yes" onclick={() => void cancelHostCompute(cs.job_id)}
+                    >cancel job</button
                   >
-                  <button class="confirm-no" onclick={() => (confirmShutdown = null)}>cancel</button>
-                </div>
-              {:else if confirmEnd === h.alias}
-                <div class="row confirm" role="alertdialog" aria-label="end sessions?">
-                  <span class="name">{h.alias}</span>
-                  <span class="confirm-label"
-                    >end {h.live_sessions ?? 0} running session{h.live_sessions === 1
-                      ? ""
-                      : "s"}? (the daemon keeps running)</span
-                  >
-                  <button class="confirm-yes" onclick={() => void endSessions(h.alias)}
-                    >end sessions</button
-                  >
-                  <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
-                </div>
-              {:else if confirmForget === h.alias}
-                <div class="row confirm" role="alertdialog" aria-label="forget host?">
-                  <span class="name">{h.alias}</span>
-                  <span class="confirm-label">forget this host?</span>
-                  <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
-                  <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
+                  <button class="confirm-no" onclick={() => (confirmCancel = null)}>keep</button>
                 </div>
               {:else}
-                <div class="rowwrap" role="presentation" class:connected={h.status === "connected"}>
+                <div class="rowwrap" role="presentation" class:live={csState === "alive"}>
                   <button
                     class="row"
-                    title={h.status === "connected"
-                      ? `browse ${h.alias}`
-                      : `connect to ${h.alias}`}
-                    disabled={h.status === "connecting"}
-                    onclick={() =>
-                      h.status === "connected"
-                        ? void openWindow(h.alias, null)
-                        : void connect(h.alias)}
+                    title={cs.ready
+                      ? `open the session on ${cs.node} (slurm job ${cs.job_id})`
+                      : `slurm job ${cs.job_id} — ${cs.state}${cs.node !== "" ? ` on ${cs.node}` : ""}, not connectable yet`}
+                    disabled={!cs.ready}
+                    onclick={() => void openHostCompute(cs.job_id)}
                   >
-                    <span
-                      class="dot {h.status === 'connected'
-                        ? 'alive'
-                        : h.status === 'connecting'
-                          ? 'starting'
-                          : ''}"
-                      title={h.status === "connected"
-                        ? "connected"
-                        : h.status === "connecting"
-                          ? "connecting…"
-                          : "not connected"}
-                    ></span>
-                    <span class="name">{h.alias}</span>
-                    {#if localState?.dev_build}
-                      <span
-                        class="pill-dev"
-                        title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
-                        >dev</span
-                      >
+                    <span class="dot {csState}" title={cs.state}></span>
+                    <span class="name">{cs.name}</span>
+                    <span class="node">{cs.node === "" ? "queued" : cs.node}</span>
+                    {#if res !== ""}
+                      <span class="badge">{res}</span>
                     {/if}
-                    {#if phase !== undefined}
-                      <span class="phase">{phase}</span>
-                    {:else if h.status === "connected"}
-                      <span class="phase quiet">connected · 127.0.0.1:{h.local_port}</span>
-                    {:else}
-                      <span class="when">{ago(h.last_connected_at)}</span>
-                    {/if}
-                    {#if h.status === "connected" && (h.live_sessions ?? 0) > 0}
-                      <span
-                        class="badge"
-                        title="{h.live_sessions} live session{h.live_sessions === 1
-                          ? ''
-                          : 's'} on {h.alias}"
-                      >
-                        <span class="dot alive"></span>{h.live_sessions}
-                      </span>
-                    {/if}
+                    <span class="when" title="walltime remaining">{cs.time_left}</span>
                   </button>
-                  {#if h.status === "connected"}
-                    {#if (h.live_sessions ?? 0) > 0}
-                      <button
-                        class="side"
-                        title="end all sessions on {h.alias} — the daemon keeps running"
-                        onclick={() => (confirmEnd = h.alias)}>end sessions</button
-                      >
-                    {/if}
-                    <button
-                      class="side"
-                      title="close the tunnel — sessions keep running on {h.alias}"
-                      onclick={() => void disconnect(h.alias)}>disconnect</button
-                    >
-                    <button
-                      class="side stop"
-                      title="shut down {h.alias} — end all sessions and stop the daemon"
-                      onclick={() => (confirmShutdown = h.alias)}>shut down</button
-                    >
-                  {/if}
-                  <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
-                    >&times;</button
+                  <button
+                    class="side"
+                    title={cs.ready
+                      ? "open this compute session"
+                      : "not connectable yet — the session's daemon is still starting"}
+                    disabled={!cs.ready}
+                    onclick={() => void openHostCompute(cs.job_id)}>open</button
+                  >
+                  <button
+                    class="side stop"
+                    title="cancel slurm job {cs.job_id}"
+                    onclick={() => (confirmCancel = cs.job_id)}>cancel</button
                   >
                 </div>
-                {#if err !== undefined}
-                  <div class="err-line">{err}</div>
-                {/if}
-                {#if h.status === "connected" && h.outdated && phase === undefined}
-                  <div class="note-line" title={buildNote(h.remote_build)}>
-                    daemon is an older build —
-                    <button class="update-act" onclick={() => void connect(h.alias, true)}>
-                      update{endsLabel(h.live_sessions)}
-                    </button>
-                  </div>
-                {/if}
-                {#if h.status === "connected" && ws !== undefined}
-                  <div class="remote-ws">
-                    {#each ws as rw (rw.id)}
-                      <div class="rowwrap" role="presentation">
-                        <button
-                          class="row sub"
-                          title={rw.root}
-                          onclick={() => void openWindow(h.alias, rw.id)}
-                        >
-                          <span class="name">{rw.name}</span>
-                          <span class="path">{tildify(rw.root)}</span>
-                          <span class="when">{ago(rw.last_opened_at)}</span>
-                        </button>
-                      </div>
-                    {/each}
-                    <div class="rowwrap" role="presentation">
-                      <button class="row sub browse" onclick={() => void openWindow(h.alias, null)}>
-                        <span class="name">browse {h.alias}…</span>
-                      </button>
-                    </div>
-                  </div>
-                {/if}
-                {#if h.status === "connected"}
-                  {@const rc = remoteCompute.get(h.alias)}
-                  {@const cerr = computeErrors.get(h.alias)}
-                  <!-- Mode 2: chimaera sessions running as Slurm jobs — each a
-                       first-class connectable entity with "x compute and hours
-                       left" (maintainer intent, features/compute.md). Shown
-                       only where the host actually has a scheduler. -->
-                  {#if rc !== undefined && rc.scheduler === "slurm"}
-                    <div class="remote-ws compute-group">
-                      <div class="comp-head">
-                        <span class="sec-title">compute sessions</span>
-                        <span class="comp-acts">
-                          <button class="ghost" onclick={() => (launchFor = h.alias)}
-                            >new compute session…</button
-                          >
-                          <button
-                            class="ghost refresh"
-                            title="refresh compute sessions"
-                            aria-label="refresh compute sessions"
-                            onclick={() => void refreshCompute(h.alias)}
-                          >
-                            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-                              <path
-                                d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="1.4"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                              />
-                            </svg>
-                          </button>
-                        </span>
-                      </div>
-                      {#each rc.sessions as cs (cs.job_id)}
-                        {@const csState =
-                          cs.state === "RUNNING" && cs.ready
-                            ? "alive"
-                            : cs.state === "PENDING"
-                              ? "starting"
-                              : ""}
-                        {@const res = resourceLabel(cs)}
-                        {#if confirmCancel?.alias === h.alias && confirmCancel.jobId === cs.job_id}
-                          <div class="row confirm" role="alertdialog" aria-label="cancel compute session?">
-                            <span class="name">{cs.name}</span>
-                            <span class="confirm-label"
-                              >cancel job {cs.job_id}? everything in the allocation ends</span
-                            >
-                            <button
-                              class="confirm-yes"
-                              onclick={() => void cancelCompute(h.alias, cs.job_id)}
-                              >cancel job</button
-                            >
-                            <button class="confirm-no" onclick={() => (confirmCancel = null)}
-                              >keep</button
-                            >
-                          </div>
-                        {:else}
-                          <div class="rowwrap" role="presentation">
-                            <button
-                              class="row sub"
-                              title={cs.ready
-                                ? `open the session on ${cs.node} (slurm job ${cs.job_id})`
-                                : `slurm job ${cs.job_id} — ${cs.state}${cs.node !== "" ? ` on ${cs.node}` : ""}, not connectable yet`}
-                              disabled={!cs.ready}
-                              onclick={() => void openCompute(h.alias, cs.job_id)}
-                            >
-                              <span class="dot {csState}" title={cs.state}></span>
-                              <span class="name">{cs.name}</span>
-                              <span class="node">{cs.node === "" ? "queued" : cs.node}</span>
-                              {#if res !== ""}
-                                <span class="badge">{res}</span>
-                              {/if}
-                              <span class="when" title="walltime remaining">{cs.time_left}</span>
-                            </button>
-                            <button
-                              class="side"
-                              title={cs.ready
-                                ? "open this compute session"
-                                : "not connectable yet — the session's daemon is still starting"}
-                              disabled={!cs.ready}
-                              onclick={() => void openCompute(h.alias, cs.job_id)}>open</button
-                            >
-                            <button
-                              class="side stop"
-                              title="cancel slurm job {cs.job_id}"
-                              onclick={() =>
-                                (confirmCancel = { alias: h.alias, jobId: cs.job_id })}
-                              >cancel</button
-                            >
-                          </div>
-                          {#if cs.egress === false}
-                            <!-- Only a VERIFIED-blocked probe warns; absent
-                                 egress means "couldn't verify", not blocked. -->
-                            <div class="egress-note">
-                              agents can't reach the API from this node
-                            </div>
-                          {/if}
-                        {/if}
-                      {/each}
-                      {#if rc.sessions.length === 0}
-                        <p class="comp-hint">
-                          none running — launch one to own a full session on a compute node.
-                        </p>
-                      {/if}
-                      {#if cerr !== undefined}
-                        <div class="err-line">{cerr}</div>
-                      {/if}
-                    </div>
-                  {/if}
+                {#if cs.egress === false}
+                  <!-- Only a VERIFIED-blocked probe warns; absent egress
+                       means "couldn't verify", not blocked. -->
+                  <div class="egress-note">agents can't reach the API from this node</div>
                 {/if}
               {/if}
             {/each}
           </div>
         {/if}
-      {/if}
-    </section>
+        {#if hostComputeError !== null}
+          <div class="err-line">{hostComputeError}</div>
+        {/if}
+      </section>
+    {/if}
+
+    {#if ownAlias === null}
+      <section>
+        <div class="sec-head">
+          <span class="sec-title">remote hosts</span>
+          {#if native}
+            <button
+              class="ghost"
+              onclick={() => {
+                addOpen = !addOpen;
+                addError = null;
+              }}>add a host…</button
+            >
+          {/if}
+        </div>
+
+        {#if !native}
+          <p class="hint">
+            Remote hosts connect from the chimaera app — or run
+            <code>chimaera connect &lt;host&gt;</code> in a terminal and open the printed URL.
+          </p>
+        {:else}
+          {#if addOpen}
+            <form
+              class="add"
+              onsubmit={(e) => {
+                e.preventDefault();
+                void submitAdd();
+              }}
+            >
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="add-input"
+                bind:value={addAlias}
+                placeholder="ssh alias or user@host (from your ~/.ssh/config)"
+                spellcheck="false"
+                autocomplete="off"
+                autofocus
+                onkeydown={(e) => {
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    addOpen = false;
+                  }
+                }}
+              />
+              <button class="cta small" type="submit" disabled={addAlias.trim() === ""}
+                >connect</button
+              >
+            </form>
+            {#if addError !== null}
+              <div class="err-line">{addError}</div>
+            {/if}
+          {/if}
+
+          {#if hosts.length === 0 && !addOpen}
+            <p class="hint">
+              No remotes yet. Add your cluster's ssh alias — chimaera installs its own daemon in
+              <code>~/.chimaera{localState?.dev_build ? "-dev" : ""}</code> over ssh, no root needed.
+            </p>
+          {:else}
+            <div class="rows">
+              {#each hosts as h (h.alias)}
+                {@const phase = phases.get(h.alias)}
+                {@const err = hostErrors.get(h.alias)}
+                {@const ws = remoteWs.get(h.alias)}
+                {@const compCount = computeCount(h.alias)}
+                {#if confirmShutdown === h.alias}
+                  <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
+                    <span class="name">{h.alias}</span>
+                    <span class="confirm-label"
+                      >shut down — end {h.live_sessions ?? 0} session{h.live_sessions === 1
+                        ? ""
+                        : "s"} and stop the daemon?</span
+                    >
+                    <button class="confirm-yes" onclick={() => void shutdown(h.alias)}>shut down</button
+                    >
+                    <button class="confirm-no" onclick={() => (confirmShutdown = null)}>cancel</button>
+                  </div>
+                {:else if confirmEnd === h.alias}
+                  <div class="row confirm" role="alertdialog" aria-label="end sessions?">
+                    <span class="name">{h.alias}</span>
+                    <span class="confirm-label"
+                      >end {h.live_sessions ?? 0} running session{h.live_sessions === 1
+                        ? ""
+                        : "s"}? (the daemon keeps running)</span
+                    >
+                    <button class="confirm-yes" onclick={() => void endSessions(h.alias)}
+                      >end sessions</button
+                    >
+                    <button class="confirm-no" onclick={() => (confirmEnd = null)}>cancel</button>
+                  </div>
+                {:else if confirmForget === h.alias}
+                  <div class="row confirm" role="alertdialog" aria-label="forget host?">
+                    <span class="name">{h.alias}</span>
+                    <span class="confirm-label">forget this host?</span>
+                    <button class="confirm-yes" onclick={() => void forget(h.alias)}>forget</button>
+                    <button class="confirm-no" onclick={() => (confirmForget = null)}>cancel</button>
+                  </div>
+                {:else}
+                  <div class="rowwrap" role="presentation" class:connected={h.status === "connected"}>
+                    <button
+                      class="row"
+                      title={h.status === "connected"
+                        ? `browse ${h.alias}`
+                        : `connect to ${h.alias}`}
+                      disabled={h.status === "connecting"}
+                      onclick={() =>
+                        h.status === "connected"
+                          ? void openWindow(h.alias, null)
+                          : void connect(h.alias)}
+                    >
+                      <span
+                        class="dot {h.status === 'connected'
+                          ? 'alive'
+                          : h.status === 'connecting'
+                            ? 'starting'
+                            : ''}"
+                        title={h.status === "connected"
+                          ? "connected"
+                          : h.status === "connecting"
+                            ? "connecting…"
+                            : "not connected"}
+                      ></span>
+                      <span class="name">{h.alias}</span>
+                      {#if localState?.dev_build}
+                        <span
+                          class="pill-dev"
+                          title="dev build — every connection targets this machine's own build in ~/.chimaera-dev on {h.alias}; the real daemon there is untouched"
+                          >dev</span
+                        >
+                      {/if}
+                      {#if phase !== undefined}
+                        <span class="phase">{phase}</span>
+                      {:else if h.status === "connected"}
+                        <span class="phase quiet">connected · 127.0.0.1:{h.local_port}</span>
+                      {:else}
+                        <span class="when">{ago(h.last_connected_at)}</span>
+                      {/if}
+                      {#if h.status === "connected" && (h.live_sessions ?? 0) > 0}
+                        <span
+                          class="badge"
+                          title="{h.live_sessions} live session{h.live_sessions === 1
+                            ? ''
+                            : 's'} on {h.alias}"
+                        >
+                          <span class="dot alive"></span>{h.live_sessions}
+                        </span>
+                      {/if}
+                    </button>
+                    {#if h.status === "connected"}
+                      {#if (h.live_sessions ?? 0) > 0}
+                        <button
+                          class="side"
+                          title="end all sessions on {h.alias} — the daemon keeps running"
+                          onclick={() => (confirmEnd = h.alias)}>end sessions</button
+                        >
+                      {/if}
+                      <button
+                        class="side"
+                        title="close the tunnel — sessions keep running on {h.alias}"
+                        onclick={() => void disconnect(h.alias)}>disconnect</button
+                      >
+                      <button
+                        class="side stop"
+                        title="shut down {h.alias} — end all sessions and stop the daemon"
+                        onclick={() => (confirmShutdown = h.alias)}>shut down</button
+                      >
+                    {/if}
+                    <button class="side x" title="forget host" onclick={() => (confirmForget = h.alias)}
+                      >&times;</button
+                    >
+                  </div>
+                  {#if err !== undefined}
+                    <div class="err-line">{err}</div>
+                  {/if}
+                  {#if h.status === "connected" && h.outdated && phase === undefined}
+                    <div class="note-line" title={buildNote(h.remote_build)}>
+                      daemon is an older build —
+                      <button class="update-act" onclick={() => void connect(h.alias, true)}>
+                        update{endsLabel(h.live_sessions)}
+                      </button>
+                    </div>
+                  {/if}
+                  {#if h.status === "connected" && ws !== undefined}
+                    <div class="remote-ws">
+                      {#each ws as rw (rw.id)}
+                        <div class="rowwrap" role="presentation">
+                          <button
+                            class="row sub"
+                            title={rw.root}
+                            onclick={() => void openWindow(h.alias, rw.id)}
+                          >
+                            <span class="name">{rw.name}</span>
+                            <span class="path">{tildify(rw.root)}</span>
+                            <span class="when">{ago(rw.last_opened_at)}</span>
+                          </button>
+                        </div>
+                      {/each}
+                      {#if compCount > 0}
+                        <!-- Indicator ONLY (maintainer, 2026-07-15): the cards
+                             and the launch dialog live on the host's own page.
+                             Clicking = the host row's own action. -->
+                        <div class="rowwrap" role="presentation">
+                          <button
+                            class="row sub comp-count"
+                            title="{compCount} compute session{compCount === 1
+                              ? ''
+                              : 's'} on {h.alias} — open the host to manage them"
+                            onclick={() => void openWindow(h.alias, null)}
+                          >
+                            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+                              <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                            </svg>
+                            <span class="name"
+                              >{compCount} compute session{compCount === 1 ? "" : "s"}</span
+                            >
+                          </button>
+                        </div>
+                      {/if}
+                      <div class="rowwrap" role="presentation">
+                        <button class="row sub browse" onclick={() => void openWindow(h.alias, null)}>
+                          <span class="name">browse {h.alias}…</span>
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                {/if}
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      </section>
+    {/if}
   </div>
 
-  {#if launchFor !== null}
+  {#if launchOpen && isHostPage}
     <ComputeLaunchDialog
-      alias={launchFor}
-      partitions={remoteCompute.get(launchFor)?.partitions ?? []}
-      onClose={() => (launchFor = null)}
-      onLaunched={(alias) => {
-        launchFor = null;
-        void refreshCompute(alias);
+      alias={hostLabel}
+      partitions={hostCompute?.partitions ?? []}
+      onClose={() => (launchOpen = false)}
+      onLaunched={() => {
+        launchOpen = false;
+        void refreshHostCompute();
       }}
     />
   {/if}
@@ -1393,16 +1461,8 @@
     flex-direction: column;
   }
 
-  /* Compute sessions group: same indented register as the workspace list,
-     with its own quiet header (label + launch + refresh). */
-  .comp-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 4px 10px 2px;
-  }
-
-  .comp-acts {
+  /* The compute-sessions header carries two actions (launch + refresh). */
+  .sec-acts {
     display: flex;
     align-items: center;
     gap: 2px;
@@ -1452,11 +1512,20 @@
     color: var(--warn);
   }
 
-  .comp-hint {
-    margin: 0;
-    padding: 2px 10px 6px;
-    font-size: var(--text-xs);
+  /* Local home's per-host compute indicator: quiet like the browse row,
+     waking on hover — a count, not a control surface. */
+  .row.comp-count svg {
+    flex: none;
     color: var(--muted);
+    opacity: 0.7;
+  }
+
+  .row.comp-count .name {
+    color: var(--muted);
+  }
+
+  .row.comp-count:hover .name {
+    color: var(--fg);
   }
 
   .row.confirm {

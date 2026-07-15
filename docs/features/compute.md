@@ -60,10 +60,18 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   `squeue` rows ⋈ per-job manifests ⋈ launch records, rebuilt on every list — cards survive
   laptop closes and vanish at walltime (login daemon = forever, compute daemon = until
   walltime; the snapshot's `self` block carries the countdown the window's bottom bar wears).
-- **How it's used.** Native home screen: a connected Slurm host grows a `compute sessions`
-  group — cards (state dot, node, resources pill, time-left, open/cancel) + a "new compute
-  session…" dialog (partition picker fed by the live partitions, time/cpus/mem/gres,
-  startup commands = the launch prelude). CLI parity + verification harness:
+- **How it's used** (placement per the maintainer's first live test, 2026-07-15): the
+  **host's own window** (the login daemon's home page) is the compute hub — cards (state
+  dot, node, resources pill, time-left, open/cancel) + the "new compute session…" dialog
+  (partition picker fed by live partitions, time/cpus/mem/gres, startup commands = the
+  launch prelude), self-refreshing (30s visible / 10s while anything is PENDING / instant
+  after launch-cancel; management calls go straight to that daemon's routes — only *open*
+  crosses the native bridge for the tunnel). The **local home screen** shows just a slim
+  "N compute sessions" indicator per connected host. A **compute-node window** identifies
+  itself everywhere: title + host label become `{alias} › {node}`, and an accent-washed
+  **allocation strip** above the rail's bottom bar carries a live ticking countdown +
+  `cpus · mem · gres` (daemon-truth via the snapshot's `self` block, so windows opened
+  later on the same node inherit it). CLI parity + verification harness:
   `chimaera compute list|launch|connect|cancel <host>`.
 - **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
   the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident
