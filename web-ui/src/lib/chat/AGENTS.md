@@ -41,7 +41,7 @@ hard-resets and rebuilds.
 | `Composer.svelte` | Input: draft, images, `@`-mention + `/`-slash popovers, submit/interrupt. |
 | `Markdown.svelte` | Renders agent prose. **Sanitizes untrusted model output** (marked → DOMPurify, `<style>` forbidden, external links `noopener`); stamps validated file paths as clickable. |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). |
-| `AgentsTray.svelte` / `BackgroundTray.svelte` | The pinned work-tray strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. |
+| `AgentsTray.svelte` / `BackgroundTray.svelte` | The pinned work-tray strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field). |
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
 | `RewindDialog.svelte` | The rewind/fork-point confirmation overlay (claude fork + codex `thread/rollback`). |
