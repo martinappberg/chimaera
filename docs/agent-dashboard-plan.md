@@ -1,12 +1,35 @@
 # The Agent Dashboard — design & plan
 
-Status: **design draft for discussion** (2026-07-15). Nothing here is built.
-This document synthesizes a research pass over the codebase, the current
-Claude Code and Codex integration surfaces (verified July 2026), and prior art
-(Conductor, Crystal, claude-squad, Vibe Kanban, Sculptor, Cursor agents, Codex
-cloud, Devin, Terragon, Omnara, cmux, disler's hooks-observability), plus a
-four-lens design panel (mission-control / workbench-home / mastermind /
-skeptic). Decisions marked **[decide]** are the maintainer's call.
+Status: **design draft, first maintainer pass folded in** (2026-07-15).
+Nothing here is built. This document synthesizes a research pass over the
+codebase, the current Claude Code and Codex integration surfaces (verified
+July 2026), and prior art (Conductor, Crystal, claude-squad, Vibe Kanban,
+Sculptor, Cursor agents, Codex cloud, Devin, Terragon, Omnara, cmux, disler's
+hooks-observability), plus a four-lens design panel (mission-control /
+workbench-home / mastermind / skeptic). Decisions marked **[decide]** are the
+maintainer's call.
+
+## Decisions (maintainer, 2026-07-15)
+
+1. **Names:** the surface is the **Dashboard** (tab label `dashboard`); the
+   privileged agent and the daemon module are the **Mastermind**
+   (`mastermind/`).
+2. **Asymmetric actuation, not symmetric grants:** only the Mastermind can
+   direct other agents. Worker agents get read-only observation plus
+   `ask_mastermind`; they can never command each other, and never command the
+   Mastermind. This replaces the per-capability grant matrix from the first
+   draft (§6 rewritten accordingly).
+3. **The Mastermind delegates, it doesn't do.** It can spawn agents and
+   terminals, message workers, and make suggestions — its framing (via the
+   injected skill) is understanding + delegation, not editing files itself.
+4. **Landing:** the dashboard is the default landing surface, on for everyone
+   with an off switch — but when nothing is running (no agents, no terminals)
+   it shows no dashboard chrome at all, just the launcher-style empty state.
+5. **Exactly one Mastermind per workspace**, chosen by an explicit picker on
+   first dashboard open, changeable later. It lives on the dashboard.
+6. **Codex telemetry consent** is pitched as a dashboard card.
+7. **Subagent drop-down:** an agent card whose session has live subagents
+   expands in place to show them (spec in §4).
 
 ## 0. The one-paragraph version
 
@@ -19,10 +42,10 @@ claude hook pipeline, the per-session MCP server). Beneath it, a **workspace
 status service** (the "mastermind"): one normalized feed folded from chat
 protocol events + TUI hooks, exposed back to the agents themselves through the
 existing `chimaera` MCP server — so any agent (claude *or* codex) can ask
-"what's going on in this workspace?", and — behind explicit per-capability
-user grants — act on it. The concierge ("chat with your workspace") is then
-not a feature: it's a normal chat session of the user's own agent with that
-MCP attached.
+"what's going on in this workspace?". Acting on it is reserved for exactly
+one user-picked agent per workspace: the **Mastermind**, which lives on the
+dashboard, delegates rather than does, and is a normal chat session of the
+user's own agent with the act-tier MCP tools attached.
 
 This is not a new direction. DESIGN.md's founding moat already names an
 "attention-aware multi-agent dashboard" as one of its four legs, and M2
@@ -124,10 +147,13 @@ fallback); building the orchestration layer without owning the runtime
   "v:dashboard"` — singleton for free, exactly the Settings/Git pattern.
   Branch in `Pane.svelte`, label + glyph (BrandMark monogram, 12px) in
   `PaneTabs.svelte`, serializer case.
-- **Landing:** in `pruneAndAutoOpen()`, an *empty* restored layout opens the
-  dashboard instead of the first session. A non-empty layout restores
-  untouched — it earns the center by taking the stage only when the stage was
-  empty. Setting `dashboard.landing: auto | always | never` (default `auto`).
+- **Landing (decided):** in `pruneAndAutoOpen()`, an *empty* restored layout
+  opens the dashboard instead of the first session; a non-empty layout
+  restores untouched. On for everyone; setting `dashboard.landing:
+  auto | never` (default `auto`). When the workspace has **nothing running**
+  (no agents, no terminals), the dashboard renders no dashboard chrome — no
+  empty lanes, no zeroed counters — only the launcher-style empty state
+  (BrandMark, the Launcher rows inlined, a quickopen hint).
 - **Ambient entries:** fixed rail row above the terminals section (glyph +
   "home" + amber count when attention > 0), `⌘0`, tab-badge pulse on
   attention while unfocused. No OS notifications in v1.
@@ -164,12 +190,31 @@ SessionGlyph + state dot (`dotState()` classes) + `displayName` + model chip
 (canonical vocabulary — `xhigh` stays `xhigh`) + **provenance glyph**
 (protocol/hooks/liveness/none, with a `dotTitle`-style tooltip); a one-line
 now-line (current plan step, else last ToolCall title, else last hook signal,
-else honestly nothing); subagent line ("✳ 2 subagents · 14 tools · 31k tok" —
-the `AgentsTray` derivation promoted workspace-wide, expandable, per-agent
-stop where supported); meter row (context bar, amber >80%; cost for claude,
-token totals for codex — never fake a unit the vendor doesn't report);
-evidence row on finished/errored ("+142 −38 across 6 files · view diff" →
-Changes tab scoped to that session's files). Disclosure ladder: glance →
+else honestly nothing); subagent line ("✳ 2 subagents · 14 tools · 31k tok");
+meter row (context bar, amber >80%; cost for claude, token totals for codex —
+never fake a unit the vendor doesn't report); evidence row on
+finished/errored ("+142 −38 across 6 files · view diff" → Changes tab scoped
+to that session's files).
+
+**The subagent drop-down (decided).** A card whose session has live subagents
+expands in place — click the subagent line, the card grows an indented tree
+(one level; both vendors cap fan-out depth at 1 today). Per-subagent row:
+pulsing dot · the subagent's own name (`agent_type` or the Task description —
+"Explore: map the resync paths") · a live progress line ("14 tools · 12k tok
+· 3m", from `task_progress`) · a stop control where the vendor supports it
+(claude chat: `StopTask`; codex: none yet — absent, not disabled). Data per
+fidelity tier: **claude chat** — the Agent-kind `ToolCall` rows +
+`task_progress` the `AgentsTray` already derives, promoted workspace-wide;
+**codex chat** — threads with `parentThreadId` (multi-agent/collab mode) as
+plain rows; **claude TUI** — after the v0.2 hooks upgrade, `SubagentStart/
+Stop` carry `agent_id`/`agent_type`, so the row shows identity + start time +
+last hook signal, honestly thinner; **codex TUI** — nothing until telemetry
+consent. Expansion is per-card UI state, not persisted; the collapsed line is
+the default so ten cards with subagents stay scannable. The wire needs the
+additive `subagents[]` field on session rows (§5): `{id, agent_type,
+description, last_activity, tool_uses, tokens, started_at}` — folded
+server-side by the aggregator, capped (≤16 rows, strings ≤200 chars) so a
+runaway fan-out can't bloat every snapshot. Disclosure ladder: glance →
 peek (hover popover: last ~10 journal blocks via one bounded `attach` replay,
 strictly one peek at a time) → enter (click: open in active pane; dashboard
 stays alive behind it) → split-enter (⌥-click).
@@ -225,69 +270,97 @@ New module `crates/chimaera-server/src/mastermind/` (name **[decide]** —
   default. Codex chat MCP injection via `-c mcp_servers…` ships regardless
   (verify live first — repo rule).
 
-## 6. The workspace MCP (agents observing, then acting)
+## 6. The workspace MCP — read for all, act for one (decided)
 
 Extend `mcp.rs` — same endpoint (`/mcp/{sid}?key=`), same stateless
-streamable-HTTP, same per-session secret. Tools gated by a capability set.
+streamable-HTTP, same per-session secret. Two tiers, and the tier is decided
+by *who you are*, not by a grant matrix: every session gets the observe
+tools; **only the workspace's Mastermind session gets the act tools**. No
+agent-to-agent capabilities exist at all — workers cannot command each
+other, and cannot command the Mastermind. This is strictly simpler and
+strictly safer than the first draft's per-capability grants: there is one
+privileged principal, the user picked it, and the entire grant UI collapses
+into the Mastermind picker.
 
-**Observe (default grant for every session):** `workspace_status` (bounded
-roster + counters + git summary + active subagents), `list_agents`,
+**Observe (every agent session; global off switch):** `workspace_status`
+(bounded roster + counters + git summary + active subagents), `list_agents`,
 `agent_transcript_tail {sid, n≤50}` (compact rendered events — never raw
 grids), `recent_files`, `shell_journal` (stays link-scoped),
-`list_surfaces`. The last needs the one new client obligation: alongside the
-opaque view-state blob, the client PUTs a tiny normalized **surface
-manifest** (`{surfaces:[{surface:"file",path}|{surface:"terminal",sid}|…]}`,
-≤4 KB, versioned, additive) — "what's open" becomes machine-readable without
+`list_surfaces`, and **`ask_mastermind {text}`** — the one worker→up
+channel: the question lands in the Mastermind's chat wrapped in an
+untrusted-content frame with provenance (`from session s-9f2c`), and the
+tool returns "delivered" immediately (async — the Mastermind replies via
+`message_agent` if it chooses). Workers ask; they never instruct.
+`list_surfaces` needs the one new client obligation: alongside the opaque
+view-state blob, the client PUTs a tiny normalized **surface manifest**
+(`{surfaces:[{surface:"file",path}|{surface:"terminal",sid}|…]}`, ≤4 KB,
+versioned, additive) — "what's open" becomes machine-readable without
 teaching the server the layout tree.
 
-**Act (each individually user-granted):** `message_agent {sid, text, mode:
-propose|send}` — `send` maps to `AgentCommand::Send` on the existing pump
-(chat sessions only; **TUI targets are propose-only forever**; the exec-409
-wall stands); `spawn_agent` (through the normal spawn path — env scrubbing
-and `--session-id` minting stay centralized); `interrupt_agent` /
-`stop_subagent` (never kill); `open_in_pane` (a UI *intent* frame on
-`/ws/events`, executed by the focused client through its normal open path).
+**Act (Mastermind only):** `message_agent {sid, text}` — maps to
+`AgentCommand::Send` on the existing pump for chat sessions; for **TUI
+targets it always degrades to a proposal card** (the exec-409 wall stands:
+nothing types into a TUI); `spawn_agent {agent, prompt, model?, ui?}` and
+`spawn_terminal {name?, cwd?}` — both through the daemon's normal spawn
+paths (env scrubbing and `--session-id` minting stay centralized), so the
+Mastermind can stand up a new worker or a shell and hand back the session
+id; `interrupt_agent` / `stop_subagent` (never kill); `open_in_pane` (a UI
+*intent* frame on `/ws/events`, executed by the focused client through its
+normal open path); `suggest {title, body, action?}` — a card on the
+dashboard the user can accept with one click (the "give me suggestions"
+channel that doesn't touch anything until clicked). Act calls are
+rate-limited (e.g. 6 sends/min, 4 spawns/10min) so a looping Mastermind
+can't stampede, and **every** act call appends to the audit log.
 
-**Grants** (`grants.json`, atomic tmp+rename): tiers `observe` →
-`message.propose` (default: proposals are inert cards on the dashboard and
-the target's rail row; the user clicks to deliver) → `message.send` /
-`spawn` / `interrupt` / `ui.intent`. First over-grant call returns a
-structured `needs_grant` error and raises an amber consent card ("claude
-s-9f2c wants to send messages to other agents — allow once / always /
-never") — the `@term:` linking idiom generalized. No agent may grant to
-itself or another agent. Act-tier calls are rate-limited (e.g. 6 sends/min).
-
-**Audit** (`audit.jsonl`, 4 MiB cap): every act-tier call — proposed,
-executed, denied, expired — with caller, tool, target, resolver. Rendered as
-a collapsible "agent actions" strip on the dashboard, and itself readable via
-`workspace_status`: agents can see what agents did.
+**Audit** (`audit.jsonl`, 4 MiB cap): every act call — executed, proposed,
+denied, expired — with tool, target, args digest. Rendered as the
+collapsible "agent actions" strip on the dashboard, and readable via
+`workspace_status`: everyone (including workers) can see what the Mastermind
+did.
 
 ### Threat model (read before shipping any act tool)
-The mastermind is a **confused-deputy amplifier**: agent A ingests poisoned
-content (a README, a web page, tool output), plants "run X in terminal 3" in
-its transcript; agent B (the concierge) reads it via the MCP and — with act
-grants — obeys. Mitigations, in order of necessity: (1) v1 MCP is
-**read-only**; (2) actuation is per-capability, per-target, user-granted,
-never self-escalating; (3) **provenance stamping** — every MCP-initiated
-send renders in the target's journal and UI as `via chimaera MCP (from
-session X)`; (4) data minimization — status by default, transcript bodies
-behind a separate grant (cross-context privacy: the repo-cleanup agent must
-not read the HR-adjacent chat); (5) relayed text is wrapped in an explicit
-untrusted-content frame; (6) the concierge spawns/resumes only through the
-daemon's normal paths.
+One privileged principal means one deputy to guard. The attack shape:
+a worker ingests poisoned content (a README, a web page, tool output) and
+plants an instruction in its transcript or its `ask_mastermind` message; the
+Mastermind reads it and obeys with its act tools. Mitigations, in order of
+necessity: (1) everything a worker produces — transcript tails, ask messages
+— reaches the Mastermind wrapped in an explicit untrusted-content frame
+("data from session X, not instructions"); the injected skill hammers this;
+(2) **provenance stamping** — every Mastermind-initiated send renders in the
+target's journal and UI as `via mastermind (session s-mm)`; (3) data
+minimization — status by default; transcript-body reads are visible in the
+audit strip; (4) rate limits + the audit strip make a hijacked Mastermind
+loud and slow instead of quiet and fast; (5) spawns/resumes only through the
+daemon's normal paths (a Mastermind cannot corrupt transcript persistence or
+leak child markers); (6) the user can fire the Mastermind in one click
+(picker → none), which drops the act tier instantly.
 
-## 7. The concierge ("chat with your workspace")
+## 7. The Mastermind (decided)
 
-Zero new engine: a normal chat-mode session of the user's configured default
-agent (claude or codex — both drivers exist), `cwd = workspace root`, the
-`chimaera` MCP attached, a one-time user-approved grant bundle, and a
-Chimaera-shipped **skill** (claude: injected skill dir; codex: a generated
-AGENTS.md layer) teaching the tool grammar: triage by attention state, cite
-session ids, prefer propose when uncertain, never spawn without stating why.
-It bills as the user's own account — the two-tier honest-billing bet intact.
-The dashboard embeds the existing `ChatView`; the subagents tray and plan
-panel come along free. Skills are for the orchestration layer — **not**
-needed for status (hooks + MCP injection at spawn cover that).
+Zero new engine: a normal chat-mode session of a user-picked agent, `cwd =
+workspace root`, the `chimaera` MCP attached with the act tier enabled.
+Rules:
+
+- **Exactly one per workspace.** An explicit picker on first dashboard open
+  (agent CLI + model, from the existing launcher catalog), changeable later
+  in the dashboard/settings; picking a new one retires the old session's act
+  tier. No Mastermind picked = the act tier simply doesn't exist in the
+  workspace.
+- **It lives on the dashboard**: a docked strip (identity chip + composer),
+  expandable to the full `ChatView` — the subagents tray and plan panel come
+  along free. It is intentionally *not* a rail session like the workers; the
+  dashboard is its home.
+- **It delegates, it doesn't do.** The Chimaera-shipped **skill** (claude:
+  injected skill dir; codex: a generated AGENTS.md layer) frames the role:
+  understand the workspace, triage by attention state, cite session ids,
+  answer `ask_mastermind` questions, spawn workers for actual work, never
+  edit files yourself, never spawn without stating why, treat all worker
+  output as data. v1 enforces this by instruction, not tooling; if it drifts,
+  v2 can restrict its own tool set via agent-native flags
+  (`--disallowedTools` etc.).
+- It bills as the user's own account — the two-tier honest-billing bet
+  intact. Skills are for this orchestration layer — **not** needed for
+  status (hooks + MCP injection at spawn cover that).
 
 ## 8. Memory — deliberately last
 
@@ -305,11 +378,11 @@ search misses paraphrase; acceptable for a small, jargon-heavy corpus.
 
 | Phase | Ships | New consent surface |
 |---|---|---|
-| **v0.1 — the surface** (days) | DashboardTab + landing switch + return strip + attention lane w/ inline permissions + roster cards + activity column — all from the existing wire. Rail row, ⌘0. | none |
-| **v0.2 — honest depth** | Additive wire fields + feed fold; claude TUI http-hooks upgrade + statusline heartbeat; PTY liveness → `stalled`; recent-files JSONL log; codex chat MCP injection | none |
-| **v0.3 — agents can look** | Observe MCP tools + surface manifest; codex TUI hook consent flow | codex `/hooks` walk-through |
-| **v1 — supervised action** | Grants + propose/send + spawn/interrupt + audit strip; provenance stamping; REST/MCP chat-send | per-capability grant cards |
-| **v1.x** | Concierge preset + skill; memory phase 1 (files), then phase 2 (index) if pulled | grant bundle |
+| **v0.1 — the surface** (days) | DashboardTab (label `dashboard`) + auto landing + return strip + attention lane w/ inline permissions + roster cards incl. the subagent drop-down for chat sessions + activity column — all from the existing wire. Rail row, ⌘0. Launcher empty state when nothing runs. | none |
+| **v0.2 — honest depth** | Additive wire fields (`subagents[]`, `provenance`, `now_line`, usage) + feed fold; claude TUI http-hooks upgrade (subagent identity for TUIs) + statusline heartbeat; PTY liveness → `stalled`; recent-files JSONL log; codex chat MCP injection | none |
+| **v0.3 — agents can look** | Observe MCP tools + `ask_mastermind` (queued until a Mastermind exists) + surface manifest; codex TUI hook consent flow | codex `/hooks` walk-through (dashboard card) |
+| **v1 — the Mastermind** | Picker (one per workspace) + docked strip on the dashboard + act tools (`message_agent`, `spawn_agent`, `spawn_terminal`, `interrupt`, `open_in_pane`, `suggest`) + audit strip; provenance stamping; REST/MCP chat-send | the Mastermind picker itself |
+| **v1.x** | The Mastermind skill hardening; suggestion cards polish; memory phase 1 (files), then phase 2 (index) if pulled | none |
 
 Each phase is independently verifiable live (`verify-app`) and useful alone.
 The **wedge** (v0.1's reason to exist): *the attention queue with inline
@@ -318,16 +391,25 @@ persistence + honest cross-vendor state — no competitor has all three.
 
 ## 10. Open questions **[decide]**
 
-1. Tab label & noun: "home" vs "dashboard" (rail row says `home`?).
-2. Default landing mode `auto` (empty-layout-only) — or `always` for a true
-   "center page"?
-3. Module/name for the status service: `mastermind` is fun; `feed` is boring
-   and durable.
-4. Does v0.1 ship behind a setting, or on for everyone?
-5. Concierge default agent: the user's `agents.defaultView` agent, or an
-   explicit picker on first open?
-6. How loudly to pitch the codex hooks consent (dashboard card vs settings
-   page only)?
+Resolved 2026-07-15: name (Dashboard surface / Mastermind agent+module),
+landing (auto, on for everyone, off switch, launcher when idle), one
+Mastermind per workspace via explicit picker, codex consent as a dashboard
+card. Still open:
+
+1. **Mastermind sends: direct or propose-first at launch?** The decided
+   model lets it direct chat workers outright (audited, rate-limited). A
+   conservative launch variant makes even chat sends proposal cards for the
+   first release, flipping to direct once trust is earned. Lean: direct,
+   with the audit strip prominent — but cheap to flip.
+2. **"New agent window":** `spawn_agent` opens a session (a pane); spawning
+   a native OS *window* is a shell concern — defer to a UI intent the native
+   shell handles, or drop?
+3. **Does `ask_mastermind` exist before a Mastermind is picked?** Lean:
+   yes, queued — the first pick drains the queue; the tool result says
+   "no mastermind yet — queued for when one exists".
+4. **Should the Mastermind's session appear in the rail's agents list**, or
+   only on the dashboard? Lean: dashboard-only (it's furniture, not a
+   worker), with the picker as the only management surface.
 
 ## Appendix: what we deliberately do NOT build
 
