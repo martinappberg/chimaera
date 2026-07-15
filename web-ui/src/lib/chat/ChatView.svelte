@@ -7,6 +7,7 @@
   import { insertIntoComposer } from "./composerBus";
   import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
+  import { formatElapsedSeconds } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
@@ -577,31 +578,20 @@
     }, 1000);
     return () => clearInterval(iv);
   });
-  /** Upward "1h 2m 13s"-style elapsed, leading zero-units dropped: "7s",
-   *  "1m 04s", "1h 02m 03s". Null below 5s so quick turns stay uncluttered. */
+  /** Upward elapsed for the live status row (shared ladder: "7s", "1m 04s",
+   *  "1h 02m 03s"). Null below 5s so quick turns stay uncluttered. */
   const turnElapsedLabel = $derived.by(() => {
     const total = Math.floor(turnElapsedMs / 1000);
     if (total < 5) return null;
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    if (h > 0) return `${h}h ${pad(m)}m ${pad(s)}s`;
-    if (m > 0) return `${m}m ${pad(s)}s`;
-    return `${s}s`;
+    return formatElapsedSeconds(total);
   });
   /** A completed turn's duration for the turn-end badge. Sub-minute keeps one
-   *  decimal ("2.4s"); a minute or more switches to "44m 24s" / "1h 02m 03s"
-   *  so a long turn never renders as a raw "2664.6s". */
+   *  decimal ("2.4s"); a minute or more switches to the shared ladder so a
+   *  long turn never renders as a raw "2664.6s". */
   function formatDurationMs(ms: number): string {
     const totalSec = ms / 1000;
     if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
-    const total = Math.floor(totalSec);
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    return h > 0 ? `${h}h ${pad(m)}m ${pad(s)}s` : `${m}m ${pad(s)}s`;
+    return formatElapsedSeconds(Math.floor(totalSec));
   }
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
