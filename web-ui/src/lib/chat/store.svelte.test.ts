@@ -313,3 +313,98 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.activity).toBeNull();
   });
 });
+
+describe("ChatStore background tasks", () => {
+  const BG = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "bg-1",
+    task_type: "local_bash",
+    description: "sleep 30",
+    status: "running",
+    started_at_ms: 1000,
+    ...over,
+  });
+
+  it("replaces the set on every event (level-set, never a patch)", () => {
+    const store = fold([
+      { type: "background_tasks", tasks: [BG()] },
+      { type: "background_tasks", tasks: [BG({ id: "bg-2", description: "make -j" })] },
+    ]);
+    // The second event REPLACED the set — bg-1 is gone, only bg-2 remains.
+    expect(store.backgroundTasks).toHaveLength(1);
+    expect(store.backgroundTasks[0]).toMatchObject({
+      id: "bg-2",
+      taskType: "local_bash",
+      description: "make -j",
+      status: "running",
+      startedAtMs: 1000,
+    });
+  });
+
+  it("folds a close verdict into history as a notice and empties the set", () => {
+    const store = fold([
+      { type: "background_tasks", tasks: [BG()] },
+      {
+        type: "background_tasks",
+        tasks: [],
+        closed: [{ id: "bg-1", description: "sleep 30", status: "completed", summary: "exit 0" }],
+      },
+    ]);
+    expect(store.backgroundTasks).toHaveLength(0);
+    const notices = store.blocks.filter((b) => b.kind === "notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ tone: "info" });
+    expect((notices[0] as { text: string }).text).toContain("sleep 30");
+    expect((notices[0] as { text: string }).text).toContain("completed");
+    expect((notices[0] as { text: string }).text).toContain("exit 0");
+  });
+
+  it("renders a failed verdict as an error notice", () => {
+    const store = fold([
+      { type: "background_tasks", tasks: [BG()] },
+      {
+        type: "background_tasks",
+        tasks: [],
+        closed: [{ id: "bg-1", description: "sleep 30", status: "failed" }],
+      },
+    ]);
+    const notices = store.blocks.filter((b) => b.kind === "notice");
+    expect(notices[0]).toMatchObject({ tone: "error" });
+  });
+
+  it("survives a turn end but dies with the driver process", () => {
+    // Cross-turn: the turn ending does not clear the set (that's the point
+    // of background work) — but a driver exit does (the tasks were the
+    // CLI's children), and a fresh init starts empty.
+    const store = fold([
+      { type: "turn_started", turn_id: "t1" },
+      { type: "background_tasks", tasks: [BG()] },
+      { type: "turn_completed", turn_id: "t1", usage: {} },
+    ]);
+    expect(store.backgroundTasks).toHaveLength(1);
+    store.apply({ seq: 4, ts: 4, ev: { type: "exited", status: 0 } } as SeqEvent);
+    expect(store.backgroundTasks).toHaveLength(0);
+
+    const respawned = fold([
+      { type: "background_tasks", tasks: [BG()] },
+      { type: "init", native_session_id: "n2" },
+    ]);
+    expect(respawned.backgroundTasks).toHaveLength(0);
+  });
+
+  it("replay converges on the last set event", () => {
+    const events = [
+      { type: "background_tasks", tasks: [BG()] },
+      { type: "background_tasks", tasks: [BG(), BG({ id: "bg-2", description: "audit" })] },
+      {
+        type: "background_tasks",
+        tasks: [BG({ id: "bg-2", description: "audit" })],
+        closed: [{ id: "bg-1", description: "sleep 30", status: "stopped" }],
+      },
+    ];
+    const live = fold(events);
+    const replay = fold(events);
+    expect(replay.backgroundTasks).toEqual(live.backgroundTasks);
+    expect(replay.blocks).toEqual(live.blocks);
+    expect(live.backgroundTasks.map((t) => t.id)).toEqual(["bg-2"]);
+  });
+});

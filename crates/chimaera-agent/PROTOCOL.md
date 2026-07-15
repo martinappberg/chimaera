@@ -383,9 +383,47 @@ tool_uses, duration_ms}}`. New subtypes on the same wire:
 `background_tasks_changed {tasks:[{task_id, task_type, description}]}` — a
 REPLACE-the-set signal (empty array = none left). The driver binds by
 tool_use_id when present (description fallback for older CLIs) and honors
-the notification verdict; the background lane (local_bash etc. +
-task_updated + background_tasks_changed) is recognized but NOT yet
-rendered — a dedicated background-tasks surface is planned.
+the notification verdict. The background lane (non-`local_agent`
+task_started + task_updated + background_tasks_changed + the notification
+close) feeds the normalized `background_tasks` level-set event and the
+chat UI's background tray.
+
+**Background frame ORDER, live-verified 2.1.207** (raw `-p stream-json`
+probe, backgrounded `sleep 8`): at spawn, `background_tasks_changed`
+(set WITH the task) arrives immediately BEFORE `task_started` — same
+instant. At settle, the removal precedes the verdict by ~10 ms:
+`background_tasks_changed {tasks:[]}` → `task_updated {patch:{status:
+"completed", end_time}}` → `task_notification {status, summary
+("Background command … completed (exit code 0)"), output_file}` — then a
+fresh `system/init` and a bare no-turn `result` (the CLI telling the
+model). So a driver that forgets a task at the set-change drops the
+verdict: chimaera parks removed-but-unverdicted tasks in a bounded
+departed buffer and folds the close from the notification (the only frame
+carrying summary + output_file). No `task_progress` fires for background
+tasks.
+
+**stop_task is generic over the task registry** (binary mining +
+LIVE-VERIFIED 2.1.207: a `stop_task {task_id}` with a running local_bash
+key killed the shell and produced `task_notification {status:"stopped",
+summary: <the description>, output_file}`; a natural finish produces
+`status:"completed", summary:"Background command \"…\" completed (exit
+code 0)"`):
+the control's schema is `{subtype:"stop_task", task_id}` described plainly
+as "Stops a running task"; the handler resolves the id from the SAME
+registry that holds every task type (local_agent, local_bash,
+remote_agent, …) and dispatches a per-type kill driver ("Unsupported task
+type" error otherwise). `not_found`/`not_running` errors are acked as
+SUCCESS (`{}`), so a stop racing the task's own finish is harmless; the
+kill emits a `task_notification {status:"stopped"}`. So the background
+tray's kill button sends the native background task_id through the
+existing stop_task control — no separate shell-kill control needed (the
+`{task_id, shell_id}` shape seen in earlier mining is registry-internal
+state, not a distinct control). The `background_tasks` CONTROL (Ctrl-B
+parity) is the other direction: `tool_use_id` present backgrounds that one
+task, ABSENT backgrounds all foreground tasks (Bash commands and
+subagents); each backgrounded tool call returns a "running in the
+background" tool_result immediately and settles later via
+task_notification.
 
 ### Codex: model/list + settings + steer (partially adopted)
 

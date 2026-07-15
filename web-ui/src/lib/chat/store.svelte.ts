@@ -179,6 +179,20 @@ export interface UsageWindow {
   resets_at?: string | null;
 }
 
+/** One running background task (claude's backgrounded Bash / workflows).
+ *  Mirrors the wire's `background_tasks` set member. */
+export interface BackgroundTask {
+  /** The agent's own task key — sent back verbatim as stop_task's task_id. */
+  id: string;
+  /** Lane name, verbatim (local_bash, local_workflow, …). */
+  taskType: string;
+  description: string;
+  /** The agent's own status word (`running` until it patches it). */
+  status: string;
+  /** Driver-stamped epoch ms at first sight — the elapsed display's anchor. */
+  startedAtMs: number;
+}
+
 export interface ModeInfo {
   id: string;
   label: string;
@@ -241,6 +255,11 @@ export class ChatStore {
   /** CLI-suggested next prompt (claude prompt_suggestion) — composer ghost
    *  chip; cleared when the user sends anything. */
   promptSuggestion = $state<string | null>(null);
+  /** The agent's live background tasks (the `background_tasks` level-set) —
+   *  the background tray. Survives turn ends (background work is cross-turn);
+   *  dies with the driver process (cleared on init/exited: the tasks are the
+   *  CLI's children). */
+  backgroundTasks = $state<BackgroundTask[]>([]);
 
   /** Extended-thinking preference (claude). NOT journal-derived — the CLI has
    *  no read-back — but kept HERE (pooled per session, surviving a ChatView
@@ -324,6 +343,7 @@ export class ChatStore {
     // (or a stuck "running") must not outlive the reset; the replay rebuilds
     // whatever is genuinely current.
     this.plan = [];
+    this.backgroundTasks = [];
     this.running = false;
     this.activity = null;
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
@@ -345,6 +365,9 @@ export class ChatStore {
         // view must re-push the user's preference to it (seq-dedupe means only
         // a genuinely-new init re-applies here; a plain reconnect doesn't).
         this.thinkingPushed = false;
+        // Background tasks were the OLD process's children — they died with
+        // it. A replayed set event after this init rebuilds any live ones.
+        this.backgroundTasks = [];
         // Any ask still pending predates this driver process — its reply
         // route died with the old one, so an answer could never land. Seq
         // ordering makes this safe: a live driver's Init is journaled BEFORE
@@ -385,6 +408,31 @@ export class ChatStore {
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         }
         this.promptSuggestion = null;
+        break;
+      }
+      case "background_tasks": {
+        // LEVEL-SET: the event carries the whole set — replace, never patch,
+        // so replay's final state is simply the last event seen.
+        this.backgroundTasks = ((ev.tasks as Record<string, unknown>[]) ?? []).map((t) => ({
+          id: t.id as string,
+          taskType: (t.task_type as string) ?? "",
+          description: (t.description as string) ?? "",
+          status: (t.status as string) ?? "running",
+          startedAtMs: (t.started_at_ms as number) ?? 0,
+        }));
+        // Tasks that left the set WITH a verdict fold into history as quiet
+        // notices — completion is transcript-worthy; a set change alone is
+        // not. A stop's wire summary IS the description (live-verified), so
+        // an echoing summary is dropped rather than said twice.
+        for (const c of (ev.closed as Record<string, unknown>[]) ?? []) {
+          const desc = (c.description as string) ?? "background task";
+          const status = (c.status as string) ?? "completed";
+          const summary = (c.summary as string) ?? "";
+          this.notice(
+            `background “${desc}” ${status}${summary !== "" && summary !== desc ? ` — ${summary}` : ""}`,
+            status === "failed" ? "error" : "info",
+          );
+        }
         break;
       }
       case "user_message_update": {
@@ -755,6 +803,9 @@ export class ChatStore {
         this.activity = null;
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
+        // Background tasks are the CLI's children — they died with it (the
+        // CLI SIGTERMs its tracked shells on exit).
+        this.backgroundTasks = [];
         // The reply route for any pending ask died with the process. The
         // driver drains resolutions before Exited, so this is usually a
         // no-op — it covers old journals recorded before that fix.
