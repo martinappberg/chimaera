@@ -1,15 +1,18 @@
 # Compute (Slurm awareness)
 
-Scheduler detection + a slim queue strip: when the host a daemon runs on has Slurm, the
-workbench shows it — a compute chip in the rail's bottom bar with the user's queued/running
-job count, and a popover listing their jobs and the cluster's partitions. On a laptop (no
-scheduler) the whole surface is invisible. First slice of the M5 HPC layer's *placement
-axis*; the deep design (Mode 1 login-node job control, Mode 2 compute-node sessions) lives
-in the [architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
+Scheduler detection + a slim **indicator**: when the host a daemon runs on has Slurm, the
+rail's bottom bar shows a passive compute chip — a queue glyph plus the user's
+queued/running job count (tooltip carries the words). Deliberately NOT a control surface:
+no popover, no queue browsing from the rail (maintainer call, 2026-07-15 — that arrives
+with the agent dashboard; launching onto compute nodes is the home screen's Mode 2 flow).
+On a laptop (no scheduler) the whole surface is invisible. First slice of the M5 HPC
+layer's *placement axis*; the deep design (Mode 1 login-node job control, Mode 2
+compute-node sessions) lives in the
+[architecture guide](../agent-guides/architecture.md#environment-prelude-compute-node-sessions).
 
 **Where it lives (shared):** daemon `crates/chimaera-server/src/compute.rs` (detection +
 snapshot service + route). UI `web-ui/src/lib/workspace/compute.ts` (store/poller) and the
-chip + popover in `web-ui/src/App.svelte` (the `.daemon` bottom bar, beside the git chip).
+indicator chip in `web-ui/src/App.svelte` (the `.daemon` bottom bar, beside the git chip).
 Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
 
 ## Detection & the snapshot
@@ -21,8 +24,9 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   the daemon's lifetime; `?refresh=true` re-detects (e.g. after a `module load slurm`).
 - **How it's used.** The UI fetches `GET /api/v1/compute` at boot; if `scheduler` is
   `"none"` it never asks again that page-load. On a Slurm host it refetches every 60s while
-  the tab is visible. The chip appears only when `scheduler == "slurm"`; clicking it opens
-  the popover (jobs + partitions + a manual refresh).
+  the tab is visible. The chip appears only when `scheduler == "slurm"` and is read-only
+  orientation; the jobs/partitions detail in the snapshot feeds the coming launch dialog
+  and dashboard surfaces.
 - **Where it lives.** `ComputeService` (detection + 30s snapshot cache, single-flight —
   concurrent requests coalesce on one refresh); `parse_squeue`/`parse_sinfo` are pure and
   unit-tested against Sherlock-shaped fixtures.
@@ -73,3 +77,15 @@ _Captured 2026-07-15 (from the maintainer; drafted from his design-session words
   ladder finds no path.
 - **Do not change:** the probe-and-degrade-honestly posture, and hidden-off-cluster.
   Everything else is an addition, open to improvement.
+
+### Addendum — the chip is an indicator, not a controller
+_Captured 2026-07-15 (maintainer, direct feedback after first live use)._
+
+- The rail chip stays a **passive indicator** on login-node workspaces ("there is no
+  reason from the login-node workspace right now to show slurms etc. from the left-pane,
+  that should just be an indicator"). The queue-browsing functionality is good and will be
+  **extended later into the agent dashboard**, not grown in the rail.
+- The real destination is **Mode 2 from the native window launcher** — especially when
+  browsing a remote host: submit a chimaera session as an HPC job, displayed as its own
+  first-class connectable entity ("like a workspace you connect to, which then has a
+  certain x compute and hours left").

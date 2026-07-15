@@ -171,7 +171,3 @@ export function initCompute(): () => void {
   };
 }
 
-/** Manual refresh (the popover's button): forces scheduler re-detection. */
-export function refreshCompute(): void {
-  if (started) void fetchSnapshot(true);
-}

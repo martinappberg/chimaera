@@ -204,7 +204,6 @@
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
-  import ComputePopover from "./lib/workspace/ComputePopover.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
   import QuickOpen from "./lib/workspace/QuickOpen.svelte";
   import FileTree from "./lib/workspace/FileTree.svelte";
@@ -414,8 +413,6 @@
   /** The stage element; its edges are the root-split drop targets. */
   let stageEl = $state<HTMLElement | null>(null);
   // Slurm queue popover (the daemon bar's compute chip; anchor = chip rect).
-  let computeOpen = $state(false);
-  let computeAnchor = $state<DOMRect | null>(null);
 
   const winKey = windowKey();
 
@@ -3337,21 +3334,14 @@
         {/if}
         {#if $computeStatus?.scheduler === "slurm"}
           {@const queued = queuedJobCount($computeStatus)}
-          <!-- Slurm orientation: the scheduler exists here and how much of
-               your work is in its queue; one click opens the queue popover. -->
-          <button
+          <!-- Slurm orientation, indicator ONLY (maintainer, 2026-07-15):
+               the scheduler exists here + how much of your work is queued.
+               Queue browsing/management deliberately does NOT live in the
+               rail — that arrives with the agent dashboard; launching onto
+               compute nodes belongs to the home screen's Mode 2 flow. -->
+          <span
             class="daemon-compute"
-            class:open={computeOpen}
             title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
-            aria-expanded={computeOpen}
-            onclick={(e) => {
-              if (computeOpen) {
-                computeOpen = false;
-              } else {
-                computeAnchor = e.currentTarget.getBoundingClientRect();
-                computeOpen = true;
-              }
-            }}
           >
             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <rect
@@ -3396,7 +3386,7 @@
               />
             </svg>
             {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
-          </button>
+          </span>
         {/if}
         {#if canCaffeinate}
           <button
@@ -3595,9 +3585,6 @@
   />
 {/if}
 
-{#if computeOpen && computeAnchor !== null}
-  <ComputePopover anchor={computeAnchor} onClose={() => (computeOpen = false)} />
-{/if}
 
 {#if pickerOpen}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
@@ -4488,29 +4475,16 @@
   /* Slurm chip: scheduler presence + your queued-job count, quiet like the
      git chip (same height/typography); flex:none so a long branch name
      truncates before this disappears. */
+  /* Passive indicator (no hover/press affordance): slurm-here + queue count. */
   .daemon-compute {
     flex: none;
-    appearance: none;
-    border: none;
-    background: none;
     display: flex;
     align-items: center;
     gap: 0.22rem;
     height: 20px;
     padding: 0 0.3rem;
-    border-radius: 5px;
     color: var(--muted);
-    cursor: pointer;
     font: inherit;
-    transition:
-      background-color 0.12s ease,
-      color 0.12s ease;
-  }
-
-  .daemon-compute:hover,
-  .daemon-compute.open {
-    background: var(--row-hover);
-    color: var(--fg);
   }
 
   .dc-count {
