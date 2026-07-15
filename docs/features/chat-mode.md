@@ -330,5 +330,17 @@ _Captured 2026-07-12 (from the maintainer, in-session)._
   transcript for conversation).
 
 ### Background-work tray — why it exists
+_Captured 2026-07-15 (from the maintainer)._
 
-_Intent pending — to be captured from the maintainer (capture-feature-intent)._
+- **Problem it solves:** both the trigger and the frame. The trigger: backgrounded bash/workflows
+  were invisible the moment the turn ended — nothing showed what was still running, nothing could
+  kill it, and completions arrived silently. The frame: the same **workbench-promotion** principle
+  as the subagents tray — long-lived, monitorable work belongs in a pinned surface, not scrolled-away
+  transcript.
+- **How settled it is:** **mostly provisional** — only the *why* is settled. The surface, placement,
+  notices, and chrome are all free to change if improved.
+- **Deliberately open / where it may go:** both known gaps are open improvements, not decisions —
+  the close carries `output_file` but the tray doesn't yet open/preview the task's output, and codex
+  has no background lane today (claude-only by wire reality, not by design choice).
+- **Open to change:** fully. **Grade — addition**: no locked rules beyond the repo's standing
+  invariants; don't treat any of the current mechanics as a contract.
