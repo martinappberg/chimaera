@@ -35,14 +35,39 @@ pub fn open_ui_window(
     if let Some(alias) = &record.alias {
         hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
     }
-    let url = format!("http://127.0.0.1:{port}/#{hash}")
-        .parse()
-        .expect("daemon url is always valid");
-    let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
+    let url = format!("http://127.0.0.1:{port}/#{hash}");
     let title = match &record.alias {
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
+    open_shell_window(app, &url, &title, record, record.alias.clone())
+}
+
+/// Open a window on a compute-node daemon (Mode 2). Same shell wiring as
+/// `open_ui_window`, but the URL is the ComputeTunnel's own (token + host +
+/// job + node already ride its hash; only `win=` is added here) and the
+/// tracked scope alias is the composite `"{alias}#job{id}"` so focus-existing
+/// never confuses a job window with the login host's.
+pub(super) fn open_compute_window(
+    app: &AppHandle,
+    url: &str,
+    title: &str,
+    record: &WindowRecord,
+    scope_alias: &str,
+) -> tauri::Result<()> {
+    let url = format!("{url}&win={}", urlencoding::encode(&record.id));
+    open_shell_window(app, &url, title, record, Some(scope_alias.to_string()))
+}
+
+fn open_shell_window(
+    app: &AppHandle,
+    url: &str,
+    title: &str,
+    record: &WindowRecord,
+    scope_alias: Option<String>,
+) -> tauri::Result<()> {
+    let url = url.parse().expect("daemon url is always valid");
+    let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
         .title(title)
         // Tauri's own drag-drop handler intercepts OS file drops and suppresses
@@ -68,7 +93,7 @@ pub fn open_ui_window(
         lock(&shell.windows).insert(
             label,
             WindowScope {
-                alias: record.alias.clone(),
+                alias: scope_alias,
                 ws: record.ws.clone(),
                 stable_id: record.id.clone(),
                 // Named by the SPA once it mounts (report_window_scope); until
@@ -145,6 +170,15 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
     let mut opened = false;
     let mut remote_aliases: Vec<String> = Vec::new();
     for record in &records {
+        // A compute window was a view onto a walltime-bounded job tunnel that
+        // did not survive the restart — walltime death is honest, and the
+        // home-screen card is the reconnect path. Purge the record so
+        // windows.json doesn't accumulate dead jobs across quits.
+        if record.compute.is_some() {
+            let shell = handle.state::<Shell>();
+            lock(&shell.registry).remove(&record.id);
+            continue;
+        }
         match &record.alias {
             None => match open_ui_window(handle, port, token, record) {
                 Ok(()) => opened = true,

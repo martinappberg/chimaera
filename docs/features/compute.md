@@ -45,9 +45,38 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   - **Test knob:** `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
     `sbatch`/`squeue`/`sinfo` so the whole surface can be driven live without a cluster
     (the `CHIMAERA_RELEASES_API` pattern).
-- **Status: partial (by design).** Detection + the strip only. Planned on this seam, per
-  the architecture spec: job↔session linking, the login-node Slurm skill (Mode 1), and
-  sbatch-launched compute-node sessions (Mode 2).
+- **Status: partial (by design).** Detection + the strip, plus the Mode 2 core below.
+  Still to come on this seam: job↔session linking and the login-node Slurm skill (Mode 1).
+
+## Mode 2 — chimaera sessions AS Slurm jobs
+
+- **What & when.** Launch a whole chimaera daemon *inside* an allocation and connect to it
+  as a first-class entity — "a workspace you connect to, with x compute and hours left."
+  The login daemon is the control plane: `POST/GET /api/v1/compute/sessions` +
+  `DELETE /api/v1/compute/sessions/{job_id}` (bearer-authed). Launch renders an sbatch
+  script (directives charset-validated; body = the environment prelude verbatim + an egress
+  probe to `caps.json`; `exec chimaera serve` with an isolated `CHIMAERA_HOME` per jobid on
+  the shared FS — same binary, no redeploy). The registry is stateless: `chimaera-`named
+  `squeue` rows ⋈ per-job manifests ⋈ launch records, rebuilt on every list — cards survive
+  laptop closes and vanish at walltime (login daemon = forever, compute daemon = until
+  walltime; the snapshot's `self` block carries the countdown the window's bottom bar wears).
+- **How it's used.** Native home screen: a connected Slurm host grows a `compute sessions`
+  group — cards (state dot, node, resources pill, time-left, open/cancel) + a "new compute
+  session…" dialog (partition picker fed by the live partitions, time/cpus/mem/gres,
+  startup commands = the launch prelude). CLI parity + verification harness:
+  `chimaera compute list|launch|connect|cancel <host>`.
+- **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
+  the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident
+  `ssh -N -L` relay to the node's loopback, running as the remote command of the same
+  laptop ssh that forwards to it (lifetimes coupled; the path on hostbased-only clusters
+  like Sherlock — verified live) → **A** direct login→node forward, only for jobs launched
+  `--bind-routable` (opt-in 0.0.0.0, token-gated) → else "not supported on this cluster",
+  and the job keeps running for login-node use.
+- **Key constraints.** Tokens/ports never reach the home-screen JS (the app shell scrubs
+  them and holds tunnels in Rust, keyed `"{alias}#job{job_id}"`); launch-restore skips
+  compute windows (the card is the reconnect path); cluster-vintage tooling is assumed
+  hostile-old (login-node OpenSSH without `accept-new`, `%C` needing `%%` escaping inside
+  ProxyCommand — both found live and handled).
 
 ---
 

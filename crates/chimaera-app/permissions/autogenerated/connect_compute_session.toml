@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connect-compute-session"
+description = "Enables the connect_compute_session command without any pre-configured scope."
+commands.allow = ["connect_compute_session"]
+
+[[permission]]
+identifier = "deny-connect-compute-session"
+description = "Denies the connect_compute_session command without any pre-configured scope."
+commands.deny = ["connect_compute_session"]

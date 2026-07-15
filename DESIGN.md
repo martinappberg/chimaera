@@ -323,6 +323,20 @@ which is the survival property that matters.
   per-cluster fact: probed at job start, recorded in the manifest; where blocked, Mode 2 degrades
   by capability (terminals/previews on the node, agents via Mode 1). Deep spec: Architecture →
   Environment prelude & compute-node sessions.
+- **2026-07-15 — Mode 2 core SHIPPED (daemon routes + tunnel ladder + CLI + app/home-screen
+  surfaces), verified end-to-end on Sherlock.** Implemented shape: launch/discover/cancel are
+  LOGIN-daemon routes (it owns sbatch, the preludes, its own shared-FS binary) — the client
+  side only tunnels and opens windows; the registry stays stateless (`squeue` ⋈ per-job
+  manifests under `data_dir()/compute/<jobid>`). The live pass forced one ladder amendment:
+  hostbased-only node sshd (Sherlock) defeats a laptop-originated node leg, so rung B gained a
+  **chained** mechanic — a login-resident `ssh -N -L` relay to the node's loopback running as
+  the remote command of the same laptop ssh that forwards to it (lifetimes coupled, nothing
+  orphaned, daemon stays loopback). Rung A's `--bind-routable` (opt-in 0.0.0.0, token-gated)
+  amends the loopback-only security note deliberately. The app shell keeps tokens/tunnels in
+  Rust under composite `"{alias}#job{id}"` keys; window restore skips compute windows — the
+  squeue-rebuilt home-screen card is the reconnect path. Verified live: launch → RUNNING →
+  ready → chained-B tunnel → health/self-walltime/sessions on the node → cancel → queue clean.
+  Native-app visual pass outstanding (needs the maintainer's screen).
 
 Still open:
 

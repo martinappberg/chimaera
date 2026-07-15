@@ -142,6 +142,7 @@ pub async fn connect(host: &str, job_id: &str, no_open: bool) -> anyhow::Result<
         "rung: {} · node {} · job {} — Ctrl-C closes the tunnel (the job keeps running)",
         match tunnel.rung {
             chimaera_remote::ComputeRung::SshAdopt => "B (ssh-adopt, loopback daemon)",
+            chimaera_remote::ComputeRung::Chained => "B (chained via login node, loopback daemon)",
             chimaera_remote::ComputeRung::Direct => "A (direct routable forward)",
         },
         tunnel.node,

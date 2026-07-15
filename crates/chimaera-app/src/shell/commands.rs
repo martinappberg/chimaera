@@ -11,10 +11,10 @@ use chimaera_remote::hosts::HostsStore;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use super::connect::{do_connect, state_for, HostState};
-use super::restore::open_ui_window;
-use super::{lock, Shell, WindowScope};
-use crate::windows::WindowRecord;
+use super::connect::{do_connect, state_for, HostState, HostStatus};
+use super::restore::{open_compute_window, open_ui_window};
+use super::{lock, ComputeEndpoint, Shell, WindowScope};
+use crate::windows::{ComputeScope, WindowRecord};
 
 /// The local daemon's build parity, as the home screen sees it.
 #[derive(Clone, Serialize)]
@@ -246,6 +246,302 @@ pub(super) async fn remote_workspaces(
     })
     .await
     .map_err(|e| format!("{e}"))?
+}
+
+/// Composite key for per-job compute state: distinct from the login alias so
+/// a job window never collides with the host's own in focus-existing.
+fn compute_key(alias: &str, job_id: &str) -> String {
+    format!("{alias}#job{job_id}")
+}
+
+/// Same digit gate as the daemon's cancel route — the id lands in URL paths
+/// and the composite tunnel key.
+fn valid_job_id(job_id: &str) -> bool {
+    !job_id.is_empty() && job_id.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Surface the daemon's own `{"error": …}` body on an HTTP error — a launch
+/// rejection carries the real reason ("invalid partition …"), not just a code.
+fn compute_api_error(context: &str, e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let msg = resp
+                .into_string()
+                .ok()
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .and_then(|v| v.get("error").and_then(|m| m.as_str()).map(str::to_string));
+            match msg {
+                Some(m) => format!("{context}: {m}"),
+                None => format!("{context}: HTTP {code}"),
+            }
+        }
+        e => format!("{context}: {e}"),
+    }
+}
+
+/// GET the login daemon's compute registry through the tunnel, cache each
+/// session's node endpoint in Rust, and scrub `port`/`token` from the JSON:
+/// the webview never sees compute tokens — the window URL built by
+/// `connect_compute_session` is their only way out of this process.
+async fn fetch_compute_sessions(state: &Shell, alias: &str) -> Result<serde_json::Value, String> {
+    let (port, token) = {
+        let tunnels = state.tunnels.lock().await;
+        let t = tunnels
+            .get(alias)
+            .ok_or_else(|| format!("{alias} is not connected"))?;
+        (t.local_port, t.manifest.token.clone())
+    };
+    let mut payload: serde_json::Value = tokio::task::spawn_blocking(move || {
+        let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(15))
+            .call()
+            .map_err(|e| compute_api_error("could not list compute sessions", e))?
+            .into_string()
+            .map_err(|e| format!("could not read compute sessions: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("bad compute sessions payload: {e}"))
+    })
+    .await
+    .map_err(|e| format!("{e}"))??;
+    if let Some(sessions) = payload.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+        let mut endpoints = lock(&state.compute_endpoints);
+        for session in sessions {
+            let Some(obj) = session.as_object_mut() else {
+                continue;
+            };
+            let job_id = obj
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let node = obj
+                .get("node")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let routable = obj
+                .get("routable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Keep the endpoint Rust-side; JS gets the scrubbed card.
+            let port = obj
+                .remove("port")
+                .and_then(|v| v.as_u64())
+                .and_then(|p| u16::try_from(p).ok());
+            let token = obj
+                .remove("token")
+                .and_then(|v| v.as_str().map(str::to_string));
+            if let (Some(port), Some(token)) = (port, token) {
+                if !job_id.is_empty() {
+                    endpoints.insert(
+                        (alias.to_string(), job_id),
+                        ComputeEndpoint {
+                            node,
+                            port,
+                            token,
+                            routable,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(payload)
+}
+
+/// The connected host's compute-session registry (Mode 2 cards), proxied
+/// through the login tunnel like `remote_workspaces`. Returns
+/// `{scheduler, sessions, partitions}` with each session's `port`/`token`
+/// stripped (cached in Rust for `connect_compute_session`).
+#[tauri::command]
+pub(super) async fn remote_compute_sessions(
+    state: State<'_, Shell>,
+    alias: String,
+) -> Result<serde_json::Value, String> {
+    fetch_compute_sessions(&state, &alias).await
+}
+
+/// Submit a compute session (a chimaera daemon as a Slurm job) through the
+/// login tunnel; returns the job id. The spec passes through verbatim — the
+/// daemon owns validation (charset gates on every sbatch directive).
+#[tauri::command]
+pub(super) async fn launch_compute_session(
+    state: State<'_, Shell>,
+    alias: String,
+    spec: serde_json::Value,
+) -> Result<String, String> {
+    tracing::info!("ipc: launch_compute_session on {alias}");
+    let (port, token) = {
+        let tunnels = state.tunnels.lock().await;
+        let t = tunnels
+            .get(&alias)
+            .ok_or_else(|| format!("{alias} is not connected"))?;
+        (t.local_port, t.manifest.token.clone())
+    };
+    tokio::task::spawn_blocking(move || {
+        let body = ureq::post(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .timeout(Duration::from_secs(30))
+            .send_json(spec)
+            .map_err(|e| compute_api_error("could not launch the compute session", e))?
+            .into_string()
+            .map_err(|e| format!("could not read the launch reply: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("bad launch payload: {e}"))?;
+        v.get("job_id")
+            .and_then(|j| j.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "launch returned no job_id".to_string())
+    })
+    .await
+    .map_err(|e| format!("{e}"))?
+}
+
+/// scancel a compute session through the login tunnel. Any live tunnel to
+/// that job goes too — the daemon behind it is on its way out.
+#[tauri::command]
+pub(super) async fn cancel_compute_session(
+    state: State<'_, Shell>,
+    alias: String,
+    job_id: String,
+) -> Result<(), String> {
+    if !valid_job_id(&job_id) {
+        return Err("invalid job id".to_string());
+    }
+    tracing::info!("ipc: cancel_compute_session {alias} job {job_id}");
+    let (port, token) = {
+        let tunnels = state.tunnels.lock().await;
+        let t = tunnels
+            .get(&alias)
+            .ok_or_else(|| format!("{alias} is not connected"))?;
+        (t.local_port, t.manifest.token.clone())
+    };
+    let job = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        ureq::delete(&format!(
+            "http://127.0.0.1:{port}/api/v1/compute/sessions/{job}"
+        ))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(Duration::from_secs(20))
+        .call()
+        .map(|_| ())
+        .map_err(|e| compute_api_error("could not cancel the compute session", e))
+    })
+    .await
+    .map_err(|e| format!("{e}"))??;
+    if let Some(tunnel) = state
+        .compute_tunnels
+        .lock()
+        .await
+        .remove(&compute_key(&alias, &job_id))
+    {
+        tunnel.close().await;
+    }
+    Ok(())
+}
+
+/// Build (or reuse) the tunnel to a job's compute-node daemon and open a
+/// window on it. The endpoint comes from the Rust-side cache that
+/// `remote_compute_sessions` fills — re-fetched once when missing (a connect
+/// straight after an app restart).
+#[tauri::command]
+pub(super) async fn connect_compute_session(
+    app: AppHandle,
+    state: State<'_, Shell>,
+    alias: String,
+    job_id: String,
+) -> Result<(), String> {
+    if !valid_job_id(&job_id) {
+        return Err("invalid job id".to_string());
+    }
+    tracing::info!("ipc: connect_compute_session {alias} job {job_id}");
+    let key = compute_key(&alias, &job_id);
+    // A window already on this job → raise it, like `open_window` does.
+    if let Some(label) = find_by_scope(&state.windows, &Some(key.clone()), &None, None) {
+        if let Some(win) = app.get_webview_window(&label) {
+            return win
+                .set_focus()
+                .map_err(|e| format!("could not focus window: {e}"));
+        }
+    }
+    // Reuse a live tunnel, probed end-to-end like `do_connect` (after laptop
+    // sleep the local listener can outlive its dead connection) and without
+    // holding the lock across the probe. A dead one is torn down and rebuilt.
+    let existing_port = {
+        let tunnels = state.compute_tunnels.lock().await;
+        tunnels.get(&key).map(|t| t.local_port)
+    };
+    if let Some(port) = existing_port {
+        if !chimaera_remote::http_alive(port).await {
+            if let Some(tunnel) = state.compute_tunnels.lock().await.remove(&key) {
+                tunnel.close().await;
+            }
+        }
+    }
+    if state.compute_tunnels.lock().await.get(&key).is_none() {
+        let cached = lock(&state.compute_endpoints)
+            .get(&(alias.clone(), job_id.clone()))
+            .cloned();
+        let endpoint = match cached {
+            Some(e) => e,
+            None => {
+                fetch_compute_sessions(&state, &alias).await?;
+                lock(&state.compute_endpoints)
+                    .get(&(alias.clone(), job_id.clone()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "job {job_id} on {alias} has no daemon manifest yet (still starting?)"
+                        )
+                    })?
+            }
+        };
+        let tunnel = chimaera_remote::connect_compute_node(
+            &alias,
+            &endpoint.node,
+            &job_id,
+            endpoint.port,
+            &endpoint.token,
+            endpoint.routable,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        state
+            .compute_tunnels
+            .lock()
+            .await
+            .insert(key.clone(), tunnel);
+    }
+    // Snapshot what the window needs; the tunnel stays owned by the map.
+    let (url, node, local_port) = {
+        let tunnels = state.compute_tunnels.lock().await;
+        let t = tunnels
+            .get(&key)
+            .ok_or_else(|| format!("{key} disconnected while connecting"))?;
+        (t.url(), t.node.clone(), t.local_port)
+    };
+    let mut record = WindowRecord::new(Some(alias.clone()), None);
+    record.compute = Some(ComputeScope {
+        job_id: job_id.clone(),
+        node: node.clone(),
+    });
+    let title = format!("{alias} › {node} — chimaera");
+    open_compute_window(&app, &url, &title, &record, &key)
+        .map_err(|e| format!("could not open window: {e}"))?;
+    // Cheap status ping so a home screen can flip the card to "connected".
+    // No token: compute tokens stay in Rust — the window URL above is the
+    // only carrier, and only for the window that needs it.
+    let _ = app.emit(
+        "host-status",
+        HostStatus {
+            alias: key,
+            status: "connected",
+            local_port: Some(local_port),
+            token: None,
+            error: None,
+        },
+    );
+    Ok(())
 }
 
 /// Open a window on the local daemon (`alias` None) or a connected remote.

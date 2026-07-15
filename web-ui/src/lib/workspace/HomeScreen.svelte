@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import BrandMark from "../shared/BrandMark.svelte";
+  import ComputeLaunchDialog from "./ComputeLaunchDialog.svelte";
   import { keyHint } from "../shared/keybindings";
   import { isBusy, needsAttention, type Session, type Workspace } from "./sessions";
   import {
     addHost,
     beginUpdate,
+    cancelComputeSession,
     checkAppUpdate,
+    connectComputeSession,
     connectHost,
     disconnectHost,
     endHostSessions,
@@ -16,13 +19,16 @@
     onConnectProgress,
     onHostStatus,
     openWindow,
+    remoteComputeSessions,
     remoteWorkspaces,
     removeHost,
     shutdownHost,
     updateLocalDaemon,
+    type ComputeSessionView,
     type ConnectProgress,
     type HostState,
     type LocalDaemonState,
+    type RemoteComputeList,
   } from "../net/native";
   import type { Health } from "../net/api";
 
@@ -103,6 +109,19 @@
   let confirmEnd = $state<string | null>(null);
   let confirmShutdown = $state<string | null>(null);
 
+  // --- compute-node sessions (Mode 2: Slurm jobs owning a full daemon) --------
+  // Fetched per connected host alongside its workspaces; absent = no scheduler
+  // there (or not asked yet). No polling timer — connect-time + the manual
+  // refresh only (login-node discipline: never a tight loop on squeue).
+
+  let remoteCompute = $state<Map<string, RemoteComputeList>>(new Map());
+  /** Quiet inline compute failure per host (refresh/open/cancel). */
+  let computeErrors = $state<Map<string, string>>(new Map());
+  /** In-row two-step confirm target for scancel. */
+  let confirmCancel = $state<{ alias: string; jobId: string } | null>(null);
+  /** Host alias the launch dialog is open for. */
+  let launchFor = $state<string | null>(null);
+
   // --- local daemon build parity (native shell, local window only) ------------
 
   let localState = $state<LocalDaemonState | null>(null);
@@ -176,7 +195,10 @@
       );
       // Any terminal transition ends the phase line, whoever ran the connect.
       phases = mapWithout(phases, e.alias);
-      if (e.status === "down") remoteWs = mapWithout(remoteWs, e.alias);
+      if (e.status === "down") {
+        remoteWs = mapWithout(remoteWs, e.alias);
+        remoteCompute = mapWithout(remoteCompute, e.alias);
+      }
       if (e.status === "error" && e.error !== undefined) {
         hostErrors = new Map(hostErrors).set(e.alias, e.error);
       } else if (e.status === "connected") {
@@ -195,6 +217,7 @@
               // dropped again in between; the next transition retries
             });
         }
+        if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
       }
     }).then((u) => unlisteners.push(u));
     return () => unlisteners.forEach((u) => u());
@@ -215,6 +238,7 @@
     try {
       const state = await connectHost(alias, updateDaemon);
       hosts = hosts.map((h) => (h.alias === alias ? state : h));
+      void refreshCompute(alias);
       const list = await remoteWorkspaces(alias);
       remoteWs = new Map(remoteWs).set(
         alias,
@@ -231,6 +255,7 @@
   async function disconnect(alias: string): Promise<void> {
     await disconnectHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
+    remoteCompute = mapWithout(remoteCompute, alias);
     void refreshHosts();
   }
 
@@ -238,6 +263,7 @@
     confirmForget = null;
     await removeHost(alias);
     remoteWs = mapWithout(remoteWs, alias);
+    remoteCompute = mapWithout(remoteCompute, alias);
     void refreshHosts();
   }
 
@@ -259,10 +285,66 @@
     try {
       await shutdownHost(alias);
       remoteWs = mapWithout(remoteWs, alias);
+      remoteCompute = mapWithout(remoteCompute, alias);
     } catch (e) {
       hostErrors = new Map(hostErrors).set(alias, e instanceof Error ? e.message : String(e));
     }
     void refreshHosts();
+  }
+
+  /** Fetch a connected host's compute-node sessions. Never throws: a shell
+   *  without the command (built in parallel) or a probe failure must not
+   *  blank the host row — the group just stays absent, or keeps its last
+   *  list with a quiet inline error. */
+  async function refreshCompute(alias: string): Promise<void> {
+    computeErrors = mapWithout(computeErrors, alias);
+    try {
+      remoteCompute = new Map(remoteCompute).set(alias, await remoteComputeSessions(alias));
+    } catch (e) {
+      if (remoteCompute.has(alias)) {
+        computeErrors = new Map(computeErrors).set(
+          alias,
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+    }
+  }
+
+  /** Tunnel to a ready compute-node session — the shell opens its window. */
+  async function openCompute(alias: string, jobId: string): Promise<void> {
+    computeErrors = mapWithout(computeErrors, alias);
+    try {
+      await connectComputeSession(alias, jobId);
+    } catch (e) {
+      computeErrors = new Map(computeErrors).set(
+        alias,
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+
+  /** scancel the job (Slurm ends everything in the allocation), then refetch. */
+  async function cancelCompute(alias: string, jobId: string): Promise<void> {
+    confirmCancel = null;
+    computeErrors = mapWithout(computeErrors, alias);
+    try {
+      await cancelComputeSession(alias, jobId);
+    } catch (e) {
+      computeErrors = new Map(computeErrors).set(
+        alias,
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+    void refreshCompute(alias);
+  }
+
+  /** "{cpus} cpu · {mem} · {gres}" — omitting whatever the wire didn't carry. */
+  function resourceLabel(cs: ComputeSessionView): string {
+    const parts: string[] = [];
+    if (cs.cpus !== undefined && cs.cpus !== null) parts.push(`${cs.cpus} cpu`);
+    if (cs.mem !== undefined && cs.mem !== null && cs.mem !== "") parts.push(cs.mem);
+    if (cs.gres !== undefined && cs.gres !== null && cs.gres !== "") parts.push(cs.gres);
+    return parts.join(" · ");
   }
 
   async function submitAdd(): Promise<void> {
@@ -714,6 +796,117 @@
                     </div>
                   </div>
                 {/if}
+                {#if h.status === "connected"}
+                  {@const rc = remoteCompute.get(h.alias)}
+                  {@const cerr = computeErrors.get(h.alias)}
+                  <!-- Mode 2: chimaera sessions running as Slurm jobs — each a
+                       first-class connectable entity with "x compute and hours
+                       left" (maintainer intent, features/compute.md). Shown
+                       only where the host actually has a scheduler. -->
+                  {#if rc !== undefined && rc.scheduler === "slurm"}
+                    <div class="remote-ws compute-group">
+                      <div class="comp-head">
+                        <span class="sec-title">compute sessions</span>
+                        <span class="comp-acts">
+                          <button class="ghost" onclick={() => (launchFor = h.alias)}
+                            >new compute session…</button
+                          >
+                          <button
+                            class="ghost refresh"
+                            title="refresh compute sessions"
+                            aria-label="refresh compute sessions"
+                            onclick={() => void refreshCompute(h.alias)}
+                          >
+                            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                              <path
+                                d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7M13.4 2.5v2.3h-2.3"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="1.4"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                              />
+                            </svg>
+                          </button>
+                        </span>
+                      </div>
+                      {#each rc.sessions as cs (cs.job_id)}
+                        {@const csState =
+                          cs.state === "RUNNING" && cs.ready
+                            ? "alive"
+                            : cs.state === "PENDING"
+                              ? "starting"
+                              : ""}
+                        {@const res = resourceLabel(cs)}
+                        {#if confirmCancel?.alias === h.alias && confirmCancel.jobId === cs.job_id}
+                          <div class="row confirm" role="alertdialog" aria-label="cancel compute session?">
+                            <span class="name">{cs.name}</span>
+                            <span class="confirm-label"
+                              >cancel job {cs.job_id}? everything in the allocation ends</span
+                            >
+                            <button
+                              class="confirm-yes"
+                              onclick={() => void cancelCompute(h.alias, cs.job_id)}
+                              >cancel job</button
+                            >
+                            <button class="confirm-no" onclick={() => (confirmCancel = null)}
+                              >keep</button
+                            >
+                          </div>
+                        {:else}
+                          <div class="rowwrap" role="presentation">
+                            <button
+                              class="row sub"
+                              title={cs.ready
+                                ? `open the session on ${cs.node} (slurm job ${cs.job_id})`
+                                : `slurm job ${cs.job_id} — ${cs.state}${cs.node !== "" ? ` on ${cs.node}` : ""}, not connectable yet`}
+                              disabled={!cs.ready}
+                              onclick={() => void openCompute(h.alias, cs.job_id)}
+                            >
+                              <span class="dot {csState}" title={cs.state}></span>
+                              <span class="name">{cs.name}</span>
+                              <span class="node">{cs.node === "" ? "queued" : cs.node}</span>
+                              {#if res !== ""}
+                                <span class="badge">{res}</span>
+                              {/if}
+                              <span class="when" title="walltime remaining">{cs.time_left}</span>
+                            </button>
+                            <button
+                              class="side"
+                              title={cs.ready
+                                ? "open this compute session"
+                                : "not connectable yet — the session's daemon is still starting"}
+                              disabled={!cs.ready}
+                              onclick={() => void openCompute(h.alias, cs.job_id)}>open</button
+                            >
+                            <button
+                              class="side stop"
+                              title="cancel slurm job {cs.job_id}"
+                              onclick={() =>
+                                (confirmCancel = { alias: h.alias, jobId: cs.job_id })}
+                              >cancel</button
+                            >
+                          </div>
+                          {#if cs.egress === false}
+                            <!-- Only a VERIFIED-blocked probe warns; absent
+                                 egress means "couldn't verify", not blocked. -->
+                            <div class="egress-note">
+                              agents can't reach the API from this node
+                            </div>
+                          {/if}
+                        {/if}
+                      {/each}
+                      {#if rc.sessions.length === 0}
+                        <p class="comp-hint">
+                          none running — launch one to own a full session on a compute node.
+                        </p>
+                      {/if}
+                      {#if cerr !== undefined}
+                        <div class="err-line">{cerr}</div>
+                      {/if}
+                    </div>
+                  {/if}
+                {/if}
               {/if}
             {/each}
           </div>
@@ -721,6 +914,18 @@
       {/if}
     </section>
   </div>
+
+  {#if launchFor !== null}
+    <ComputeLaunchDialog
+      alias={launchFor}
+      partitions={remoteCompute.get(launchFor)?.partitions ?? []}
+      onClose={() => (launchFor = null)}
+      onLaunched={(alias) => {
+        launchFor = null;
+        void refreshCompute(alias);
+      }}
+    />
+  {/if}
 </div>
 
 <style>
@@ -1186,6 +1391,72 @@
     border-left: 1px solid var(--edge);
     display: flex;
     flex-direction: column;
+  }
+
+  /* Compute sessions group: same indented register as the workspace list,
+     with its own quiet header (label + launch + refresh). */
+  .comp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px 2px;
+  }
+
+  .comp-acts {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .ghost.refresh {
+    display: flex;
+    align-items: center;
+    padding: 2px 4px;
+  }
+
+  /* The node a session landed on — mono like a path, never stealing the
+     name's space. */
+  .node {
+    flex: none;
+    max-width: 30%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+
+  /* A not-yet-ready session can't be opened; the row still reads, the
+     actions just wait. */
+  .row:disabled .name,
+  .row:disabled .node {
+    opacity: 0.75;
+  }
+
+  .side:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .side:disabled:hover {
+    color: var(--muted);
+  }
+
+  /* Verified-blocked egress: the one per-cluster fact worth a warning —
+     terminals/previews still work there, agents can't. */
+  .egress-note {
+    padding: 0 10px 6px 27px;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--warn);
+  }
+
+  .comp-hint {
+    margin: 0;
+    padding: 2px 10px 6px;
+    font-size: var(--text-xs);
+    color: var(--muted);
   }
 
   .row.confirm {

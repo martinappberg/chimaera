@@ -1038,5 +1038,8 @@ not either/or:
 - Bearer token on every request; manifest is 0600 on `$HOME`.
 - The sandboxed-HTML `/raw/` endpoint must not receive the main bearer token (self-XSS →
   token theft): use short-lived per-file tokens or a separate cookie-scoped origin.
-- The daemon never accepts non-loopback connections. Users who want LAN/Tailscale do it with
-  their own tunnels.
+- The daemon accepts only loopback connections **by default**. The one deliberate exception
+  (2026-07-15, Mode 2 rung A): `chimaera serve --bind-routable` opts a *compute-node* daemon
+  into 0.0.0.0 for clusters whose ladder has no ssh-to-node path, with the per-job bearer token
+  as the gate. Never the default, never implied — the launch request must ask for it. Users who
+  want LAN/Tailscale still do it with their own tunnels.

@@ -3334,14 +3334,20 @@
         {/if}
         {#if $computeStatus?.scheduler === "slurm"}
           {@const queued = queuedJobCount($computeStatus)}
+          {@const selfJob = $computeStatus.self}
           <!-- Slurm orientation, indicator ONLY (maintainer, 2026-07-15):
                the scheduler exists here + how much of your work is queued.
                Queue browsing/management deliberately does NOT live in the
                rail — that arrives with the agent dashboard; launching onto
-               compute nodes belongs to the home screen's Mode 2 flow. -->
+               compute nodes belongs to the home screen's Mode 2 flow.
+               Inside an allocation (a Mode 2 compute-node daemon) the chip
+               wears walltime-remaining INSTEAD of the queue count — this
+               window's honest lifetime beats a secondary queue number. -->
           <span
             class="daemon-compute"
-            title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
+            title={selfJob !== null
+              ? `slurm job ${selfJob.job_id} on ${selfJob.node} — ${selfJob.time_left} left`
+              : `slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
           >
             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
               <rect
@@ -3385,7 +3391,11 @@
                 stroke-width="1.4"
               />
             </svg>
-            {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
+            {#if selfJob !== null}
+              <span class="dc-count">{selfJob.time_left}</span>
+            {:else if queued > 0}
+              <span class="dc-count">{queued}</span>
+            {/if}
           </span>
         {/if}
         {#if canCaffeinate}

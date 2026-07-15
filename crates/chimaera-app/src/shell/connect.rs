@@ -309,7 +309,11 @@ fn reopen_windows(app: &AppHandle, alias: &str, port: u16, token: &str) {
     let records: Vec<WindowRecord> = lock(&shell.registry)
         .list()
         .into_iter()
-        .filter(|r| r.alias.as_deref() == Some(alias) && !open.contains(&r.id))
+        // A compute record is scoped to a job's own tunnel, not the login
+        // daemon this connect just landed — never reopen it here.
+        .filter(|r| {
+            r.alias.as_deref() == Some(alias) && !open.contains(&r.id) && r.compute.is_none()
+        })
         .collect();
     for record in records {
         if let Err(e) = open_ui_window(app, port, token, &record) {

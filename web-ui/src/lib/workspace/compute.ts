@@ -33,6 +33,20 @@ export interface ComputePartition {
   nodes: number;
 }
 
+/**
+ * The allocation THIS daemon runs inside (Mode 2 compute-node session).
+ * Present only when the daemon detects it was launched under a Slurm job —
+ * the walltime here is the window's lifetime, so the bottom bar wears it.
+ */
+export interface ComputeSelf {
+  job_id: string;
+  node: string;
+  partition: string;
+  /** Raw Slurm state — never relabeled. */
+  state: string;
+  time_left: string;
+}
+
 export interface ComputeSnapshot {
   scheduler: "slurm" | "none";
   /** The current user's jobs only, already capped server-side. */
@@ -41,6 +55,9 @@ export interface ComputeSnapshot {
   fetched_at_ms: number;
   /** True when the server-side cap dropped rows. */
   truncated: boolean;
+  /** The allocation this daemon runs inside, when it IS a compute-node
+   *  session (`null` = the wire didn't carry a usable `self` block). */
+  self: ComputeSelf | null;
 }
 
 // Defensive parsing (the environment-fetcher idiom): drop malformed entries
@@ -71,6 +88,20 @@ function parsePartition(raw: unknown): ComputePartition | null {
   };
 }
 
+// Absent, malformed, or missing its job id all read as "not in an allocation".
+function parseSelf(raw: unknown): ComputeSelf | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.job_id !== "string" || r.job_id === "") return null;
+  return {
+    job_id: r.job_id,
+    node: typeof r.node === "string" ? r.node : "",
+    partition: typeof r.partition === "string" ? r.partition : "",
+    state: typeof r.state === "string" ? r.state : "",
+    time_left: typeof r.time_left === "string" ? r.time_left : "",
+  };
+}
+
 function parseSnapshot(body: unknown): ComputeSnapshot {
   const none: ComputeSnapshot = {
     scheduler: "none",
@@ -78,6 +109,7 @@ function parseSnapshot(body: unknown): ComputeSnapshot {
     partitions: [],
     fetched_at_ms: 0,
     truncated: false,
+    self: null,
   };
   if (typeof body !== "object" || body === null) return none;
   const b = body as Record<string, unknown>;
@@ -92,6 +124,7 @@ function parseSnapshot(body: unknown): ComputeSnapshot {
       : [],
     fetched_at_ms: typeof b.fetched_at_ms === "number" ? b.fetched_at_ms : 0,
     truncated: b.truncated === true,
+    self: parseSelf(b.self),
   };
 }
 

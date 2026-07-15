@@ -11,6 +11,7 @@
 import { writable } from "svelte/store";
 import { getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
+import type { ComputePartition } from "../workspace/compute";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -269,6 +270,90 @@ export async function remoteWorkspaces(alias: string): Promise<Workspace[]> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
   return t.core.invoke<Workspace[]>("remote_workspaces", { alias });
+}
+
+/**
+ * A chimaera compute-node session (Mode 2: a Slurm job owning a full daemon),
+ * as the shell relays it — the daemon's wire shape MINUS port/token, which
+ * the shell strips before anything reaches JS.
+ */
+export interface ComputeSessionView {
+  job_id: string;
+  name: string;
+  /** Raw Slurm state (RUNNING, PENDING, …) — never relabeled. */
+  state: string;
+  /** Node name once allocated; empty while the job waits in the queue. */
+  node: string;
+  partition: string;
+  /** Walltime remaining — the session's honest lifetime. */
+  time_left: string;
+  cpus?: number | null;
+  mem?: string | null;
+  gres?: string | null;
+  workspace_id?: string | null;
+  /** The daemon bound a cluster-routable address instead of loopback. */
+  routable: boolean;
+  /** Whether the node can reach the agent API. Absent = couldn't verify —
+   *  which is NOT the same fact as blocked. */
+  egress?: boolean | null;
+  /** The session's daemon is up and connectable (manifest written). */
+  ready: boolean;
+}
+
+/** What `remote_compute_sessions` answers for one connected host. */
+export interface RemoteComputeList {
+  /** "slurm" or "none" — anything but "slurm" hides the compute surface. */
+  scheduler: string;
+  sessions: ComputeSessionView[];
+  partitions: ComputePartition[];
+}
+
+/** An sbatch submission for a new compute-node session. */
+export interface ComputeLaunchSpec {
+  name: string;
+  /** Slurm walltime, e.g. "2:00:00". */
+  time: string;
+  partition?: string;
+  cpus?: number;
+  mem?: string;
+  gres?: string;
+  workspace_id?: string;
+  /** Launch-scope startup commands — host/workspace preludes still apply. */
+  prelude?: string;
+  /** Bind a routable address (rung A) — exposes the port on the cluster
+   *  network, token-gated. Default (absent/false) is loopback + ssh forward. */
+  routable?: boolean;
+}
+
+/** The connected host's compute-node sessions + partitions (shell-proxied). */
+export async function remoteComputeSessions(alias: string): Promise<RemoteComputeList> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  return t.core.invoke<RemoteComputeList>("remote_compute_sessions", { alias });
+}
+
+/** Submit a compute-node session on `alias`. Resolves to the Slurm job id. */
+export async function launchComputeSession(
+  alias: string,
+  spec: ComputeLaunchSpec,
+): Promise<string> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  return t.core.invoke<string>("launch_compute_session", { alias, spec });
+}
+
+/** `scancel` a compute-node session — Slurm ends everything in the allocation. */
+export async function cancelComputeSession(alias: string, jobId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("cancel_compute_session", { alias, jobId });
+}
+
+/** Tunnel to a ready compute-node session; the shell opens its window. */
+export async function connectComputeSession(alias: string, jobId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("connect_compute_session", { alias, jobId });
 }
 
 /** Subscribe to connect progress events. Returns an unsubscribe promise. */
