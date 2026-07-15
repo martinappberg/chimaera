@@ -148,7 +148,7 @@ change without notice. See [DESIGN.md](DESIGN.md) for the full design and roadma
 The workspace is a Rust daemon (`crates/`) plus a Svelte web UI (`web-ui/`) it embeds, and a
 standalone Tauri app (`crates/chimaera-app`). Start here:
 
-- **[CLAUDE.md](CLAUDE.md)** is the fast orientation map: repo layout, the dev loop, working
+- **[AGENTS.md](AGENTS.md)** is the fast orientation map: repo layout, the dev loop, working
   rules, and how releases work. Read it first, whether you're a person or an agent.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)**: dev setup, code style, verification culture, the CLA.
 - **[DESIGN.md](DESIGN.md)** is the design spine: problem, product model, scope, roadmap,

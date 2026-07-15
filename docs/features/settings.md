@@ -7,7 +7,7 @@ a hand-editor (vim over ssh) are first-class; a change from either propagates li
 **Where it lives (shared):** UI `web-ui/src/lib/settings/` (`SettingsView.svelte`,
 `AgentsSettings.svelte`, `SettingRow.svelte`, `SettingsJson.svelte`, `schema.ts`, `store.svelte.ts`,
 `themes.ts`). Daemon `crates/chimaera-server/src/settings.rs`. Wire: `GET/PUT /api/v1/settings` and
-a `settings` frame on `/ws/events`. Map: [settings/CLAUDE.md](../../web-ui/src/lib/settings/CLAUDE.md).
+a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md).
 
 ## The settings model
 

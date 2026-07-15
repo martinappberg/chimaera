@@ -1,12 +1,12 @@
 # Feature catalog
 
 What Chimaera actually **does**, feature by feature — the reference the rest of the
-agent layer lacked. The nested `CLAUDE.md` maps tell you how the code is *structured*;
+agent layer lacked. The nested `AGENTS.md` maps tell you how the code is *structured*;
 this catalog tells you what a user or an agent can *do* and how each capability is
 wired end to end, so you can locate and extend a feature without re-exploring the tree.
 
 > **Deep-doc, not always-on.** Only this index is pointed at from the root
-> [CLAUDE.md](../../CLAUDE.md). Read the one page for the feature you're touching —
+> [AGENTS.md](../../AGENTS.md). Read the one page for the feature you're touching —
 > don't front-load the set. Each page is on-demand reference material.
 
 > **Docs drift — verify before you trust.** Same rule as everywhere in this repo:
@@ -59,7 +59,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 
 Cross-cutting *infrastructure* — not user features — lives with the code, not here:
 
-- **Auth** (bearer / WS first-frame / `/raw` ticket / key-in-URL) → [rules/daemon.md](../../.claude/rules/daemon.md) + [chimaera-server/CLAUDE.md](../../crates/chimaera-server/CLAUDE.md).
+- **Auth** (bearer / WS first-frame / `/raw` ticket / key-in-URL) → [rules/daemon.md](../../.claude/rules/daemon.md) + [chimaera-server/AGENTS.md](../../crates/chimaera-server/AGENTS.md).
 - **The daemon↔UI wire contract** (`SessionInfo`, `SessionEvent`, `ExecOutcome`, chat `SeqEvent`/`AgentCommand`) → the same two places. Feature pages name the routes/WS channels a feature uses; the wire *invariants* are a rule, not a feature.
 - **How it's built and why** → the [architecture guide](../agent-guides/architecture.md) and [DESIGN.md](../../DESIGN.md).
 

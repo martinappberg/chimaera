@@ -6,7 +6,7 @@ paths: ["crates/chimaera-server/**", "crates/chimaera/**"]
 # Daemon rules (server + binary)
 
 The daemon lives on shared HPC **login nodes**. These are review criteria, not
-nice-to-haves. Depth + module map: [chimaera-server/CLAUDE.md](../../crates/chimaera-server/CLAUDE.md).
+nice-to-haves. Depth + module map: [chimaera-server/AGENTS.md](../../crates/chimaera-server/AGENTS.md).
 
 - **Bounded resources.** Target ~150 MB RSS, <1 core steady-state. No unbounded
   buffers, no busy loops, hard ceilings on preview/extraction. A change that works

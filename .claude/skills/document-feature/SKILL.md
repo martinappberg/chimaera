@@ -62,5 +62,5 @@ same headings, same derived/intent divider, same footer block.
 - Every path, route, and command you write must resolve against the code **now** — derive it,
   don't remember it. `node scripts/check-doc-links.mjs` catches broken markdown links + anchors.
 - The page is reference material: it should be reached on demand, not duplicated into the index
-  or a `CLAUDE.md`. Only the [index](../../../docs/features/README.md) is pointed at from the root
-  [CLAUDE.md](../../../CLAUDE.md).
+  or a `AGENTS.md`. Only the [index](../../../docs/features/README.md) is pointed at from the root
+  [AGENTS.md](../../../AGENTS.md).

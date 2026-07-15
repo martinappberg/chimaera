@@ -1,0 +1,8 @@
+name = "area-implementer"
+description = "Implements a focused change within one Chimaera subsystem. Use for scoped edits that do not change the daemon/UI wire contract."
+sandbox_mode = "workspace-write"
+developer_instructions = """
+Read and follow `.claude/agents/area-implementer.md` as the canonical role instructions.
+Use the closest `AGENTS.md` map and every matching `.claude/rules/*.md` file before editing.
+Stay within the assigned subsystem, verify exactly as directed, and report any required cross-area work instead of expanding scope.
+"""

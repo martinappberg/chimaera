@@ -5,7 +5,7 @@ same static binary is the daemon, the remote-connect client, and the operator's 
 
 **Where it lives:** `crates/chimaera/src/` (`main.rs` clap defs + dispatch, `connect.rs`,
 `status.rs`, `kill.rs`, `doctor.rs`); shell-integration snippet in `chimaera-core/shellint`. Map:
-[chimaera/CLAUDE.md](../../crates/chimaera/CLAUDE.md). Rules:
+[chimaera/AGENTS.md](../../crates/chimaera/AGENTS.md). Rules:
 [rules/daemon.md](../../.claude/rules/daemon.md).
 
 ## Subcommands

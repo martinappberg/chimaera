@@ -6,8 +6,8 @@ paths: ["web-ui/**"]
 # Web-UI rules
 
 Svelte 5 (runes). Build/check needs **Node 22** (`nvm use 22`; the nvm default 16
-errors). Depth: [chat/CLAUDE.md](../../web-ui/src/lib/chat/CLAUDE.md),
-[settings/CLAUDE.md](../../web-ui/src/lib/settings/CLAUDE.md).
+errors). Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
+[settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md).
 
 `src/lib/` is grouped by concern, not flat: **`net/`** (api, ws-adjacent transport,
 reconnect, native bridge, the `/ws/events` socket) · **`layout/`** (the split/pane/tab

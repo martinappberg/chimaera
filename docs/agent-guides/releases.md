@@ -1,7 +1,7 @@
 # Releases & versioning
 
 The single source of truth for how Chimaera versions and ships. The root
-[CLAUDE.md](../../CLAUDE.md), the [ship-pr skill](../../.claude/skills/ship-pr/SKILL.md),
+[AGENTS.md](../../AGENTS.md), the [ship-pr skill](../../.claude/skills/ship-pr/SKILL.md),
 [CONTRIBUTING.md](../../CONTRIBUTING.md), and `.github/workflows/release.yml` all
 point here — change the policy here (and in the script + its test), not by editing
 five copies.

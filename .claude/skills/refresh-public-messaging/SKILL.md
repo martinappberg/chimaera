@@ -32,7 +32,7 @@ change to one is usually a change to all three.
 |---|---|
 | [docs/features/](../../../docs/features/README.md) | What the app *does* now, feature by feature — the derived truth. **Read this before writing any factual claim.** Honor its `Status: partial` flags. |
 | [DESIGN.md](../../../DESIGN.md) | The positioning spine: the problem, the "four-way intersection nobody ships," non-goals, and the dated decisions log (e.g. chat became the default view 2026-07-07). |
-| [CLAUDE.md](../../../CLAUDE.md) | The one-paragraph "what Chimaera is" — the canonical framing to stay consistent with. |
+| [AGENTS.md](../../../AGENTS.md) | The one-paragraph "what Chimaera is" — the canonical framing to stay consistent with. |
 | `git log` since the last touch | What shipped that the copy hasn't caught up with (see step 1). |
 
 ## Step 1 — compute the delta
