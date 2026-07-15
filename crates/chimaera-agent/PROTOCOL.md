@@ -360,12 +360,32 @@ standard base64 image blocks; text files as `document` blocks with `title`.
 Subagent status frames: `system/task_started {task_id, task_type,
 description, prompt}`, `system/task_progress {task_id, last_tool_name?,
 summary?, usage:{total_tokens, tool_uses, duration_ms}}`,
-`system/task_notification` (remove). The official client HIDES
-parent_tool_use_id-tagged transcript frames — the visible surface is the
-Task tool row ("Agent: {description}"). No client-side message queue exists:
-mid-turn user frames go straight to stdin (the CLI queues);
-`{"subtype":"cancel_async_message","message_uuid"}` un-queues. Slash sends
-bypass queueing.
+`system/task_notification` (close, with verdict — see below). The official
+client HIDES parent_tool_use_id-tagged transcript frames — the visible
+surface is the Task tool row ("Agent: {description}"). No client-side
+message queue exists: mid-turn user frames go straight to stdin (the CLI
+queues); `{"subtype":"cancel_async_message","message_uuid"}` un-queues.
+Slash sends bypass queueing.
+
+Live-verified at 2.1.207 (probe 2026-07-15, `-p --output-format
+stream-json` stdout): **the subagent tool itself was renamed `Task` →
+`Agent`** (the tool_use block's `name`; input still carries `description` +
+`prompt` — drivers must match both names), the task frames grew richer, and
+background work now rides the same lane. `task_started` carries `tool_use_id` (exact binding to
+the spawning tool card — the old opaque-key/description-match caveat is
+solved wire-side) plus `subagent_type` for agents; `task_type` values seen:
+`local_agent` (Task subagent), `local_bash` (backgrounded Bash — binary
+mining also names local_command/local_workflow/remote_agent).
+`task_notification` is a rich close: `{task_id, tool_use_id, status
+("completed"|"failed"|"stopped"), output_file, summary, usage:{total_tokens,
+tool_uses, duration_ms}}`. New subtypes on the same wire:
+`task_updated {task_id, patch:{status, end_time}}` (patch semantics) and
+`background_tasks_changed {tasks:[{task_id, task_type, description}]}` — a
+REPLACE-the-set signal (empty array = none left). The driver binds by
+tool_use_id when present (description fallback for older CLIs) and honors
+the notification verdict; the background lane (local_bash etc. +
+task_updated + background_tasks_changed) is recognized but NOT yet
+rendered — a dedicated background-tasks surface is planned.
 
 ### Codex: model/list + settings + steer (partially adopted)
 
@@ -435,13 +455,16 @@ file list is therefore honest about exactly what will revert.
   `cancel_async_message {message_uuid}` exists in the SDK; the extension
   never calls it, but ours DOES now, for the `CancelQueued` command — see
   Pass 12 for the un-queue reliability.
-- Subagents: `task_started {task_id, task_type ("local_agent" only),
-  description, prompt}`, `task_progress {task_id, description?,
-  last_tool_name?, summary?, usage:{total_tokens, tool_uses, duration_ms}}`,
-  `task_notification {task_id}` = removal. task_id is an OPAQUE key with no
-  relation to the Task tool_use_id — chimaera correlates by description and
-  synthesizes an "Agent:" row when no Task card matches. Maps wipe on
-  `result`.
+- Subagents: `task_started {task_id, task_type, description, prompt}`,
+  `task_progress {task_id, description?, last_tool_name?, summary?,
+  usage:{total_tokens, tool_uses, duration_ms}}`, `task_notification` =
+  close with verdict. task_id is an OPAQUE key — but since 2.1.207 the
+  frames also carry `tool_use_id`, so chimaera binds exactly when present
+  and falls back to description-matching (older CLIs), synthesizing an
+  "Agent:" row when no Task card matches. Maps wipe on `result`; an
+  errored/interrupted turn first closes still-open rows as failed. See
+  "Claude: subagents + queueing truth" for the full 2.1.207 shapes
+  (status enum, task_updated, background_tasks_changed).
 - Permission destinations: rule/suggestion field is `destination`
   (localSettings|userSettings|projectSettings|session|cliArg); cycler order
   is that list minus cliArg; the chosen destination re-stamps every

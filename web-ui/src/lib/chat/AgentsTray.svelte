@@ -36,7 +36,7 @@
   }
 </script>
 
-<div class="tray" role="status" aria-live="polite">
+<div class="tray">
   <button
     class="tray-head"
     aria-expanded={open}
@@ -45,7 +45,9 @@
   >
     <Chevron {open} />
     <span class="spark" aria-hidden="true">✳</span>
-    <span class="head-label"
+    <!-- aria-live on the summary only: the count changing is worth announcing,
+         each agent's per-second progress line is not. -->
+    <span class="head-label" role="status" aria-live="polite"
       >{agents.length === 1 ? "subagent working" : `${agents.length} subagents working`}</span
     >
   </button>
@@ -84,6 +86,7 @@
     max-height: 168px;
     overflow-y: auto;
     background: color-mix(in srgb, var(--accent) 4%, transparent);
+    animation: rise 0.15s ease; /* shared keyframe in app.css */
   }
   /* The whole header is the collapse toggle (button reset), so the one-line
      summary is the click target — like the ToolGroup summary. */
@@ -177,6 +180,7 @@
     }
   }
   @media (prefers-reduced-motion: reduce) {
+    .tray,
     .dot,
     .spark {
       animation: none;

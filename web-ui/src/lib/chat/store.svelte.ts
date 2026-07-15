@@ -320,6 +320,12 @@ export class ChatStore {
     this.lastSeq = 0;
     this.exited = null;
     this.degraded = false;
+    // Turn state and the plan belong to the dead journal too — a stale plan
+    // (or a stuck "running") must not outlive the reset; the replay rebuilds
+    // whatever is genuinely current.
+    this.plan = [];
+    this.running = false;
+    this.activity = null;
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
     // the preference is re-pushed even if this reset races ahead of it.
     this.thinkingPushed = false;
@@ -506,7 +512,16 @@ export class ChatStore {
         if (idx === undefined) break;
         const block = this.blocks[idx];
         if (block.kind !== "tool") break;
-        block.status = ev.status as "completed" | "failed" | "in_progress";
+        // A late in_progress update (e.g. straggling subagent progress) must
+        // never walk a finished tool back to running — mirror the tool_call
+        // re-emit guard above. Content still applies below.
+        const status = ev.status as "completed" | "failed" | "in_progress";
+        if (
+          status !== "in_progress" ||
+          (block.status !== "completed" && block.status !== "failed")
+        ) {
+          block.status = status;
+        }
         const content = ev.content as ToolContent | null | undefined;
         // An Edit card's diff (from tool inputs) must not be clobbered by a
         // later status-only update.

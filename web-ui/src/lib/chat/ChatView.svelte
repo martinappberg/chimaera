@@ -208,6 +208,17 @@
     socket.send({ type: "interrupt" });
   }
 
+  // Stop/background ride the same never-lose-a-click contract as decide():
+  // a send into a closed socket says why nothing happened.
+  function stopTask(id: string) {
+    const sent = socket.send({ type: "stop_task", task_id: id });
+    if (!sent) store.notice("not connected — stop not sent, try again in a moment", "error");
+  }
+  function backgroundTool(id: string) {
+    const sent = socket.send({ type: "background_tool", tool_call_id: id });
+    if (!sent) store.notice("not connected — try again in a moment", "error");
+  }
+
   /** Pull back a still-queued message before the agent consumes it. The store
    *  removes it on the resulting `user_message_update{cancelled}` (deterministic
    *  from the wire, so replay agrees). Respect the closed-socket rule: if it
@@ -703,12 +714,8 @@
           tools={item.tools}
           active={store.running && item === renderItems[renderItems.length - 1]}
           {onOpenFile}
-          onBackground={agentKind === "claude"
-            ? (id) => socket.send({ type: "background_tool", tool_call_id: id })
-            : undefined}
-          onStopTask={agentKind === "claude"
-            ? (id) => socket.send({ type: "stop_task", task_id: id })
-            : undefined}
+          onBackground={agentKind === "claude" ? backgroundTool : undefined}
+          onStopTask={agentKind === "claude" ? stopTask : undefined}
         />
       {:else if item.block.kind === "user"}
         {@const block = item.block}
@@ -841,12 +848,7 @@
   </div>
 
   {#if activeAgents.length > 0}
-    <AgentsTray
-      agents={activeAgents}
-      onStop={agentKind === "claude"
-        ? (id) => socket.send({ type: "stop_task", task_id: id })
-        : undefined}
-    />
+    <AgentsTray agents={activeAgents} onStop={agentKind === "claude" ? stopTask : undefined} />
   {/if}
 
   {#if store.plan.length > 0}
