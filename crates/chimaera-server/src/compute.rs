@@ -151,9 +151,12 @@ impl ComputeService {
     }
 
     /// Find the Slurm client tools. The knob dir wins (tests / unusual
-    /// installs); otherwise resolve through the user's login shell — the
-    /// same reasoning as the git resolution: on some clusters the tools
-    /// arrive via a profile-managed PATH the daemon's own env never sourced.
+    /// installs); otherwise ask the user's login shell for its PATH and walk
+    /// it here — the profile-managed-PATH reasoning of the git resolution,
+    /// WITHOUT `command -v`: real clusters wrap the tools in profile shell
+    /// functions (Sherlock's login rc does — found live: `command -v squeue`
+    /// prints the bare function name, not a path), and a PATH walk is also
+    /// the only form that works identically under bash/zsh/fish.
     async fn detect(&self) -> Detection {
         if let Some(dir) = &self.bindir {
             let (squeue, sinfo) = (dir.join("squeue"), dir.join("sinfo"));
@@ -164,27 +167,50 @@ impl ComputeService {
             tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but sbatch/squeue/sinfo not all present");
             return Detection::None;
         }
-        // One login-shell round-trip resolves all three; absolute paths are
-        // cached so polls never re-source the profile.
         let shell = chimaera_core::login_shell();
-        let script = "command -v sbatch && command -v squeue && command -v sinfo";
-        let out = run_capped(&shell, &["-lc".into(), script.into()]).await;
-        let Some(out) = out else {
+        let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
+        let Some(path) = out else {
             return Detection::None;
         };
-        let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
-        match (lines.next(), lines.next(), lines.next()) {
-            // `&&` chains: three hits or the whole probe exits non-zero.
+        // The walk stats PATH entries that may live on slow network mounts —
+        // off the reactor with it (detection runs once per daemon lifetime).
+        let found = tokio::task::spawn_blocking(move || {
+            let find = |name: &str| find_on_path(path.trim(), name);
+            (find("sbatch"), find("squeue"), find("sinfo"))
+        })
+        .await
+        .unwrap_or((None, None, None));
+        match found {
             (Some(_sbatch), Some(squeue), Some(sinfo)) => {
-                tracing::info!(%squeue, "slurm detected");
-                Detection::Slurm {
-                    squeue: PathBuf::from(squeue),
-                    sinfo: PathBuf::from(sinfo),
-                }
+                tracing::info!(squeue = %squeue.display(), "slurm detected");
+                Detection::Slurm { squeue, sinfo }
             }
             _ => Detection::None,
         }
     }
+}
+
+/// First executable `name` on the colon-separated `path` (the login shell's
+/// PATH, resolved fresh). Empty PATH members are skipped — searching the cwd
+/// is sh legacy the daemon must not inherit.
+fn find_on_path(path: &str, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(p))
+}
+
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    p.is_file()
 }
 
 async fn fetch_snapshot(squeue: &std::path::Path, sinfo: &std::path::Path) -> ComputeSnapshot {
@@ -388,6 +414,30 @@ mod tests {
         assert_eq!(normal.nodes, 130, "duplicate avail-state rows sum");
         assert!(!parts[2].avail);
         assert!(!parts[1].default);
+    }
+
+    #[test]
+    fn find_on_path_walks_skips_and_requires_exec() {
+        let dir = test_dir("path");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("squeue");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Plain file, not executable: must not count (the Sherlock lesson —
+        // detection must find real binaries, not whatever a profile says).
+        std::fs::write(bin.join("sinfo"), "not a binary").unwrap();
+
+        let path = format!("/nonexistent::{}", bin.display());
+        assert_eq!(find_on_path(&path, "squeue"), Some(exe));
+        #[cfg(unix)]
+        assert_eq!(find_on_path(&path, "sinfo"), None);
+        assert_eq!(find_on_path("", "squeue"), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
