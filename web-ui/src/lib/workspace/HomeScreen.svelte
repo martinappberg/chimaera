@@ -121,8 +121,12 @@
   //    launch dialog, cancel — talking to the login daemon's routes directly.
   //    Job-scoped windows suppress it (the allocation strip is their UI).
 
-  /** Local home: per-connected-host session lists, for the count line. */
+  /** Local home: per-connected-host session lists, for the indicator line. */
   let remoteCompute = $state<Map<string, ComputeSessionList>>(new Map());
+  /** Aliases whose FIRST compute fetch is still in flight — the indicator
+   *  shows "checking for compute…" instead of silently not existing, so a
+   *  cluster host reads as one from the moment it connects. */
+  let computeChecking = $state<Set<string>>(new Set());
 
   /** True when this home screen IS a host-detail page. Two "am I job-scoped"
    *  signals gate the compute hub: the window's own `job=` params AND the
@@ -138,6 +142,9 @@
   );
   /** Host page: the daemon's own compute list (null = not fetched / no route). */
   let hostCompute = $state<ComputeSessionList | null>(null);
+  /** A list fetch is in flight — first load shows the probe line, later
+   *  ones spin the refresh glyph (quiet liveness, not a blocking state). */
+  let hostComputeLoading = $state(false);
   /** List-level failure (the fetch itself); card-level errors live below. */
   let hostComputeError = $state<string | null>(null);
   /** Job id pending the in-row two-step scancel confirm. */
@@ -230,6 +237,18 @@
       void checkAppUpdate().then((v) => (appUpdate = v));
     }
     const unlisteners: Array<() => void> = [];
+    // Local home: pause the compute-indicator refresh while hidden, and
+    // catch up the moment the page is visible again.
+    const onVis = (): void => {
+      pageVisible = document.visibilityState === "visible";
+      if (pageVisible) {
+        for (const h of hosts) {
+          if (h.status === "connected") void refreshCompute(h.alias);
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    unlisteners.push(() => document.removeEventListener("visibilitychange", onVis));
     void onConnectProgress((p) => {
       phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
     }).then((u) => unlisteners.push(u));
@@ -346,13 +365,23 @@
     void refreshHosts();
   }
 
-  /** Local home: fetch a connected host's session list for the count line.
-   *  Never throws — a shell/daemon without the surface just means no count. */
+  /** Local home: fetch a connected host's session list for the indicator.
+   *  Never throws — a shell/daemon without the surface just means no
+   *  indicator. The first fetch per alias shows as "checking for compute…". */
   async function refreshCompute(alias: string): Promise<void> {
+    if (!remoteCompute.has(alias) && !computeChecking.has(alias)) {
+      computeChecking = new Set(computeChecking).add(alias);
+    }
     try {
       remoteCompute = new Map(remoteCompute).set(alias, await remoteComputeSessions(alias));
     } catch {
       // no scheduler / older shell — the indicator simply doesn't show
+    } finally {
+      if (computeChecking.has(alias)) {
+        const next = new Set(computeChecking);
+        next.delete(alias);
+        computeChecking = next;
+      }
     }
   }
 
@@ -363,6 +392,36 @@
     return rc.sessions.filter((s) => s.state === "RUNNING" || s.state === "PENDING").length;
   }
 
+  /** Indicator tooltip: the cluster's partition names ground "this host has
+   *  compute nodes" in something real without opening the host. */
+  function computeTitle(alias: string, rc: ComputeSessionList): string {
+    const parts = rc.partitions
+      .map((p) => p.name)
+      .slice(0, 6)
+      .join(", ");
+    const n = computeCount(alias);
+    const head =
+      n > 0
+        ? `${n} compute session${n === 1 ? "" : "s"} on ${alias}`
+        : `Slurm detected on ${alias}`;
+    return `${head} — open the host to launch & manage compute sessions${
+      parts === "" ? "" : ` (partitions: ${parts})`
+    }`;
+  }
+
+  // Local home: keep the per-host compute indicators honest without
+  // hammering anything — one proxied call per connected host per minute,
+  // visible only (the remote daemon caches its snapshot ~30s anyway).
+  $effect(() => {
+    if (!native || ownAlias !== null || !pageVisible) return;
+    const t = setInterval(() => {
+      for (const h of hosts) {
+        if (h.status === "connected") void refreshCompute(h.alias);
+      }
+    }, 60_000);
+    return () => clearInterval(t);
+  });
+
   // --- host page: the full compute-sessions surface ---------------------------
 
   /** Refetch this host's sessions from ITS daemon. Keeps the stale list on a
@@ -370,6 +429,7 @@
    *  Sequenced so an overtaken response can never clobber a newer one. */
   async function refreshHostCompute(): Promise<void> {
     const seq = ++computeFetchSeq;
+    hostComputeLoading = true;
     try {
       const list = await listComputeSessions();
       if (seq !== computeFetchSeq) return;
@@ -391,6 +451,8 @@
     } catch (e) {
       if (seq !== computeFetchSeq) return;
       hostComputeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (seq === computeFetchSeq) hostComputeLoading = false;
     }
   }
 
@@ -771,7 +833,25 @@
       {/if}
     </section>
 
-    {#if isHostPage && hostCompute !== null && hostCompute.scheduler === "slurm"}
+    {#if isHostPage && hostCompute === null}
+      <!-- The first compute fetch also runs the daemon's scheduler detection
+           (a login-shell PATH walk — seconds on a slow cluster). Showing the
+           probe beats the section popping in out of nowhere; on a host with
+           no scheduler this line simply fades away. -->
+      <div class="probe-line" role="status">
+        {#if hostComputeError === null}
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+            <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+          </svg>
+          <span>checking this host for a scheduler…</span>
+        {:else}
+          <span class="err">compute check failed — {hostComputeError}</span>
+        {/if}
+      </div>
+    {:else if isHostPage && hostCompute !== null && hostCompute.scheduler === "slurm"}
       <!-- Mode 2 (maintainer intent, features/compute.md): chimaera sessions
            running as Slurm jobs — first-class connectable entities with
            "x compute and hours left". This host's own page is where they are
@@ -785,8 +865,10 @@
             >
             <button
               class="ghost refresh"
+              class:spinning={hostComputeLoading}
               title="refresh compute sessions"
               aria-label="refresh compute sessions"
+              disabled={hostComputeLoading}
               onclick={() => void refreshHostCompute()}
             >
               <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
@@ -959,6 +1041,7 @@
                 {@const err = hostErrors.get(h.alias)}
                 {@const ws = remoteWs.get(h.alias)}
                 {@const compCount = computeCount(h.alias)}
+                {@const comp = remoteCompute.get(h.alias)}
                 {#if confirmShutdown === h.alias}
                   <div class="row confirm strong" role="alertdialog" aria-label="shut down host?">
                     <span class="name">{h.alias}</span>
@@ -1091,16 +1174,16 @@
                           </button>
                         </div>
                       {/each}
-                      {#if compCount > 0}
+                      {#if comp !== undefined && comp.scheduler === "slurm"}
                         <!-- Indicator ONLY (maintainer, 2026-07-15): the cards
                              and the launch dialog live on the host's own page.
-                             Clicking = the host row's own action. -->
+                             Clicking = the host row's own action. A cluster
+                             reads as one even at zero sessions — "there are
+                             compute nodes here" is the load-bearing fact. -->
                         <div class="rowwrap" role="presentation">
                           <button
                             class="row sub comp-count"
-                            title="{compCount} compute session{compCount === 1
-                              ? ''
-                              : 's'} on {h.alias} — open the host to manage them"
+                            title={computeTitle(h.alias, comp)}
                             onclick={() => void openWindow(h.alias, null)}
                           >
                             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
@@ -1109,10 +1192,28 @@
                               <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
                               <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
                             </svg>
-                            <span class="name"
-                              >{compCount} compute session{compCount === 1 ? "" : "s"}</span
-                            >
+                            {#if compCount > 0}
+                              <span class="name"
+                                >{compCount} compute session{compCount === 1 ? "" : "s"}</span
+                              >
+                              <span class="path">slurm</span>
+                            {:else}
+                              <span class="name">slurm cluster</span>
+                              <span class="path">no compute sessions</span>
+                            {/if}
                           </button>
+                        </div>
+                      {:else if comp === undefined && computeChecking.has(h.alias)}
+                        <div class="rowwrap" role="presentation">
+                          <div class="row sub comp-count checking" role="status">
+                            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+                              <rect x="2" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="9" y="2" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                              <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                            </svg>
+                            <span class="name">checking for compute…</span>
+                          </div>
                         </div>
                       {/if}
                       <div class="rowwrap" role="presentation">
@@ -1707,7 +1808,7 @@
   }
 
   /* Local home's per-host compute indicator: quiet like the browse row,
-     waking on hover — a count, not a control surface. */
+     waking on hover — an indicator, not a control surface. */
   .row.comp-count svg {
     flex: none;
     color: var(--muted);
@@ -1720,6 +1821,47 @@
 
   .row.comp-count:hover .name {
     color: var(--fg);
+  }
+
+  /* First fetch in flight: same quiet row, softly breathing, not clickable. */
+  .row.comp-count.checking {
+    animation: dotpulse 1.4s ease-in-out infinite;
+    cursor: default;
+  }
+
+  /* Host page, before the scheduler is known: the compute section's seat is
+     held by one breathing line instead of the section popping in from
+     nothing (or never arriving, on a host without a scheduler). */
+  .probe-line {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 2px 10px 0;
+    font-size: 12px;
+    color: var(--muted);
+    animation: dotpulse 1.4s ease-in-out infinite;
+  }
+
+  .probe-line svg {
+    flex: none;
+    opacity: 0.7;
+  }
+
+  .probe-line .err {
+    animation: none;
+    opacity: 0.8;
+  }
+
+  /* The refresh glyph turns while a list fetch is in flight — the section's
+     only "something is happening" tell, poll or click alike. */
+  .ghost.refresh.spinning svg {
+    animation: spin 0.9s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   .row.confirm {

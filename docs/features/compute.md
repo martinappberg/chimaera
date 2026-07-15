@@ -78,8 +78,14 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
   **"ended" tombstone card** built from its launch record (explicit cancels clean up
-  silently — the user watched those; tombstones age out after 48h). CLI parity +
-  verification harness: `chimaera compute list|launch|connect|cancel <host>`.
+  silently — the user watched those; tombstones age out after 48h). **Nothing pops in
+  from nowhere**: the host page holds the section's seat with a breathing "checking this
+  host for a scheduler…" probe line until the first fetch answers (the refresh glyph
+  spins during any later fetch), and the local home's indicator reads "checking for
+  compute…" → "slurm cluster" (even at zero sessions — *this host has compute nodes* is
+  the load-bearing fact) → the live session count, refreshed once a minute per connected
+  host while the page is visible. CLI parity + verification harness:
+  `chimaera compute list|launch|connect|cancel <host>`.
 - **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
   the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident
   `ssh -N -L` relay to the node's loopback, running as the remote command of the same
