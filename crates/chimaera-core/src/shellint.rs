@@ -398,20 +398,19 @@ PROMPT_COMMAND='RET=$?; : logger-standin'
         assert!(out.contains("AUDIT-RAN"), "prior trap not chained: {out}");
     }
 
-    /// A tool that re-traps DEBUG from PROMPT_COMMAND (bash-preexec style)
-    /// steals the hook: on bash >= 4.4 the theft takes and the per-prompt
-    /// re-arm must win it back by the next prompt; on older bash the shell
-    /// itself reverts prompt-time trap changes (the same quirk that reverts
-    /// rc-time installs). Either way the command after the theft must carry
-    /// a command-start mark directly before its output.
+    /// A prior PROMPT_COMMAND that re-traps DEBUG at every prompt (site rc
+    /// machinery runs before the integration wraps around it): the per-
+    /// prompt re-arm executes after it, so the hook must win on every bash
+    /// — commands still carry a command-start mark directly before their
+    /// output. Without the re-arm, the thief keeps the trap on bash >= 4.4.
     #[test]
     #[cfg(unix)]
-    fn bash_rearm_survives_late_trap_clobber() {
-        let epilogue = r#"PROMPT_COMMAND="$PROMPT_COMMAND; trap ':' DEBUG""#;
-        let out = bash_probe("clobber", "", epilogue, "echo first\necho recovered\n");
+    fn bash_rearm_beats_prompt_time_trap_thief() {
+        let prelude = "PROMPT_COMMAND='trap : DEBUG'";
+        let out = bash_probe("thief", prelude, "", "echo first\necho recovered\n");
         assert!(
             out.contains("\x1b]133;C\x07recovered"),
-            "re-arm did not keep/recover the hook: {out:?}"
+            "re-arm did not keep the hook: {out:?}"
         );
     }
 }
