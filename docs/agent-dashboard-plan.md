@@ -301,16 +301,35 @@ teaching the server the layout tree.
 `AgentCommand::Send` on the existing pump for chat sessions; for **TUI
 targets it always degrades to a proposal card** (the exec-409 wall stands:
 nothing types into a TUI); `spawn_agent {agent, prompt, model?, ui?}` and
-`spawn_terminal {name?, cwd?}` — both through the daemon's normal spawn
-paths (env scrubbing and `--session-id` minting stay centralized), so the
-Mastermind can stand up a new worker or a shell and hand back the session
-id; `interrupt_agent` / `stop_subagent` (never kill); `open_in_pane` (a UI
-*intent* frame on `/ws/events`, executed by the focused client through its
-normal open path); `suggest {title, body, action?}` — a card on the
-dashboard the user can accept with one click (the "give me suggestions"
-channel that doesn't touch anything until clicked). Act calls are
-rate-limited (e.g. 6 sends/min, 4 spawns/10min) so a looping Mastermind
-can't stampede, and **every** act call appends to the audit log.
+`spawn_terminal {name?, cwd?}` — both open a **pane** through the daemon's
+normal spawn paths (env scrubbing and `--session-id` minting stay
+centralized), handing back the session id; `interrupt_agent` /
+`stop_subagent` (never kill); `open_in_pane` (a UI *intent* frame on
+`/ws/events`, executed by the focused client through its normal open path);
+`suggest {title, body, action?}` — a card on the dashboard the user can
+accept with one click (the "give me suggestions" channel that doesn't touch
+anything until clicked). Act calls are rate-limited (e.g. 6 sends/min,
+4 spawns/10min) so a looping Mastermind can't stampede, and **every** act
+call appends to the audit log.
+
+**Ask-first vs auto (decided): route through the harness.** The act tools
+are ordinary MCP tools, so the Mastermind's own agent already gates them:
+in the default **ask-first** mode the generated config simply does *not*
+pre-allow the act tools, and every act call raises the agent's native
+permission prompt (`PermissionRequest` on the wire) — which renders in the
+dashboard's attention lane like any other permission, answerable inline.
+**Auto** mode pre-allows them (claude: `allowedTools` for
+`mcp__chimaera__*` act tools in the generated `--settings`; codex: the
+equivalent approval policy). No bespoke propose/consent layer to build or
+maintain — the existing permission cards *are* the ask-first mode, and the
+mode toggle lives on the Mastermind dock. In practice most Mastermind
+traffic is reads anyway ("what's the status of this workspace", "what
+should I do next") — acts are the rare tail, which is exactly where a
+native ask belongs.
+
+**`ask_mastermind` exists only while a Mastermind does (decided).** No
+Mastermind → the tool is absent from `tools/list` (computed per-call; the
+endpoint is stateless). No queueing, no stub errors.
 
 **Audit** (`audit.jsonl`, 4 MiB cap): every act call — executed, proposed,
 denied, expired — with tool, target, args digest. Rendered as the
@@ -341,15 +360,19 @@ Zero new engine: a normal chat-mode session of a user-picked agent, `cwd =
 workspace root`, the `chimaera` MCP attached with the act tier enabled.
 Rules:
 
-- **Exactly one per workspace.** An explicit picker on first dashboard open
-  (agent CLI + model, from the existing launcher catalog), changeable later
-  in the dashboard/settings; picking a new one retires the old session's act
-  tier. No Mastermind picked = the act tier simply doesn't exist in the
-  workspace.
-- **It lives on the dashboard**: a docked strip (identity chip + composer),
-  expandable to the full `ChatView` — the subagents tray and plan panel come
-  along free. It is intentionally *not* a rail session like the workers; the
-  dashboard is its home.
+- **Exactly one per workspace.** Until one exists, the dock renders as a
+  **setup card**: a short plain-English explanation ("one agent that knows
+  every inch of this workspace — it sees every session, answers questions,
+  and delegates work; it never does the work itself; it bills as your own
+  account") plus the picker (agent CLI + model, from the existing launcher
+  catalog) and the ask-first/auto mode choice. Changeable later from the
+  dock; picking a new one retires the old session's act tier. No Mastermind
+  = no act tier and no `ask_mastermind` tool anywhere in the workspace.
+- **It lives on the dashboard, only on the dashboard** (decided): a docked
+  strip (identity chip + mode + composer), expandable to the full
+  `ChatView` — the subagents tray and plan panel come along free. It never
+  appears in the rail's agents list; the dock is its one management
+  surface.
 - **It delegates, it doesn't do.** The Chimaera-shipped **skill** (claude:
   injected skill dir; codex: a generated AGENTS.md layer) frames the role:
   understand the workspace, triage by attention state, cite session ids,
@@ -380,8 +403,8 @@ search misses paraphrase; acceptable for a small, jargon-heavy corpus.
 |---|---|---|
 | **v0.1 — the surface** (days) | DashboardTab (label `dashboard`) + auto landing + return strip + attention lane w/ inline permissions + roster cards incl. the subagent drop-down for chat sessions + activity column — all from the existing wire. Rail row, ⌘0. Launcher empty state when nothing runs. | none |
 | **v0.2 — honest depth** | Additive wire fields (`subagents[]`, `provenance`, `now_line`, usage) + feed fold; claude TUI http-hooks upgrade (subagent identity for TUIs) + statusline heartbeat; PTY liveness → `stalled`; recent-files JSONL log; codex chat MCP injection | none |
-| **v0.3 — agents can look** | Observe MCP tools + `ask_mastermind` (queued until a Mastermind exists) + surface manifest; codex TUI hook consent flow | codex `/hooks` walk-through (dashboard card) |
-| **v1 — the Mastermind** | Picker (one per workspace) + docked strip on the dashboard + act tools (`message_agent`, `spawn_agent`, `spawn_terminal`, `interrupt`, `open_in_pane`, `suggest`) + audit strip; provenance stamping; REST/MCP chat-send | the Mastermind picker itself |
+| **v0.3 — agents can look** | Observe MCP tools + surface manifest; codex TUI hook consent flow | codex `/hooks` walk-through (dashboard card) |
+| **v1 — the Mastermind** | Setup card + picker (one per workspace) + docked strip + act tools (`message_agent`, `spawn_agent`, `spawn_terminal`, `interrupt`, `open_in_pane`, `suggest`) gated by the harness ask-first/auto mode + `ask_mastermind` for workers + audit strip; provenance stamping; REST/MCP chat-send | the Mastermind setup card itself |
 | **v1.x** | The Mastermind skill hardening; suggestion cards polish; memory phase 1 (files), then phase 2 (index) if pulled | none |
 
 Each phase is independently verifiable live (`verify-app`) and useful alone.
@@ -389,27 +412,23 @@ The **wedge** (v0.1's reason to exist): *the attention queue with inline
 permission payloads, workspace-wide, surviving laptop-close.* Overview +
 persistence + honest cross-vendor state — no competitor has all three.
 
-## 10. Open questions **[decide]**
+## 10. Open questions
 
-Resolved 2026-07-15: name (Dashboard surface / Mastermind agent+module),
-landing (auto, on for everyone, off switch, launcher when idle), one
-Mastermind per workspace via explicit picker, codex consent as a dashboard
-card. Still open:
+All resolved 2026-07-15 (second maintainer pass):
 
-1. **Mastermind sends: direct or propose-first at launch?** The decided
-   model lets it direct chat workers outright (audited, rate-limited). A
-   conservative launch variant makes even chat sends proposal cards for the
-   first release, flipping to direct once trust is earned. Lean: direct,
-   with the audit strip prominent — but cheap to flip.
-2. **"New agent window":** `spawn_agent` opens a session (a pane); spawning
-   a native OS *window* is a shell concern — defer to a UI intent the native
-   shell handles, or drop?
-3. **Does `ask_mastermind` exist before a Mastermind is picked?** Lean:
-   yes, queued — the first pick drains the queue; the tool result says
-   "no mastermind yet — queued for when one exists".
-4. **Should the Mastermind's session appear in the rail's agents list**, or
-   only on the dashboard? Lean: dashboard-only (it's furniture, not a
-   worker), with the picker as the only management surface.
+1. **Mastermind sends are direct**, gated by an **ask-first / auto mode
+   that routes through the harness** — the agent's own tool-permission
+   system gates the act tools; ask-first prompts render in the attention
+   lane; auto pre-allows them in the generated config (§6). Most Mastermind
+   traffic is reads ("what's the status / what should I do next"); acts are
+   the rare, natively-gated tail.
+2. **`spawn_agent` / `spawn_terminal` open panes.** Native OS windows are
+   out of scope.
+3. **No Mastermind, no `ask_mastermind`** — the tool is absent from
+   `tools/list` until one exists; the dashboard dock shows the setup card
+   (short help + picker + mode) instead. No queueing.
+4. **The Mastermind lives only on the dashboard** — never in the rail; the
+   dock is its one management surface.
 
 ## Appendix: what we deliberately do NOT build
 
