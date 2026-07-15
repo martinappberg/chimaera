@@ -312,6 +312,36 @@ pub(crate) async fn launch_compute_session(
             .into_response();
     };
 
+    // Seed the job daemon's workspace registry over the shared FS: the job
+    // will `mkdir -p` this same home, and its WorkspaceStore then boots with
+    // the launch's workspace already registered — the compute window lands
+    // on a ready-to-open workspace instead of a bare "open a folder" page
+    // (the maintainer hit exactly that dead end on first use).
+    if let Some(ws) = spec
+        .workspace_id
+        .as_deref()
+        .and_then(|id| crate::lock(&state.workspaces).get(id))
+    {
+        let seed_dir = root.join(&job_id).join("data");
+        let seed = json!([{
+            "id": format!("w-{}", &chimaera_core::generate_token()[..8]),
+            "root": ws.root,
+            "name": ws.name,
+            "last_opened_at": now_secs(),
+        }]);
+        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            std::fs::create_dir_all(&seed_dir)?;
+            crate::persist::atomic_write_json(
+                &seed_dir.join("workspaces.json"),
+                serde_json::to_vec_pretty(&seed)?,
+            )
+        })
+        .await;
+        if let Err(e) = res.map_err(anyhow::Error::from).and_then(|r| r) {
+            tracing::warn!(%e, %job_id, "workspace seed failed (compute window starts empty)");
+        }
+    }
+
     // The launch record: the card's resource numbers while Slurm is the
     // only other truth (and after; squeue doesn't report mem/gres cheaply).
     let record = json!({
@@ -441,16 +471,17 @@ pub(crate) async fn cancel_compute_session(
     StatusCode::NO_CONTENT.into_response()
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Sortable second-resolution stamp for script filenames without pulling a
 /// date crate: unix seconds, zero-padded.
 fn chrono_free_ts() -> String {
-    format!(
-        "{:012}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    )
+    format!("{:012}", now_secs())
 }
 
 #[cfg(test)]

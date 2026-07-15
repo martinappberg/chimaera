@@ -46,6 +46,9 @@ pub struct Shell {
     /// gets never carries a port or token — `connect_compute_session` reads
     /// them back here, in Rust.
     compute_endpoints: Mutex<HashMap<(String, String), ComputeEndpoint>>,
+    /// Composite keys mid-connect: one tunnel build per job at a time (a
+    /// click storm must not race N tunnel builds — seen on first live use).
+    compute_connecting: Mutex<std::collections::HashSet<String>>,
     /// In-flight connect per alias. One flight owns the ssh; every other
     /// caller (other windows' reconnects, the home screen, startup restore)
     /// awaits its outcome — so a drop never fans out into an auth-prompt
@@ -293,6 +296,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
             compute_endpoints: Mutex::new(HashMap::new()),
+            compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),

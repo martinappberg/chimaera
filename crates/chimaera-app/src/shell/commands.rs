@@ -479,33 +479,58 @@ pub(super) async fn connect_compute_session(
         }
     }
     if state.compute_tunnels.lock().await.get(&key).is_none() {
-        let cached = lock(&state.compute_endpoints)
-            .get(&(alias.clone(), job_id.clone()))
-            .cloned();
-        let endpoint = match cached {
-            Some(e) => e,
-            None => {
-                fetch_compute_sessions(&state, &alias).await?;
-                lock(&state.compute_endpoints)
-                    .get(&(alias.clone(), job_id.clone()))
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "job {job_id} on {alias} has no daemon manifest yet (still starting?)"
-                        )
-                    })?
+        // One connect per job at a time: the first live test produced eight
+        // rapid clicks racing eight tunnel builds. Guard released on every
+        // exit path below.
+        {
+            let mut connecting = lock(&state.compute_connecting);
+            if !connecting.insert(key.clone()) {
+                return Err(format!("already connecting to job {job_id} — hold on"));
             }
-        };
-        let tunnel = chimaera_remote::connect_compute_node(
-            &alias,
-            &endpoint.node,
-            &job_id,
-            endpoint.port,
-            &endpoint.token,
-            endpoint.routable,
-        )
-        .await
-        .map_err(|e| format!("{e:#}"))?;
+        }
+        let result = async {
+            // ALWAYS re-list before tunneling: the endpoint cache may hold a
+            // previous life of this queue, and a pending job must fail with
+            // the truth ("still queued"), never a stale/foreign endpoint.
+            let payload = fetch_compute_sessions(&state, &alias).await?;
+            let endpoint = lock(&state.compute_endpoints)
+                .get(&(alias.clone(), job_id.clone()))
+                .cloned();
+            let Some(endpoint) = endpoint else {
+                let state_word = payload
+                    .get("sessions")
+                    .and_then(|s| s.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|s| {
+                            s.get("job_id").and_then(|j| j.as_str()) == Some(job_id.as_str())
+                        })
+                    })
+                    .and_then(|s| s.get("state").and_then(|v| v.as_str()))
+                    .unwrap_or("gone");
+                return Err(match state_word {
+                    "PENDING" => format!(
+                        "job {job_id} is still queued — it can be opened once it starts running"
+                    ),
+                    "gone" => {
+                        format!("job {job_id} is no longer in the queue (ended or cancelled)")
+                    }
+                    other => format!("job {job_id} is {other} — its daemon isn't reachable yet"),
+                });
+            };
+            chimaera_remote::connect_compute_node(
+                &alias,
+                &endpoint.node,
+                &job_id,
+                endpoint.port,
+                &endpoint.token,
+                endpoint.routable,
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
+        }
+        .await;
+        lock(&state.compute_connecting).remove(&key);
+        let tunnel = result?;
         state
             .compute_tunnels
             .lock()

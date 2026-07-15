@@ -33,6 +33,7 @@
     type ComputeSessionList,
     type ComputeSessionView,
   } from "./computeSessions";
+  import { formatSlurmDuration, parseSlurmTimeLeft } from "./compute";
   import { getJobContext, type Health } from "../net/api";
 
   interface Props {
@@ -127,12 +128,28 @@
   const isHostPage = $derived(native && ownAlias !== null && getJobContext() === null);
   /** Host page: the daemon's own compute list (null = not fetched / no route). */
   let hostCompute = $state<ComputeSessionList | null>(null);
+  /** List-level failure (the fetch itself); card-level errors live below. */
   let hostComputeError = $state<string | null>(null);
   /** Job id pending the in-row two-step scancel confirm. */
   let confirmCancel = $state<string | null>(null);
   let launchOpen = $state(false);
   /** Poll gate: the sessions list only refreshes while the page is visible. */
   let pageVisible = $state(document.visibilityState === "visible");
+  /** The open currently in flight (job id) — the card pulses "connecting…",
+   *  its actions freeze, and a second click is impossible until it settles. */
+  let connectingJob = $state<string | null>(null);
+  /** scancel'd jobs → their state when the cancel was sent. The card shows
+   *  "cancelling…" until a refetch shows the job GONE or in a new state
+   *  (Slurm then reports CANCELLING/COMPLETING, which speak for themselves). */
+  let cancelling = $state<Map<string, string>>(new Map());
+  /** Per-card failure lines (open/cancel), keyed by job id. */
+  let cardErrors = $state<Map<string, string>>(new Map());
+  /** Drops stale list responses (a manual refresh overtaking the poller). */
+  let computeFetchSeq = 0;
+  /** Client clock when the current list arrived — the tick baseline. */
+  let listReceivedAt = $state(Date.now());
+  /** ONE shared 1s tick for every RUNNING card (never per-card timers). */
+  let nowTick = $state(Date.now());
 
   // --- local daemon build parity (native shell, local window only) ------------
 
@@ -339,12 +356,30 @@
   // --- host page: the full compute-sessions surface ---------------------------
 
   /** Refetch this host's sessions from ITS daemon. Keeps the stale list on a
-   *  transient failure (with a quiet inline error) — never blanks the page. */
+   *  transient failure (with a quiet inline error) — never blanks the page.
+   *  Sequenced so an overtaken response can never clobber a newer one. */
   async function refreshHostCompute(): Promise<void> {
+    const seq = ++computeFetchSeq;
     try {
-      hostCompute = await listComputeSessions();
+      const list = await listComputeSessions();
+      if (seq !== computeFetchSeq) return;
+      hostCompute = list;
       hostComputeError = null;
+      // Re-sync the shared tick baseline to this response.
+      listReceivedAt = Date.now();
+      nowTick = listReceivedAt;
+      // A "cancelling…" card settles once the job is gone or Slurm moved it
+      // to a new state (CANCELLING/COMPLETING then speak for themselves).
+      if (cancelling.size > 0) {
+        const next = new Map(cancelling);
+        for (const [id, stateAtCancel] of next) {
+          const row = list.sessions.find((s) => s.job_id === id);
+          if (row === undefined || row.state !== stateAtCancel) next.delete(id);
+        }
+        cancelling = next;
+      }
     } catch (e) {
+      if (seq !== computeFetchSeq) return;
       hostComputeError = e instanceof Error ? e.message : String(e);
     }
   }
@@ -364,24 +399,40 @@
     return () => clearInterval(t);
   });
 
-  /** Tunnel to a ready session — the shell builds it and opens the window. */
-  async function openHostCompute(jobId: string): Promise<void> {
-    hostComputeError = null;
+  /** Tunnel to a ready session — the shell builds it and opens the window.
+   *  Hard-gated: only a `ready` card is openable, and only one open can be
+   *  in flight at a time (the card shows "connecting…" until it settles). */
+  async function openHostCompute(cs: ComputeSessionView): Promise<void> {
+    if (!cs.ready || connectingJob !== null || cancelling.has(cs.job_id)) return;
+    cardErrors = mapWithout(cardErrors, cs.job_id);
+    connectingJob = cs.job_id;
     try {
-      await connectComputeSession(hostLabel, jobId);
+      await connectComputeSession(hostLabel, cs.job_id);
     } catch (e) {
-      hostComputeError = e instanceof Error ? e.message : String(e);
+      cardErrors = new Map(cardErrors).set(
+        cs.job_id,
+        e instanceof Error ? e.message : String(e),
+      );
+    } finally {
+      connectingJob = null;
     }
   }
 
-  /** scancel the job (Slurm ends everything in the allocation), then refetch. */
-  async function cancelHostCompute(jobId: string): Promise<void> {
+  /** scancel the job (Slurm ends everything in the allocation). The card
+   *  wears "cancelling…" until a refetch shows movement (see refresh). */
+  async function cancelHostCompute(cs: ComputeSessionView): Promise<void> {
     confirmCancel = null;
-    hostComputeError = null;
+    if (cancelling.has(cs.job_id)) return;
+    cardErrors = mapWithout(cardErrors, cs.job_id);
+    cancelling = new Map(cancelling).set(cs.job_id, cs.state);
     try {
-      await cancelComputeSession(jobId);
+      await cancelComputeSession(cs.job_id);
     } catch (e) {
-      hostComputeError = e instanceof Error ? e.message : String(e);
+      cancelling = mapWithout(cancelling, cs.job_id);
+      cardErrors = new Map(cardErrors).set(
+        cs.job_id,
+        e instanceof Error ? e.message : String(e),
+      );
     }
     void refreshHostCompute();
   }
@@ -394,6 +445,69 @@
     if (cs.gres !== null && cs.gres !== "") parts.push(cs.gres);
     return parts.join(" · ");
   }
+
+  // --- card presentation (Slurm's raw vocabulary, styled but never renamed) ---
+
+  /** Dot class: transitional client states win, then the raw Slurm state
+   *  maps onto the home screen's dot language. */
+  function sessionDot(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
+    if (isCancelling) return "ending";
+    if (connecting) return "booting";
+    if (cs.state === "RUNNING") return cs.ready ? "alive" : "booting";
+    if (cs.state === "PENDING") return "queued";
+    if (cs.state === "COMPLETING" || cs.state === "CANCELLING") return "ending";
+    return "";
+  }
+
+  /** The mono meta slot: node / raw state / transitional verbs. While
+   *  PENDING, squeue's %N carries the pending REASON — shown raw too. */
+  function sessionMeta(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
+    if (isCancelling) return "cancelling…";
+    if (connecting) return "connecting…";
+    if (cs.state === "RUNNING") {
+      if (cs.ready) return cs.node;
+      return cs.node === "" ? "starting…" : `${cs.node} · starting…`;
+    }
+    if (cs.state === "PENDING") {
+      return cs.node === "" ? cs.state : `${cs.state} ${cs.node}`;
+    }
+    return cs.node === "" ? cs.state : `${cs.node} · ${cs.state}`;
+  }
+
+  /** One honest tooltip for the row and its open action. */
+  function sessionTitle(cs: ComputeSessionView, connecting: boolean, isCancelling: boolean): string {
+    if (isCancelling) return `cancelling slurm job ${cs.job_id}…`;
+    if (connecting) return `connecting to slurm job ${cs.job_id}…`;
+    if (cs.ready) return `open the session on ${cs.node} (slurm job ${cs.job_id})`;
+    if (cs.state === "PENDING") return "starts when the job leaves the queue";
+    if (cs.state === "RUNNING") {
+      return `slurm job ${cs.job_id} is starting — its daemon isn't up yet`;
+    }
+    return `slurm job ${cs.job_id} — ${cs.state}`;
+  }
+
+  /** RUNNING cards tick down between polls off the ONE shared clock (client
+   *  math only — zero extra fetches). Other states show the raw value: for
+   *  PENDING it's the requested LIMIT, not a countdown. */
+  function displayTimeLeft(cs: ComputeSessionView): string {
+    if (cs.state !== "RUNNING") return cs.time_left;
+    const base = parseSlurmTimeLeft(cs.time_left);
+    if (base === null) return cs.time_left;
+    return formatSlurmDuration(
+      Math.max(0, base - Math.floor((nowTick - listReceivedAt) / 1000)),
+    );
+  }
+
+  const anyRunning = $derived(
+    hostCompute?.sessions.some((s) => s.state === "RUNNING") ?? false,
+  );
+  // The shared ticker: one interval for the whole list, only while the page
+  // is visible and something is actually counting down.
+  $effect(() => {
+    if (!isHostPage || !pageVisible || !anyRunning) return;
+    const t = setInterval(() => (nowTick = Date.now()), 1000);
+    return () => clearInterval(t);
+  });
 
   async function submitAdd(): Promise<void> {
     const alias = addAlias.trim();
@@ -681,56 +795,64 @@
         {:else}
           <div class="rows">
             {#each hostCompute.sessions as cs (cs.job_id)}
-              {@const csState =
-                cs.state === "RUNNING" && cs.ready
-                  ? "alive"
-                  : cs.state === "PENDING"
-                    ? "starting"
-                    : ""}
+              {@const isConnecting = connectingJob === cs.job_id}
+              {@const isCancelling = cancelling.has(cs.job_id)}
+              {@const dotCls = sessionDot(cs, isConnecting, isCancelling)}
+              {@const meta = sessionMeta(cs, isConnecting, isCancelling)}
+              {@const title = sessionTitle(cs, isConnecting, isCancelling)}
               {@const res = resourceLabel(cs)}
+              {@const cerr = cardErrors.get(cs.job_id)}
               {#if confirmCancel === cs.job_id}
                 <div class="row confirm" role="alertdialog" aria-label="cancel compute session?">
                   <span class="name">{cs.name}</span>
                   <span class="confirm-label"
                     >cancel job {cs.job_id}? everything in the allocation ends</span
                   >
-                  <button class="confirm-yes" onclick={() => void cancelHostCompute(cs.job_id)}
+                  <button class="confirm-yes" onclick={() => void cancelHostCompute(cs)}
                     >cancel job</button
                   >
                   <button class="confirm-no" onclick={() => (confirmCancel = null)}>keep</button>
                 </div>
               {:else}
-                <div class="rowwrap" role="presentation" class:live={csState === "alive"}>
+                <div class="rowwrap" role="presentation" class:live={dotCls === "alive"}>
                   <button
-                    class="row"
-                    title={cs.ready
-                      ? `open the session on ${cs.node} (slurm job ${cs.job_id})`
-                      : `slurm job ${cs.job_id} — ${cs.state}${cs.node !== "" ? ` on ${cs.node}` : ""}, not connectable yet`}
-                    disabled={!cs.ready}
-                    onclick={() => void openHostCompute(cs.job_id)}
+                    class="row comp"
+                    {title}
+                    disabled={!cs.ready || isConnecting || isCancelling}
+                    onclick={() => void openHostCompute(cs)}
                   >
-                    <span class="dot {csState}" title={cs.state}></span>
-                    <span class="name">{cs.name}</span>
-                    <span class="node">{cs.node === "" ? "queued" : cs.node}</span>
+                    <span class="dot {dotCls}" title={cs.state}></span>
+                    <span class="name" class:dim={isCancelling}>{cs.name}</span>
+                    <span class="node">{meta}</span>
                     {#if res !== ""}
                       <span class="badge">{res}</span>
                     {/if}
-                    <span class="when" title="walltime remaining">{cs.time_left}</span>
+                    <span
+                      class="when"
+                      title={cs.state === "RUNNING" ? "walltime remaining" : "walltime limit"}
+                      >{displayTimeLeft(cs)}</span
+                    >
                   </button>
-                  <button
-                    class="side"
-                    title={cs.ready
-                      ? "open this compute session"
-                      : "not connectable yet — the session's daemon is still starting"}
-                    disabled={!cs.ready}
-                    onclick={() => void openHostCompute(cs.job_id)}>open</button
-                  >
-                  <button
-                    class="side stop"
-                    title="cancel slurm job {cs.job_id}"
-                    onclick={() => (confirmCancel = cs.job_id)}>cancel</button
-                  >
+                  {#if !isCancelling}
+                    <button
+                      class="side"
+                      class:busy={isConnecting}
+                      {title}
+                      disabled={!cs.ready || isConnecting}
+                      onclick={() => void openHostCompute(cs)}
+                      >{isConnecting ? "connecting…" : "open"}</button
+                    >
+                    <button
+                      class="side stop"
+                      title="cancel slurm job {cs.job_id}"
+                      disabled={isConnecting}
+                      onclick={() => (confirmCancel = cs.job_id)}>cancel</button
+                    >
+                  {/if}
                 </div>
+                {#if cerr !== undefined}
+                  <div class="err-line card">{cerr}</div>
+                {/if}
                 {#if cs.egress === false}
                   <!-- Only a VERIFIED-blocked probe warns; absent egress
                        means "couldn't verify", not blocked. -->
@@ -1510,6 +1632,52 @@
     font-family: var(--mono);
     font-size: var(--text-xs);
     color: var(--warn);
+  }
+
+  /* Compute-card dots: Slurm's states styled, never renamed. queued =
+     hollow muted pulse (waiting in line, nothing alive yet); booting =
+     accent pulse (the allocation runs, its daemon is coming up — also the
+     "connecting…" wait); ending = warn (CANCELLING/COMPLETING and the
+     local "cancelling…" wait). */
+  .dot.queued {
+    box-sizing: border-box;
+    background: transparent;
+    border: 1.5px solid var(--muted);
+    opacity: 1;
+    animation: dotpulse 1.6s ease-in-out infinite;
+  }
+
+  .dot.booting {
+    background: var(--accent);
+    opacity: 1;
+    animation: dotpulse 1.1s ease-in-out infinite;
+  }
+
+  .dot.ending {
+    background: var(--warn);
+    opacity: 0.9;
+  }
+
+  /* A non-openable compute row is calmly disabled — not "in progress"
+     (the generic .row:disabled progress cursor belongs to connecting
+     hosts, not to a job waiting in the queue). */
+  .row.comp:disabled {
+    cursor: default;
+  }
+
+  /* The name recedes while its card is being cancelled. */
+  .name.dim {
+    opacity: 0.55;
+  }
+
+  /* Card-level failure aligns under the card's name (the egress indent). */
+  .err-line.card {
+    padding-left: 27px;
+  }
+
+  /* The in-flight "connecting…" action stays visible without hover. */
+  .side.busy {
+    visibility: visible;
   }
 
   /* Local home's per-host compute indicator: quiet like the browse row,
