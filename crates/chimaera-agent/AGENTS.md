@@ -44,7 +44,7 @@ gap-replay idea as the PTY transport, realized for structured streams.
 |---|---|---|
 | `lib.rs` | `ChatManager`: the session registry + the pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`. | adding session lifecycle, changing fan-out, touching `ChatInfo`. |
 | `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. `agent_version`, `rollback_turns`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
-| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), `Usage`, the delta `Coalescer`, and the size caps (`cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`). | adding an event/command kind, or a cap. |
+| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), `Usage`, the delta `Coalescer`, and the size caps (`cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
 | `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
 | `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn lifecycle, approvals. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
 | `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index + dir pruning. The gap-replay crown jewel. | anything touching durability, replay, or seq numbering. |

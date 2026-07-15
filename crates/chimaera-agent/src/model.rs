@@ -26,6 +26,9 @@ pub const DIFF_TURN_BUDGET: usize = 256 * 1024;
 pub const BG_TASKS_CAP: usize = 32;
 /// One-line cap for background-task descriptions and close summaries.
 pub const BG_LABEL_MAX: usize = 200;
+/// Bound for a close's output-file PATH — never ellipsized (a truncated
+/// path is a corrupt path); an oversized one is dropped whole.
+pub const BG_PATH_MAX: usize = 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -294,10 +297,11 @@ pub enum AgentEvent {
     /// every event carries the WHOLE set (empty = none running), so consumers
     /// replace rather than patch and replay's final state is simply the last
     /// event seen. `closed` rides the tasks that left the set at this event
-    /// WITH a verdict (a task_notification, or a terminal task_updated
-    /// patch) — one-shot notice material, not state. APPENDED last: strictly
-    /// additive, so old journals never carry it and old clients skip the
-    /// unknown tag.
+    /// WITH a verdict — the task_notification close, the only frame that
+    /// carries one (set-removals and terminal task_updated patches don't;
+    /// they just shrink `tasks`) — one-shot notice material, not state.
+    /// APPENDED last: strictly additive, so old journals never carry it and
+    /// old clients skip the unknown tag.
     BackgroundTasks {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tasks: Vec<BackgroundTask>,
@@ -327,8 +331,8 @@ pub struct BackgroundTask {
 pub struct BackgroundTaskClose {
     pub id: String,
     pub description: String,
-    /// completed | failed | stopped (the task_notification verdict, or a
-    /// terminal task_updated status), verbatim.
+    /// completed | failed | stopped — the task_notification verdict,
+    /// verbatim.
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -429,7 +433,8 @@ pub enum AgentCommand {
     BackgroundTool {
         tool_call_id: String,
     },
-    /// Stop a running subagent (claude stop_task).
+    /// Stop a running task — a subagent row id or a background task's
+    /// native key (claude stop_task, generic over its task registry).
     StopTask {
         task_id: String,
     },

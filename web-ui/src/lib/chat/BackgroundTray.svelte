@@ -24,10 +24,15 @@
 
   let open = $state(false);
 
-  /** 1 Hz clock for the elapsed column — only while the tray is mounted
-   *  (it unmounts with an empty set), and torn down with it. */
+  /** 1 Hz clock for the elapsed column — only while the rows are actually
+   *  visible: collapsed (the default) nothing reads `now`, so the effect
+   *  bails and a long-running task doesn't tick a wake-up per second for
+   *  hours. Re-arms on expand (with a fresh `now`), torn down with the
+   *  tray (it unmounts on an empty set). */
   let now = $state(Date.now());
   $effect(() => {
+    if (!open) return;
+    now = Date.now();
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);
   });
@@ -63,6 +68,7 @@
   {#if open}
     <div class="rows">
       {#each tasks as task (task.id)}
+        {@const e = elapsed(task)}
         <div class="task">
           <span class="dot" aria-hidden="true"></span>
           <div class="body">
@@ -71,8 +77,8 @@
             {#if task.status !== "running"}
               <span class="status">{task.status}</span>
             {/if}
-            {#if elapsed(task) !== ""}
-              <span class="elapsed">{elapsed(task)}</span>
+            {#if e !== ""}
+              <span class="elapsed">{e}</span>
             {/if}
           </div>
           {#if onStop !== undefined}
@@ -125,7 +131,7 @@
   .spark {
     flex: none;
     color: var(--accent);
-    /* Presence, not alarm — the same slow breathe as the agents tray. */
+    /* Presence, not alarm — shared keyframe in app.css, same as AgentsTray. */
     animation: tray-breathe 1.8s ease-in-out infinite;
   }
   .task {
@@ -182,15 +188,6 @@
   }
   .stop:hover {
     color: var(--err);
-  }
-  @keyframes tray-breathe {
-    0%,
-    100% {
-      opacity: 0.9;
-    }
-    50% {
-      opacity: 0.5;
-    }
   }
   @media (prefers-reduced-motion: reduce) {
     .tray,

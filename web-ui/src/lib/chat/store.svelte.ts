@@ -365,9 +365,11 @@ export class ChatStore {
         // view must re-push the user's preference to it (seq-dedupe means only
         // a genuinely-new init re-applies here; a plain reconnect doesn't).
         this.thinkingPushed = false;
-        // Background tasks were the OLD process's children — they died with
-        // it. A replayed set event after this init rebuilds any live ones.
-        this.backgroundTasks = [];
+        // Deliberately NOT clearing backgroundTasks here: the driver re-emits
+        // init MID-PROCESS (a model-switch ack, a safety/consent fallback),
+        // when the tasks are still very much alive. Their real lifecycle ends
+        // are `exited`/fatal `error` below — and the driver journals an empty
+        // level-set at teardown, so replay agrees without this case guessing.
         // Any ask still pending predates this driver process — its reply
         // route died with the old one, so an answer could never land. Seq
         // ordering makes this safe: a live driver's Init is journaled BEFORE
@@ -412,27 +414,33 @@ export class ChatStore {
       }
       case "background_tasks": {
         // LEVEL-SET: the event carries the whole set — replace, never patch,
-        // so replay's final state is simply the last event seen.
-        this.backgroundTasks = ((ev.tasks as Record<string, unknown>[]) ?? []).map((t) => ({
-          id: t.id as string,
-          taskType: (t.task_type as string) ?? "",
-          description: (t.description as string) ?? "",
-          status: (t.status as string) ?? "running",
-          startedAtMs: (t.started_at_ms as number) ?? 0,
-        }));
+        // so replay's final state is simply the last event seen. An id-less
+        // entry (a corrupt journal line) is dropped rather than fed to the
+        // tray's keyed render, where a duplicate/undefined key throws.
+        this.backgroundTasks = ((ev.tasks as Record<string, unknown>[]) ?? [])
+          .map((t) => ({
+            id: (t.id as string) ?? "",
+            taskType: (t.task_type as string) ?? "",
+            description: (t.description as string) ?? "",
+            status: (t.status as string) ?? "running",
+            startedAtMs: (t.started_at_ms as number) ?? 0,
+          }))
+          .filter((t) => t.id !== "");
         // Tasks that left the set WITH a verdict fold into history as quiet
         // notices — completion is transcript-worthy; a set change alone is
-        // not. The wire summary shapes (live-verified): a natural close is
-        // self-contained ('Background command "…" completed (exit code 0)')
-        // — render it alone rather than saying everything twice; a stop's
-        // summary is just the description — drop the echo and say the
-        // verdict ourselves.
+        // not. A summary that names the verdict is the CLI's own full
+        // sentence ('Background command "…" completed (exit code 0)') —
+        // render it alone rather than saying everything twice. Matching on
+        // the status word (not the description) keeps that working when the
+        // driver truncated a long description. A summary that merely echoes
+        // the description (a stop's shape, on pre-fix journals — the driver
+        // drops the echo at construction now) adds nothing and is dropped.
         for (const c of (ev.closed as Record<string, unknown>[]) ?? []) {
           const desc = (c.description as string) ?? "background task";
           const status = (c.status as string) ?? "completed";
           const summary = (c.summary as string) ?? "";
           const selfContained =
-            summary.includes(desc) && summary.toLowerCase().includes(status.toLowerCase());
+            summary !== "" && summary.toLowerCase().includes(status.toLowerCase());
           this.notice(
             selfContained
               ? summary
@@ -801,8 +809,10 @@ export class ChatStore {
           this.activity = null;
           // A fatal error is a terminal path like the others — a tool left
           // in_progress must not spin forever when no `exited` follows (a kept-
-          // visible ProtocolError session emits no exit).
+          // visible ProtocolError session emits no exit). Background tasks
+          // died with the process too.
           this.reconcileOpenTools();
+          this.backgroundTasks = [];
         }
         break;
       case "exited":

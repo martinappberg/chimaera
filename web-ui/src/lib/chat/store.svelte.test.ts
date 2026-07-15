@@ -396,24 +396,28 @@ describe("ChatStore background tasks", () => {
     expect(notices[0]).toMatchObject({ tone: "error" });
   });
 
-  it("survives a turn end but dies with the driver process", () => {
+  it("survives a turn end AND a mid-process init, dies with the process", () => {
     // Cross-turn: the turn ending does not clear the set (that's the point
-    // of background work) — but a driver exit does (the tasks were the
-    // CLI's children), and a fresh init starts empty.
+    // of background work). Neither does an init — the driver re-emits init
+    // MID-PROCESS (model-switch ack, safety fallback) while the tasks still
+    // run; the model-switch wipe was a real bug. The lifecycle ends are a
+    // driver exit / fatal error (the tasks were the CLI's children) — and
+    // the driver journals an empty level-set at teardown, so replay agrees.
     const store = fold([
       { type: "turn_started", turn_id: "t1" },
       { type: "background_tasks", tasks: [BG()] },
       { type: "turn_completed", turn_id: "t1", usage: {} },
+      { type: "init", native_session_id: "n1" },
     ]);
     expect(store.backgroundTasks).toHaveLength(1);
-    store.apply({ seq: 4, ts: 4, ev: { type: "exited", status: 0 } } as SeqEvent);
+    store.apply({ seq: 5, ts: 5, ev: { type: "exited", status: 0 } } as SeqEvent);
     expect(store.backgroundTasks).toHaveLength(0);
 
-    const respawned = fold([
+    const fatal = fold([
       { type: "background_tasks", tasks: [BG()] },
-      { type: "init", native_session_id: "n2" },
+      { type: "error", message: "driver died", fatal: true },
     ]);
-    expect(respawned.backgroundTasks).toHaveLength(0);
+    expect(fatal.backgroundTasks).toHaveLength(0);
   });
 
   it("replay converges on the last set event", () => {
