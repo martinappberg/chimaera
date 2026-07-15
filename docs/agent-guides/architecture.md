@@ -912,12 +912,120 @@ setup into a new session. Distinctive, deferred.
     forced. The branch always survives — removing a worktree is not `rm -rf` history. The remove
     control shows in the UI exactly where the daemon would allow it. All four fences are
     unit-tested, and the create → land-in-session → remove loop was driven live.
-- **Slurm**: `squeue`/`sacct --json` poller with backoff; job strip in the sidebar;
-  job↔session linking (detect agent-submitted sbatch); degrades to no-op off-cluster.
-  Post-v1: launch agent sessions *as* Slurm jobs for heavy work — but note most compute nodes
-  have no outbound internet, so agents needing `api.anthropic.com` generally live on the login
-  node and dispatch work to compute via sbatch/srun (support `http(s)_proxy` passthrough for
-  centers with allowlisted proxies).
+- **Slurm** (design pass 2026-07-14 — detection first, two placement modes; deep spec in
+  *Environment prelude & compute-node sessions* below). The cluster-side daemon detects the
+  scheduler *locally* (`command -v sbatch`) and serves it — the git-service model, not a
+  connect-time ssh probe — so it lights up automatically on HPC and is a no-op off-cluster. A
+  bounded `squeue --me` / `sinfo` poller (git-service resource discipline: `tokio::process` +
+  hard timeout + output cap + coalescing + backoff, never a tight loop on a shared login node),
+  a `GET /api/v1/compute` route, a client store parallel to `gitStatus`, and a job strip in the
+  rail; job↔session linking detects agent-submitted `sbatch`. **Inbound and outbound are
+  different facts and must not be conflated** (the earlier note here did): the *login node CAN
+  reach a compute node's ports* — verified on Sherlock 2026-07-14, both a direct TCP route and
+  `pam_slurm_adopt` ssh — so a daemon *on* a compute node is reachable through the one login-node
+  hop; what compute nodes *may* lack is *outbound* internet to `api.anthropic.com`, which is the
+  real gate on running an agent there — a per-cluster fact (Sherlock's nodes have direct egress,
+  verified 2026-07-14; `http(s)_proxy` passthrough where centers allowlist a proxy). See below.
+
+### Environment prelude & compute-node sessions
+
+*Design pass 2026-07-14 (author idea, developed in-session; tunnel reachability verified live on
+Sherlock). Two independent axes were deliberately separated — **environment** (what runs before
+your shell/agent) and **placement** (where it runs). Keeping them apart is what makes this
+extendable instead of a pile of per-scheduler special-cases; they compose (a compute-node job
+still applies your prelude).*
+
+**Axis A — the environment prelude.** A *prelude* is opaque shell text run before a shell or
+agent starts: `micromamba activate env`, `ml bcftools`, `source setup.sh`, `export FOO=bar`.
+Chimaera **never parses it** — it is the user's own commands in the user's own login shell, so
+conda/lmod/spack/venv/nix all "just work" with zero tool-specific code (the not-too-specific
+invariant). Honest scoping: shells already run interactive and source `~/.bashrc`/`.zshrc`, and
+agents already run under `-lc` (login profile sourced), so the prelude is exactly *the
+per-session setup your dotfiles don't do* — the things nobody puts in an rc.
+
+- **Scopes concatenate, they do not override.** Effective prelude = host-default ⊕
+  workspace-default ⊕ session/launch, in order; env vars merge last-wins. Concatenation matches
+  how shells actually work and the HPC mental model ("always `ml bcftools` on this host" + "this
+  project also `conda activate hello`" + "this session also `export DEBUG=1`").
+- **Federated storage falls out of the daemon-per-host model.** A host-default lives in *that
+  host's* daemon config (the cluster daemon owns "always `ml …` on the cluster"); a
+  workspace-default lives with the daemon that owns the workspace — no cross-host config sync,
+  each daemon persists its own. Storage: a dedicated `env-profiles.json` store (structured,
+  multi-line) mirroring `WorkspaceStore` + `atomic_write_json` with a route; bindings (which
+  profile is a host/workspace default) as settings keys; a settings **Environment** category
+  edits them (bespoke panel, the `AgentsSettings` special-case pattern).
+- **One injection seam, two hooks that already exist.** Write the effective prelude to a
+  per-session file and export `CHIMAERA_PRELUDE`; the shell-integration rc sources it *after*
+  the user's rc (`shellint`), and the agent login-wrapper sources it before `exec`
+  (`wrap_login_shell`). Env vars ride the existing `SpawnOpts.env` overlay (`session_env`). Both
+  terminal and agent spawns already funnel through these, so the prelude applies uniformly.
+  Preludes run once per real spawn, **not on reconnect** (reconnect reuses the live PTY — no
+  repeated `module load` cost).
+- **Capture (later).** A scratch terminal where the user sets up interactively (`micromamba
+  activate`, `ml load`), then snapshots the resulting env (`env -0` diff, powered by the OSC-133
+  command boundaries already parsed) into a profile — captures whatever they did without
+  Chimaera understanding any of it. Handles env-only tools; explicitly *cannot* capture `srun`
+  (that changes *where*, not env — that is Axis B, and the clean line between them).
+- **Trust boundary.** A prelude is the user's own commands (same privilege as their rc — nothing
+  to enter, no credential). A prelude sourced from a *checked-in* workspace file would be a
+  supply-chain vector: require explicit confirmation before running repo-provided commands.
+
+**Axis B — compute placement.** *Where* a session runs. Today: whatever host the daemon is on
+(laptop, or the login node `connect` reached). Slurm adds compute nodes — two modes, by intent,
+not either/or:
+
+- **Mode 1 — login node, agent-driven (the safe default; works wherever Slurm exists).** Detect
+  the scheduler, hand the agent a **Slurm skill** (the cluster's `sbatch`/`srun`/`squeue`/`sinfo`
+  conventions + default partition/account/prelude) and let it orchestrate; Chimaera just detects
+  and exposes. No new daemon, no tunnel. Matches the standing HPC wisdom — the agent needs the
+  API, the login node *has* internet, and heavy work dispatches to compute via `sbatch`/`srun`.
+  It is also where the prelude pays off: the skill's `sbatch` script body = the workspace prelude
+  + the job.
+- **Mode 2 — own the full session ON the compute node (the isolated, premium experience).**
+  `sbatch --job-name=chimaera-<ws>` runs a script whose body is the workspace prelude then
+  `chimaera serve`. The whole workbench — daemon, file-watch, git, previews, every agent/terminal
+  — runs *inside the allocation's cgroup*: correct resource accounting, and Slurm kills the whole
+  tree cleanly at walltime / `scancel` (the isolation the design wants, for free). The compute
+  node shares the parallel filesystem with the login node, so the workspace path is identical and
+  **no file sync is needed**, and the same static binary is already visible — no redeploy.
+  - **`squeue` IS the registry.** Jobs named `chimaera-*` are the discovery/reconnect index:
+    `squeue --me --name=chimaera-*` → `%N` is the (routable) node name, `%L` the walltime shown on
+    the daemon chip. Close the laptop → the job keeps running → reconnect → `squeue` finds it →
+    re-establish the tunnel. No separate registry is built; Slurm already is one.
+  - **The shared filesystem is the coordination channel.** The serve script writes
+    `{node, port, token}` to `~/.chimaera/compute/<jobid>/manifest.json` — visible from the login
+    node (same Lustre/GPFS), polled the way `RemoteHome` already polls a manifest. Per-user
+    `$HOME` = per-user isolation for free; jobid keys multiple jobs within a user.
+  - **Dynamic ports, never fixed.** The compute daemon binds `:0` (OS-assigned) and records the
+    actual port in its manifest. Any number of users or workspaces on one fat node get distinct,
+    non-colliding ports automatically — a fixed port collides the moment two of anything share a
+    node.
+  - **Reaching it is a negotiated ladder** — decided by bounded probes, surfaced to the user,
+    never guessed per-cluster. **B (preferred):** loopback bind + `ssh`-forward through the login
+    node (`ProxyJump`, reusing the login-node ControlMaster) — the port is *not exposed to
+    co-tenants* at all, and with `pam_slurm_adopt` the ssh channel is adopted into the job cgroup
+    (verified on Sherlock). **A (fallback):** routable bind + direct login→node forward (the
+    existing `spawn_tunnel`, with the `%N` node name as the `-L` target instead of `127.0.0.1`) +
+    per-session token as the only gate (verified reachable on Sherlock). **Neither → Mode 2
+    unsupported on this cluster:** degrade to Mode 1 and *say so plainly* in the compute panel —
+    no reverse-tunnel heroics (that rung was dropped 2026-07-14 as scope, not lock-in; the ladder
+    stays open for a third rung if a real cluster ever needs it). "Not supported" here means only
+    *own-the-session-on-the-node* — detection, the job strip, and Mode 1 still work.
+  - **Compute-node outbound is a per-cluster fact — probe it, never assume it.** Mode 2 runs the
+    agent on the node, so it must reach `api.anthropic.com` from there — directly or via an
+    allowlisted `http(s)_proxy`. Verified on Sherlock 2026-07-14: **direct egress works from a
+    compute node** (HTTP 405 from the API endpoint — TLS + HTTP path intact, no proxy configured),
+    so Mode 2 is fully viable there. Other centers differ (many do block node egress), so the
+    generalizable mechanism is a probe at job start: the serve script checks outbound and records
+    the result in the manifest, letting the client say "agents can't reach the API from this node
+    — terminals/previews here, agents via Mode 1" instead of an agent failing mysteriously. Where
+    egress is blocked, Mode 2 still carries non-agent sessions (terminals, previews, file work
+    inside the allocation) — the mode degrades by capability, not all-or-nothing.
+  - **Two-tier persistence, stated honestly.** The login-node daemon persists indefinitely (the
+    classic "close the laptop, nothing dies"). A compute-node daemon persists **until its
+    allocation ends** — reconnectable via `squeue` the whole time, but walltime-bounded by
+    construction. Surface walltime-remaining on the chip; this is correct for HPC (you asked for
+    N hours, you get N), not a regression.
 
 ### Security notes
 

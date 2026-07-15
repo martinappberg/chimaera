@@ -124,7 +124,8 @@ After-1.0 (sequencing, not compromise — these need a working product to be des
 - Published/versioned public protocol. tmux and LSP earned protocol status *after* adoption;
   the internal protocol is designed cleanly so publication is a docs-and-freeze exercise.
 - Multi-host hub federation (manifest + per-host windows cover multi-cluster use until then).
-- sbatch-offloaded agent sessions (agents running inside Slurm jobs).
+- sbatch-offloaded agent sessions — **Mode 2**: own the full workbench on a compute node via the
+  negotiated tunnel ladder (specced in Architecture → Environment prelude & compute-node sessions).
 
 ## Risks (ranked)
 
@@ -166,7 +167,7 @@ dev working with AI agents, part-time.
 | **M3 — Previews wave 1** | file tree, images+thumbnails, Markdown, sandboxed HTML reports (MultiQC), CSV/TSV with gzip tier. | most code-server use | 3–4 wks |
 | **M4 — Previews wave 2 + git** | Parquet paging, ipynb, PDF, JSON tree, large-file guards; git status/log/diff panel. | code-server, entirely | 3–4 wks |
 | **M4.5 — Linked terminals** | OSC 133 shell integration + per-session command journal, daemon HTTP MCP server (`run_in_terminal`/`read_terminal`/`list_terminals`), link UX (agent top-bar chips, reference-band drag, auto-link on `@term:` mention), sentinel fallback for remote shells. | agent↔shell copy-paste | 3–4 wks |
-| **M5 — HPC layer** | Slurm strip + job↔session links, `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. | — | 2–3 wks |
+| **M5 — HPC layer** | Environment prelude (host/workspace/session scopes, one spawn seam) + Slurm detection/strip + job↔session links + Mode 1 (login-node agent + Slurm skill); `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. *(scope grew with the 2026-07-14 design pass — estimate predates it.)* | — | 2–3 wks |
 | **M6 — Optimal-build completion → v1.0** | Tauri native shell (window per workspace, native notifications, menubar badge), Tier C ACP agents (Gemini native). ~~Tier B structured chat mode~~ (+ native codex app-server) delivered early, 2026-07-07. | Claude desktop app | 6–8 wks |
 | After 1.0 | Hub federation, sbatch-offloaded sessions, protocol publication, single-file editing. | | ongoing |
 
@@ -296,6 +297,32 @@ which is the survival property that matters.
   token; `SessionManager::kill_all` + a public `KILL_ESCALATION_GRACE`. Local-daemon shutdown
   is intentionally not surfaced — quitting the app is the local equivalent, and the endpoints
   already work on loopback if that changes.
+
+- **2026-07-14 — HPC environment + compute-node placement (design pass; tunnel reachability
+  verified live on Sherlock).** Two deliberately separated axes. **Environment prelude:** opaque
+  shell text (`ml …`, `micromamba activate`, `export …`) run before a shell/agent, *never parsed*
+  by Chimaera (so conda/lmod/spack/venv/nix need zero tool-specific code), concatenated across
+  host→workspace→session scopes (env last-wins), injected at the one spawn seam both shells and
+  agents already share (`CHIMAERA_PRELUDE` sourced by the shell-integration rc / the `-lc` agent
+  wrapper; env via `SpawnOpts.env`). Federated by the daemon-per-host model — each host's daemon
+  owns its own defaults, no config sync. **Compute placement, two modes (not either/or):** Mode 1
+  (login node, agent + Slurm skill — the safe default, works wherever Slurm exists; agent keeps
+  API internet and dispatches to compute via `sbatch`/`srun`); Mode 2 (own the full session on the
+  compute node — `sbatch --job-name=chimaera-<ws>` runs the prelude then `chimaera serve` inside
+  the job cgroup; isolated, walltime-bounded, cleaned up on `scancel`). Mode 2 mechanics: `squeue`
+  job-name is the reconnect registry (`%N` node, `%L` walltime), the shared FS carries a per-jobid
+  `{node,port,token}` manifest (no sync — same Lustre path, same binary already visible), dynamic
+  `:0` ports (multi-user/multi-workspace on one node never collide). Reaching a compute-node daemon
+  is a **negotiated, bounded probe ladder** — B (loopback + ssh-adopt forward through the login
+  node; *preferred*, port unexposed; verified on Sherlock incl. `pam_slurm_adopt`) → A (routable
+  bind + direct login→node forward + token; verified reachable on Sherlock) → **unsupported → fall
+  back to Mode 1, stated plainly** (reverse-tunnel rung dropped as scope, ladder left open).
+  **Two-tier persistence** made explicit: login-node daemon = forever; compute-node daemon = until
+  walltime. **Outbound gate closed on Sherlock (2026-07-14):** direct compute-node egress to
+  `api.anthropic.com` verified (HTTP 405, no proxy) — Mode 2 fully viable there. Elsewhere a
+  per-cluster fact: probed at job start, recorded in the manifest; where blocked, Mode 2 degrades
+  by capability (terminals/previews on the node, agents via Mode 1). Deep spec: Architecture →
+  Environment prelude & compute-node sessions.
 
 Still open:
 
