@@ -124,10 +124,15 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 - **Key behaviors.** Two modes: **integrated** (shell integration active → OSC 133 marks delimit
   output + carry exit code) and **sentinel** (no integration → wrap in printf-emitted marks, zero
   remote install). A busy integrated shell **queues** the exec (bounded by `queue_timeout`) rather
-  than typing over a running command. Exec refuses agent sessions (409 — typing into a claude TUI
-  is chaos; exec is terminals-only). `ExecOutcome` is a wire type. Journal caps: `MAX_RECORDS 500`,
-  `TOTAL_OUTPUT_BUDGET 8 MiB`, the scanner runs independent of the alacritty grid so journal reads
-  never need the term lock.
+  than typing over a running command. A **half-broken integration** (prompt marks fire but a typed
+  command never produces 133;C — e.g. an rc chain that kills bash's DEBUG trap) fails that exec
+  once (504 never-started), and the session degrades to sentinel mode for later execs; any
+  shell-emitted 133;C restores integrated mode. The bash integration itself re-arms its DEBUG
+  trap from PROMPT_COMMAND at every prompt, so audit-shell rc chains (Sherlock's user-audit trap
+  on bash 4.2) can't silently revert the hook. Exec refuses agent sessions (409 — typing into a
+  claude TUI is chaos; exec is terminals-only). `ExecOutcome` is a wire type. Journal caps:
+  `MAX_RECORDS 500`, `TOTAL_OUTPUT_BUDGET 8 MiB`, the scanner runs independent of the alacritty
+  grid so journal reads never need the term lock.
 
 ## Kill & last words
 

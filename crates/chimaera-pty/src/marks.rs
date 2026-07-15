@@ -180,6 +180,9 @@ impl Record {
 struct AgentExpect {
     command: String,
     token: u64,
+    /// The exec engine typed this command sentinel-wrapped; the 133;C it
+    /// produces is our own printf, not proof the shell integration works.
+    sentinel: bool,
 }
 
 /// Escape-stream scanner state (one per session, reader-thread only).
@@ -245,6 +248,11 @@ struct Inner {
     reported_command: Option<String>,
     /// Agent stamp for the next command (takes precedence over 633;E).
     agent_expect: Option<AgentExpect>,
+    /// The shell reports prompts (133;A) but a typed command never produced
+    /// 133;C — a half-broken integration (e.g. an rc that kills the shell's
+    /// command-start hook). Execs then degrade to sentinel mode; any
+    /// non-sentinel 133;C proves the hook works again and clears this.
+    integration_c_broken: bool,
     running: Option<Record>,
     done: VecDeque<Record>,
     total_output: usize,
@@ -272,6 +280,7 @@ impl Marks {
                 cwd: None,
                 reported_command: None,
                 agent_expect: None,
+                integration_c_broken: false,
                 running: None,
                 done: VecDeque::new(),
                 total_output: 0,
@@ -415,13 +424,31 @@ impl Marks {
     }
 
     /// Stamp the next command to start as agent-typed. Returns a correlation
-    /// token; the record created at the next 133;C carries it.
-    pub fn expect_agent_command(&self, command: String) -> u64 {
+    /// token; the record created at the next 133;C carries it. `sentinel`
+    /// marks the command as sentinel-wrapped, so its self-emitted 133;C is
+    /// not mistaken for a working shell integration.
+    pub fn expect_agent_command(&self, command: String, sentinel: bool) -> u64 {
         let mut inner = lock_unpoisoned(&self.inner);
         let token = inner.next_token;
         inner.next_token += 1;
-        inner.agent_expect = Some(AgentExpect { command, token });
+        inner.agent_expect = Some(AgentExpect {
+            command,
+            token,
+            sentinel,
+        });
         token
+    }
+
+    /// The integration reported `ready` but a typed command never produced
+    /// 133;C (recorded by the exec engine); execs should use sentinel mode.
+    pub fn integration_start_broken(&self) -> bool {
+        lock_unpoisoned(&self.inner).integration_c_broken
+    }
+
+    /// Record that an integrated-mode exec typed a command and its 133;C
+    /// never came: the shell's command-start hook is broken.
+    pub fn note_integrated_start_failure(&self) {
+        lock_unpoisoned(&self.inner).integration_c_broken = true;
     }
 
     /// Withdraw an agent stamp that never started (exec aborted pre-typing).
@@ -510,7 +537,13 @@ impl Inner {
                 if self.running.is_some() {
                     self.finish_running(None);
                 }
-                let (command, source, agent_token) = match self.agent_expect.take() {
+                let expect = self.agent_expect.take();
+                // A 133;C the shell emitted itself (not our sentinel printf)
+                // proves the command-start hook works.
+                if !expect.as_ref().is_some_and(|e| e.sentinel) {
+                    self.integration_c_broken = false;
+                }
+                let (command, source, agent_token) = match expect {
                     Some(e) => (Some(e.command), CommandSource::Agent, Some(e.token)),
                     None => (self.reported_command.take(), CommandSource::User, None),
                 };
@@ -752,7 +785,7 @@ mod tests {
     fn agent_stamp_beats_shell_report_and_correlates() {
         let marks = Marks::new();
         feed_str(&marks, "\x1b]133;A\x07");
-        let token = marks.expect_agent_command("sbatch job.sh".into());
+        let token = marks.expect_agent_command("sbatch job.sh".into(), false);
         // The shell still reports the echoed line; the agent stamp wins.
         feed_str(&marks, "\x1b]633;E;sbatch job.sh\x07\x1b]133;C\x07");
         assert!(marks.find_by_token(token).is_none());
@@ -771,13 +804,31 @@ mod tests {
     #[test]
     fn cleared_stamp_falls_back_to_user_attribution() {
         let marks = Marks::new();
-        let token = marks.expect_agent_command("never typed".into());
+        let token = marks.expect_agent_command("never typed".into(), false);
         marks.clear_agent_expect(token);
         feed_str(&marks, "\x1b]633;E;ls\x07\x1b]133;C\x07\x1b]133;D;0\x07");
         let journal = marks.journal(10);
         assert_eq!(journal[0].command.as_deref(), Some("ls"));
         assert_eq!(journal[0].source, CommandSource::User);
         assert!(marks.find_by_token(token).is_none());
+    }
+
+    #[test]
+    fn broken_start_flag_cleared_only_by_non_sentinel_c() {
+        let marks = Marks::new();
+        assert!(!marks.integration_start_broken());
+        marks.note_integrated_start_failure();
+        assert!(marks.integration_start_broken());
+
+        // A sentinel exec's own printf'd 133;C proves nothing.
+        let token = marks.expect_agent_command("echo hi".into(), true);
+        feed_str(&marks, "\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        assert!(marks.find_by_token(token).is_some());
+        assert!(marks.integration_start_broken());
+
+        // A shell-emitted 133;C (user-typed here) restores integrated mode.
+        feed_str(&marks, "\x1b]633;E;ls\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(!marks.integration_start_broken());
     }
 
     #[test]
