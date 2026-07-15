@@ -1039,8 +1039,7 @@ impl CodexMapper {
                     // instead (the extension's own fallback path).
                     self.settings_update_unsupported = true;
                     self.mode_per_turn = Some(per_turn);
-                    self.current_mode = mode_id.clone();
-                    step.events.push(AgentEvent::ModeChanged { mode_id });
+                    self.apply_mode(mode_id, step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("mode change failed: {}", err["message"]),
@@ -1058,8 +1057,7 @@ impl CodexMapper {
                 });
             }
             (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
-                self.current_mode = mode_id.clone();
-                step.events.push(AgentEvent::ModeChanged { mode_id });
+                self.apply_mode(mode_id, step);
             }
             (PendingRpc::AccountRead { report }, None) => {
                 self.on_account(&frame["result"], report, step);
@@ -1406,6 +1404,27 @@ impl CodexMapper {
             // etc. are tolerated silently (the official client renders
             // nothing for them either).
             _ => {}
+        }
+    }
+
+    /// Apply a resolved mode locally: record it, tell the UI (ModeChanged),
+    /// and — the first time the user switches INTO full-access — announce the
+    /// contract. Full access maps to approvalPolicy "never", so the only other
+    /// visible effect is that approval cards stop appearing, which reads as
+    /// "nothing happened"; the reactive per-action counterpart is
+    /// `note_auto_decline`. Called from all three mode-application paths (the
+    /// live settings/update ack, the -32601 fallback, and the
+    /// already-unsupported per-turn path) so they stay consistent.
+    fn apply_mode(&mut self, mode_id: String, step: &mut DriverStep) {
+        let entered_full = mode_id == "full-access" && self.current_mode != "full-access";
+        self.current_mode = mode_id.clone();
+        step.events.push(AgentEvent::ModeChanged { mode_id });
+        if entered_full {
+            step.events.push(AgentEvent::Notice {
+                text: "full access on — codex will no longer ask for approval; a \
+                       genuinely blocked action is auto-declined rather than prompted"
+                    .into(),
+            });
         }
     }
 
@@ -1969,8 +1988,7 @@ impl CodexMapper {
                 );
                 if self.settings_update_unsupported {
                     self.mode_per_turn = Some(fields);
-                    self.current_mode = mode_id.clone();
-                    step.events.push(AgentEvent::ModeChanged { mode_id });
+                    self.apply_mode(mode_id, &mut step);
                 } else {
                     // Probe thread/settings/update (applies mid-thread); the
                     // response handler falls back to per-turn on -32601.

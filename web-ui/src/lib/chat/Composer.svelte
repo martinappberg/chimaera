@@ -29,6 +29,8 @@
      *  the composer keeps the draft instead of losing it). */
     onSubmit(text: string, images: ImageAttachment[]): boolean;
     onInterrupt(): void;
+    /** Shift+Tab: advance to the next permission mode (agent-TUI parity). */
+    onCycleMode(): void;
     /** Intercept a dialog-only slash command with native UI. True = handled. */
     onSlash(name: string, args?: string): boolean;
   }
@@ -43,6 +45,7 @@
     focused,
     onSubmit,
     onInterrupt,
+    onCycleMode,
     onSlash,
   }: Props = $props();
 
@@ -331,6 +334,14 @@
         }
         return;
       }
+    }
+    // Shift+Tab cycles the permission mode, mirroring the agent TUIs. Only
+    // reached with no popover open (there Tab accepts a completion). No-op
+    // when the agent exposes no modes.
+    if (e.key === "Tab" && e.shiftKey) {
+      e.preventDefault();
+      onCycleMode();
+      return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();

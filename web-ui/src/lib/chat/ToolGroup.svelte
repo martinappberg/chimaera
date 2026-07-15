@@ -17,9 +17,14 @@
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
     onStopTask?: (id: string) => void;
+    /** This is the live tail group of a running turn — tools stream in as
+     *  separate frames, so hold it open even in the momentary gap where every
+     *  already-seen tool has finished but the next hasn't landed yet. Without
+     *  this the group collapses and re-expands between commands (the flicker). */
+    active?: boolean;
   }
 
-  let { tools, onOpenFile, onBackground, onStopTask }: Props = $props();
+  let { tools, onOpenFile, onBackground, onStopTask, active = false }: Props = $props();
 
   const running = $derived(
     tools.some((t) => t.status === "in_progress" || t.status === "pending"),
@@ -49,7 +54,7 @@
 
   /** null = follow the auto rule; a bool = the user's explicit choice. */
   let userOpen = $state<boolean | null>(null);
-  const open = $derived(userOpen ?? (running || failed));
+  const open = $derived(userOpen ?? (running || failed || active));
 
   /** "6 commands · 2 files · 1 step" — only the non-zero parts, so a pure
    *  command run reads cleanly. Edits are counted by distinct file. */

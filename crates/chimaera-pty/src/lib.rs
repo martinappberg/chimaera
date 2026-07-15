@@ -47,6 +47,12 @@ pub struct SessionInfo {
     pub renamed: bool,
     /// Shell phase from OSC 133 marks (`unknown` without shell integration).
     pub phase: ShellPhase,
+    /// Unix ms of the most recent PTY output chunk (the spawn instant until
+    /// the first byte arrives). Kept OFF the wire: a raw timestamp would
+    /// defeat the events-bus snapshot dedupe on every tick — the daemon
+    /// serializes a derived activity flag instead (`session_view`).
+    #[serde(skip)]
+    pub last_output_at: u64,
 }
 
 /// Options for spawning a new session.

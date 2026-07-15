@@ -584,6 +584,10 @@ pub(crate) fn chat_session_json(
         "agent_state": agent.map(|a| a.state.as_str()),
         "agent_title": agent.and_then(|a| a.title()),
         "files_touched": agent.map(|a| &a.files_touched),
+        // Chat state is protocol-driven; the output-recency fallback is a
+        // PTY-row signal only (same key; null like any row whose state
+        // comes from a better signal).
+        "output_active": null,
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,

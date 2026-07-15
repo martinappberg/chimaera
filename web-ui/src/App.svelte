@@ -17,6 +17,7 @@
     displayName,
     dotState,
     dotTitle,
+    isBusy,
     listSessions,
     listWorkspaces,
     renameSession,
@@ -2233,9 +2234,12 @@
     });
   });
 
-  /** The × on a rail row: live sessions get an inline confirm first. */
+  /** The × on a rail row: only a session doing ACTIVE work (a running command
+   *  or an agent mid-turn) gets an inline confirm — an idle/empty shell or a
+   *  waiting/finished/not-running agent closes straight away. (A hook-less TUI
+   *  reads as not-busy until its activity signal lands — a separate change.) */
   function requestKill(s: Session): void {
-    if (s.alive) {
+    if (isBusy(s)) {
       confirmKillId = s.id;
     } else {
       void killSession(s.id);

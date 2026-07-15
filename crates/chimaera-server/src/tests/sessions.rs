@@ -162,6 +162,8 @@ async fn session_kind_defaults_to_shell_and_round_trips() {
     assert_eq!(session["agent_state"], serde_json::Value::Null);
     assert_eq!(session["agent_title"], serde_json::Value::Null);
     assert_eq!(session["files_touched"], serde_json::Value::Null);
+    // Output-recency activity is an agent-row signal; shells carry null.
+    assert_eq!(session["output_active"], serde_json::Value::Null);
 
     // Explicit kind "shell" round-trips through GET.
     let (status, session) = request(
