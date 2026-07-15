@@ -4,6 +4,7 @@ mod api;
 mod assets;
 mod chat;
 mod download;
+mod environment;
 mod exec;
 mod fs;
 mod git;

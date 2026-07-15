@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agents, chat, fs, git, launcher, ledger, quickopen, recents, settings, update, view_state,
-    workspaces,
+    agents, chat, environment, fs, git, launcher, ledger, quickopen, recents, settings, update,
+    view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -45,6 +45,10 @@ pub(crate) struct AppState {
     /// User settings (the settings.json ground truth), stored in the config
     /// dir; mtime-checked on read so hand-edits surface without a restart.
     pub(crate) settings: Mutex<settings::SettingsStore>,
+    /// Environment preludes (`env-profiles.json`, config dir): startup
+    /// commands concatenated host ⊕ workspace ⊕ launch into each spawn's
+    /// `CHIMAERA_PRELUDE` file. Same hand-edit story as settings.
+    pub(crate) env_preludes: Mutex<environment::EnvPreludeStore>,
     /// Owner of all PTY sessions; outlives any client connection.
     pub(crate) sessions: Arc<chimaera_pty::SessionManager>,
     /// Owner of all structured chat sessions (Tier B agent drivers).
@@ -172,6 +176,9 @@ impl AppState {
             update_epoch: std::sync::atomic::AtomicU64::new(0),
             settings: Mutex::new(settings::SettingsStore::load(
                 config_dir.join("settings.json"),
+            )),
+            env_preludes: Mutex::new(environment::EnvPreludeStore::load(
+                config_dir.join("env-profiles.json"),
             )),
             sessions: chimaera_pty::SessionManager::new(),
             chat,
