@@ -2,7 +2,7 @@
 # Stop: WARN (never block) when code in an area changed in the working tree but the
 # area's map/design doc wasn't touched. A nudge to keep docs honest — it emits a
 # systemMessage and always exits 0. Pairs with the "verify, then trust, then update"
-# loop in CLAUDE.md.
+# loop in AGENTS.md.
 set -u
 command -v jq >/dev/null 2>&1 || exit 0
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -21,12 +21,12 @@ check() { # $1 = code path prefix, $2 = the doc that should move with it, $3 = l
   fi
 }
 
-# Area maps — the nested CLAUDE.md that describes a crate/UI area's structure.
-check 'crates/chimaera-server/src/'   'crates/chimaera-server/CLAUDE.md' 'chimaera-server'
-check 'crates/chimaera-agent/src/'    'crates/chimaera-agent/CLAUDE.md'  'chimaera-agent'
-check 'crates/chimaera-pty/src/'      'crates/chimaera-pty/CLAUDE.md'    'chimaera-pty'
-check 'crates/chimaera-app/src/'      'crates/chimaera-app/CLAUDE.md'    'chimaera-app'
-check 'web-ui/src/lib/chat/'          'web-ui/src/lib/chat/CLAUDE.md'     'chat UI'
+# Area maps — the nested AGENTS.md that describes a crate/UI area's structure.
+check 'crates/chimaera-server/src/'   'crates/chimaera-server/AGENTS.md' 'chimaera-server'
+check 'crates/chimaera-agent/src/'    'crates/chimaera-agent/AGENTS.md'  'chimaera-agent'
+check 'crates/chimaera-pty/src/'      'crates/chimaera-pty/AGENTS.md'    'chimaera-pty'
+check 'crates/chimaera-app/src/'      'crates/chimaera-app/AGENTS.md'    'chimaera-app'
+check 'web-ui/src/lib/chat/'          'web-ui/src/lib/chat/AGENTS.md'     'chat UI'
 
 # Feature pages — docs/features/<page> describes what a capability DOES. Prefixes are
 # a feature's entry points; a change there usually wants its page updated too. Warn-only.
@@ -50,7 +50,7 @@ check 'crates/chimaera/src/'          'docs/features/cli.md'                    
 
 [ -n "$warn" ] || exit 0
 msg="Doc-drift check (warning — not blocking):${warn}
-If the change is user- or contract-visible, update the area's CLAUDE.md/DESIGN or the named
+If the change is user- or contract-visible, update the area's AGENTS.md/DESIGN or the named
 docs/features/ page (see the document-feature skill); otherwise it's fine to skip."
 jq -cn --arg m "$msg" '{systemMessage:$m}'
 exit 0

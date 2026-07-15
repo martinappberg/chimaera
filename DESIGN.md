@@ -93,7 +93,7 @@ lossless reconnect, HPC-realistic state storage, the three-tier agent event mode
 the web-first client, in-window layout, naming/orientation, file previews, linked
 terminals, and Git + Slurm — lives in
 **[docs/agent-guides/architecture.md](docs/agent-guides/architecture.md)** (moved out
-to keep this document a readable spine). Nested `CLAUDE.md` maps link straight to the
+to keep this document a readable spine). Nested `AGENTS.md` maps link straight to the
 section they need.
 
 ## Scope philosophy and non-goals

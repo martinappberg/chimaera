@@ -5,7 +5,7 @@ paths: ["crates/chimaera-pty/**"]
 
 # PTY-engine rules
 
-Depth + the resize invariants: [chimaera-pty/CLAUDE.md](../../crates/chimaera-pty/CLAUDE.md)
+Depth + the resize invariants: [chimaera-pty/AGENTS.md](../../crates/chimaera-pty/AGENTS.md)
 and the [architecture guide](../../docs/agent-guides/architecture.md) (resize repaint
 refinement).
 

@@ -13,7 +13,7 @@ dispatch), `shell.rs` + `shell/{commands,connect,restore}.rs`, `daemon.rs`, `win
 `update.rs`, `askpass.rs`, `menu.rs`. UI bridge `web-ui/src/lib/net/native.ts`; toast
 `web-ui/src/lib/workspace/{UpdateToast.svelte,update.svelte.ts}`. Rules:
 [rules/native-app.md](../../.claude/rules/native-app.md); map:
-[chimaera-app/CLAUDE.md](../../crates/chimaera-app/CLAUDE.md). Build with `just app-dev` / `just
+[chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md). Build with `just app-dev` / `just
 app-build` (never the root `cargo`).
 
 ## Three-role binary

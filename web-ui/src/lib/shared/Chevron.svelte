@@ -2,7 +2,7 @@
   /**
    * The disclosure chevron shared by the chat collapse surfaces (ToolGroup,
    * AgentsTray): a `›` that rotates to `⌄` when open. One home for the glyph
-   * and its rotation so the two never drift — see chat/CLAUDE.md ("shared
+   * and its rotation so the two never drift — see chat/AGENTS.md ("shared
    * chrome should be shared, not re-pasted per card").
    */
   interface Props {

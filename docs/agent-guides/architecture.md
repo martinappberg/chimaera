@@ -2,9 +2,9 @@
 
 > The deep architecture + rationale: the source of truth for **how** Chimaera is
 > built and **why**. The high-level [DESIGN.md](../../DESIGN.md) links here, and the
-> nested `CLAUDE.md` maps point at the section they need. Docs drift — verify a
+> nested `AGENTS.md` maps point at the section they need. Docs drift — verify a
 > detail against the code before relying on it, and fix this file when you find it
-> wrong (see the anti-drift note in the root [CLAUDE.md](../../CLAUDE.md)).
+> wrong (see the anti-drift note in the root [AGENTS.md](../../AGENTS.md)).
 
 ## Architecture
 

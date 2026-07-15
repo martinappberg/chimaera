@@ -6,7 +6,7 @@ paths: ["crates/chimaera-agent/**", "crates/chimaera-server/src/chat.rs"]
 # Agent-protocol rules
 
 The claude `stream-json` and codex `app-server` wire formats are **unversioned**.
-Depth: [chimaera-agent/CLAUDE.md](../../crates/chimaera-agent/CLAUDE.md) and
+Depth: [chimaera-agent/AGENTS.md](../../crates/chimaera-agent/AGENTS.md) and
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md).
 
 - **Pinned, not trusted.** Each driver is verified against a pinned CLI version

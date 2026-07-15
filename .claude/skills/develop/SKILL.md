@@ -7,7 +7,7 @@ description: Run Chimaera locally and iterate on it — the daemon + Vite web-UI
 
 Chimaera is a Rust daemon (`crates/`) that embeds and serves a Svelte web UI
 (`web-ui/`), plus a standalone Tauri app (`crates/chimaera-app`). See
-[CLAUDE.md](../../../CLAUDE.md) for the repo map; this skill is the run loop.
+[AGENTS.md](../../../AGENTS.md) for the repo map; this skill is the run loop.
 
 ## The dev loop (do this to develop the UI + daemon)
 

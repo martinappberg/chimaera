@@ -7,14 +7,14 @@ description: Work on Chimaera's structured chat mode (Tier B) — the stream-jso
 
 Chat mode drives coding-agent CLIs through their **structured** protocols instead
 of a PTY, and renders the result in a rich UI. It spans three places — read the
-CLAUDE.md that governs the part you're touching first, they are the fast map:
+AGENTS.md that governs the part you're touching first, they are the fast map:
 
-- Engine: [`crates/chimaera-agent/CLAUDE.md`](../../../crates/chimaera-agent/CLAUDE.md)
+- Engine: [`crates/chimaera-agent/AGENTS.md`](../../../crates/chimaera-agent/AGENTS.md)
   — drivers, journal, registry, event model. Wire facts:
   [`PROTOCOL.md`](../../../crates/chimaera-agent/PROTOCOL.md).
-- Server glue: [`crates/chimaera-server/CLAUDE.md`](../../../crates/chimaera-server/CLAUDE.md)
+- Server glue: [`crates/chimaera-server/AGENTS.md`](../../../crates/chimaera-server/AGENTS.md)
   — `chat.rs`, the WS/REST seams, the lifecycle locks.
-- UI: [`web-ui/src/lib/chat/CLAUDE.md`](../../../web-ui/src/lib/chat/CLAUDE.md)
+- UI: [`web-ui/src/lib/chat/AGENTS.md`](../../../web-ui/src/lib/chat/AGENTS.md)
   — the store reducer, the socket, the components.
 
 ## The end-to-end path (know it before you change it)

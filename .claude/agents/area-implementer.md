@@ -1,6 +1,6 @@
 ---
 name: area-implementer
-description: Implements a focused, behavior-preserving change WITHIN a single Chimaera subsystem (one crate, or one web-ui area) — following that area's nested CLAUDE.md map and matching .claude/rules, then verifying via `just check` and the live isolated preview. Use for scoped edits that stay inside one area and do NOT change the daemon↔UI wire contract. Not for cross-cutting refactors or protocol/wire changes.
+description: Implements a focused, behavior-preserving change WITHIN a single Chimaera subsystem (one crate, or one web-ui area) — following that area's nested AGENTS.md map and matching .claude/rules, then verifying via `just check` and the live isolated preview. Use for scoped edits that stay inside one area and do NOT change the daemon↔UI wire contract. Not for cross-cutting refactors or protocol/wire changes.
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
@@ -10,8 +10,8 @@ plus a standalone Tauri app (`crates/chimaera-app`). You are trusted to edit —
 be disciplined.
 
 ## Before you touch code
-1. Read the **nested `CLAUDE.md`** for the area you're changing (e.g.
-   `crates/chimaera-server/CLAUDE.md`, `web-ui/src/lib/chat/CLAUDE.md`). It is the
+1. Read the **nested `AGENTS.md`** for the area you're changing (e.g.
+   `crates/chimaera-server/AGENTS.md`, `web-ui/src/lib/chat/AGENTS.md`). It is the
    map: file table + the invariants that bite.
 2. Read the matching **`.claude/rules/*.md`** — the hard constraints for that path.
 3. Skim the code you're about to change and the tests that cover it. Match the

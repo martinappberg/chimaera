@@ -7,7 +7,7 @@ description: Open a pull request for Chimaera correctly — the CI gates that mu
 
 Merges to `main` are automated: **every merge cuts a published release** unless
 you opt out. So the PR *title* and *commit prefix* are load-bearing. See
-[CLAUDE.md](../../../CLAUDE.md) → "Releases & how to skip one" for the full rules.
+[AGENTS.md](../../../AGENTS.md) → "Releases & how to skip one" for the full rules.
 
 ## Before opening
 
@@ -61,14 +61,16 @@ time, verify the type/marker survived into the squash subject.
 
 ```sh
 git push -u upstream HEAD          # push the branch
-gh pr create --title "docs: <what> [skip release]" --body "<what changed; what you ran/observed>"
+gh pr create --title "chore: <what>" --body "<what changed; what you ran/observed>"
 ```
 
-End the PR body with the standard trailer:
+End the PR body with an accurate agent trailer. For Codex:
 
 ```
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+🤖 Generated with [Codex](https://openai.com/codex/)
 ```
+
+Claude Code uses its corresponding Claude Code trailer instead.
 
 ## After merge
 

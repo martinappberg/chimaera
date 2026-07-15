@@ -5,7 +5,7 @@ paths: ["crates/chimaera-app/**"]
 
 # Native-shell rules
 
-Depth: [chimaera-app/CLAUDE.md](../../crates/chimaera-app/CLAUDE.md).
+Depth: [chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md).
 
 - **This is a standalone cargo workspace.** Tauri stays out of the daemon workspace so
   musl/HPC builds stay lean; the daemon crates compile twice (intentional). Never fold

@@ -2,7 +2,7 @@
 // Deterministic backstop for the docs: every relative markdown link must resolve
 // to a real file, and every `#anchor` must match a heading in the target file.
 // Splitting DESIGN.md into docs/agent-guides/ moved anchors around; this is what
-// keeps the nested CLAUDE.md maps and skills from silently pointing at nothing.
+// keeps the nested AGENTS.md maps and skills from silently pointing at nothing.
 //
 // Zero deps. Run: `node scripts/check-doc-links.mjs` (CI + the doc-drift hook use it).
 // Scope: tracked + untracked-not-ignored *.md (so it sees new docs before commit).
