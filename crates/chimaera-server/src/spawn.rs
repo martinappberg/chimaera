@@ -82,6 +82,8 @@ pub(crate) async fn spawn_session(
     // per real spawn only — reconnects reattach to the live PTY.
     let prelude =
         crate::environment::materialize_prelude(state, &id, &workspace.id, spec.prelude.as_deref());
+    let env = crate::api::session_env(state, &id, &spec.theme, prelude.as_deref());
+    let env_remove = crate::api::spawn_env_remove(&env);
     let mut opts = chimaera_pty::SpawnOpts {
         cwd,
         name: spec.name,
@@ -89,8 +91,8 @@ pub(crate) async fn spawn_session(
         rows: spec.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
         id: Some(id.clone()),
-        env: crate::api::session_env(state, &id, &spec.theme, prelude.as_deref()),
-        env_remove: crate::api::spawn_env_remove(),
+        env,
+        env_remove,
         // settings.json ground truth; applies to sessions spawned from now on.
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };

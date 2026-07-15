@@ -214,16 +214,24 @@ async fn session_env_reaches_spawned_session() {
     // No prelude → no CHIMAERA_PRELUDE at all (zero-delta contract); with
     // one, the path rides along and the DONE guard is scrubbed first.
     assert!(!env.iter().any(|(k, _)| k == "CHIMAERA_PRELUDE"), "{env:?}");
-    let env = api::session_env(
+    let env_with = api::session_env(
         &state,
         "s-envx",
         "light",
         Some(std::path::Path::new("/tmp/p.sh")),
     );
-    assert!(env.contains(&("CHIMAERA_PRELUDE".to_string(), "/tmp/p.sh".to_string())));
-    let remove = api::spawn_env_remove();
+    assert!(env_with.contains(&("CHIMAERA_PRELUDE".to_string(), "/tmp/p.sh".to_string())));
+    // The remove-list stays DISJOINT from the add-list: the chat transport
+    // applies removes after adds (removal wins), so a remove of a var the
+    // spawn sets would delete it — found live, chat drivers lost their
+    // prelude. Without a prelude both names are scrubbed; with one, the
+    // path var survives and only the stale DONE guard is scrubbed.
+    let remove = api::spawn_env_remove(&env);
     assert!(remove.iter().any(|n| n == "CHIMAERA_PRELUDE"));
     assert!(remove.iter().any(|n| n == "CHIMAERA_PRELUDE_DONE"));
+    let remove_with = api::spawn_env_remove(&env_with);
+    assert!(!remove_with.iter().any(|n| n == "CHIMAERA_PRELUDE"));
+    assert!(remove_with.iter().any(|n| n == "CHIMAERA_PRELUDE_DONE"));
 
     // An empty inherited PATH must not leave a trailing colon (an empty
     // member = the cwd on the search path); the fixed system default

@@ -28,17 +28,22 @@ pub(crate) fn session_env(
     env
 }
 
-/// The full remove-list for spawned sessions: the launcher-context scrub
-/// plus the prelude pair. The prelude vars must go unconditionally — a
-/// daemon started from inside a chimaera terminal (dev loops do this all
-/// the time) inherits `CHIMAERA_PRELUDE_DONE`, which would silently
-/// suppress preludes in every session it spawns (the same bug class as
-/// the launcher-context leak). Removal happens before the env overlay, so
-/// a session that DOES get a prelude has it re-set cleanly on top.
-pub(crate) fn spawn_env_remove() -> Vec<String> {
+/// The remove-list for a spawn whose add-list is `env`: the
+/// launcher-context scrub plus the prelude pair, minus anything `env`
+/// explicitly sets. The prelude vars must go — a daemon started from
+/// inside a chimaera terminal (dev loops do this all the time) inherits
+/// `CHIMAERA_PRELUDE_DONE`, which would silently suppress preludes in
+/// every session it spawns (the same bug class as the launcher-context
+/// leak). The env/env_remove sets are kept DISJOINT here because the two
+/// spawn layers order them oppositely: chimaera-pty applies removes
+/// before the overlay (adds win), the chat driver transport applies them
+/// after (removal wins — found live: it deleted the CHIMAERA_PRELUDE the
+/// spawn had just set). Disjoint sets behave identically under both.
+pub(crate) fn spawn_env_remove(env: &[(String, String)]) -> Vec<String> {
     let mut names = launcher_context_env();
     names.push("CHIMAERA_PRELUDE".to_string());
     names.push("CHIMAERA_PRELUDE_DONE".to_string());
+    names.retain(|n| !env.iter().any(|(k, _)| k == n));
     names
 }
 

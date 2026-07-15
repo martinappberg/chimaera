@@ -519,6 +519,8 @@ async fn degrade_to_pty(
         &recipe.workspace_id,
         recipe.prelude.as_deref(),
     );
+    let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
         // Carry the user's pinned name across the toggle so the PTY row keeps
@@ -532,8 +534,8 @@ async fn degrade_to_pty(
             argv,
         )),
         id: Some(id.to_string()),
-        env: crate::api::session_env(state, id, &recipe.theme, prelude.as_deref()),
-        env_remove: crate::api::spawn_env_remove(),
+        env,
+        env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
     match state.sessions.spawn(opts) {
@@ -1421,7 +1423,7 @@ pub(crate) fn spawn_chat_session(
     // Strip the daemon's own launcher context (same set the PTY path removes)
     // so a chimaera launched from inside an agent can't leak that context into
     // the chat agent it spawns.
-    spec.env_remove = crate::api::spawn_env_remove();
+    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
