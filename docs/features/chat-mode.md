@@ -277,7 +277,18 @@ TUI (see [view switch](#view-switch-and-rewind)).
 > be "helpfully" changed without asking.
 
 ### Rich workflow rows — why they exist
-_No intent captured yet — pending the maintainer's answers (PR #69, 2026-07-16)._
+_Captured 2026-07-16 (from the maintainer, PR #69)._
+
+- **Problem it solves:** "parity with the claude app" — the official chat UI renders Workflow runs
+  as a rich card (name, agent count, elapsed, per-agent dots); Chimaera's chat mode should show the
+  same run, not an anonymous tool card.
+- **How settled it is:** nothing here is a promise — it's "subject to change if how claude works
+  changed." The feature tracks the upstream wire (PROTOCOL.md Pass 15) and should follow it when it
+  moves.
+- **Deliberately open / non-obvious decisions:** none named by the maintainer. (The tray-as-live-
+  surface / card-as-transcript-artifact split is the implementer's fit to the existing workbench
+  design, not a maintainer constraint.)
+- **Do not change:** nothing — the **whole area is open**. Grade: an addition, no core bets.
 
 ### Why chat mode exists
 _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
