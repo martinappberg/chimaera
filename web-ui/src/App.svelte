@@ -3376,15 +3376,16 @@
             <span class="dg-branch">can’t read repo</span>
           </button>
         {/if}
-        {#if $computeStatus?.scheduler === "slurm"}
+        {#if $computeStatus?.scheduler === "slurm" && !$computeStatus?.self}
           {@const queued = queuedJobCount($computeStatus)}
           <!-- Slurm orientation, indicator ONLY (maintainer, 2026-07-15):
                the scheduler exists here + how much of your work is queued.
                Queue browsing/management deliberately does NOT live in the
                rail — that arrives with the agent dashboard; launching onto
-               compute nodes belongs to the home screen's Mode 2 flow. The
-               daemon's OWN allocation is NOT this chip's job — the strip
-               above this bar wears it. -->
+               compute nodes belongs to the home screen's Mode 2 flow.
+               INSIDE an allocation the chip disappears entirely (maintainer,
+               2026-07-16): the strip above this bar IS the compute truth of
+               a job window, and a queue count is login-node orientation. -->
           <span
             class="daemon-compute"
             title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
