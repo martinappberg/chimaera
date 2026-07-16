@@ -337,6 +337,16 @@ which is the survival property that matters.
   squeue-rebuilt home-screen card is the reconnect path. Verified live: launch → RUNNING →
   ready → chained-B tunnel → health/self-walltime/sessions on the node → cancel → queue clean.
   Native-app visual pass outstanding (needs the maintainer's screen).
+- **2026-07-16 — Loopback stays the compute-daemon default; routable bind remains per-launch
+  opt-in (maintainer decision).** Raised because the connection is token-gated anyway and the
+  node is "our own"; decided against flipping: compute nodes are routinely SHARED (co-tenant
+  jobs on the same node reach a 0.0.0.0 bind; only the token gates them), the chained-B rung
+  gives every ssh-reachable cluster a loopback path anyway (verified on hostbased-only
+  Sherlock), and one leaked/logged token on a routable bind is a cluster-internal exposure
+  loopback never has. Rung A via the explicit `routable` launch flag (dialog checkbox with
+  exposure warning, CLI flag) is the escape hatch for clusters whose ladder finds no ssh
+  path; "not supported on this cluster" stays an acceptable honest end state. No per-host
+  auto-routable memory for now — premature until a real cluster defeats rung B.
 
 Still open:
 

@@ -143,6 +143,18 @@ _Captured 2026-07-15 (from the maintainer; drafted from his design-session words
 - **Do not change:** the probe-and-degrade-honestly posture, and hidden-off-cluster.
   Everything else is an addition, open to improvement.
 
+### Addendum — loopback stays the default; routable is per-launch opt-in
+_Captured 2026-07-16 (maintainer decision, after raising the question himself)._
+
+- The maintainer asked whether `--bind-routable` should be the standard ("it is through
+  token anyway … and it is our own compute node"), weighed the trade-off, and **decided
+  against**: compute nodes are routinely shared, the chained-B rung already gives every
+  ssh-reachable cluster a loopback path, and a 0.0.0.0 bind makes the token the only wall
+  between the daemon and every co-tenant of the node. Routable stays an explicit
+  per-launch flag (dialog checkbox with its exposure warning, CLI flag) for clusters whose
+  ladder finds no ssh path; per-host auto-routable memory was deliberately deferred until a
+  real cluster defeats rung B.
+
 ### Addendum — the chip is an indicator, not a controller
 _Captured 2026-07-15 (maintainer, direct feedback after first live use)._
 
