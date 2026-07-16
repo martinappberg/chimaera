@@ -1405,3 +1405,34 @@ post-result and pins the shape IF a frame shows up — its absence is the
 expected outcome on 2.1.211 and is printed, not failed. Full
 `just chat-smoke` re-run against 2.1.211 (16/16) and the pin bumped
 2.1.207 → 2.1.211.
+## Pass 18 (2026-07-16 — live probe 0.144.2): codex MCP tool-call approvals
+are ELICITATIONS. ADOPTED.
+
+Reachable only once chimaera started injecting `-c mcp_servers.chimaera.url`
+into codex chat spawns (before that, no MCP server ever existed for codex, so
+this path was dead). With approvals on (`on-request`), a codex MCP tool call
+does NOT raise `item/permissions/requestApproval` — it raises a server→client
+request **`mcpServer/elicitation/request`**:
+
+```json
+{"threadId","turnId","serverName":"chimaera","mode":"form",
+ "_meta":{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],
+          "tool_description":"…","tool_params":{},"tool_params_display":[]},
+ "message":"Allow the chimaera MCP server to run tool \"list_terminals\"?",
+ "requestedSchema":{"type":"object","properties":{}}}
+```
+
+The response is the MCP elicitation shape with a REQUIRED `action` —
+**`{"action":"accept","content":{}}` runs the tool; `{"action":"decline"}`
+rejects it** (both live-verified). An approval-style `{"decision":"accept"}`
+fails server-side deserialization (`failed to deserialize
+McpServerElicitationRequestResponse: missing field 'action'` on codex stderr)
+and codex silently resolves the call as "user rejected MCP tool call" — the
+Allow button lies. `_meta.persist` advertises session/always variants;
+`{"action":"accept","content":{"persist":"session"}}` deserializes and runs,
+but whether it actually persists is unverified, so the driver offers only the
+once/decline pair (`codex.rs::on_server_request`, mined-frame test
+`mcp_elicitation_approval_answers_with_action_shape`). The binary also names
+`item/permissions/requestApproval` (`PermissionsRequestApprovalResponse
+{scope, strictAutoReview, …}`) — never observed live for MCP calls; left
+unmapped (falls to the generic approval arm).

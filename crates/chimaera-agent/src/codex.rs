@@ -2091,6 +2091,59 @@ impl CodexMapper {
             decisions.insert(id.into(), decision);
         };
 
+        // MCP-server elicitation (mined live, codex 0.144): a per-tool MCP
+        // approval arrives as `mcpServer/elicitation/request` with
+        // `_meta.codex_approval_kind: "mcp_tool_call"` — NOT as an
+        // item/*/requestApproval. Its response is the MCP elicitation shape
+        // with a REQUIRED `action` (`accept` / `decline`); an approval-style
+        // `{"decision": …}` fails deserialization server-side and codex
+        // silently rejects the tool call. `_meta.persist` advertises
+        // session/always variants, but their accept payload is unmined —
+        // only the verified once/decline pair is offered (unknown decision
+        // shapes decline silently, so nothing unverified may ship).
+        if method == "mcpServer/elicitation/request" {
+            let server = params["serverName"].as_str().unwrap_or("mcp");
+            let raw_title = params["message"]
+                .as_str()
+                .filter(|m| !m.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("{server} MCP tool call"));
+            opt(
+                &mut options,
+                &mut decisions,
+                "accept",
+                "Allow".into(),
+                PermissionOptionKind::AllowOnce,
+                json!({ "action": "accept", "content": {} }),
+            );
+            opt(
+                &mut options,
+                &mut decisions,
+                "decline",
+                "Deny".into(),
+                PermissionOptionKind::RejectOnce,
+                json!({ "action": "decline" }),
+            );
+            self.pending_approvals
+                .insert(request_id.clone(), (rpc_id, decisions));
+            step.events.push(AgentEvent::PermissionRequest {
+                request_id,
+                tool_call_id: None,
+                title: truncate_label(&raw_title, 120),
+                options,
+                input_preview: json!({
+                    "server": server,
+                    "description": cap_output(
+                        params["_meta"]["tool_description"].as_str().unwrap_or_default(),
+                    )
+                    .0,
+                    "params": params["_meta"]["tool_params"],
+                }),
+                plan: None,
+            });
+            return;
+        }
+
         let network_host = params["networkApprovalContext"]["host"].as_str();
         let title;
         let input_preview;
@@ -3524,6 +3577,69 @@ mod tests {
             step.outbound[0]["result"]["decision"]["acceptWithExecpolicyAmendment"]
                 ["execpolicy_amendment"],
             json!(["cargo", "test"])
+        );
+    }
+
+    /// The MCP tool-call approval is an ELICITATION request, and its answer
+    /// is the MCP `action` shape — pinned against a live-mined codex 0.144
+    /// frame. Answering with the exec-style `{"decision": …}` deserializes
+    /// to nothing server-side and codex silently rejects the tool call
+    /// ("user rejected MCP tool call"), so this shape is load-bearing.
+    #[test]
+    fn mcp_elicitation_approval_answers_with_action_shape() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "id": 79,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "serverName": "chimaera",
+                "mode": "form",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"],
+                    "tool_description": "List the terminal sessions linked to this agent.",
+                    "tool_params": {},
+                },
+                "message": "Allow the chimaera MCP server to run tool \"list_terminals\"?",
+                "requestedSchema": { "type": "object", "properties": {} },
+            },
+        }));
+        let request_id = match &step.events[0] {
+            AgentEvent::PermissionRequest {
+                request_id,
+                title,
+                options,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(
+                    title,
+                    "Allow the chimaera MCP server to run tool \"list_terminals\"?"
+                );
+                // Only the two live-verified payloads are offered — the
+                // persist variants stay off until their shape is mined.
+                assert_eq!(
+                    options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+                    ["accept", "decline"]
+                );
+                assert_eq!(input_preview["server"], "chimaera");
+                request_id.clone()
+            }
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        };
+
+        let step = m.on_command(AgentCommand::Permission {
+            request_id,
+            option_id: "accept".into(),
+            destination: None,
+            feedback: None,
+        });
+        assert_eq!(step.outbound[0]["id"], 79);
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({ "action": "accept", "content": {} })
         );
     }
 
