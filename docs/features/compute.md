@@ -87,17 +87,37 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   "ended": launch/cancel invalidate the snapshot cache, and an orphaned launch record
   younger than 120s renders as a PENDING submitted-card (squeue lag), leading the list.
   Launch itself is queue-truth based: a detached srun can't hand back a job id, so every
-  launch adopts the newest unrecorded queue row wearing its job name (retried ~6s); a
+  launch adopts the queue row wearing its **unique per-launch name**
+  (`chimaera-<slug>~<tok>`, retried ~6s) — adoption is an exact lookup, so concurrent
+  same-name launches, a user's own `chimaera-*` jobs, and a dev daemon sharing the queue
+  can never be mis-adopted (and cancel can never scancel the wrong allocation); a
   refusal never reaches the queue, and then the srun log's tail — Slurm's own
   admin-authored words — is the error the dialog shows. Cards fall back to squeue's
-  `%C`/`%m` for cpu/mem when no record exists. **State is two-speed**: squeue stays the
+  `%C`/`%m` for cpu/mem when no record exists (the `~tok` suffix is shorn for display).
+  Post-srun bookkeeping (adoption → record → seed) runs in a spawned task a
+  disconnecting client can't abort, the record is written atomically (the list poller
+  reads it mid-flight over the shared FS), and the detached line scrubs
+  `SLURM_JOB_ID` first — a daemon started *inside* an allocation would otherwise launch
+  a job STEP into it instead of a new job. Everything under the compute root is
+  **owner-only** (`umask 077`, script `0600`, dirs `0700`): launch scripts embed the
+  user's prelude (API keys on egress-limited clusters) and job homes carry daemon
+  tokens, on a shared filesystem. Retired records take their launch litter with them
+  (script, srun log, per-job home) — nothing accumulates across launches. **State is two-speed**: squeue stays the
   authoritative registry on its polite 30s cadence, while every list call reads two LOCAL
   signals fresh at zero controller cost — the process table (each record's script path is
   the launch's argv fingerprint; a dead srun client flips the card to ENDED *now* —
   verified live: 2s after an out-of-band scancel, mid-TTL — and a living one keeps an
   orphan PENDING past any grace) and the shared-FS manifest (daemon booted ⇒ present
   RUNNING/ready now, node from the manifest, countdown estimated from requested walltime
-  minus daemon uptime; squeue corrects within a round). Launch **seeds the job daemon's workspace registry
+  minus daemon uptime; squeue corrects within a round). A failed squeue round rides the
+  wire as `degraded: true` with last-good rows carried forward — the UI keeps its old
+  countdown baseline instead of rewinding to pre-outage time-left strings each poll. A
+  cancel is only reported done when scancel actually succeeded (Slurm's "Invalid job id"
+  on an already-gone job stays idempotent-OK; a wedged controller is an honest error,
+  never a silent 204 that would mark the record and swallow the eventual tombstone); the
+  allocation banner's end-job button routes through the LOGIN daemon in the native app
+  (correct record marking + the job tunnel is closed), and its browser fallback
+  distinguishes the expected mid-flight connection death from a real refusal. Launch **seeds the job daemon's workspace registry
   with the host's whole list** (shared-FS roots are equally valid on the node), so the
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
@@ -135,9 +155,16 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   and the job keeps running for login-node use. Every rung's arbiter is `tunnel_proven`:
   a **bearer-authed 200 through our own forward** (identity, not bare liveness — a stale
   relay or foreign tenant of a shared login-node port can answer a plain probe), from an
-  ssh child still alive afterwards; the chained rung's login-side relay port is **always
-  randomized** (the daemon's own port number is exactly where a previous connect's relay
-  sits — both found live as "sometimes works").
+  ssh child still alive afterwards — OR, mux-aware, a child that exited 0 after
+  delegating the forward to a live ControlMaster (the normal app state; requiring
+  child-alive there made rung A unreachable). Master-held forwards are `ssh -O cancel`ed
+  on failure and close, never leaked. The chained rung's login-side relay port is
+  **always randomized** (the daemon's own port number is exactly where a previous
+  connect's relay sits — both found live as "sometimes works"). A job window heals a
+  dead LOGIN tunnel too (reconnect re-establishes it before re-listing), re-listing
+  evicts stale cached endpoints (an ended job answers "no longer in the queue", not a
+  45s ladder against a dead node), and reconnect raises the existing job window by its
+  composite alias alone — whatever workspace it currently shows.
 - **Key constraints.** Tokens/ports never reach the home-screen JS (the app shell scrubs
   them and holds tunnels in Rust, keyed `"{alias}#job{job_id}"`); launch-restore skips
   compute windows (the card is the reconnect path); cluster-vintage tooling is assumed

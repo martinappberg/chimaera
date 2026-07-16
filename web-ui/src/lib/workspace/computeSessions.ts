@@ -13,8 +13,8 @@
  * goes through the native bridge (`connectComputeSession`): only the shell
  * can build the tunnel and the window.
  */
-import { api } from "../net/api";
-import type { ComputePartition } from "./compute";
+import { api, ApiError } from "../net/api";
+import { parsePartition, type ComputePartition } from "./compute";
 
 /** A compute-node session (a Slurm job owning a full chimaera daemon),
  *  minus its port/token — see the module header. */
@@ -48,6 +48,10 @@ export interface ComputeSessionList {
   scheduler: string;
   sessions: ComputeSessionView[];
   partitions: ComputePartition[];
+  /** The squeue round failed and `sessions` carries the last good rows
+   *  forward stale — countdown baselines must NOT re-sync to this response.
+   *  Missing on older daemons → false. */
+  degraded: boolean;
 }
 
 /** A launch request for a new compute-node session (detached srun). */
@@ -90,21 +94,6 @@ function parseSession(raw: unknown): ComputeSessionView | null {
   };
 }
 
-function parsePartition(raw: unknown): ComputePartition | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.name !== "string") return null;
-  return {
-    name: r.name,
-    default: r.default === true,
-    avail: r.avail === true,
-    nodes: typeof r.nodes === "number" ? r.nodes : 0,
-    time_limit: typeof r.time_limit === "string" ? r.time_limit : "",
-    cpus_per_node: typeof r.cpus_per_node === "string" ? r.cpus_per_node : "",
-    mem_per_node: typeof r.mem_per_node === "string" ? r.mem_per_node : "",
-  };
-}
-
 /** The daemon's error envelope is `{"error": msg}`; fall back to the status. */
 async function errorMessage(res: Response, fallback: string): Promise<string> {
   try {
@@ -133,6 +122,7 @@ export async function listComputeSessions(): Promise<ComputeSessionList> {
     partitions: Array.isArray(b.partitions)
       ? b.partitions.map(parsePartition).filter((p): p is ComputePartition => p !== null)
       : [],
+    degraded: b.degraded === true,
   };
 }
 
@@ -152,10 +142,16 @@ export async function launchComputeSession(spec: ComputeLaunchSpec): Promise<str
   return typeof jobId === "string" ? jobId : "";
 }
 
-/** scancel `jobId` — Slurm ends everything in the allocation. Idempotent. */
+/** scancel `jobId` — Slurm ends everything in the allocation. Idempotent.
+ *  Error shape is the discriminant callers need: the daemon ANSWERING with an
+ *  error status throws `ApiError` (the cancel definitively FAILED — e.g. 409
+ *  "no scheduler detected" from a node without Slurm client tools), while a
+ *  network-level rejection (fetch died mid-flight) propagates as-is — for a
+ *  job window cancelling its OWN daemon, that death is the expected success
+ *  signal. */
 export async function cancelComputeSession(jobId: string): Promise<void> {
   const res = await api(`/compute/sessions/${encodeURIComponent(jobId)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error(await errorMessage(res, "cancel failed"));
+  if (!res.ok) throw new ApiError(res.status, await errorMessage(res, "cancel failed"));
 }

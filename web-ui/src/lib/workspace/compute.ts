@@ -7,9 +7,9 @@
  * first fetch says `scheduler:"none"` and the store goes quiet — one probe per
  * page load on a laptop. On-cluster it refetches every 60s, but ONLY while the
  * window is visible; a hidden tab pauses and catches up on the next
- * visibilitychange. `?refresh=true` (the popover's refresh button) forces the
- * daemon to re-detect — the "I just module-loaded slurm" path — and a "slurm"
- * answer there restarts polling.
+ * visibilitychange. `?refresh=true` is an API knob nothing in the UI calls
+ * today: it forces the daemon to re-detect — the "I just module-loaded slurm"
+ * path — and a "slurm" answer there restarts polling.
  */
 import { writable, type Readable } from "svelte/store";
 
@@ -90,7 +90,7 @@ function parseJob(raw: unknown): ComputeJob | null {
   };
 }
 
-function parsePartition(raw: unknown): ComputePartition | null {
+export function parsePartition(raw: unknown): ComputePartition | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
   if (typeof r.name !== "string") return null;
@@ -214,9 +214,13 @@ const snapshotStore = writable<ComputeSnapshot | null>(null);
 export const computeStatus: Readable<ComputeSnapshot | null> = snapshotStore;
 
 const POLL_MS = 60_000;
+/** Backstop cadence while NO fetch has ever succeeded (see below). */
+const RETRY_MS = 15_000;
 
 let started = false;
 let timer: ReturnType<typeof setInterval> | null = null;
+/** First-fetch retry timer — armed only while `lastScheduler === null`. */
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let fetchSeq = 0;
 /** The last RESPONSE's scheduler; a failed fetch doesn't change the gate. */
 let lastScheduler: "slurm" | "none" | null = null;
@@ -233,20 +237,46 @@ function sync(): void {
   }
 }
 
+/**
+ * Retry the FIRST fetch until any response lands. Before a success there is
+ * nothing to recover from a failure — `lastScheduler` stays null, so neither
+ * the poll gate nor visibilitychange ever refetches, and one transient 502
+ * (a still-settling tunnel) would disable the compute surface for the
+ * window's life. Bounded: one probe per RETRY_MS, and the first response —
+ * "slurm" OR "none" — retires it permanently (the poll gate owns the cadence
+ * from then on). Torn down alongside the poll timer in initCompute.
+ */
+function scheduleFirstFetchRetry(): void {
+  if (!started || lastScheduler !== null || retryTimer !== null) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (started && lastScheduler === null) void fetchSnapshot(false);
+  }, RETRY_MS);
+}
+
 async function fetchSnapshot(force: boolean): Promise<void> {
   const seq = ++fetchSeq;
   try {
     const res = await api(`/compute${force ? "?refresh=true" : ""}`);
     // Transient failure: keep the shown snapshot; the timer (if any) retries.
-    if (!res.ok) return;
+    if (!res.ok) {
+      scheduleFirstFetchRetry();
+      return;
+    }
     const snap = parseSnapshot((await res.json()) as unknown);
     // Drop stale responses (a manual refresh overtook us, or teardown ran).
     if (!started || seq !== fetchSeq) return;
     lastScheduler = snap.scheduler;
+    // A response landed: the first-fetch backstop is done for good.
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
     snapshotStore.set(snap);
     sync();
   } catch {
     // unreachable daemon; the daemon dot already reflects reachability
+    scheduleFirstFetchRetry();
   }
 }
 
@@ -274,6 +304,10 @@ export function initCompute(): () => void {
     if (timer !== null) {
       clearInterval(timer);
       timer = null;
+    }
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
     }
   };
 }

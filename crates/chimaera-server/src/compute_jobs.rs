@@ -148,7 +148,10 @@ fn safe_directive(v: &str, extra: &str) -> bool {
 fn render_launch_script(bin: &Path, root: &Path, prelude: &str, routable: bool) -> String {
     let mut s = String::from("#!/bin/bash -l\n");
     s.push_str(&format!(
-        "export CHIMAERA_HOME=\"{}/${{SLURM_JOB_ID}}\"\n\
+        "# Owner-only: the job home lands on a SHARED filesystem and holds\n\
+         # the daemon manifest (bearer token) and caps probe.\n\
+         umask 077\n\
+         export CHIMAERA_HOME=\"{}/${{SLURM_JOB_ID}}\"\n\
          mkdir -p \"$CHIMAERA_HOME\"\n\
          # Clean prelude slate: the job daemon materializes its own for the\n\
          # sessions IT spawns (same scrub the daemon does at every spawn).\n\
@@ -169,7 +172,13 @@ fn render_launch_script(bin: &Path, root: &Path, prelude: &str, routable: bool) 
     }
     s.push_str(
         "# Per-cluster fact, probed where it matters (THIS node), recorded for the UI.\n\
-         code=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null || echo 0)\n\
+         # curl prints 000 AND exits non-zero on failure; digits-only + base-10\n\
+         # normalization keeps the emitted value a valid JSON number (a leading-\n\
+         # zero \"000\" would make caps.json unparseable exactly on the blocked-\n\
+         # egress nodes the probe exists for).\n\
+         code=$(curl -sS -m 8 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null) || true\n\
+         code=$(printf '%s' \"$code\" | tr -cd '0-9')\n\
+         code=$((10#${code:-0}))\n\
          printf '{\"egress\":%s,\"http_code\":%s,\"probed_at\":%s}\\n' \\\n\
          \x20 \"$([ \"$code\" -ge 200 ] && echo true || echo false)\" \"$code\" \"$(date +%s)\" \\\n\
          \x20 > \"$CHIMAERA_HOME/caps.json\"\n\n",
@@ -183,9 +192,13 @@ fn render_launch_script(bin: &Path, root: &Path, prelude: &str, routable: bool) 
 /// directives in the sbatch era). Every value is charset-validated by the
 /// handler before this runs; the returned args are also safe to
 /// single-quote into a shell line (the charsets exclude quotes).
-fn srun_args(spec: &LaunchSpec, job_slug: &str, script: &Path) -> Vec<String> {
+/// `job_name` is the launch's UNIQUE name (`chimaera-<slug>~<tok>`): queue
+/// adoption matches it exactly, so two concurrent launches sharing a slug —
+/// or a dev and a real daemon sharing one user's queue — can never adopt
+/// each other's job (and cancel can never scancel the wrong allocation).
+fn srun_args(spec: &LaunchSpec, job_name: &str, script: &Path) -> Vec<String> {
     let mut a = vec![
-        format!("--job-name=chimaera-{job_slug}"),
+        format!("--job-name={job_name}"),
         format!("--time={}", spec.time),
     ];
     if let Some(p) = &spec.partition {
@@ -219,8 +232,14 @@ fn detached_srun_line(srun: &Path, args: &[String], log: &Path) -> String {
         .chain(args.iter().cloned())
         .map(|a| quote(&a))
         .collect();
+    // `unset SLURM_JOB_ID SLURM_JOBID`: srun inherits the daemon's env, and
+    // with a job id set it attaches a STEP inside that existing allocation
+    // instead of submitting a new job — a daemon started from within an
+    // allocation (an sdev shell, or the job daemon's own route) would launch
+    // an invisible, unadoptable daemon into the old job. `umask 077`: the
+    // log lands on the shared FS and echoes the srun argv + daemon stderr.
     format!(
-        "setsid nohup {} >> {} 2>&1 < /dev/null & echo detached",
+        "unset SLURM_JOB_ID SLURM_JOBID; umask 077; setsid nohup {} >> {} 2>&1 < /dev/null & echo detached",
         argv.join(" "),
         quote(&log.to_string_lossy())
     )
@@ -283,22 +302,46 @@ pub(crate) async fn launch_compute_session(
         spec.prelude.as_deref(),
     );
     let job_slug = slug(&spec.name);
+    // Per-launch token: suffixes the job NAME (queue adoption then matches
+    // exactly — concurrent same-slug launches, foreign chimaera-* jobs, and
+    // a dev daemon sharing this user's queue can never be mis-adopted) and
+    // names the script/log files.
+    let launch_tok = chimaera_core::generate_token()[..6].to_string();
+    let job_name = format!("chimaera-{job_slug}~{launch_tok}");
     let root = compute_root();
     let script = render_launch_script(&bin, &root, &prelude, spec.routable);
 
     // Blocking fs (shared FS!) off the reactor: dirs + the script file.
+    // Everything under the compute root is owner-only — the script embeds
+    // the user's prelude (people export API keys there on egress-limited
+    // clusters) and the job homes carry daemon tokens; a traversable $HOME
+    // on a shared login node must not expose either.
     let script_path = {
         let root = root.clone();
+        let tok = launch_tok.clone();
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
-            std::fs::create_dir_all(root.join("logs"))?;
-            std::fs::create_dir_all(root.join("scripts"))?;
-            std::fs::create_dir_all(root.join("pending"))?;
-            let path = root.join("scripts").join(format!(
-                "{}-{}.sh",
-                chrono_free_ts(),
-                &chimaera_core::generate_token()[..6]
-            ));
+            for dir in [
+                root.clone(),
+                root.join("logs"),
+                root.join("scripts"),
+                root.join("pending"),
+            ] {
+                std::fs::create_dir_all(&dir)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            let path = root
+                .join("scripts")
+                .join(format!("{}-{}.sh", chrono_free_ts(), tok));
             std::fs::write(&path, &script)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
             Ok(path)
         })
         .await;
@@ -323,12 +366,10 @@ pub(crate) async fn launch_compute_session(
     // Slurm can't hand us the job id this way, so the id comes from the
     // queue itself (the same adoption used for ghost recovery), and srun's
     // own words (refusals, limits) land in a log we tail on failure.
-    let log_path = root.join("logs").join(format!(
-        "srun-{}-{}.log",
-        chrono_free_ts(),
-        &chimaera_core::generate_token()[..6]
-    ));
-    let line = detached_srun_line(&srun, &srun_args(&spec, &job_slug, &script_path), &log_path);
+    let log_path = root
+        .join("logs")
+        .join(format!("srun-{}-{}.log", chrono_free_ts(), launch_tok));
+    let line = detached_srun_line(&srun, &srun_args(&spec, &job_name, &script_path), &log_path);
     let detached = crate::compute::run_capped("bash", &["-c".into(), line]).await;
     if detached.is_none() {
         return (
@@ -337,110 +378,134 @@ pub(crate) async fn launch_compute_session(
         )
             .into_response();
     }
-    // The job registers in squeue within moments (PENDING while it waits
-    // for resources). Adopt the newest unrecorded row wearing this launch's
-    // name; a refusal never registers, so after the retries the log tail is
-    // the diagnosis — Slurm's own words, the round-6 promise kept.
-    let mut job_id: Option<String> = None;
-    for _ in 0..4 {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        job_id = adopt_submitted(&state, &format!("chimaera-{job_slug}"), &root).await;
-        if job_id.is_some() {
-            break;
-        }
-    }
-    let Some(job_id) = job_id else {
-        let tail = {
-            let log_path = log_path.clone();
-            tokio::task::spawn_blocking(move || read_log_tail(&log_path))
-                .await
-                .ok()
-                .flatten()
-        };
-        let msg = match tail {
-            Some(t) if !t.is_empty() => format!("srun: {t}"),
-            _ => "srun started but the job never appeared in the queue — try again".to_string(),
-        };
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
-    };
 
-    // Seed the job daemon's workspace registry over the shared FS: the job
-    // will `mkdir -p` this same home, and its WorkspaceStore then boots with
-    // this host's WHOLE workspace list already registered (shared-FS roots
-    // are equally valid on the node) — the compute window lands on the same
-    // ready-to-open workspaces as the login window, instead of a bare "open
-    // a folder" page (the maintainer hit exactly that dead end on first
-    // use; launches from the host page carry no workspace_id, so seeding
-    // only the launch workspace left the window empty on second use).
-    let seed: Vec<serde_json::Value> = {
-        let launch_ws = spec.workspace_id.as_deref();
-        crate::lock(&state.workspaces)
-            .list()
-            .into_iter()
-            .map(|ws| {
-                json!({
-                    "id": format!("w-{}", &chimaera_core::generate_token()[..8]),
-                    "root": ws.root,
-                    "name": ws.name,
-                    // The launch's workspace (when there is one) sorts first.
-                    "last_opened_at": if launch_ws == Some(ws.id.as_str()) {
-                        now_secs() + 1
-                    } else {
-                        now_secs()
-                    },
-                })
-            })
-            .collect()
-    };
-    if !seed.is_empty() {
-        let seed_dir = root.join(&job_id).join("data");
-        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            std::fs::create_dir_all(&seed_dir)?;
+    // Everything after the detach runs in a SPAWNED task: srun has already
+    // fired, and a client that gives up (timeout, closed window) drops this
+    // handler future — aborting adoption mid-flight would leave a live job
+    // with no record and no workspace seed. The spawned task finishes
+    // regardless; the handler merely awaits its outcome.
+    let post = tokio::spawn(async move {
+        // The job registers in squeue within moments (PENDING while it
+        // waits for resources). Adopt the row wearing this launch's UNIQUE
+        // name; a refusal never registers, so after the retries the log
+        // tail is the diagnosis — Slurm's own words.
+        let mut job_id: Option<String> = None;
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            job_id = adopt_submitted(&state, &job_name, &root).await;
+            if job_id.is_some() {
+                break;
+            }
+        }
+        let Some(job_id) = job_id else {
+            let tail = {
+                let log_path = log_path.clone();
+                tokio::task::spawn_blocking(move || read_log_tail(&log_path))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let msg = match tail {
+                Some(t) if !t.is_empty() => format!("srun: {t}"),
+                _ => "srun started but the job never appeared in the queue — try again".to_string(),
+            };
+            return Err(msg);
+        };
+
+        // The launch record FIRST (it is what makes the job adopted — the
+        // next same-name launch must not see this row as unclaimed), then
+        // the workspace seed. The record's card carries the resource
+        // numbers while Slurm is the only other truth; the script path
+        // doubles as the launch's PROCESS-TABLE FINGERPRINT — unique per
+        // launch and verbatim in the detached srun's argv, which is what
+        // lets the fast-twitch layer map live srun clients back to
+        // sessions without asking the controller. Atomic write: the list
+        // poller reads this file concurrently over the shared FS, and a
+        // torn read would get the record swept as corrupt.
+        let record = json!({
+            "name": job_name,
+            "display_name": spec.name,
+            "partition": spec.partition,
+            "cpus": spec.cpus,
+            "mem": spec.mem,
+            "gres": spec.gres,
+            "time": spec.time,
+            "workspace_id": spec.workspace_id,
+            "routable": spec.routable,
+            "script": script_path.to_string_lossy(),
+            "log": log_path.to_string_lossy(),
+        });
+        let rec_path = root.join("pending").join(format!("{job_id}.json"));
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             crate::persist::atomic_write_json(
-                &seed_dir.join("workspaces.json"),
-                serde_json::to_vec_pretty(&seed)?,
+                &rec_path,
+                serde_json::to_vec_pretty(&record).unwrap_or_default(),
             )
         })
-        .await;
-        if let Err(e) = res.map_err(anyhow::Error::from).and_then(|r| r) {
-            tracing::warn!(%e, %job_id, "workspace seed failed (compute window starts empty)");
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
+        {
+            tracing::warn!(%e, %job_id, "launch record write failed (card shows without resources)");
         }
-    }
 
-    // The launch record: the card's resource numbers while Slurm is the
-    // only other truth (and after; squeue doesn't report mem/gres cheaply).
-    // The script path doubles as the launch's PROCESS-TABLE FINGERPRINT —
-    // it is unique per launch and appears verbatim in the detached srun's
-    // argv, which is what lets the fast-twitch layer map "which srun
-    // clients are alive" back to sessions without asking the controller.
-    let record = json!({
-        "name": format!("chimaera-{job_slug}"),
-        "display_name": spec.name,
-        "partition": spec.partition,
-        "cpus": spec.cpus,
-        "mem": spec.mem,
-        "gres": spec.gres,
-        "time": spec.time,
-        "workspace_id": spec.workspace_id,
-        "routable": spec.routable,
-        "script": script_path.to_string_lossy(),
+        // Seed the job daemon's workspace registry over the shared FS: the
+        // job will `mkdir -p` this same home, and its WorkspaceStore then
+        // boots with this host's WHOLE workspace list already registered
+        // (shared-FS roots are equally valid on the node) — the compute
+        // window lands on the same ready-to-open workspaces as the login
+        // window, instead of a bare "open a folder" page (the maintainer
+        // hit exactly that dead end on first use; launches from the host
+        // page carry no workspace_id, so seeding only the launch workspace
+        // left the window empty on second use).
+        let seed: Vec<serde_json::Value> = {
+            let launch_ws = spec.workspace_id.as_deref();
+            crate::lock(&state.workspaces)
+                .list()
+                .into_iter()
+                .map(|ws| {
+                    json!({
+                        "id": format!("w-{}", &chimaera_core::generate_token()[..8]),
+                        "root": ws.root,
+                        "name": ws.name,
+                        // The launch's workspace (when there is one) sorts first.
+                        "last_opened_at": if launch_ws == Some(ws.id.as_str()) {
+                            now_secs() + 1
+                        } else {
+                            now_secs()
+                        },
+                    })
+                })
+                .collect()
+        };
+        if !seed.is_empty() {
+            let seed_dir = root.join(&job_id).join("data");
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                std::fs::create_dir_all(&seed_dir)?;
+                crate::persist::atomic_write_json(
+                    &seed_dir.join("workspaces.json"),
+                    serde_json::to_vec_pretty(&seed)?,
+                )
+            })
+            .await;
+            if let Err(e) = res.map_err(anyhow::Error::from).and_then(|r| r) {
+                tracing::warn!(%e, %job_id, "workspace seed failed (compute window starts empty)");
+            }
+        }
+        Ok(job_id)
     });
-    let rec_path = root.join("pending").join(format!("{job_id}.json"));
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        std::fs::write(
-            rec_path,
-            serde_json::to_vec_pretty(&record).unwrap_or_default(),
+    match post.await {
+        Ok(Ok(job_id)) => {
+            tracing::info!(%job_id, slug = %job_slug, "compute session submitted");
+            Json(json!({ "job_id": job_id })).into_response()
+        }
+        Ok(Err(msg)) => (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("launch bookkeeping failed: {e}")})),
         )
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|r| r.map_err(Into::into))
-    {
-        tracing::warn!(%e, %job_id, "launch record write failed (card shows without resources)");
+            .into_response(),
     }
-
-    tracing::info!(%job_id, slug = %job_slug, "compute session submitted");
-    Json(json!({ "job_id": job_id })).into_response()
 }
 
 /// The last ~4KB of a detached srun's log, cleaned into the admin-authored
@@ -455,12 +520,20 @@ fn read_log_tail(log: &Path) -> Option<String> {
 }
 
 /// The queue-side id discovery every launch relies on (srun can't hand us
-/// the job id the way `sbatch --parsable` did): force-refresh the queue and
-/// pick the newest job wearing `job_name` that no launch record claims. The
-/// fs check runs off the reactor (shared FS).
+/// the job id the way `sbatch --parsable` did): refetch the queue and pick
+/// the job wearing this launch's UNIQUE name (`chimaera-<slug>~<tok>`) that
+/// no launch record claims. The unique suffix makes adoption a lookup, not
+/// a heuristic; newest-unrecorded remains only as a tiebreak against a
+/// pathological name collision. The fs check runs off the reactor
+/// (shared FS).
 async fn adopt_submitted(state: &Arc<AppState>, job_name: &str, root: &Path) -> Option<String> {
+    // invalidate + snapshot(false): drop the cache so this round refetches
+    // the queue, WITHOUT `refresh=true` — that would also discard scheduler
+    // detection and re-run the login-shell probe on every retry (seconds
+    // each under the single-flight lock, and a transient probe failure
+    // mid-launch would misreport a queued job as never-appeared).
     state.compute.invalidate().await;
-    let snap = state.compute.snapshot(true).await;
+    let snap = state.compute.snapshot(false).await;
     let candidates: Vec<String> = snap
         .jobs
         .iter()
@@ -545,6 +618,10 @@ pub(crate) async fn list_compute_sessions(
         "scheduler": snap.scheduler,
         "sessions": sessions,
         "partitions": snap.partitions,
+        // Stale-jobs marker (squeue failed; rows carried forward): the UI
+        // keeps its old countdown baseline instead of rewinding to these
+        // rows' pre-outage time_left strings on every poll.
+        "degraded": degraded,
     }))
     .into_response()
 }
@@ -595,6 +672,7 @@ fn append_ended_sessions(
         let age = mtime.elapsed().unwrap_or(Duration::ZERO);
         let state = orphan_state(age, client_alive(record.as_ref(), clients));
         if dismissed || state.is_none() || record.is_none() {
+            prune_launch_artifacts(root, job_id, record.as_ref());
             let _ = std::fs::remove_file(&path);
             continue;
         }
@@ -643,6 +721,31 @@ fn append_ended_sessions(
     }
     ended.sort_by_key(|e| std::cmp::Reverse(e.0));
     sessions.extend(ended.into_iter().take(ENDED_CAP).map(|(_, s)| s));
+}
+
+/// A retired record takes its launch litter with it: the staged script, the
+/// srun log, and the per-job daemon home. Only the record had a sweep before
+/// — every launch leaked all three onto the user's (quota'd) shared home
+/// forever. Paths from the record are honored only inside the compute root
+/// (the record is ours, but a tampered one must not become an arbitrary
+/// delete); the job id is digits-only by the caller's filename filter.
+fn prune_launch_artifacts(root: &Path, job_id: &str, record: Option<&serde_json::Value>) {
+    if let Some(rec) = record {
+        for key in ["script", "log"] {
+            if let Some(p) = rec
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(Path::new)
+                .filter(|p| p.starts_with(root))
+            {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let home = root.join(job_id);
+    if home.is_dir() {
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 /// What an orphaned launch record (no squeue row for its job) means. The
@@ -759,7 +862,12 @@ fn join_session(root: &Path, j: crate::compute::Job, clients: Option<&[String]>)
         ready: running && manifest.is_some(),
         name: rec("display_name")
             .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| j.name.trim_start_matches("chimaera-").to_string()),
+            // Record-less fallback: the squeue name, shorn of the chimaera-
+            // prefix and the per-launch `~tok` uniqueness suffix.
+            .unwrap_or_else(|| {
+                let base = j.name.trim_start_matches("chimaera-");
+                base.split('~').next().unwrap_or(base).to_string()
+            }),
         // Resources: the launch record's request first, squeue's own %C/%m
         // as the fallback — a record-less job (adopted late submission,
         // launched outside chimaera) still shows what it holds.
@@ -854,8 +962,32 @@ pub(crate) async fn cancel_compute_session(
         )
             .into_response();
     };
-    let _ =
-        crate::compute::run_capped(&scancel.to_string_lossy(), std::slice::from_ref(&job_id)).await;
+    // scancel's outcome matters: answering 204 on a FAILED cancel would mark
+    // the record cancelled while the job keeps running — the card would
+    // revert to RUNNING next poll, and the eventual walltime death would be
+    // silently swept instead of raising its tombstone. Idempotency is kept
+    // where it belongs: a job that already ended fails with Slurm's
+    // "Invalid job id" words, which IS success here.
+    match crate::compute::run_checked(&scancel.to_string_lossy(), std::slice::from_ref(&job_id))
+        .await
+    {
+        Some(out) if out.success || out.stderr.contains("Invalid job id") => {}
+        Some(out) => {
+            let msg = crate::compute::clean_tool_stderr(&out.stderr, "scancel");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("scancel: {msg}")})),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "scancel did not answer (controller busy?) — the job was NOT cancelled"})),
+            )
+                .into_response();
+        }
+    }
     // Same reasoning as launch: the instant post-cancel refresh should see
     // the queue's new truth, not the pre-cancel cache.
     state.compute.invalidate().await;
@@ -1093,11 +1225,13 @@ mod tests {
     #[test]
     fn srun_args_carry_resources_and_detached_line_quotes() {
         let s = spec();
-        let args = srun_args(&s, &slug(&s.name), Path::new("/r/scripts/a.sh"));
+        // The handler passes the UNIQUE per-launch name (slug + token).
+        let job_name = format!("chimaera-{}~ab12cd", slug(&s.name));
+        let args = srun_args(&s, &job_name, Path::new("/r/scripts/a.sh"));
         assert_eq!(
             args,
             vec![
-                "--job-name=chimaera-my-align-run".to_string(),
+                "--job-name=chimaera-my-align-run~ab12cd".to_string(),
                 "--time=4:00:00".to_string(),
                 "--partition=normal".to_string(),
                 "--cpus-per-task=4".to_string(),
@@ -1109,16 +1243,23 @@ mod tests {
         );
         let mut g = spec();
         g.gres = Some("gpu:1".to_string());
-        assert!(srun_args(&g, "x", Path::new("/s")).contains(&"--gres=gpu:1".to_string()));
+        assert!(
+            srun_args(&g, "chimaera-x~t0", Path::new("/s")).contains(&"--gres=gpu:1".to_string())
+        );
 
         // The detached line: setsid+nohup+& (tmux-grade persistence), every
-        // token single-quoted, output into the launch log.
+        // token single-quoted, output into the launch log. The env scrub
+        // comes FIRST — an inherited SLURM_JOB_ID would turn srun into a
+        // step of the surrounding allocation instead of a new job — and the
+        // umask keeps the shared-FS log owner-only.
         let line = detached_srun_line(
             Path::new("/usr/bin/srun"),
             &args,
             Path::new("/r/logs/x.log"),
         );
-        assert!(line.starts_with("setsid nohup '/usr/bin/srun' '--job-name=chimaera-my-align-run'"));
+        assert!(line.starts_with(
+            "unset SLURM_JOB_ID SLURM_JOBID; umask 077; setsid nohup '/usr/bin/srun' '--job-name=chimaera-my-align-run~ab12cd'"
+        ));
         assert!(line.contains(">> '/r/logs/x.log' 2>&1 < /dev/null &"));
     }
 

@@ -36,7 +36,9 @@ if status is-interactive; and not set -q CHIMAERA_INTEGRATION
             command -sq bash; or return
             # Prelude stdout goes to stderr so it still shows in the
             # terminal without corrupting the NUL-delimited env capture.
-            bash -c 'source "$CHIMAERA_PRELUDE" 1>&2; command env -0' | while read -lz __chim_kv
+            # LOGIN bash (-l): `ml`/`module`/conda hooks are profile-defined
+            # shell functions a plain `bash -c` never sees.
+            bash -lc 'source "$CHIMAERA_PRELUDE" 1>&2; command env -0' | while read -lz __chim_kv
                 set -l __chim_pair (string split -m 1 = -- $__chim_kv)
                 test (count $__chim_pair) -eq 2; or continue
                 set -l __chim_k $__chim_pair[1]

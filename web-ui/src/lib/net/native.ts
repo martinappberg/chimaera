@@ -292,6 +292,20 @@ export async function connectComputeSession(alias: string, jobId: string): Promi
   await t.core.invoke<void>("connect_compute_session", { alias, jobId });
 }
 
+/**
+ * scancel a compute-node session through the LOGIN daemon (`alias` is the
+ * login host) and close any live tunnel to that job. A job window ending its
+ * own allocation must use this rather than its own daemon's DELETE route:
+ * the login daemon owns the launch record (the job daemon has a different
+ * compute root, so cancelling there never marks it), and the shell tears the
+ * job tunnel down with it. Rejects with the shell's error message on failure.
+ */
+export async function cancelComputeSession(alias: string, jobId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("cancel_compute_session", { alias, jobId });
+}
+
 /** Subscribe to connect progress events. Returns an unsubscribe promise. */
 export function onConnectProgress(
   handler: (p: ConnectProgress) => void,

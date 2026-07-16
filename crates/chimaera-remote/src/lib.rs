@@ -479,19 +479,26 @@ impl Tunnel {
     /// and other windows on this host keep their authenticated connection.
     pub async fn close(mut self) {
         self.child.kill().await.ok();
-        let _ = output_bounded(
-            ssh_base()
-                .args(["-O", "cancel", "-L"])
-                .arg(format!(
-                    "{}:127.0.0.1:{}",
-                    self.local_port, self.manifest.port
-                ))
-                .arg(&self.host),
-            30,
-            "ssh -O cancel",
+        cancel_master_forward(
+            &self.host,
+            &format!("{}:127.0.0.1:{}", self.local_port, self.manifest.port),
         )
         .await;
     }
+}
+
+/// Best-effort `ssh -O cancel` of a `-L` forward the host's ControlMaster
+/// holds. A forward registered by a mux client belongs to the MASTER, not
+/// the client — killing (or outliving) the client leaves the local listener
+/// bound until the master expires, so every path that abandons such a
+/// forward must cancel it by the exact spec it was opened with.
+async fn cancel_master_forward(host: &str, spec: &str) {
+    let _ = output_bounded(
+        ssh_base().args(["-O", "cancel", "-L"]).arg(spec).arg(host),
+        30,
+        "ssh -O cancel",
+    )
+    .await;
 }
 
 /// Whether an HTTP server answers on `127.0.0.1:port` within 2s. A bare TCP
@@ -1553,9 +1560,13 @@ pub struct ComputeTunnel {
     pub port: u16,
     pub token: String,
     pub rung: ComputeRung,
-    /// Rung A rides the login master (the child may delegate and exit 0);
-    /// rung B's child owns its connection end-to-end.
-    mux_delegated: bool,
+    /// The `-L` spec of a forward the login ControlMaster holds instead of
+    /// `child`: rung A's when its mux client delegated, and the chained
+    /// rung's outer forward always (its ssh rides `ssh_base`, so the master
+    /// owns the local listener even while the child holds the relay).
+    /// `None` for rung B1 — `node_ssh_base` pins `ControlPath=none`, so
+    /// that child owns its forward end-to-end and dies with it.
+    master_forward: Option<String>,
     child: Child,
 }
 
@@ -1575,20 +1586,12 @@ impl ComputeTunnel {
         self.child.wait().await
     }
 
-    /// Kill the tunnel; a master-held rung-A forward is also cancelled so
-    /// local ports don't leak past the window that opened them.
+    /// Kill the tunnel; a master-held forward is also cancelled so local
+    /// ports don't leak past the window that opened them.
     pub async fn close(mut self) {
         self.child.kill().await.ok();
-        if self.mux_delegated {
-            let _ = output_bounded(
-                ssh_base()
-                    .args(["-O", "cancel", "-L"])
-                    .arg(format!("{}:{}:{}", self.local_port, self.node, self.port))
-                    .arg(&self.host),
-                30,
-                "ssh -O cancel",
-            )
-            .await;
+        if let Some(spec) = &self.master_forward {
+            cancel_master_forward(&self.host, spec).await;
         }
     }
 }
@@ -1631,16 +1634,6 @@ fn node_ssh_base(host: &str) -> Command {
     ]);
     c.arg(format!("ProxyCommand={}", node_proxy_command(host)));
     c
-}
-
-/// Rung-B reachability: one bounded ssh to the node through the master.
-pub async fn probe_node_ssh(host: &str, node: &str) -> bool {
-    let mut cmd = node_ssh_base(host);
-    cmd.arg(node_target(host, node).await).arg("true");
-    matches!(
-        output_bounded(&mut cmd, 45, "ssh node probe").await,
-        Ok(out) if out.status.success()
-    )
 }
 
 /// `user@node` for the direct node leg: node hostnames don't match the
@@ -1732,10 +1725,11 @@ fn spawn_direct_node_tunnel(
 /// Build the tunnel to a compute-node daemon: rung B, then rung A when the
 /// job daemon has a routable bind, else an honest error. The arbiter on
 /// every rung is `tunnel_proven`: an authed 200 through OUR forward, from a
-/// child that is still running afterwards — a forward that binds but can't
-/// reach the daemon, answers with the wrong daemon, or dies right after
-/// answering (a bind-clash exit racing a stale relay) is a failure, not a
-/// success.
+/// child that is still running afterwards (or that delegated the forward to
+/// the ControlMaster and exited 0 — rung A whenever a master is up) — a
+/// forward that binds but can't reach the daemon, answers with the wrong
+/// daemon, or dies right after answering (a bind-clash exit racing a stale
+/// relay) is a failure, not a success.
 pub async fn connect_compute_node(
     host: &str,
     node: &str,
@@ -1745,7 +1739,7 @@ pub async fn connect_compute_node(
     routable: bool,
 ) -> anyhow::Result<ComputeTunnel> {
     anyhow::ensure!(!node.is_empty(), "job {job_id} has no node yet (queued?)");
-    let mk = |local_port, rung, mux_delegated, child| ComputeTunnel {
+    let mk = |local_port, rung, master_forward, child| ComputeTunnel {
         host: host.to_string(),
         node: node.to_string(),
         job_id: job_id.to_string(),
@@ -1753,7 +1747,7 @@ pub async fn connect_compute_node(
         port,
         token: token.to_string(),
         rung,
-        mux_delegated,
+        master_forward,
         child,
     };
 
@@ -1762,9 +1756,9 @@ pub async fn connect_compute_node(
     let local = pick_local_port(None, port)?;
     match spawn_node_tunnel(host, &target, local, port) {
         Ok(mut child) => match wait_for_port(local, &mut child).await {
-            Ok(_) if tunnel_proven(local, token, 10, &mut child).await => {
+            Ok(mux) if tunnel_proven(local, token, 10, mux, &mut child).await => {
                 tracing::info!(%node, %job_id, "compute tunnel up (rung B, ssh-adopt)");
-                return Ok(mk(local, ComputeRung::SshAdopt, false, child));
+                return Ok(mk(local, ComputeRung::SshAdopt, None, child));
             }
             Ok(_) => {
                 child.kill().await.ok();
@@ -1787,30 +1781,53 @@ pub async fn connect_compute_node(
         let Ok(mut child) = spawn_chained_node_tunnel(host, node, local, relay_port, port) else {
             break;
         };
+        // The outer `-L` rides `ssh_base`, so the login master holds the
+        // local listener — abandoning this attempt must cancel it (killing
+        // the child only tears down the relay leg). Best-effort on the Err
+        // arm too: an early inner-relay death can land AFTER the forward
+        // registered, and cancelling a never-registered spec is a no-op.
+        let outer_spec = format!("{local}:127.0.0.1:{relay_port}");
         match wait_for_port(local, &mut child).await {
-            Ok(_) if tunnel_proven(local, token, 15, &mut child).await => {
+            Ok(mux) if tunnel_proven(local, token, 15, mux, &mut child).await => {
                 tracing::info!(%node, %job_id, relay_port, "compute tunnel up (rung B, chained via login node)");
-                return Ok(mk(local, ComputeRung::Chained, false, child));
+                return Ok(mk(local, ComputeRung::Chained, Some(outer_spec), child));
             }
             Ok(_) => {
                 child.kill().await.ok();
+                cancel_master_forward(host, &outer_spec).await;
                 tracing::info!(%node, relay_port, "chained rung forwarded but the job daemon did not answer");
             }
-            Err(err) => tracing::info!(%node, relay_port, %err, "chained rung attempt failed"),
+            Err(err) => {
+                child.kill().await.ok();
+                cancel_master_forward(host, &outer_spec).await;
+                tracing::info!(%node, relay_port, %err, "chained rung attempt failed");
+            }
         }
     }
 
     // Rung A — direct login→node forward; only for routable-bound jobs.
     if routable {
         let local = pick_local_port(None, port)?;
+        let spec = format!("{local}:{node}:{port}");
         if let Ok(mut child) = spawn_direct_node_tunnel(host, node, local, port) {
             match wait_for_port(local, &mut child).await {
-                Ok(mux) if tunnel_proven(local, token, 10, &mut child).await => {
+                Ok(mux) if tunnel_proven(local, token, 10, mux, &mut child).await => {
                     tracing::info!(%node, %job_id, "compute tunnel up (rung A, direct)");
-                    return Ok(mk(local, ComputeRung::Direct, mux, child));
+                    return Ok(mk(
+                        local,
+                        ComputeRung::Direct,
+                        mux.then(|| spec.clone()),
+                        child,
+                    ));
                 }
-                Ok(_) => {
+                // A delegated forward outlives the exited mux client — the
+                // probe failing does not tear it down, so cancel or the
+                // master keeps proxying the local port until it expires.
+                Ok(mux) => {
                     child.kill().await.ok();
+                    if mux {
+                        cancel_master_forward(host, &spec).await;
+                    }
                 }
                 Err(err) => tracing::info!(%node, %err, "rung A unavailable"),
             }
@@ -1836,7 +1853,19 @@ pub async fn connect_compute_node(
 /// running. The second check closes a live-found race: a chained relay
 /// whose login-side bind clashed can die (ExitOnForwardFailure) moments
 /// AFTER a stale relay on the same port answered the probe for it.
-async fn tunnel_proven(port: u16, token: &str, deadline_secs: u64, child: &mut Child) -> bool {
+///
+/// `mux` (from [`wait_for_port`]) exempts a DELEGATED child from that
+/// still-running requirement: it registered the forward with the
+/// ControlMaster and exited 0 by design, so the authed answer alone is the
+/// proof — demanding a live child there made rung A unfailable-yet-
+/// unpassable whenever a master was up (which it essentially always is).
+async fn tunnel_proven(
+    port: u16,
+    token: &str,
+    deadline_secs: u64,
+    mux: bool,
+    child: &mut Child,
+) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(deadline_secs);
     loop {
         if http_alive_authed(port, token).await {
@@ -1847,7 +1876,11 @@ async fn tunnel_proven(port: u16, token: &str, deadline_secs: u64, child: &mut C
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    matches!(child.try_wait(), Ok(None))
+    match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => mux && status.success(),
+        Err(_) => false,
+    }
 }
 
 /// A pseudo-random high port for the chained relay's login-node bind —
@@ -1875,12 +1908,16 @@ fn curl_config_escape(v: &str) -> String {
 /// Call the LOGIN daemon's API via curl-over-ssh. Token, method, url, and
 /// body all ride stdin as a curl config (`--config -`) so nothing sensitive
 /// lands in argv on a shared login node. Returns stdout on HTTP success.
+/// `timeout_secs` bounds curl end-to-end (`-m`) — size it to the route:
+/// cutting a slow-but-legitimate response mid-flight aborts the request's
+/// work server-side.
 async fn login_daemon_api(
     host: &str,
     manifest: &Manifest,
     method: &str,
     path: &str,
     body: Option<&serde_json::Value>,
+    timeout_secs: u64,
 ) -> anyhow::Result<String> {
     let mut config = format!(
         "header = \"Authorization: Bearer {}\"\nrequest = \"{}\"\nurl = \"http://127.0.0.1:{}{}\"\n",
@@ -1894,7 +1931,7 @@ async fn login_daemon_api(
         ));
     }
     let mut child = ssh_cmd(host)
-        .arg("curl -fsS -m 20 --config -")
+        .arg(format!("curl -fsS -m {timeout_secs} --config -"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1919,7 +1956,7 @@ pub async fn compute_sessions(
     host: &str,
     manifest: &Manifest,
 ) -> anyhow::Result<serde_json::Value> {
-    let out = login_daemon_api(host, manifest, "GET", "/api/v1/compute/sessions", None).await?;
+    let out = login_daemon_api(host, manifest, "GET", "/api/v1/compute/sessions", None, 20).await?;
     serde_json::from_str(out.trim()).context("bad compute sessions payload")
 }
 
@@ -1929,12 +1966,16 @@ pub async fn compute_launch(
     manifest: &Manifest,
     spec: &serde_json::Value,
 ) -> anyhow::Result<String> {
+    // 60, not the quick-verb 20: the launch route runs Slurm detection plus
+    // a multi-round queue-adoption loop server-side (worst case ~30s) — a
+    // client-side timeout here kills curl mid-launch and loses the job id.
     let out = login_daemon_api(
         host,
         manifest,
         "POST",
         "/api/v1/compute/sessions",
         Some(spec),
+        60,
     )
     .await?;
     let v: serde_json::Value = serde_json::from_str(out.trim()).context("bad launch payload")?;
@@ -1956,6 +1997,7 @@ pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> an
         "DELETE",
         &format!("/api/v1/compute/sessions/{job_id}"),
         None,
+        20,
     )
     .await
     .map(|_| ())

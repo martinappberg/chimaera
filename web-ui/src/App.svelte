@@ -429,7 +429,6 @@
   let daemonEl = $state<HTMLElement | null>(null);
   /** The stage element; its edges are the root-split drop targets. */
   let stageEl = $state<HTMLElement | null>(null);
-  // Slurm queue popover (the daemon bar's compute chip; anchor = chip rect).
 
   const winKey = windowKey();
 

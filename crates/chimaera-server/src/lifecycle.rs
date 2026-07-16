@@ -185,10 +185,20 @@ async fn port_answers_http(port: u16) -> bool {
         .is_some()
 }
 
+/// Loopback is the rule; 0.0.0.0 is the explicit Mode 2 rung-A opt-in
+/// (compute-node daemon reached by a login-node forward; token-gated).
+/// Every listener bind — fresh or handoff-rebind — must resolve its host
+/// here, or a restart silently demotes a routable daemon to loopback-only.
+fn bind_host(routable: bool) -> &'static str {
+    if routable {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
 async fn fresh_listener(port: Option<u16>, routable: bool) -> anyhow::Result<TcpListener> {
-    // Loopback is the rule; 0.0.0.0 is the explicit Mode 2 rung-A opt-in
-    // (compute-node daemon reached by a login-node forward; token-gated).
-    let host = if routable { "0.0.0.0" } else { "127.0.0.1" };
+    let host = bind_host(routable);
     TcpListener::bind((host, port.unwrap_or(0)))
         .await
         .with_context(|| format!("failed to bind {host}"))
@@ -206,7 +216,7 @@ async fn listener_after_handoff(
     handoff_port: u16,
     routable: bool,
 ) -> anyhow::Result<(TcpListener, bool)> {
-    match rebind(handoff_port).await {
+    match rebind(handoff_port, routable).await {
         Some(listener) => Ok((listener, true)),
         None => Ok((fresh_listener(None, routable).await?, false)),
     }
@@ -214,9 +224,9 @@ async fn listener_after_handoff(
 
 /// Try the handoff port for ~5s: the predecessor releases it at exit, but
 /// its teardown can lag the successor's start.
-async fn rebind(port: u16) -> Option<TcpListener> {
+async fn rebind(port: u16, routable: bool) -> Option<TcpListener> {
     for _ in 0..20 {
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
+        if let Ok(listener) = TcpListener::bind((bind_host(routable), port)).await {
             return Some(listener);
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -333,5 +343,29 @@ mod tests {
         let (listener, reused) = listener_after_handoff(port, false).await.expect("rebind");
         assert!(reused, "a free handoff port is reused");
         assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert!(
+            listener.local_addr().unwrap().ip().is_loopback(),
+            "without --bind-routable a rebind stays loopback"
+        );
+    }
+
+    /// A --bind-routable daemon consuming a handoff must come back routable:
+    /// `rebind` honors the flag like `fresh_listener` does, instead of
+    /// hardcoding loopback (which silently demoted a Mode 2 compute-node
+    /// daemon to unreachable-from-the-login-forward after a restart).
+    #[tokio::test]
+    async fn handoff_rebind_honors_routable_bind() {
+        let free = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+
+        let (listener, reused) = listener_after_handoff(port, true).await.expect("rebind");
+        assert!(reused, "a free handoff port is reused");
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.port(), port);
+        assert!(
+            addr.ip().is_unspecified(),
+            "routable rebind must bind 0.0.0.0, got {addr}"
+        );
     }
 }

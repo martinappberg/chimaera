@@ -3,7 +3,11 @@
     launchComputeSession,
     type ComputeLaunchSpec,
   } from "./computeSessions";
-  import { parseSlurmTimeLeft, type ComputePartition } from "./compute";
+  import {
+    formatSlurmDuration,
+    parseSlurmTimeLeft,
+    type ComputePartition,
+  } from "./compute";
 
   interface Props {
     /** The host the job submits on — display only; the submission goes to
@@ -35,11 +39,10 @@
     const d = Math.max(0, Math.floor(days ?? 0));
     const h = Math.max(0, Math.floor(hours ?? 0));
     const m = Math.max(0, Math.floor(mins ?? 0));
+    // The empty-guard is load-bearing: formatSlurmDuration(0) is "00:00", a
+    // real walltime string that would slip past the canSubmit gate.
     if (d + h + m === 0) return "";
-    const mm = String(m).padStart(2, "0");
-    if (d > 0) return `${d}-${String(h).padStart(2, "0")}:${mm}:00`;
-    if (h > 0) return `${h}:${mm}:00`;
-    return `${m}:00`;
+    return formatSlurmDuration(((d * 24 + h) * 60 + m) * 60);
   });
   /** Numeric input: Svelte binds an empty field as null. */
   let cpus = $state<number | null>(1);

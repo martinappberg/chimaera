@@ -51,9 +51,12 @@ route + per-session materialization) and `crates/chimaera-core/src/shellint.rs`
   - **Zero delta when unused:** no prelude → no env var, byte-identical spawns.
   - **fish:** preludes are POSIX by contract. Fish terminals import the resulting *env*
     via a one-shot bash capture on first prompt (functions/aliases don't transfer); agent
-    spawns under a fish login shell exec through a bash trampoline (full semantics). No
-    bash on the host → the prelude is skipped, never a broken shell. Syntax-reviewed and
-    guard-tested; not yet exercised against a live fish install.
+    spawns under a fish login shell exec through a bash trampoline. Both run a **login**
+    bash (`-lc`) — `ml`/`module`/conda hooks are profile-defined shell functions a plain
+    `bash -c` never sees, which would have silently no-op'd the founding use case
+    (caught in the 2026-07-16 review pass). No bash on the host → the prelude is
+    skipped, never a broken shell. Syntax-reviewed and guard-tested; not yet exercised
+    against a live fish install.
   - **Trust boundary:** a prelude is the user's own commands (same privilege as their rc),
     entering only via the bearer-authed route. Any future "read a prelude from a
     checked-in workspace file" needs an explicit confirmation gate (supply-chain vector).

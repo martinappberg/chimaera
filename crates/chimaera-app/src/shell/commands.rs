@@ -52,6 +52,18 @@ fn find_by_scope(
         .map(|(label, _)| label.clone())
 }
 
+/// The label of an open window on `alias`, whatever workspace it shows. The
+/// raise for job windows, whose identity IS their composite alias
+/// (`"{alias}#job{id}"`): the SPA overwrites the stored `ws` once a workspace
+/// opens inside one, so an exact `(alias, ws)` match would miss it and open a
+/// duplicate window for the same job on every reconnect.
+fn find_by_alias(windows: &Mutex<HashMap<String, WindowScope>>, alias: &str) -> Option<String> {
+    lock(windows)
+        .iter()
+        .find(|(_, scope)| scope.alias.as_deref() == Some(alias))
+        .map(|(label, _)| label.clone())
+}
+
 #[tauri::command]
 pub(super) async fn list_hosts(state: State<'_, Shell>) -> Result<Vec<HostState>, String> {
     tracing::debug!("ipc: list_hosts");
@@ -254,6 +266,23 @@ fn compute_key(alias: &str, job_id: &str) -> String {
     format!("{alias}#job{job_id}")
 }
 
+/// Releases a job's slot in `compute_connecting` on drop, so every exit path
+/// out of the build (including `?`) clears the one-connect-per-job guard. Its
+/// drop sits AFTER the tunnel lands in `compute_tunnels`: releasing between
+/// build and insert left a gap where a concurrent connect passed both the map
+/// check and the guard, built a duplicate tunnel, and its insert dropped the
+/// first (kill_on_drop ssh) out from under the window just opened on it.
+struct ConnectingGuard<'a> {
+    connecting: &'a Mutex<HashSet<String>>,
+    key: &'a str,
+}
+
+impl Drop for ConnectingGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.connecting).remove(self.key);
+    }
+}
+
 /// Same digit gate as the daemon's cancel route — the id lands in URL paths
 /// and the composite tunnel key.
 fn valid_job_id(job_id: &str) -> bool {
@@ -303,8 +332,8 @@ async fn fetch_compute_sessions(state: &Shell, alias: &str) -> Result<serde_json
     })
     .await
     .map_err(|e| format!("{e}"))??;
+    let mut fresh: Vec<(String, ComputeEndpoint)> = Vec::new();
     if let Some(sessions) = payload.get_mut("sessions").and_then(|s| s.as_array_mut()) {
-        let mut endpoints = lock(&state.compute_endpoints);
         for session in sessions {
             let Some(obj) = session.as_object_mut() else {
                 continue;
@@ -333,18 +362,27 @@ async fn fetch_compute_sessions(state: &Shell, alias: &str) -> Result<serde_json
                 .and_then(|v| v.as_str().map(str::to_string));
             if let (Some(port), Some(token)) = (port, token) {
                 if !job_id.is_empty() {
-                    endpoints.insert(
-                        (alias.to_string(), job_id),
+                    fresh.push((
+                        job_id,
                         ComputeEndpoint {
                             node,
                             port,
                             token,
                             routable,
                         },
-                    );
+                    ));
                 }
             }
         }
+    }
+    // REPLACE this alias's endpoint set under one lock so the cache always
+    // mirrors the latest list: merging left an ended job's endpoint resolving
+    // forever, which sent `connect_compute_session`'s tunnel ladder at a dead
+    // node instead of letting its "no longer in the queue" arm tell the truth.
+    let mut endpoints = lock(&state.compute_endpoints);
+    endpoints.retain(|(a, _), _| a.as_str() != alias);
+    for (job_id, endpoint) in fresh {
+        endpoints.insert((alias.to_string(), job_id), endpoint);
     }
     Ok(payload)
 }
@@ -480,15 +518,41 @@ pub(super) async fn connect_compute_session(
     }
     if state.compute_tunnels.lock().await.get(&key).is_none() {
         // One connect per job at a time: the first live test produced eight
-        // rapid clicks racing eight tunnel builds. Guard released on every
-        // exit path below.
+        // rapid clicks racing eight tunnel builds. The guard drops on every
+        // exit path — but only after the insert into `compute_tunnels` below,
+        // so there is no window where the job is neither "connecting" nor in
+        // the map (see `ConnectingGuard`).
         {
             let mut connecting = lock(&state.compute_connecting);
             if !connecting.insert(key.clone()) {
                 return Err(format!("already connecting to job {job_id} — hold on"));
             }
         }
+        let _connecting = ConnectingGuard {
+            connecting: &state.compute_connecting,
+            key: &key,
+        };
         let result = async {
+            // The re-list below rides the LOGIN tunnel, and after laptop
+            // sleep both tunnels are typically dead — nothing else heals the
+            // login one for a job window, which listens only on its composite
+            // key (never the login alias). Re-establish it through the same
+            // coalesced flight as `connect_host`, so a concurrent
+            // user-initiated connect joins the attempt instead of
+            // double-building. Probe like the health monitor does: ssh's
+            // local listener can outlive its dead connection, so absence
+            // alone is not the test.
+            let login_port = {
+                let tunnels = state.tunnels.lock().await;
+                tunnels.get(&alias).map(|t| t.local_port)
+            };
+            let login_up = match login_port {
+                Some(port) => chimaera_remote::http_alive(port).await,
+                None => false,
+            };
+            if !login_up {
+                do_connect(&app, alias.clone(), false).await?;
+            }
             // ALWAYS re-list before tunneling: the endpoint cache may hold a
             // previous life of this queue, and a pending job must fail with
             // the truth ("still queued"), never a stale/foreign endpoint.
@@ -529,7 +593,6 @@ pub(super) async fn connect_compute_session(
             .map_err(|e| format!("{e:#}"))
         }
         .await;
-        lock(&state.compute_connecting).remove(&key);
         let tunnel = result?;
         state
             .compute_tunnels
@@ -547,9 +610,10 @@ pub(super) async fn connect_compute_session(
     };
     // A window already on this job → raise it; the status ping below tells
     // it the (possibly rebuilt) tunnel's port, and it re-homes itself if
-    // that moved. Otherwise open a fresh window on the tunnel URL.
-    let raised = find_by_scope(&state.windows, &Some(key.clone()), &None, None)
-        .and_then(|label| app.get_webview_window(&label));
+    // that moved. Otherwise open a fresh window on the tunnel URL. Matched on
+    // the composite alias ALONE — whichever workspace the window shows now.
+    let raised =
+        find_by_alias(&state.windows, &key).and_then(|label| app.get_webview_window(&label));
     match raised {
         Some(win) => {
             win.set_focus()

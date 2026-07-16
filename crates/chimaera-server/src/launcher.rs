@@ -671,17 +671,19 @@ pub(crate) fn build_chat_command(
 /// a fresh terminal. The POSIX branch embeds the same guarded snippet the
 /// shell-integration rc sources (one source of truth in chimaera-core);
 /// fish can't source POSIX text, so it execs through a bash trampoline
-/// that sources the prelude and then execs the agent — full bash
-/// semantics, and the exec chain still leaves the agent as the PTY's
-/// direct child. No bash on the host → the prelude is skipped, never a
-/// failed launch.
+/// that sources the prelude and then execs the agent — a LOGIN bash
+/// (`-l`), because the commands preludes exist for (`ml`, `module`,
+/// conda's hook) are profile-defined shell functions that a plain
+/// `bash -c` never sees; the exec chain still leaves the agent as the
+/// PTY's direct child. No bash on the host → the prelude is skipped,
+/// never a failed launch.
 pub(crate) fn wrap_login_shell(shell: &str, argv: Vec<String>) -> Vec<String> {
     let script = if shell.rsplit('/').next() == Some("fish") {
         // fish has no `$0`/`$@`; -c puts trailing args in $argv instead.
         r#"test -n "$CHIMAERA_SHIMS"; and set -gx PATH $CHIMAERA_SHIMS $PATH
 if set -q CHIMAERA_PRELUDE; and not set -q CHIMAERA_PRELUDE_DONE; and test -r "$CHIMAERA_PRELUDE"; and command -sq bash
     set -gx CHIMAERA_PRELUDE_DONE 1
-    exec bash -c '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv
+    exec bash -lc '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv
 end
 exec $argv"#
             .to_string()
@@ -1234,7 +1236,7 @@ mod tests {
         // no bash → fall through to the plain exec.
         assert!(script.contains("command -sq bash"), "{script}");
         assert!(
-            script.contains(r#"exec bash -c '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv"#),
+            script.contains(r#"exec bash -lc '. "$CHIMAERA_PRELUDE"; exec "$@"' bash $argv"#),
             "{script}"
         );
         assert_eq!(cmd[3..], ["/usr/bin/claude"]);

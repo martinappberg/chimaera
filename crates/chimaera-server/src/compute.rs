@@ -190,13 +190,18 @@ impl ComputeService {
     }
 
     /// The detected scheduler toolset (for the Mode 2 launch/cancel routes);
-    /// runs detection if it hasn't happened yet.
+    /// runs detection if it hasn't happened yet. A TRANSIENT probe failure
+    /// (the login shell timing out under load) is not cached — the next call
+    /// retries — while a definitive "no tools" answer is; otherwise one slow
+    /// boot-time profile would brand a real cluster "no scheduler" for the
+    /// daemon's whole lifetime (the UI then stops polling and never asks
+    /// again).
     pub(crate) async fn detection(&self) -> Detection {
         let mut inner = self.inner.lock().await;
         if inner.detection.is_none() {
-            inner.detection = Some(self.detect().await);
+            inner.detection = self.detect().await;
         }
-        inner.detection.clone().expect("just set")
+        inner.detection.clone().unwrap_or(Detection::None)
     }
 
     /// The current snapshot: cached, single-flight, never an error (a
@@ -209,12 +214,13 @@ impl ComputeService {
             inner.cache = None;
         }
         if inner.detection.is_none() {
-            inner.detection = Some(self.detect().await);
+            // None (transient probe failure) stays uncached: this round
+            // answers "none" but the next call re-probes — see detection().
+            inner.detection = self.detect().await;
         }
-        let detection = inner.detection.clone().expect("just set");
-        let (squeue, sinfo) = match &detection {
-            Detection::None => return ComputeSnapshot::none(),
-            Detection::Slurm { squeue, sinfo, .. } => (squeue.clone(), sinfo.clone()),
+        let (squeue, sinfo) = match &inner.detection {
+            None | Some(Detection::None) => return ComputeSnapshot::none(),
+            Some(Detection::Slurm { squeue, sinfo, .. }) => (squeue.clone(), sinfo.clone()),
         };
         if let Some((at, snap)) = &inner.cache {
             if at.elapsed() < SNAPSHOT_TTL {
@@ -281,26 +287,30 @@ impl ComputeService {
     /// functions (Sherlock's login rc does — found live: `command -v squeue`
     /// prints the bare function name, not a path), and a PATH walk is also
     /// the only form that works identically under bash/zsh/fish.
-    async fn detect(&self) -> Detection {
+    /// `None` = the probe itself failed (login shell timed out — transient,
+    /// don't cache); `Some(Detection::None)` = the shell answered and the
+    /// tools are genuinely absent (definitive, cache it).
+    async fn detect(&self) -> Option<Detection> {
         if let Some(dir) = &self.bindir {
             let tools = ["srun", "scancel", "squeue", "sinfo"].map(|n| dir.join(n));
             if tools.iter().all(|p| p.is_file()) {
                 tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
                 let [srun, scancel, squeue, sinfo] = tools;
-                return Detection::Slurm {
+                return Some(Detection::Slurm {
                     srun,
                     scancel,
                     squeue,
                     sinfo,
-                };
+                });
             }
             tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but srun/scancel/squeue/sinfo not all present");
-            return Detection::None;
+            return Some(Detection::None);
         }
         let shell = chimaera_core::login_shell();
         let out = run_capped(&shell, &["-lc".into(), "printf %s \"$PATH\"".into()]).await;
         let Some(path) = out else {
-            return Detection::None;
+            tracing::warn!("login-shell PATH probe failed; scheduler detection will retry");
+            return None;
         };
         // The walk stats PATH entries that may live on slow network mounts —
         // off the reactor with it (detection runs once per daemon lifetime).
@@ -312,14 +322,14 @@ impl ComputeService {
         match found {
             [Some(srun), Some(scancel), Some(squeue), Some(sinfo)] => {
                 tracing::info!(squeue = %squeue.display(), "slurm detected");
-                Detection::Slurm {
+                Some(Detection::Slurm {
                     srun,
                     scancel,
                     squeue,
                     sinfo,
-                }
+                })
             }
-            _ => Detection::None,
+            _ => Some(Detection::None),
         }
     }
 }
@@ -353,46 +363,59 @@ async fn fetch_snapshot(
     self_job: Option<&str>,
 ) -> ComputeSnapshot {
     // The daemon's own allocation, when it has one: one bounded squeue -j.
-    let self_alloc = match self_job {
-        Some(id) => run_capped(
-            &squeue.to_string_lossy(),
-            &[
-                "-j".into(),
-                id.to_string(),
-                "--noheader".into(),
-                "-o".into(),
-                "%i|%P|%T|%L|%N|%C|%m|%b".into(),
-            ],
-        )
-        .await
-        .as_deref()
-        .and_then(parse_self_allocation),
-        None => None,
-    };
-    // `-u <user>`, not `--me`: --me is newer than the Slurm versions real
-    // clusters still run. No USER (exotic) → skip the queue rather than
-    // listing the whole cluster's jobs.
-    let jobs_out = match std::env::var("USER") {
-        Ok(user) => {
-            run_capped(
+    let self_fut = async {
+        match self_job {
+            Some(id) => run_capped(
                 &squeue.to_string_lossy(),
                 &[
-                    "-u".into(),
-                    user,
+                    "-j".into(),
+                    id.to_string(),
                     "--noheader".into(),
                     "-o".into(),
-                    "%i|%j|%P|%T|%L|%N|%C|%m".into(),
+                    "%i|%P|%T|%L|%N|%C|%m|%b".into(),
                 ],
             )
             .await
+            .as_deref()
+            .and_then(parse_self_allocation),
+            None => None,
         }
-        Err(_) => None,
     };
-    let parts_out = run_capped(
-        &sinfo.to_string_lossy(),
-        &["--noheader".into(), "-o".into(), "%P|%a|%D|%l|%c|%m".into()],
-    )
-    .await;
+    // `-u <user>`, not `--me`: --me is newer than the Slurm versions real
+    // clusters still run. No USER (exotic) → skip the queue rather than
+    // listing the whole cluster's jobs. %j goes LAST: job names are the one
+    // user-controlled field and may contain the `|` delimiter — splitn can
+    // only protect the final field from shifting every later one.
+    let jobs_fut = async {
+        match std::env::var("USER") {
+            Ok(user) => {
+                run_capped(
+                    &squeue.to_string_lossy(),
+                    &[
+                        "-u".into(),
+                        user,
+                        "--noheader".into(),
+                        "-o".into(),
+                        "%i|%P|%T|%L|%N|%C|%m|%j".into(),
+                    ],
+                )
+                .await
+            }
+            Err(_) => None,
+        }
+    };
+    let parts_fut = async {
+        run_capped(
+            &sinfo.to_string_lossy(),
+            &["--noheader".into(), "-o".into(), "%P|%a|%D|%l|%c|%m".into()],
+        )
+        .await
+    };
+    // Independent controller queries; running them together caps the
+    // single-flight lock hold at ONE command deadline instead of stacking
+    // three (a wedged controller otherwise blocks every /compute caller for
+    // the sum).
+    let (self_alloc, jobs_out, parts_out) = tokio::join!(self_fut, jobs_fut, parts_fut);
 
     let (jobs, jobs_truncated) = parse_squeue(jobs_out.as_deref().unwrap_or(""));
     let (partitions, parts_truncated) = parse_sinfo(parts_out.as_deref().unwrap_or(""));
@@ -535,17 +558,19 @@ fn format_utc_minute(t: SystemTime) -> Option<String> {
     Some(format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02} UTC"))
 }
 
-/// `squeue --noheader -o "%i|%j|%P|%T|%L|%N|%C|%m"` → jobs. Unparseable
+/// `squeue --noheader -o "%i|%P|%T|%L|%N|%C|%m|%j"` → jobs. Unparseable
 /// lines are skipped, never fatal (Slurm banners/warnings sometimes precede
-/// output). The trailing resource fields are tolerated missing — older rows
-/// or exotic formats degrade to "".
+/// output). %j sits LAST because job names are user-controlled and may
+/// contain `|` — splitn(8) folds any embedded delimiters into the name
+/// instead of shifting the fields before it. The mid-row resource fields
+/// are tolerated missing — older rows or exotic formats degrade to "".
 fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
     let mut jobs = Vec::new();
     let mut truncated = false;
     for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let mut f = line.splitn(8, '|').map(str::trim);
-        let (Some(id), Some(name), Some(partition), Some(state), Some(time_left)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
+        let (Some(id), Some(partition), Some(state), Some(time_left)) =
+            (f.next(), f.next(), f.next(), f.next())
         else {
             continue;
         };
@@ -556,16 +581,19 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
             truncated = true;
             break;
         }
+        // %N is empty while pending — an empty string is the honest value.
+        let nodes = f.next().unwrap_or("").to_string();
+        let cpus = f.next().unwrap_or("").to_string();
+        let mem = f.next().unwrap_or("").to_string();
         jobs.push(Job {
             id: id.to_string(),
-            name: name.to_string(),
+            name: f.next().unwrap_or("").to_string(),
             partition: partition.to_string(),
             state: state.to_string(),
             time_left: time_left.to_string(),
-            // %N is empty while pending — an empty string is the honest value.
-            nodes: f.next().unwrap_or("").to_string(),
-            cpus: f.next().unwrap_or("").to_string(),
-            mem: f.next().unwrap_or("").to_string(),
+            nodes,
+            cpus,
+            mem,
         });
     }
     (jobs, truncated)
@@ -624,37 +652,57 @@ fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
     (partitions, truncated)
 }
 
-/// Run one child with the default timeout + output cap; None on spawn
-/// failure, non-zero exit, or timeout (the caller degrades, never errors).
-/// Shared with `compute_jobs` (scancel rides the same discipline).
-pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
-    run_capped_within(bin, args, CMD_TIMEOUT).await
+/// One child's outcome under the poll discipline. `None` from
+/// [`run_checked`] means the child never ran to completion (spawn failure
+/// or the deadline); an exit is always `Some` — success or not — with both
+/// streams captured (capped), so callers can tell "the tool said no" from
+/// "the tool never answered" (cancel needs that split: scancel of an
+/// already-gone job fails with words, a wedged controller fails silently).
+pub(crate) struct CmdResult {
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
-/// [`run_capped`] with a caller-chosen deadline, for callers whose child
-/// legitimately outlives the 5s poll discipline.
-pub(crate) async fn run_capped_within(
-    bin: &str,
-    args: &[String],
-    timeout: Duration,
-) -> Option<String> {
+/// Run one child with the default timeout + output cap; None on spawn
+/// failure, non-zero exit, or timeout (the caller degrades, never errors).
+/// Shared with `compute_jobs` (the launch/cancel verbs ride the same
+/// discipline).
+pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
+    let out = run_checked(bin, args).await?;
+    out.success.then_some(out.stdout)
+}
+
+/// [`run_capped`]'s status-aware form: a completed child is `Some` even on
+/// non-zero exit.
+pub(crate) async fn run_checked(bin: &str, args: &[String]) -> Option<CmdResult> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         // Timeout drops the future, dropping the child; this reaps it.
         .kill_on_drop(true);
-    let fut = async {
-        let out = cmd.output().await.ok()?;
-        out.status.success().then_some(out.stdout)
-    };
-    let bytes = tokio::time::timeout(timeout, fut).await.ok()??;
-    let mut s = String::from_utf8_lossy(&bytes).into_owned();
-    if s.len() > MAX_OUTPUT {
-        s.truncate(MAX_OUTPUT);
+    let out = tokio::time::timeout(CMD_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    Some(CmdResult {
+        success: out.status.success(),
+        stdout: capped_lossy(out.stdout),
+        stderr: capped_lossy(out.stderr),
+    })
+}
+
+/// Byte-capped lossy decode. The BYTES are truncated first: cutting a
+/// decoded `String` at a fixed byte offset panics off a char boundary
+/// (a multi-byte job name straddling the cap would take the request task
+/// down), while a byte cut costs at most a trailing U+FFFD.
+fn capped_lossy(mut bytes: Vec<u8>) -> String {
+    if bytes.len() > MAX_OUTPUT {
+        bytes.truncate(MAX_OUTPUT);
     }
-    Some(s)
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Slurm's stderr/log text, made presentable: `<tool>: error: ` prefixes
@@ -732,14 +780,16 @@ mod tests {
 
     #[test]
     fn parse_squeue_rows_caps_and_skips_noise() {
-        // Shapes measured on Sherlock 2026-07-14 (`%i %j %N %T %L`), plus
-        // the %C|%m resource tail (2026-07-16) — tolerated missing.
-        let out = "34022541|chimaera-test|normal|RUNNING|9:54|sh02-01n58|4|16G\n\
-                   34022542|align.sh|owners|PENDING|8:00:00|\n\
+        // Shapes measured on Sherlock 2026-07-14, %C|%m resource tail
+        // 2026-07-16, %j moved LAST 2026-07-16 (user-controlled names may
+        // contain the `|` delimiter — the final field absorbs them).
+        let out = "34022541|normal|RUNNING|9:54|sh02-01n58|4|16G|chimaera-test\n\
+                   34022542|owners|PENDING|8:00:00||||align.sh\n\
+                   34022543|owners|RUNNING|1:00|n1|2|4G|my|weird|name\n\
                    slurm_load_jobs: Warning: something\n";
         let (jobs, truncated) = parse_squeue(out);
         assert!(!truncated);
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 3);
         assert_eq!(jobs[0].id, "34022541");
         assert_eq!(jobs[0].name, "chimaera-test");
         assert_eq!(jobs[0].state, "RUNNING");
@@ -748,10 +798,16 @@ mod tests {
         assert_eq!(jobs[0].cpus, "4");
         assert_eq!(jobs[0].mem, "16G");
         assert_eq!(jobs[1].nodes, "", "pending job has no nodes yet");
-        assert_eq!(jobs[1].cpus, "", "short rows degrade to empty resources");
+        assert_eq!(jobs[1].cpus, "", "pending rows degrade to empty resources");
+        assert_eq!(jobs[1].name, "align.sh");
+        assert_eq!(
+            jobs[2].name, "my|weird|name",
+            "embedded delimiters fold into the trailing name, never shift fields"
+        );
+        assert_eq!(jobs[2].state, "RUNNING");
 
         let many: String = (0..60)
-            .map(|i| format!("{i}|j{i}|p|RUNNING|1:00|n{i}\n"))
+            .map(|i| format!("{i}|p|RUNNING|1:00|n{i}|1|1G|j{i}\n"))
             .collect();
         let (jobs, truncated) = parse_squeue(&many);
         assert_eq!(jobs.len(), MAX_JOBS);
@@ -940,7 +996,7 @@ mod tests {
             ("scancel", "#!/bin/sh\nexit 0\n"),
             (
                 "squeue",
-                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|myjob|normal|RUNNING|59:00|node1'; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = \"-j\" ]; then echo \"$2|gpu|RUNNING|3:59:00|node7\"; else echo '1|normal|RUNNING|59:00|node1|4|8G|myjob'; fi\n",
             ),
             ("sinfo", "#!/bin/sh\necho 'normal*|up|10'\n"),
         ] {

@@ -32,7 +32,12 @@
   );
   const countdown = $derived(
     remaining === null
-      ? alloc.time_left
+      ? // Slurm's %L emits INVALID/NOT_SET while a job transitions —
+        // placeholder words, not durations, so show a dash. UNLIMITED (and
+        // any other raw value) stays: Slurm vocabulary is never relabeled.
+        alloc.time_left === "INVALID" || alloc.time_left === "NOT_SET"
+        ? "—"
+        : alloc.time_left
       : remaining === 0
         ? "expiring…"
         : formatSlurmDuration(remaining),

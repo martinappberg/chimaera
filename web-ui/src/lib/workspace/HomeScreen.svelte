@@ -147,6 +147,14 @@
       getJobContext() === null &&
       ($computeStatus?.self ?? null) === null,
   );
+  /** This window sits on a compute-node daemon (either job-scope signal
+   *  isHostPage reads). Its workspace ids were minted at seed time on the
+   *  JOB daemon — `openWindow(ownAlias, …)` targets the bare LOGIN alias,
+   *  where those ids don't exist (the window lands on the launcher) — so
+   *  cross-window opening isn't offered here. */
+  const jobScoped = $derived(
+    getJobContext() !== null || ($computeStatus?.self ?? null) !== null,
+  );
   /** Host page: the daemon's own compute list (null = not fetched / no route). */
   let hostCompute = $state<ComputeSessionList | null>(null);
   /** A list fetch is in flight — first load shows the probe line, later
@@ -228,7 +236,9 @@
       const onVis = (): void => {
         pageVisible = document.visibilityState === "visible";
         // Hidden paused the poller; catch up NOW instead of waiting a period.
-        if (pageVisible) void refreshHostCompute();
+        // Re-check isHostPage: it can flip false after mount (the daemon's
+        // `self` block arriving) and this handler must not outlive the fact.
+        if (pageVisible && isHostPage) void refreshHostCompute();
       };
       document.addEventListener("visibilitychange", onVis);
       return () => document.removeEventListener("visibilitychange", onVis);
@@ -445,9 +455,14 @@
       hostCompute = list;
       hostComputeError = null;
       rememberScheduler(hostLabel, list.scheduler);
-      // Re-sync the shared tick baseline to this response.
-      listReceivedAt = Date.now();
-      nowTick = listReceivedAt;
+      // Re-sync the shared tick baseline to this response — but NOT for a
+      // degraded round (squeue failed; time_left carried forward stale):
+      // re-baselining there would restart every countdown from its
+      // pre-outage value on each poll.
+      if (!list.degraded) {
+        listReceivedAt = Date.now();
+        nowTick = listReceivedAt;
+      }
       // A "cancelling…" card settles once the job is gone or Slurm moved it
       // to a new state (CANCELLING/COMPLETING then speak for themselves).
       if (cancelling.size > 0) {
@@ -689,9 +704,10 @@
   }
 
   function openRow(e: MouseEvent, w: Workspace): void {
-    if (e.metaKey || e.ctrlKey) {
+    if ((e.metaKey || e.ctrlKey) && !jobScoped) {
       // Cmd/Ctrl-click is the explicit "give me another window" gesture — on
-      // THIS screen's own daemon (see ownAlias).
+      // THIS screen's own daemon (see ownAlias). Job-scoped windows degrade
+      // to the in-window open (see jobScoped).
       void openWindow(ownAlias, w.id, true);
     } else {
       onOpen(w);
@@ -842,11 +858,13 @@
                     onclick={() => (confirmStopId = w.id)}>stop</button
                   >
                 {/if}
-                <button
-                  class="side"
-                  title="open in a new window"
-                  onclick={() => void openWindow(ownAlias, w.id, true)}>new window</button
-                >
+                {#if !jobScoped}
+                  <button
+                    class="side"
+                    title="open in a new window"
+                    onclick={() => void openWindow(ownAlias, w.id, true)}>new window</button
+                  >
+                {/if}
                 <button
                   class="side x"
                   title="remove from this list (folder untouched)"

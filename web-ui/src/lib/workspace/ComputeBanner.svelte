@@ -5,7 +5,12 @@
     type ComputeSelf,
   } from "./compute";
   import { cancelComputeSession } from "./computeSessions";
-  import { closeThisWindow, isNativeShell } from "../net/native";
+  import {
+    cancelComputeSession as cancelViaShell,
+    closeThisWindow,
+    isNativeShell,
+  } from "../net/native";
+  import { ApiError, getHostLabel } from "../net/api";
 
   interface Props {
     /** The daemon's own allocation (present in every compute-node window). */
@@ -17,11 +22,17 @@
   let { self: alloc, receivedAt }: Props = $props();
 
   /** The end-job flow: idle → confirm (inline, Escape disarms) → cancelling
-   *  (DELETE in flight) → ended (this window's daemon is going down). */
+   *  (cancel in flight) → ended (this window's daemon is going down). A
+   *  definitive failure returns to confirm with `cancelError` inline. */
   let phase = $state<"idle" | "confirm" | "cancelling" | "ended">("idle");
+  /** Why the last cancel attempt FAILED (the job is still running). */
+  let cancelError = $state<string | null>(null);
   let keepBtn = $state<HTMLButtonElement | null>(null);
 
   const native = isNativeShell();
+  /** The LOGIN host this job window was tunnelled through (the shell put the
+   *  alias in the hash); "local" means there is no shell tunnel to speak of. */
+  const loginAlias = getHostLabel();
 
   // Same live-tick discipline as ComputeStrip: the fetched time_left only
   // moves per poll, so tick locally against the receipt time and re-sync on
@@ -76,18 +87,48 @@
 
   async function endJob(): Promise<void> {
     if (phase !== "confirm") return;
+    cancelError = null;
     phase = "cancelling";
+    if (native && loginAlias !== "local") {
+      // Native: the shell's own command scancels via the LOGIN daemon — the
+      // one that owns the launch record (this job daemon has a different
+      // compute root, so a DELETE here never marks it cancelled and a later
+      // watched cancel raises a spurious ENDED tombstone) — and closes the
+      // job tunnel with it.
+      try {
+        await cancelViaShell(loginAlias, alloc.job_id);
+      } catch (e) {
+        cancelError = e instanceof Error ? e.message : String(e);
+        phase = "confirm";
+        return;
+      }
+      phase = "ended";
+      return;
+    }
+    // Browser fallback: this daemon's own DELETE. Only a NETWORK-level death
+    // is the expected success signal (scancel kills this very daemon, so the
+    // response often can't land); a daemon that ANSWERED with an error means
+    // the job is still running — say so instead of claiming ended.
     try {
       await cancelComputeSession(alloc.job_id);
-    } catch {
-      // EXPECTED: scancel kills this window's own daemon, so the DELETE
-      // often dies mid-flight — that failure IS the success signal here.
+    } catch (e) {
+      if (e instanceof ApiError) {
+        cancelError = e.message;
+        phase = "confirm";
+        return;
+      }
+      // fetch rejected mid-flight — the daemon died under us, as expected
     }
     phase = "ended";
   }
 
+  function disarm(): void {
+    phase = "idle";
+    cancelError = null;
+  }
+
   function onWindowKeydown(e: KeyboardEvent): void {
-    if (e.key === "Escape" && phase === "confirm") phase = "idle";
+    if (e.key === "Escape" && phase === "confirm") disarm();
   }
 </script>
 
@@ -113,22 +154,27 @@
       aria-label={`cancel slurm job ${alloc.job_id}?`}
       aria-describedby="compute-banner-end-copy"
     >
-      <span class="confirm-copy" id="compute-banner-end-copy">
-        cancel slurm job {alloc.job_id}? the whole allocation ends — every terminal, agent,
-        and unsaved change in this window dies
-      </span>
+      <div class="confirm-text">
+        <span class="confirm-copy" id="compute-banner-end-copy">
+          cancel slurm job {alloc.job_id}? the whole allocation ends — every terminal, agent,
+          and unsaved change in this window dies
+        </span>
+        {#if cancelError !== null}
+          <span class="confirm-err" role="alert">cancel failed — {cancelError}</span>
+        {/if}
+      </div>
       <div class="confirm-actions">
         <button
           class="confirm-end"
           disabled={phase === "cancelling"}
           onclick={() => void endJob()}
-          >{phase === "cancelling" ? "ending…" : "end the job"}</button
+          >{phase === "cancelling" ? "ending…" : cancelError !== null ? "retry" : "end the job"}</button
         >
         <button
           class="confirm-keep"
           bind:this={keepBtn}
           disabled={phase === "cancelling"}
-          onclick={() => (phase = "idle")}>keep</button
+          onclick={disarm}>keep</button
         >
       </div>
     </div>
@@ -317,11 +363,26 @@
     width: 100%;
   }
 
+  .confirm-text {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
   .confirm-copy {
     min-width: 0;
     font-size: 12.5px;
     line-height: 1.45;
     color: var(--fg);
+  }
+
+  /* A definitive cancel failure (the daemon answered an error): the job is
+     still running, so the confirm stays armed and says why. */
+  .confirm-err {
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--err);
   }
 
   .confirm-actions {
