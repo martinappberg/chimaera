@@ -1113,6 +1113,135 @@ async fn agent_events_state_transitions() {
     state.sessions.kill(&id).ok();
 }
 
+/// The v0.2 status-feed ingest end to end over the route: SubagentStart/Stop
+/// build the live roster + a delegation now-line, PostToolUse replaces the
+/// now-line, the statusline heartbeat (`?event=statusline`) lands quantized
+/// usage, and Stop clears the turn-scoped fields while usage (session
+/// telemetry, not turn state) survives.
+#[tokio::test]
+async fn agent_events_track_subagents_now_line_and_statusline_usage() {
+    let state = test_state();
+    let id = inject_agent(&state, "k");
+
+    // Before any hook the state is unknown: `stalled` isn't checkable.
+    assert_eq!(
+        session_entry(&state, &id).await["stalled"],
+        serde_json::Value::Null
+    );
+
+    // SubagentStart: identity on the row, plus a delegation now-line.
+    let status = post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "agent_id": "sub-1",
+            "agent_type": "Explore",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = session_entry(&state, &id).await;
+    let subs = row["subagents"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["id"], "sub-1");
+    assert_eq!(subs[0]["label"], "Explore");
+    assert!(subs[0]["started_at"].as_u64().unwrap() > 0);
+    assert_eq!(row["now_line"], "delegating to Explore");
+    // Running + a just-spawned (still chatty) PTY: checkable, not stalled.
+    assert_eq!(row["agent_state"], "running");
+    assert_eq!(row["stalled"], false);
+
+    // A SubagentStart without identity is logged and dropped, never an error.
+    let status = post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({"hook_event_name": "SubagentStart", "unexpected": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = session_entry(&state, &id).await;
+    assert_eq!(row["subagents"].as_array().unwrap().len(), 1);
+
+    // PostToolUse replaces the now-line with the tool summary.
+    post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/w/src/lib.rs"},
+        }),
+    )
+    .await;
+    assert_eq!(
+        session_entry(&state, &id).await["now_line"],
+        "edited lib.rs"
+    );
+
+    // SubagentStop drops the entry; an empty roster reads null on the wire.
+    post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({"hook_event_name": "SubagentStop", "agent_id": "sub-1"}),
+    )
+    .await;
+    assert_eq!(
+        session_entry(&state, &id).await["subagents"],
+        serde_json::Value::Null
+    );
+
+    // The statusline heartbeat authenticates like any hook delivery.
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/agent-events/{id}?key=wrong&event=statusline"),
+        Some(serde_json::json!({"cost": {"total_cost_usd": 1.0}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // A good heartbeat lands quantized usage without touching the state.
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        &format!("/api/v1/agent-events/{id}?key=k&event=statusline"),
+        Some(serde_json::json!({
+            "hook_event_name": "Status",
+            "model": {"id": "claude-opus-4", "display_name": "Opus"},
+            "context_window": {"used_percentage": 41.7},
+            "cost": {"total_cost_usd": 0.1249},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = session_entry(&state, &id).await;
+    assert_eq!(
+        row["usage"],
+        serde_json::json!({"model": "Opus", "context_pct": 42, "cost_usd": 0.12})
+    );
+    assert_eq!(row["agent_state"], "running");
+
+    // Stop clears the turn-scoped fields; usage survives the turn.
+    post_hook(
+        &state,
+        &id,
+        "k",
+        serde_json::json!({"hook_event_name": "Stop"}),
+    )
+    .await;
+    let row = session_entry(&state, &id).await;
+    assert_eq!(row["now_line"], serde_json::Value::Null);
+    assert_eq!(row["usage"]["model"], "Opus");
+    // Finished ≠ a working claim: stalled is null again.
+    assert_eq!(row["stalled"], serde_json::Value::Null);
+
+    state.sessions.kill(&id).ok();
+}
+
 #[tokio::test]
 async fn agent_title_tail_polls_transcript() {
     let state = test_state();

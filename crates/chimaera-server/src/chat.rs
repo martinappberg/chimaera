@@ -614,6 +614,13 @@ pub(crate) fn chat_session_json(
         // PTY-row signal only (same key; null like any row whose state
         // comes from a better signal).
         "output_active": null,
+        // The v0.2 status-feed fields are hooks/PTY-tier signals: `stalled`
+        // needs a PTY to be silent, and the chat client derives richer
+        // subagents/now-line/usage from its own journal — always null here.
+        "stalled": null,
+        "subagents": null,
+        "now_line": null,
+        "usage": null,
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,
@@ -1511,7 +1518,14 @@ pub(crate) async fn resurrect_chat(
     let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
         let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
             .then_some(entry.theme.as_str());
-        let s = crate::agents::write_settings(&entry.id, &key, state.port, settings_theme)?;
+        let user_statusline = crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+        let s = crate::agents::write_settings(
+            &entry.id,
+            &key,
+            state.port,
+            settings_theme,
+            user_statusline.as_ref(),
+        )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))
     } else {

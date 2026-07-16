@@ -621,6 +621,20 @@ pub(crate) fn codex_theme_name(theme: &str) -> &'static str {
     }
 }
 
+/// The user's own `statusLine` config from their claude settings file, if
+/// any — the generated per-session settings wrap it (pipe the same stdin
+/// through, print its output) so injecting the telemetry statusline never
+/// changes what the user's TUI renders. User-level settings only: the same
+/// file the theme gate reads.
+pub(crate) fn claude_user_statusline(settings_path: &Path) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(settings_path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()?
+        .get("statusLine")
+        .filter(|v| !v.is_null())
+        .cloned()
+}
+
 /// Whether the user's own claude settings file sets a theme — if so,
 /// chimaera respects it and skips injection (fill the gap, never fight an
 /// explicit choice).
@@ -1435,6 +1449,32 @@ mod tests {
         assert_eq!(codex_theme_name("light"), "catppuccin-latte");
         assert_eq!(codex_theme_name("dark"), "catppuccin-mocha");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The statusline gate reads the same user settings file as the theme
+    /// gate: present objects come back whole (the settings writer wraps
+    /// them), absent/null/garbage read as "none configured".
+    #[test]
+    fn claude_user_statusline_reads_real_files() {
+        let dir = test_dir("statusline-gate");
+        let settings = dir.join("settings.json");
+        assert_eq!(claude_user_statusline(&settings), None); // absent file
+        std::fs::write(&settings, r#"{"theme": "dark"}"#).unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
+        std::fs::write(&settings, r#"{"statusLine": null}"#).unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
+        std::fs::write(
+            &settings,
+            r#"{"statusLine": {"type": "command", "command": "my-status", "padding": 0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_user_statusline(&settings),
+            Some(json!({"type": "command", "command": "my-status", "padding": 0}))
+        );
+        std::fs::write(&settings, "not json").unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

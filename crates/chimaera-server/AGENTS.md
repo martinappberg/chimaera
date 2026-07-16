@@ -38,6 +38,29 @@ the module you need and read its header doc.
 | `compute_jobs.rs` | Mode 2 — chimaera daemons AS Slurm jobs: `POST/GET/DELETE /compute/sessions` (DETACHED-srun launch — setsid/nohup, tmux-grade persistence, works on interactive-only partitions; charset-gated argv; job id via queue adoption; refusals surfaced from the srun log tail; stateless squeue⋈manifest⋈record listing + dismissable "ended" tombstones from orphaned records, scancel + record marking). Launch seeds the job home's `workspaces.json` with the host's whole registry over the shared FS. |
 | `workspaces` / `links`+`mcp` / `settings` / `quickopen` / `recents` / `naming` / `view_state` | The rest of the workbench: roots, linked terminals, settings, palette, history, per-window view-state. |
 
+## The status feed (v0.2)
+
+Session rows carry four additive dashboard fields, assembled in
+`session_view::session_json` (chat rows — `chat::chat_session_json` — carry
+explicit nulls: the chat client derives richer versions from its journal):
+
+- **`stalled`** — PTY liveness vs the hook claim: a live claude TUI whose
+  `AgentRecord` says Running but whose PTY has been silent ≥180s. Recomputed
+  per snapshot; the `/ws/events` 1s fallback tick is what flips it without
+  any event arriving (same mechanism as `output_active`) — no per-session
+  timers.
+- **`subagents[]` / `now_line`** — from the claude TUI hook ingest
+  (`agents::ingest`): `SubagentStart/Stop` identity (`agent_id`/`agent_type`,
+  capped at 32, cleared on Stop/exit) and a one-line latest-hook summary
+  ("ran Bash" / "edited foo.rs"), replaced per event, cleared on Stop/exit.
+- **`usage`** — the statusline heartbeat: the generated `--settings` points
+  `statusLine` at a per-session wrapper script that tees claude's statusline
+  JSON to `/agent-events/{id}?key=…&event=statusline` (model / context % /
+  cost, quantized to whole percent/cents so snapshot dedupe holds) while
+  preserving any user statusline command byte-for-byte.
+
+The wire shapes are pinned in `session_view.rs` tests — extend additively.
+
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 
 `chimaera-agent` owns the drivers, journal, and registry (`state.chat`). This

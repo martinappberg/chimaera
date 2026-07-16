@@ -28,7 +28,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::AppState;
 
 pub(crate) use crate::agent_state::{apply_title_line, truncate_prompt, AgentKind, AgentRecord};
-use crate::agent_state::{cleared_by_output, map_event, touched_file};
+use crate::agent_state::{
+    cleared_by_output, map_event, now_line_update, statusline_usage, subagent_identity,
+    touched_file,
+};
 
 /// Fresh session id in the same format the PTY engine generates.
 pub(crate) fn fresh_session_id() -> String {
@@ -62,17 +65,27 @@ pub(crate) fn mcp_config_path(session_id: &str) -> PathBuf {
 
 /// Hook events wired into the generated settings file. Everything the state
 /// machine consumes, plus PostToolUse so long tool-free stretches still
-/// refresh "running".
-const HOOK_EVENTS: [&str; 8] = [
+/// refresh "running", plus SubagentStart/Stop for the live-subagent roster
+/// (payloads carry `agent_id`/`agent_type` — verified claude 2.1.20x).
+const HOOK_EVENTS: [&str; 10] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    "SubagentStart",
+    "SubagentStop",
     "Stop",
     "StopFailure",
     "Notification",
     "SessionEnd",
 ];
+
+/// Path to a session's generated statusline wrapper script (see
+/// [`write_settings`]). Lives next to the settings file that references it,
+/// so the two are scrubbed and regenerated together.
+pub(crate) fn statusline_script_path(session_id: &str) -> PathBuf {
+    agents_runtime_dir().join(format!("{session_id}-statusline.sh"))
+}
 
 /// Write the per-agent Claude Code settings file (hooks -> daemon ingest URL)
 /// into the chimaera runtime dir, mode 0600 (it embeds the session secret).
@@ -82,11 +95,20 @@ const HOOK_EVENTS: [&str; 8] = [
 /// in a `--settings` file re-themes the TUI. Callers pass `None` when the
 /// user's own settings file already sets a theme (respect an explicit
 /// choice; only fill the gap).
+///
+/// `user_statusline` is the user's own `statusLine` config (see
+/// `runtimes::claude_user_statusline`): the settings also inject a
+/// `statusLine` wrapper script that tees claude's statusline JSON to the
+/// ingest route (`?event=statusline` — per-turn model/context/cost for TUI
+/// rows) while preserving the user's statusline exactly. Injected under the
+/// same condition as the hooks themselves; a user statusLine we cannot
+/// reproduce (no single-line command string) wins outright — no injection.
 pub(crate) fn write_settings(
     session_id: &str,
     key: &str,
     port: u16,
     theme: Option<&str>,
+    user_statusline: Option<&serde_json::Value>,
 ) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -100,6 +122,14 @@ pub(crate) fn write_settings(
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
     }
+    if let Some(passthrough) = statusline_passthrough(user_statusline) {
+        let script = write_statusline_script(session_id, key, port, passthrough.as_deref())?;
+        settings["statusLine"] = json!({ "type": "command", "command": script });
+        // Mirror the user's padding so their statusline spacing is unchanged.
+        if let Some(padding) = user_statusline.and_then(|s| s.get("padding")) {
+            settings["statusLine"]["padding"] = padding.clone();
+        }
+    }
 
     let path = settings_path(session_id);
     if let Some(dir) = path.parent() {
@@ -111,6 +141,71 @@ pub(crate) fn write_settings(
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to chmod {}", path.display()))?;
     Ok(path)
+}
+
+/// Whether/how to wrap the user's statusline: `Some(passthrough_command)` =
+/// inject the wrapper (piping stdin through the command when one exists;
+/// with none the wrapper prints nothing and claude renders no statusline —
+/// the TUI looks unchanged either way). `None` = the user's statusLine can't
+/// be reproduced faithfully (not a single-line `command`), so injection is
+/// skipped entirely and their own config applies untouched.
+fn statusline_passthrough(user: Option<&serde_json::Value>) -> Option<Option<String>> {
+    let Some(user) = user else {
+        return Some(None);
+    };
+    // Only the documented `command` type is reproducible.
+    if user
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t != "command")
+    {
+        return None;
+    }
+    match user.get("command").and_then(|c| c.as_str()).map(str::trim) {
+        None | Some("") => Some(None),
+        // A multi-line command can't be embedded on the wrapper's pipe line.
+        Some(cmd) if cmd.contains('\n') || cmd.contains('\r') => None,
+        Some(cmd) => Some(Some(cmd.to_string())),
+    }
+}
+
+/// Write the statusline wrapper script (mode 0700 — the URL embeds the
+/// session secret): tee stdin to the ingest route in the background, then
+/// pipe the same stdin through the user's own statusline command, if any.
+/// Returns the script path as the string the settings `command` carries.
+fn write_statusline_script(
+    session_id: &str,
+    key: &str,
+    port: u16,
+    passthrough: Option<&str>,
+) -> anyhow::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = format!(
+        "http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?key={key}&event=statusline"
+    );
+    let mut script = format!(
+        "#!/bin/sh\n\
+         # generated by chimaera — do not edit (rewritten on session spawn)\n\
+         # Tees claude's statusline JSON to the chimaera daemon (usage telemetry\n\
+         # for the dashboard); your own statusline, if configured, still renders\n\
+         # exactly as before.\n\
+         input=$(cat)\n\
+         printf '%s' \"$input\" | curl -s -m 5 -H 'Content-Type: application/json' \
+         --data-binary @- '{url}' >/dev/null 2>&1 &\n"
+    );
+    if let Some(cmd) = passthrough {
+        script.push_str(&format!("printf '%s' \"$input\" | {cmd}\n"));
+    }
+    let path = statusline_script_path(session_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    std::fs::write(&path, script).with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Write the per-agent MCP config wiring claude to this daemon's
@@ -139,6 +234,11 @@ pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow
 pub(crate) struct IngestQuery {
     #[serde(default)]
     key: String,
+    /// Non-hook deliveries on the same route: the statusline wrapper posts
+    /// with `event=statusline` (its payload has no meaningful
+    /// `hook_event_name` for the state machine).
+    #[serde(default)]
+    event: Option<String>,
 }
 
 /// POST /api/v1/agent-events/{id}?key={secret} — Claude Code hook ingestion.
@@ -151,6 +251,40 @@ pub(crate) async fn ingest(
     Query(query): Query<IngestQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
+    // Statusline heartbeat (the generated wrapper posts the TUI's statusline
+    // JSON with `?event=statusline`): quantized usage telemetry only — it
+    // never touches the hook state machine. Liberal ingest: an unknown shape
+    // is logged and dropped, never an error back at the wrapper.
+    if query.event.as_deref() == Some("statusline") {
+        let changed = {
+            let mut agents = crate::lock(&state.agents);
+            let Some(record) = agents.get_mut(&id) else {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("unknown agent session {id}")})),
+                )
+                    .into_response();
+            };
+            if record.key != query.key {
+                return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
+            }
+            let usage = statusline_usage(&payload);
+            if usage.is_empty() {
+                tracing::debug!(session = %id, "statusline payload carried no usage fields; dropped");
+                false
+            } else if record.usage.as_ref() != Some(&usage) {
+                record.usage = Some(usage);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            state.changes.notify_waiters();
+        }
+        return Json(json!({})).into_response();
+    }
+
     // `event` comes from the payload, not the record — compute it before the
     // lock so the guard's block below stays tight.
     let event = payload
@@ -208,6 +342,42 @@ pub(crate) async fn ingest(
             if let Some(path) = touched_file(&payload) {
                 changed |= record.touch_file(path);
                 touched_path = Some(path.to_string());
+            }
+        }
+
+        // Live-subagent roster for the dashboard cards. Payload identity is
+        // parsed liberally (`agent_state::subagent_identity`); an unknown
+        // shape is logged and dropped, never an ingest error.
+        match event {
+            "SubagentStart" => match subagent_identity(&payload) {
+                Some((sub_id, label)) => {
+                    changed |= record.subagent_started(sub_id, label, crate::session_view::now_ms())
+                }
+                None => {
+                    tracing::debug!(session = %id, "SubagentStart without agent identity; dropped")
+                }
+            },
+            "SubagentStop" => match subagent_identity(&payload) {
+                Some((sub_id, _)) => changed |= record.subagent_stopped(sub_id),
+                None => {
+                    tracing::debug!(session = %id, "SubagentStop without agent identity; dropped")
+                }
+            },
+            // A turn/session end means every live subagent is done — clear
+            // stragglers whose SubagentStop never arrived.
+            "Stop" | "StopFailure" | "SessionEnd" if !record.subagents.is_empty() => {
+                record.subagents.clear();
+                changed = true;
+            }
+            _ => {}
+        }
+
+        // One-line "what it's doing now" for the dashboard card, replaced
+        // per event and cleared at turn boundaries.
+        if let Some(update) = now_line_update(event, &payload) {
+            if record.now_line != update {
+                record.now_line = update;
+                changed = true;
             }
         }
 
@@ -427,7 +597,7 @@ mod tests {
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -445,6 +615,7 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
     }
 
     /// The scheme-matched theme merges into the SAME settings file the hooks
@@ -454,7 +625,7 @@ mod tests {
     fn settings_file_merges_theme_next_to_hooks() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, Some("light")).unwrap();
+        let path = write_settings(&sid, &key, 43999, Some("light"), None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "light");
@@ -464,5 +635,85 @@ mod tests {
             "http"
         );
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+    }
+
+    /// The statusline heartbeat: the settings point `statusLine` at a
+    /// generated wrapper that tees stdin to the ingest route in the
+    /// background. With no user statusline the wrapper prints nothing; a
+    /// user command is piped the same stdin (their TUI looks unchanged); an
+    /// un-embeddable user statusLine suppresses injection entirely.
+    #[test]
+    fn settings_statusline_wrapper_preserves_user_statusline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // (a) No user statusline: wrapper injected, prints nothing itself.
+        let sid = fresh_session_id();
+        let key = fresh_agent_key();
+        let path = write_settings(&sid, &key, 43999, None, None).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let script_path = statusline_script_path(&sid);
+        assert_eq!(value["statusLine"]["type"], "command");
+        assert_eq!(
+            value["statusLine"]["command"],
+            json!(script_path.to_string_lossy())
+        );
+        assert!(value["statusLine"].get("padding").is_none());
+        let script = std::fs::read_to_string(&script_path).unwrap();
+        let url =
+            format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}&event=statusline");
+        assert!(script.contains(&format!("'{url}'")), "{script}");
+        // The POST is backgrounded (never delays a user statusline) and the
+        // wrapper's only output line is the optional passthrough — absent here.
+        assert!(script.contains(">/dev/null 2>&1 &"), "{script}");
+        assert_eq!(script.matches("printf '%s' \"$input\"").count(), 1);
+        // Executable, owner-only: the URL embeds the session secret.
+        let mode = std::fs::metadata(&script_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&script_path).ok();
+
+        // (b) A user statusline command: piped the same stdin, padding kept.
+        let sid = fresh_session_id();
+        let user = json!({"type": "command", "command": "my-status --flag", "padding": 0});
+        let path = write_settings(&sid, &key, 43999, None, Some(&user)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["statusLine"]["padding"], 0);
+        let script_path = statusline_script_path(&sid);
+        let script = std::fs::read_to_string(&script_path).unwrap();
+        assert!(
+            script.contains("printf '%s' \"$input\" | my-status --flag"),
+            "{script}"
+        );
+        // The wrapper is a real sh program: it must at least parse.
+        let parses = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(parses, "{script}");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&script_path).ok();
+
+        // (c) A user statusLine we can't reproduce (multi-line command or a
+        // non-command type): no injection at all — theirs applies untouched.
+        for user in [
+            json!({"type": "command", "command": "line1\nline2"}),
+            json!({"type": "widget"}),
+        ] {
+            let sid = fresh_session_id();
+            let path = write_settings(&sid, &key, 43999, None, Some(&user)).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(value.get("statusLine").is_none(), "{user}");
+            assert!(!statusline_script_path(&sid).exists());
+            std::fs::remove_file(&path).ok();
+        }
     }
 }

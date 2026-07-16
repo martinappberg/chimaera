@@ -286,7 +286,14 @@ async fn spawn_chat_ui(
     let settings = if agent_kind == crate::agents::AgentKind::Claude {
         let settings_theme =
             (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path)).then_some(theme);
-        match crate::agents::write_settings(&id, &key, state.port, settings_theme) {
+        let user_statusline = crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+        match crate::agents::write_settings(
+            &id,
+            &key,
+            state.port,
+            settings_theme,
+            user_statusline.as_ref(),
+        ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),
         }
