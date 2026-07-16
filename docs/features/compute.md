@@ -87,12 +87,16 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
   **"ended" tombstone card** built from its launch record (explicit cancels clean up
   silently — the user watched those; tombstones age out after 48h). **Nothing pops in
-  from nowhere**: the host page holds the section's seat with a breathing "checking this
-  host for a scheduler…" probe line until the first fetch answers (the refresh glyph
-  spins during any later fetch), and the local home's indicator reads "checking for
-  compute…" → "slurm cluster" (even at zero sessions — *this host has compute nodes* is
-  the load-bearing fact) → the live session count, refreshed once a minute per connected
-  host while the page is visible. CLI parity + verification harness:
+  from nowhere — and nothing teases**: loading states ("loading compute sessions…" on the
+  host page, the breathing indicator on the local home) show **only on hosts a previous
+  fetch confirmed as clusters** (per-host scheduler memory in localStorage; the
+  maintainer: plain remotes must never see scheduler checks) — a first-ever cluster
+  confirms silently and the surface simply appears. On known clusters the refresh glyph
+  spins during any fetch, and the local indicator reads "slurm cluster" (even at zero
+  sessions — *this host has compute nodes* is the load-bearing fact) → the live session
+  count, refreshed once a minute per connected host while the page is visible. The launch
+  dialog's walltime is **d/h/m segment boxes** composing the sbatch string (no Slurm
+  string surgery), pre-flighted against the partition's published limit. CLI parity + verification harness:
   `chimaera compute list|launch|connect|cancel <host>`.
 - **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
   the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident

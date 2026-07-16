@@ -135,6 +135,32 @@ export function parseSlurmTimeLeft(s: string): number | null {
   return ((days * 24 + hours) * 60 + Number(m[3])) * 60 + Number(m[4]);
 }
 
+/**
+ * Per-host scheduler memory: what the last successful compute fetch said
+ * about a host ("slurm" | "none"), keyed by the user's alias. This is what
+ * keeps "checking this host for a scheduler…" states OFF plain remote
+ * hosts (maintainer ask) — a probe hint only shows where a scheduler is
+ * already KNOWN to live; a first-ever cluster confirms silently and the
+ * surface simply appears. localStorage so the memory survives reloads;
+ * everything degrades to "unknown" where storage is unavailable.
+ */
+export function rememberScheduler(host: string, scheduler: string): void {
+  try {
+    localStorage.setItem(`chimaera.scheduler:${host}`, scheduler);
+  } catch {
+    // storage full/blocked — the probe hint just stays conservative
+  }
+}
+
+/** "slurm" | "none" | null (never fetched / storage unavailable). */
+export function knownScheduler(host: string): string | null {
+  try {
+    return localStorage.getItem(`chimaera.scheduler:${host}`);
+  } catch {
+    return null;
+  }
+}
+
 /** Seconds → Slurm's own duration style (`1-04:00:00`, `1:57:12`, `04:32`). */
 export function formatSlurmDuration(totalSecs: number): string {
   const secs = Math.max(0, Math.floor(totalSecs));

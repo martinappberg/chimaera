@@ -25,7 +25,22 @@
   let partition = $state(
     partitions.find((p) => p.default)?.name ?? partitions[0]?.name ?? "",
   );
-  let time = $state("2:00:00");
+  // Walltime as separate d/h/m boxes (maintainer ask — "easier to fix" than
+  // one Slurm string); the composed sbatch form rides the wire. Numeric
+  // inputs bind empty as null → read as 0.
+  let days = $state<number | null>(0);
+  let hours = $state<number | null>(2);
+  let mins = $state<number | null>(0);
+  const time = $derived.by(() => {
+    const d = Math.max(0, Math.floor(days ?? 0));
+    const h = Math.max(0, Math.floor(hours ?? 0));
+    const m = Math.max(0, Math.floor(mins ?? 0));
+    if (d + h + m === 0) return "";
+    const mm = String(m).padStart(2, "0");
+    if (d > 0) return `${d}-${String(h).padStart(2, "0")}:${mm}:00`;
+    if (h > 0) return `${h}:${mm}:00`;
+    return `${m}:00`;
+  });
   /** Numeric input: Svelte binds an empty field as null. */
   let cpus = $state<number | null>(1);
   let mem = $state("4G");
@@ -36,7 +51,7 @@
   let busy = $state(false);
   let error = $state<string | null>(null);
 
-  const canSubmit = $derived(!busy && time.trim() !== "");
+  const canSubmit = $derived(!busy && time !== "");
 
   // --- per-partition ceilings (sinfo %l/%c/%m) — hints + a soft pre-flight.
   // Slurm remains the authority (QOS/account rules can differ); the launch
@@ -60,17 +75,10 @@
     return parts.join(" · ");
   });
 
-  /** Accepts sbatch's common walltime spellings (bare minutes included). */
-  function parseWalltime(s: string): number | null {
-    const t = s.trim();
-    if (/^\d+$/.test(t)) return Number(t) * 60;
-    return parseSlurmTimeLeft(t);
-  }
-
   const timeWarning = $derived.by(() => {
     if (selected === null || selected.time_limit === "") return null;
     const limit = parseSlurmTimeLeft(selected.time_limit);
-    const asked = parseWalltime(time);
+    const asked = parseSlurmTimeLeft(time);
     if (limit === null || asked === null || asked <= limit) return null;
     return `${selected.name} allows at most ${selected.time_limit}`;
   });
@@ -83,7 +91,7 @@
     // the sbatch line from what's present.
     const spec: ComputeLaunchSpec = {
       name: name.trim() === "" ? "session" : name.trim(),
-      time: time.trim(),
+      time,
     };
     if (partition.trim() !== "") spec.partition = partition.trim();
     if (cpus !== null && Number.isFinite(cpus) && cpus >= 1) spec.cpus = Math.floor(cpus);
@@ -164,17 +172,23 @@
           {/if}
         </label>
         <div class="triple">
-          <label class="field">
+          <div class="field">
             <span class="lab">time</span>
-            <input
-              class="in mono"
-              class:over={timeWarning !== null}
-              bind:value={time}
-              placeholder="2:00:00"
-              spellcheck="false"
-              autocomplete="off"
-            />
-          </label>
+            <div class="dur" class:over={timeWarning !== null} role="group" aria-label="walltime">
+              <label class="seg" title="days">
+                <input type="number" min="0" max="99" step="1" bind:value={days} aria-label="days" />
+                <span>d</span>
+              </label>
+              <label class="seg" title="hours">
+                <input type="number" min="0" max="23" step="1" bind:value={hours} aria-label="hours" />
+                <span>h</span>
+              </label>
+              <label class="seg" title="minutes">
+                <input type="number" min="0" max="59" step="1" bind:value={mins} aria-label="minutes" />
+                <span>m</span>
+              </label>
+            </div>
+          </div>
           <label class="field">
             <span class="lab">cpus</span>
             <input class="in mono" type="number" min="1" step="1" bind:value={cpus} />
@@ -404,9 +418,60 @@
     font-family: var(--mono);
   }
 
+  /* Walltime as d/h/m segments: one bordered pill per unit, the unit letter
+     living inside the box — adjustable without Slurm-string surgery. */
+  .dur {
+    display: flex;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .seg {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--bg);
+    cursor: text;
+  }
+
+  .seg:focus-within {
+    border-color: var(--focus-ring);
+  }
+
+  .seg input {
+    min-width: 0;
+    width: 100%;
+    border: none;
+    background: none;
+    color: var(--fg);
+    font: inherit;
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    padding: 6px 0 6px 8px;
+    outline: none;
+    text-align: right;
+  }
+
+  /* Spinner chrome crowds a 3ch box; arrow keys still step the value. */
+  .seg input::-webkit-outer-spin-button,
+  .seg input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .seg span {
+    flex: none;
+    padding: 0 7px 0 3px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+
   /* Over the partition's published ceiling: caution, not a block — Slurm
      stays the authority (QOS/accounts can differ), but say so up front. */
-  .in.over {
+  .dur.over .seg {
     border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
   }
 

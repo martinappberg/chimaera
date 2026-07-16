@@ -33,7 +33,13 @@
     type ComputeSessionList,
     type ComputeSessionView,
   } from "./computeSessions";
-  import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "./compute";
+  import {
+    computeStatus,
+    formatSlurmDuration,
+    knownScheduler,
+    parseSlurmTimeLeft,
+    rememberScheduler,
+  } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, type Health } from "../net/api";
 
@@ -374,7 +380,9 @@
       computeChecking = new Set(computeChecking).add(alias);
     }
     try {
-      remoteCompute = new Map(remoteCompute).set(alias, await remoteComputeSessions(alias));
+      const list = await remoteComputeSessions(alias);
+      remoteCompute = new Map(remoteCompute).set(alias, list);
+      rememberScheduler(alias, list.scheduler);
     } catch {
       // no scheduler / older shell — the indicator simply doesn't show
     } finally {
@@ -436,6 +444,7 @@
       if (seq !== computeFetchSeq) return;
       hostCompute = list;
       hostComputeError = null;
+      rememberScheduler(hostLabel, list.scheduler);
       // Re-sync the shared tick baseline to this response.
       listReceivedAt = Date.now();
       nowTick = listReceivedAt;
@@ -842,11 +851,13 @@
       {/if}
     </section>
 
-    {#if isHostPage && hostCompute === null}
+    {#if isHostPage && hostCompute === null && knownScheduler(hostLabel) === "slurm"}
       <!-- The first compute fetch also runs the daemon's scheduler detection
-           (a login-shell PATH walk — seconds on a slow cluster). Showing the
-           probe beats the section popping in out of nowhere; on a host with
-           no scheduler this line simply fades away. -->
+           (a login-shell PATH walk — seconds on a slow cluster). The probe
+           holds the section's seat ONLY on hosts a previous fetch confirmed
+           as clusters (maintainer: never tease plain remotes with scheduler
+           checks) — a first-ever cluster confirms silently and the section
+           simply appears. -->
       <div class="probe-line" role="status">
         {#if hostComputeError === null}
           <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
@@ -855,7 +866,7 @@
             <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
             <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
           </svg>
-          <span>checking this host for a scheduler…</span>
+          <span>loading compute sessions…</span>
         {:else}
           <span class="err">compute check failed — {hostComputeError}</span>
         {/if}
@@ -1212,7 +1223,7 @@
                             {/if}
                           </button>
                         </div>
-                      {:else if comp === undefined && computeChecking.has(h.alias)}
+                      {:else if comp === undefined && computeChecking.has(h.alias) && knownScheduler(h.alias) === "slurm"}
                         <div class="rowwrap" role="presentation">
                           <div class="row sub comp-count checking" role="status">
                             <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
@@ -1221,7 +1232,8 @@
                               <rect x="2" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
                               <rect x="9" y="9" width="5" height="5" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4" />
                             </svg>
-                            <span class="name">checking for compute…</span>
+                            <span class="name">slurm cluster</span>
+                            <span class="path">checking…</span>
                           </div>
                         </div>
                       {/if}
