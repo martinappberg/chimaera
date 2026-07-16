@@ -70,10 +70,14 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   after launch-cancel; management calls go straight to that daemon's routes — only *open*
   crosses the native bridge for the tunnel). The **local home screen** shows just a slim
   "N compute sessions" indicator per connected host. A **compute-node window** identifies
-  itself everywhere: title + host label become `{alias} › {node}`, and an accent-washed
-  **allocation strip** above the rail's bottom bar carries a live ticking countdown +
-  `cpus · mem · gres` (daemon-truth via the snapshot's `self` block, so windows opened
-  later on the same node inherit it). Launch **seeds the job daemon's workspace registry
+  itself everywhere: title + host label become `{alias} › {node}`, its home page opens
+  with an **allocation banner** (node, partition, job id, resources, live ticking
+  walltime countdown — warn-toned under ten minutes), and an accent-washed
+  **allocation strip** above the rail's bottom bar carries the same countdown +
+  `cpus · mem · gres` inside a workspace (daemon-truth via the snapshot's `self` block,
+  so windows opened later on the same node inherit it). A fresh launch never flashes
+  "ended": launch/cancel invalidate the snapshot cache, and an orphaned launch record
+  younger than 120s renders as a PENDING submitted-card (squeue lag), leading the list. Launch **seeds the job daemon's workspace registry
   with the host's whole list** (shared-FS roots are equally valid on the node), so the
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
