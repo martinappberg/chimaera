@@ -464,7 +464,13 @@
   }
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
-  const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+  // The Mastermind is the observer, not the observed: its flagged row never
+  // enters the workspace roster — the rail, chord map, attention counts,
+  // quick-open, and reference targets all derive from here. Lookups by id
+  // (sessionsById, the pools' keep-alive sync) stay on the unfiltered list.
+  const wsSessions = $derived(
+    sessions.filter((s) => s.workspace_id === activeWsId && s.mastermind !== true),
+  );
 
   /** How this window is named in the shell's tray window-list: the workspace
    *  name (with the host on a remote window), or "Home" for the home screen —
@@ -552,6 +558,8 @@
     ready: gotSessions,
     recents: visibleRecents,
     mru: agentMru,
+    mastermind: workspace?.mastermind ?? null,
+    refreshWorkspaces,
     onOpenRecent: openRecent,
     onNewTerminal: newShell,
     onNewAgent: newAgentPrimary,
@@ -1597,9 +1605,11 @@
   /**
    * Refresh the workspace list; if the tab's stored workspace no longer
    * exists on the daemon, clear it and fall back to the empty state.
+   * Resolves once the fresh list is applied (never rejects) — the dashboard's
+   * Mastermind dock awaits it after a PUT/DELETE to pick up the binding.
    */
-  function refreshWorkspaces(): void {
-    void listWorkspaces()
+  function refreshWorkspaces(): Promise<void> {
+    return listWorkspaces()
       .then((list) => {
         workspaces = list;
         if (activeWsId !== null && !list.some((w) => w.id === activeWsId)) {
@@ -2957,10 +2967,11 @@
 <div class="shell">
   {#if activeWsId === null}
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
-         exist once a workspace scopes this window. -->
+         exist once a workspace scopes this window. A Mastermind is never a
+         worker: keep it out of the per-workspace live/attention rollups. -->
     <HomeScreen
       {workspaces}
-      {sessions}
+      sessions={sessions.filter((s) => s.mastermind !== true)}
       hostLabel={getHostLabel()}
       {health}
       connected={eventsUp}

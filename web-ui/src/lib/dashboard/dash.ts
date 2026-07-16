@@ -21,6 +21,12 @@ export interface DashCtx {
   recents: RecentConvo[];
   /** Agent session ids this window focused, most recent first. */
   mru: string[];
+  /** The workspace's Mastermind binding (the additive `GET /workspaces`
+   *  field); null when none is configured. The dock renders from this. */
+  mastermind: { session_id: string; mode: "ask" | "auto" } | null;
+  /** Re-fetch the workspaces list — the Mastermind binding lives there, so
+   *  the dock calls this after a PUT/DELETE. Resolves once applied. */
+  refreshWorkspaces: () => Promise<void>;
   onOpenRecent: (r: RecentConvo) => void;
   onNewTerminal: () => void;
   onNewAgent: () => void;

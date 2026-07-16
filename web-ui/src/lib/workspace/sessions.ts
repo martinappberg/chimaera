@@ -9,6 +9,12 @@ export interface Workspace {
   name: string;
   /** Unix seconds of the last open/activity; 0/absent on old daemons. */
   last_opened_at?: number;
+  /**
+   * The workspace's Mastermind binding: the privileged chat session's id +
+   * the ask/auto gating mode its act tools were spawned with. Absent when
+   * none is configured (and on old daemons). Exactly one per workspace.
+   */
+  mastermind?: { session_id: string; mode: "ask" | "auto" };
 }
 
 export type SessionKind = "shell" | "agent";
@@ -106,6 +112,13 @@ export interface Session {
    * for chat rows and hook-less TUIs; absent on old daemons.
    */
   usage?: { model: string | null; context_pct: number | null; cost_usd: number | null } | null;
+  /**
+   * True when this session is a workspace's Mastermind — the observer, not
+   * the observed: the UI keeps flagged rows out of the rail, the dashboard
+   * roster/lane, and every recents-like surface (the dashboard dock is its
+   * one home). Null on ordinary rows; absent on old daemons.
+   */
+  mastermind?: boolean | null;
   /**
    * Which surface the session's process runs behind: "chat" (structured
    * stream-json driver) or "term" (a PTY). Server truth — the pane renders
@@ -334,6 +347,31 @@ export async function touchWorkspace(id: string): Promise<Workspace> {
 /** Unregister a workspace from the daemon (the folder itself is untouched). */
 export async function deleteWorkspace(id: string): Promise<void> {
   await json<void>(await api(`/workspaces/${id}`, { method: "DELETE" }));
+}
+
+/**
+ * Appoint the workspace's Mastermind: the daemon creates the privileged chat
+ * session AND binds it in one step, retiring any previous one — a mode change
+ * is a re-PUT (a running agent never re-reads its generated settings).
+ * Returns the new session row. Errors carry UI-showable messages: 400 (codex
+ * refusal, bad mode), 409 (agent binary unavailable), 404 (unknown workspace).
+ */
+export async function putMastermind(
+  workspaceId: string,
+  body: { agent: string; mode: "ask" | "auto"; model?: string; theme?: "light" | "dark" },
+): Promise<Session> {
+  return json(
+    await api(`/workspaces/${workspaceId}/mastermind`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** Retire the workspace's Mastermind: unbind + end its session (204). */
+export async function deleteMastermind(workspaceId: string): Promise<void> {
+  await json<void>(await api(`/workspaces/${workspaceId}/mastermind`, { method: "DELETE" }));
 }
 
 export async function listSessions(): Promise<Session[]> {

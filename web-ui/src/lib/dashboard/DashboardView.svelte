@@ -6,13 +6,17 @@
    * /ws/events roster, the git status store, the rail's recents) plus a
    * BOUNDED set of warm chat stores for inline permission answering and live
    * card detail. It is a router into live sessions, never a replacement —
-   * every card is one click from the real pane.
+   * every card is one click from the real pane. The Mastermind dock rides
+   * along as a full-height third column (collapsing to an edge pill): the
+   * one home of the workspace's privileged agent, which the roster below
+   * deliberately never lists.
    */
   import { onMount, untrack } from "svelte";
   import BrandMark from "../shared/BrandMark.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import AgentCard from "./AgentCard.svelte";
   import AttentionCard from "./AttentionCard.svelte";
+  import MastermindDock from "./MastermindDock.svelte";
   import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
@@ -45,8 +49,10 @@
 
   // --- the roster --------------------------------------------------------------
 
+  // The Mastermind never joins the roster it observes (its flagged row lives
+  // on the dock alone) — same filter App's wsSessions applies for the rail.
   const wsSessions = $derived(
-    [...sessions.values()].filter((s) => s.workspace_id === wsId),
+    [...sessions.values()].filter((s) => s.workspace_id === wsId && s.mastermind !== true),
   );
   const agents = $derived(wsSessions.filter((s) => s.kind === "agent"));
   const shells = $derived(wsSessions.filter((s) => s.kind !== "agent"));
@@ -71,6 +77,54 @@
   const quiet = $derived(lane.length === 0 && !agents.some(isBusy));
 
   const nothingRunning = $derived(wsSessions.length === 0);
+
+  // --- the Mastermind dock -------------------------------------------------------
+  //
+  // A bound Mastermind means the workspace is NOT "nothing running": the
+  // dashboard chrome shows (dock + an honest empty roster) instead of the
+  // launcher blank state. The true blank state offers "+ mastermind", which
+  // opens the chrome with the dock's setup card visible.
+
+  /** The Mastermind's roster row (looked up in the UNFILTERED map). */
+  const mmSession = $derived(
+    dash.mastermind !== null ? (sessions.get(dash.mastermind.session_id) ?? null) : null,
+  );
+  /** Honest pill affordance: an ask-mode Mastermind waiting on a permission
+   *  must be findable while the dock is collapsed (wire state, no store). */
+  const mmAttn = $derived(mmSession !== null && mmSession.alive && needsAttention(mmSession));
+
+  /** The user asked for the setup card from the blank state. */
+  let mastermindSetup = $state(false);
+  const blank = $derived(nothingRunning && dash.mastermind === null && !mastermindSetup);
+
+  // Collapse mechanism: the dock mounts/unmounts on toggle, so the width
+  // gate is the PANE's own measured width (bind:clientWidth — a container
+  // measure like the 860px activity-column query, never a window media
+  // query). Wide panes get the docked third column; narrower ones a slim
+  // edge pill that opens the dock as an overlay. Local state only (v1).
+  let dashWidth = $state(0);
+  const dockWide = $derived(dashWidth >= 1240);
+  /** Wide-mode manual collapse (the dock header's » button). */
+  let dockCollapsed = $state(false);
+  /** Narrow-mode overlay toggle (the edge pill). */
+  let overlayOpen = $state(false);
+  const dockOverlay = $derived(!dockWide && overlayOpen);
+  const showDock = $derived((dockWide && !dockCollapsed) || dockOverlay);
+
+  function openDock(): void {
+    if (dockWide) dockCollapsed = false;
+    else overlayOpen = true;
+  }
+  function collapseDock(): void {
+    if (dockWide) dockCollapsed = true;
+    else overlayOpen = false;
+  }
+  function openMastermindSetup(): void {
+    mastermindSetup = true;
+    // The setup card must actually appear, whatever the pane width.
+    dockCollapsed = false;
+    overlayOpen = true;
+  }
 
   /** "Continue where you left off": this window's most recent agent, else the
    *  newest live one. Rendered only when it isn't already the whole story. */
@@ -240,13 +294,14 @@
   const dirtyCount = $derived($gitStatus?.entries.length ?? 0);
 </script>
 
-<div class="dashboard">
+<div class="dashboard" bind:clientWidth={dashWidth}>
   {#if !dash.ready}
     <div class="skeleton"><span>connecting…</span></div>
-  {:else if nothingRunning}
-    <!-- Nothing running: no dashboard chrome — the launcher-style blank
-         state (per the design decision: an empty workspace shows nothing
-         dashboard-shaped, just the ways to start). -->
+  {:else if blank}
+    <!-- Nothing running AND no Mastermind: no dashboard chrome — the
+         launcher-style blank state (per the design decision: an empty
+         workspace shows nothing dashboard-shaped, just the ways to start).
+         A bound Mastermind is something running: the chrome shows instead. -->
     <div class="blank">
       <BrandMark size={26} draw title="chimaera" />
       <h2>{dash.wsName}</h2>
@@ -254,6 +309,11 @@
       <div class="blank-actions">
         <button class="cta" onclick={dash.onNewAgent}>+ new agent</button>
         <button class="cta quiet" onclick={dash.onNewTerminal}>+ terminal</button>
+        <button
+          class="cta quiet"
+          title="one agent that watches the whole workspace and delegates work"
+          onclick={openMastermindSetup}>+ mastermind</button
+        >
       </div>
       {#if dash.recents.length > 0}
         <div class="blank-recents">
@@ -270,7 +330,12 @@
       <p class="hint"><kbd>{keyHint("quickOpen")}</kbd> to open a file</p>
     </div>
   {:else}
-    <div class="inner">
+    <!-- Chrome: the scrolling surface + the Mastermind dock as a full-height
+         third column (or its collapsed edge pill) — flex siblings, so no
+         horizontal scroll and no overlap at any pane width. -->
+    <div class="body">
+      <div class="scroll">
+        <div class="inner">
       <!-- The vital-signs strip: name · branch · the summary sentence · the
            compute chip — one quiet row (decision 10). -->
       <header class="strip">
@@ -306,6 +371,18 @@
 
       <div class="columns">
         <div class="main">
+          {#if nothingRunning}
+            <!-- Chrome without workers (a Mastermind is bound, or its setup
+                 was requested): say so honestly and keep the ways to start. -->
+            <div class="noworkers">
+              <p>No workers running yet.</p>
+              <div class="blank-actions">
+                <button class="cta" onclick={dash.onNewAgent}>+ new agent</button>
+                <button class="cta quiet" onclick={dash.onNewTerminal}>+ terminal</button>
+              </div>
+            </div>
+          {/if}
+
           {#if lane.length > 0}
             <div class="sec-title">needs you</div>
             <div class="lane">
@@ -345,22 +422,24 @@
             </div>
           {/if}
 
-          <div class="shells">
-            {#if shells.length > 0}
-              <span class="shellsum">
-                {shells.length} terminal{shells.length === 1 ? "" : "s"}
-                {#if busyShells > 0}· {busyShells} running a command{/if}
-              </span>
-              {#each shells.slice(0, 4) as t (t.id)}
-                <button class="shellchip" onclick={() => dash.onOpenSession(t.id)}>
-                  <span class="dot {dotState(t)}" title={dotTitle(t)}></span>
-                  {names.get(t.id) ?? t.name}
-                </button>
-              {/each}
-            {/if}
-            <button class="ghost" onclick={dash.onNewTerminal}>+ terminal</button>
-            <button class="ghost" onclick={dash.onNewAgent}>+ agent</button>
-          </div>
+          {#if !nothingRunning}
+            <div class="shells">
+              {#if shells.length > 0}
+                <span class="shellsum">
+                  {shells.length} terminal{shells.length === 1 ? "" : "s"}
+                  {#if busyShells > 0}· {busyShells} running a command{/if}
+                </span>
+                {#each shells.slice(0, 4) as t (t.id)}
+                  <button class="shellchip" onclick={() => dash.onOpenSession(t.id)}>
+                    <span class="dot {dotState(t)}" title={dotTitle(t)}></span>
+                    {names.get(t.id) ?? t.name}
+                  </button>
+                {/each}
+              {/if}
+              <button class="ghost" onclick={dash.onNewTerminal}>+ terminal</button>
+              <button class="ghost" onclick={dash.onNewAgent}>+ agent</button>
+            </div>
+          {/if}
         </div>
 
         <aside class="side">
@@ -420,6 +499,38 @@
           {/if}
         </aside>
       </div>
+        </div>
+      </div>
+
+      {#if wsId !== null}
+        {#if showDock}
+          <div class="dockcol" class:overlay={dockOverlay}>
+            <MastermindDock
+              cfg={dash.mastermind}
+              session={mmSession}
+              {wsId}
+              {paneId}
+              {ctrl}
+              refresh={dash.refreshWorkspaces}
+              onCollapse={collapseDock}
+            />
+          </div>
+        {:else}
+          <button
+            class="pill"
+            title={dash.mastermind !== null
+              ? "open the Mastermind dock"
+              : "set up the Mastermind — one agent that watches the whole workspace"}
+            onclick={openDock}
+          >
+            <BrandMark size={14} title="Mastermind" />
+            <span class="pill-label">mastermind</span>
+            {#if mmAttn}
+              <span class="pill-dot" title="the Mastermind needs you"></span>
+            {/if}
+          </button>
+        {/if}
+      {/if}
     </div>
   {/if}
 </div>
@@ -512,6 +623,21 @@
   }
 
   /* --- the populated surface --------------------------------------------------- */
+  /* The chrome row: the scrolling surface + the Mastermind dock (or its edge
+     pill) as flex siblings — the dock never overlaps content when docked,
+     and only the deliberate narrow-width overlay ever floats above it. */
+  .body {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    min-width: 0;
+  }
+  .scroll {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+  }
+
   .inner {
     max-width: 1000px;
     margin: 0 auto;
@@ -519,6 +645,84 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+  }
+
+  /* The Mastermind dock: a full-height third column right of the activity
+     column. Narrow panes swap it for the edge pill; the pill opens it as an
+     overlay pinned to the pane's right edge (see .dockcol.overlay). */
+  .dockcol {
+    flex: none;
+    width: 360px;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--edge);
+    background: var(--bg);
+  }
+  .dockcol.overlay {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(380px, calc(100% - 44px));
+    z-index: 6;
+    box-shadow: -10px 0 32px rgba(0, 0, 0, 0.22);
+  }
+
+  /* The collapsed dock: a slim right-edge strip, always reachable. */
+  .pill {
+    flex: none;
+    width: 30px;
+    appearance: none;
+    border: none;
+    border-left: 1px solid var(--edge);
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 0;
+    font: inherit;
+    transition:
+      color 0.12s ease,
+      background-color 0.12s ease;
+  }
+  .pill:hover {
+    color: var(--fg);
+    background: var(--row-hover);
+  }
+  .pill-label {
+    writing-mode: vertical-rl;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.08em;
+  }
+  .pill-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 16%, transparent);
+  }
+
+  /* Chrome without workers (a Mastermind is bound): honest, minimal. */
+  .noworkers {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 16px 16px 18px;
+    border: 1px dashed var(--edge);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: var(--text-md);
+  }
+  .noworkers p {
+    margin: 0;
   }
 
   .strip {

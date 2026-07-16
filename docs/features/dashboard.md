@@ -3,18 +3,21 @@
 The landing surface of a workspace: which agents need you, what everyone is doing, what
 they produced, and where you left off — one glance, every element one click from the live
 session. An empty workspace layout opens onto it; ⌘0 / the rail's `dashboard` row reach it
-any time. This is v0.1 of the larger dashboard/Mastermind design
-([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)); the workspace status feed,
-the workspace MCP tools, and the Mastermind agent phase in behind it.
+any time. This is the larger dashboard/Mastermind design
+([docs/agent-dashboard-plan.md](../agent-dashboard-plan.md)) through v1: the surface
+(v0.1), the status-feed depth (v0.2), and the Mastermind dock (v1).
 
 **Where it lives (shared):** UI `web-ui/src/lib/dashboard/` (`DashboardView.svelte`,
-`AgentCard.svelte`, `AttentionCard.svelte`, `dash.ts`); the `dashboard` surface in
-`web-ui/src/lib/layout/layout.ts` (`DashboardTab`, `openDashboard`, key `v:dashboard`) and
-its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch + rail row + ⌘0 in
-`web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`, `dashCtx`). No new
-daemon surface: it renders from the existing `/ws/events` roster, the chat journal via
-`web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`peekChat`), the git status store, and
-the rail's recents.
+`AgentCard.svelte`, `AttentionCard.svelte`, `MastermindDock.svelte`, `dash.ts`); the
+`dashboard` surface in `web-ui/src/lib/layout/layout.ts` (`DashboardTab`, `openDashboard`,
+key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
++ rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
+`dashCtx`). The surface renders from the existing `/ws/events` roster, the chat journal
+via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`peekChat`), the git status store,
+and the rail's recents; the dock additionally rides the Mastermind daemon surface
+(`PUT`/`DELETE /api/v1/workspaces/{id}/mastermind` in
+`crates/chimaera-server/src/api/workspaces.rs`, the `mastermind` fields on the
+workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 
 ## Landing & entry points
 
@@ -26,10 +29,13 @@ the rail's recents.
   ride-along lives in `web-ui/src/lib/shared/keys.ts::chordDigit`).
 - **Key behaviors.** Singleton tab (re-opening focuses it); serialized additively in the
   layout blob (`{v:"dashboard"}` — older builds skip it without resetting the layout).
-  When **nothing is running** (no agents, no terminals) the surface shows no dashboard
-  chrome at all — a launcher-style blank state (brand mark, `+ new agent` / `+ terminal`,
-  recents, quick-open hint). Before the first session snapshot it shows a skeleton, never
-  a false "everything died".
+  When **nothing is running** (no agents, no terminals, no Mastermind) the surface shows
+  no dashboard chrome at all — a launcher-style blank state (brand mark, `+ new agent` /
+  `+ terminal` / a quiet `+ mastermind` leading to the dock's setup card, recents,
+  quick-open hint). A **bound Mastermind counts as something running**: the chrome shows
+  (the dock plus an honest "No workers running yet." roster area with the same spawners)
+  instead of the blank state. Before the first session snapshot it shows a skeleton,
+  never a false "everything died".
 
 ## The attention lane ("needs you")
 
@@ -95,6 +101,43 @@ the rail's recents.
 - **Git** — branch, ahead/behind, change count; opens the source-control panel. Reads the
   live `gitStatus` store (epoch-driven, never polled).
 
+## The Mastermind dock
+
+- **What & when.** The one home of the workspace's privileged agent (plan §7: exactly one
+  per workspace, it delegates rather than does): a full-height third column right of the
+  activity column, `MastermindDock.svelte`. Until one exists the dock is a **setup card**
+  — brand mark, plain-English help (sees every session, answers questions, delegates
+  work; never does the work itself; bills as your own account), the agent choice, the
+  ask-first/auto mode choice, and Start.
+- **How it's used.** Start `PUT`s `/workspaces/{id}/mastermind {agent, mode, theme}`; the
+  daemon creates the chat session AND binds it in one step and the dock swaps to the
+  identity header (mark · "Mastermind" · agent + mode chips) over an **embedded
+  `ChatView`** — the same component the panes use, on the same chat pool, so permission
+  prompts of an ask-mode Mastermind render inline in its own chat (never in the attention
+  lane). The header's `⋯` menu offers "switch to ask/auto" (an inline confirm — a mode
+  change is a re-PUT that restarts the session; a running claude never re-reads its
+  settings) and "retire" (inline confirm → `DELETE`, which unbinds and ends the session).
+- **Key behaviors.**
+  - **Ask first vs auto** is worn on the chip: ask-first means acting on the workspace
+    raises the agent's own permission prompt (reads never ask); auto acts without asking,
+    every act audited. The gating rides the agent's native harness, set at spawn.
+  - **Claude-only in v1**: codex shows in the setup card but disabled, wearing the
+    server's refusal verbatim (no per-tool permission gate for MCP calls, so ask-first
+    can't be enforced) — the same 400 the daemon would return. PUT errors (the 409
+    missing-binary conflict included) surface inline in the server's own words.
+  - **Reactive-only**: nothing in the UI ever triggers a Mastermind turn — no briefing
+    prompt on setup, no event-nudged sends. It speaks when the user types.
+  - **The observer, not the observed**: session rows flagged `mastermind: true` are
+    filtered out of the rail, the roster/lane, the chord map, quick-open, the home-screen
+    rollups, and the recents-adjacent surfaces. The dock is the only place it renders.
+  - **Collapse**: panes ≥ ~1240px (the pane's own measured width, not the window's) get
+    the docked 360px column with a header `»` collapse; narrower panes get a slim
+    right-edge pill ("mastermind" + the mark, plus an amber dot when it waits on you)
+    that opens the dock as a right-pinned overlay. No horizontal scroll, no overlap.
+  - **Honest gone-state**: a binding whose session is missing/dead says "the Mastermind
+    session is gone — set it up again" with a reset (DELETE, then the setup card) —
+    never a ghost chat.
+
 ## Key constraints
 
 - **Status must be honest** (design spine): a card can never fake-green; every state comes
@@ -112,6 +155,10 @@ claude chat from the dashboard; the attention lane rendering a real Write permis
 answering it inline (file created); provenance/now-line/ctx meter on the hero card;
 changed-files attribution (`claude` vs `you`); evidence link opening the session Changes
 view beside the dashboard; container-query collapse.
+
+**Verification pending (Mastermind dock, 2026-07-16):** setup → embedded chat → mode
+switch → retire; the blank-state variants (`+ mastermind`, bound-but-no-workers chrome);
+the collapse pill at narrow pane widths; hidden-from-roster across rail/lane/chords.
 
 ---
 
