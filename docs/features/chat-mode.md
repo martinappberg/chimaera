@@ -128,6 +128,20 @@ TUI (see [view switch](#view-switch-and-rewind)).
   order). The ■ stop sends `stop_task` with the native task key — the CLI's stop is generic over its
   task registry and acks a raced not-found as success. Codex has no background lane — the tray never
   renders there.
+- **Rich workflow rows + card verdicts (claude).** A `local_workflow` lane renders richer than a
+  bare bash row: the tray row leads with the workflow's `meta.name` (from `task_started
+  .workflow_name`; lane + description stay in the tooltip) and carries a per-agent **dot row**
+  (filled = done, red = error-ish states, hollow = anything else — at most 24 dots, newest win,
+  per-dot tooltip = label — state: result preview) plus an honest "done/total agents" count. The
+  driver folds `task_progress.workflow_progress` (per-agent `{index, label, state, resultPreview…}`,
+  live-probed shape — PROTOCOL.md Pass 15) into the level-set, capped at 64 stored agents per task
+  with totals counted over the whole wire list, and re-emits **only on state transitions** (the
+  stored fields exclude per-tick token churn, so the journal stays quiet). The launching `Workflow`
+  tool card ticks "N/M agents done" while the run lives and lands a final
+  `workflow "name" completed · 4/4 agents · 7m 15s` line at the close (a `failed` verdict flips the
+  card red); the count/elapsed survive the departed buffer because they ride the task identity.
+  Inner workflow agents' permission asks ride the normal `can_use_tool` path — they surface as
+  ordinary permission cards, and a denied agent shows as an error dot.
 - **Live subagents tray + active plan step.** Subagents running *right now* are promoted out of the
   (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
   glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"

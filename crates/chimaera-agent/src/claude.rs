@@ -1298,6 +1298,15 @@ impl ClaudeMapper {
             if a["type"].as_str() != Some("workflow_agent") {
                 continue;
             }
+            // Dedupe within the frame (newest occurrence wins — we walk from
+            // the tail): the client's keyed dot render chokes on a repeated
+            // index, and a dupe must not inflate the totals either. Only the
+            // KEPT entries can be checked, so a dupe beyond the cap slips the
+            // count — acceptable for an over-cap corrupt frame.
+            let index = a["index"].as_u64().unwrap_or(0);
+            if agents.iter().any(|kept| kept.index == index) {
+                continue;
+            }
             total += 1;
             let state = a["state"].as_str().unwrap_or("start");
             if state == "done" {
@@ -1305,7 +1314,7 @@ impl ClaudeMapper {
             }
             if agents.len() < WF_AGENTS_CAP {
                 agents.push(WorkflowAgent {
-                    index: a["index"].as_u64().unwrap_or(0),
+                    index,
                     label: truncate_label(
                         a["label"]
                             .as_str()
@@ -4644,6 +4653,31 @@ mod tests {
         assert_eq!(
             tasks[0].agents[0].index, 11,
             "the cap keeps the newest entries"
+        );
+    }
+
+    #[test]
+    fn workflow_progress_dedupes_repeated_indexes_newest_wins() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-6", "description": "d",
+        }));
+        // Index 1 appears twice — the tail (newest) occurrence wins, and the
+        // dupe inflates neither the dot row nor the totals.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-6",
+            "workflow_progress": [wf_agent(1, "start"), wf_agent(2, "start"), wf_agent(1, "done")],
+        }));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].agents.len(), 2);
+        assert_eq!(tasks[0].agents_total, 2);
+        assert_eq!(tasks[0].agents_done, 1);
+        assert_eq!(tasks[0].agents[0].index, 2);
+        assert_eq!(tasks[0].agents[1].index, 1);
+        assert_eq!(
+            tasks[0].agents[1].state, "done",
+            "the newest occurrence wins"
         );
     }
 

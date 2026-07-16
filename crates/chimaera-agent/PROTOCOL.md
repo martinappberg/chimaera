@@ -1198,7 +1198,7 @@ e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
 covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
 untouched. `just chat-smoke` re-run for the driver change.
 
-## Pass 15 (2026-07-16 — live probe 2.1.207: Workflow runs). OBSERVED, not adopted.
+## Pass 15 (2026-07-16 — live probe 2.1.207: Workflow runs). ADOPTED.
 
 A minimal ultracode-keyword Workflow (2 trivial agents, haiku, ~6¢) in
 `-p stream-json`, to see what the official rich workflow card is built from.
@@ -1233,6 +1233,22 @@ Everything below is already on the 2.1.207 wire — no newer CLI needed
 - Also seen, unmapped: `post_turn_summary {summarizes_uuid, status_category
   (e.g. "review_ready"), status_detail, needs_action}` after each turn —
   dashboard/status material, deliberately not adopted yet.
+- ADOPTION (same day, verified live against 2.1.211 in the isolated
+  preview — three workflow runs, journal inspected): the driver folds
+  `workflow_name` + `workflow_progress` into the `background_tasks`
+  level-set (per-task agents capped at `WF_AGENTS_CAP`, newest kept;
+  `agents_total`/`agents_done` counted over the whole wire list; re-emit on
+  STATE TRANSITIONS only — the stored fields exclude per-tick churn) and
+  lands "N/M agents done" ticks + a final `workflow "name" {status} ·
+  done/total agents · elapsed` line on the launching Workflow card via
+  `tool_use_id`. New live facts from the adoption runs: agent `state` also
+  takes `progress` (mid-run) and `error`; an agent() with no label gets a
+  CLI-derived `{meta.name}:{index}` label; a workflow whose EVERY agent
+  errors still closes `task_notification {status:"completed"}` (the card's
+  honest 0/N is the tell); inner workflow agents' permission requests ride
+  the ordinary `can_use_tool` control path mid-lane. `just chat-smoke`
+  16/16 on 2.1.211 + codex 0.144.2; TESTED_CLAUDE_VERSION bumped
+  2.1.207 → 2.1.211.
 - Codex counterpart (0.144.2 binary mine + docs, no live probe yet): collab
   tools `SpawnAgent`/`SendInput`/`ResumeAgent`/`CloseAgent`, thread-item
   `collabAgentToolCall`, activity variants `subAgentThreadSpawn`/
