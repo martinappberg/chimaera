@@ -85,12 +85,28 @@ export function listAgents(refresh = false, check = false): Promise<AgentInfo[]>
   return pending;
 }
 
+/** Re-fetch the catalog WITHOUT `refresh` (poll cadence): bypasses this
+ *  module's memo but not the daemon's detection cache — the daemon's install
+ *  watcher already re-detects when an install/update session ends, and its
+ *  mtime validation notices a swapped binary, so a poll never needs to force
+ *  four login-shell re-resolutions per tick. Replaces the memoized catalog. */
+export function pollAgents(): Promise<AgentInfo[]> {
+  const pending = fetchAgents(false);
+  agentsCache = pending;
+  void pending.catch(() => {
+    if (agentsCache === pending) agentsCache = null;
+  });
+  return pending;
+}
+
 async function fetchAgents(refresh: boolean, check = false): Promise<AgentInfo[]> {
   const params = new URLSearchParams();
   if (refresh) params.set("refresh", "true");
   if (check) params.set("check", "true");
-  const q = params.size > 0 ? `?${params.toString()}` : "";
-  const body = await json<unknown>(await api(`/agents${q}`));
+  // Not URLSearchParams.size: it's missing on older WebKit (Safari < 17 /
+  // webkit2gtk), where `undefined > 0` would silently drop the params.
+  const qs = params.toString();
+  const body = await json<unknown>(await api(`/agents${qs === "" ? "" : `?${qs}`}`));
   if (!Array.isArray(body)) return [];
   return body.flatMap((raw): AgentInfo[] => {
     if (typeof raw !== "object" || raw === null) return [];

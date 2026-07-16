@@ -133,31 +133,10 @@ pub(crate) async fn check_now(state: &Arc<AppState>) {
 
 async fn fetch_latest() -> anyhow::Result<Release> {
     let url = releases_api_url().context("no releases endpoint for this build")?;
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-fsSL",
-            "-m",
-            "10",
-            "--max-filesize",
-            "1048576",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            concat!("User-Agent: chimaera/", env!("CARGO_PKG_VERSION")),
-            &url,
-        ])
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("failed to run curl")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "curl exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    parse_release(&output.stdout)
+    // The shared bounded fetch (10s, 1MB, kill_on_drop) — one fence for
+    // every phone-home the daemon makes.
+    let body = crate::agent_updates::curl(&url, &["Accept: application/vnd.github+json"]).await?;
+    parse_release(&body)
 }
 
 /// Parse a GitHub `releases/latest` payload.

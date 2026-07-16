@@ -408,11 +408,16 @@ pub(crate) async fn update_agent(
             .into_response();
     };
     // The swap is atomic and running agents keep their exec'd inode — say so
-    // up front, in the pane, where the person watching the update is.
+    // up front, in the pane, where the person watching the update is. The
+    // whole message goes through sq: managed_path derives from the home
+    // directory, which may carry a quote (the module-wide interpolation rule).
     let script = format!(
-        "echo 'chimaera: updating {} in place ({}) — running sessions keep the old build until relaunched'\n{script}",
-        kind.product_name(),
-        managed_path,
+        "echo {}\n{script}",
+        sq(&format!(
+            "chimaera: updating {} in place ({}) — running sessions keep the old build until relaunched",
+            kind.product_name(),
+            managed_path,
+        )),
     );
     match start_install(&state, kind, &workspace, "update", script) {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),

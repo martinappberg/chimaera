@@ -16,6 +16,7 @@
   import { getActiveWorkspaceId } from "../net/api";
   import {
     listAgents,
+    pollAgents,
     relativeAge,
     uninstallAgent,
     updateAgent,
@@ -143,10 +144,13 @@
   onDestroy(stopPoll);
 
   /** Refresh only the daemon-state side of the rows (never `inputs` — a
-   *  path edit in progress must not be clobbered by a background poll). */
+   *  path edit in progress must not be clobbered by a background poll).
+   *  pollAgents, not listAgents(true): the daemon's install watcher already
+   *  re-detected when the update session ended — forcing `refresh` here
+   *  would spawn four login-shell re-resolutions every 5s tick. */
   async function refreshRows(): Promise<void> {
     try {
-      const list = await listAgents(true);
+      const list = await pollAgents();
       agents = list;
       const next = { ...updating };
       for (const a of list) if (!a.updateAvailable) next[a.id] = false;

@@ -177,9 +177,10 @@ fn agy_platform() -> &'static str {
     }
 }
 
-/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Same fence as
-/// `update::fetch_latest`.
-async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
+/// One bounded fetch: 10s wall clock, 1MB body, kill_on_drop. Shared with
+/// `update::fetch_latest` (the daemon's own release check) — one fence for
+/// every phone-home the daemon makes.
+pub(crate) async fn curl(url: &str, headers: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut cmd = tokio::process::Command::new("curl");
     cmd.args(["-fsSL", "-m", "10", "--max-filesize", "1048576"]);
     for header in headers {
