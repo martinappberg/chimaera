@@ -218,6 +218,23 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
 - **How settled:** chat-by-default from the launcher row and the explicit per-spawn terminal
   affordance are deliberate; the exact visuals can evolve.
 
+### Agent update awareness & one-click managed updates — why it exists
+_Captured 2026-07-16 (from the maintainer, in-session)._
+
+- **Problem it solves — both halves equally.** The field dead end (a managed codex's own
+  `codex update` on Sherlock failing with "could not detect the installation method" — managed
+  binaries had no update path at all) AND staleness awareness: agent CLIs release near-daily, and
+  the user should see at a glance, on every host chimaera runs on, whether an agent is stale — and
+  fix it in one click.
+- **How settled (early feature):** all of it is provisional **except the why**. Even the
+  managed-only action gate is today's choice, not a locked contract — the maintainer explicitly
+  leaves open growing a personal-binary update path later (e.g. running the agent's own
+  self-updater, `claude update`/`codex update`, in a visible terminal). The surfaces, the
+  `→ <new>` affordance shape, the 6h cadence, the settings poll — additions, improvable freely.
+- **Core bet — do not change: never guess `update_available`.** The signal is honest or absent —
+  an unparseable version (either side) must never claim an update. Everything else in this area is
+  an addition, open to change if improved.
+
 ### Busy/idle session status — why it exists
 _Captured 2026-07-11 (from the maintainer)._
 
