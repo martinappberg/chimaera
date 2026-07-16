@@ -103,11 +103,12 @@ pub(crate) fn is_managed(path: &Path, managed_root: &Path) -> bool {
 // --- curated install scripts -------------------------------------------------
 
 /// Official artifact base URLs (see module docs for verification notes).
-const CLAUDE_DOWNLOAD_BASE: &str = "https://downloads.claude.ai/claude-code-releases";
+/// `agent_updates` probes the same endpoints for latest-version awareness.
+pub(crate) const CLAUDE_DOWNLOAD_BASE: &str = "https://downloads.claude.ai/claude-code-releases";
 const CODEX_RELEASE_BASE: &str = "https://github.com/openai/codex/releases/latest/download";
 /// Pinned inside https://antigravity.google/cli/install.sh (fetched
 /// 2026-07-06); serves `manifests/<platform>.json` with version/url/sha512.
-const AGY_MANIFEST_BASE: &str =
+pub(crate) const AGY_MANIFEST_BASE: &str =
     "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app";
 
 /// Single-quote `s` for sh (`'` becomes `'\''`): every path interpolated
@@ -329,21 +330,112 @@ pub(crate) async fn install_agent(
         )
             .into_response();
     };
-    match start_install(&state, kind, &workspace, script) {
+    match start_install(&state, kind, &workspace, "install", script) {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
         Err(response) => *response,
     }
 }
 
-/// Spawn one install session (kind "shell", pinned name, standard session
-/// env) and its exit watcher. `Err` carries the ready-made 409/500
-/// response (boxed: a `Response` is bulky next to the id). Factored from
-/// the handler so tests can drive the session mechanics with a stub script
-/// instead of the real (network-bound) curated one.
+// --- POST /api/v1/agents/{id}/update ------------------------------------------
+
+/// POST /api/v1/agents/{id}/update — bring a chimaera-MANAGED binary to the
+/// latest release: the curated install script already fetches latest and
+/// atomically re-swaps the symlink, so an update is the same script under a
+/// session honestly named "update <agent>". Managed only — chimaera never
+/// touches a binary it doesn't own; the UI shows a personal install's newer
+/// release as information, not an action. 404 unknown agent id or workspace;
+/// 400 when the resolved binary isn't chimaera-managed (or none is
+/// installed); 409 while an install/update session for the same agent runs.
+pub(crate) async fn update_agent(
+    State(state): State<Arc<AppState>>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<InstallBody>,
+) -> Response {
+    let Some(kind) = AgentKind::parse(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown agent {id:?}")})),
+        )
+            .into_response();
+    };
+    // Cached detection (mtime-validated): the gate is what a spawn would
+    // actually run, so a personal install shadowing a managed copy reads —
+    // and refuses — as "yours".
+    let detection = crate::launcher::detect(&state, kind, false).await;
+    let managed_path = match &detection.path {
+        Ok(path) if detection.managed => path.display().to_string(),
+        Ok(path) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "{} resolves to your own install ({}) — chimaera only updates binaries \
+                     it manages under ~/.chimaera/agents",
+                    kind.product_name(),
+                    path.display(),
+                )})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "{} is not installed — install it first",
+                    kind.product_name(),
+                )})),
+            )
+                .into_response();
+        }
+    };
+    let Some(workspace) = crate::lock(&state.workspaces).get(&body.workspace_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown workspace {}", body.workspace_id)})),
+        )
+            .into_response();
+    };
+    let Some(script) = install_script(kind, &state.managed_root) else {
+        // Unreachable through the UI (nothing managed exists without a
+        // curated script), but a hand-placed binary under the managed
+        // prefix gets the honest answer.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!(
+                "no curated update exists for {}",
+                kind.product_name(),
+            )})),
+        )
+            .into_response();
+    };
+    // The swap is atomic and running agents keep their exec'd inode — say so
+    // up front, in the pane, where the person watching the update is. The
+    // whole message goes through sq: managed_path derives from the home
+    // directory, which may carry a quote (the module-wide interpolation rule).
+    let script = format!(
+        "echo {}\n{script}",
+        sq(&format!(
+            "chimaera: updating {} in place ({}) — running sessions keep the old build until relaunched",
+            kind.product_name(),
+            managed_path,
+        )),
+    );
+    match start_install(&state, kind, &workspace, "update", script) {
+        Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// Spawn one install/update session (kind "shell", pinned name
+/// "`<action>` `<agent>`", standard session env) and its exit watcher.
+/// `Err` carries the ready-made 409/500 response (boxed: a `Response` is
+/// bulky next to the id). Factored from the handlers so tests can drive the
+/// session mechanics with a stub script instead of the real (network-bound)
+/// curated one.
 pub(crate) fn start_install(
     state: &Arc<AppState>,
     kind: AgentKind,
     workspace: &crate::workspaces::Workspace,
+    action: &str,
     script: String,
 ) -> Result<String, Box<Response>> {
     let session_id = crate::agents::fresh_session_id();
@@ -362,7 +454,7 @@ pub(crate) fn start_install(
                         StatusCode::CONFLICT,
                         Json(json!({
                             "error": format!(
-                                "an install session for {} is already running",
+                                "an install or update session for {} is already running",
                                 kind.product_name()
                             ),
                             "session_id": existing,
@@ -383,7 +475,7 @@ pub(crate) fn start_install(
     let opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         // Pinned name: the pane reads as what it is on every surface.
-        name: Some(format!("install {}", kind.as_str())),
+        name: Some(format!("{action} {}", kind.as_str())),
         cols: 80,
         rows: 24,
         command: Some(vec!["/bin/bash".to_string(), "-c".to_string(), script]),
@@ -735,6 +827,16 @@ if [ ! -x "$real" ]; then
   echo "  add your own {bin} to your PATH, or install one from the agent launcher (+ new agent)." >&2
   exit 127
 fi
+# A managed install is a bare checksum-verified binary behind a symlink in
+# ~/.chimaera/agents/bin — {bin}'s own updater has no package manager to
+# detect there (field failure: a confusing "could not detect the
+# installation method"), or worse, would install a second copy elsewhere
+# and leave the managed one stale. Point at the real updater instead.
+if [ "$real" = {managed} ] && [ "${{1:-}}" = update ]; then
+  echo "chimaera: this {bin} is managed by chimaera — its own updater cannot update it." >&2
+  echo "  update it in chimaera instead: the agent launcher (+ new agent) or Settings > Agents." >&2
+  exit 1
+fi
 "#,
         managed = sq(&format!("{}/{bin}", managed_bin.display())),
     );
@@ -1082,6 +1184,71 @@ mod tests {
         let out = run();
         assert!(out.status.success(), "{out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "managed-codex");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `<agent> update` against a MANAGED binary is intercepted with a pointer
+    /// at chimaera's own updater (field failure: codex's self-updater cannot
+    /// detect an install method for a bare binary behind our symlink, and
+    /// claude's would install a second copy elsewhere). A user's own binary
+    /// is never intercepted — their updater is theirs.
+    #[test]
+    fn shim_intercepts_update_only_for_the_managed_binary() {
+        let dir = test_dir("shim-update");
+        let shim_dir = dir.join("shims");
+        let managed = dir.join("agents").join("bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        write_exec(
+            &managed.join("codex"),
+            "#!/bin/sh\necho \"managed-codex $*\"\n",
+        );
+        write_shims(&shim_dir, &managed, &HashMap::new()).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let run = |extra_path: Option<&Path>, args: &[&str]| -> std::process::Output {
+            let mut cmd = std::process::Command::new(shim_dir.join("codex"));
+            cmd.args(args);
+            cmd.env_clear();
+            let user = extra_path
+                .map(|p| format!("{}:", p.display()))
+                .unwrap_or_default();
+            cmd.env(
+                "PATH",
+                format!("{}:{user}/usr/bin:/bin", shim_dir.display()),
+            );
+            cmd.env("HOME", &home);
+            cmd.output().expect("shim ran")
+        };
+
+        // Managed resolution + `update`: intercepted, pointed at chimaera.
+        let out = run(None, &["update"]);
+        assert!(!out.status.success(), "{out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("managed by chimaera"), "{err}");
+        assert!(err.contains("agent launcher"), "{err}");
+        // Any other invocation of the managed binary passes through.
+        let out = run(None, &["--version"]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "managed-codex --version"
+        );
+
+        // The user's own codex on PATH: `update` is their updater's business.
+        let user_bin = dir.join("user-bin");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        write_exec(
+            &user_bin.join("codex"),
+            "#!/bin/sh\necho \"user-codex $*\"\n",
+        );
+        let out = run(Some(&user_bin), &["update"]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "user-codex update"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

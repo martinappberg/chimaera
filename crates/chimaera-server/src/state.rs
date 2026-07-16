@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agents, chat, compute, environment, fs, git, launcher, ledger, quickopen, recents, settings,
-    update, view_state, workspaces,
+    agent_updates, agents, chat, compute, environment, fs, git, launcher, ledger, quickopen,
+    recents, settings, update, view_state, workspaces,
 };
 
 /// Upper bound on how long a sessions snapshot waits for ledger restore.
@@ -40,6 +40,10 @@ pub(crate) struct AppState {
     pub(crate) session_themes: Mutex<HashMap<String, String>>,
     /// What the daemon knows about newer releases (see `update`).
     pub(crate) update: Mutex<update::UpdateStatus>,
+    /// The newest known upstream release per agent CLI (see `agent_updates`):
+    /// filled by its slow checker and Settings' inline `?check=true`, read by
+    /// the GET /agents row builder. Bounded: one entry per known agent.
+    pub(crate) agent_updates: Mutex<HashMap<agents::AgentKind, agent_updates::AgentLatest>>,
     /// Bumped when the update status changes; drives the `update` ws frame.
     pub(crate) update_epoch: std::sync::atomic::AtomicU64,
     /// User settings (the settings.json ground truth), stored in the config
@@ -177,6 +181,7 @@ impl AppState {
             session_themes: Mutex::new(HashMap::new()),
             update: Mutex::new(update::UpdateStatus::default()),
             update_epoch: std::sync::atomic::AtomicU64::new(0),
+            agent_updates: Mutex::new(HashMap::new()),
             settings: Mutex::new(settings::SettingsStore::load(
                 config_dir.join("settings.json"),
             )),

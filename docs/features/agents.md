@@ -51,7 +51,10 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   `claude`). If the default is missing, the main surface doesn't spawn a doomed pane — it installs
   in place (if managed) or opens the popover. Provenance is stated in words: **"yours"** (your
   binary on PATH) vs **"chimaera"** (a build under `~/.chimaera/agents`), with the resolved path in
-  the tooltip. The popover paints INSTANTLY from the window's last-known catalog (no "checking…"
+  the tooltip. When the daemon knows a strictly newer release, the version line grows **`→ <new>`**:
+  an accent one-click curated update for a chimaera-managed build, quiet muted information for your
+  own (chimaera never touches an install it doesn't own — the docs link is the affordance). The
+  popover paints INSTANTLY from the window's last-known catalog (no "checking…"
   flash per open) and re-detects in the background, swapping in the truth; only a window that has
   never seen a catalog shows the pulse. The explicit open/terminal choice overrides the
   `agents.defaultView` setting for that one spawn (the setting still governs the split button's
@@ -63,31 +66,47 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 - **What & when.** Chimaera installs and updates the agent CLIs itself (curated scripts, official
   sources, checksum-verified, never sudo), streaming the installer into a visible terminal pane —
   and writes tiny theming "shims" that inject a scheme-matched theme into agent spawns.
-- **How it's used.** Click an install/update chip → `POST /api/v1/agents/{id}/install {workspace_id}`
-  spawns the curated command as an ordinary shell session you watch. `DELETE /api/v1/agents/{id}/install`
-  uninstalls the managed copy (driven from the Agents settings panel).
-- **Where it lives.** `runtimes.rs` (`install_agent`, `start_install`, `install_script`,
-  `write_shims`, `regenerate_shims`).
+- **How it's used.** Click an install chip → `POST /api/v1/agents/{id}/install {workspace_id}`
+  spawns the curated command as an ordinary shell session you watch. Click an update affordance
+  (launcher `→ <new>`, or Settings → Agents "update → \<new\>") → `POST /api/v1/agents/{id}/update`
+  re-runs the same curated script (it always fetches latest and re-swaps atomically) as a session
+  named `update <agent>` — **managed binaries only**; for your own binary the daemon 400s and the
+  UI never offers it. `DELETE /api/v1/agents/{id}/install` uninstalls the managed copy (driven
+  from the Agents settings panel).
+- **Where it lives.** `runtimes.rs` (`install_agent`, `update_agent`, `start_install`,
+  `install_script`, `write_shims`, `regenerate_shims`); latest-release awareness in
+  `agent_updates.rs`.
 - **Key behaviors.** Scripts are composed by the daemon (never the client), `set -euo pipefail`,
   HTTPS-only, no sudo, version charset-whitelisted, downloads in a `mktemp` dir. Layout
   `~/.chimaera/agents/<agent>/<version>/bin/` with an atomic per-agent symlink swap (running
-  sessions keep their exec'd inode). One install per agent (409 while running). Gemini has no
+  sessions keep their exec'd inode — the update session says so up front). One install/update per
+  agent (409 while running, either verb). Gemini has no
   managed install (needs a node runtime — phase 2; POST → honest 400). Shims are written **only**
   when chimaera owns the binary (never shadow your own install) and theme injection is skipped when
-  your own config already sets a theme (fill the gap, never fight a choice).
+  your own config already sets a theme (fill the gap, never fight a choice). Typing
+  `<agent> update` in a chimaera terminal against a **managed** binary is intercepted by the shim
+  with a pointer at chimaera's own updater (field failure: codex's self-updater can't detect an
+  install method for a bare binary behind our symlink, and claude's would install a second copy
+  elsewhere, leaving the managed link stale); your own binary's `update` passes through untouched.
 
 ## Agent detection & catalog
 
 - **What & when.** The launcher popover's truth: which agents this host has (installed? version?
-  outdated?), their curated model lists, install hints, and (for claude) resumable past
-  conversations.
+  outdated? newer release upstream?), their curated model lists, install hints, and (for claude)
+  resumable past conversations.
 - **Where it lives.** `launcher.rs` (`list_agents`, `detect`, `resolve_bin`, `models`,
-  `is_outdated`, `claude_resumables`). Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
+  `is_outdated`, `claude_resumables`); upstream latest-release probes in `agent_updates.rs`.
+  Routes `GET /api/v1/agents`, `GET /api/v1/agents/claude/sessions`.
 - **Key behaviors.** Detection runs three login shells + version probes concurrently (serial would
   visibly stall the popover), with a 6s timeout backstopped by well-known paths. `is_outdated` flags
   npm-era codex (0.1.x). The Antigravity IDE's `agy` symlink (which just opens the GUI) is detected
   and refused. Resumables are scanned off the reactor, exclude transcripts already open in a live
-  session, and are titled by the same custom > ai > first-prompt chain as live naming.
+  session, and are titled by the same custom > ai > first-prompt chain as live naming. Latest
+  releases are probed from the same official endpoints the install scripts trust (bounded curl,
+  10s/1MB) by a slow checker (every 6h, gated by `update.autoCheck` like the daemon's own release
+  check); rows carry `latest_version`/`update_available` (never guessed — unparseable versions stay
+  false), and `GET /api/v1/agents?check=true` (Settings' re-check) probes inline. The launcher
+  never blocks on a probe — it reads the cache.
 
 ## The session rail — state, rename, kill
 
@@ -198,6 +217,23 @@ _Captured 2026-07-09 (from the maintainer, in-session)._
   I press the whole button thing it should open it in the UI"**.
 - **How settled:** chat-by-default from the launcher row and the explicit per-spawn terminal
   affordance are deliberate; the exact visuals can evolve.
+
+### Agent update awareness & one-click managed updates — why it exists
+_Captured 2026-07-16 (from the maintainer, in-session)._
+
+- **Problem it solves — both halves equally.** The field dead end (a managed codex's own
+  `codex update` on Sherlock failing with "could not detect the installation method" — managed
+  binaries had no update path at all) AND staleness awareness: agent CLIs release near-daily, and
+  the user should see at a glance, on every host chimaera runs on, whether an agent is stale — and
+  fix it in one click.
+- **How settled (early feature):** all of it is provisional **except the why**. Even the
+  managed-only action gate is today's choice, not a locked contract — the maintainer explicitly
+  leaves open growing a personal-binary update path later (e.g. running the agent's own
+  self-updater, `claude update`/`codex update`, in a visible terminal). The surfaces, the
+  `→ <new>` affordance shape, the 6h cadence, the settings poll — additions, improvable freely.
+- **Core bet — do not change: never guess `update_available`.** The signal is honest or absent —
+  an unparseable version (either side) must never claim an update. Everything else in this area is
+  an addition, open to change if improved.
 
 ### Busy/idle session status — why it exists
 _Captured 2026-07-11 (from the maintainer)._

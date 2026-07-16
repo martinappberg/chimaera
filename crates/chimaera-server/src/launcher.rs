@@ -419,20 +419,33 @@ async fn probe_version(bin: &Path) -> Option<String> {
 pub(crate) struct AgentsQuery {
     #[serde(default)]
     refresh: bool,
+    /// Also probe upstream for each agent's latest release, inline (bounded
+    /// by curl's own fences) — Settings' re-check. The launcher never passes
+    /// it: rows must paint instantly, and `agent_updates`' slow loop keeps
+    /// the cached answer fresh enough for its update affordance.
+    #[serde(default)]
+    check: bool,
 }
 
-/// GET /api/v1/agents[?refresh=true] — the launcher's agent rows.
+/// GET /api/v1/agents[?refresh=true][&check=true] — the launcher's agent rows.
 pub(crate) async fn list_agents(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AgentsQuery>,
 ) -> Json<serde_json::Value> {
     // Detect concurrently: three login shells plus version probes on a cold
-    // cache would otherwise serialize into a visible popover delay.
-    let detections = futures::future::join_all(AgentKind::ALL.into_iter().map(|kind| {
+    // cache would otherwise serialize into a visible popover delay. The
+    // optional upstream check rides the same await.
+    let detect_all = futures::future::join_all(AgentKind::ALL.into_iter().map(|kind| {
         let state = state.clone();
         async move { (kind, detect(&state, kind, query.refresh).await) }
-    }))
-    .await;
+    }));
+    let detections = if query.check {
+        let (detections, ()) = tokio::join!(detect_all, crate::agent_updates::check_all(&state));
+        detections
+    } else {
+        detect_all.await
+    };
+    let latest_by_kind = crate::agent_updates::snapshot(&state);
 
     let rows = detections
         .into_iter()
@@ -451,6 +464,21 @@ pub(crate) async fn list_agents(
                 // Installed but too old to run usefully: the UI offers the
                 // install command as an UPDATE instead of spawning blind.
                 row.insert("outdated".into(), json!(true));
+            }
+            if let Some(latest) = latest_by_kind.get(&kind) {
+                // The newest known upstream release (agent_updates); the UI
+                // shows an update affordance only when strictly newer —
+                // one-click for a managed binary, informational for yours.
+                row.insert("latest_version".into(), json!(latest.version));
+                row.insert("latest_checked_at".into(), json!(latest.checked_at));
+                if detection.path.is_ok()
+                    && crate::agent_updates::update_available(
+                        detection.version.as_deref(),
+                        &latest.version,
+                    )
+                {
+                    row.insert("update_available".into(), json!(true));
+                }
             }
             if detection.managed {
                 // The resolved binary is a chimaera-managed install under

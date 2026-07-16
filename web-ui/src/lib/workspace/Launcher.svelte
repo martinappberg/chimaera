@@ -9,7 +9,10 @@
    * - installed → click spawns; the row names whose binary runs — "yours"
    *   (your own on PATH) or "chimaera" (accent, a build chimaera installed
    *   under ~/.chimaera/agents) — with the version and the resolved path in
-   *   the tooltip;
+   *   the tooltip. When the daemon knows a strictly newer release, the
+   *   version line grows "→ <new>": a one-click curated update for a
+   *   chimaera-managed build, quiet muted information for the user's own
+   *   (chimaera never touches an install it doesn't own);
    * - installed but outdated (npm-era codex, pre-`codex login`) → click
    *   still spawns, an "update" chip runs the daemon's curated update
    *   in-app (managed runtimes), streaming into a visible terminal;
@@ -34,6 +37,10 @@
     anchor: DOMRect;
     onPick: (pick: LaunchPick) => void;
     onInstall: (agent: AgentInfo) => void;
+    /** Update a chimaera-MANAGED binary to `latestVersion` (the daemon's
+     *  curated script in a visible pane). Only reachable when the row is
+     *  managed AND a strictly newer release is known. */
+    onUpdate: (agent: AgentInfo) => void;
     onClose: () => void;
     /** Report the freshly-probed catalog up so the split button reflects it
      *  (this popover always re-detects on open). */
@@ -44,7 +51,7 @@
     initial?: AgentInfo[] | null;
   }
 
-  let { anchor, onPick, onInstall, onClose, onAgents, initial = null }: Props = $props();
+  let { anchor, onPick, onInstall, onUpdate, onClose, onAgents, initial = null }: Props = $props();
 
   let agents = $state<AgentInfo[] | null>(null);
   let loadError = $state<string | null>(null);
@@ -134,7 +141,9 @@
   const pos = $derived.by(() => {
     const viewW = window.innerWidth || document.documentElement.clientWidth || 1280;
     const viewH = window.innerHeight || document.documentElement.clientHeight || 800;
-    const width = 326;
+    // 348: wide enough that a hot row keeps its whole subheader — provenance,
+    // version, the "→ <new>" update affordance AND the docs link — un-truncated.
+    const width = 348;
     const left = Math.max(8, Math.min(anchor.left, viewW - width - 8));
     const top = anchor.bottom + 6;
     const maxH = Math.max(180, viewH - top - 12);
@@ -254,6 +263,30 @@
                   <span class="prov">{a.managed ? "chimaera" : "yours"}</span>
                   {#if a.version !== null}<span class="num">{versionNumber(a.version)}</span>{/if}
                 </span>
+                {#if a.updateAvailable && a.latestVersion !== null}
+                  {#if a.managed}
+                    <!-- One-click update of chimaera's own install: the same
+                         curated, checksum-verified script as install, atomic
+                         swap, streaming into a terminal you can watch. -->
+                    <button
+                      class="aup"
+                      tabindex="-1"
+                      title="update to {a.latestVersion} — downloads the official {a.name} build into ~/.chimaera/agents, in a terminal you can watch"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        onUpdate(a);
+                      }}>→&thinsp;{a.latestVersion}</button
+                    >
+                  {:else}
+                    <!-- The user's own binary: chimaera never touches it —
+                         the newer release is information, docs is the way. -->
+                    <span
+                      class="aup info"
+                      title="{a.latestVersion} is out — this is your own install; update it your way (docs ↗)"
+                      >→&thinsp;{a.latestVersion}</span
+                    >
+                  {/if}
+                {/if}
               {/if}
               {#if a.installUrl !== null}
                 <!-- Official docs, in the browser — quiet until the row is hot. -->
@@ -537,6 +570,44 @@
     content: "·";
     margin-right: 5px;
     opacity: 0.5;
+  }
+
+  /* Update-available: "→ <new>" appended to the version line, only when a
+     strictly newer release is known. A real button (accent) when chimaera
+     manages the binary — one click runs the curated update in a visible
+     pane; quiet muted information when the binary is the user's own
+     (chimaera never touches an install it doesn't own). */
+  .aup {
+    appearance: none;
+    border: none;
+    background: none;
+    padding: 0;
+    flex: none;
+    font: inherit;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    opacity: 0.85;
+    transition: opacity 0.12s ease;
+  }
+
+  button.aup {
+    cursor: pointer;
+  }
+
+  button.aup:hover {
+    opacity: 1;
+    text-decoration: underline;
+  }
+
+  button.aup:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+  }
+
+  .aup.info {
+    color: var(--muted);
+    opacity: 0.8;
   }
 
   /* Uninstalled agents: visible but muted — honest, not hidden. */

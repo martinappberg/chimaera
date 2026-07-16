@@ -29,8 +29,10 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 
 ## Agents settings & themes
 
-- **Agents panel** (`AgentsSettings.svelte`) — install/uninstall managed agent runtimes and set an
-  explicit binary path per agent (see [agents.md](agents.md)).
+- **Agents panel** (`AgentsSettings.svelte`) — update/uninstall managed agent runtimes and set an
+  explicit binary path per agent; "re-check" also probes upstream for each agent's latest release,
+  a known-newer release shows an accent "update → \<new\>" button on managed rows and a quiet
+  "\<new\> available" note on your own (see [agents.md](agents.md)).
 - **Theme palettes** (`themes.ts`) — each theme carries its own hand-tuned 16-color terminal ANSI
   palette alongside the UI tokens; a UI theme without a terminal palette is "half a theme". UI quality
   (curated light/dark) is an acceptance criterion, per [rules/web-ui.md](../../.claude/rules/web-ui.md).
