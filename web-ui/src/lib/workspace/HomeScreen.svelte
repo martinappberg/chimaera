@@ -34,6 +34,7 @@
     type ComputeSessionView,
   } from "./computeSessions";
   import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "./compute";
+  import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, type Health } from "../net/api";
 
   interface Props {
@@ -733,6 +734,14 @@
         {/if}
       {/if}
     </header>
+
+    {#if $computeStatus?.self}
+      <!-- This whole daemon lives inside a Slurm allocation: say so before
+           anything else — node, partition, job, resources, and the live
+           walltime countdown (the maintainer: "we need to be MUCH clearer
+           that it is a compute node"). -->
+      <ComputeBanner self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
+    {/if}
 
     <section>
       <div class="sec-head">

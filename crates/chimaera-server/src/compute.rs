@@ -218,6 +218,15 @@ impl ComputeService {
         snap
     }
 
+    /// Drop the cached snapshot (detection stays): the next list refetches
+    /// the queue NOW. Launch/cancel call this so the instant refresh the UI
+    /// fires right after sees the queue change instead of a ≤30s-stale
+    /// cache — a fresh launch otherwise reads as an orphaned record and
+    /// briefly wears an "ended" card (found live, maintainer's 4th round).
+    pub(crate) async fn invalidate(&self) {
+        self.inner.lock().await.cache = None;
+    }
+
     /// Find the Slurm client tools. The knob dir wins (tests / unusual
     /// installs); otherwise ask the user's login shell for its PATH and walk
     /// it here — the profile-managed-PATH reasoning of the git resolution,

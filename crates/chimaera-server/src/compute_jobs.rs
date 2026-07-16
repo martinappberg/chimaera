@@ -312,6 +312,9 @@ pub(crate) async fn launch_compute_session(
         )
             .into_response();
     };
+    // The queue just changed and the UI refetches immediately — don't let
+    // that refetch see the pre-launch snapshot cache.
+    state.compute.invalidate().await;
 
     // Seed the job daemon's workspace registry over the shared FS: the job
     // will `mkdir -p` this same home, and its WorkspaceStore then boots with
@@ -437,13 +440,13 @@ pub(crate) async fn list_compute_sessions(
 /// dismissable tombstones: DELETE marks the record cancelled, and this sweep
 /// removes marked or aged-out (48h) records — self-cleaning, no daemon state.
 fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
-    const ENDED_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
     const ENDED_CAP: usize = 20;
     let live: std::collections::HashSet<&str> =
         sessions.iter().map(|s| s.job_id.as_str()).collect();
     let Ok(dir) = std::fs::read_dir(root.join("pending")) else {
         return;
     };
+    let mut fresh: Vec<(std::time::SystemTime, ComputeSession)> = Vec::new();
     let mut ended: Vec<(std::time::SystemTime, ComputeSession)> = Vec::new();
     for entry in dir.flatten() {
         let path = entry.path();
@@ -469,40 +472,76 @@ fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
             .as_ref()
             .and_then(|r| r.get("cancelled").and_then(|v| v.as_bool()))
             .unwrap_or(false);
-        let aged_out = mtime.elapsed().map(|e| e > ENDED_MAX_AGE).unwrap_or(false);
-        if dismissed || aged_out || record.is_none() {
+        // A clock-skewed (future) mtime reads as age zero: brand new.
+        let age = mtime.elapsed().unwrap_or(Duration::ZERO);
+        let state = orphan_state(age);
+        if dismissed || state.is_none() || record.is_none() {
             let _ = std::fs::remove_file(&path);
             continue;
         }
+        let state = state.expect("checked above");
         let rec = |k: &str| record.as_ref().and_then(|r| r.get(k).cloned());
-        ended.push((
-            mtime,
-            ComputeSession {
-                ready: false,
-                name: rec("display_name")
+        let card = ComputeSession {
+            ready: false,
+            name: rec("display_name")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| job_id.to_string()),
+            cpus: rec("cpus").and_then(|v| v.as_u64()).map(|v| v as u32),
+            mem: rec("mem").and_then(|v| v.as_str().map(str::to_string)),
+            gres: rec("gres").and_then(|v| v.as_str().map(str::to_string)),
+            workspace_id: rec("workspace_id").and_then(|v| v.as_str().map(str::to_string)),
+            routable: false,
+            egress: None,
+            port: None,
+            token: None,
+            job_id: job_id.to_string(),
+            state: state.to_string(),
+            node: String::new(),
+            partition: rec("partition")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            // A just-submitted card shows its requested walltime, exactly
+            // like a squeue-visible PENDING row does.
+            time_left: if state == "PENDING" {
+                rec("time")
                     .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_else(|| job_id.to_string()),
-                cpus: rec("cpus").and_then(|v| v.as_u64()).map(|v| v as u32),
-                mem: rec("mem").and_then(|v| v.as_str().map(str::to_string)),
-                gres: rec("gres").and_then(|v| v.as_str().map(str::to_string)),
-                workspace_id: rec("workspace_id").and_then(|v| v.as_str().map(str::to_string)),
-                routable: false,
-                egress: None,
-                port: None,
-                token: None,
-                job_id: job_id.to_string(),
-                state: "ENDED".to_string(),
-                node: String::new(),
-                partition: rec("partition")
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-                time_left: String::new(),
+                    .unwrap_or_default()
+            } else {
+                String::new()
             },
-        ));
+        };
+        if state == "PENDING" {
+            fresh.push((mtime, card));
+        } else {
+            ended.push((mtime, card));
+        }
     }
-    // Newest deaths first, after the live cards; a bounded tail.
+    // Just-submitted cards lead (that click deserves an instant card);
+    // tombstones trail the live cards, newest deaths first, bounded.
+    fresh.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (_, s) in fresh.into_iter().rev() {
+        sessions.insert(0, s);
+    }
     ended.sort_by_key(|e| std::cmp::Reverse(e.0));
     sessions.extend(ended.into_iter().take(ENDED_CAP).map(|(_, s)| s));
+}
+
+/// What an orphaned launch record (no squeue row for its job) means, by
+/// age. A seconds-old record is a JUST-submitted job that (a possibly
+/// cached) squeue hasn't shown yet — PENDING, not dead (found live: a
+/// fresh launch briefly wore an "ended" card). Hours old is a session that
+/// ended without an explicit cancel — the tombstone. Two days old is
+/// litter (None = remove the record).
+fn orphan_state(age: Duration) -> Option<&'static str> {
+    const SUBMIT_GRACE: Duration = Duration::from_secs(120);
+    const ENDED_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
+    if age < SUBMIT_GRACE {
+        Some("PENDING")
+    } else if age < ENDED_MAX_AGE {
+        Some("ENDED")
+    } else {
+        None
+    }
 }
 
 fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
@@ -562,6 +601,9 @@ pub(crate) async fn cancel_compute_session(
     };
     let _ =
         crate::compute::run_capped(&scancel.to_string_lossy(), std::slice::from_ref(&job_id)).await;
+    // Same reasoning as launch: the instant post-cancel refresh should see
+    // the queue's new truth, not the pre-cancel cache.
+    state.compute.invalidate().await;
     // Mark the launch record cancelled: while the job drains, the live card
     // keeps its name/resources from the record; once the squeue row is gone
     // the listing sweep removes marked records instead of raising an "ended"
@@ -626,6 +668,18 @@ mod tests {
         assert_eq!(slug("  --weird--  "), "weird");
         assert_eq!(slug("!!!"), "session");
         assert!(slug(&"x".repeat(99)).len() <= 32);
+    }
+
+    #[test]
+    fn orphan_record_age_maps_to_submitted_then_tombstone_then_litter() {
+        // Seconds old = just submitted, squeue hasn't caught up — PENDING.
+        assert_eq!(orphan_state(Duration::from_secs(5)), Some("PENDING"));
+        assert_eq!(orphan_state(Duration::from_secs(119)), Some("PENDING"));
+        // Past the grace window it ended without a cancel — the tombstone.
+        assert_eq!(orphan_state(Duration::from_secs(121)), Some("ENDED"));
+        assert_eq!(orphan_state(Duration::from_secs(47 * 3600)), Some("ENDED"));
+        // Two days on, the record is litter to sweep.
+        assert_eq!(orphan_state(Duration::from_secs(49 * 3600)), None);
     }
 
     #[test]
