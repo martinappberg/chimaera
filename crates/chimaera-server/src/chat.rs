@@ -40,6 +40,10 @@ pub(crate) enum ChatSignal {
 #[derive(Clone)]
 pub(crate) struct ChatRecipe {
     pub(crate) workspace_root: PathBuf,
+    /// Workspace id, for the environment-prelude lookup (host ⊕ workspace ⊕
+    /// launch): every respawn through this recipe re-materializes the
+    /// prelude, so view-switch/rewind/degrade all regenerate identically.
+    pub(crate) workspace_id: String,
     pub(crate) kind: AgentKind,
     pub(crate) bin: PathBuf,
     /// The `--version` line the launcher probed for `bin` at resolution
@@ -60,6 +64,10 @@ pub(crate) struct ChatRecipe {
     /// survives, so the conversation truncates in place instead of forking).
     pub(crate) rollback_turns: Option<u32>,
     pub(crate) theme: String,
+    /// Launch-scope prelude text (see `environment`). Carried on the recipe
+    /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
+    /// in the ledger, so resurrection re-runs the durable scopes only.
+    pub(crate) prelude: Option<String>,
 }
 
 /// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
@@ -503,6 +511,16 @@ async fn degrade_to_pty(
         recipe.mcp_config.as_deref(),
         codex_theme,
     );
+    // A degrade respawn is a real spawn too — same prelude as the chat
+    // process it replaces (the recipe carries the launch scope).
+    let prelude = crate::environment::materialize_prelude(
+        state,
+        id,
+        &recipe.workspace_id,
+        recipe.prelude.as_deref(),
+    );
+    let env = crate::api::session_env(state, id, &recipe.theme, prelude.as_deref());
+    let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: recipe.workspace_root,
         // Carry the user's pinned name across the toggle so the PTY row keeps
@@ -516,8 +534,8 @@ async fn degrade_to_pty(
             argv,
         )),
         id: Some(id.to_string()),
-        env: crate::api::session_env(state, id, &recipe.theme),
-        env_remove: crate::api::launcher_context_env(),
+        env,
+        env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
     match state.sessions.spawn(opts) {
@@ -826,12 +844,16 @@ pub(crate) async fn switch_view(
             .into_response();
     }
 
-    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
-    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
-        crate::lock(&state.workspaces)
-            .get(wid)
-            .map(|w| w.root.clone())
-    }) else {
+    let Some(workspace_id) = crate::lock(&state.session_workspaces).get(&id).cloned() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "session has no workspace".to_string(),
+        );
+    };
+    let Some(workspace_root) = crate::lock(&state.workspaces)
+        .get(&workspace_id)
+        .map(|w| w.root.clone())
+    else {
         return err(
             StatusCode::NOT_FOUND,
             "session has no workspace".to_string(),
@@ -915,6 +937,7 @@ pub(crate) async fn switch_view(
         currently_chat,
         resume,
         workspace_root,
+        workspace_id,
         &record,
     )
     .await;
@@ -929,6 +952,7 @@ pub(crate) async fn switch_view(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // internal helper of switch_view only
 async fn perform_switch(
     state: &Arc<AppState>,
     id: &str,
@@ -936,8 +960,14 @@ async fn perform_switch(
     currently_chat: bool,
     resume: Option<String>,
     workspace_root: PathBuf,
+    workspace_id: String,
     record: &crate::agent_state::AgentRecord,
 ) -> Result<(), String> {
+    // Launch-scope prelude survives a toggle when the old recipe still holds
+    // it (chat→term→chat); gone recipe = the launch scope honestly expires.
+    let launch_prelude = crate::lock(&state.chat_recipes)
+        .get(id)
+        .and_then(|r| r.prelude.clone());
     // A user-pinned name lives in different stores per surface: chat sessions
     // pin it on the AgentRecord (customTitle), PTY sessions on SessionInfo.name
     // (renamed). Capture it from whichever holds it NOW so the toggle carries
@@ -998,6 +1028,7 @@ async fn perform_switch(
     if target_chat {
         let recipe = ChatRecipe {
             workspace_root: workspace_root.clone(),
+            workspace_id: workspace_id.clone(),
             kind: record.kind,
             bin: bin.clone(),
             version: version.clone(),
@@ -1008,11 +1039,13 @@ async fn perform_switch(
             fork_at: None,
             rollback_turns: None,
             theme: theme.clone(),
+            prelude: launch_prelude.clone(),
         };
         spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
     } else {
         let recipe = ChatRecipe {
             workspace_root,
+            workspace_id,
             kind: record.kind,
             bin,
             version,
@@ -1023,6 +1056,7 @@ async fn perform_switch(
             fork_at: None,
             rollback_turns: None,
             theme,
+            prelude: launch_prelude,
         };
         degrade_to_pty(state, id, recipe, pinned_name).await;
     }
@@ -1089,12 +1123,16 @@ pub(crate) async fn rewind_session(
             format!("invalid resume_at {:?}", body.resume_at),
         );
     }
-    let workspace_id = crate::lock(&state.session_workspaces).get(&id).cloned();
-    let Some(workspace_root) = workspace_id.as_ref().and_then(|wid| {
-        crate::lock(&state.workspaces)
-            .get(wid)
-            .map(|w| w.root.clone())
-    }) else {
+    let Some(workspace_id) = crate::lock(&state.session_workspaces).get(&id).cloned() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "session has no workspace".to_string(),
+        );
+    };
+    let Some(workspace_root) = crate::lock(&state.workspaces)
+        .get(&workspace_id)
+        .map(|w| w.root.clone())
+    else {
         return err(
             StatusCode::NOT_FOUND,
             "session has no workspace".to_string(),
@@ -1194,8 +1232,13 @@ pub(crate) async fn rewind_session(
             tracing::warn!(%id, %e, "failed to journal the rewind");
         }
         let is_codex = record.kind == AgentKind::Codex;
+        // A rewind respawns the same session — keep its launch prelude.
+        let launch_prelude = crate::lock(&state.chat_recipes)
+            .get(&id)
+            .and_then(|r| r.prelude.clone());
         let recipe = ChatRecipe {
             workspace_root,
+            workspace_id,
             kind: record.kind,
             bin,
             version,
@@ -1206,6 +1249,7 @@ pub(crate) async fn rewind_session(
             fork_at: (!is_codex).then(|| body.resume_at.clone()),
             rollback_turns: if is_codex { dropped_turns } else { None },
             theme: "dark".to_string(),
+            prelude: launch_prelude,
         };
         spawn_chat_session(&state, id.clone(), recipe, None).map_err(|e| e.to_string())?;
         Ok(())
@@ -1367,11 +1411,19 @@ pub(crate) fn spawn_chat_session(
     let argv = crate::launcher::wrap_login_shell(&crate::launcher::login_shell(), argv);
     let mut spec =
         chimaera_agent::driver::SpawnSpec::new(id.clone(), argv, recipe.workspace_root.clone());
-    spec.env = crate::api::session_env(state, &id, &recipe.theme);
+    // A driver respawn is a real spawn: re-materialize the environment
+    // prelude (picks up config edits; the login-wrapper sources it).
+    let prelude = crate::environment::materialize_prelude(
+        state,
+        &id,
+        &recipe.workspace_id,
+        recipe.prelude.as_deref(),
+    );
+    spec.env = crate::api::session_env(state, &id, &recipe.theme, prelude.as_deref());
     // Strip the daemon's own launcher context (same set the PTY path removes)
     // so a chimaera launched from inside an agent can't leak that context into
     // the chat agent it spawns.
-    spec.env_remove = crate::api::launcher_context_env();
+    spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
@@ -1493,6 +1545,7 @@ pub(crate) async fn resurrect_chat(
 
     let recipe = ChatRecipe {
         workspace_root: root,
+        workspace_id: workspace.id.clone(),
         kind: agent.kind,
         bin,
         version: detection.version,
@@ -1503,6 +1556,9 @@ pub(crate) async fn resurrect_chat(
         fork_at: None,
         rollback_turns: None,
         theme: entry.theme.clone(),
+        // The ledger doesn't persist launch text: a resurrected session
+        // re-runs the durable scopes (host ⊕ workspace) only.
+        prelude: None,
     };
     match spawn_chat_session(state, entry.id.clone(), recipe, None) {
         Ok(_) => {

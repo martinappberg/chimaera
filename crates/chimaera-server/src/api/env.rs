@@ -5,19 +5,46 @@ use crate::AppState;
 /// only — user dotfiles are never touched), the session's own id, and the
 /// client's color scheme. `CHIMAERA_SHIMS` lets the login-shell wrap
 /// re-prepend the shim dir after profile init reorders PATH.
+/// `prelude` (when a prelude applies — see `environment`) rides as
+/// `CHIMAERA_PRELUDE`, sourced once by the shell-integration rc or the
+/// agent login-wrapper; None sets nothing (zero delta without preludes).
 pub(crate) fn session_env(
     state: &AppState,
     session_id: &str,
     theme: &str,
+    prelude: Option<&std::path::Path>,
 ) -> Vec<(String, String)> {
     let shims = state.shims_dir.display().to_string();
     let inherited = std::env::var("PATH").unwrap_or_default();
-    vec![
+    let mut env = vec![
         ("PATH".to_string(), spawn_path(&shims, &inherited)),
         ("CHIMAERA_SESSION".to_string(), session_id.to_string()),
         ("CHIMAERA_THEME".to_string(), theme.to_string()),
         ("CHIMAERA_SHIMS".to_string(), shims),
-    ]
+    ];
+    if let Some(path) = prelude {
+        env.push(("CHIMAERA_PRELUDE".to_string(), path.display().to_string()));
+    }
+    env
+}
+
+/// The remove-list for a spawn whose add-list is `env`: the
+/// launcher-context scrub plus the prelude pair, minus anything `env`
+/// explicitly sets. The prelude vars must go — a daemon started from
+/// inside a chimaera terminal (dev loops do this all the time) inherits
+/// `CHIMAERA_PRELUDE_DONE`, which would silently suppress preludes in
+/// every session it spawns (the same bug class as the launcher-context
+/// leak). The env/env_remove sets are kept DISJOINT here because the two
+/// spawn layers order them oppositely: chimaera-pty applies removes
+/// before the overlay (adds win), the chat driver transport applies them
+/// after (removal wins — found live: it deleted the CHIMAERA_PRELUDE the
+/// spawn had just set). Disjoint sets behave identically under both.
+pub(crate) fn spawn_env_remove(env: &[(String, String)]) -> Vec<String> {
+    let mut names = launcher_context_env();
+    names.push("CHIMAERA_PRELUDE".to_string());
+    names.push("CHIMAERA_PRELUDE_DONE".to_string());
+    names.retain(|n| !env.iter().any(|(k, _)| k == n));
+    names
 }
 
 /// Inherited env vars to REMOVE from every spawned session: markers that

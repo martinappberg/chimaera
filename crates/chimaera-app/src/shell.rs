@@ -37,6 +37,18 @@ pub struct Shell {
     pub local: Mutex<LocalDaemon>,
     /// Live tunnels by host alias.
     tunnels: tokio::sync::Mutex<HashMap<String, Tunnel>>,
+    /// Live tunnels to compute-node daemons (Mode 2), keyed
+    /// `"{alias}#job{job_id}"`. Separate from `tunnels`: a job tunnel is its
+    /// own type with its own two-rung ladder and a walltime-bounded lifetime.
+    compute_tunnels: tokio::sync::Mutex<HashMap<String, chimaera_remote::ComputeTunnel>>,
+    /// Compute-node endpoints ((alias, job_id) → node/port/token/routable),
+    /// cached by `remote_compute_sessions` so the session list the webview
+    /// gets never carries a port or token — `connect_compute_session` reads
+    /// them back here, in Rust.
+    compute_endpoints: Mutex<HashMap<(String, String), ComputeEndpoint>>,
+    /// Composite keys mid-connect: one tunnel build per job at a time (a
+    /// click storm must not race N tunnel builds — seen on first live use).
+    compute_connecting: Mutex<std::collections::HashSet<String>>,
     /// In-flight connect per alias. One flight owns the ssh; every other
     /// caller (other windows' reconnects, the home screen, startup restore)
     /// awaits its outcome — so a drop never fans out into an auth-prompt
@@ -78,6 +90,17 @@ pub struct WindowScope {
     /// reported by the SPA alongside the scope so the tray never has to read the
     /// racy OS titlebar. Empty until the first scope report lands.
     pub label: String,
+}
+
+/// A compute-node daemon's coordinates — everything `connect_compute_node`
+/// needs. Kept Rust-side only (see `remote_compute_sessions`): the token
+/// leaves this process solely in the URL of the window opened onto the job.
+#[derive(Clone)]
+pub(crate) struct ComputeEndpoint {
+    pub(crate) node: String,
+    pub(crate) port: u16,
+    pub(crate) token: String,
+    pub(crate) routable: bool,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -271,6 +294,9 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
         handle.manage(Shell {
             local: Mutex::new(local),
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
+            compute_tunnels: tokio::sync::Mutex::new(HashMap::new()),
+            compute_endpoints: Mutex::new(HashMap::new()),
+            compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
@@ -341,6 +367,10 @@ pub fn run() {
             commands::local_state,
             commands::update_local_daemon,
             commands::remote_workspaces,
+            commands::remote_compute_sessions,
+            commands::launch_compute_session,
+            commands::cancel_compute_session,
+            commands::connect_compute_session,
             commands::open_window,
             commands::check_app_update,
             commands::begin_update,
@@ -563,6 +593,14 @@ pub fn run() {
                     tauri::async_runtime::block_on(async {
                         let mut tunnels = state.tunnels.lock().await;
                         for (_, tunnel) in tunnels.drain() {
+                            tunnel.close().await;
+                        }
+                        drop(tunnels);
+                        // Compute-node tunnels too: closing a job's window
+                        // does not tear its forward down (a reconnect to the
+                        // same job reuses it), so quit is their cleanup.
+                        let mut compute = state.compute_tunnels.lock().await;
+                        for (_, tunnel) in compute.drain() {
                             tunnel.close().await;
                         }
                     });

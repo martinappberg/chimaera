@@ -375,6 +375,11 @@ pub(crate) fn start_install(
         installs.insert(kind, (session_id.clone(), std::time::Instant::now()));
     }
 
+    // Installer sessions run a chimaera-authored script — never a user
+    // prelude (None), and inherited prelude vars are scrubbed like
+    // everywhere else.
+    let env = crate::api::session_env(state, &session_id, "dark", None);
+    let env_remove = crate::api::spawn_env_remove(&env);
     let opts = chimaera_pty::SpawnOpts {
         cwd: workspace.root.clone(),
         // Pinned name: the pane reads as what it is on every surface.
@@ -383,8 +388,8 @@ pub(crate) fn start_install(
         rows: 24,
         command: Some(vec!["/bin/bash".to_string(), "-c".to_string(), script]),
         id: Some(session_id.clone()),
-        env: crate::api::session_env(state, &session_id, "dark"),
-        env_remove: crate::api::launcher_context_env(),
+        env,
+        env_remove,
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };
     match state.sessions.spawn(opts) {

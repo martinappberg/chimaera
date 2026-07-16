@@ -11,11 +11,21 @@
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
+  import EnvironmentSettings from "./EnvironmentSettings.svelte";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
-  /** Nav sections come straight from the schema categories. */
-  const sections = CATEGORIES;
+  /**
+   * Nav sections: the schema categories, plus the bespoke Environment section
+   * (store-backed via /api/v1/environment — it has no schema rows) slotted
+   * after Agents.
+   */
+  const sections = (() => {
+    const out = [...CATEGORIES];
+    const at = out.indexOf("Agents");
+    out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment");
+    return out;
+  })();
 
   let tab = $state<"ui" | "json">("ui");
   let query = $state("");
@@ -44,10 +54,22 @@
   const visible = $derived(SETTINGS.filter(matches));
   const modifiedCount = $derived(SETTINGS.filter((d) => isModified(d.id)).length);
 
+  /**
+   * Environment has no schema rows to search over, so it participates in
+   * search through its own keyword list — what a user would type looking for
+   * per-session setup.
+   */
+  const ENV_KEYWORDS = ["environment", "prelude", "module", "conda", "micromamba", "startup", "activate", "export"];
+  const envVisible = $derived(q === "" || ENV_KEYWORDS.some((k) => k.includes(q)));
+
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
     const out: { category: string; defs: SettingDef[] }[] = [];
-    for (const cat of CATEGORIES) {
+    for (const cat of sections) {
+      if (cat === "Environment") {
+        if (envVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
       const defs = visible.filter((d) => d.category === cat);
       if (defs.length > 0) out.push({ category: cat, defs });
     }
@@ -180,6 +202,13 @@
                  its own <h2>, so the generic rows are skipped here. -->
             <section data-section={group.category}>
               <AgentsSettings />
+            </section>
+          {:else if group.category === "Environment"}
+            <!-- Bespoke panel: edits the daemon's prelude map over
+                 /api/v1/environment (env-profiles.json), not settings.json.
+                 It renders its own <h2>; there are no generic rows. -->
+            <section data-section={group.category}>
+              <EnvironmentSettings />
             </section>
           {:else}
             <section data-section={group.category}>

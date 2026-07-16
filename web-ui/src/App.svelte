@@ -4,6 +4,7 @@
     ApiError,
     getActiveWorkspaceId,
     getHostLabel,
+    getJobContext,
     getToken,
     notifyUnauthorized,
     pollHealth,
@@ -142,6 +143,8 @@
     workspacesChanged,
     type DiffMode,
   } from "./lib/workspace/git";
+  import { computeStatus, initCompute, queuedJobCount } from "./lib/workspace/compute";
+  import ComputeStrip from "./lib/workspace/ComputeStrip.svelte";
   import {
     paneContentEl,
     paneIdAt,
@@ -160,6 +163,7 @@
     askpassActive,
     caffeinateState,
     closeThisWindow,
+    connectComputeSession,
     connectHost,
     isNativeShell,
     onAppUpdate,
@@ -250,10 +254,17 @@
   /** This window's host alias ("local" for the local daemon). */
   const hostAlias = getHostLabel();
   const isRemoteWindow = hostAlias !== "local";
+  /** Set when this window sits on a compute-node daemon (Mode 2 job). */
+  const jobCtx = getJobContext();
+  /** The key this window's tunnel reports `host-status` under. A job window
+   *  listens ONLY on its composite key — matching the bare login alias made
+   *  every login-tunnel blip re-home job windows onto the login daemon
+   *  (found live: "opening the session just opens Sherlock"). */
+  const statusAlias = jobCtx !== null ? `${hostAlias}#job${jobCtx.jobId}` : hostAlias;
   /** Only the native shell can re-run ssh; a browser tunnel is the CLI's job. */
   const canReconnect = isRemoteWindow && isNativeShell();
   /** This window's scope key for the shell registry (null alias = local). */
-  const scopeAlias = isRemoteWindow ? hostAlias : null;
+  const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
   /** The reconnect overlay is showing (tunnel dropped, healing). */
   let showReconnect = $state(false);
   /** A connectHost call is in flight. */
@@ -267,13 +278,20 @@
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
    *  navigation. Surfaces the SSH auth modal (mounted app-wide) only if ssh
-   *  actually re-prompts. */
+   *  actually re-prompts. A job window heals through the COMPUTE path — its
+   *  tunnel goes laptop→node, and rebuilding the login tunnel wouldn't touch
+   *  it; the shell probes/rebuilds the job tunnel and pings the composite
+   *  status key with the (possibly new) port. */
   async function attemptReconnect(): Promise<void> {
     if (!canReconnect || reconnecting) return;
     reconnecting = true;
     reconnectError = null;
     try {
-      await connectHost(hostAlias);
+      if (jobCtx !== null) {
+        await connectComputeSession(hostAlias, jobCtx.jobId);
+      } else {
+        await connectHost(hostAlias);
+      }
       // Same-port heal → our WebSocket reconnects and eventsUp clears the
       // overlay; a moved port/token re-homes this window via onHostStatus.
     } catch (e) {
@@ -592,6 +610,10 @@
     ),
   );
 
+  // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
+  // "scheduler is slurm" + a visible window (see workspace/compute.ts).
+  $effect(() => initCompute());
+
   // Daemon/app build skew (native): the daemon serving this window is a
   // different build than the app — the update toast offers the restart.
   // Health rides a poll, so this stays current without extra traffic. The
@@ -765,16 +787,23 @@
       }).then((u) => (unlistenDaemonMoved = u));
       // This remote window's tunnel dropped or came back. "down" → reconnect
       // now (the shell confirmed the forward is dead); "connected" → re-home
-      // only if the origin actually moved (daemon restart / update), else the
-      // heal is in place and the WebSocket just reconnects.
+      // only if the origin actually moved (daemon restart / update / rebuilt
+      // job tunnel), else the heal is in place and the WebSocket just
+      // reconnects. Matching is on statusAlias: a job window heeds ONLY its
+      // composite key's events — the login alias's port/token are a
+      // different daemon entirely.
       void onHostStatus((e) => {
-        if (!canReconnect || e.alias !== hostAlias) return;
+        if (!canReconnect || e.alias !== statusAlias) return;
         if (e.status === "down") {
           beginReconnect();
           return;
         }
         const port = e.local_port;
-        const token = e.token ?? null;
+        // Compute-status events carry no token (compute tokens stay in the
+        // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
+        // so this window's own token still holds — carry it across the
+        // origin move ourselves.
+        const token = e.token ?? (jobCtx !== null ? getToken() : null);
         const portMoved = port !== null && String(port) !== location.port;
         const tokenMoved = token !== null && token !== getToken();
         if (portMoved || tokenMoved) {
@@ -783,6 +812,10 @@
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
           params.set("host", hostAlias);
+          if (jobCtx !== null) {
+            params.set("job", jobCtx.jobId);
+            if (jobCtx.node !== null) params.set("node", jobCtx.node);
+          }
           location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
         }
       }).then((u) => (unlistenHostStatus = u));
@@ -1511,7 +1544,12 @@
     //   "crc_finish •Sherlock | chimaera"  (remote, in a workspace)
     //   "crc_finish | chimaera"            (local — the host is implicit)
     // Home (no workspace) drops the workspace but keeps the host when remote.
-    const host = isRemoteWindow ? hostAlias : null;
+    // A compute-node daemon (the snapshot's `self` — daemon truth, not the
+    // URL hash) appends its node: "crc_finish •Sherlock › sh02-02n44 | …",
+    // so a job window never poses as its login node.
+    const node = $computeStatus?.self?.node;
+    const hostWithNode = node ? `${hostAlias} › ${node}` : hostAlias;
+    const host = isRemoteWindow ? hostWithNode : null;
     const scope = workspace
       ? host
         ? `${workspace.name} •${host}`
@@ -3239,6 +3277,12 @@
         </section>
       {/if}
 
+      {#if $computeStatus?.self}
+        <!-- This whole window lives inside a Slurm allocation (the daemon's
+             own truth, not the URL hash): countdown + resources, stacked
+             ABOVE the daemon bar so neither crowds the other. -->
+        <ComputeStrip self={$computeStatus.self} receivedAt={$computeStatus.received_at_ms} />
+      {/if}
       <div class="daemon" bind:this={daemonEl}>
         <span
           class="daemon-dot"
@@ -3248,8 +3292,13 @@
           title={eventsUp ? "connected" : "disconnected"}
           aria-label={eventsUp ? "connected" : "disconnected"}
         ></span>
+        <!-- Inside an allocation the label carries the node ("Sherlock ›
+             sh02-02n44") so a compute-node window never poses as its login
+             node — derived from the daemon's self block, hash-independent. -->
         <span class="daemon-host" class:remote={isRemoteWindow} title={health?.hostname}
-          >{getHostLabel()}</span
+          >{$computeStatus?.self
+            ? `${getHostLabel()} › ${$computeStatus.self.node}`
+            : getHostLabel()}</span
         >
         {#if $gitStatus !== null}
           <!-- Always-on orientation: what branch you're on and how dirty the
@@ -3325,6 +3374,65 @@
             </svg>
             <span class="dg-branch">can’t read repo</span>
           </button>
+        {/if}
+        {#if $computeStatus?.scheduler === "slurm" && !$computeStatus?.self}
+          {@const queued = queuedJobCount($computeStatus)}
+          <!-- Slurm orientation, indicator ONLY (maintainer, 2026-07-15):
+               the scheduler exists here + how much of your work is queued.
+               Queue browsing/management deliberately does NOT live in the
+               rail — that arrives with the agent dashboard; launching onto
+               compute nodes belongs to the home screen's Mode 2 flow.
+               INSIDE an allocation the chip disappears entirely (maintainer,
+               2026-07-16): the strip above this bar IS the compute truth of
+               a job window, and a queue count is login-node orientation. -->
+          <span
+            class="daemon-compute"
+            title={`slurm — ${queued} job${queued === 1 ? "" : "s"} in queue`}
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+              <rect
+                x="2"
+                y="2"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="9"
+                y="2"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="2"
+                y="9"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+              <rect
+                x="9"
+                y="9"
+                width="5"
+                height="5"
+                rx="1.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+              />
+            </svg>
+            {#if queued > 0}<span class="dc-count">{queued}</span>{/if}
+          </span>
         {/if}
         {#if canCaffeinate}
           <button
@@ -3522,6 +3630,7 @@
     onAgents={(a) => (agents = a)}
   />
 {/if}
+
 
 {#if pickerOpen}
   <FolderPicker recents={workspaces} onOpened={activateWorkspace} onClose={closePicker} />
@@ -4407,6 +4516,26 @@
 
   .dg-dirty {
     color: var(--git-modified);
+  }
+
+  /* Slurm chip: scheduler presence + your queued-job count, quiet like the
+     git chip (same height/typography); flex:none so a long branch name
+     truncates before this disappears. */
+  /* Passive indicator (no hover/press affordance): slurm-here + queue count. */
+  .daemon-compute {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 0.22rem;
+    height: 20px;
+    padding: 0 0.3rem;
+    color: var(--muted);
+    font: inherit;
+  }
+
+  .dc-count {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Settings gear: the always-there mouse path to ⌘, — quiet until hover. */

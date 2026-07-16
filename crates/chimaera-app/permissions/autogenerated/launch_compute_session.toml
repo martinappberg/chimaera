@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-compute-session"
+description = "Enables the launch_compute_session command without any pre-configured scope."
+commands.allow = ["launch_compute_session"]
+
+[[permission]]
+identifier = "deny-launch-compute-session"
+description = "Denies the launch_compute_session command without any pre-configured scope."
+commands.deny = ["launch_compute_session"]

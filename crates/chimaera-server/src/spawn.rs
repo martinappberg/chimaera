@@ -48,6 +48,11 @@ pub(crate) struct SpawnSpec {
     /// the dead session's title so the rail row stays recognizable until
     /// the agent re-titles itself). Ignored for shells.
     pub(crate) title_hint: Option<String>,
+    /// Launch-scope prelude text (concatenated after the host + workspace
+    /// preludes — see `environment`). Not persisted in the ledger, so
+    /// resurrection passes None: a resurrected session re-runs the durable
+    /// scopes only.
+    pub(crate) prelude: Option<String>,
     pub(crate) kind: SpawnKind,
 }
 
@@ -72,6 +77,13 @@ pub(crate) async fn spawn_session(
     // context) and, for claude, in the hook URL.
     let id = spec.id.unwrap_or_else(crate::agents::fresh_session_id);
     let cwd = spec.cwd.unwrap_or_else(|| workspace.root.clone());
+    // The user's environment prelude (host ⊕ workspace ⊕ launch), written
+    // per session and sourced once by the shell rc / agent wrapper. Runs
+    // per real spawn only — reconnects reattach to the live PTY.
+    let prelude =
+        crate::environment::materialize_prelude(state, &id, &workspace.id, spec.prelude.as_deref());
+    let env = crate::api::session_env(state, &id, &spec.theme, prelude.as_deref());
+    let env_remove = crate::api::spawn_env_remove(&env);
     let mut opts = chimaera_pty::SpawnOpts {
         cwd,
         name: spec.name,
@@ -79,8 +91,8 @@ pub(crate) async fn spawn_session(
         rows: spec.rows.map_or(24, |r| r.clamp(5, 200)),
         command: None,
         id: Some(id.clone()),
-        env: crate::api::session_env(state, &id, &spec.theme),
-        env_remove: crate::api::launcher_context_env(),
+        env,
+        env_remove,
         // settings.json ground truth; applies to sessions spawned from now on.
         scrollback: crate::lock(&state.settings).scrollback_lines(),
     };

@@ -15,7 +15,7 @@ mod sessions;
 mod shutdown;
 mod workspaces;
 
-pub(crate) use env::{launcher_context_env, session_env};
+pub(crate) use env::{session_env, spawn_env_remove};
 // `spawn_path` is exercised only by the lib.rs router tests.
 #[cfg(test)]
 pub(crate) use env::spawn_path;

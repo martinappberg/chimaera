@@ -5,6 +5,9 @@ const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
 /** Same key viewState.windowKey() reads — the hash seeds it. */
 const WIN_KEY = "chimaera.win";
+/** Set when this window was opened onto a compute-node daemon (Mode 2). */
+const JOB_KEY = "chimaera.job";
+const NODE_KEY = "chimaera.node";
 
 /**
  * Read the access token, workspace id, host label, and window id from the
@@ -24,6 +27,8 @@ function initFromHash(): string | null {
   const wsFromHash = params.get("ws");
   const hostFromHash = params.get("host");
   const winFromHash = params.get("win");
+  const jobFromHash = params.get("job");
+  const nodeFromHash = params.get("node");
   if (tokenFromHash !== null) {
     sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
@@ -36,11 +41,19 @@ function initFromHash(): string | null {
   if (winFromHash !== null && /^[A-Za-z0-9_-]{1,64}$/.test(winFromHash)) {
     sessionStorage.setItem(WIN_KEY, winFromHash);
   }
+  if (jobFromHash !== null) {
+    sessionStorage.setItem(JOB_KEY, jobFromHash);
+  }
+  if (nodeFromHash !== null) {
+    sessionStorage.setItem(NODE_KEY, nodeFromHash);
+  }
   if (
     tokenFromHash !== null ||
     wsFromHash !== null ||
     hostFromHash !== null ||
-    winFromHash !== null
+    winFromHash !== null ||
+    jobFromHash !== null ||
+    nodeFromHash !== null
   ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
@@ -100,6 +113,22 @@ export function getHostLabel(): string {
  */
 export function isRemoteHost(): boolean {
   return getHostLabel() !== "local";
+}
+
+/** The Slurm job a job-scoped window was opened onto (from the shell's
+ *  `job=`/`node=` hash params). Orientation only — the daemon's own
+ *  `/compute` `self` block is the authoritative "am I inside a job" fact
+ *  (windows opened from within a compute window may not carry the params). */
+export interface JobContext {
+  jobId: string;
+  node: string | null;
+}
+
+/** Non-null when this window was opened job-scoped (a compute-node session). */
+export function getJobContext(): JobContext | null {
+  const jobId = sessionStorage.getItem(JOB_KEY);
+  if (jobId === null) return null;
+  return { jobId, node: sessionStorage.getItem(NODE_KEY) };
 }
 
 /** The workspace id this tab is scoped to, if any (window = workspace). */

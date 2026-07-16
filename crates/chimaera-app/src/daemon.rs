@@ -48,6 +48,8 @@ pub fn run_headless() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
     if let Err(e) = runtime.block_on(chimaera_server::run(chimaera_server::ServerConfig {
         port: None,
+        // The app's local daemon is never a compute-node daemon.
+        routable_bind: false,
     })) {
         eprintln!("daemon exited with error: {e:#}");
         std::process::exit(1);

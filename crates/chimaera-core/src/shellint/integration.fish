@@ -20,4 +20,38 @@ if status is-interactive; and not set -q CHIMAERA_INTEGRATION
         printf '\033]7;file://%s%s\007' (hostname) (string escape --style=url -- $PWD | string replace -a '%2F' '/')
         printf '\033]133;A\007'
     end
+
+    # Environment prelude: CHIMAERA_PRELUDE points at a POSIX script of
+    # user-configured startup commands (module load, conda activate, …).
+    # fish can't source POSIX, so run it in bash and import the resulting
+    # environment — env vars transfer, bash functions/aliases don't (the
+    # documented tradeoff; every module/conda-style tool works by mutating
+    # env). Deferred to the first prompt because vendor_conf.d loads BEFORE
+    # the user's config.fish, and the prelude must run after their rc; the
+    # handler erases itself so it runs exactly once.
+    if set -q CHIMAERA_PRELUDE; and not set -q CHIMAERA_PRELUDE_DONE; and test -r "$CHIMAERA_PRELUDE"
+        function __chimaera_prelude --on-event fish_prompt
+            functions -e __chimaera_prelude
+            set -gx CHIMAERA_PRELUDE_DONE 1
+            command -sq bash; or return
+            # Prelude stdout goes to stderr so it still shows in the
+            # terminal without corrupting the NUL-delimited env capture.
+            # LOGIN bash (-l): `ml`/`module`/conda hooks are profile-defined
+            # shell functions a plain `bash -c` never sees.
+            bash -lc 'source "$CHIMAERA_PRELUDE" 1>&2; command env -0' | while read -lz __chim_kv
+                set -l __chim_pair (string split -m 1 = -- $__chim_kv)
+                test (count $__chim_pair) -eq 2; or continue
+                set -l __chim_k $__chim_pair[1]
+                # Only names fish can hold (drops BASH_FUNC_x%% exports and
+                # other exotica), minus vars fish owns / bash-run artifacts.
+                string match -qr '^[A-Za-z_][A-Za-z0-9_]*$' -- $__chim_k; or continue
+                string match -qr '^(_|SHLVL|PWD|OLDPWD|SHELL|IFS|PS1|BASH.*)$' -- $__chim_k; and continue
+                if test "$__chim_k" = PATH
+                    set -gx PATH (string split : -- $__chim_pair[2])
+                else
+                    set -gx $__chim_k $__chim_pair[2]
+                end
+            end
+        end
+    end
 end

@@ -68,6 +68,11 @@ pub(crate) struct CreateSession {
     /// Old clients never send it and keep getting terminals.
     #[serde(default)]
     ui: Option<String>,
+    /// Launch-scope environment prelude: opaque shell text run once before
+    /// this session's shell/agent, after the host + workspace preludes (see
+    /// `environment`). Old clients never send it; nothing changes shape.
+    #[serde(default)]
+    prelude: Option<String>,
 }
 
 /// POST /api/v1/sessions — spawn a shell (kind "shell", the default) or an
@@ -104,6 +109,20 @@ pub(crate) async fn create_session(
         }
     };
     let theme: &str = &theme_owned;
+
+    // Launch-scope prelude: opaque shell text by design, so only size and
+    // NUL are policed (the same caps the stored scopes get on PUT).
+    if let Some(p) = &body.prelude {
+        if p.len() > crate::environment::MAX_SCOPE_BYTES {
+            return bad_request(format!(
+                "prelude exceeds {} bytes",
+                crate::environment::MAX_SCOPE_BYTES
+            ));
+        }
+        if p.contains('\0') {
+            return bad_request("prelude text contains a NUL byte".to_string());
+        }
+    }
 
     // Structured chat surface: an agent driven over stream-json/app-server,
     // not a PTY. It is resolved and spawned here (returning early); the TUI
@@ -179,6 +198,7 @@ pub(crate) async fn create_session(
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(crate::agents::truncate_prompt),
+        prelude: body.prelude.filter(|p| !p.trim().is_empty()),
         kind,
     };
     match crate::spawn::spawn_session(&state, spec).await {
@@ -313,6 +333,7 @@ async fn spawn_chat_ui(
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
     let recipe = crate::chat::ChatRecipe {
         workspace_root: workspace.root.clone(),
+        workspace_id: workspace.id.clone(),
         kind: agent_kind,
         bin,
         version: agent_version,
@@ -323,6 +344,7 @@ async fn spawn_chat_ui(
         fork_at: None,
         rollback_turns: None,
         theme: theme.to_string(),
+        prelude: body.prelude.clone().filter(|p| !p.trim().is_empty()),
     };
 
     // A resumed recent replays no history over the wire — seed the new journal
@@ -358,6 +380,7 @@ async fn spawn_chat_ui(
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .map(crate::agents::truncate_prompt),
+            prelude: body.prelude.filter(|p| !p.trim().is_empty()),
             kind: crate::spawn::SpawnKind::Agent {
                 kind: agent_kind,
                 model: body.model,
@@ -475,8 +498,10 @@ pub(crate) async fn delete_session(
     match state.sessions.kill(&id) {
         Ok(()) => {
             // Shells never pass through `recents::retire` (that hook is
-            // agent-only), so their uploads are pruned here.
+            // agent-only), so their uploads (and prelude file) are pruned
+            // here.
             crate::upload::prune_session_uploads(&state, &id);
+            crate::environment::remove_prelude_file(&id);
             state.changes.notify_waiters();
             StatusCode::NO_CONTENT.into_response()
         }

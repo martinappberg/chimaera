@@ -11,6 +11,7 @@
 import { writable } from "svelte/store";
 import { getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
+import type { ComputeSessionList } from "../workspace/computeSessions";
 
 interface TauriGlobal {
   core: { invoke: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T> };
@@ -269,6 +270,40 @@ export async function remoteWorkspaces(alias: string): Promise<Workspace[]> {
   const t = tauri();
   if (t === null) throw new Error("not running in the native shell");
   return t.core.invoke<Workspace[]>("remote_workspaces", { alias });
+}
+
+/**
+ * The connected host's compute-node sessions + partitions, shell-proxied —
+ * the LOCAL home screen's per-host indicator count. The shell strips each
+ * session's daemon port/token before anything reaches JS. Managing sessions
+ * (launch/cancel/refresh) lives on the host-detail page, which talks to the
+ * login daemon's routes directly (see workspace/computeSessions.ts).
+ */
+export async function remoteComputeSessions(alias: string): Promise<ComputeSessionList> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  return t.core.invoke<ComputeSessionList>("remote_compute_sessions", { alias });
+}
+
+/** Tunnel to a ready compute-node session; the shell opens its window. */
+export async function connectComputeSession(alias: string, jobId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("connect_compute_session", { alias, jobId });
+}
+
+/**
+ * scancel a compute-node session through the LOGIN daemon (`alias` is the
+ * login host) and close any live tunnel to that job. A job window ending its
+ * own allocation must use this rather than its own daemon's DELETE route:
+ * the login daemon owns the launch record (the job daemon has a different
+ * compute root, so cancelling there never marks it), and the shell tears the
+ * job tunnel down with it. Rejects with the shell's error message on failure.
+ */
+export async function cancelComputeSession(alias: string, jobId: string): Promise<void> {
+  const t = tauri();
+  if (t === null) throw new Error("not running in the native shell");
+  await t.core.invoke<void>("cancel_compute_session", { alias, jobId });
 }
 
 /** Subscribe to connect progress events. Returns an unsubscribe promise. */

@@ -124,7 +124,8 @@ After-1.0 (sequencing, not compromise — these need a working product to be des
 - Published/versioned public protocol. tmux and LSP earned protocol status *after* adoption;
   the internal protocol is designed cleanly so publication is a docs-and-freeze exercise.
 - Multi-host hub federation (manifest + per-host windows cover multi-cluster use until then).
-- sbatch-offloaded agent sessions (agents running inside Slurm jobs).
+- sbatch-offloaded agent sessions — **Mode 2**: own the full workbench on a compute node via the
+  negotiated tunnel ladder (specced in Architecture → Environment prelude & compute-node sessions).
 
 ## Risks (ranked)
 
@@ -166,7 +167,7 @@ dev working with AI agents, part-time.
 | **M3 — Previews wave 1** | file tree, images+thumbnails, Markdown, sandboxed HTML reports (MultiQC), CSV/TSV with gzip tier. | most code-server use | 3–4 wks |
 | **M4 — Previews wave 2 + git** | Parquet paging, ipynb, PDF, JSON tree, large-file guards; git status/log/diff panel. | code-server, entirely | 3–4 wks |
 | **M4.5 — Linked terminals** | OSC 133 shell integration + per-session command journal, daemon HTTP MCP server (`run_in_terminal`/`read_terminal`/`list_terminals`), link UX (agent top-bar chips, reference-band drag, auto-link on `@term:` mention), sentinel fallback for remote shells. | agent↔shell copy-paste | 3–4 wks |
-| **M5 — HPC layer** | Slurm strip + job↔session links, `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. | — | 2–3 wks |
+| **M5 — HPC layer** | Environment prelude (host/workspace/session scopes, one spawn seam) + Slurm detection/strip + job↔session links + Mode 1 (login-node agent + Slurm skill); `doctor`, transcript pruning/quotas, docs, demo, v0.1 release. *(scope grew with the 2026-07-14 design pass — estimate predates it.)* | — | 2–3 wks |
 | **M6 — Optimal-build completion → v1.0** | Tauri native shell (window per workspace, native notifications, menubar badge), Tier C ACP agents (Gemini native). ~~Tier B structured chat mode~~ (+ native codex app-server) delivered early, 2026-07-07. | Claude desktop app | 6–8 wks |
 | After 1.0 | Hub federation, sbatch-offloaded sessions, protocol publication, single-file editing. | | ongoing |
 
@@ -296,6 +297,83 @@ which is the survival property that matters.
   token; `SessionManager::kill_all` + a public `KILL_ESCALATION_GRACE`. Local-daemon shutdown
   is intentionally not surfaced — quitting the app is the local equivalent, and the endpoints
   already work on loopback if that changes.
+
+- **2026-07-14 — HPC environment + compute-node placement (design pass; tunnel reachability
+  verified live on Sherlock).** Two deliberately separated axes. **Environment prelude:** opaque
+  shell text (`ml …`, `micromamba activate`, `export …`) run before a shell/agent, *never parsed*
+  by Chimaera (so conda/lmod/spack/venv/nix need zero tool-specific code), concatenated across
+  host→workspace→session scopes (env last-wins), injected at the one spawn seam both shells and
+  agents already share (`CHIMAERA_PRELUDE` sourced by the shell-integration rc / the `-lc` agent
+  wrapper; env via `SpawnOpts.env`). Federated by the daemon-per-host model — each host's daemon
+  owns its own defaults, no config sync. **Compute placement, two modes (not either/or):** Mode 1
+  (login node, agent + Slurm skill — the safe default, works wherever Slurm exists; agent keeps
+  API internet and dispatches to compute via `sbatch`/`srun`); Mode 2 (own the full session on the
+  compute node — `sbatch --job-name=chimaera-<ws>` runs the prelude then `chimaera serve` inside
+  the job cgroup; isolated, walltime-bounded, cleaned up on `scancel`). Mode 2 mechanics: `squeue`
+  job-name is the reconnect registry (`%N` node, `%L` walltime), the shared FS carries a per-jobid
+  `{node,port,token}` manifest (no sync — same Lustre path, same binary already visible), dynamic
+  `:0` ports (multi-user/multi-workspace on one node never collide). Reaching a compute-node daemon
+  is a **negotiated, bounded probe ladder** — B (loopback + ssh-adopt forward through the login
+  node; *preferred*, port unexposed; verified on Sherlock incl. `pam_slurm_adopt`) → A (routable
+  bind + direct login→node forward + token; verified reachable on Sherlock) → **unsupported → fall
+  back to Mode 1, stated plainly** (reverse-tunnel rung dropped as scope, ladder left open).
+  **Two-tier persistence** made explicit: login-node daemon = forever; compute-node daemon = until
+  walltime. **Outbound gate closed on Sherlock (2026-07-14):** direct compute-node egress to
+  `api.anthropic.com` verified (HTTP 405, no proxy) — Mode 2 fully viable there. Elsewhere a
+  per-cluster fact: probed at job start, recorded in the manifest; where blocked, Mode 2 degrades
+  by capability (terminals/previews on the node, agents via Mode 1). Deep spec: Architecture →
+  Environment prelude & compute-node sessions.
+- **2026-07-15 — Mode 2 core SHIPPED (daemon routes + tunnel ladder + CLI + app/home-screen
+  surfaces), verified end-to-end on Sherlock.** Implemented shape: launch/discover/cancel are
+  LOGIN-daemon routes (it owns sbatch, the preludes, its own shared-FS binary) — the client
+  side only tunnels and opens windows; the registry stays stateless (`squeue` ⋈ per-job
+  manifests under `data_dir()/compute/<jobid>`). The live pass forced one ladder amendment:
+  hostbased-only node sshd (Sherlock) defeats a laptop-originated node leg, so rung B gained a
+  **chained** mechanic — a login-resident `ssh -N -L` relay to the node's loopback running as
+  the remote command of the same laptop ssh that forwards to it (lifetimes coupled, nothing
+  orphaned, daemon stays loopback). Rung A's `--bind-routable` (opt-in 0.0.0.0, token-gated)
+  amends the loopback-only security note deliberately. The app shell keeps tokens/tunnels in
+  Rust under composite `"{alias}#job{id}"` keys; window restore skips compute windows — the
+  squeue-rebuilt home-screen card is the reconnect path. Verified live: launch → RUNNING →
+  ready → chained-B tunnel → health/self-walltime/sessions on the node → cancel → queue clean.
+  Native-app visual pass outstanding (needs the maintainer's screen).
+- **2026-07-16 (later) — SUPERSEDED below: Mode 2 launches are srun-only (maintainer
+  decision).** The sbatch-retention rationale (next entry) over-weighted login-daemon
+  restarts ("once in a blue moon" in steady state — the maintainer, correctly: "most
+  people have tmux sessions going there") and the srun-as-child objection dissolves once
+  the client is DETACHED: `setsid nohup srun … &` orphans it onto init, tmux-grade — it
+  survives daemon restarts and ends only at walltime, scancel, or a login-node reboot.
+  What srun-only buys: ONE launch mechanism that works on every partition (including
+  interactive-only ones like Sherlock's `dev`, whose job_submit policy refuses batch —
+  found live), no batch/interactive mode switch, no learned per-partition preferences.
+  Costs, accepted openly: sessions die with a login-node reboot, and clusters that reap
+  login-node user processes (where tmux dies too) are honest "not supported" territory.
+  The job id comes from queue adoption (srun can't print it detached); launch refusals
+  surface from the srun log's tail — Slurm's own words, preserved.
+- **2026-07-16 — Mode 2 stays sbatch-based; srun-as-child rejected for session ownership
+  (maintainer question, answered; SUPERSEDED same day by the srun-only decision above).** The question: "surely srun would be most compatible —
+  the login-node daemon runs srun as a background process, owns it, can kill it
+  automatically." The reason it loses: an srun/salloc allocation's lifetime is chained to
+  its CLIENT PROCESS — if the login daemon restarts (self-update on every merge, dev
+  cycles, crashes), every compute session dies with it. sbatch hands ownership to Slurm
+  itself: sessions survive laptop closes AND login-daemon restarts, `squeue` is the
+  stateless reconnect registry, walltime ends things deterministically. The ownership the
+  maintainer wants exists already at the right level — the login daemon kills via scancel
+  (cards' cancel, the banner's end-job), which beats a process handle as owner-of-record.
+  srun's one genuine advantage — interactive-only partitions (Sherlock's `dev` refuses
+  batch; found live) — is noted as a possible future "Mode 2b" interactive-allocation
+  flavor that would be explicitly connection-tied; not in scope now. Programmatic/web
+  access is unaffected either way (launch is a daemon HTTP route).
+- **2026-07-16 — Loopback stays the compute-daemon default; routable bind remains per-launch
+  opt-in (maintainer decision).** Raised because the connection is token-gated anyway and the
+  node is "our own"; decided against flipping: compute nodes are routinely SHARED (co-tenant
+  jobs on the same node reach a 0.0.0.0 bind; only the token gates them), the chained-B rung
+  gives every ssh-reachable cluster a loopback path anyway (verified on hostbased-only
+  Sherlock), and one leaked/logged token on a routable bind is a cluster-internal exposure
+  loopback never has. Rung A via the explicit `routable` launch flag (dialog checkbox with
+  exposure warning, CLI flag) is the escape hatch for clusters whose ladder finds no ssh
+  path; "not supported on this cluster" stays an acceptable honest end state. No per-host
+  auto-routable memory for now — premature until a real cluster defeats rung B.
 
 Still open:
 

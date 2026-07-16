@@ -18,6 +18,16 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+/// Scope of a compute-node (Mode 2) window: a view onto a job tunnel whose
+/// lifetime is the allocation's walltime. Launch-time restore SKIPS records
+/// carrying this — walltime death is honest; the home-screen card is the
+/// reconnect path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ComputeScope {
+    pub job_id: String,
+    pub node: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WindowRecord {
     /// Stable across app restarts; the SPA's view-state key (`win=` in the
@@ -27,6 +37,10 @@ pub struct WindowRecord {
     pub alias: Option<String>,
     /// Workspace id; `None` = the home screen.
     pub ws: Option<String>,
+    /// Present on a compute-node window (never reopened at launch). The
+    /// `default` keeps existing windows.json registries parsing.
+    #[serde(default)]
+    pub compute: Option<ComputeScope>,
     /// Outer position + inner size, logical pixels.
     #[serde(default)]
     pub x: Option<f64>,
@@ -45,6 +59,7 @@ impl WindowRecord {
             id: format!("w-{}", &chimaera_core::generate_token()[..16]),
             alias,
             ws,
+            compute: None,
             x: None,
             y: None,
             width: None,

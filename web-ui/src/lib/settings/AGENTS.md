@@ -12,6 +12,13 @@ default, label, and grouping — is declared there once; the form (`SettingRow`,
 `AgentsSettings`) and the raw editor (`SettingsJson`) both derive from it. Add a
 setting by adding it to the schema, not by hand-wiring a control.
 
+**Exception — Environment.** The Environment category is store-backed, not
+schema-backed: `EnvironmentSettings.svelte` edits the daemon's prelude map over
+`/api/v1/environment` (persisted as `env-profiles.json`, not `settings.json`).
+No schema rows, an explicit Save (fetch-merge-put — the PUT replaces the whole
+map, so other workspaces' entries must round-trip), and an empty editor deletes
+its scope's entry rather than persisting `{text: ""}`.
+
 ## File map
 
 | File | What it owns |
@@ -20,6 +27,8 @@ setting by adding it to the schema, not by hand-wiring a control.
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, the sparse-map semantics, and the `dirtySince` echo-guard. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
+| `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
+| `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `SettingRow.svelte` | One schema-driven control. |
 | `SettingsJson.svelte` | The raw-JSON editor (validates against the schema). |
 

@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, assets, chat, download, fs, git, launcher, links, mcp, quickopen, recents,
-    runtimes, settings, update, upload, view_state, ws,
+    agents, api, assets, chat, compute, compute_jobs, download, environment, fs, git, launcher,
+    links, mcp, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -68,6 +68,10 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
+        .route(
+            "/environment",
+            get(environment::get_environment).put(environment::put_environment),
+        )
         .route("/fs/home", get(fs::home))
         .route("/fs/dirs", get(fs::dirs))
         .route("/fs/list", get(fs::list))
@@ -90,6 +94,15 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             post(upload::upload_to_dir).layer(axum::extract::DefaultBodyLimit::max(
                 upload::MAX_UPLOAD_BYTES as usize + 64 * 1024,
             )),
+        )
+        .route("/compute", get(compute::get_compute))
+        .route(
+            "/compute/sessions",
+            get(compute_jobs::list_compute_sessions).post(compute_jobs::launch_compute_session),
+        )
+        .route(
+            "/compute/sessions/{job_id}",
+            delete(compute_jobs::cancel_compute_session),
         )
         .route("/git/status", get(git::status))
         .route("/git/diff", get(git::diff))

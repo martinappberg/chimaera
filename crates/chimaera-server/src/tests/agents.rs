@@ -30,6 +30,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
         id.clone(),
         chat::ChatRecipe {
             workspace_root: dir.clone(),
+            workspace_id: "w-test".into(),
             kind: agents::AgentKind::Claude,
             bin: tui.clone(),
             version: None,
@@ -40,6 +41,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             fork_at: None,
             rollback_turns: None,
             theme: "dark".into(),
+            prelude: None,
         },
     );
 
