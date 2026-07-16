@@ -77,7 +77,11 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   `cpus · mem · gres` inside a workspace (daemon-truth via the snapshot's `self` block,
   so windows opened later on the same node inherit it). A fresh launch never flashes
   "ended": launch/cancel invalidate the snapshot cache, and an orphaned launch record
-  younger than 120s renders as a PENDING submitted-card (squeue lag), leading the list. Launch **seeds the job daemon's workspace registry
+  younger than 120s renders as a PENDING submitted-card (squeue lag), leading the list.
+  Launch itself is race-hardened: sbatch gets a 30s deadline (killing it does NOT
+  unsubmit — a busy controller once produced "sbatch failed" plus a ghost job), a
+  no-answer launch adopts the newest unrecorded queue row wearing its job name, and
+  cards fall back to squeue's `%C`/`%m` for cpu/mem when no record exists. Launch **seeds the job daemon's workspace registry
   with the host's whole list** (shared-FS roots are equally valid on the node), so the
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
