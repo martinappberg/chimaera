@@ -276,6 +276,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
 
+### Rich workflow rows — why they exist
+_No intent captured yet — pending the maintainer's answers (PR #69, 2026-07-16)._
+
 ### Why chat mode exists
 _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._
 
