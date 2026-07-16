@@ -191,6 +191,24 @@ export interface BackgroundTask {
   status: string;
   /** Driver-stamped epoch ms at first sight — the elapsed display's anchor. */
   startedAtMs: number;
+  /** The workflow's meta.name (local_workflow lanes) — the row's title. */
+  workflowName: string | null;
+  /** Per-agent progress (capped server-side, newest kept) — the dot row. */
+  agents: WorkflowAgent[];
+  /** Aggregates counted over the WHOLE wire list — honest beyond the cap. */
+  agentsTotal: number;
+  agentsDone: number;
+}
+
+/** One workflow agent's progress (a `BackgroundTask.agents` member). */
+export interface WorkflowAgent {
+  /** The workflow's own 1-based agent number. */
+  index: number;
+  label: string;
+  /** The wire's state word verbatim (start | done | …) — never remapped. */
+  state: string;
+  /** Head of the agent's final text, once done. */
+  resultPreview: string | null;
 }
 
 export interface ModeInfo {
@@ -424,6 +442,15 @@ export class ChatStore {
             description: (t.description as string) ?? "",
             status: (t.status as string) ?? "running",
             startedAtMs: (t.started_at_ms as number) ?? 0,
+            workflowName: (t.workflow_name as string) ?? null,
+            agents: ((t.agents as Record<string, unknown>[]) ?? []).map((a) => ({
+              index: (a.index as number) ?? 0,
+              label: (a.label as string) ?? "",
+              state: (a.state as string) ?? "start",
+              resultPreview: (a.result_preview as string) ?? null,
+            })),
+            agentsTotal: (t.agents_total as number) ?? 0,
+            agentsDone: (t.agents_done as number) ?? 0,
           }))
           .filter((t) => t.id !== "");
         // Tasks that left the set WITH a verdict fold into history as quiet

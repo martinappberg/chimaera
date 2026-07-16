@@ -31,6 +31,12 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// Per-workflow bound on stored per-agent entries (the dot row). A workflow
+/// can spawn up to 1000 agents lifetime; the newest entries win and the
+/// `agents_total`/`agents_done` aggregates stay honest beyond the cap.
+pub const WF_AGENTS_CAP: usize = 64;
+/// One-line cap for a workflow agent's label and result preview.
+pub const WF_AGENT_LABEL_MAX: usize = 120;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -343,6 +349,52 @@ pub struct BackgroundTask {
     /// anchor, journaled so replay shows honest ages (there is no
     /// start-time on the wire).
     pub started_at_ms: u64,
+    /// The workflow's `meta.name` (claude `task_started.workflow_name`,
+    /// `local_workflow` lanes only) — the row's title. All the workflow
+    /// fields below are additive: old journals/clients skip them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    /// Per-agent progress for a workflow lane (claude `task_progress
+    /// .workflow_progress`, folded on state transitions only) — the dot
+    /// row. Capped at [`WF_AGENTS_CAP`] keeping the newest; the aggregates
+    /// below stay honest beyond the cap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<WorkflowAgent>,
+    /// Agents the wire has reported so far (spawned or queued — the CLI
+    /// lists an agent once it exists, so "total" grows as the script runs).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub agents_total: u64,
+    /// Agents whose wire state is `done`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub agents_done: u64,
+    /// The tool_use that launched this task (claude `task_started
+    /// .tool_use_id`) — driver-internal card binding, never on the wire:
+    /// it rides the task identity through the live set and the departed
+    /// buffer so the close can land a final line on the launching card.
+    #[serde(skip)]
+    pub tool_use_id: Option<String>,
+}
+
+/// One workflow agent's progress (a `BackgroundTask::agents` member).
+/// Deliberately excludes the wire's per-tick fields (tokens-while-running,
+/// lastProgressAt): every field here changes only on a state transition, so
+/// `PartialEq` gating keeps the journal quiet between them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowAgent {
+    /// The workflow's own 1-based agent number, verbatim.
+    pub index: u64,
+    /// The agent's display label (the script's `label` or prompt head).
+    pub label: String,
+    /// The wire's state word verbatim (`start`, `done`, …) — rendered
+    /// generically, never remapped.
+    pub state: String,
+    /// The CLI's epoch-ms start stamp (CLI and daemon share a host/clock).
+    /// 0 = not reported.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub started_at_ms: u64,
+    /// Head of the agent's final text, once done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
 }
 
 /// A background task leaving the set with a verdict.

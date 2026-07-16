@@ -46,6 +46,17 @@
     if (t.startedAtMs <= 0) return "";
     return formatElapsedSeconds(Math.max(0, Math.floor((now - t.startedAtMs) / 1000)));
   }
+
+  /** The dot row stays glanceable: at most this many dots; the newest win
+   *  (the entries are already the server-capped newest) and the count text
+   *  stays the honest total. */
+  const DOTS_MAX = 24;
+
+  function dotClass(state: string): string {
+    if (state === "done") return "done";
+    if (state.includes("fail") || state.includes("error")) return "err";
+    return "";
+  }
 </script>
 
 <WorkTray
@@ -61,8 +72,28 @@
       onStop={onStop !== undefined ? () => onStop?.(task.id) : undefined}
       stopTitle="stop this background task"
     >
-      <!-- The lane name (local_bash, …) stays canonical in the tooltip. -->
-      <span class="name" title={task.taskType}>{task.description}</span>
+      <!-- The lane name (local_bash, …) stays canonical in the tooltip;
+           a workflow row leads with its meta.name. -->
+      <span
+        class="name"
+        title={task.workflowName !== null
+          ? `${task.taskType} · ${task.description}`
+          : task.taskType}>{task.workflowName ?? task.description}</span
+      >
+      {#if task.agents.length > 0}
+        <!-- Per-agent dots (newest {DOTS_MAX}); the count text is the honest
+             aggregate, so the dots stay decoration for a screen reader. -->
+        <span class="dots" aria-hidden="true">
+          {#if task.agents.length > DOTS_MAX}<span class="dots-more">⋯</span>{/if}
+          {#each task.agents.slice(-DOTS_MAX) as agent (agent.index)}
+            <span
+              class="wf-dot {dotClass(agent.state)}"
+              title={`${agent.label} — ${agent.state}${agent.resultPreview !== null ? `: ${agent.resultPreview}` : ""}`}
+            ></span>
+          {/each}
+        </span>
+        <span class="count">{task.agentsDone}/{task.agentsTotal} agents</span>
+      {/if}
       {#if task.status !== "running"}
         <span class="status">{task.status}</span>
       {/if}
@@ -87,6 +118,37 @@
     flex: none;
     color: var(--muted);
     font-size: var(--text-xs);
+  }
+  .dots {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .dots-more {
+    color: var(--muted);
+    font-size: var(--text-xs);
+    line-height: 1;
+  }
+  .wf-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    border: 1px solid var(--accent);
+    box-sizing: border-box;
+  }
+  .wf-dot.done {
+    background: var(--accent);
+  }
+  .wf-dot.err {
+    background: var(--err);
+    border-color: var(--err);
+  }
+  .count {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
   .elapsed {
     flex: none;
