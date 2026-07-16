@@ -57,6 +57,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
             "/agents/{id}/install",
             post(runtimes::install_agent).delete(runtimes::uninstall_agent),
         )
+        .route("/agents/{id}/update", post(runtimes::update_agent))
         .route("/agents/claude/sessions", get(launcher::claude_resumables))
         .route("/recents", get(recents::list_recents))
         .route("/update", get(update::get_update))

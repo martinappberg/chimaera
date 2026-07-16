@@ -36,6 +36,17 @@ export interface AgentInfo {
   models: { id: string; label: string }[];
   /** Whether this agent can run as a structured chat session. */
   chatCapable: boolean;
+  /** The newest upstream release the daemon knows of (bare number), from
+   *  its slow periodic probe or a `check=true` re-check. Null until a
+   *  probe has landed. */
+  latestVersion: string | null;
+  /** When that probe ran, unix seconds. */
+  latestCheckedAt: number | null;
+  /** Installed and strictly older than `latestVersion` — the update
+   *  affordance: one-click for a managed binary (POST update), quiet
+   *  information for the user's own. Never guessed: unparseable versions
+   *  stay false. */
+  updateAvailable: boolean;
 }
 
 
@@ -60,10 +71,13 @@ async function json<T>(res: Response): Promise<T> {
  *  error can't poison later calls. */
 let agentsCache: Promise<AgentInfo[]> | null = null;
 
-/** GET /api/v1/agents — what this host has, per known agent. */
-export function listAgents(refresh = false): Promise<AgentInfo[]> {
-  if (!refresh && agentsCache !== null) return agentsCache;
-  const pending = fetchAgents(refresh);
+/** GET /api/v1/agents — what this host has, per known agent. `check` also
+ *  probes upstream for each agent's latest release inline (Settings'
+ *  re-check); the launcher never passes it — its rows must paint instantly,
+ *  and the daemon's slow probe keeps the cached answer fresh enough. */
+export function listAgents(refresh = false, check = false): Promise<AgentInfo[]> {
+  if (!refresh && !check && agentsCache !== null) return agentsCache;
+  const pending = fetchAgents(refresh, check);
   agentsCache = pending;
   void pending.catch(() => {
     if (agentsCache === pending) agentsCache = null;
@@ -71,8 +85,12 @@ export function listAgents(refresh = false): Promise<AgentInfo[]> {
   return pending;
 }
 
-async function fetchAgents(refresh: boolean): Promise<AgentInfo[]> {
-  const body = await json<unknown>(await api(`/agents${refresh ? "?refresh=true" : ""}`));
+async function fetchAgents(refresh: boolean, check = false): Promise<AgentInfo[]> {
+  const params = new URLSearchParams();
+  if (refresh) params.set("refresh", "true");
+  if (check) params.set("check", "true");
+  const q = params.size > 0 ? `?${params.toString()}` : "";
+  const body = await json<unknown>(await api(`/agents${q}`));
   if (!Array.isArray(body)) return [];
   return body.flatMap((raw): AgentInfo[] => {
     if (typeof raw !== "object" || raw === null) return [];
@@ -103,6 +121,9 @@ async function fetchAgents(refresh: boolean): Promise<AgentInfo[]> {
             })
           : [],
         chatCapable: a.chat_capable === true,
+        latestVersion: typeof a.latest_version === "string" ? a.latest_version : null,
+        latestCheckedAt: typeof a.latest_checked_at === "number" ? a.latest_checked_at : null,
+        updateAvailable: a.update_available === true,
       },
     ];
   });
@@ -126,6 +147,28 @@ export async function installAgent(agentId: string, workspaceId: string): Promis
   );
   if (typeof body.session_id !== "string") {
     throw new ApiError(500, "malformed install response");
+  }
+  return body.session_id;
+}
+
+/**
+ * POST /api/v1/agents/{id}/update — bring a chimaera-MANAGED binary to the
+ * latest release: the daemon re-runs its curated script (fetch latest +
+ * atomic symlink re-swap) as a visible "update <agent>" session in
+ * `workspaceId`. Managed only — the daemon 400s for a personal binary, and
+ * the UI never offers the action for one. Returns the spawned session id;
+ * 409 while an install/update for that agent is already running.
+ */
+export async function updateAgent(agentId: string, workspaceId: string): Promise<string> {
+  const body = await json<{ session_id?: unknown }>(
+    await api(`/agents/${encodeURIComponent(agentId)}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    }),
+  );
+  if (typeof body.session_id !== "string") {
+    throw new ApiError(500, "malformed update response");
   }
   return body.session_id;
 }

@@ -309,6 +309,20 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
         Err("agy not found (test)".to_string()),
         None,
     );
+    // Upstream latest knowledge (agent_updates): newer than claude's
+    // install, and known for the uninstalled gemini too.
+    for (kind, version) in [
+        (agents::AgentKind::Claude, "2.1.207"),
+        (agents::AgentKind::Gemini, "0.9.0"),
+    ] {
+        lock(&state.agent_updates).insert(
+            kind,
+            agent_updates::AgentLatest {
+                version: version.to_string(),
+                checked_at: 1_000,
+            },
+        );
+    }
 
     let (status, list) = request(&state, Method::GET, "/api/v1/agents", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -318,12 +332,16 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
     assert_eq!(ids, ["claude", "codex", "gemini", "agy"]);
 
     // Installed and current: path + version present, no outdated flag.
+    // A known-newer upstream release marks it update_available.
     let claude = &list[0];
     assert_eq!(claude["name"], "Claude Code");
     assert_eq!(claude["installed"], true);
     assert_eq!(claude["path"], "/bin/echo");
     assert_eq!(claude["version"], "2.1.196 (Claude Code)");
     assert!(!claude.as_object().unwrap().contains_key("outdated"));
+    assert_eq!(claude["latest_version"], "2.1.207");
+    assert_eq!(claude["latest_checked_at"], 1_000);
+    assert_eq!(claude["update_available"], true);
     assert!(claude["install"]["command"]
         .as_str()
         .unwrap()
@@ -334,11 +352,21 @@ async fn agents_endpoint_lists_catalog_with_installed_and_missing() {
         .starts_with("https://"));
 
     // Installed but legacy (npm-era codex, no `codex login`): flagged so
-    // the UI offers the install command as an update.
+    // the UI offers the install command as an update. No upstream check has
+    // landed for it → no latest fields, and never a guessed update flag.
     let codex = &list[1];
     assert_eq!(codex["installed"], true);
     assert_eq!(codex["outdated"], true);
     assert_eq!(codex["install"]["command"], "npm install -g @openai/codex");
+    assert!(!codex.as_object().unwrap().contains_key("latest_version"));
+    assert!(!codex.as_object().unwrap().contains_key("update_available"));
+
+    // Not installed but latest known: the info rides along (the row can say
+    // what an install would get), never an update flag.
+    let gemini = &list[2];
+    assert_eq!(gemini["installed"], false);
+    assert_eq!(gemini["latest_version"], "0.9.0");
+    assert!(!gemini.as_object().unwrap().contains_key("update_available"));
 
     // Not installed: muted row material — no path/version, but the
     // install action and docs link are still there.
@@ -435,6 +463,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         &state,
         agents::AgentKind::Codex,
         &workspace,
+        "install",
         "echo stub-install-output; sleep 30".to_string(),
     )
     .expect("stub install spawned");
@@ -463,6 +492,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         &state,
         agents::AgentKind::Codex,
         &workspace,
+        "install",
         "echo second".to_string(),
     )
     .expect_err("second install must conflict");
@@ -471,6 +501,7 @@ async fn install_endpoint_contract_and_session_mechanics() {
         &state,
         agents::AgentKind::Antigravity,
         &workspace,
+        "install",
         "echo other; sleep 30".to_string(),
     )
     .expect("other agent installs in parallel");
@@ -490,11 +521,123 @@ async fn install_endpoint_contract_and_session_mechanics() {
         &state,
         agents::AgentKind::Codex,
         &workspace,
+        "install",
         "echo again; sleep 30".to_string(),
     )
     .expect("slot free after the session ended");
     state.sessions.kill(&again).ok();
     state.sessions.kill(&other).ok();
+}
+
+/// POST /api/v1/agents/{id}/update: managed-only. 404 unknown agent /
+/// unknown workspace; 400 when nothing is installed; 400 when the resolved
+/// binary is the user's own (chimaera never touches a binary it doesn't
+/// own). Session mechanics ride the same `start_install` slot as installs —
+/// driven with a stub script so the test never hits the network; the pane
+/// name says "update", and a running update 409s BOTH endpoints.
+#[tokio::test]
+async fn update_endpoint_is_managed_only_and_shares_the_install_slot() {
+    let state = test_state();
+    let ws_id = make_workspace(&state, "update-root").await;
+
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/nope/update",
+        Some(serde_json::json!({"workspace_id": ws_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // Nothing installed → 400 pointing at install.
+    preset_agent(
+        &state,
+        agents::AgentKind::Codex,
+        Err("not found".to_string()),
+        None,
+    );
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/codex/update",
+        Some(serde_json::json!({"workspace_id": ws_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("not installed"),
+        "{body}"
+    );
+
+    // The user's own binary → 400 naming whose it is.
+    preset_agent(
+        &state,
+        agents::AgentKind::Codex,
+        Ok(PathBuf::from("/usr/local/bin/codex")),
+        Some("codex-cli 0.144.1"),
+    );
+    let (status, body) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/codex/update",
+        Some(serde_json::json!({"workspace_id": ws_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("your own install"),
+        "{body}"
+    );
+
+    // A managed binary passes the gate; an unknown workspace still 404s.
+    let managed_bin = runtimes::managed_bin_dir(&state.managed_root).join("codex");
+    preset_agent(
+        &state,
+        agents::AgentKind::Codex,
+        Ok(managed_bin),
+        Some("codex-cli 0.144.1"),
+    );
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/codex/update",
+        Some(serde_json::json!({"workspace_id": "w-00000000"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The session mechanics, stubbed (the endpoint's OK path would run the
+    // real network-bound script; live verification covers it): the pane is
+    // named for what it does, and the one-per-agent slot 409s both verbs.
+    let workspace = lock(&state.workspaces).get(&ws_id).unwrap();
+    let sid = runtimes::start_install(
+        &state,
+        agents::AgentKind::Codex,
+        &workspace,
+        "update",
+        "echo stub-update; sleep 30".to_string(),
+    )
+    .expect("stub update spawned");
+    let entry = session_entry(&state, &sid).await;
+    assert_eq!(entry["kind"], "shell");
+    assert_eq!(entry["display_name"], "update codex");
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/codex/update",
+        Some(serde_json::json!({"workspace_id": ws_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "update blocks update");
+    let (status, _) = request(
+        &state,
+        Method::POST,
+        "/api/v1/agents/codex/install",
+        Some(serde_json::json!({"workspace_id": ws_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "update blocks install");
+    state.sessions.kill(&sid).ok();
 }
 
 /// A same-agent POST racing the spawn window must 409, not overwrite:
@@ -517,6 +660,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         &state,
         agents::AgentKind::Codex,
         &workspace,
+        "install",
         "echo racer".to_string(),
     )
     .expect_err("a fresh reservation must read as busy");
@@ -535,6 +679,7 @@ async fn install_reservation_blocks_the_spawn_registration_race() {
         &state,
         agents::AgentKind::Codex,
         &workspace,
+        "install",
         "echo reclaimed; sleep 30".to_string(),
     )
     .expect("a stale reservation is reclaimable");

@@ -251,6 +251,7 @@ async fn session_env_reaches_spawned_session() {
         &state,
         agents::AgentKind::Claude,
         &workspace,
+        "install",
         "/usr/bin/env; sleep 30".to_string(),
     )
     .expect("stub env session spawned");

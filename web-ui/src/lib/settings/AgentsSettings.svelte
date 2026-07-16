@@ -3,15 +3,24 @@
    * The Agents settings section: one row per agent CLI showing what chimaera
    * resolves for it (yours / chimaera-managed / a path you set / not found) with
    * the version and resolved path, an explicit-path override, and — for a
-   * chimaera-managed binary — an Uninstall button.
+   * chimaera-managed binary — Update (when a newer release is known) and
+   * Uninstall buttons. A newer release for the user's OWN binary renders as
+   * quiet information only: chimaera never touches an install it doesn't own.
    *
    * Bespoke rather than generic SettingRows because it fuses live daemon state
-   * (GET /api/v1/agents) with the `agents.<id>.path` settings and an imperative
-   * uninstall. The path override still persists as a normal setting (so the
-   * JSON editor and the store stay in sync); only the presentation is custom.
+   * (GET /api/v1/agents) with the `agents.<id>.path` settings and imperative
+   * update/uninstall. The path override still persists as a normal setting (so
+   * the JSON editor and the store stay in sync); only the presentation is custom.
    */
-  import { onMount } from "svelte";
-  import { listAgents, uninstallAgent, type AgentInfo } from "../workspace/launcher";
+  import { onDestroy, onMount } from "svelte";
+  import { getActiveWorkspaceId } from "../net/api";
+  import {
+    listAgents,
+    relativeAge,
+    uninstallAgent,
+    updateAgent,
+    type AgentInfo,
+  } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { flushSettings, getSetting, isModified, setSetting } from "./store.svelte";
 
@@ -23,6 +32,10 @@
     | "agents.agy.path";
   const pathKey = (id: string): AgentPathKey => `agents.${id}.path` as AgentPathKey;
 
+  // The window's workspace identity is fixed for the pane's lifetime
+  // (window = workspace) — where an update session spawns.
+  const wsId = getActiveWorkspaceId();
+
   let agents = $state<AgentInfo[]>([]);
   let loading = $state(true);
   let loadError = $state<string | null>(null);
@@ -30,15 +43,18 @@
   let inputs = $state<Record<string, string>>({});
   let saving = $state<Record<string, boolean>>({});
   let removing = $state<Record<string, boolean>>({});
+  let updating = $state<Record<string, boolean>>({});
   let rowError = $state<Record<string, string | null>>({});
 
-  async function load(): Promise<void> {
+  async function load(check = false): Promise<void> {
     loading = true;
     loadError = null;
     try {
       // refresh=true so the rows reflect the current settings + managed state
-      // (the daemon busts its detection cache on an install/uninstall/edit).
-      const list = await listAgents(true);
+      // (the daemon busts its detection cache on an install/uninstall/edit);
+      // check=true (the re-check button) also probes upstream for each
+      // agent's latest release before answering.
+      const list = await listAgents(true, check);
       agents = list;
       const next: Record<string, string> = {};
       for (const a of list) next[a.id] = getSetting(pathKey(a.id));
@@ -50,7 +66,7 @@
     }
   }
 
-  onMount(load);
+  onMount(() => void load());
 
   function provenance(a: AgentInfo): { label: string; cls: string; title: string } {
     if (!a.installed)
@@ -74,6 +90,70 @@
       rowError = { ...rowError, [id]: e instanceof Error ? e.message : "failed to save" };
     } finally {
       saving = { ...saving, [id]: false };
+    }
+  }
+
+  /** Start the daemon's curated update for a MANAGED binary: it streams into
+   *  an "update <agent>" terminal (visible in the rail), and a bounded poll
+   *  clears the row's affordance when the new build lands. */
+  async function startUpdate(a: AgentInfo): Promise<void> {
+    if (updating[a.id] || wsId === null) return;
+    updating = { ...updating, [a.id]: true };
+    rowError = { ...rowError, [a.id]: null };
+    try {
+      await updateAgent(a.id, wsId);
+      ensurePoll();
+    } catch (e) {
+      updating = { ...updating, [a.id]: false };
+      rowError = {
+        ...rowError,
+        [a.id]: e instanceof Error ? e.message : "failed to start the update",
+      };
+    }
+  }
+
+  // While an update session runs, re-probe the catalog every few seconds so
+  // the row reconciles itself (the affordance disappears once the swap
+  // lands). Bounded: a wedged download stops the poll after ~2 minutes and
+  // re-enables the button — the daemon 409s a double-start anyway.
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTicks = 0;
+
+  function ensurePoll(): void {
+    if (pollTimer !== null) return;
+    pollTicks = 0;
+    pollTimer = setInterval(() => {
+      pollTicks += 1;
+      if (pollTicks > 24) {
+        stopPoll();
+        updating = {};
+        return;
+      }
+      void refreshRows();
+    }, 5000);
+  }
+
+  function stopPoll(): void {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  onDestroy(stopPoll);
+
+  /** Refresh only the daemon-state side of the rows (never `inputs` — a
+   *  path edit in progress must not be clobbered by a background poll). */
+  async function refreshRows(): Promise<void> {
+    try {
+      const list = await listAgents(true);
+      agents = list;
+      const next = { ...updating };
+      for (const a of list) if (!a.updateAvailable) next[a.id] = false;
+      updating = next;
+      if (!list.some((a) => updating[a.id])) stopPoll();
+    } catch {
+      // transient fetch hiccup; the next tick retries
     }
   }
 
@@ -101,12 +181,30 @@
 
   const versionNumber = (v: string): string =>
     v.split(" ").find((t) => /^\d/.test(t)) ?? v.split(" ")[0];
+
+  /** Version tooltip: the full --version line plus the newest upstream
+   *  release the daemon knows (and how fresh that knowledge is) — "am I
+   *  current?" answerable without adding a visible element. */
+  function verTitle(a: AgentInfo): string {
+    let title = a.version ?? "";
+    if (a.latestVersion !== null) {
+      const age = a.latestCheckedAt !== null ? relativeAge(a.latestCheckedAt) : null;
+      const checked = age === null ? "" : age === "now" ? ", checked just now" : `, checked ${age} ago`;
+      title += ` — latest: ${a.latestVersion}${checked}`;
+    }
+    return title;
+  }
 </script>
 
 <section class="agents">
   <div class="cat-row">
     <h2 class="cat">Agents</h2>
-    <button class="recheck" title="re-check installed agents" onclick={() => void load()} disabled={loading}>
+    <button
+      class="recheck"
+      title="re-detect installed agents and check upstream for their latest releases"
+      onclick={() => void load(true)}
+      disabled={loading}
+    >
       {loading ? "checking…" : "re-check"}
     </button>
   </div>
@@ -131,8 +229,17 @@
           <span class="glyph"><SessionGlyph kind="agent" agentKind={a.id} size={13} title={a.name} /></span>
           <span class="title">{a.name}</span>
           <span class="badge {p.cls}" title={p.title}>{p.label}</span>
-          {#if a.version}<span class="ver" title={a.version}>{versionNumber(a.version)}</span>{/if}
+          {#if a.version}<span class="ver" title={verTitle(a)}>{versionNumber(a.version)}</span>{/if}
           {#if a.outdated}<span class="badge missing" title="installed but too old to run usefully">outdated</span>{/if}
+          {#if a.updateAvailable && a.latestVersion !== null && !a.managed}
+            <!-- The user's own binary: a newer release is information, never
+                 an action — chimaera doesn't touch installs it doesn't own. -->
+            <span
+              class="newver"
+              title="{a.latestVersion} is out — this is your own install; update it your way"
+              >{a.latestVersion} available</span
+            >
+          {/if}
         </div>
         <p class="desc" title={a.path ?? undefined}>
           {a.path ?? "not on your PATH — set a path below, or install it and re-check"}
@@ -161,6 +268,16 @@
         >
           {saving[a.id] ? "saving…" : "save"}
         </button>
+        {#if a.managed && a.updateAvailable && a.latestVersion !== null}
+          <button
+            class="btn update"
+            disabled={updating[a.id] || wsId === null}
+            title="downloads the official {a.name} build into ~/.chimaera/agents — runs in a terminal you can watch"
+            onclick={() => void startUpdate(a)}
+          >
+            {updating[a.id] ? "updating…" : `update → ${a.latestVersion}`}
+          </button>
+        {/if}
         {#if a.managed}
           <button
             class="btn danger"
@@ -308,6 +425,16 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* A newer release for the user's OWN binary: quiet information (their
+     updater is theirs — no action here), tinted just enough to be found. */
+  .newver {
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    color: color-mix(in srgb, var(--accent) 80%, var(--muted));
+    white-space: nowrap;
+  }
+
   .desc {
     margin: 3px 0 0;
     font-family: var(--mono);
@@ -387,6 +514,21 @@
     color: var(--warn);
     border-color: color-mix(in srgb, var(--warn) 45%, var(--edge));
     background: color-mix(in srgb, var(--warn) 8%, transparent);
+  }
+
+  /* The one-click managed update: accent = the row's single actionable
+     affordance, present only while a strictly newer release is known. */
+  .btn.update {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .btn.update:hover:not(:disabled) {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
 
   .err {

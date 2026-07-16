@@ -39,6 +39,7 @@
     listRecents,
     relativeAge,
     setAgentDefault,
+    updateAgent,
     type AgentInfo,
     type LaunchPick,
     type RecentConvo,
@@ -2092,10 +2093,26 @@
 
   /** Install/update flow (managed runtimes): the daemon builds its own
    *  curated command — official artifacts only, into ~/.chimaera/agents —
-   *  and runs it as an ordinary shell session here. The chip's tooltip
+   *  and runs it as an ordinary shell session here. The affordance's tooltip
    *  said exactly what runs; this one explicit click executes it, and the
    *  session opens like any other so the output streams in a visible pane. */
   function launcherInstall(a: AgentInfo): void {
+    managedRuntimeFlow(a, installAgent, "install");
+  }
+
+  /** Update, same trusted shape: the daemon re-runs its curated script
+   *  (fetch latest, verify, atomic symlink re-swap) in a visible
+   *  "update <agent>" session. Managed binaries only — the launcher and
+   *  settings never offer this for the user's own install. */
+  function launcherUpdate(a: AgentInfo): void {
+    managedRuntimeFlow(a, updateAgent, "update");
+  }
+
+  function managedRuntimeFlow(
+    a: AgentInfo,
+    run: (agentId: string, workspaceId: string) => Promise<string>,
+    verb: "install" | "update",
+  ): void {
     launcherOpen = false;
     const ws = activeWsId;
     if (ws === null) {
@@ -2103,11 +2120,11 @@
       return;
     }
     createError = null;
-    void installAgent(a.id, ws)
+    void run(a.id, ws)
       .then(async (sessionId) => {
         recentlyCreated.set(sessionId, Date.now());
-        // Watch this install session: when it exits, re-probe the catalog so
-        // the split button flips from "install" to a plain spawn.
+        // Watch this session: when it exits, re-probe the catalog so the
+        // split button / rows reflect the new binary.
         pendingInstalls.add(sessionId);
         // The daemon spawned the session; a racing events snapshot may not
         // carry it yet, so fetch the roster before surfacing it exactly
@@ -2123,9 +2140,9 @@
       })
       .catch((e) => {
         // Inline error, same surface as any create failure (404 unknown
-        // agent, 409 an install for it is already running).
+        // agent, 409 an install/update for it is already running).
         createError =
-          e instanceof ApiError ? e.message : `failed to start the ${a.name} install`;
+          e instanceof ApiError ? e.message : `failed to start the ${a.name} ${verb}`;
       });
   }
 
@@ -3626,6 +3643,7 @@
     initial={agents}
     onPick={launcherPick}
     onInstall={launcherInstall}
+    onUpdate={launcherUpdate}
     onClose={closeLauncher}
     onAgents={(a) => (agents = a)}
   />

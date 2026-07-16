@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use tokio::net::TcpListener;
 
+use crate::{agent_updates, git, ledger, recents, runtimes, update};
 use crate::{app, lock, AppState, ServerConfig};
-use crate::{git, ledger, recents, runtimes, update};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
 pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
@@ -101,8 +101,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     state.restored.send_replace(false);
     tokio::spawn(ledger::run(state.clone()));
 
-    // Release awareness (GET /api/v1/update + the `update` ws frame).
+    // Release awareness (GET /api/v1/update + the `update` ws frame), and
+    // the same question for the agent CLIs the daemon launches.
     tokio::spawn(update::run_checker(state.clone()));
+    tokio::spawn(agent_updates::run_checker(state.clone()));
 
     // Uploads left by sessions that ended while no daemon was watching
     // (crashes, unclean stops) — swept once restore has decided which
