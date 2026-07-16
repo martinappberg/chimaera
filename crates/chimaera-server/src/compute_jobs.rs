@@ -409,6 +409,10 @@ pub(crate) async fn launch_compute_session(
 
     // The launch record: the card's resource numbers while Slurm is the
     // only other truth (and after; squeue doesn't report mem/gres cheaply).
+    // The script path doubles as the launch's PROCESS-TABLE FINGERPRINT —
+    // it is unique per launch and appears verbatim in the detached srun's
+    // argv, which is what lets the fast-twitch layer map "which srun
+    // clients are alive" back to sessions without asking the controller.
     let record = json!({
         "name": format!("chimaera-{job_slug}"),
         "display_name": spec.name,
@@ -419,6 +423,7 @@ pub(crate) async fn launch_compute_session(
         "time": spec.time,
         "workspace_id": spec.workspace_id,
         "routable": spec.routable,
+        "script": script_path.to_string_lossy(),
     });
     let rec_path = root.join("pending").join(format!("{job_id}.json"));
     if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -513,16 +518,24 @@ pub(crate) async fn list_compute_sessions(
         .cloned()
         .collect();
     let degraded = snap.degraded;
+    // The fast-twitch layer: the squeue snapshot above may be ≤30s stale
+    // (controller politeness), but two LOCAL signals are read fresh on
+    // every call at zero controller cost — the process table (is a
+    // launch's detached srun client still alive? its script path is the
+    // per-launch argv fingerprint) and the shared-FS manifests (has the
+    // job daemon booted?). Together they flip cards the moment reality
+    // changes; squeue reconciles everything on its own cadence.
+    let clients = live_srun_clients().await;
     // Blocking joins (manifest/caps/record on possibly-NFS) off the reactor.
     let sessions = tokio::task::spawn_blocking(move || {
         let mut sessions = candidates
             .into_iter()
-            .map(|j| join_session(&root, j))
+            .map(|j| join_session(&root, j, clients.as_deref()))
             .collect::<Vec<_>>();
         // A stale-jobs snapshot (squeue failed) must not turn live jobs
         // into tombstones — skip the orphan sweep on degraded rounds.
         if !degraded {
-            append_ended_sessions(&root, &mut sessions);
+            append_ended_sessions(&root, &mut sessions, clients.as_deref());
         }
         sessions
     })
@@ -541,7 +554,11 @@ pub(crate) async fn list_compute_sessions(
 /// "the job sometimes disappears?" (the maintainer, live). Ended cards are
 /// dismissable tombstones: DELETE marks the record cancelled, and this sweep
 /// removes marked or aged-out (48h) records — self-cleaning, no daemon state.
-fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
+fn append_ended_sessions(
+    root: &Path,
+    sessions: &mut Vec<ComputeSession>,
+    clients: Option<&[String]>,
+) {
     const ENDED_CAP: usize = 20;
     let live: std::collections::HashSet<&str> =
         sessions.iter().map(|s| s.job_id.as_str()).collect();
@@ -576,7 +593,7 @@ fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
             .unwrap_or(false);
         // A clock-skewed (future) mtime reads as age zero: brand new.
         let age = mtime.elapsed().unwrap_or(Duration::ZERO);
-        let state = orphan_state(age);
+        let state = orphan_state(age, client_alive(record.as_ref(), clients));
         if dismissed || state.is_none() || record.is_none() {
             let _ = std::fs::remove_file(&path);
             continue;
@@ -628,25 +645,59 @@ fn append_ended_sessions(root: &Path, sessions: &mut Vec<ComputeSession>) {
     sessions.extend(ended.into_iter().take(ENDED_CAP).map(|(_, s)| s));
 }
 
-/// What an orphaned launch record (no squeue row for its job) means, by
-/// age. A seconds-old record is a JUST-submitted job that (a possibly
-/// cached) squeue hasn't shown yet — PENDING, not dead (found live: a
-/// fresh launch briefly wore an "ended" card). Hours old is a session that
-/// ended without an explicit cancel — the tombstone. Two days old is
-/// litter (None = remove the record).
-fn orphan_state(age: Duration) -> Option<&'static str> {
+/// What an orphaned launch record (no squeue row for its job) means. The
+/// process table outranks age when it can speak: a LIVING srun client
+/// means the launch is still queued/held however stale the squeue cache is
+/// (PENDING past any grace window), and a dead client on a young record
+/// means it already failed. Age decides only when the client is unknowable
+/// (pre-fingerprint records): a seconds-old record is a JUST-submitted job
+/// squeue hasn't shown yet — PENDING, not dead (found live: a fresh launch
+/// briefly wore an "ended" card). Hours old is a session that ended
+/// without an explicit cancel — the tombstone. Two days old is litter
+/// (None = remove the record).
+fn orphan_state(age: Duration, client_alive: Option<bool>) -> Option<&'static str> {
     const SUBMIT_GRACE: Duration = Duration::from_secs(120);
     const ENDED_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
-    if age < SUBMIT_GRACE {
-        Some("PENDING")
-    } else if age < ENDED_MAX_AGE {
-        Some("ENDED")
-    } else {
-        None
+    if age >= ENDED_MAX_AGE {
+        return None;
+    }
+    match client_alive {
+        Some(true) => Some("PENDING"),
+        Some(false) => Some("ENDED"),
+        None if age < SUBMIT_GRACE => Some("PENDING"),
+        None => Some("ENDED"),
     }
 }
 
-fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
+/// Whether a launch's detached srun client is still in the process table —
+/// matched by the record's script path, the per-launch argv fingerprint.
+/// `None` = unknowable (no scan, or a pre-fingerprint record); the caller
+/// falls back to squeue/age truth.
+fn client_alive(record: Option<&serde_json::Value>, clients: Option<&[String]>) -> Option<bool> {
+    let clients = clients?;
+    let script = record?.get("script")?.as_str()?;
+    if script.is_empty() {
+        return None;
+    }
+    Some(clients.iter().any(|line| line.contains(script)))
+}
+
+/// One `ps` pass over the user's processes → the argv lines of live
+/// chimaera srun clients. Local and controller-free (the whole point);
+/// `None` when the scan itself is unavailable, so callers infer nothing.
+async fn live_srun_clients() -> Option<Vec<String>> {
+    let user = std::env::var("USER").ok()?;
+    let out =
+        crate::compute::run_capped("ps", &["-u".into(), user, "-o".into(), "args=".into()]).await?;
+    Some(
+        out.lines()
+            .filter(|l| l.contains("srun") && l.contains("--job-name=chimaera-"))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn join_session(root: &Path, j: crate::compute::Job, clients: Option<&[String]>) -> ComputeSession {
     let home = root.join(&j.id);
     let manifest: Option<chimaera_core::Manifest> = std::fs::read(home.join("data/manifest.json"))
         .ok()
@@ -658,8 +709,52 @@ fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
         std::fs::read(root.join("pending").join(format!("{}.json", j.id)))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
+
+    // Fast-twitch corrections over the (≤30s stale) squeue row, from the
+    // two fresh local signals. Order matters: death outranks boot.
+    let mut state = j.state.clone();
+    let mut node = j.nodes.clone();
+    let mut time_left = j.time_left.clone();
+    if client_alive(record.as_ref(), clients) == Some(false) {
+        // The detached srun client is GONE: scancel'd, walltime-killed, or
+        // failed — however lively the cached row still looks. Present the
+        // truth now; the next squeue round agrees and the tombstone flow
+        // takes over.
+        state = "ENDED".to_string();
+        node = String::new();
+        time_left = String::new();
+    } else if state == "PENDING" && manifest.is_some() {
+        // The job daemon has BOOTED (manifest on the shared FS) — the job
+        // is running whatever the cached row says. Node from the manifest's
+        // own hostname (first label matches squeue's %N form); time_left
+        // estimated from the requested walltime minus the daemon's uptime,
+        // squeue-corrected within a round.
+        state = "RUNNING".to_string();
+        if node.is_empty() {
+            if let Some(m) = &manifest {
+                node = m
+                    .hostname
+                    .split('.')
+                    .next()
+                    .unwrap_or(&m.hostname)
+                    .to_string();
+            }
+        }
+        if let (Some(m), Some(requested)) = (
+            &manifest,
+            record
+                .as_ref()
+                .and_then(|r| r.get("time"))
+                .and_then(|v| v.as_str()),
+        ) {
+            if let Some(estimate) = estimate_time_left(requested, m.started_at) {
+                time_left = estimate;
+            }
+        }
+    }
+
     let rec = |k: &str| record.as_ref().and_then(|r| r.get(k).cloned());
-    let running = j.state == "RUNNING";
+    let running = state == "RUNNING";
     ComputeSession {
         ready: running && manifest.is_some(),
         name: rec("display_name")
@@ -682,11 +777,61 @@ fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
         port: manifest.as_ref().map(|m| m.port),
         token: manifest.map(|m| m.token),
         job_id: j.id,
-        state: j.state,
-        node: j.nodes,
+        state,
+        node,
         partition: j.partition,
-        time_left: j.time_left,
+        time_left,
     }
+}
+
+/// Requested walltime minus the job daemon's uptime → a Slurm-style
+/// remaining-time string, for the gap between the daemon booting and the
+/// next squeue round confirming it. None when the request isn't a duration
+/// or the clock says nonsense — then the raw squeue value stands.
+fn estimate_time_left(requested: &str, daemon_started_at: u64) -> Option<String> {
+    let m = regex_lite_time(requested)?;
+    let elapsed = now_secs().checked_sub(daemon_started_at)?;
+    let left = m.saturating_sub(elapsed);
+    let days = left / 86_400;
+    let hours = (left % 86_400) / 3_600;
+    let mins = (left % 3_600) / 60;
+    let secs = left % 60;
+    Some(if days > 0 {
+        format!("{days}-{hours:02}:{mins:02}:{secs:02}")
+    } else if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    })
+}
+
+/// Slurm walltime grammar (`[days-]hours:minutes:seconds`, `MM:SS`, bare
+/// minutes) → seconds. Non-durations (UNLIMITED, …) → None.
+fn regex_lite_time(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return s.parse::<u64>().ok().map(|m| m * 60);
+    }
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let nums: Vec<u64> = parts
+        .iter()
+        .map(|p| p.parse::<u64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let (h, m, sec) = match nums.as_slice() {
+        [h, m, s] => (*h, *m, *s),
+        [m, s] if days == 0 => (0, *m, *s),
+        [h, m] => (*h, *m, 0),
+        _ => return None,
+    };
+    Some(((days * 24 + h) * 60 + m) * 60 + sec)
 }
 
 /// DELETE /api/v1/compute/sessions/{job_id} — scancel. Idempotent: a job
@@ -804,14 +949,115 @@ mod tests {
 
     #[test]
     fn orphan_record_age_maps_to_submitted_then_tombstone_then_litter() {
-        // Seconds old = just submitted, squeue hasn't caught up — PENDING.
-        assert_eq!(orphan_state(Duration::from_secs(5)), Some("PENDING"));
-        assert_eq!(orphan_state(Duration::from_secs(119)), Some("PENDING"));
+        // Client unknowable → age decides. Seconds old = just submitted,
+        // squeue hasn't caught up — PENDING.
+        assert_eq!(orphan_state(Duration::from_secs(5), None), Some("PENDING"));
+        assert_eq!(
+            orphan_state(Duration::from_secs(119), None),
+            Some("PENDING")
+        );
         // Past the grace window it ended without a cancel — the tombstone.
-        assert_eq!(orphan_state(Duration::from_secs(121)), Some("ENDED"));
-        assert_eq!(orphan_state(Duration::from_secs(47 * 3600)), Some("ENDED"));
+        assert_eq!(orphan_state(Duration::from_secs(121), None), Some("ENDED"));
+        assert_eq!(
+            orphan_state(Duration::from_secs(47 * 3600), None),
+            Some("ENDED")
+        );
         // Two days on, the record is litter to sweep.
-        assert_eq!(orphan_state(Duration::from_secs(49 * 3600)), None);
+        assert_eq!(orphan_state(Duration::from_secs(49 * 3600), None), None);
+    }
+
+    #[test]
+    fn process_table_outranks_age_for_orphans() {
+        // A living srun client keeps the launch PENDING past any grace —
+        // the squeue cache is just stale.
+        assert_eq!(
+            orphan_state(Duration::from_secs(3600), Some(true)),
+            Some("PENDING")
+        );
+        // A dead client on a young record means it already failed.
+        assert_eq!(
+            orphan_state(Duration::from_secs(5), Some(false)),
+            Some("ENDED")
+        );
+        // Litter is litter regardless of what the table says.
+        assert_eq!(
+            orphan_state(Duration::from_secs(49 * 3600), Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn client_alive_matches_by_script_fingerprint() {
+        let rec = json!({"script": "/r/scripts/a.sh"});
+        let lines = vec![
+            "/usr/bin/srun --job-name=chimaera-x --time=1:00:00 bash -l /r/scripts/a.sh"
+                .to_string(),
+        ];
+        assert_eq!(client_alive(Some(&rec), Some(&lines)), Some(true));
+        assert_eq!(client_alive(Some(&rec), Some(&[])), Some(false));
+        // Unknowable: no scan, no record, or a pre-fingerprint record.
+        assert_eq!(client_alive(Some(&rec), None), None);
+        assert_eq!(client_alive(None, Some(&lines)), None);
+        assert_eq!(client_alive(Some(&json!({})), Some(&lines)), None);
+    }
+
+    #[test]
+    fn walltime_grammar_and_estimates() {
+        assert_eq!(regex_lite_time("2:00:00"), Some(7200));
+        assert_eq!(regex_lite_time("1-00:00:00"), Some(86_400));
+        assert_eq!(regex_lite_time("30:00"), Some(1800));
+        assert_eq!(regex_lite_time("45"), Some(2700));
+        assert_eq!(regex_lite_time("UNLIMITED"), None);
+        // Daemon booted 60s ago on a 20-minute request → ~19:00 left.
+        let est = estimate_time_left("0:20:00", now_secs() - 60).unwrap();
+        assert!(est.starts_with("19:") || est.starts_with("18:5"), "{est}");
+    }
+
+    #[test]
+    fn join_fast_forwards_pending_with_manifest_and_ends_dead_clients() {
+        let dir = std::env::temp_dir().join(format!("chimaera-join-{}", std::process::id()));
+        let home = dir.join("77").join("data");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("pending")).unwrap();
+        std::fs::write(
+            home.join("manifest.json"),
+            format!(
+                "{{\"hostname\":\"nodeX.int\",\"port\":4000,\"token\":\"t\",\"pid\":1,\"version\":\"0.0.1\",\"started_at\":{},\"build\":\"x\"}}",
+                now_secs() - 30
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pending").join("77.json"),
+            "{\"display_name\":\"t\",\"time\":\"0:20:00\",\"script\":\"/r/s/77.sh\"}",
+        )
+        .unwrap();
+        let job = |state: &str| crate::compute::Job {
+            id: "77".to_string(),
+            name: "chimaera-t".to_string(),
+            partition: "normal".to_string(),
+            state: state.to_string(),
+            time_left: "20:00".to_string(),
+            nodes: String::new(),
+            cpus: String::new(),
+            mem: String::new(),
+        };
+        // Cached PENDING + manifest on disk + living client → RUNNING/ready
+        // with the manifest's node and an estimated countdown.
+        let lines = vec!["srun --job-name=chimaera-t bash -l /r/s/77.sh".to_string()];
+        let s = join_session(&dir, job("PENDING"), Some(&lines));
+        assert_eq!(s.state, "RUNNING");
+        assert!(s.ready);
+        assert_eq!(s.node, "nodeX");
+        assert!(!s.time_left.is_empty());
+        // Client verifiably gone → ENDED now, however lively the cache row.
+        let s = join_session(&dir, job("RUNNING"), Some(&[]));
+        assert_eq!(s.state, "ENDED");
+        assert!(!s.ready);
+        // No scan → squeue truth stands untouched.
+        let s = join_session(&dir, job("PENDING"), None);
+        assert_eq!(s.state, "RUNNING", "manifest fast-forward needs no scan");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

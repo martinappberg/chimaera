@@ -477,7 +477,11 @@
   );
   $effect(() => {
     if (!isHostPage || !pageVisible || schedulerKnownNone) return;
-    const t = setInterval(() => void refreshHostCompute(), anyPending ? 10_000 : 30_000);
+    // 5s while anything is pending: the list call now reads the fast-twitch
+    // signals (process table + manifests) fresh each time WITHOUT touching
+    // the controller — squeue still refreshes on its own 30s cadence — so a
+    // tighter poll here buys instant-feeling flips at zero cluster cost.
+    const t = setInterval(() => void refreshHostCompute(), anyPending ? 5_000 : 30_000);
     return () => clearInterval(t);
   });
 
