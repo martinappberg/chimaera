@@ -79,6 +79,34 @@ export interface Session {
    */
   output_active?: boolean | null;
   /**
+   * The inverse liveness check for the hooks tier (claude TUIs): true when
+   * the record claims "running" but the PTY has been silent past the
+   * daemon's stall window (180s) — the state claim is likely stale. Boolean
+   * only while the claim is checkable (a live claude TUI in state
+   * "running"); null elsewhere, absent on old daemons.
+   */
+  stalled?: boolean | null;
+  /**
+   * Live claude-TUI subagents from the SubagentStart/Stop hooks: the
+   * agent's own id + label (canonical, never relabeled) and the daemon's
+   * epoch-ms start stamp. Null (never []) when none, for chat rows (the
+   * chat client derives richer rows from its journal), and for hook-less
+   * TUIs; absent on old daemons.
+   */
+  subagents?: { id: string; label: string; started_at: number }[] | null;
+  /**
+   * One-line latest-hook summary of what a claude TUI just did ("ran Bash",
+   * "editing foo.rs"); replaced per hook, cleared on exit. Null for chat
+   * rows and hook-less TUIs; absent on old daemons.
+   */
+  now_line?: string | null;
+  /**
+   * The claude-TUI statusline heartbeat: model name, context-window use
+   * (whole percent), session cost (dollars, quantized to whole cents). Null
+   * for chat rows and hook-less TUIs; absent on old daemons.
+   */
+  usage?: { model: string | null; context_pct: number | null; cost_usd: number | null } | null;
+  /**
    * Which surface the session's process runs behind: "chat" (structured
    * stream-json driver) or "term" (a PTY). Server truth — the pane renders
    * whichever the daemon says. Optional on old daemons (= "term").

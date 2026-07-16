@@ -53,13 +53,21 @@ the rail's recents.
   dashboard (`LayoutCtrl.openChangesFrom`). A work line ("✳ 2 subagents · 1 background
   task") expands in place to per-row detail — live subagents ∪ background tasks on the
   shared `WorkTray` shell, with stop controls (claude chat: `{type:"stop_task"}` for both
-  kinds) — the `AgentsTray`/`BackgroundTray` derivations promoted workspace-wide.
+  kinds) — the `AgentsTray`/`BackgroundTray` derivations promoted workspace-wide. Cards
+  without a warm store get the same drop-down fed by the wire `subagents` field (claude
+  TUI hooks): label + relative age, read-only — hooks can't stop a TUI subagent, and the
+  wire and store rows never merge (double counting).
 - **Key behaviors.**
   - **Provenance is worn openly**: every card carries its fidelity tier — `protocol`
     (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs) — with a
     tooltip saying what that means (`dash.ts::provenanceOf`). Output-only cards read the
     daemon's output-recency signal for the now-line ("working — terminal output flowing" /
-    "quiet — no recent output"); "state unknown" survives only on old daemons.
+    "quiet — no recent output"); "state unknown" survives only on old daemons. Hooks
+    cards read the v0.2 status-feed fields: the wire `now_line` ("ran Bash" /
+    "editing foo.rs") beats the last-file-edited fallback, and `stalled: true` (the
+    record claims running but the PTY has been silent 3+ min) overrides the now-line
+    with a warn-toned "stalled — no output for 3+ min" — the claim is likely stale and
+    the card says so.
   - **Density-adaptive**: one agent → a hero card (plan snapshot, subagents open by
     default); 2–6 → a card grid; 7+ → compact triage rows. The side column collapses under
     the pane's own width (container query), not the window's.
@@ -68,8 +76,11 @@ the rail's recents.
     dashboard can never churn the chat pool's LRU out from under open tabs; released on
     unmount (`releaseChat`, never `disposeChat`). Cards beyond the cap render wire truth
     only — empty is honest, fabricated is lying.
-  - Cost is deliberately absent in v0.1 (no wire field carries a session total yet — the
-    v0.2 feed adds usage); the context meter shows only when a warm store reports it.
+  - **Cost + context ride the v0.2 `usage` field** (the claude-TUI statusline heartbeat):
+    with no warm store the same context meter renders from `usage.context_pct` (the
+    tooltip names the model when the heartbeat carries one) and a quiet mono `$0.42`
+    joins the footer from `usage.cost_usd`. Chat rows carry `usage` null on the wire —
+    their meter stays store-derived and a chat cost line is a later pass.
 - Plain shells collapse to one summary row ("N terminals · M running a command") with
   per-shell chips, plus `+ terminal` / `+ agent` spawners.
 

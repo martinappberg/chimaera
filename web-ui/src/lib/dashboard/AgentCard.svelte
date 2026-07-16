@@ -2,11 +2,14 @@
   /**
    * One roster card on the workspace dashboard: who, doing what, produced
    * what — and a door into the live session (the whole card opens it).
-   * Renders from server wire truth alone; when a warm chat store is passed
-   * (bounded upstream in DashboardView) it adds the live now-line, context
-   * meter, plan snapshot, and the work drop-down (live subagents ∪
-   * background tasks, on the shared WorkTray shell). Zones a card can't
-   * truthfully fill stay empty — never fabricated.
+   * Renders from server wire truth alone; the v0.2 status-feed fields let a
+   * hooks-tier claude TUI card carry a now-line, a read-only work drop-down
+   * (wire subagents), the context meter + cost (statusline usage), and a
+   * stalled warning. When a warm chat store is passed (bounded upstream in
+   * DashboardView) it upgrades to the richer store-derived now-line, plan
+   * snapshot, and work drop-down (live subagents ∪ background tasks with
+   * stop controls) — never both sources at once (double counting). Zones a
+   * card can't truthfully fill stay empty — never fabricated.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
@@ -60,7 +63,12 @@
       const lastMsg = [...store.blocks].reverse().find((b) => b.kind === "message");
       if (lastMsg !== undefined) return lastMsg.text.slice(0, 160);
     }
-    // Hook-level truth: the last file the agent wrote is the freshest signal.
+    // The wire now_line (a claude TUI's latest-hook summary) beats the
+    // files_touched fallback — fresher and more specific ("ran Bash" vs the
+    // last write); the daemon clears it on exit, so a dead card falls
+    // through honestly.
+    if (session.now_line != null && session.now_line !== "") return session.now_line;
+    // Hook-level fallback: the last file the agent wrote.
     if (prov === "hooks" && touched.length > 0) {
       return `edited ${basename(touched[touched.length - 1])}`;
     }
@@ -86,18 +94,25 @@
         ),
   );
 
+  /** Wire subagents (claude TUI SubagentStart hooks) — the read-only tier
+   *  for cards with no warm store. Never unioned with the store rows: a
+   *  warm store derives the SAME work from its journal, so merging the two
+   *  sources would double-count it. */
+  const wireAgents = $derived(store === null ? (session.subagents ?? []) : []);
+
   /** Background work (backgrounded Bash / workflows) — the level-set the
    *  BackgroundTray renders, promoted card-side the same way. A card that
    *  showed only subagents would lie by omission (design decision 12). */
   const bgTasks = $derived(store?.backgroundTasks ?? []);
-  const workCount = $derived(activeAgents.length + bgTasks.length);
+  /** Exactly one subagent source is populated (see wireAgents), so the sum
+   *  is the count — the summary label reads the same either way. */
+  const subCount = $derived(activeAgents.length + wireAgents.length);
+  const workCount = $derived(subCount + bgTasks.length);
 
   /** "2 subagents · 1 background task" — a zero half is omitted. */
   const workLabel = $derived(
     [
-      activeAgents.length > 0
-        ? `${activeAgents.length} subagent${activeAgents.length === 1 ? "" : "s"}`
-        : null,
+      subCount > 0 ? `${subCount} subagent${subCount === 1 ? "" : "s"}` : null,
       bgTasks.length > 0
         ? `${bgTasks.length} background task${bgTasks.length === 1 ? "" : "s"}`
         : null,
@@ -106,19 +121,20 @@
       .join(" · "),
   );
   /** The trays' own identity glyphs: ✳ subagents, ⧖ background-only. */
-  const workGlyph = $derived(activeAgents.length > 0 ? "✳" : "⧖");
+  const workGlyph = $derived(subCount > 0 ? "✳" : "⧖");
 
   /** The drop-down: closed by default so ten cards stay scannable; the
    *  single-agent hero opens it. Writable derived: the tray's own toggle
    *  (bound below) overrides until the hero default itself changes. */
   let workOpen = $derived(hero);
 
-  /** 1 Hz clock for the background rows' elapsed column — only while the
-   *  rows are actually visible (the BackgroundTray idiom: collapsed cards
-   *  must not tick a wake-up per second for hours). */
+  /** 1 Hz clock for the rows' elapsed/age columns (background elapsed, wire
+   *  subagent age) — only while the rows are actually visible (the
+   *  BackgroundTray idiom: collapsed cards must not tick a wake-up per
+   *  second for hours). */
   let now = $state(Date.now());
   $effect(() => {
-    if (!workOpen || bgTasks.length === 0) return;
+    if (!workOpen || (bgTasks.length === 0 && wireAgents.length === 0)) return;
     now = Date.now();
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);
@@ -148,7 +164,25 @@
   }
 
   const planEntries = $derived(hero && store !== null ? store.plan.slice(0, 6) : []);
-  const ctxPct = $derived(store?.contextPct ?? null);
+  /** Context meter: the warm store's live figure first, else the claude-TUI
+   *  statusline heartbeat — same meter, same thresholds, only the source
+   *  differs (chat rows carry wire usage null, so the two never overlap). */
+  const ctxPct = $derived(store?.contextPct ?? session.usage?.context_pct ?? null);
+  /** The meter tooltip names the model only when the statusline heartbeat
+   *  carries one (the store tier doesn't track it — don't fabricate). */
+  const ctxTitle = $derived(
+    store === null && session.usage?.model != null
+      ? `context window used — ${session.usage.model}`
+      : "context window used",
+  );
+  /** Session cost from the statusline heartbeat (claude TUI only; chat rows
+   *  carry wire usage null — their cost story is a later pass). */
+  const costUsd = $derived(session.usage?.cost_usd ?? null);
+
+  /** The hooks-tier stall check: the record claims running but the PTY has
+   *  been silent past the daemon's window, so the claim is likely stale —
+   *  say so instead of a stale now-line (honest status). */
+  const isStalled = $derived(session.stalled === true);
 
   function onKeydown(e: KeyboardEvent): void {
     if (e.key === "Enter" || e.key === " ") {
@@ -185,7 +219,16 @@
     </span>
   </div>
 
-  {#if !compact && nowLine !== null}
+  {#if !compact && isStalled}
+    <!-- Stalled overrides the now-line: whatever the hooks last said is
+         exactly the claim the silence contradicts. -->
+    <div
+      class="now stalled"
+      title="the agent reports running but its terminal has been silent — it may be stuck"
+    >
+      stalled — no output for 3+ min
+    </div>
+  {:else if !compact && nowLine !== null}
     <div class="now" title={nowLine}>{nowLine}</div>
   {/if}
 
@@ -217,6 +260,15 @@
             {/if}
           </WorkTrayRow>
         {/each}
+        {#each wireAgents as a (a.id)}
+          <!-- Hook-tier rows are read-only: hooks can't stop a TUI subagent,
+               and a stop button that can't work would be a lie. The label is
+               the agent's own type name — canonical, never relabeled. -->
+          <WorkTrayRow>
+            <span class="subname" title={a.label}>{a.label}</span>
+            <span class="subage">{relativeAge(Math.floor(a.started_at / 1000), now)}</span>
+          </WorkTrayRow>
+        {/each}
         {#each bgTasks as t (t.id)}
           {@const e = elapsed(t)}
           <WorkTrayRow
@@ -239,7 +291,7 @@
 
   <div class="meta">
     {#if ctxPct !== null}
-      <span class="ctxwrap" title="context window used">
+      <span class="ctxwrap" title={ctxTitle}>
         <span class="ctxlabel">ctx</span>
         <span class="ctx" class:hot={ctxPct > 80}><i style:width="{Math.min(ctxPct, 100)}%"></i></span>
         <span class="ctxpct">{Math.round(ctxPct)}%</span>
@@ -258,6 +310,11 @@
       </button>
     {/if}
     <span class="age">{relativeAge(session.created_at)}</span>
+    {#if costUsd !== null}
+      <span class="cost" title="session cost — from the claude statusline">
+        ${costUsd.toFixed(2)}
+      </span>
+    {/if}
   </div>
 </div>
 
@@ -405,6 +462,12 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* The stall warning wears the warn token (the attn/output-only family) —
+     a caution about a stale claim, not an error. */
+  .now.stalled {
+    color: var(--warn);
+    cursor: help;
+  }
 
   .plan {
     display: flex;
@@ -478,6 +541,12 @@
     white-space: nowrap;
     color: var(--muted);
     font-size: var(--text-xs);
+  }
+  .subage {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
   .bgname {
     flex: 1;
@@ -554,5 +623,12 @@
     margin-left: auto;
     flex: none;
     opacity: 0.8;
+  }
+  /* Quiet running-cost figure (statusline heartbeat), riding the footer's
+     mono/muted right edge next to the age. */
+  .cost {
+    flex: none;
+    opacity: 0.8;
+    font-variant-numeric: tabular-nums;
   }
 </style>
