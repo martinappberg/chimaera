@@ -103,12 +103,21 @@ pub(crate) fn statusline_script_path(session_id: &str) -> PathBuf {
 /// rows) while preserving the user's statusline exactly. Injected under the
 /// same condition as the hooks themselves; a user statusLine we cannot
 /// reproduce (no single-line command string) wins outright — no injection.
+///
+/// `mastermind` gates the workspace Mastermind's act-tier MCP tools through
+/// claude's own permission system (the dashboard plan §6): `Ask` pre-allows
+/// ONLY the read tools (reads never nag; every act call raises claude's
+/// native permission prompt), `Auto` pre-allows the whole chimaera server.
+/// `None` (every non-mastermind session) writes no permissions block. A
+/// running claude never re-reads this file, so a mode change re-creates the
+/// session (the PUT mastermind route) rather than editing in place.
 pub(crate) fn write_settings(
     session_id: &str,
     key: &str,
     port: u16,
     theme: Option<&str>,
     user_statusline: Option<&serde_json::Value>,
+    mastermind: Option<crate::workspaces::MastermindMode>,
 ) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -121,6 +130,19 @@ pub(crate) fn write_settings(
     let mut settings = json!({ "hooks": hooks });
     if let Some(theme) = theme {
         settings["theme"] = json!(theme);
+    }
+    if let Some(mode) = mastermind {
+        let allow = match mode {
+            crate::workspaces::MastermindMode::Ask => json!([
+                "mcp__chimaera__workspace_status",
+                "mcp__chimaera__read_session",
+                "mcp__chimaera__list_changed_files",
+                "mcp__chimaera__list_terminals",
+                "mcp__chimaera__read_terminal",
+            ]),
+            crate::workspaces::MastermindMode::Auto => json!(["mcp__chimaera"]),
+        };
+        settings["permissions"] = json!({ "allow": allow });
     }
     if let Some(passthrough) = statusline_passthrough(user_statusline) {
         let script = write_statusline_script(session_id, key, port, passthrough.as_deref())?;
@@ -208,13 +230,20 @@ fn write_statusline_script(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// The per-session MCP endpoint URL (key-in-URL auth — an agent's MCP client
+/// cannot know the daemon bearer token). One source for the claude
+/// `--mcp-config` writer and the codex `-c mcp_servers` injection.
+pub(crate) fn mcp_url(session_id: &str, key: &str, port: u16) -> String {
+    format!("http://127.0.0.1:{port}/api/v1/mcp/{session_id}?key={key}")
+}
+
 /// Write the per-agent MCP config wiring claude to this daemon's
 /// linked-terminal tools (`--mcp-config`; merges with the user's own MCP
 /// servers). Mode 0600 — the URL embeds the session secret.
 pub(crate) fn write_mcp_config(session_id: &str, key: &str, port: u16) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let url = format!("http://127.0.0.1:{port}/api/v1/mcp/{session_id}?key={key}");
+    let url = mcp_url(session_id, key, port);
     let config = json!({
         "mcpServers": { "chimaera": { "type": "http", "url": url } }
     });
@@ -597,7 +626,7 @@ mod tests {
     fn settings_file_embeds_hook_url() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
         let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}");
@@ -611,6 +640,8 @@ mod tests {
         // No theme requested: the settings stay hooks-only (a user with an
         // explicit theme choice is never overridden).
         assert!(value.get("theme").is_none());
+        // Not a mastermind: no permissions block (the pre-mastermind shape).
+        assert!(value.get("permissions").is_none());
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -625,7 +656,7 @@ mod tests {
     fn settings_file_merges_theme_next_to_hooks() {
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, Some("light"), None).unwrap();
+        let path = write_settings(&sid, &key, 43999, Some("light"), None, None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["theme"], "light");
@@ -634,6 +665,50 @@ mod tests {
             value["hooks"]["SessionStart"][0]["hooks"][0]["type"],
             "http"
         );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+    }
+
+    /// The Mastermind's harness gating rides the generated settings: ask
+    /// mode pre-allows ONLY the read tools (acts raise claude's native
+    /// permission prompt → the attention lane); auto pre-allows the whole
+    /// chimaera server. The exact rule strings are the contract claude
+    /// matches against — pin them.
+    #[test]
+    fn settings_permissions_gate_mastermind_modes() {
+        use crate::workspaces::MastermindMode;
+
+        let key = fresh_agent_key();
+
+        let sid = fresh_session_id();
+        let path =
+            write_settings(&sid, &key, 43999, None, None, Some(MastermindMode::Ask)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["permissions"]["allow"],
+            json!([
+                "mcp__chimaera__workspace_status",
+                "mcp__chimaera__read_session",
+                "mcp__chimaera__list_changed_files",
+                "mcp__chimaera__list_terminals",
+                "mcp__chimaera__read_terminal",
+            ])
+        );
+        // The hooks still ride along untouched.
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["type"],
+            "http"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(statusline_script_path(&sid)).ok();
+
+        let sid = fresh_session_id();
+        let path =
+            write_settings(&sid, &key, 43999, None, None, Some(MastermindMode::Auto)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["permissions"]["allow"], json!(["mcp__chimaera"]));
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(statusline_script_path(&sid)).ok();
     }
@@ -650,7 +725,7 @@ mod tests {
         // (a) No user statusline: wrapper injected, prints nothing itself.
         let sid = fresh_session_id();
         let key = fresh_agent_key();
-        let path = write_settings(&sid, &key, 43999, None, None).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, None, None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let script_path = statusline_script_path(&sid);
@@ -680,7 +755,7 @@ mod tests {
         // (b) A user statusline command: piped the same stdin, padding kept.
         let sid = fresh_session_id();
         let user = json!({"type": "command", "command": "my-status --flag", "padding": 0});
-        let path = write_settings(&sid, &key, 43999, None, Some(&user)).unwrap();
+        let path = write_settings(&sid, &key, 43999, None, Some(&user), None).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["statusLine"]["padding"], 0);
@@ -708,7 +783,7 @@ mod tests {
             json!({"type": "widget"}),
         ] {
             let sid = fresh_session_id();
-            let path = write_settings(&sid, &key, 43999, None, Some(&user)).unwrap();
+            let path = write_settings(&sid, &key, 43999, None, Some(&user), None).unwrap();
             let value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert!(value.get("statusLine").is_none(), "{user}");

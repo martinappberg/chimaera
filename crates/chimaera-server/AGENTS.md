@@ -61,6 +61,59 @@ explicit nulls: the chat client derives richer versions from its journal):
 
 The wire shapes are pinned in `session_view.rs` tests — extend additively.
 
+## The Mastermind (v1)
+
+One privileged chat session per workspace (the dashboard plan §6/§7 —
+"read for all, act for one", v1 scopes both new MCP tiers to it). The pieces:
+
+- **Binding** — `Workspace.mastermind: Option<MastermindCfg{session_id, mode}>`
+  (`workspaces.rs`), persisted in `workspaces.json` and additive on the
+  `GET /workspaces` wire. `mode` is `ask | auto`. Exactly one per workspace.
+- **Routes** (`api/workspaces.rs`) — `PUT /workspaces/{id}/mastermind
+  {agent, mode, model?, theme?}` **creates the chat session AND binds it in
+  one step**, bind-before-spawn (the generated settings must carry the mode
+  before the process exists), retiring any previous Mastermind first (its
+  identity is pre-removed so the exit path can't push it into Recents — the
+  Mastermind is never a roster conversation). Mode changes are a re-PUT: a
+  running claude never re-reads its settings file. `DELETE` unbinds + kills.
+  Claude-only in v1 — codex loads the MCP tools but has no per-tool ask gate
+  (its approvals cover exec/patch/network only), so agent=codex is refused
+  with an explanation.
+- **Wire flag** — additive `"mastermind": true` on the session row (both
+  builders: `session_json` / `chat_session_json`; null elsewhere), computed
+  per snapshot from the binding. The UI hides flagged rows from the
+  roster/rail (the observer, not the observed).
+- **MCP tiers** (`mcp.rs`) — the tier is `mastermind_of()` (who you are, not
+  a grant), computed per call on the stateless endpoint: firing the
+  Mastermind drops the tier on the very next call. Observe:
+  `workspace_status` / `read_session` / `list_changed_files` (read-only;
+  `read_session` may read agent-TUI screens — reading is safe, typing never
+  is). Act: `spawn_agent` / `spawn_terminal` (the normal spawn paths, never
+  a mastermind) / `message_agent` / `interrupt_agent` (**chat sessions in
+  the same workspace only** — the exec-409 wall: nothing types into a TUI;
+  those answers say "propose to the user"). `message_agent` rides the same
+  `ChatManager::command` path a `/ws/chat` Send takes, prefixed
+  `[from the workspace Mastermind]` (provenance stamping). Every act call
+  logs a `tracing::info!` audit line. Every answer is capped (constants at
+  the top of `mcp.rs`); journal tails read under `spawn_blocking`.
+- **Harness gating** (`agents.rs::write_settings`) — ask mode pre-allows
+  ONLY the read tools in `permissions.allow` (acts raise claude's native
+  permission prompt → the attention lane); auto pre-allows `mcp__chimaera`.
+  The role prompt is argv (`launcher::MASTERMIND_SYSTEM_PROMPT`, via
+  `--append-system-prompt`).
+- **Reactive-only** — the daemon never triggers a Mastermind turn; it speaks
+  only when the user (or nothing) does. No event-nudged turns, no
+  `ask_mastermind` in v1 (decision 9 in the plan).
+- **Lifecycle** — resurrection (`resurrect_chat`) re-resolves the mode from
+  the binding; view-switch/rewind respawns resolve `ChatRecipe.mastermind`
+  from the binding too. A Mastermind that dies on its own clears its binding
+  in `recents::retire` (and skips Recents).
+
+Codex chat sessions (workers) get the per-session chimaera MCP injected at
+spawn via `-c mcp_servers.chimaera.url=…` (`launcher::build_codex_chat_command`,
+verified codex 0.144.2) — the same key-in-URL endpoint claude's
+`--mcp-config` points at.
+
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 
 `chimaera-agent` owns the drivers, journal, and registry (`state.chat`). This

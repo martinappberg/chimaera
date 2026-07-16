@@ -352,6 +352,25 @@ pub(super) async fn spawn_integrated_bash(state: &Arc<AppState>, label: &str) ->
     info.id
 }
 
+/// Write a minimal fake `claude` chat binary: answers the stream-json
+/// initialize handshake (the driver hardcodes request_id "init") and then
+/// stays alive swallowing stdin, so spawn-path route tests run hermetically.
+/// Protocol depth lives in chimaera-agent's scripted `fake-claude`; this is
+/// just enough for "the driver spawned and registered".
+pub(super) fn write_fake_claude(label: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = test_dir(label).join("claude");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"init\",\"response\":{\"commands\":[]}}}'\n\
+         cat >/dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 /// POST one JSON-RPC message to an agent's MCP endpoint.
 pub(super) async fn mcp_post(
     state: &Arc<AppState>,

@@ -271,6 +271,34 @@ async fn spawn_chat_ui(
         }
     }
 
+    // No resume: the shared fresh-spawn plumbing (also the mastermind PUT's
+    // and the Mastermind spawn_agent tool's path). Everything below this
+    // point is the resume story: journal seeding + the TUI fallback.
+    if body.resume.is_none() {
+        return match crate::chat::spawn_fresh_chat(
+            state,
+            workspace,
+            crate::chat::FreshChat {
+                id: None,
+                kind: agent_kind,
+                model: body.model,
+                name: body.name,
+                title_hint: body.title_hint,
+                theme: theme.to_string(),
+                prelude: body.prelude.filter(|p| !p.trim().is_empty()),
+                mastermind: None,
+            },
+        )
+        .await
+        {
+            Ok(row) => Json(row).into_response(),
+            Err(crate::chat::ChatSpawnFailure::AgentUnavailable(msg)) => {
+                (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response()
+            }
+            Err(crate::chat::ChatSpawnFailure::Internal(err)) => internal(err),
+        };
+    }
+
     let id = crate::agents::fresh_session_id();
     // Take the path AND its probed version from one detection so the chat
     // driver's version notice reflects the binary it actually spawns.
@@ -282,7 +310,8 @@ async fn spawn_chat_ui(
     };
     let key = crate::agents::fresh_agent_key();
     // Hook injection + theme (claude-only), unless the user's settings pick a
-    // theme themselves.
+    // theme themselves. A resumed recent is never a Mastermind (masterminds
+    // never retire into recents), so no mastermind gating here.
     let settings = if agent_kind == crate::agents::AgentKind::Claude {
         let settings_theme =
             (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path)).then_some(theme);
@@ -293,6 +322,7 @@ async fn spawn_chat_ui(
             state.port,
             settings_theme,
             user_statusline.as_ref(),
+            None,
         ) {
             Ok(path) => Some(path),
             Err(err) => return internal(err),
@@ -352,6 +382,7 @@ async fn spawn_chat_ui(
         rollback_turns: None,
         theme: theme.to_string(),
         prelude: body.prelude.clone().filter(|p| !p.trim().is_empty()),
+        mastermind: false,
     };
 
     // A resumed recent replays no history over the wire — seed the new journal
@@ -411,6 +442,7 @@ async fn spawn_chat_ui(
                 &info,
                 Some(workspace.id),
                 Some(&record),
+                false,
             ))
             .into_response()
         }

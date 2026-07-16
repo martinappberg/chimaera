@@ -6,6 +6,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// How the workspace Mastermind's act-tier MCP tools are gated by its own
+/// harness (the dashboard plan §6): `ask` pre-allows only the read tools
+/// (every act call raises the agent's native permission prompt), `auto`
+/// pre-allows the whole chimaera server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MastermindMode {
+    Ask,
+    Auto,
+}
+
+/// The workspace's bound Mastermind: exactly one privileged chat session per
+/// workspace (picked by the user), the only principal the act-tier MCP tools
+/// answer to. Persisted on the Workspace so a daemon restart resurrects the
+/// session with the same mode.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct MastermindCfg {
+    pub(crate) session_id: String,
+    pub(crate) mode: MastermindMode,
+}
+
 /// A registered workspace: a canonicalized directory the user opened.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Workspace {
@@ -15,6 +36,10 @@ pub(crate) struct Workspace {
     /// Unix seconds of the last open/activity; 0 for pre-upgrade records.
     #[serde(default)]
     pub(crate) last_opened_at: u64,
+    /// The bound Mastermind, if the user appointed one. Additive wire field:
+    /// absent for unbound workspaces (and for every pre-upgrade record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mastermind: Option<MastermindCfg>,
 }
 
 /// In-memory workspace list backed by a JSON file (save-on-change).
@@ -68,6 +93,7 @@ impl WorkspaceStore {
             root,
             name,
             last_opened_at: unix_now(),
+            mastermind: None,
         };
         self.items.push(workspace.clone());
         self.save()?;
@@ -84,6 +110,52 @@ impl WorkspaceStore {
             tracing::warn!(%err, "failed to persist workspace touch");
         }
         Some(workspace)
+    }
+
+    /// Set (or clear) `id`'s Mastermind binding, persisting on change
+    /// (mirrors `touch`). Returns the updated workspace, or None if unknown.
+    pub(crate) fn set_mastermind(
+        &mut self,
+        id: &str,
+        cfg: Option<MastermindCfg>,
+    ) -> Option<Workspace> {
+        let entry = self.items.iter_mut().find(|w| w.id == id)?;
+        entry.mastermind = cfg;
+        let workspace = entry.clone();
+        if let Err(err) = self.save() {
+            tracing::warn!(%err, "failed to persist mastermind binding");
+        }
+        Some(workspace)
+    }
+
+    /// Clear `workspace_id`'s Mastermind binding IF it names `session_id`
+    /// (the retire path: a dead Mastermind must not stay bound). Returns
+    /// whether it did.
+    pub(crate) fn clear_mastermind_if(&mut self, workspace_id: &str, session_id: &str) -> bool {
+        let bound = self.items.iter().any(|w| {
+            w.id == workspace_id
+                && w.mastermind
+                    .as_ref()
+                    .is_some_and(|m| m.session_id == session_id)
+        });
+        if bound {
+            self.set_mastermind(workspace_id, None);
+        }
+        bound
+    }
+
+    /// workspace id -> bound Mastermind session id, for the roster snapshot
+    /// (the additive `mastermind` wire flag is computed per snapshot, so it
+    /// can never disagree with the store).
+    pub(crate) fn mastermind_bindings(&self) -> std::collections::HashMap<String, String> {
+        self.items
+            .iter()
+            .filter_map(|w| {
+                w.mastermind
+                    .as_ref()
+                    .map(|m| (w.id.clone(), m.session_id.clone()))
+            })
+            .collect()
     }
 
     /// Unregister `id` (never touches the directory). Returns whether it
@@ -117,4 +189,73 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Whether `session_id` is `workspace_id`'s bound Mastermind. The one
+/// predicate every tier check shares (MCP gating, the wire flag, respawns).
+pub(crate) fn is_workspace_mastermind(
+    state: &crate::AppState,
+    workspace_id: &str,
+    session_id: &str,
+) -> bool {
+    crate::lock(&state.workspaces)
+        .get(workspace_id)
+        .and_then(|w| w.mastermind)
+        .is_some_and(|m| m.session_id == session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-ws-store-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The Mastermind binding round-trips the store file: set persists, a
+    /// fresh load reads it back (serde-lowercase mode included), clear
+    /// persists too. Pre-binding records load with `mastermind: None`.
+    #[test]
+    fn mastermind_binding_round_trips_persistence() {
+        let path = test_dir("mm-roundtrip").join("workspaces.json");
+        let root = test_dir("mm-root");
+        let mut store = WorkspaceStore::load(path.clone());
+        let ws = store.add(root).unwrap();
+        assert!(ws.mastermind.is_none());
+
+        let cfg = MastermindCfg {
+            session_id: "s-mm000001".to_string(),
+            mode: MastermindMode::Auto,
+        };
+        let updated = store.set_mastermind(&ws.id, Some(cfg)).unwrap();
+        assert_eq!(
+            updated.mastermind.as_ref().unwrap().session_id,
+            "s-mm000001"
+        );
+
+        // The mode serializes lowercase (the wire + store contract).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"mode\": \"auto\""), "{raw}");
+
+        let reloaded = WorkspaceStore::load(path.clone());
+        let back = reloaded.get(&ws.id).unwrap().mastermind.unwrap();
+        assert_eq!(back.session_id, "s-mm000001");
+        assert_eq!(back.mode, MastermindMode::Auto);
+        assert_eq!(
+            reloaded.mastermind_bindings(),
+            std::collections::HashMap::from([(ws.id.clone(), "s-mm000001".to_string())])
+        );
+
+        // clear_mastermind_if only clears a MATCHING binding.
+        let mut store = WorkspaceStore::load(path.clone());
+        assert!(!store.clear_mastermind_if(&ws.id, "s-other"));
+        assert!(store.clear_mastermind_if(&ws.id, "s-mm000001"));
+        let reloaded = WorkspaceStore::load(path);
+        assert!(reloaded.get(&ws.id).unwrap().mastermind.is_none());
+
+        std::fs::remove_file(reloaded.path.clone()).ok();
+    }
 }

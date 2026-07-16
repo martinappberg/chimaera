@@ -243,6 +243,15 @@ pub(crate) fn retire(
     // but tidy is tidy).
     crate::environment::remove_prelude_file(session_id);
 
+    // A dead Mastermind must not stay bound (the dock would show a ghost),
+    // and it never lands in Recents: it is the observer, not a roster
+    // conversation — resuming it as a normal chat would leak MCP status
+    // dumps into the launcher. The PUT/DELETE routes pre-remove the record
+    // (making this retire a no-op); this arm covers self-exits.
+    let was_mastermind = workspace_id
+        .as_deref()
+        .is_some_and(|ws| crate::lock(&state.workspaces).clear_mastermind_if(ws, session_id));
+
     let title = pinned
         .map(str::to_string)
         .unwrap_or_else(|| record.display_name(osc));
@@ -250,7 +259,8 @@ pub(crate) fn retire(
     // empty boots, nothing a human could recognize in a list. Codex/gemini
     // have no title machinery yet, so their bare-name rows stay (dropping
     // them would keep those agents out of recents entirely).
-    let skip = record.kind == AgentKind::Claude && title == record.kind.as_str();
+    let skip =
+        was_mastermind || (record.kind == AgentKind::Claude && title == record.kind.as_str());
     if let Some(workspace_id) = workspace_id.filter(|_| !skip) {
         // Only promise resumption a transcript can deliver: claude 2.1.204
         // interactive sessions persist NO transcript (verified 2026-07-07),

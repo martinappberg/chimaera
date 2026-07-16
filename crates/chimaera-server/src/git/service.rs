@@ -534,6 +534,50 @@ pub(super) fn configured_git(state: &AppState) -> Option<String> {
     crate::lock(&state.settings).git_path()
 }
 
+/// Dirty-path cap on [`git_facts`]: the MCP answer is a digest, not the
+/// status panel.
+pub(crate) const GIT_FACTS_DIRTY_CAP: usize = 100;
+
+/// Compact repo facts for the workspace MCP (`workspace_status` /
+/// `list_changed_files`): branch, ahead/behind, and dirty paths
+/// (workspace-relative, capped). `None` on ANY failure — missing/old git,
+/// not a repo, a wedged status — so the MCP answer degrades to null instead
+/// of erroring. Bounded by the same timeout/semaphore fences as every other
+/// git call; read-only (never publishes, so no epoch side effects).
+pub(crate) struct GitFacts {
+    pub(crate) branch: Option<String>,
+    pub(crate) ahead: i64,
+    pub(crate) behind: i64,
+    pub(crate) dirty: Vec<String>,
+    /// More dirty paths exist than the cap allows.
+    pub(crate) dirty_truncated: bool,
+}
+
+pub(crate) async fn git_facts(state: &AppState, ws_id: &str, root: &Path) -> Option<GitFacts> {
+    let git = state.git.resolve_git(configured_git(state)).await;
+    if !git.adequate {
+        return None;
+    }
+    let repo = state
+        .git
+        .discover(&git.path, ws_id, root)
+        .await
+        .into_repo()?;
+    let data = state.git.status(&git.path, &repo).await.ok()?;
+    let dirty: Vec<String> = data
+        .rel_paths()
+        .take(GIT_FACTS_DIRTY_CAP)
+        .map(str::to_string)
+        .collect();
+    Some(GitFacts {
+        branch: data.branch.clone(),
+        ahead: data.ahead,
+        behind: data.behind,
+        dirty_truncated: data.entries.len() > GIT_FACTS_DIRTY_CAP || data.truncated,
+        dirty,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

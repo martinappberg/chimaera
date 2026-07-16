@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{middleware, Router};
 use tower_http::trace::TraceLayer;
 
@@ -23,6 +23,12 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         )
         .route("/workspaces/{id}", delete(api::delete_workspace))
         .route("/workspaces/{id}/open", post(api::open_workspace))
+        // The workspace Mastermind: PUT creates-and-binds (re-PUT retires the
+        // old one — that is also how the mode changes), DELETE unbinds.
+        .route(
+            "/workspaces/{id}/mastermind",
+            put(api::put_mastermind).delete(api::delete_mastermind),
+        )
         .route(
             "/sessions",
             get(api::list_sessions)

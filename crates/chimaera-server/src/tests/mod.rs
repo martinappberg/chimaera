@@ -7,6 +7,7 @@ mod fs;
 mod git;
 mod ledger;
 mod links;
+mod mastermind;
 mod mcp;
 mod recents;
 mod resumables;

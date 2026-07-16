@@ -138,12 +138,15 @@ pub(crate) async fn spawn_session(
                         .then_some(spec.theme.as_str());
                 let user_statusline =
                     crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+                // PTY TUI spawns are never the Mastermind (a chat-only role),
+                // so no permissions block rides these settings.
                 match crate::agents::write_settings(
                     &id,
                     &key,
                     state.port,
                     settings_theme,
                     user_statusline.as_ref(),
+                    None,
                 ) {
                     Ok(path) => Some(path),
                     Err(err) => {
@@ -230,8 +233,9 @@ pub(crate) async fn spawn_session(
                 Some(workspace.id),
                 agent.as_ref(),
                 polled.as_deref(),
-                None, // fresh session: cwd_current is the spawn cwd
-                None, // no exec in flight
+                None,  // fresh session: cwd_current is the spawn cwd
+                None,  // no exec in flight
+                false, // a fresh PTY spawn is never a bound Mastermind
             ))
         }
         Err(err) => {

@@ -35,7 +35,10 @@ pub(crate) fn now_ms() -> u64 {
 /// `agent` is the wrapper record for kind "agent" sessions; `None` means a
 /// plain shell. `polled` / `polled_cwd` are the shell naming watcher's
 /// latest values, if any; `cwd_current` falls back to the spawn cwd (agents,
-/// never-polled shells).
+/// never-polled shells). `mastermind` is the additive wire flag: `true` only
+/// when this session is its workspace's bound Mastermind (a chat session
+/// normally, but a degraded/toggled Mastermind can live as a PTY), `null`
+/// otherwise — the UI hides flagged rows from the roster/rail.
 pub(crate) fn session_json(
     info: &chimaera_pty::SessionInfo,
     workspace_id: Option<String>,
@@ -43,6 +46,7 @@ pub(crate) fn session_json(
     polled: Option<&str>,
     polled_cwd: Option<&std::path::Path>,
     exec_stage: Option<chimaera_pty::ExecStage>,
+    mastermind: bool,
 ) -> serde_json::Value {
     let mut map = match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -136,6 +140,14 @@ pub(crate) fn session_json(
             .and_then(|a| a.usage.as_ref())
             .map_or(serde_json::Value::Null, |u| u.to_json()),
     );
+    map.insert(
+        "mastermind".to_string(),
+        if mastermind {
+            json!(true)
+        } else {
+            serde_json::Value::Null
+        },
+    );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the
     // pin for the UI); agents and shells resolve their own chains.
@@ -154,16 +166,26 @@ pub(crate) fn session_json(
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots): PTY rows plus synthetic rows for structured chat
 /// sessions, sorted by creation time so the rail interleaves them honestly.
-/// Lock order: session_workspaces -> agents -> display_names ->
+/// Lock order: workspaces (taken and dropped first, for the mastermind
+/// bindings) -> session_workspaces -> agents -> display_names ->
 /// current_cwds -> exec_status.
 pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let sessions = state.sessions.list();
     let chats = state.chat.list();
+    // Mastermind bindings (workspace id -> session id), taken — and dropped —
+    // BEFORE the row locks below so the workspace store never nests inside
+    // them. Computed per snapshot, so the flag can't disagree with the store.
+    let masterminds = crate::lock(&state.workspaces).mastermind_bindings();
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
     let names = crate::lock(&state.display_names);
     let cwds = crate::lock(&state.current_cwds);
     let execs = crate::lock(&state.exec_status);
+    let is_mastermind = |id: &str| {
+        workspaces
+            .get(id)
+            .is_some_and(|ws| masterminds.get(ws).is_some_and(|sid| sid == id))
+    };
     let mut rows: Vec<(u64, serde_json::Value)> = sessions
         .iter()
         .map(|info| {
@@ -174,6 +196,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 names.get(&info.id).map(String::as_str),
                 cwds.get(&info.id).map(PathBuf::as_path),
                 execs.get(&info.id).copied(),
+                is_mastermind(&info.id),
             );
             if let serde_json::Value::Object(map) = &mut row {
                 map.insert("ui".to_string(), json!("term"));
@@ -190,6 +213,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 info,
                 workspaces.get(&info.id).cloned(),
                 agents.get(&info.id),
+                is_mastermind(&info.id),
             ),
         )
     }));
@@ -232,6 +256,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 "subagents": null,
                 "now_line": null,
                 "usage": null,
+                "mastermind": if is_mastermind(id) { json!(true) } else { json!(null) },
                 "display_name": record.display_name(None),
                 "ui": target,
                 "chat_capable": true,
@@ -272,7 +297,7 @@ mod tests {
     #[test]
     fn output_active_gates_on_unknown_live_agent_rows() {
         let active = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
-            session_json(&info, None, agent, None, None, None)["output_active"].clone()
+            session_json(&info, None, agent, None, None, None, false)["output_active"].clone()
         };
 
         // Shell rows (no agent record): null.
@@ -302,7 +327,7 @@ mod tests {
     #[test]
     fn stalled_gates_on_running_live_claude_rows() {
         let stalled = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
-            session_json(&info, None, agent, None, None, None)["stalled"].clone()
+            session_json(&info, None, agent, None, None, None, false)["stalled"].clone()
         };
         let quiet_ms = now_ms() - STALL_QUIET.as_millis() as u64 - 1_000;
 
@@ -329,7 +354,7 @@ mod tests {
     #[test]
     fn status_feed_fields_ride_agent_rows() {
         let row = |agent: Option<&AgentRecord>| {
-            session_json(&info(true, now_ms()), None, agent, None, None, None)
+            session_json(&info(true, now_ms()), None, agent, None, None, None, false)
         };
 
         // Nothing known: all three are null (shells and fresh agents alike).
@@ -357,5 +382,29 @@ mod tests {
             row["usage"],
             json!({"model": "Opus", "context_pct": 42, "cost_usd": 0.12})
         );
+    }
+
+    /// `mastermind` is part of the wire contract: `true` only for the
+    /// workspace's bound Mastermind (the UI hides flagged rows from the
+    /// roster/rail), null on every other row — shells included. Pinned here;
+    /// the UI has no tests of its own.
+    #[test]
+    fn mastermind_flag_rides_session_rows() {
+        let record = AgentRecord::new("k".into(), AgentKind::Claude);
+        let row = |agent: Option<&AgentRecord>, mastermind: bool| {
+            session_json(
+                &info(true, now_ms()),
+                None,
+                agent,
+                None,
+                None,
+                None,
+                mastermind,
+            )["mastermind"]
+                .clone()
+        };
+        assert_eq!(row(Some(&record), true), json!(true));
+        assert_eq!(row(Some(&record), false), json!(null));
+        assert_eq!(row(None, false), json!(null));
     }
 }
