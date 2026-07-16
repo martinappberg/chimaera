@@ -3,7 +3,7 @@
     launchComputeSession,
     type ComputeLaunchSpec,
   } from "./computeSessions";
-  import type { ComputePartition } from "./compute";
+  import { parseSlurmTimeLeft, type ComputePartition } from "./compute";
 
   interface Props {
     /** The host the job submits on — display only; the submission goes to
@@ -37,6 +37,43 @@
   let error = $state<string | null>(null);
 
   const canSubmit = $derived(!busy && time.trim() !== "");
+
+  // --- per-partition ceilings (sinfo %l/%c/%m) — hints + a soft pre-flight.
+  // Slurm remains the authority (QOS/account rules can differ); the launch
+  // is never blocked, but a request already over the published limit gets
+  // told BEFORE the round-trip.
+  const selected = $derived(partitions.find((p) => p.name === partition.trim()) ?? null);
+
+  /** sinfo %m is MB ("128000+") — read as "128G+ mem/node". */
+  function fmtMemPerNode(raw: string): string {
+    const m = raw.match(/^(\d+)(\+?)$/);
+    if (m === null) return raw;
+    return `${Math.round(Number(m[1]) / 1000)}G${m[2]}`;
+  }
+
+  const partitionHint = $derived.by(() => {
+    if (selected === null) return "";
+    const parts: string[] = [];
+    if (selected.time_limit !== "") parts.push(`up to ${selected.time_limit}`);
+    if (selected.cpus_per_node !== "") parts.push(`${selected.cpus_per_node} cpus/node`);
+    if (selected.mem_per_node !== "") parts.push(`${fmtMemPerNode(selected.mem_per_node)}/node`);
+    return parts.join(" · ");
+  });
+
+  /** Accepts sbatch's common walltime spellings (bare minutes included). */
+  function parseWalltime(s: string): number | null {
+    const t = s.trim();
+    if (/^\d+$/.test(t)) return Number(t) * 60;
+    return parseSlurmTimeLeft(t);
+  }
+
+  const timeWarning = $derived.by(() => {
+    if (selected === null || selected.time_limit === "") return null;
+    const limit = parseSlurmTimeLeft(selected.time_limit);
+    const asked = parseWalltime(time);
+    if (limit === null || asked === null || asked <= limit) return null;
+    return `${selected.name} allows at most ${selected.time_limit}`;
+  });
 
   async function submit(): Promise<void> {
     if (!canSubmit) return;
@@ -122,12 +159,16 @@
               autocomplete="off"
             />
           {/if}
+          {#if partitionHint !== ""}
+            <span class="hint mono">{partitionHint}</span>
+          {/if}
         </label>
         <div class="triple">
           <label class="field">
             <span class="lab">time</span>
             <input
               class="in mono"
+              class:over={timeWarning !== null}
               bind:value={time}
               placeholder="2:00:00"
               spellcheck="false"
@@ -149,6 +190,9 @@
             />
           </label>
         </div>
+        {#if timeWarning !== null}
+          <div class="preflight">{timeWarning} — Slurm will likely refuse this walltime</div>
+        {/if}
         <label class="field">
           <span class="lab">gres</span>
           <input
@@ -354,6 +398,21 @@
   .hint {
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  .hint.mono {
+    font-family: var(--mono);
+  }
+
+  /* Over the partition's published ceiling: caution, not a block — Slurm
+     stays the authority (QOS/accounts can differ), but say so up front. */
+  .in.over {
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--edge));
+  }
+
+  .preflight {
+    font-size: var(--text-xs);
+    color: var(--warn);
   }
 
   .adv-toggle {

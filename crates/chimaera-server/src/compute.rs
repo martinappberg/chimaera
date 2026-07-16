@@ -61,6 +61,14 @@ pub(crate) struct Job {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Partition {
     pub(crate) name: String,
+    /// Per-partition ceilings straight from sinfo (`%l` walltime,
+    /// `%c` cpus/node, `%m` MB/node — "+" suffixes mean "varies upward").
+    /// Raw strings, "" when the wire lacked them: the launch dialog shows
+    /// them as hints and pre-flights the walltime, because "what can I
+    /// request here" is standard Slurm the UI should know (maintainer ask).
+    pub(crate) time_limit: String,
+    pub(crate) cpus_per_node: String,
+    pub(crate) mem_per_node: String,
     pub(crate) default: bool,
     pub(crate) avail: bool,
     pub(crate) nodes: u64,
@@ -349,7 +357,7 @@ async fn fetch_snapshot(
     };
     let parts_out = run_capped(
         &sinfo.to_string_lossy(),
-        &["--noheader".into(), "-o".into(), "%P|%a|%D".into()],
+        &["--noheader".into(), "-o".into(), "%P|%a|%D|%l|%c|%m".into()],
     )
     .await;
 
@@ -434,14 +442,16 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
     (jobs, truncated)
 }
 
-/// `sinfo --noheader -o "%P|%a|%D"` → partitions. sinfo groups rows by the
-/// non-numeric format fields, so this yields one row per (partition, avail);
-/// the default partition carries a `*` suffix on its name.
+/// `sinfo --noheader -o "%P|%a|%D|%l|%c|%m"` → partitions. sinfo groups
+/// rows by the non-numeric format fields, so this yields one row per
+/// (partition, avail); the default partition carries a `*` suffix on its
+/// name. The limit tail (%l walltime, %c cpus/node, %m MB/node) is
+/// tolerated missing.
 fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
     let mut partitions: Vec<Partition> = Vec::new();
     let mut truncated = false;
     for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(3, '|').map(str::trim);
+        let mut f = line.splitn(6, '|').map(str::trim);
         let (Some(raw_name), Some(avail)) = (f.next(), f.next()) else {
             continue;
         };
@@ -453,12 +463,19 @@ fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
             None => (raw_name, false),
         };
         let nodes: u64 = f.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        let time_limit = f.next().unwrap_or("").to_string();
+        let cpus_per_node = f.next().unwrap_or("").to_string();
+        let mem_per_node = f.next().unwrap_or("").to_string();
         // A partition briefly listed under two avail states: keep one row,
-        // sum the nodes, "up" wins (orientation, not accounting).
+        // sum the nodes, "up" wins, first non-empty limits stick
+        // (orientation, not accounting).
         if let Some(existing) = partitions.iter_mut().find(|p| p.name == name) {
             existing.nodes += nodes;
             existing.avail |= avail == "up";
             existing.default |= default;
+            if existing.time_limit.is_empty() {
+                existing.time_limit = time_limit;
+            }
             continue;
         }
         if partitions.len() >= MAX_PARTITIONS {
@@ -467,6 +484,9 @@ fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
         }
         partitions.push(Partition {
             name: name.to_string(),
+            time_limit,
+            cpus_per_node,
+            mem_per_node,
             default,
             avail: avail == "up",
             nodes,
@@ -509,6 +529,98 @@ pub(crate) async fn run_capped_within(
         s.truncate(MAX_OUTPUT);
     }
     Some(s)
+}
+
+/// How a [`run_reported`] child failed — the caller's branch point: a tool
+/// that SPOKE gets its words surfaced; a timeout may have half-succeeded
+/// (sbatch submits before it answers) and needs reconciliation.
+pub(crate) enum ExecFailure {
+    Timeout,
+    /// Spawn failure or non-zero exit; carries the tool's own (cleaned)
+    /// stderr — for sbatch that text is the whole diagnosis ("Batch jobs
+    /// are not allowed in the 'dev' partition…" — found live; the generic
+    /// error hid it).
+    Tool(String),
+}
+
+/// [`run_capped_within`] for user-initiated actions: same timeout + caps,
+/// but stderr is kept and returned on failure instead of swallowed.
+pub(crate) async fn run_reported(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, ExecFailure> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let fut = async {
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+                if s.len() > MAX_OUTPUT {
+                    s.truncate(MAX_OUTPUT);
+                }
+                Ok(s)
+            }
+            Ok(out) => {
+                let tool = std::path::Path::new(bin)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Err(ExecFailure::Tool(clean_tool_stderr(
+                    &String::from_utf8_lossy(&out.stderr),
+                    &tool,
+                )))
+            }
+            Err(e) => Err(ExecFailure::Tool(format!("could not run {bin}: {e}"))),
+        }
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(ExecFailure::Timeout),
+    }
+}
+
+/// Slurm's stderr, made presentable: `<tool>: error: ` prefixes stripped,
+/// ASCII ruler lines dropped, whitespace collapsed, length capped. What
+/// remains is the admin-authored message — the most cluster-specific,
+/// user-actionable text we will ever have.
+fn clean_tool_stderr(raw: &str, tool: &str) -> String {
+    let tool_prefix = format!("{tool}: ");
+    let mut cleaned: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let mut line = line.trim();
+        if !tool.is_empty() {
+            while let Some(rest) = line.strip_prefix(&tool_prefix) {
+                line = rest.trim_start();
+            }
+        }
+        while let Some(rest) = line.strip_prefix("error:") {
+            line = rest.trim_start();
+        }
+        if line.is_empty() || line.chars().all(|c| c == '=' || c == '-') {
+            continue;
+        }
+        cleaned.push(line.to_string());
+    }
+    let mut s = cleaned.join(" ");
+    if s.is_empty() {
+        s = "the command failed without a message".to_string();
+    }
+    if s.len() > 400 {
+        let cut = s
+            .char_indices()
+            .take_while(|(i, _)| *i < 400)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(400);
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
 }
 
 fn now_ms() -> u64 {
@@ -572,8 +684,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_sinfo_default_star_dedupe_and_avail() {
-        let out = "normal*|up|123\nowners|up|1200\ngpu|down|48\nnormal*|up|7\n";
+    fn parse_sinfo_default_star_dedupe_avail_and_limits() {
+        // Sherlock-shaped rows with the %l|%c|%m limit tail (2026-07-16);
+        // short rows (older callers / exotic sinfo) degrade to "".
+        let out = "normal*|up|123|7-00:00:00|20+|128000+\n\
+                   owners|up|1200\n\
+                   gpu|down|48|2-00:00:00|20+|191000+\n\
+                   normal*|up|7|7-00:00:00|20+|128000+\n";
         let (parts, truncated) = parse_sinfo(out);
         assert!(!truncated);
         assert_eq!(parts.len(), 3);
@@ -582,8 +699,35 @@ mod tests {
         assert!(normal.default);
         assert!(normal.avail);
         assert_eq!(normal.nodes, 130, "duplicate avail-state rows sum");
+        assert_eq!(normal.time_limit, "7-00:00:00");
+        assert_eq!(normal.cpus_per_node, "20+");
+        assert_eq!(normal.mem_per_node, "128000+");
+        assert_eq!(parts[1].time_limit, "", "short rows degrade to empty");
         assert!(!parts[2].avail);
         assert!(!parts[1].default);
+    }
+
+    #[test]
+    fn clean_tool_stderr_keeps_the_admin_message() {
+        // The real Sherlock dev-partition refusal, verbatim shape.
+        let raw = "sbatch: error: =============================================================================\n\
+                   sbatch: error:  ERROR: batch job not allowed\n\
+                   sbatch: error: =============================================================================\n\
+                   sbatch: error:  Batch jobs are not allowed in the 'dev' partition, which is reserved for\n\
+                   sbatch: error:  interactive sessions (salloc/srun/sdev and OnDemand). Please submit\n\
+                   sbatch: error:  batch jobs to another partition (e.g. 'normal').\n\
+                   sbatch: error: -----------------------------------------------------------------------------\n\
+                   sbatch: error: Batch job submission failed: Invalid partition name specified\n";
+        let msg = clean_tool_stderr(raw, "sbatch");
+        assert!(msg.starts_with("ERROR: batch job not allowed"));
+        assert!(msg.contains("reserved for interactive sessions"));
+        assert!(msg.contains("Please submit batch jobs to another partition"));
+        assert!(!msg.contains("====="), "ruler lines dropped");
+        assert!(!msg.contains("sbatch:"), "tool prefixes stripped");
+        assert_eq!(
+            clean_tool_stderr("", "sbatch"),
+            "the command failed without a message"
+        );
     }
 
     #[test]

@@ -99,6 +99,9 @@ function parsePartition(raw: unknown): ComputePartition | null {
     default: r.default === true,
     avail: r.avail === true,
     nodes: typeof r.nodes === "number" ? r.nodes : 0,
+    time_limit: typeof r.time_limit === "string" ? r.time_limit : "",
+    cpus_per_node: typeof r.cpus_per_node === "string" ? r.cpus_per_node : "",
+    mem_per_node: typeof r.mem_per_node === "string" ? r.mem_per_node : "",
   };
 }
 

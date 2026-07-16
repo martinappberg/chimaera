@@ -294,7 +294,11 @@ pub(crate) async fn launch_compute_session(
     // A generous deadline, NOT the 5s poll discipline: sbatch against a busy
     // controller can take longer, and killing it mid-flight does not
     // unsubmit — the job lands in the queue while we report failure.
-    let out = crate::compute::run_capped_within(
+    // `run_reported` keeps stderr: when sbatch REFUSES, its own words are
+    // the diagnosis ("Batch jobs are not allowed in the 'dev' partition,
+    // which is reserved for interactive sessions…" — found live; the
+    // generic error hid exactly the sentence the user needed).
+    let out = crate::compute::run_reported(
         &sbatch.to_string_lossy(),
         &[
             "--parsable".into(),
@@ -303,6 +307,17 @@ pub(crate) async fn launch_compute_session(
         std::time::Duration::from_secs(30),
     )
     .await;
+    let out = match out {
+        Ok(out) => Some(out),
+        Err(crate::compute::ExecFailure::Tool(msg)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("sbatch: {msg}")})),
+            )
+                .into_response()
+        }
+        Err(crate::compute::ExecFailure::Timeout) => None,
+    };
     // `--parsable` prints `jobid[;cluster]`.
     let job_id = out
         .as_deref()
@@ -311,10 +326,11 @@ pub(crate) async fn launch_compute_session(
         .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
     let job_id = match job_id {
         Some(id) => id,
-        // sbatch gave no usable answer — but it may have SUBMITTED before
-        // dying/timing out. Ask the queue before crying failure: adopt the
-        // newest row wearing this launch's job name that no record claims
-        // (found live: a >5s sbatch produced "sbatch failed" + a ghost job).
+        // sbatch answered nothing usable (timeout, or odd stdout) — but it
+        // may have SUBMITTED before dying. Ask the queue before crying
+        // failure: adopt the newest row wearing this launch's job name that
+        // no record claims (found live: a >5s sbatch produced "sbatch
+        // failed" + a ghost job).
         None => match adopt_submitted(&state, &format!("chimaera-{job_slug}"), &root).await {
             Some(id) => {
                 tracing::warn!(%id, "sbatch answered late/nothing; adopted the submitted job from the queue");
@@ -323,7 +339,7 @@ pub(crate) async fn launch_compute_session(
             None => {
                 return (
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "sbatch failed — check partition/resources and cluster health"})),
+                    Json(json!({"error": "sbatch did not answer (busy controller?) and nothing matching landed in the queue — try again"})),
                 )
                     .into_response()
             }
