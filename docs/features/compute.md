@@ -19,9 +19,10 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
 
 - **What & when.** "Is this an HPC, and what do I have running?" — answered by the daemon
   about its *own* host (a remote daemon detects its own cluster; nothing is probed over ssh
-  at connect time). Detection = `command -v sbatch` through the user's login shell (same
-  reasoning as git resolution: tools often arrive via a profile-managed PATH), cached for
-  the daemon's lifetime; `?refresh=true` re-detects (e.g. after a `module load slurm`).
+  at connect time). Detection = a Rust walk of the user's login shell's `$PATH` for
+  `srun`/`scancel`/`squeue`/`sinfo` (profile-managed PATHs, and real clusters wrap the
+  tools in shell functions that defeat `command -v` — found live), cached for the
+  daemon's lifetime; `?refresh=true` re-detects (e.g. after a `module load slurm`).
 - **How it's used.** The UI fetches `GET /api/v1/compute` at boot; if `scheduler` is
   `"none"` it never asks again that page-load. On a Slurm host it refetches every 60s while
   the tab is visible. The chip appears only when `scheduler == "slurm"` and is read-only
@@ -45,7 +46,7 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   - The default partition carries sinfo's `*` suffix → surfaced as `"default": true`;
     duplicate (partition, avail) rows are merged, "up" wins.
   - **Test knob:** `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
-    `sbatch`/`squeue`/`sinfo` so the whole surface can be driven live without a cluster
+    `srun`/`scancel`/`squeue`/`sinfo` so the whole surface can be driven live without a cluster
     (the `CHIMAERA_RELEASES_API` pattern).
 - **Status: partial (by design).** Detection + the strip, plus the Mode 2 core below.
   Still to come on this seam: job↔session linking and the login-node Slurm skill (Mode 1).
@@ -55,13 +56,20 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
 - **What & when.** Launch a whole chimaera daemon *inside* an allocation and connect to it
   as a first-class entity — "a workspace you connect to, with x compute and hours left."
   The login daemon is the control plane: `POST/GET /api/v1/compute/sessions` +
-  `DELETE /api/v1/compute/sessions/{job_id}` (bearer-authed). Launch renders an sbatch
-  script (directives charset-validated; body = the environment prelude verbatim + an egress
-  probe to `caps.json`; `exec chimaera serve` with an isolated `CHIMAERA_HOME` per jobid on
-  the shared FS — same binary, no redeploy). The registry is stateless: `chimaera-`named
-  `squeue` rows ⋈ per-job manifests ⋈ launch records, rebuilt on every list — cards survive
-  laptop closes and vanish at walltime (login daemon = forever, compute daemon = until
-  walltime; the snapshot's `self` block carries the countdown the window's bottom bar wears).
+  `DELETE /api/v1/compute/sessions/{job_id}` (bearer-authed). Launch is a **DETACHED
+  `srun`** — sbatch is gone (maintainer decision, 2026-07-16): one mechanism that works on
+  EVERY partition, including interactive-only ones whose `job_submit` policy refuses batch
+  (Sherlock's `dev` — found live). `setsid nohup srun … &` orphans the client onto init,
+  giving the allocation **tmux-grade persistence**: login-daemon restarts don't touch it;
+  walltime, scancel, or a login-node reboot end it (clusters that reap login-node user
+  processes — where tmux dies too — are honest "not supported" territory). Resources ride
+  srun argv (charset-validated); the node-side script = the environment prelude verbatim +
+  an egress probe to `caps.json` + `exec chimaera serve` with an isolated `CHIMAERA_HOME`
+  per jobid on the shared FS (same binary, no redeploy). The registry is stateless:
+  `chimaera-`named `squeue` rows ⋈ per-job manifests ⋈ launch records, rebuilt on every
+  list — cards survive laptop closes and vanish at walltime (login daemon = forever,
+  compute daemon = until walltime; the snapshot's `self` block carries the countdown the
+  window's bottom bar wears).
 - **How it's used** (placement per the maintainer's first live test, 2026-07-15): the
   **host's own window** (the login daemon's home page) is the compute hub — cards (state
   dot, node, resources pill, time-left, open/cancel) + the "new compute session…" dialog
@@ -78,10 +86,11 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   so windows opened later on the same node inherit it). A fresh launch never flashes
   "ended": launch/cancel invalidate the snapshot cache, and an orphaned launch record
   younger than 120s renders as a PENDING submitted-card (squeue lag), leading the list.
-  Launch itself is race-hardened: sbatch gets a 30s deadline (killing it does NOT
-  unsubmit — a busy controller once produced "sbatch failed" plus a ghost job), a
-  no-answer launch adopts the newest unrecorded queue row wearing its job name, and
-  cards fall back to squeue's `%C`/`%m` for cpu/mem when no record exists. Launch **seeds the job daemon's workspace registry
+  Launch itself is queue-truth based: a detached srun can't hand back a job id, so every
+  launch adopts the newest unrecorded queue row wearing its job name (retried ~6s); a
+  refusal never reaches the queue, and then the srun log's tail — Slurm's own
+  admin-authored words — is the error the dialog shows. Cards fall back to squeue's
+  `%C`/`%m` for cpu/mem when no record exists. Launch **seeds the job daemon's workspace registry
   with the host's whole list** (shared-FS roots are equally valid on the node), so the
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
@@ -95,7 +104,7 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   spins during any fetch, and the local indicator reads "slurm cluster" (even at zero
   sessions — *this host has compute nodes* is the load-bearing fact) → the live session
   count, refreshed once a minute per connected host while the page is visible. The launch
-  dialog's walltime is **d/h/m segment boxes** composing the sbatch string (no Slurm
+  dialog's walltime is **d/h/m segment boxes** composing the Slurm walltime (no Slurm
   string surgery), pre-flighted against the partition's published limit. CLI parity + verification harness:
   `chimaera compute list|launch|connect|cancel <host>`.
 - **Agent awareness.** Every claude session a compute-node daemon spawns — TUI and chat

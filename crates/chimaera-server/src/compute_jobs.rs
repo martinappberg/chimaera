@@ -1,5 +1,7 @@
 //! Mode 2 — chimaera sessions AS Slurm jobs. The login-node daemon is the
-//! control plane: it owns sbatch (via `compute::Detection`), the environment
+//! control plane: it owns the DETACHED srun clients (via `compute::Detection`
+//! — sbatch is gone, maintainer decision 2026-07-16: one mechanism that works
+//! on every partition, tmux-grade persistence via setsid/nohup), the environment
 //! preludes, its own deployed binary (`current_exe`, visible on compute
 //! nodes over the shared FS — no redeploy), and the per-job homes. Launch,
 //! discovery, and cancel are daemon routes so the feature is identical for
@@ -28,11 +30,11 @@ use serde_json::json;
 use crate::compute::Detection;
 use crate::AppState;
 
-/// A launch request. Everything lands in an sbatch script, so every field
-/// is validated against a strict charset — never interpolate free text into
-/// directives (the prelude body is the one deliberate exception: it is the
-/// user's own shell text, same trust as their rc, and it lives in the
-/// script BODY, not in `#SBATCH` lines).
+/// A launch request. Everything lands in srun argv (and a script srun runs
+/// on the node), so every field is validated against a strict charset —
+/// never interpolate free text into flags (the prelude body is the one
+/// deliberate exception: it is the user's own shell text, same trust as
+/// their rc, and it lives in the script BODY, never in argv).
 #[derive(Deserialize)]
 pub(crate) struct LaunchSpec {
     /// Display name; slugged into the job name (`chimaera-<slug>`).
@@ -106,8 +108,8 @@ fn compute_root() -> PathBuf {
     chimaera_core::data_dir().join("compute")
 }
 
-/// Job-name slug: lowercase alnum/dash, bounded — goes into `#SBATCH
-/// --job-name=chimaera-<slug>` and the discovery prefix match.
+/// Job-name slug: lowercase alnum/dash, bounded — goes into srun's
+/// `--job-name=chimaera-<slug>` and the discovery prefix match.
 fn slug(name: &str) -> String {
     let mut s: String = name
         .trim()
@@ -128,7 +130,7 @@ fn slug(name: &str) -> String {
     s
 }
 
-/// Charset gate for values that land in `#SBATCH` directive lines.
+/// Charset gate for values that land in srun argv (and shell lines).
 fn safe_directive(v: &str, extra: &str) -> bool {
     !v.is_empty()
         && v.len() <= 64
@@ -136,37 +138,15 @@ fn safe_directive(v: &str, extra: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
 }
 
-/// The sbatch script. `bash -l` so the prelude sees profile functions
-/// (`ml`, conda) exactly like the agent login-wrapper; `exec` so the daemon
-/// IS the job's main process — walltime/scancel kill the whole tree. The
-/// job daemon gets an isolated CHIMAERA_HOME keyed by jobid: own manifest,
-/// token, sessions — multi-job and multi-user safe by construction.
-fn render_sbatch(
-    spec: &LaunchSpec,
-    job_slug: &str,
-    bin: &Path,
-    root: &Path,
-    prelude: &str,
-) -> String {
+/// The launch script srun runs ON THE NODE (`bash -l <script>` so the
+/// prelude sees profile functions — `ml`, conda — exactly like the agent
+/// login-wrapper); `exec` so the daemon IS the job's main process —
+/// walltime/scancel kill the whole tree. The job daemon gets an isolated
+/// CHIMAERA_HOME keyed by jobid: own manifest, token, sessions — multi-job
+/// and multi-user safe by construction. Resources live in [`srun_args`],
+/// not here (no #SBATCH lines: sbatch is gone — see the launch handler).
+fn render_launch_script(bin: &Path, root: &Path, prelude: &str, routable: bool) -> String {
     let mut s = String::from("#!/bin/bash -l\n");
-    s.push_str(&format!("#SBATCH --job-name=chimaera-{job_slug}\n"));
-    s.push_str(&format!("#SBATCH --time={}\n", spec.time));
-    if let Some(p) = &spec.partition {
-        s.push_str(&format!("#SBATCH --partition={p}\n"));
-    }
-    if let Some(c) = spec.cpus {
-        s.push_str(&format!("#SBATCH --cpus-per-task={c}\n"));
-    }
-    if let Some(m) = &spec.mem {
-        s.push_str(&format!("#SBATCH --mem={m}\n"));
-    }
-    if let Some(g) = spec.gres.as_deref().filter(|g| !g.is_empty()) {
-        s.push_str(&format!("#SBATCH --gres={g}\n"));
-    }
-    s.push_str(&format!(
-        "#SBATCH --output={}/logs/%j.log\n\n",
-        root.display()
-    ));
     s.push_str(&format!(
         "export CHIMAERA_HOME=\"{}/${{SLURM_JOB_ID}}\"\n\
          mkdir -p \"$CHIMAERA_HOME\"\n\
@@ -194,13 +174,56 @@ fn render_sbatch(
          \x20 \"$([ \"$code\" -ge 200 ] && echo true || echo false)\" \"$code\" \"$(date +%s)\" \\\n\
          \x20 > \"$CHIMAERA_HOME/caps.json\"\n\n",
     );
-    let flag = if spec.routable {
-        " --bind-routable"
-    } else {
-        ""
-    };
+    let flag = if routable { " --bind-routable" } else { "" };
     s.push_str(&format!("exec \"{}\" serve{flag}\n", bin.display()));
     s
+}
+
+/// The srun argv for a launch — resources as flags (they lived in #SBATCH
+/// directives in the sbatch era). Every value is charset-validated by the
+/// handler before this runs; the returned args are also safe to
+/// single-quote into a shell line (the charsets exclude quotes).
+fn srun_args(spec: &LaunchSpec, job_slug: &str, script: &Path) -> Vec<String> {
+    let mut a = vec![
+        format!("--job-name=chimaera-{job_slug}"),
+        format!("--time={}", spec.time),
+    ];
+    if let Some(p) = &spec.partition {
+        a.push(format!("--partition={p}"));
+    }
+    if let Some(c) = spec.cpus {
+        a.push(format!("--cpus-per-task={c}"));
+    }
+    if let Some(m) = &spec.mem {
+        a.push(format!("--mem={m}"));
+    }
+    if let Some(g) = spec.gres.as_deref().filter(|g| !g.is_empty()) {
+        a.push(format!("--gres={g}"));
+    }
+    a.push("bash".to_string());
+    a.push("-l".to_string());
+    a.push(script.to_string_lossy().into_owned());
+    a
+}
+
+/// One shell line that DETACHES srun from this daemon: `setsid`, `nohup`,
+/// and `&` together orphan the client onto init, so the allocation has
+/// tmux-grade persistence — it survives daemon restarts and ends only at
+/// walltime, scancel, or a login-node reboot (the maintainer's model:
+/// "most people have tmux sessions going there"). srun's own output
+/// (including Slurm's refusal messages) lands in `log`, which the handler
+/// tails when the job never appears in the queue.
+fn detached_srun_line(srun: &Path, args: &[String], log: &Path) -> String {
+    let quote = |s: &str| format!("'{s}'");
+    let argv: Vec<String> = std::iter::once(srun.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|a| quote(&a))
+        .collect();
+    format!(
+        "setsid nohup {} >> {} 2>&1 < /dev/null & echo detached",
+        argv.join(" "),
+        quote(&log.to_string_lossy())
+    )
 }
 
 /// POST /api/v1/compute/sessions — submit a chimaera daemon as a Slurm job.
@@ -240,7 +263,7 @@ pub(crate) async fn launch_compute_session(
         }
     }
 
-    let Detection::Slurm { sbatch, .. } = state.compute.detection().await else {
+    let Detection::Slurm { srun, .. } = state.compute.detection().await else {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "no scheduler detected on this host"})),
@@ -261,7 +284,7 @@ pub(crate) async fn launch_compute_session(
     );
     let job_slug = slug(&spec.name);
     let root = compute_root();
-    let script = render_sbatch(&spec, &job_slug, &bin, &root, &prelude);
+    let script = render_launch_script(&bin, &root, &prelude, spec.routable);
 
     // Blocking fs (shared FS!) off the reactor: dirs + the script file.
     let script_path = {
@@ -271,7 +294,7 @@ pub(crate) async fn launch_compute_session(
             std::fs::create_dir_all(root.join("scripts"))?;
             std::fs::create_dir_all(root.join("pending"))?;
             let path = root.join("scripts").join(format!(
-                "{}-{}.sbatch",
+                "{}-{}.sh",
                 chrono_free_ts(),
                 &chimaera_core::generate_token()[..6]
             ));
@@ -284,70 +307,62 @@ pub(crate) async fn launch_compute_session(
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("cannot stage sbatch script: {e}")})),
+                    Json(json!({"error": format!("cannot stage launch script: {e}")})),
                 )
                     .into_response()
             }
         }
     };
 
-    // A generous deadline, NOT the 5s poll discipline: sbatch against a busy
-    // controller can take longer, and killing it mid-flight does not
-    // unsubmit — the job lands in the queue while we report failure.
-    // `run_reported` keeps stderr: when sbatch REFUSES, its own words are
-    // the diagnosis ("Batch jobs are not allowed in the 'dev' partition,
-    // which is reserved for interactive sessions…" — found live; the
-    // generic error hid exactly the sentence the user needed).
-    let out = crate::compute::run_reported(
-        &sbatch.to_string_lossy(),
-        &[
-            "--parsable".into(),
-            script_path.to_string_lossy().into_owned(),
-        ],
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-    let out = match out {
-        Ok(out) => Some(out),
-        Err(crate::compute::ExecFailure::Tool(msg)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("sbatch: {msg}")})),
-            )
-                .into_response()
+    // DETACHED srun, not sbatch (maintainer decision, 2026-07-16): one
+    // launch mechanism that works on EVERY partition — including
+    // interactive-only ones whose job_submit policy refuses batch (found
+    // live: Sherlock's `dev`). setsid+nohup+& orphans the srun client onto
+    // init, so the allocation persists like a tmux session: daemon restarts
+    // don't touch it; walltime, scancel, or a login-node reboot end it.
+    // Slurm can't hand us the job id this way, so the id comes from the
+    // queue itself (the same adoption used for ghost recovery), and srun's
+    // own words (refusals, limits) land in a log we tail on failure.
+    let log_path = root.join("logs").join(format!(
+        "srun-{}-{}.log",
+        chrono_free_ts(),
+        &chimaera_core::generate_token()[..6]
+    ));
+    let line = detached_srun_line(&srun, &srun_args(&spec, &job_slug, &script_path), &log_path);
+    let detached = crate::compute::run_capped("bash", &["-c".into(), line]).await;
+    if detached.is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not start srun on this host"})),
+        )
+            .into_response();
+    }
+    // The job registers in squeue within moments (PENDING while it waits
+    // for resources). Adopt the newest unrecorded row wearing this launch's
+    // name; a refusal never registers, so after the retries the log tail is
+    // the diagnosis — Slurm's own words, the round-6 promise kept.
+    let mut job_id: Option<String> = None;
+    for _ in 0..4 {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        job_id = adopt_submitted(&state, &format!("chimaera-{job_slug}"), &root).await;
+        if job_id.is_some() {
+            break;
         }
-        Err(crate::compute::ExecFailure::Timeout) => None,
+    }
+    let Some(job_id) = job_id else {
+        let tail = {
+            let log_path = log_path.clone();
+            tokio::task::spawn_blocking(move || read_log_tail(&log_path))
+                .await
+                .ok()
+                .flatten()
+        };
+        let msg = match tail {
+            Some(t) if !t.is_empty() => format!("srun: {t}"),
+            _ => "srun started but the job never appeared in the queue — try again".to_string(),
+        };
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
     };
-    // `--parsable` prints `jobid[;cluster]`.
-    let job_id = out
-        .as_deref()
-        .and_then(|o| o.lines().next())
-        .map(|l| l.split(';').next().unwrap_or(l).trim().to_string())
-        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
-    let job_id = match job_id {
-        Some(id) => id,
-        // sbatch answered nothing usable (timeout, or odd stdout) — but it
-        // may have SUBMITTED before dying. Ask the queue before crying
-        // failure: adopt the newest row wearing this launch's job name that
-        // no record claims (found live: a >5s sbatch produced "sbatch
-        // failed" + a ghost job).
-        None => match adopt_submitted(&state, &format!("chimaera-{job_slug}"), &root).await {
-            Some(id) => {
-                tracing::warn!(%id, "sbatch answered late/nothing; adopted the submitted job from the queue");
-                id
-            }
-            None => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "sbatch did not answer (busy controller?) and nothing matching landed in the queue — try again"})),
-                )
-                    .into_response()
-            }
-        },
-    };
-    // The queue just changed and the UI refetches immediately — don't let
-    // that refetch see the pre-launch snapshot cache.
-    state.compute.invalidate().await;
 
     // Seed the job daemon's workspace registry over the shared FS: the job
     // will `mkdir -p` this same home, and its WorkspaceStore then boots with
@@ -423,9 +438,21 @@ pub(crate) async fn launch_compute_session(
     Json(json!({ "job_id": job_id })).into_response()
 }
 
-/// The sbatch-timeout reconciliation: force-refresh the queue and pick the
-/// newest job wearing `job_name` that no launch record claims. The fs check
-/// runs off the reactor (shared FS).
+/// The last ~4KB of a detached srun's log, cleaned into the admin-authored
+/// message ("Batch jobs are not allowed…"-grade text) — the diagnosis when
+/// a launch never reached the queue. Blocking fs: call off the reactor.
+fn read_log_tail(log: &Path) -> Option<String> {
+    let bytes = std::fs::read(log).ok()?;
+    let start = bytes.len().saturating_sub(4096);
+    let tail = String::from_utf8_lossy(&bytes[start..]);
+    let cleaned = crate::compute::clean_tool_stderr(&tail, "srun");
+    (cleaned != "the command failed without a message").then_some(cleaned)
+}
+
+/// The queue-side id discovery every launch relies on (srun can't hand us
+/// the job id the way `sbatch --parsable` did): force-refresh the queue and
+/// pick the newest job wearing `job_name` that no launch record claims. The
+/// fs check runs off the reactor (shared FS).
 async fn adopt_submitted(state: &Arc<AppState>, job_name: &str, root: &Path) -> Option<String> {
     state.compute.invalidate().await;
     let snap = state.compute.snapshot(true).await;
@@ -788,22 +815,15 @@ mod tests {
     }
 
     #[test]
-    fn render_sbatch_directives_prelude_and_exec() {
-        let s = spec();
-        let script = render_sbatch(
-            &s,
-            &slug(&s.name),
+    fn render_launch_script_prelude_and_exec() {
+        let script = render_launch_script(
             Path::new("/home/u/.chimaera-dev/bin/chimaera"),
             Path::new("/home/u/.chimaera-dev/data/compute"),
             "ml biology bcftools\nexport X=1",
+            false,
         );
         for needle in [
             "#!/bin/bash -l",
-            "#SBATCH --job-name=chimaera-my-align-run",
-            "#SBATCH --time=4:00:00",
-            "#SBATCH --partition=normal",
-            "#SBATCH --cpus-per-task=4",
-            "#SBATCH --mem=16G",
             "CHIMAERA_HOME=\"/home/u/.chimaera-dev/data/compute/${SLURM_JOB_ID}\"",
             "unset CHIMAERA_PRELUDE CHIMAERA_PRELUDE_DONE",
             "ml biology bcftools",
@@ -812,19 +832,48 @@ mod tests {
         ] {
             assert!(script.contains(needle), "missing {needle:?} in:\n{script}");
         }
-        // No gres → no gres line; prelude precedes exec; loopback default.
-        assert!(!script.contains("--gres"));
+        // Resources live in srun argv, never in the script; prelude precedes
+        // exec; loopback default.
+        assert!(!script.contains("#SBATCH"));
         assert!(script.find("bcftools").unwrap() < script.find("exec \"").unwrap());
         assert!(!script.contains("--bind-routable"));
 
-        let mut routable = spec();
-        routable.gres = Some("gpu:1".to_string());
-        routable.routable = true;
-        let script = render_sbatch(&routable, "x", Path::new("/b"), Path::new("/r"), "");
-        assert!(script.contains("#SBATCH --gres=gpu:1"));
+        let script = render_launch_script(Path::new("/b"), Path::new("/r"), "", true);
         assert!(script.ends_with("serve --bind-routable\n"));
         // Empty prelude: no prelude banner at all.
         assert!(!script.contains("environment prelude"));
+    }
+
+    #[test]
+    fn srun_args_carry_resources_and_detached_line_quotes() {
+        let s = spec();
+        let args = srun_args(&s, &slug(&s.name), Path::new("/r/scripts/a.sh"));
+        assert_eq!(
+            args,
+            vec![
+                "--job-name=chimaera-my-align-run".to_string(),
+                "--time=4:00:00".to_string(),
+                "--partition=normal".to_string(),
+                "--cpus-per-task=4".to_string(),
+                "--mem=16G".to_string(),
+                "bash".to_string(),
+                "-l".to_string(),
+                "/r/scripts/a.sh".to_string(),
+            ]
+        );
+        let mut g = spec();
+        g.gres = Some("gpu:1".to_string());
+        assert!(srun_args(&g, "x", Path::new("/s")).contains(&"--gres=gpu:1".to_string()));
+
+        // The detached line: setsid+nohup+& (tmux-grade persistence), every
+        // token single-quoted, output into the launch log.
+        let line = detached_srun_line(
+            Path::new("/usr/bin/srun"),
+            &args,
+            Path::new("/r/logs/x.log"),
+        );
+        assert!(line.starts_with("setsid nohup '/usr/bin/srun' '--job-name=chimaera-my-align-run'"));
+        assert!(line.contains(">> '/r/logs/x.log' 2>&1 < /dev/null &"));
     }
 
     #[test]

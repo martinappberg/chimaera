@@ -26,7 +26,7 @@
     partitions.find((p) => p.default)?.name ?? partitions[0]?.name ?? "",
   );
   // Walltime as separate d/h/m boxes (maintainer ask — "easier to fix" than
-  // one Slurm string); the composed sbatch form rides the wire. Numeric
+  // one Slurm string); the composed Slurm walltime rides the wire. Numeric
   // inputs bind empty as null → read as 0.
   let days = $state<number | null>(0);
   let hours = $state<number | null>(2);
@@ -88,7 +88,7 @@
     error = null;
     busy = true;
     // Empty optional fields are OMITTED, not sent as "" — the daemon composes
-    // the sbatch line from what's present.
+    // the srun argv from what's present.
     const spec: ComputeLaunchSpec = {
       name: name.trim() === "" ? "session" : name.trim(),
       time,
@@ -134,7 +134,7 @@
     >
       <div class="head">
         <span class="title">new compute session</span>
-        <span class="host">sbatch on {alias}</span>
+        <span class="host">srun on {alias}</span>
       </div>
       <div class="fields">
         <label class="field">

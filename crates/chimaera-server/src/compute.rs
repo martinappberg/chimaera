@@ -16,7 +16,7 @@
 //! clusters run, and the output is bounded by construction.
 //!
 //! Test knob: `CHIMAERA_SLURM_BINDIR` points at a directory of stand-in
-//! `sbatch`/`squeue`/`sinfo` executables so the whole surface can be driven
+//! `srun`/`scancel`/`squeue`/`sinfo` executables so the whole surface can be driven
 //! live without a cluster (the `CHIMAERA_RELEASES_API` pattern).
 
 use std::path::PathBuf;
@@ -51,8 +51,8 @@ pub(crate) struct Job {
     pub(crate) time_left: String,
     pub(crate) nodes: String,
     /// Requested/allocated CPUs (`%C`) and min memory (`%m`) — squeue's own
-    /// resource truth, so a job with no launch record (an sbatch that timed
-    /// out after submitting, or one launched outside chimaera) still shows
+    /// resource truth, so a job with no launch record (a launch whose id
+    /// was never adopted, or one launched outside chimaera) still shows
     /// what it holds. "" when the wire lacked them.
     pub(crate) cpus: String,
     pub(crate) mem: String,
@@ -127,13 +127,13 @@ impl ComputeSnapshot {
 
 /// Where the scheduler binaries live once detected. All four client tools
 /// are required together: the snapshot needs squeue/sinfo, Mode 2's
-/// launch/cancel routes need sbatch/scancel — a cluster with a partial
+/// launch/cancel routes need srun/scancel — a cluster with a partial
 /// toolset is not one we can operate on.
 #[derive(Clone, Debug)]
 pub(crate) enum Detection {
     None,
     Slurm {
-        sbatch: PathBuf,
+        srun: PathBuf,
         scancel: PathBuf,
         squeue: PathBuf,
         sinfo: PathBuf,
@@ -283,18 +283,18 @@ impl ComputeService {
     /// the only form that works identically under bash/zsh/fish.
     async fn detect(&self) -> Detection {
         if let Some(dir) = &self.bindir {
-            let tools = ["sbatch", "scancel", "squeue", "sinfo"].map(|n| dir.join(n));
+            let tools = ["srun", "scancel", "squeue", "sinfo"].map(|n| dir.join(n));
             if tools.iter().all(|p| p.is_file()) {
                 tracing::info!(dir = %dir.display(), "slurm tools from CHIMAERA_SLURM_BINDIR");
-                let [sbatch, scancel, squeue, sinfo] = tools;
+                let [srun, scancel, squeue, sinfo] = tools;
                 return Detection::Slurm {
-                    sbatch,
+                    srun,
                     scancel,
                     squeue,
                     sinfo,
                 };
             }
-            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but sbatch/scancel/squeue/sinfo not all present");
+            tracing::warn!(dir = %dir.display(), "CHIMAERA_SLURM_BINDIR set but srun/scancel/squeue/sinfo not all present");
             return Detection::None;
         }
         let shell = chimaera_core::login_shell();
@@ -305,15 +305,15 @@ impl ComputeService {
         // The walk stats PATH entries that may live on slow network mounts —
         // off the reactor with it (detection runs once per daemon lifetime).
         let found = tokio::task::spawn_blocking(move || {
-            ["sbatch", "scancel", "squeue", "sinfo"].map(|n| find_on_path(path.trim(), n))
+            ["srun", "scancel", "squeue", "sinfo"].map(|n| find_on_path(path.trim(), n))
         })
         .await
         .unwrap_or([None, None, None, None]);
         match found {
-            [Some(sbatch), Some(scancel), Some(squeue), Some(sinfo)] => {
+            [Some(srun), Some(scancel), Some(squeue), Some(sinfo)] => {
                 tracing::info!(squeue = %squeue.display(), "slurm detected");
                 Detection::Slurm {
-                    sbatch,
+                    srun,
                     scancel,
                     squeue,
                     sinfo,
@@ -631,11 +631,8 @@ pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
     run_capped_within(bin, args, CMD_TIMEOUT).await
 }
 
-/// [`run_capped`] with a caller-chosen deadline. sbatch needs a longer one
-/// than the 5s poll discipline: a busy controller can take longer to answer,
-/// and killing sbatch mid-flight does NOT unsubmit — the tight cap turned a
-/// slow submission into "sbatch failed" plus a ghost job in the queue
-/// (found live, maintainer's 5th round).
+/// [`run_capped`] with a caller-chosen deadline, for callers whose child
+/// legitimately outlives the 5s poll discipline.
 pub(crate) async fn run_capped_within(
     bin: &str,
     args: &[String],
@@ -660,64 +657,13 @@ pub(crate) async fn run_capped_within(
     Some(s)
 }
 
-/// How a [`run_reported`] child failed — the caller's branch point: a tool
-/// that SPOKE gets its words surfaced; a timeout may have half-succeeded
-/// (sbatch submits before it answers) and needs reconciliation.
-pub(crate) enum ExecFailure {
-    Timeout,
-    /// Spawn failure or non-zero exit; carries the tool's own (cleaned)
-    /// stderr — for sbatch that text is the whole diagnosis ("Batch jobs
-    /// are not allowed in the 'dev' partition…" — found live; the generic
-    /// error hid it).
-    Tool(String),
-}
-
-/// [`run_capped_within`] for user-initiated actions: same timeout + caps,
-/// but stderr is kept and returned on failure instead of swallowed.
-pub(crate) async fn run_reported(
-    bin: &str,
-    args: &[String],
-    timeout: Duration,
-) -> Result<String, ExecFailure> {
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let fut = async {
-        match cmd.output().await {
-            Ok(out) if out.status.success() => {
-                let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-                if s.len() > MAX_OUTPUT {
-                    s.truncate(MAX_OUTPUT);
-                }
-                Ok(s)
-            }
-            Ok(out) => {
-                let tool = std::path::Path::new(bin)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                Err(ExecFailure::Tool(clean_tool_stderr(
-                    &String::from_utf8_lossy(&out.stderr),
-                    &tool,
-                )))
-            }
-            Err(e) => Err(ExecFailure::Tool(format!("could not run {bin}: {e}"))),
-        }
-    };
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(res) => res,
-        Err(_) => Err(ExecFailure::Timeout),
-    }
-}
-
-/// Slurm's stderr, made presentable: `<tool>: error: ` prefixes stripped,
-/// ASCII ruler lines dropped, whitespace collapsed, length capped. What
-/// remains is the admin-authored message — the most cluster-specific,
-/// user-actionable text we will ever have.
-fn clean_tool_stderr(raw: &str, tool: &str) -> String {
+/// Slurm's stderr/log text, made presentable: `<tool>: error: ` prefixes
+/// stripped, ASCII ruler lines dropped, whitespace collapsed, length
+/// capped. What remains is the admin-authored message — the most
+/// cluster-specific, user-actionable text we will ever have (a detached
+/// srun's refusals land in its log file; `compute_jobs` tails it through
+/// this when a launch never reaches the queue).
+pub(crate) fn clean_tool_stderr(raw: &str, tool: &str) -> String {
     let tool_prefix = format!("{tool}: ");
     let mut cleaned: Vec<String> = Vec::new();
     for line in raw.lines() {
@@ -990,7 +936,7 @@ mod tests {
         // answers both forms: -u (the queue) and -j (the self allocation).
         let dir = test_dir("fake");
         for (name, body) in [
-            ("sbatch", "#!/bin/sh\nexit 0\n"),
+            ("srun", "#!/bin/sh\nexit 0\n"),
             ("scancel", "#!/bin/sh\nexit 0\n"),
             (
                 "squeue",

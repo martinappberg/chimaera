@@ -337,8 +337,21 @@ which is the survival property that matters.
   squeue-rebuilt home-screen card is the reconnect path. Verified live: launch → RUNNING →
   ready → chained-B tunnel → health/self-walltime/sessions on the node → cancel → queue clean.
   Native-app visual pass outstanding (needs the maintainer's screen).
+- **2026-07-16 (later) — SUPERSEDED below: Mode 2 launches are srun-only (maintainer
+  decision).** The sbatch-retention rationale (next entry) over-weighted login-daemon
+  restarts ("once in a blue moon" in steady state — the maintainer, correctly: "most
+  people have tmux sessions going there") and the srun-as-child objection dissolves once
+  the client is DETACHED: `setsid nohup srun … &` orphans it onto init, tmux-grade — it
+  survives daemon restarts and ends only at walltime, scancel, or a login-node reboot.
+  What srun-only buys: ONE launch mechanism that works on every partition (including
+  interactive-only ones like Sherlock's `dev`, whose job_submit policy refuses batch —
+  found live), no batch/interactive mode switch, no learned per-partition preferences.
+  Costs, accepted openly: sessions die with a login-node reboot, and clusters that reap
+  login-node user processes (where tmux dies too) are honest "not supported" territory.
+  The job id comes from queue adoption (srun can't print it detached); launch refusals
+  surface from the srun log's tail — Slurm's own words, preserved.
 - **2026-07-16 — Mode 2 stays sbatch-based; srun-as-child rejected for session ownership
-  (maintainer question, answered).** The question: "surely srun would be most compatible —
+  (maintainer question, answered; SUPERSEDED same day by the srun-only decision above).** The question: "surely srun would be most compatible —
   the login-node daemon runs srun as a background process, owns it, can kill it
   automatically." The reason it loses: an srun/salloc allocation's lifetime is chained to
   its CLIENT PROCESS — if the login daemon restarts (self-update on every merge, dev

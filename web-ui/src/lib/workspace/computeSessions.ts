@@ -3,7 +3,7 @@
  * HOST-DETAIL home screen (a remote window already talking to the login
  * daemon, so no native-bridge hop is needed):
  *   GET    /api/v1/compute/sessions            the stateless registry
- *   POST   /api/v1/compute/sessions            sbatch a new session
+ *   POST   /api/v1/compute/sessions            launch a new session (detached srun)
  *   DELETE /api/v1/compute/sessions/{job_id}   scancel
  *
  * The wire MAY carry each session's daemon `port`/`token` (the app shell's
@@ -50,7 +50,7 @@ export interface ComputeSessionList {
   partitions: ComputePartition[];
 }
 
-/** An sbatch submission for a new compute-node session. */
+/** A launch request for a new compute-node session (detached srun). */
 export interface ComputeLaunchSpec {
   name: string;
   /** Slurm walltime, e.g. "2:00:00". */

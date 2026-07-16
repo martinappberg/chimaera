@@ -1,6 +1,6 @@
 //! `chimaera compute …` — Mode 2 from the CLI: launch/list/connect/cancel
 //! chimaera sessions running AS Slurm jobs, via the LOGIN daemon's routes
-//! (curl-over-ssh; the daemon owns sbatch and the preludes). Thin by
+//! (curl-over-ssh; the daemon owns the detached srun clients and the preludes). Thin by
 //! design: this is the verification harness and the app-parity surface,
 //! not a second implementation.
 
