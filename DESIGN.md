@@ -337,6 +337,20 @@ which is the survival property that matters.
   squeue-rebuilt home-screen card is the reconnect path. Verified live: launch → RUNNING →
   ready → chained-B tunnel → health/self-walltime/sessions on the node → cancel → queue clean.
   Native-app visual pass outstanding (needs the maintainer's screen).
+- **2026-07-16 — Mode 2 stays sbatch-based; srun-as-child rejected for session ownership
+  (maintainer question, answered).** The question: "surely srun would be most compatible —
+  the login-node daemon runs srun as a background process, owns it, can kill it
+  automatically." The reason it loses: an srun/salloc allocation's lifetime is chained to
+  its CLIENT PROCESS — if the login daemon restarts (self-update on every merge, dev
+  cycles, crashes), every compute session dies with it. sbatch hands ownership to Slurm
+  itself: sessions survive laptop closes AND login-daemon restarts, `squeue` is the
+  stateless reconnect registry, walltime ends things deterministically. The ownership the
+  maintainer wants exists already at the right level — the login daemon kills via scancel
+  (cards' cancel, the banner's end-job), which beats a process handle as owner-of-record.
+  srun's one genuine advantage — interactive-only partitions (Sherlock's `dev` refuses
+  batch; found live) — is noted as a possible future "Mode 2b" interactive-allocation
+  flavor that would be explicitly connection-tied; not in scope now. Programmatic/web
+  access is unaffected either way (launch is a daemon HTTP route).
 - **2026-07-16 — Loopback stays the compute-daemon default; routable bind remains per-launch
   opt-in (maintainer decision).** Raised because the connection is token-gated anyway and the
   node is "our own"; decided against flipping: compute nodes are routinely SHARED (co-tenant

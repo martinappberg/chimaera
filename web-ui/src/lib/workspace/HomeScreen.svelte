@@ -577,6 +577,10 @@
    *  math only — zero extra fetches). Other states show the raw value: for
    *  PENDING it's the requested LIMIT, not a countdown. */
   function displayTimeLeft(cs: ComputeSessionView): string {
+    // Slurm's %L emits INVALID/NOT_SET while a job transitions — placeholder
+    // words, not durations, so show a dash. UNLIMITED (and any other raw
+    // value) stays: Slurm vocabulary is never relabeled.
+    if (cs.time_left === "INVALID" || cs.time_left === "NOT_SET") return "—";
     if (cs.state !== "RUNNING") return cs.time_left;
     const base = parseSlurmTimeLeft(cs.time_left);
     if (base === null) return cs.time_left;
