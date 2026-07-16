@@ -1435,4 +1435,6 @@ once/decline pair (`codex.rs::on_server_request`, mined-frame test
 `mcp_elicitation_approval_answers_with_action_shape`). The binary also names
 `item/permissions/requestApproval` (`PermissionsRequestApprovalResponse
 {scope, strictAutoReview, …}`) — never observed live for MCP calls; left
-unmapped (falls to the generic approval arm).
+unmapped (falls to the generic approval arm). `just chat-smoke` re-run for
+the driver change: 16/16 (253s), plus the targeted live regression (allow →
+`list_terminals` runs) against a spawned codex chat.

@@ -109,6 +109,12 @@ pub(crate) async fn put_mastermind(
     Json(body): Json<PutMastermind>,
 ) -> Response {
     let err = |code: StatusCode, msg: String| (code, Json(json!({"error": msg}))).into_response();
+    let Some(_guard) = MastermindSwitchGuard::acquire(&state, &id) else {
+        return err(
+            StatusCode::CONFLICT,
+            "a Mastermind change is already in flight for this workspace — try again".to_string(),
+        );
+    };
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return err(StatusCode::NOT_FOUND, format!("unknown workspace {id}"));
     };
@@ -225,6 +231,13 @@ pub(crate) async fn delete_mastermind(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    let Some(_guard) = MastermindSwitchGuard::acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "a Mastermind change is already in flight for this workspace — try again"})),
+        )
+            .into_response();
+    };
     let Some(workspace) = crate::lock(&state.workspaces).get(&id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -242,6 +255,34 @@ pub(crate) async fn delete_mastermind(
     crate::lock(&state.workspaces).set_mastermind(&id, None);
     retire_mastermind_session(&state, &cfg.session_id).await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// One Mastermind change per workspace at a time (the `chat_switching`
+/// idiom): the PUT/DELETE flows are multi-step with rollback, and two racing
+/// callers would leak the loser's spawned session — worse, the loser's
+/// rollback could clobber the winner's fresh binding. RAII so every early
+/// return releases.
+struct MastermindSwitchGuard {
+    state: Arc<AppState>,
+    workspace_id: String,
+}
+
+impl MastermindSwitchGuard {
+    fn acquire(state: &Arc<AppState>, workspace_id: &str) -> Option<Self> {
+        if !crate::lock(&state.mastermind_switching).insert(workspace_id.to_string()) {
+            return None;
+        }
+        Some(Self {
+            state: state.clone(),
+            workspace_id: workspace_id.to_string(),
+        })
+    }
+}
+
+impl Drop for MastermindSwitchGuard {
+    fn drop(&mut self) {
+        crate::lock(&self.state.mastermind_switching).remove(&self.workspace_id);
+    }
 }
 
 /// Tear down a Mastermind session deterministically: identity first (so the

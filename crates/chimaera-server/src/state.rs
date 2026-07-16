@@ -68,6 +68,12 @@ pub(crate) struct AppState {
     /// the moment the id is in neither registry — a vanishing row would make
     /// every window prune the session's tabs mid-toggle.
     pub(crate) chat_switching: Mutex<HashMap<String, String>>,
+    /// Workspaces with a Mastermind PUT/DELETE in flight. The routes are
+    /// multi-step (retire old → bind → spawn, with rollback); two racing
+    /// callers would leak the loser's spawned session and could clobber the
+    /// winner's binding on rollback — so per workspace, one change at a time
+    /// (the `chat_switching` idiom).
+    pub(crate) mastermind_switching: Mutex<std::collections::HashSet<String>>,
     /// session id -> workspace id.
     pub(crate) session_workspaces: Mutex<HashMap<String, String>>,
     /// session id -> agent wrapper state (kind "agent" sessions only).
@@ -193,6 +199,7 @@ impl AppState {
             chat_signals: Mutex::new(Some(chat_signals_rx)),
             chat_recipes: Mutex::new(HashMap::new()),
             chat_switching: Mutex::new(HashMap::new()),
+            mastermind_switching: Mutex::new(std::collections::HashSet::new()),
             session_workspaces: Mutex::new(HashMap::new()),
             agents: Mutex::new(HashMap::new()),
             display_names: Mutex::new(HashMap::new()),

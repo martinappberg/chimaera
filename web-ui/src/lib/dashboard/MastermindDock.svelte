@@ -244,6 +244,24 @@
         <div class="err">{error}</div>
       {/if}
     </div>
+  {:else if live !== null && live.ui !== "chat"}
+    <!-- The daemon degrades a chat whose handshake fails into a PTY under
+         the same id — and a flagged row is hidden from the rail/roster, so
+         the dock must be its door or the session is unreachable. -->
+    <div class="gone">
+      <BrandMark size={20} title="chimaera" />
+      <p>
+        the Mastermind degraded to a terminal (its chat handshake failed) —
+        open it to see why, or reset and start over.
+      </p>
+      <button
+        class="cta quiet"
+        onclick={() => {
+          if (live !== null) ctrl.revealWorktreeSession(live.id, wsId);
+        }}>open the terminal</button
+      >
+      <button class="cta quiet" disabled={pending} onclick={retire}>reset</button>
+    </div>
   {:else if live !== null}
     <!-- The embedded chat: the same ChatView the panes use, on the same chat
          pool, scoped by the wrapper so it behaves at dock width. -->

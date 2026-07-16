@@ -53,6 +53,13 @@ const READ_SESSION_DEFAULT: usize = 60;
 const READ_SESSION_MAX: usize = 200;
 /// Bytes cap on a rendered `read_session` answer (tail wins).
 const READ_SESSION_BYTES: usize = 24 * 1024;
+
+/// Ceiling on LIVE sessions in a workspace before the Mastermind's spawn
+/// tools refuse. The one place this surface creates *processes*: an
+/// auto-mode Mastermind (whole server pre-allowed) deciding "one worker per
+/// file" must hit a daemon-side wall, not just an audit line — the daemon
+/// shares HPC login nodes, and every spawned agent bills the user.
+const MASTERMIND_SPAWN_CEILING: usize = 8;
 /// Chars per rendered journal item (text heads, tool titles).
 const ITEM_HEAD_CHARS: usize = 240;
 /// Attributed files in a `list_changed_files` answer.
@@ -693,6 +700,39 @@ async fn list_changed_files(
     )
 }
 
+/// Live sessions (PTY + chat) currently in the workspace — the spawn tools'
+/// ceiling check. Counts the Mastermind's own row too: it holds a process.
+fn live_workspace_sessions(state: &Arc<AppState>, workspace_id: &str) -> usize {
+    crate::session_view::sessions_json(state)
+        .into_iter()
+        .filter(|row| row["workspace_id"] == json!(workspace_id) && row["alive"] == json!(true))
+        .count()
+}
+
+/// The refusal both spawn tools return at the ceiling — a model-facing
+/// tool error, so the Mastermind reports the wall instead of retrying.
+fn spawn_ceiling_error(live: usize) -> Value {
+    tool_error(format!(
+        "this workspace already has {live} live sessions — the Mastermind may \
+         not spawn past {MASTERMIND_SPAWN_CEILING}. Ask the user to close or \
+         retire sessions (or to spawn manually) if more are truly needed.",
+    ))
+}
+
+/// Theme for Mastermind-spawned sessions: the user's persisted
+/// `appearance.theme` when it names a concrete scheme (an MCP caller has no
+/// client theme to ride); "system"/unset falls back to dark.
+fn spawn_theme(state: &Arc<AppState>) -> String {
+    let mut settings = crate::lock(&state.settings);
+    settings
+        .current()
+        .get("appearance.theme")
+        .and_then(|v| v.as_str())
+        .filter(|t| *t == "light" || *t == "dark")
+        .unwrap_or("dark")
+        .to_string()
+}
+
 /// spawn_agent (act) — a normal worker chat session at the workspace root,
 /// through the same plumbing `POST /sessions {ui:"chat"}` uses. NEVER a
 /// mastermind: there is exactly one, and only the user appoints it.
@@ -727,6 +767,10 @@ async fn spawn_agent(
         .and_then(|n| n.as_str())
         .map(|n| head(n.trim(), 200))
         .filter(|n| !n.is_empty());
+    let live = live_workspace_sessions(state, &workspace.id);
+    if live >= MASTERMIND_SPAWN_CEILING {
+        return spawn_ceiling_error(live);
+    }
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id, agent = %kind.as_str(),
         "mastermind act: spawn_agent");
     match crate::chat::spawn_fresh_chat(
@@ -738,7 +782,7 @@ async fn spawn_agent(
             model,
             name,
             title_hint: None,
-            theme: "dark".to_string(),
+            theme: spawn_theme(state),
             prelude: None,
             mastermind: None,
         },
@@ -772,6 +816,10 @@ async fn spawn_terminal(
         .and_then(|n| n.as_str())
         .map(|n| head(n.trim(), 200))
         .filter(|n| !n.is_empty());
+    let live = live_workspace_sessions(state, &workspace.id);
+    if live >= MASTERMIND_SPAWN_CEILING {
+        return spawn_ceiling_error(live);
+    }
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id,
         "mastermind act: spawn_terminal");
     let spec = crate::spawn::SpawnSpec {
@@ -781,7 +829,7 @@ async fn spawn_terminal(
         cwd: None,
         cols: None,
         rows: None,
-        theme: "dark".to_string(),
+        theme: spawn_theme(state),
         title_hint: None,
         prelude: None,
         kind: crate::spawn::SpawnKind::Shell,

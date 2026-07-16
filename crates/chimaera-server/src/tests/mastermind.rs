@@ -569,3 +569,61 @@ async fn spawn_tools_create_workspace_sessions() {
     state.sessions.kill(&sid).ok();
     state.sessions.kill(&mastermind).ok();
 }
+
+/// One Mastermind change per workspace at a time: the routes are multi-step
+/// (retire → bind → spawn, with rollback), so a second caller mid-flight gets
+/// a 409 instead of racing — and the guard releases on every exit path.
+#[tokio::test]
+async fn mastermind_changes_are_serialized_per_workspace() {
+    let state = test_state();
+    let ws = make_workspace(&state, "mm-race").await;
+    preset_agent(
+        &state,
+        agents::AgentKind::Claude,
+        Ok(write_fake_claude("mm-race-fake")),
+        Some("9.9.9-fake"),
+    );
+
+    // Simulate an in-flight change (the guard is held across the PUT body).
+    assert!(lock(&state.mastermind_switching).insert(ws.clone()));
+    let (status, body) = put_mastermind(
+        &state,
+        &ws,
+        serde_json::json!({"agent":"claude","mode":"ask"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("in flight"),
+        "{body}"
+    );
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/workspaces/{ws}/mastermind"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    lock(&state.mastermind_switching).remove(&ws);
+
+    // Released: the same PUT now proceeds (and its own guard releases —
+    // a follow-up DELETE reaches the 404-no-binding arm, not a 409).
+    let (status, body) = put_mastermind(
+        &state,
+        &ws,
+        serde_json::json!({"agent":"claude","mode":"ask"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mm = body["id"].as_str().unwrap().to_string();
+    let (status, _) = request(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/workspaces/{ws}/mastermind"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    wait_session_gone(&state, &mm).await;
+}

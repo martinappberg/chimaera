@@ -213,6 +213,16 @@
     />
     <span class="dot {dotState(session)}" title={dotTitle(session)}></span>
     <span class="name" title={name}>{name}</span>
+    {#if compact && isStalled}
+      <!-- Compact rows carry no now-line, but the stall warning is built for
+           exactly this density (a wedged agent in a fan-out must not look
+           identical to a working one). -->
+      <span
+        class="stall-mark"
+        title="the agent reports running but its terminal has been silent — it may be stuck"
+        >stalled</span
+      >
+    {/if}
     <span class="chip">{agentKind(session)} · {session.ui === "chat" ? "chat" : "term"}</span>
     <span class="prov {prov}" title={provenanceTitle(prov)}>
       {prov === "protocol" ? "protocol" : prov === "hooks" ? "hooks" : "output-only"}
@@ -466,6 +476,17 @@
      a caution about a stale claim, not an error. */
   .now.stalled {
     color: var(--warn);
+    cursor: help;
+  }
+  /* The compact-density stall marker — same warn voice as the full line. */
+  .stall-mark {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+    border-radius: 999px;
+    padding: 0 6px;
     cursor: help;
   }
 
