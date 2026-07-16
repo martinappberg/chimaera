@@ -165,7 +165,7 @@ pub(crate) async fn ingest(
     // never be live across an await (the future would be !Send), and an
     // explicit `drop` isn't enough here: the `let-else` borrow keeps the guard
     // in the async state machine, so it must go out of scope lexically.
-    {
+    let compute_ctx_pending = {
         let mut agents = crate::lock(&state.agents);
         let Some(record) = agents.get_mut(&id) else {
             return (
@@ -217,7 +217,12 @@ pub(crate) async fn ingest(
                 changed = true;
             }
         }
-    }
+
+        // Compute-session context wants delivering on whichever carrier
+        // fires first (see below); the record's flag is only SET once the
+        // context actually exists — checked outside this lock.
+        matches!(event, "SessionStart" | "UserPromptSubmit") && !record.compute_ctx_delivered
+    };
 
     if changed {
         state.changes.notify_waiters();
@@ -229,23 +234,52 @@ pub(crate) async fn ingest(
         crate::git::mark_path_dirty(&state, &path).await;
     }
 
+    // Compute-session context: a daemon running INSIDE a Slurm allocation
+    // (a Mode 2 compute-node daemon) tells its agents so, via the hook
+    // response's `additionalContext` — the only chimaera-owned channel that
+    // reaches BOTH surfaces (TUI and chat ride the same `--settings` hooks)
+    // without touching any user-owned file ($HOME is a shared filesystem, so
+    // a CLAUDE.md edit would leak into login-node sessions). Delivered once
+    // per record, on whichever carrier fires first: SessionStart covers chat
+    // mode (hooks fire normally under stream-json EXCEPT UserPromptSubmit —
+    // PROTOCOL.md), the first UserPromptSubmit covers TUIs where SessionStart
+    // has been unreliable (see the transcript_path note above). Off-cluster
+    // `agent_context` is None in one Option check — response unchanged.
+    let mut context: Vec<String> = Vec::new();
+    if compute_ctx_pending {
+        if let Some(ctx) = state.compute.agent_context().await {
+            let mut agents = crate::lock(&state.agents);
+            // Re-check under the lock: a concurrent hook may have delivered
+            // it between the block above and here.
+            if let Some(record) = agents.get_mut(&id) {
+                if !record.compute_ctx_delivered {
+                    record.compute_ctx_delivered = true;
+                    context.push(ctx);
+                }
+            }
+        }
+    }
+
     // `@term:` mentions in the user's prompt auto-link those terminals to
     // this agent (the mention is the consent — this hook only fires for the
     // human's composer input). The notes flow back as context, so the agent
     // knows the link exists without a discovery round-trip.
     if event == "UserPromptSubmit" {
         if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-            let notes = crate::mcp::autolink_mentions(&state, &id, prompt);
-            if !notes.is_empty() {
-                return Json(json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
-                        "additionalContext": notes.join("\n"),
-                    }
-                }))
-                .into_response();
-            }
+            context.extend(crate::mcp::autolink_mentions(&state, &id, prompt));
         }
+    }
+
+    // `context` is only ever non-empty for SessionStart/UserPromptSubmit,
+    // so `event` is always the right hookEventName here.
+    if !context.is_empty() {
+        return Json(json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": context.join("\n"),
+            }
+        }))
+        .into_response();
     }
 
     Json(json!({})).into_response()

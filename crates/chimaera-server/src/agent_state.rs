@@ -124,6 +124,12 @@ pub(crate) struct AgentRecord {
     /// [`FILES_TOUCHED_CAP`]. Never cleared — the list lives as long as the
     /// session.
     pub(crate) files_touched: Vec<String>,
+    /// Whether the compute-session context (`compute::agent_context`) has
+    /// been delivered to this session via a hook response. Once per record:
+    /// the context lands in the conversation itself, so later hooks — and a
+    /// view switch, which respawns the process but keeps the record and the
+    /// conversation — must not repeat it. Never true off-cluster.
+    pub(crate) compute_ctx_delivered: bool,
 }
 
 impl AgentRecord {
@@ -138,6 +144,7 @@ impl AgentRecord {
             first_prompt: None,
             resumed_from: None,
             files_touched: Vec::new(),
+            compute_ctx_delivered: false,
         }
     }
 

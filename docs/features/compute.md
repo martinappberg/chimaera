@@ -98,6 +98,18 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   dialog's walltime is **d/h/m segment boxes** composing the sbatch string (no Slurm
   string surgery), pre-flighted against the partition's published limit. CLI parity + verification harness:
   `chimaera compute list|launch|connect|cancel <host>`.
+- **Agent awareness.** Every claude session a compute-node daemon spawns — TUI and chat
+  alike — receives a one-time context block telling the model it is on a compute node:
+  job/node/partition, the allocation's cpus/mem/gres, and an **absolute** walltime-end
+  estimate (baked once per daemon lifetime from squeue's time-left —
+  `compute::agent_context`). It rides the hook response's `additionalContext`
+  (`agents::ingest`), delivered on whichever carrier fires first — SessionStart covers
+  chat mode (UserPromptSubmit never fires under stream-json), the first UserPromptSubmit
+  covers TUIs — because $HOME is a shared FS and any CLAUDE.md/AGENTS.md write would leak
+  into login-node sessions. Codex has no chimaera-owned injection seam (no additive
+  instructions config; app-server `thread/start` takes none), so codex sessions stay
+  uninformed for now. Provably inert off-cluster: no `SLURM_JOB_ID` at boot
+  short-circuits before any lock or subprocess.
 - **The tunnel ladder** (per connect, honest about defeat): **B1** laptop-ssh end-to-end to
   the node (pam_slurm_adopt clusters) → **B2 chained** — a login-node-resident
   `ssh -N -L` relay to the node's loopback, running as the remote command of the same

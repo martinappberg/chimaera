@@ -157,6 +157,9 @@ pub(crate) struct ComputeService {
 struct Inner {
     detection: Option<Detection>,
     cache: Option<(Instant, ComputeSnapshot)>,
+    /// The rendered compute-session agent context, baked once per daemon
+    /// lifetime (see [`ComputeService::agent_context`]).
+    agent_context: Option<String>,
 }
 
 impl ComputeService {
@@ -230,6 +233,36 @@ impl ComputeService {
         }
         inner.cache = Some((Instant::now(), snap.clone()));
         snap
+    }
+
+    /// The context block a compute-node daemon injects into its agent
+    /// sessions (delivered via the claude hook response — see
+    /// `agents::ingest`). `None` for a normal daemon: the `self_job` check
+    /// is the whole off-cluster path — no lock, no subprocess, no allocation
+    /// — so this is provably inert unless `SLURM_JOB_ID` was set at boot.
+    ///
+    /// Baked ONCE per daemon lifetime, at first use: the allocation's facts
+    /// (job/node/partition/resources) are constant for the job's life, and
+    /// the walltime end is stored as an ABSOLUTE estimate (bake-time now +
+    /// squeue's time_left) rather than re-derived per spawn — any bake
+    /// moment yields the same end instant (modulo squeue's minute rounding),
+    /// one bake keeps every session's text identical, and a relative
+    /// "3:59 left" would go stale in the transcript.
+    pub(crate) async fn agent_context(&self) -> Option<String> {
+        self.self_job.as_ref()?;
+        if let Some(ctx) = &self.inner.lock().await.agent_context {
+            return Some(ctx.clone());
+        }
+        // Not baked yet. The snapshot is cached + single-flight (worst case
+        // one 5s-capped squeue); a failed squeue yields no self block, and
+        // the bake simply retries on the next call rather than caching
+        // an absence forever.
+        let alloc = self.snapshot(false).await.self_alloc?;
+        let text = self_context_text(&alloc, SystemTime::now());
+        let mut inner = self.inner.lock().await;
+        // get_or_insert: a concurrent first bake wins and both callers hand
+        // out the SAME string (the two candidates differ only by seconds).
+        Some(inner.agent_context.get_or_insert(text).clone())
     }
 
     /// Drop the cached snapshot (detection stays): the next list refetches
@@ -404,6 +437,102 @@ fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
             gres
         },
     })
+}
+
+/// Render the compute-session context for one [`SelfAllocation`]: what a
+/// model on this node needs to know that nothing else tells it — it is on a
+/// compute node (not the login node it may assume), what the allocation
+/// provides, and that everything here dies at walltime. `now` is the bake
+/// time (threaded in so tests can pin it); the walltime end lands in the
+/// text as an absolute UTC instant. Missing resource fields (older squeue
+/// rows degrade to "") are simply omitted, never rendered empty.
+fn self_context_text(alloc: &SelfAllocation, now: SystemTime) -> String {
+    let mut place = format!("Slurm job {}", alloc.job_id);
+    if !alloc.node.is_empty() {
+        place.push_str(&format!(" on node {}", alloc.node));
+    }
+    if !alloc.partition.is_empty() {
+        place.push_str(&format!(" (partition {})", alloc.partition));
+    }
+    let mut resources = Vec::new();
+    if !alloc.cpus.is_empty() {
+        resources.push(format!("{} CPUs", alloc.cpus));
+    }
+    if !alloc.mem.is_empty() {
+        resources.push(format!("{} memory", alloc.mem));
+    }
+    if !alloc.gres.is_empty() {
+        resources.push(format!("gres {}", alloc.gres));
+    }
+    let resources = if resources.is_empty() {
+        String::new()
+    } else {
+        format!(" The allocation provides {}.", resources.join(", "))
+    };
+    // "UNLIMITED"/"NOT_SET"/noise parse to None: state the walltime rule
+    // without inventing an end time.
+    let ends = match parse_slurm_time_left(&alloc.time_left)
+        .and_then(|left| format_utc_minute(now + left))
+    {
+        Some(end) => format!("approximately {end}"),
+        None => "its walltime".to_string(),
+    };
+    format!(
+        "This session runs on a Slurm COMPUTE NODE inside an allocation \
+         ({place}), not on a login node.{resources} Heavy computation \
+         belongs here and can run directly (no need to submit it as a \
+         separate job). The allocation ends at {ends}, and everything \
+         running on this node — including this session — is killed then. \
+         Tools or services that exist only on login nodes (for example \
+         outbound network access or job submission on some clusters) may \
+         behave differently or be unavailable here."
+    )
+}
+
+/// Parse Slurm's elapsed/remaining time format (`squeue %L` / `sinfo %l`):
+/// `days-hours:minutes:seconds` with zero leading components omitted, so
+/// `9:54` is min:sec and `8:00:00` is h:min:sec. `UNLIMITED`, `NOT_SET`,
+/// `INVALID`, and bare numbers (ambiguous) are `None`.
+fn parse_slurm_time_left(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    let (days, rest) = match s.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, s),
+    };
+    let parts: Vec<u64> = rest
+        .split(':')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    let (h, m, sec) = match (days > 0 || s.contains('-'), parts.as_slice()) {
+        // With a days prefix Slurm writes H:M:S; tolerate truncated forms.
+        (true, [h]) => (*h, 0, 0),
+        (true, [h, m]) => (*h, *m, 0),
+        // Without days the shortest real form is min:sec.
+        (false, [m, s]) => (0, *m, *s),
+        (_, [h, m, s]) => (*h, *m, *s),
+        _ => return None,
+    };
+    Some(Duration::from_secs(((days * 24 + h) * 60 + m) * 60 + sec))
+}
+
+/// `SystemTime` → `"YYYY-MM-DD HH:MM UTC"`, minute precision (walltime ends
+/// are estimates; seconds would be false precision). Hand-rolled civil-date
+/// conversion (Howard Hinnant's `civil_from_days`) because the workspace
+/// deliberately carries no date-time dependency. Valid for any post-1970
+/// time; `None` only for pre-epoch input.
+fn format_utc_minute(t: SystemTime) -> Option<String> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let (h, min) = ((secs % 86_400) / 3_600, (secs % 3_600) / 60);
+    let z = secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    Some(format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02} UTC"))
 }
 
 /// `squeue --noheader -o "%i|%j|%P|%T|%L|%N|%C|%m"` → jobs. Unparseable
@@ -731,6 +860,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_slurm_time_left_covers_squeue_forms() {
+        // Real %L shapes: min:sec, h:min:sec, days-h:min:sec.
+        assert_eq!(
+            parse_slurm_time_left("9:54"),
+            Some(Duration::from_secs(9 * 60 + 54))
+        );
+        assert_eq!(
+            parse_slurm_time_left("8:00:00"),
+            Some(Duration::from_secs(8 * 3600))
+        );
+        assert_eq!(
+            parse_slurm_time_left("7-00:00:00"),
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        assert_eq!(
+            parse_slurm_time_left("1-12:30:05"),
+            Some(Duration::from_secs(86_400 + 12 * 3600 + 30 * 60 + 5))
+        );
+        // Truncated day forms (sinfo %l on some clusters) parse as H / H:M.
+        assert_eq!(
+            parse_slurm_time_left("2-12"),
+            Some(Duration::from_secs(2 * 86_400 + 12 * 3600))
+        );
+        // Sentinels and ambiguous bare numbers stay None.
+        for junk in ["UNLIMITED", "NOT_SET", "INVALID", "", "45", "a:b"] {
+            assert_eq!(parse_slurm_time_left(junk), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn format_utc_minute_matches_date_u() {
+        // Vectors verified with `date -u -r <epoch>` on this machine.
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        assert_eq!(
+            format_utc_minute(at(0)).as_deref(),
+            Some("1970-01-01 00:00 UTC")
+        );
+        assert_eq!(
+            format_utc_minute(at(1_784_118_840)).as_deref(),
+            Some("2026-07-15 12:34 UTC")
+        );
+        // Leap-day, end of day (rollover boundaries).
+        assert_eq!(
+            format_utc_minute(at(1_709_251_140)).as_deref(),
+            Some("2024-02-29 23:59 UTC")
+        );
+    }
+
+    #[test]
+    fn self_context_text_bakes_facts_and_absolute_end() {
+        let alloc = SelfAllocation {
+            job_id: "4242".into(),
+            node: "sh03-01n52".into(),
+            partition: "gpu".into(),
+            state: "RUNNING".into(),
+            time_left: "3:59:00".into(),
+            cpus: "8".into(),
+            mem: "64G".into(),
+            gres: "gpu:1".into(),
+        };
+        // Bake at 2026-07-15 12:34 UTC; 3:59:00 left → ends 16:33 UTC.
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_118_840);
+        let text = self_context_text(&alloc, now);
+        assert!(text.contains("COMPUTE NODE"), "{text}");
+        assert!(text.contains("Slurm job 4242 on node sh03-01n52"), "{text}");
+        assert!(text.contains("(partition gpu)"), "{text}");
+        assert!(text.contains("8 CPUs, 64G memory, gres gpu:1"), "{text}");
+        assert!(
+            text.contains("approximately 2026-07-15 16:33 UTC"),
+            "{text}"
+        );
+        assert!(text.contains("killed then"), "{text}");
+        assert!(text.contains("login node"), "{text}");
+
+        // Sparse allocation (short squeue row): omitted fields never render
+        // empty, and an unparseable time_left states the rule without an
+        // invented end time.
+        let sparse = SelfAllocation {
+            job_id: "7".into(),
+            node: String::new(),
+            partition: String::new(),
+            state: "RUNNING".into(),
+            time_left: "UNLIMITED".into(),
+            cpus: String::new(),
+            mem: String::new(),
+            gres: String::new(),
+        };
+        let text = self_context_text(&sparse, now);
+        assert!(text.contains("(Slurm job 7)"), "{text}");
+        assert!(!text.contains("The allocation provides"), "{text}");
+        assert!(text.contains("ends at its walltime"), "{text}");
+        assert!(!text.contains("approximately"), "{text}");
+        assert!(!text.contains("  "), "no double spaces: {text}");
+    }
+
+    #[test]
     fn find_on_path_walks_skips_and_requires_exec() {
         let dir = test_dir("path");
         let bin = dir.join("bin");
@@ -804,7 +1029,29 @@ mod tests {
         assert_eq!(own.node, "node7");
         assert_eq!(own.time_left, "3:59:00");
 
+        // The agent context bakes from that self block, once: a second call
+        // returns the SAME string (walltime end included — it must not
+        // re-derive and drift).
+        let ctx = svc.agent_context().await.expect("agent context");
+        assert!(ctx.contains("Slurm job 4242 on node node7"), "{ctx}");
+        assert!(ctx.contains("(partition gpu)"), "{ctx}");
+        assert!(ctx.contains("approximately"), "{ctx}");
+        assert_eq!(svc.agent_context().await.as_deref(), Some(ctx.as_str()));
+
         std::fs::remove_dir_all(&empty).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Off-cluster (no SLURM_JOB_ID at construction) the agent context is
+    /// None without touching detection or the snapshot — the inertness
+    /// guarantee for normal daemons (an empty bindir would otherwise make
+    /// this probe the login shell).
+    #[tokio::test]
+    async fn agent_context_is_none_without_a_self_job() {
+        let svc = ComputeService::with_bindir(PathBuf::from("/nonexistent"));
+        assert_eq!(svc.agent_context().await, None);
+        // Nothing was detected or cached as a side effect.
+        assert!(svc.inner.lock().await.detection.is_none());
+        assert!(svc.inner.lock().await.agent_context.is_none());
     }
 }
