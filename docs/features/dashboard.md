@@ -156,9 +156,26 @@ answering it inline (file created); provenance/now-line/ctx meter on the hero ca
 changed-files attribution (`claude` vs `you`); evidence link opening the session Changes
 view beside the dashboard; container-query collapse.
 
-**Verification pending (Mastermind dock, 2026-07-16):** setup → embedded chat → mode
-switch → retire; the blank-state variants (`+ mastermind`, bound-but-no-workers chrome);
-the collapse pill at narrow pane widths; hidden-from-roster across rail/lane/chords.
+**Verified live (2026-07-16, billed real-agent runs):** the v0.2 feed on a real claude
+TUI (hook state transitions, `now_line` per tool, statusline `usage` — ctx meter +
+footer cost on the hooks-tier card — `subagents[]` around a real Task fan-out, and the
+full `stalled` lifecycle via a SIGSTOP-frozen process flipping true at ~3 min and
+clearing on resume); the Mastermind end to end — setup card → ask-mode session whose
+generated settings pre-allow exactly the read tools → `workspace_status`/`read_session`
+answered with zero prompts → `spawn_agent` + `message_agent` each raising claude's
+native permission card inline in the dock → the attributed `[from the workspace
+Mastermind]` hand-off kicking off a worker whose own Write permission landed in the
+attention lane and was answered there (docstring on disk); daemon restart resurrecting
+the binding, the mode, and the pre-allow; the `⋯` mode switch to auto (re-PUT, whole
+`mcp__chimaera` pre-allow) acting with no prompt + the `tracing` audit line; codex chat
+carrying the injected MCP URL, listing and calling `chimaera.list_terminals` with its
+approval answered from chimaera (post-fix — see PROTOCOL.md Pass 15); blank-state
+`+ mastermind`; hidden-from-roster across rail/roster/home rollups; light + dark.
+
+**Not exercised live yet:** the compute chip against a real Slurm scheduler (it reuses
+`ComputeStrip`'s exact parsing; needs a Sherlock pass); the output-only TUI now-line
+flip on screen (the shared `output_active`/`dotTitle` path shipped verified in #59);
+the store-tier work drop-down rendering subagents ∪ background tasks simultaneously.
 
 ---
 
@@ -175,12 +192,15 @@ decisions block + §10 of [docs/agent-dashboard-plan.md](../agent-dashboard-plan
   dashboard-shaped shows* — just the launcher-style blank state.
 - **Honest asymmetry is intentional:** cross-vendor status differs by tier (protocol /
   hooks / output-only) and the card must say so rather than fake parity.
-- **The Mastermind (future phases, decided):** exactly one user-picked privileged agent
-  per workspace, living only on the dashboard dock, may direct workers (message / spawn
-  panes / interrupt / suggest); workers get observe + `ask_mastermind` only — nobody
-  commands sideways. Its act tools are gated by an ask-first/auto mode routed through the
-  agent's own permission harness (ask-first prompts land in this attention lane). No
-  Mastermind → no `ask_mastermind` tool and the dock shows a setup card instead.
-- **Deliberately deferred:** memory indexing (files-as-links first), cost on cards (needs
-  the v0.2 feed), codex TUI telemetry (consent-gated by codex itself — pitched as a
-  dashboard card), kanban-style managed columns (never — derived states only).
+- **The Mastermind (v1 shipped 2026-07-16):** exactly one user-picked privileged agent
+  per workspace, living only on the dashboard dock, may direct workers (message / spawn /
+  interrupt); nobody commands sideways. Its act tools are gated by an ask-first/auto mode
+  routed through the agent's own permission harness (its prompts render in its embedded
+  chat). Reactive-only in v1 (maintainer, 2026-07-16): nothing triggers a turn but the
+  user typing — `suggest` and worker-side `ask_mastermind` moved to v1.x (fire-and-forget
+  queueing would trigger unprompted billed turns). No Mastermind → the dock is the setup
+  card.
+- **Deliberately deferred:** memory indexing (files-as-links first), chat-card cost
+  (TUI cards carry it from the statusline heartbeat; the chat wire doesn't yet), codex
+  TUI telemetry (consent-gated by codex itself — pitched as a dashboard card),
+  kanban-style managed columns (never — derived states only).

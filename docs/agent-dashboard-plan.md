@@ -1,7 +1,9 @@
 # The Agent Dashboard — design & plan
 
-Status: **v0.1 shipped (PR #62); third maintainer pass folded in** (2026-07-16).
-This document synthesizes a research pass over the
+Status: **v0.1 + v0.1.x + v0.2 + Mastermind v1 built and live-verified on the PR #62
+branch** (2026-07-16, billed real-agent runs on claude AND codex). Remaining phases:
+v0.3's observe-for-all + codex TUI hook consent, and v1.x (`ask_mastermind`, proactivity
+opt-in, memory). This document synthesizes a research pass over the
 codebase, the current Claude Code and Codex integration surfaces (verified
 July 2026), and prior art (Conductor, Crystal, claude-squad, Vibe Kanban,
 Sculptor, Cursor agents, Codex cloud, Devin, Terragon, Omnara, cmux, disler's
