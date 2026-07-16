@@ -64,16 +64,28 @@ __chimaera_arm() {
     __chimaera_armed=1
 }
 
+# On bash < 4.4 this capture can come back empty when the pre-existing
+# trap's handler calls functions (the subshell sees the trap as unset); the
+# chain then degrades to ours alone. Sites that set such traps (HPC audit
+# shells) keep their PROMPT_COMMAND-based logging — we preserve that below.
 __chimaera_prev_debug=$(trap -p DEBUG)
 if [ -n "$__chimaera_prev_debug" ]; then
     __chimaera_prev_debug=${__chimaera_prev_debug#trap -- \'}
     __chimaera_prev_debug=${__chimaera_prev_debug%\' DEBUG}
     __chimaera_prev_debug=${__chimaera_prev_debug//\'\\\'\'/\'}
-    trap "__chimaera_preexec; ${__chimaera_prev_debug}" DEBUG
+    __chimaera_debug_chain="__chimaera_preexec; ${__chimaera_prev_debug}"
 else
-    trap '__chimaera_preexec' DEBUG
+    __chimaera_debug_chain='__chimaera_preexec'
 fi
 unset __chimaera_prev_debug
+trap "$__chimaera_debug_chain" DEBUG
 
-PROMPT_COMMAND="__chimaera_precmd${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}; __chimaera_arm"
+# The trap must ALSO be re-armed at every prompt, inline at top level: on
+# bash < 4.4, when a pre-existing DEBUG trap's handler calls shell functions
+# (HPC audit shells, e.g. Sherlock's user_audit), bash reverts DEBUG-trap
+# changes made while an rc file is being sourced — the install above is
+# silently undone by the first prompt. A bare `trap` run from the
+# PROMPT_COMMAND string itself executes at top level and sticks. It also
+# wins back the hook if another tool re-traps DEBUG at prompt time.
+PROMPT_COMMAND="__chimaera_precmd${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}; "'trap "$__chimaera_debug_chain" DEBUG; __chimaera_arm'
 PS1="$PS1"'\[\e]133;B\a\]'

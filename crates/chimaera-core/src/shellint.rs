@@ -303,4 +303,114 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
+
+    /// Drive a real interactive bash (`-i`, piped stdin — PROMPT_COMMAND and
+    /// the DEBUG trap run without a pty) with `prelude` sourced before the
+    /// integration and `epilogue` after (both simulate a user rc), typing
+    /// `commands`. Returns combined stdout+stderr (marks land on both).
+    #[cfg(unix)]
+    fn bash_probe(label: &str, prelude: &str, epilogue: &str, commands: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let dir = test_base(label);
+        std::fs::write(dir.join("integration.bash"), BASH).unwrap();
+        let rc = dir.join("rc.sh");
+        std::fs::write(
+            &rc,
+            format!(
+                "{prelude}\n. \"{}\"\n{epilogue}\n",
+                dir.join("integration.bash").display()
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new("bash")
+            .args(["--noprofile", "--init-file"])
+            .arg(&rc)
+            .arg("-i")
+            .env_remove("PROMPT_COMMAND")
+            .env_remove("CHIMAERA_INTEGRATION")
+            .env_remove("BASH_ENV")
+            .env("TERM", "xterm-256color")
+            .env("HISTFILE", "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bash");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(commands.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// The command-start hook must be the DEBUG trap (works on every bash
+    /// since 3.2, unlike PS0 which needs 4.4), installed at source time
+    /// and re-armed from PROMPT_COMMAND — asserted against the running
+    /// bash, whatever version the host has.
+    #[test]
+    #[cfg(unix)]
+    fn bash_debug_hook_installed_and_rearmed() {
+        let out = bash_probe(
+            "hook",
+            "",
+            "",
+            "trap -p DEBUG\nprintf 'PC=%s\\n' \"$PROMPT_COMMAND\"\n",
+        );
+        assert!(out.contains("__chimaera_preexec"), "hook missing: {out}");
+        assert!(
+            out.contains(r#"trap "$__chimaera_debug_chain" DEBUG"#),
+            "re-arm missing from PROMPT_COMMAND: {out}"
+        );
+    }
+
+    /// The Sherlock login-node scenario: a site rc has already installed a
+    /// DEBUG trap whose handler calls functions (user-audit shells). The
+    /// integration must still emit command-start/done marks — on bash < 4.4
+    /// that takes the prompt-time re-arm, because trap changes made while an
+    /// rc is sourced get silently reverted there — and the site's handler
+    /// must keep running (chained).
+    #[test]
+    #[cfg(unix)]
+    fn bash_marks_survive_hostile_audit_trap() {
+        let prelude = r#"
+user_audit() { local CMD; CMD=$(HISTTIMEFORMAT='' builtin history 1); : "$CMD"; }
+debug_trap() { local _orig=$1; user_audit; echo AUDIT-RAN; : "$_orig"; }
+trap 'debug_trap "$_"' DEBUG
+PROMPT_COMMAND='RET=$?; : logger-standin'
+"#;
+        let out = bash_probe("hostile", prelude, "", "echo mark-test\n");
+        assert!(out.contains("\x1b]133;C"), "no command-start mark: {out}");
+        assert!(out.contains("\x1b]133;D;0"), "no done mark: {out}");
+        assert!(
+            out.contains("\x1b]633;E;echo mark-test"),
+            "no command report: {out}"
+        );
+        assert!(out.contains("AUDIT-RAN"), "prior trap not chained: {out}");
+    }
+
+    /// A prior PROMPT_COMMAND that re-traps DEBUG at every prompt (site rc
+    /// machinery runs before the integration wraps around it): the per-
+    /// prompt re-arm executes after it, so the hook must win on every bash
+    /// — commands still carry a command-start mark directly before their
+    /// output. Without the re-arm, the thief keeps the trap on bash >= 4.4.
+    #[test]
+    #[cfg(unix)]
+    fn bash_rearm_beats_prompt_time_trap_thief() {
+        let prelude = "PROMPT_COMMAND='trap : DEBUG'";
+        let out = bash_probe("thief", prelude, "", "echo first\necho recovered\n");
+        assert!(
+            out.contains("\x1b]133;C\x07recovered"),
+            "re-arm did not keep the hook: {out:?}"
+        );
+    }
 }

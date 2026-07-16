@@ -6,10 +6,11 @@
 //!
 //! - **Integrated** (shell integration active, phase `ready`): type the
 //!   command; OSC 133 marks delimit output and carry the exit code.
-//! - **Sentinel** (no integration, or — when the caller allows it — a
-//!   foreground like `ssh` that forwards keystrokes to a markless remote
-//!   shell): wrap the command in `printf`-emitted 133;C/D marks, so the
-//!   same journal machinery handles it with zero remote install.
+//! - **Sentinel** (no integration; an integration whose command-start marks
+//!   proved broken; or — when the caller allows it — a foreground like `ssh`
+//!   that forwards keystrokes to a markless remote shell): wrap the command
+//!   in `printf`-emitted 133;C/D marks, so the same journal machinery
+//!   handles it with zero remote install.
 //!
 //! Execs are serialized per session. A busy integrated shell **queues** the
 //! exec until its prompt returns (bounded by `queue_timeout`) — the linked
@@ -158,7 +159,7 @@ pub(crate) async fn exec(
     }
     let waited_ms = start.elapsed().as_millis() as u64;
 
-    let token = marks.expect_agent_command(opts.command.clone());
+    let token = marks.expect_agent_command(opts.command.clone(), mode == ExecMode::Sentinel);
     let line = match mode {
         ExecMode::Integrated => format!("{}\r", opts.command),
         ExecMode::Sentinel => sentinel_line(&opts.command),
@@ -186,7 +187,7 @@ pub(crate) async fn exec(
         let now = Instant::now();
         if running.is_none() && now >= started_by {
             marks.clear_agent_expect(token);
-            return Err(ExecError::NeverStarted(start_window));
+            return Err(never_started(&marks, mode, start_window));
         }
         if now >= overall {
             return match running {
@@ -198,7 +199,7 @@ pub(crate) async fn exec(
                 }),
                 None => {
                     marks.clear_agent_expect(token);
-                    Err(ExecError::NeverStarted(start_window))
+                    Err(never_started(&marks, mode, start_window))
                 }
             };
         }
@@ -211,8 +212,20 @@ pub(crate) async fn exec(
     }
 }
 
+/// An integrated command that never produced 133;C means the shell's
+/// command-start hook is broken (prompt marks work, preexec doesn't — seen
+/// with rc chains that kill bash's DEBUG trap): remember it so later execs
+/// on this session degrade to sentinel mode instead of failing forever.
+fn never_started(marks: &Marks, mode: ExecMode, window: Duration) -> ExecError {
+    if mode == ExecMode::Integrated {
+        marks.note_integrated_start_failure();
+    }
+    ExecError::NeverStarted(window)
+}
+
 /// Wait until the shell can accept a command, deciding the mode:
-/// `ready` -> integrated; never-integrated (after a boot grace) -> sentinel;
+/// `ready` -> integrated (sentinel if this shell's command-start marks are
+/// known-broken); never-integrated (after a boot grace) -> sentinel;
 /// stuck `running` -> sentinel only when the caller allows it.
 async fn wait_ready(
     marks: &Marks,
@@ -226,7 +239,13 @@ async fn wait_ready(
         let phase = *phase_rx.borrow_and_update();
         let now = Instant::now();
         match phase {
-            ShellPhase::Ready => return Ok(ExecMode::Integrated),
+            ShellPhase::Ready => {
+                return Ok(if marks.integration_start_broken() {
+                    ExecMode::Sentinel
+                } else {
+                    ExecMode::Integrated
+                });
+            }
             ShellPhase::Unknown => {
                 if now >= unknown_grace {
                     return Ok(ExecMode::Sentinel);
@@ -297,5 +316,48 @@ mod tests {
         let line = sentinel_line("module load samtools");
         assert!(line.starts_with("printf '\\033]133;C\\007'; module load samtools;"));
         assert!(line.ends_with("\"$?\"\r"));
+    }
+
+    /// A shell that shows prompt marks but never emits 133;C for typed
+    /// commands (a half-broken integration, e.g. an rc chain that kills
+    /// bash's DEBUG trap): the first exec fails, later execs degrade to
+    /// sentinel mode and complete.
+    #[tokio::test]
+    async fn integrated_without_c_marks_degrades_to_sentinel() {
+        let marks = Arc::new(Marks::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        marks.feed(b"\x1b]133;A\x07$ ");
+
+        let opts = ExecOptions {
+            command: "echo hi".into(),
+            queue_timeout: Duration::from_millis(0),
+            timeout: Duration::from_millis(300),
+            allow_sentinel_over_running: false,
+            stage: None,
+        };
+
+        // First exec: integrated (phase ready), types the plain command,
+        // no 133;C ever arrives -> NeverStarted + the session remembers.
+        let err = exec(marks.clone(), tx.clone(), lock.clone(), opts.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ExecError::NeverStarted(_)));
+        assert_eq!(rx.recv().await.unwrap(), Bytes::from("echo hi\r"));
+        assert!(marks.integration_start_broken());
+
+        // Second exec on the same session: still phase ready, but typed
+        // sentinel-wrapped; completes off its own printf'd marks.
+        let task = tokio::spawn(exec(marks.clone(), tx.clone(), lock.clone(), opts));
+        let typed = rx.recv().await.unwrap();
+        let line = String::from_utf8(typed.to_vec()).unwrap();
+        assert!(line.starts_with("printf"), "expected sentinel line: {line}");
+        marks.feed(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        let outcome = task.await.unwrap().expect("sentinel exec completes");
+        assert_eq!(outcome.mode, ExecMode::Sentinel);
+        assert_eq!(outcome.record.exit_code, Some(0));
+        assert_eq!(outcome.record.command.as_deref(), Some("echo hi"));
+        // The sentinel's own C did not un-degrade the session.
+        assert!(marks.integration_start_broken());
     }
 }
