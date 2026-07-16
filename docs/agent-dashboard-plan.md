@@ -1,7 +1,7 @@
 # The Agent Dashboard — design & plan
 
-Status: **design draft, first maintainer pass folded in** (2026-07-15).
-Nothing here is built. This document synthesizes a research pass over the
+Status: **v0.1 shipped (PR #62); third maintainer pass folded in** (2026-07-16).
+This document synthesizes a research pass over the
 codebase, the current Claude Code and Codex integration surfaces (verified
 July 2026), and prior art (Conductor, Crystal, claude-squad, Vibe Kanban,
 Sculptor, Cursor agents, Codex cloud, Devin, Terragon, Omnara, cmux, disler's
@@ -30,6 +30,33 @@ maintainer's call.
 6. **Codex telemetry consent** is pitched as a dashboard card.
 7. **Subagent drop-down:** an agent card whose session has live subagents
    expands in place to show them (spec in §4).
+
+## Decisions (maintainer, 2026-07-16 — post-v0.1 design pass)
+
+8. **The Mastermind dock is a third column** on the dashboard, right of the
+   activity column: a full-height slim chat, collapsing to an "Ask the
+   workspace…" pill under the pane's container width. Always visible when
+   configured — it is the mind of the surface, not a drawer.
+9. **Reactive-only in v1.** The Mastermind speaks only when spoken to: no
+   event-triggered turns, no autonomous suggestion ticks, no `suggest` tool
+   (its chat reply *is* the suggestion surface). Consequence: worker-side
+   `ask_mastermind` moves to **v1.x** — fire-and-forget queueing into an idle
+   chat session would trigger unprompted billed turns, which contradicts
+   reactive-only; it returns when we design a non-triggering inbox for it.
+   Proactivity (event-nudged briefs) is a v1.x opt-in.
+10. **Side-column diet:** changed files + git stay; **recents demote** to the
+   blank state and quiet moments (no busy agents) — during live work the
+   column stays lean. The return strip grows into a **workspace vital-signs
+   strip** (branch · N working · M waiting · compute).
+11. **Compute is a workspace vital sign:** when the daemon sees a scheduler
+   (Slurm), the dashboard shows a one-line compute summary from the existing
+   `computeStatus` store (jobs running/pending; walltime countdown inside an
+   allocation). Appears only when a scheduler exists; never a queue table.
+12. **Cards must not lie by omission:** the subagent drop-down becomes a
+   **work drop-down** — live subagents ∪ backgrounded bash/workflows (the
+   `background_tasks` level-set), reusing the shared `WorkTray` shell; and
+   output-only TUI cards use `output_active` for an honest "working —
+   terminal output flowing" / "quiet" now-line instead of "state unknown".
 
 ## 0. The one-paragraph version
 
@@ -368,11 +395,18 @@ Rules:
   catalog) and the ask-first/auto mode choice. Changeable later from the
   dock; picking a new one retires the old session's act tier. No Mastermind
   = no act tier and no `ask_mastermind` tool anywhere in the workspace.
-- **It lives on the dashboard, only on the dashboard** (decided): a docked
-  strip (identity chip + mode + composer), expandable to the full
-  `ChatView` — the subagents tray and plan panel come along free. It never
-  appears in the rail's agents list; the dock is its one management
-  surface.
+- **It lives on the dashboard, only on the dashboard** (decided): a
+  full-height **third column** right of the activity column (2026-07-16) —
+  identity chip + mode + a slim embedded chat; the subagents tray and plan
+  panel come along free. Collapses to an "Ask the workspace…" pill under the
+  pane's container width. It never appears in the rail's agents list or the
+  roster (the observer, not the observed — an additive wire flag hides it);
+  the dock is its one management surface.
+- **Reactive-only (v1, decided 2026-07-16):** it answers when the user
+  types; nothing else triggers a turn. Aliveness comes from *fresh context
+  per turn*, not autonomy: its observe tools read live daemon state, so
+  every answer reflects the workspace as of now. No `suggest` tool — the
+  reply is the suggestion surface.
 - **It delegates, it doesn't do.** The Chimaera-shipped **skill** (claude:
   injected skill dir; codex: a generated AGENTS.md layer) frames the role:
   understand the workspace, triage by attention state, cite session ids,
@@ -401,11 +435,12 @@ search misses paraphrase; acceptable for a small, jargon-heavy corpus.
 
 | Phase | Ships | New consent surface |
 |---|---|---|
-| **v0.1 — the surface** (days) | DashboardTab (label `dashboard`) + auto landing + return strip + attention lane w/ inline permissions + roster cards incl. the subagent drop-down for chat sessions + activity column — all from the existing wire. Rail row, ⌘0. Launcher empty state when nothing runs. | none |
-| **v0.2 — honest depth** | Additive wire fields (`subagents[]`, `provenance`, `now_line`, usage) + feed fold; claude TUI http-hooks upgrade (subagent identity for TUIs) + statusline heartbeat; PTY liveness → `stalled`; recent-files JSONL log; codex chat MCP injection | none |
+| **v0.1 — the surface** (SHIPPED, PR #62) | DashboardTab (label `dashboard`) + auto landing + return strip + attention lane w/ inline permissions + roster cards incl. the subagent drop-down for chat sessions + activity column — all from the existing wire. Rail row, ⌘0. Launcher empty state when nothing runs. | none |
+| **v0.1.x — rebase dividends** (client-only) | `output_active` now-lines for output-only TUIs; work drop-down (subagents ∪ `background_tasks`, shared `WorkTray` shell); compute vital-sign line from `computeStatus`; side-column diet (recents demote to quiet/blank); vital-signs strip | none |
+| **v0.2 — honest depth** | Additive wire fields (`subagents[]`, `now_line`, usage, `stalled`) + feed fold; claude TUI http-hooks upgrade (subagent identity for TUIs) + statusline heartbeat (usage/context for TUIs, preserving any user statusline); PTY liveness → `stalled`; (recent-files JSONL deferred — `files_touched` covers the need so far); codex chat MCP injection | none |
 | **v0.3 — agents can look** | Observe MCP tools + surface manifest; codex TUI hook consent flow | codex `/hooks` walk-through (dashboard card) |
-| **v1 — the Mastermind** | Setup card + picker (one per workspace) + docked strip + act tools (`message_agent`, `spawn_agent`, `spawn_terminal`, `interrupt`, `open_in_pane`, `suggest`) gated by the harness ask-first/auto mode + `ask_mastermind` for workers + audit strip; provenance stamping; REST/MCP chat-send | the Mastermind setup card itself |
-| **v1.x** | The Mastermind skill hardening; suggestion cards polish; memory phase 1 (files), then phase 2 (index) if pulled | none |
+| **v1 — the Mastermind** | Setup card + picker (one per workspace) + the third-column dock + observe tools + act tools (`message_agent` chat-targets-only, `spawn_agent`, `spawn_terminal`, `interrupt`) gated by the harness ask-first/auto mode; reactive-only; hidden from roster/rail via an additive wire flag | the Mastermind setup card itself |
+| **v1.x** | `ask_mastermind` (needs a non-triggering inbox — see decision 9); proactivity opt-in (event-nudged briefs); `open_in_pane`; the Mastermind skill hardening; memory phase 1 (files), then phase 2 (index) if pulled | none |
 
 Each phase is independently verifiable live (`verify-app`) and useful alone.
 The **wedge** (v0.1's reason to exist): *the attention queue with inline
