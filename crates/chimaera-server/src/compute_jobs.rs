@@ -291,12 +291,16 @@ pub(crate) async fn launch_compute_session(
         }
     };
 
-    let out = crate::compute::run_capped(
+    // A generous deadline, NOT the 5s poll discipline: sbatch against a busy
+    // controller can take longer, and killing it mid-flight does not
+    // unsubmit — the job lands in the queue while we report failure.
+    let out = crate::compute::run_capped_within(
         &sbatch.to_string_lossy(),
         &[
             "--parsable".into(),
             script_path.to_string_lossy().into_owned(),
         ],
+        std::time::Duration::from_secs(30),
     )
     .await;
     // `--parsable` prints `jobid[;cluster]`.
@@ -305,12 +309,25 @@ pub(crate) async fn launch_compute_session(
         .and_then(|o| o.lines().next())
         .map(|l| l.split(';').next().unwrap_or(l).trim().to_string())
         .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
-    let Some(job_id) = job_id else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "sbatch failed — check partition/resources and cluster health"})),
-        )
-            .into_response();
+    let job_id = match job_id {
+        Some(id) => id,
+        // sbatch gave no usable answer — but it may have SUBMITTED before
+        // dying/timing out. Ask the queue before crying failure: adopt the
+        // newest row wearing this launch's job name that no record claims
+        // (found live: a >5s sbatch produced "sbatch failed" + a ghost job).
+        None => match adopt_submitted(&state, &format!("chimaera-{job_slug}"), &root).await {
+            Some(id) => {
+                tracing::warn!(%id, "sbatch answered late/nothing; adopted the submitted job from the queue");
+                id
+            }
+            None => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "sbatch failed — check partition/resources and cluster health"})),
+                )
+                    .into_response()
+            }
+        },
     };
     // The queue just changed and the UI refetches immediately — don't let
     // that refetch see the pre-launch snapshot cache.
@@ -388,6 +405,48 @@ pub(crate) async fn launch_compute_session(
 
     tracing::info!(%job_id, slug = %job_slug, "compute session submitted");
     Json(json!({ "job_id": job_id })).into_response()
+}
+
+/// The sbatch-timeout reconciliation: force-refresh the queue and pick the
+/// newest job wearing `job_name` that no launch record claims. The fs check
+/// runs off the reactor (shared FS).
+async fn adopt_submitted(state: &Arc<AppState>, job_name: &str, root: &Path) -> Option<String> {
+    state.compute.invalidate().await;
+    let snap = state.compute.snapshot(true).await;
+    let candidates: Vec<String> = snap
+        .jobs
+        .iter()
+        .filter(|j| j.name == job_name)
+        .map(|j| j.id.clone())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let recorded: std::collections::HashSet<String> = candidates
+            .iter()
+            .filter(|id| root.join("pending").join(format!("{id}.json")).is_file())
+            .cloned()
+            .collect();
+        newest_unrecorded(&candidates, &recorded)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Highest-numbered candidate id not already claimed by a record — job ids
+/// are monotonically increasing, so the newest submission wins.
+fn newest_unrecorded(
+    candidates: &[String],
+    recorded: &std::collections::HashSet<String>,
+) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|id| !recorded.contains(*id))
+        .max_by_key(|id| id.parse::<u64>().unwrap_or(0))
+        .cloned()
 }
 
 /// GET /api/v1/compute/sessions — the stateless registry: chimaera-named
@@ -563,8 +622,16 @@ fn join_session(root: &Path, j: crate::compute::Job) -> ComputeSession {
         name: rec("display_name")
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| j.name.trim_start_matches("chimaera-").to_string()),
-        cpus: rec("cpus").and_then(|v| v.as_u64()).map(|v| v as u32),
-        mem: rec("mem").and_then(|v| v.as_str().map(str::to_string)),
+        // Resources: the launch record's request first, squeue's own %C/%m
+        // as the fallback — a record-less job (adopted late submission,
+        // launched outside chimaera) still shows what it holds.
+        cpus: rec("cpus")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .or_else(|| j.cpus.parse().ok()),
+        mem: rec("mem")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .or_else(|| (!j.mem.is_empty()).then(|| j.mem.clone())),
         gres: rec("gres").and_then(|v| v.as_str().map(str::to_string)),
         workspace_id: rec("workspace_id").and_then(|v| v.as_str().map(str::to_string)),
         routable: rec("routable").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -668,6 +735,28 @@ mod tests {
         assert_eq!(slug("  --weird--  "), "weird");
         assert_eq!(slug("!!!"), "session");
         assert!(slug(&"x".repeat(99)).len() <= 32);
+    }
+
+    #[test]
+    fn adoption_picks_the_newest_unrecorded_submission() {
+        let ids = ["34109903", "34109906", "34109801"].map(String::from);
+        let mut recorded = std::collections::HashSet::new();
+        // Nothing recorded → the numerically newest id wins.
+        assert_eq!(
+            newest_unrecorded(&ids, &recorded).as_deref(),
+            Some("34109906")
+        );
+        // The newest already has a record (a normal launch raced in) → the
+        // ghost is the older unrecorded one.
+        recorded.insert("34109906".to_string());
+        assert_eq!(
+            newest_unrecorded(&ids, &recorded).as_deref(),
+            Some("34109903")
+        );
+        // Everything claimed → nothing to adopt.
+        recorded.insert("34109903".to_string());
+        recorded.insert("34109801".to_string());
+        assert_eq!(newest_unrecorded(&ids, &recorded), None);
     }
 
     #[test]

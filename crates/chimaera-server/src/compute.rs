@@ -50,6 +50,12 @@ pub(crate) struct Job {
     pub(crate) state: String,
     pub(crate) time_left: String,
     pub(crate) nodes: String,
+    /// Requested/allocated CPUs (`%C`) and min memory (`%m`) — squeue's own
+    /// resource truth, so a job with no launch record (an sbatch that timed
+    /// out after submitting, or one launched outside chimaera) still shows
+    /// what it holds. "" when the wire lacked them.
+    pub(crate) cpus: String,
+    pub(crate) mem: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -334,7 +340,7 @@ async fn fetch_snapshot(
                     user,
                     "--noheader".into(),
                     "-o".into(),
-                    "%i|%j|%P|%T|%L|%N".into(),
+                    "%i|%j|%P|%T|%L|%N|%C|%m".into(),
                 ],
             )
             .await
@@ -392,13 +398,15 @@ fn parse_self_allocation(out: &str) -> Option<SelfAllocation> {
     })
 }
 
-/// `squeue --noheader -o "%i|%j|%P|%T|%L|%N"` → jobs. Unparseable lines are
-/// skipped, never fatal (Slurm banners/warnings sometimes precede output).
+/// `squeue --noheader -o "%i|%j|%P|%T|%L|%N|%C|%m"` → jobs. Unparseable
+/// lines are skipped, never fatal (Slurm banners/warnings sometimes precede
+/// output). The trailing resource fields are tolerated missing — older rows
+/// or exotic formats degrade to "".
 fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
     let mut jobs = Vec::new();
     let mut truncated = false;
     for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let mut f = line.splitn(6, '|').map(str::trim);
+        let mut f = line.splitn(8, '|').map(str::trim);
         let (Some(id), Some(name), Some(partition), Some(state), Some(time_left)) =
             (f.next(), f.next(), f.next(), f.next(), f.next())
         else {
@@ -419,6 +427,8 @@ fn parse_squeue(out: &str) -> (Vec<Job>, bool) {
             time_left: time_left.to_string(),
             // %N is empty while pending — an empty string is the honest value.
             nodes: f.next().unwrap_or("").to_string(),
+            cpus: f.next().unwrap_or("").to_string(),
+            mem: f.next().unwrap_or("").to_string(),
         });
     }
     (jobs, truncated)
@@ -465,10 +475,23 @@ fn parse_sinfo(out: &str) -> (Vec<Partition>, bool) {
     (partitions, truncated)
 }
 
-/// Run one child with the timeout + output cap; None on spawn failure,
-/// non-zero exit, or timeout (the caller degrades, never errors). Shared
-/// with `compute_jobs` (sbatch/scancel ride the same discipline).
+/// Run one child with the default timeout + output cap; None on spawn
+/// failure, non-zero exit, or timeout (the caller degrades, never errors).
+/// Shared with `compute_jobs` (scancel rides the same discipline).
 pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
+    run_capped_within(bin, args, CMD_TIMEOUT).await
+}
+
+/// [`run_capped`] with a caller-chosen deadline. sbatch needs a longer one
+/// than the 5s poll discipline: a busy controller can take longer to answer,
+/// and killing sbatch mid-flight does NOT unsubmit — the tight cap turned a
+/// slow submission into "sbatch failed" plus a ghost job in the queue
+/// (found live, maintainer's 5th round).
+pub(crate) async fn run_capped_within(
+    bin: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -480,7 +503,7 @@ pub(crate) async fn run_capped(bin: &str, args: &[String]) -> Option<String> {
         let out = cmd.output().await.ok()?;
         out.status.success().then_some(out.stdout)
     };
-    let bytes = tokio::time::timeout(CMD_TIMEOUT, fut).await.ok()??;
+    let bytes = tokio::time::timeout(timeout, fut).await.ok()??;
     let mut s = String::from_utf8_lossy(&bytes).into_owned();
     if s.len() > MAX_OUTPUT {
         s.truncate(MAX_OUTPUT);
@@ -522,8 +545,9 @@ mod tests {
 
     #[test]
     fn parse_squeue_rows_caps_and_skips_noise() {
-        // Shapes measured on Sherlock 2026-07-14 (`%i %j %N %T %L`).
-        let out = "34022541|chimaera-test|normal|RUNNING|9:54|sh02-01n58\n\
+        // Shapes measured on Sherlock 2026-07-14 (`%i %j %N %T %L`), plus
+        // the %C|%m resource tail (2026-07-16) — tolerated missing.
+        let out = "34022541|chimaera-test|normal|RUNNING|9:54|sh02-01n58|4|16G\n\
                    34022542|align.sh|owners|PENDING|8:00:00|\n\
                    slurm_load_jobs: Warning: something\n";
         let (jobs, truncated) = parse_squeue(out);
@@ -534,7 +558,10 @@ mod tests {
         assert_eq!(jobs[0].state, "RUNNING");
         assert_eq!(jobs[0].time_left, "9:54");
         assert_eq!(jobs[0].nodes, "sh02-01n58");
+        assert_eq!(jobs[0].cpus, "4");
+        assert_eq!(jobs[0].mem, "16G");
         assert_eq!(jobs[1].nodes, "", "pending job has no nodes yet");
+        assert_eq!(jobs[1].cpus, "", "short rows degrade to empty resources");
 
         let many: String = (0..60)
             .map(|i| format!("{i}|j{i}|p|RUNNING|1:00|n{i}\n"))
