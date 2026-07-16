@@ -50,13 +50,16 @@ the rail's recents.
 - **How it's used.** The whole card opens the live session (via the same reveal path the
   git panel uses, `LayoutCtrl.revealWorktreeSession`-adjacent `onOpenSession`). The
   evidence row ("N files · view changes") opens the session-scoped Changes view beside the
-  dashboard (`LayoutCtrl.openChangesFrom`). A subagent line ("✳ 2 subagents · 14 tools")
-  expands in place to per-subagent rows with live progress and a stop control (claude
-  chat: `{type:"stop_task"}`) — the `AgentsTray` derivation promoted workspace-wide.
+  dashboard (`LayoutCtrl.openChangesFrom`). A work line ("✳ 2 subagents · 1 background
+  task") expands in place to per-row detail — live subagents ∪ background tasks on the
+  shared `WorkTray` shell, with stop controls (claude chat: `{type:"stop_task"}` for both
+  kinds) — the `AgentsTray`/`BackgroundTray` derivations promoted workspace-wide.
 - **Key behaviors.**
   - **Provenance is worn openly**: every card carries its fidelity tier — `protocol`
-    (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs, honestly
-    unknown) — with a tooltip saying what that means (`dash.ts::provenanceOf`).
+    (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs) — with a
+    tooltip saying what that means (`dash.ts::provenanceOf`). Output-only cards read the
+    daemon's output-recency signal for the now-line ("working — terminal output flowing" /
+    "quiet — no recent output"); "state unknown" survives only on old daemons.
   - **Density-adaptive**: one agent → a hero card (plan snapshot, subagents open by
     default); 2–6 → a card grid; 7+ → compact triage rows. The side column collapses under
     the pane's own width (container query), not the window's.
@@ -75,7 +78,9 @@ the rail's recents.
 - **Changed files** — newest-first union of every agent's `files_touched` (attributed with
   a per-agent chip) and uncommitted git paths no agent claimed (chip `you`, tooltip states
   attribution is best-effort). Click opens the file in the active pane. Cap 10.
-- **Recents** — the rail's daemon-persisted recents, resumable, cap 5.
+- **Recents** — the rail's daemon-persisted recents, resumable, cap 5. Shown only in
+  quiet moments (attention lane empty, no agent mid-work) — during live work the column
+  stays lean; the blank state keeps its own recents regardless.
 - **Git** — branch, ahead/behind, change count; opens the source-control panel. Reads the
   live `gitStatus` store (epoch-driven, never polled).
 
@@ -85,8 +90,11 @@ the rail's recents.
   from the same `agent_state`/`dotState` vocabulary the rail uses.
 - **No new wire, no new routes** in v0.1 — the surface composes existing client state; the
   daemon is untouched.
-- The return strip's summary sentence ("2 working · 1 waiting on you · 1 finished") counts
-  agents; terminals summarize separately.
+- The return strip is the workspace vital-signs line: name · branch chip · the summary
+  sentence ("2 working · 1 waiting on you · 1 finished" — counts agents; terminals
+  summarize separately) · a compute chip when the daemon sees a scheduler (`computeStatus`:
+  Slurm running/pending counts, or a live walltime countdown inside an allocation; nothing
+  renders otherwise — never a queue table).
 
 **Verified live (2026-07-15):** empty-workspace landing + blank state; spawn terminal +
 claude chat from the dashboard; the attention lane rendering a real Write permission and

@@ -17,6 +17,7 @@
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
   import { gitStatus } from "../workspace/git";
+  import { computeStatus, formatSlurmDuration, parseSlurmTimeLeft } from "../workspace/compute";
   import { keyHint } from "../shared/keybindings";
   import { relativeAge } from "../workspace/launcher";
   import {
@@ -64,6 +65,10 @@
 
   const hero = $derived(lane.length === 0 && roster.length === 1);
   const compact = $derived(roster.length >= 7);
+
+  /** Quiet = nothing needs you and no agent is mid-work — the moment recents
+   *  earn the side column back (decision 10: lean during live work). */
+  const quiet = $derived(lane.length === 0 && !agents.some(isBusy));
 
   const nothingRunning = $derived(wsSessions.length === 0);
 
@@ -140,9 +145,61 @@
     if (!sent) entry.store.notice("not connected — decision not sent, try again", "error");
   }
 
+  /** Stop a work row (subagent or background task — both ride stop_task).
+   *  Same never-lose-a-click contract as decide(). */
   function stopTask(sessionId: string, taskId: string): void {
-    rich.get(sessionId)?.socket.send({ type: "stop_task", task_id: taskId });
+    const entry = rich.get(sessionId);
+    if (entry === undefined) return;
+    const sent = entry.socket.send({ type: "stop_task", task_id: taskId });
+    if (!sent) entry.store.notice("not connected — stop not sent, try again", "error");
   }
+
+  // --- the compute vital sign -----------------------------------------------------
+  //
+  // A scheduler is workspace context, not a queue table (decision 11): one
+  // chip on the vital-signs strip, absent entirely when no scheduler exists.
+
+  /** Local countdown baseline — ticks at 1 Hz ONLY inside an allocation
+   *  (the ComputeStrip idiom: time_left moves per 60s fetch; the chip ticks
+   *  against the snapshot's client receipt time). */
+  let computeNow = $state(Date.now());
+  $effect(() => {
+    const snap = $computeStatus;
+    if (snap === null || snap.self === null) return;
+    computeNow = Date.now();
+    const timer = setInterval(() => (computeNow = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  /** The chip's text + tooltip; null = no scheduler (nothing renders). */
+  const computeChip = $derived.by(() => {
+    const snap = $computeStatus;
+    if (snap === null || (snap.scheduler !== "slurm" && snap.self === null)) return null;
+    if (snap.self !== null) {
+      // Inside an allocation the walltime IS the vital sign.
+      const title = `slurm job ${snap.self.job_id} on ${snap.self.node} — expires at walltime`;
+      const baseline = parseSlurmTimeLeft(snap.self.time_left);
+      if (baseline === null) {
+        // Slurm's non-durations: a dash for the transitional placeholders,
+        // the raw vocabulary otherwise (UNLIMITED is never relabeled).
+        const raw =
+          snap.self.time_left === "INVALID" || snap.self.time_left === "NOT_SET"
+            ? "—"
+            : snap.self.time_left;
+        return { text: `slurm · ${raw}`, title };
+      }
+      const remaining = Math.max(0, baseline - Math.floor((computeNow - snap.received_at_ms) / 1000));
+      return {
+        text: remaining === 0 ? "slurm · expiring…" : `slurm · ${formatSlurmDuration(remaining)} left`,
+        title,
+      };
+    }
+    // Outside an allocation: the user's own queue, running vs pending
+    // (queuedJobCount's filter, split per state — raw Slurm state words).
+    const running = snap.jobs.filter((j) => j.state === "RUNNING").length;
+    const pending = snap.jobs.filter((j) => j.state === "PENDING").length;
+    return { text: `slurm · ${running} running · ${pending} pending`, title: "your slurm queue" };
+  });
 
   // --- the activity column -------------------------------------------------------
 
@@ -214,6 +271,8 @@
     </div>
   {:else}
     <div class="inner">
+      <!-- The vital-signs strip: name · branch · the summary sentence · the
+           compute chip — one quiet row (decision 10). -->
       <header class="strip">
         <span class="wsname">{dash.wsName}</span>
         {#if $gitStatus !== null}
@@ -229,6 +288,9 @@
             <b class="d">all quiet</b>
           {/if}
         </span>
+        {#if computeChip !== null}
+          <span class="compute" title={computeChip.title}>{computeChip.text}</span>
+        {/if}
       </header>
 
       {#if continueTarget !== null && agents.length > 1}
@@ -328,7 +390,9 @@
             </div>
           {/if}
 
-          {#if dash.recents.length > 0}
+          <!-- Recents show only in quiet moments — during live work the
+               column stays lean (decision 10); the blank state keeps its own. -->
+          {#if quiet && dash.recents.length > 0}
             <div class="sec">
               <div class="sec-title">recents</div>
               {#each dash.recents.slice(0, 5) as r (r.resume ?? `${r.kind}:${r.title}`)}
@@ -498,6 +562,19 @@
   }
   .sentence .d {
     color: var(--muted);
+  }
+  /* The compute vital sign — the branch chip's shape with the accent's
+     compute tint (the ComputeStrip family), quiet in both themes. */
+  .compute {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--muted);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--edge));
+    border-radius: 999px;
+    padding: 1px 8px;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
   .continue {

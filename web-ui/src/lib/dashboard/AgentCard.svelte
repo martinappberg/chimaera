@@ -4,14 +4,17 @@
    * what — and a door into the live session (the whole card opens it).
    * Renders from server wire truth alone; when a warm chat store is passed
    * (bounded upstream in DashboardView) it adds the live now-line, context
-   * meter, plan snapshot, and the subagent drop-down. Zones a card can't
+   * meter, plan snapshot, and the work drop-down (live subagents ∪
+   * background tasks, on the shared WorkTray shell). Zones a card can't
    * truthfully fill stay empty — never fabricated.
    */
   import SessionGlyph from "../shared/SessionGlyph.svelte";
-  import Chevron from "../shared/Chevron.svelte";
+  import WorkTray from "../shared/WorkTray.svelte";
+  import WorkTrayRow from "../shared/WorkTrayRow.svelte";
+  import { formatElapsedSeconds } from "../shared/time";
   import { relativeAge } from "../workspace/launcher";
   import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
-  import type { ChatBlock, ChatStore } from "../chat/store.svelte";
+  import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle } from "./dash";
 
   interface Props {
@@ -26,7 +29,8 @@
     wsRoot: string | null;
     onOpen: () => void;
     onOpenChanges: () => void;
-    /** Stop a subagent (claude chat only); omitted when unsupported. */
+    /** Stop a work row — a subagent or a background task; both ride the
+     *  same stop_task wire (claude chat only). Omitted when unsupported. */
     onStopTask?: (id: string) => void;
   }
 
@@ -61,7 +65,14 @@
       return `edited ${basename(touched[touched.length - 1])}`;
     }
     if (!session.alive) return "exited";
-    if (prov === "none") return "state unknown — open the terminal";
+    if (prov === "none") {
+      // Output recency is the only honest signal for unintegrated TUIs
+      // (dotTitle's working/quiet vocabulary); absent = an old daemon, so
+      // the state really is unknown.
+      if (session.output_active === true) return "working — terminal output flowing";
+      if (session.output_active === false) return "quiet — no recent output";
+      return "state unknown — open the terminal";
+    }
     return null;
   });
 
@@ -75,10 +86,50 @@
         ),
   );
 
-  /** The drop-down: closed by default so ten cards stay scannable (the
-   *  single-agent hero opens it); a user toggle overrides either default. */
-  let subsToggled = $state<boolean | null>(null);
-  const subsOpen = $derived(subsToggled ?? hero);
+  /** Background work (backgrounded Bash / workflows) — the level-set the
+   *  BackgroundTray renders, promoted card-side the same way. A card that
+   *  showed only subagents would lie by omission (design decision 12). */
+  const bgTasks = $derived(store?.backgroundTasks ?? []);
+  const workCount = $derived(activeAgents.length + bgTasks.length);
+
+  /** "2 subagents · 1 background task" — a zero half is omitted. */
+  const workLabel = $derived(
+    [
+      activeAgents.length > 0
+        ? `${activeAgents.length} subagent${activeAgents.length === 1 ? "" : "s"}`
+        : null,
+      bgTasks.length > 0
+        ? `${bgTasks.length} background task${bgTasks.length === 1 ? "" : "s"}`
+        : null,
+    ]
+      .filter((p) => p !== null)
+      .join(" · "),
+  );
+  /** The trays' own identity glyphs: ✳ subagents, ⧖ background-only. */
+  const workGlyph = $derived(activeAgents.length > 0 ? "✳" : "⧖");
+
+  /** The drop-down: closed by default so ten cards stay scannable; the
+   *  single-agent hero opens it. Writable derived: the tray's own toggle
+   *  (bound below) overrides until the hero default itself changes. */
+  let workOpen = $derived(hero);
+
+  /** 1 Hz clock for the background rows' elapsed column — only while the
+   *  rows are actually visible (the BackgroundTray idiom: collapsed cards
+   *  must not tick a wake-up per second for hours). */
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!workOpen || bgTasks.length === 0) return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  /** Elapsed since the driver first saw the task. Daemon-side epoch ms, so
+   *  clamp: a skewed client clock must not render "-3s". */
+  function elapsed(t: BackgroundTask): string {
+    if (t.startedAtMs <= 0) return "";
+    return formatElapsedSeconds(Math.max(0, Math.floor((now - t.startedAtMs) / 1000)));
+  }
 
   /** Driver titles are "Agent: {description}" — the prefix is the tray's. */
   function subName(title: string): string {
@@ -149,47 +200,40 @@
     </div>
   {/if}
 
-  {#if !compact && activeAgents.length > 0}
-    <div class="subs">
-      <button
-        class="subs-head"
-        aria-expanded={subsOpen}
-        onclick={(e) => {
-          e.stopPropagation();
-          subsToggled = !subsOpen;
-        }}
-      >
-        <Chevron open={subsOpen} />
-        <span class="spark" aria-hidden="true">✳</span>
-        <span
-          >{activeAgents.length === 1
-            ? "subagent working"
-            : `${activeAgents.length} subagents working`}</span
-        >
-      </button>
-      {#if subsOpen}
-        <div class="subtree">
-          {#each activeAgents as a (a.id)}
-            <div class="subrow">
-              <span class="subdot" aria-hidden="true"></span>
-              <span class="subname" title={subName(a.title)}>{subName(a.title)}</span>
-              {#if subProgress(a) !== ""}
-                <span class="subprog" title={subProgress(a)}>{subProgress(a)}</span>
-              {/if}
-              {#if onStopTask !== undefined}
-                <button
-                  class="substop"
-                  title="stop this subagent"
-                  onclick={(e) => {
-                    e.stopPropagation();
-                    onStopTask(a.id);
-                  }}>stop</button
-                >
-              {/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
+  {#if !compact && workCount > 0}
+    <!-- The tray owns its clicks (expand, stop) — none may bubble into the
+         card's open-the-session handler. -->
+    <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+    <div class="work" onclick={(e) => e.stopPropagation()}>
+      <WorkTray glyph={workGlyph} bind:open={workOpen} label={workLabel}>
+        {#each activeAgents as a (a.id)}
+          <WorkTrayRow
+            onStop={onStopTask !== undefined ? () => onStopTask(a.id) : undefined}
+            stopTitle="stop this subagent"
+          >
+            <span class="subname" title={subName(a.title)}>{subName(a.title)}</span>
+            {#if subProgress(a) !== ""}
+              <span class="subprog" title={subProgress(a)}>{subProgress(a)}</span>
+            {/if}
+          </WorkTrayRow>
+        {/each}
+        {#each bgTasks as t (t.id)}
+          {@const e = elapsed(t)}
+          <WorkTrayRow
+            onStop={onStopTask !== undefined ? () => onStopTask(t.id) : undefined}
+            stopTitle="stop this background task"
+          >
+            <!-- The lane name (local_bash, …) stays canonical in the tooltip. -->
+            <span class="bgname" title={t.taskType}>{t.description}</span>
+            {#if t.status !== "running"}
+              <span class="bgstatus">{t.status}</span>
+            {/if}
+            {#if e !== ""}
+              <span class="bgelapsed">{e}</span>
+            {/if}
+          </WorkTrayRow>
+        {/each}
+      </WorkTray>
     </div>
   {/if}
 
@@ -410,94 +454,50 @@
     }
   }
 
-  .subs {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .subs-head {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0;
-    border: none;
-    background: none;
-    font: inherit;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
-    cursor: pointer;
-  }
-  .subs-head:hover {
-    color: var(--fg);
-  }
-  .spark {
-    color: var(--accent);
-    animation: pulse 2.4s ease-in-out infinite;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .spark {
-      animation: none;
-    }
-  }
-  .subtree {
-    margin-left: 4px;
-    padding-left: 10px;
-    border-left: 1px solid var(--edge);
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-  }
-  .subrow {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    min-width: 0;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
-    color: var(--muted);
-    white-space: nowrap;
-  }
-  .subdot {
-    flex: none;
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: pulse 2.4s ease-in-out infinite;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .subdot {
-      animation: none;
-    }
+  /* The work drop-down rides the shared WorkTray shell full-bleed, so its
+     border-top + tint read as the card's own strip — the same chrome the
+     chat trays wear, never a forked copy. Row content mirrors AgentsTray
+     (subagent rows) and BackgroundTray (background rows). */
+  .work {
+    margin: 2px -12px;
   }
   .subname {
-    color: var(--fg);
+    flex: none;
+    max-width: 60%;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: none;
-    max-width: 55%;
+    white-space: nowrap;
+    color: var(--fg);
+    font-family: var(--mono, monospace);
   }
   .subprog {
     flex: 1;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .substop {
-    flex: none;
-    margin-left: auto;
-    border: none;
-    background: none;
-    font: inherit;
-    font-family: var(--mono);
-    font-size: var(--text-xs);
+    white-space: nowrap;
     color: var(--muted);
-    cursor: pointer;
-    padding: 0 2px;
+    font-size: var(--text-xs);
   }
-  .substop:hover {
-    color: var(--err);
+  .bgname {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg);
+    font-family: var(--mono, monospace);
+  }
+  .bgstatus {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .bgelapsed {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
 
   .meta {
