@@ -1394,6 +1394,12 @@ async fn start_remote(host: &str, home: RemoteHome) -> anyhow::Result<Manifest> 
         // of a subshell still holding the ssh channel's stdio, so sshd never
         // closes the session and `connect` hangs. Found the hard way on a real
         // cluster.
+        //
+        // The `>> {log}` target MUST stay a regular file: the daemonize child
+        // (chimaera/src/daemonize.rs) keeps only regular-file stdio and
+        // re-points everything else at /dev/null, so redirecting to a
+        // fifo/pipe — or dropping the redirect — silently sends the remote
+        // daemon's logs to /dev/null.
         &format!(
             "mkdir -p {log_dir}; \
              {env}{bin} serve --daemonize >> {log} 2>&1 < /dev/null && exit; \

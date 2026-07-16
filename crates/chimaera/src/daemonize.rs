@@ -66,37 +66,35 @@ pub fn detach() -> anyhow::Result<()> {
         .collect::<Result<Vec<_>, _>>()
         .context("a command-line argument has a NUL")?;
 
-    // Stdio policy, also decided in the parent: the child re-points every
-    // stdio fd that is NOT a regular file at /dev/null. A caller's file
-    // redirect (connect's start line appends to a log) is kept — writes to a
-    // file stay valid no matter what happens to the launcher. Anything else —
-    // the terminal, an ssh channel's pipes — is a live wire back to the
-    // launching session: holding it keeps sshd's session open, and once the
-    // peer dies every tracing write fails, which poisons request handlers
-    // that log (see the module doc). A closed fd (fstat EBADF) is redirected
-    // too, so the daemon's next open() can't land on fd 0/1/2 and receive
-    // stray tracing writes. /dev/null is opened WITHOUT CLOEXEC: if a stdio
-    // fd was closed at launch, the new fd may itself be 0/1/2, where the
-    // self-dup2 below is a no-op that would NOT clear a close-on-exec flag —
-    // instead the child closes the fd after the dup2s iff it landed above
-    // the stdio range.
-    let devnull = nix::fcntl::open("/dev/null", OFlag::O_RDWR, Mode::empty())
-        .context("open /dev/null for the daemon's stdio")?;
-    let is_regular_file = |fd: RawFd| matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG);
-    let redirect = [0, 1, 2].map(|fd| !is_regular_file(fd));
-
     // Ignore SIGHUP BEFORE forking so the daemon is immune from the instant it
     // exists. sshd sends SIGHUP the moment the launch command returns, and it
     // can land after the parent exits but before the child re-execs — where the
     // default disposition would kill the daemon on startup and `connect` would
     // time out on a manifest that never appears. This is the `nohup` half of the
     // old `setsid nohup`, in-process; an ignored disposition survives both `fork`
-    // and `execve`, so the child is covered throughout.
+    // and `execve`, so the child is covered throughout. Installed before the
+    // stdio prep below to keep the default-disposition window minimal.
     //
     // SAFETY: single-threaded call site (see the doc comment); `SigIgn` installs
     // no Rust handler and is async-signal-safe.
     unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }
         .context("ignore SIGHUP before detaching the daemon")?;
+
+    // Stdio policy, also decided in the parent: the child re-points every
+    // stdio fd that is NOT a regular file at /dev/null — drop anything that
+    // can die with the launching session (the module doc has the failure
+    // story), keep a caller's log-file redirect (connect's start line appends
+    // to one; file writes stay valid whatever happens to the launcher). A
+    // closed fd (fstat EBADF) is redirected too, so the daemon's next open()
+    // can't land on fd 0/1/2 and receive stray tracing writes. /dev/null is
+    // opened WITHOUT CLOEXEC: if a stdio fd was closed at launch, the new fd
+    // may itself be 0/1/2, where the self-dup2 below is a no-op that would
+    // NOT clear a close-on-exec flag — instead the child closes the fd after
+    // the dup2s iff it landed above the stdio range.
+    let devnull = nix::fcntl::open("/dev/null", OFlag::O_RDWR, Mode::empty())
+        .context("open /dev/null for the daemon's stdio")?;
+    let is_regular_file = |fd: RawFd| matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG);
+    let redirect = [0, 1, 2].map(|fd| !is_regular_file(fd));
 
     // Fork so the survivor is NOT a process-group leader (`setsid` EPERMs for a
     // leader — what an interactive shell makes of a foreground `chimaera serve`).

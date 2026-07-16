@@ -149,9 +149,16 @@ fn main() -> anyhow::Result<()> {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // log_internal_errors(false): a failed stderr write must drop the log line,
+    // never escalate. The fmt() builder's default (true) reports the failure via
+    // eprintln!, which panics on the SAME dead stderr — killing whatever task
+    // logged. A daemon that outlives its launch channel (ssh pipe, terminal)
+    // with stderr unredirected would otherwise turn every logging request
+    // handler into an empty reply once that channel dies.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .log_internal_errors(false)
         .init();
 
     tokio::runtime::Builder::new_multi_thread()
