@@ -10,9 +10,16 @@
 //! absent on macOS/BSD and on minimal Linux containers — so a daemon could only
 //! be started on GNU/Linux. Doing it in-process with POSIX primitives lets
 //! `connect` bring a daemon up on ANY POSIX remote with no host binaries. (a)
-//! stays the caller's job: the start line still redirects
-//! `>> log 2>&1 < /dev/null`, and a foreground `chimaera serve` (no
-//! `--daemonize`) keeps the terminal on purpose.
+//! is the child's job too: it re-points every stdio fd that is NOT a regular
+//! file at `/dev/null`, keeping a caller's log redirect (`connect`'s start
+//! line does `>> log 2>&1 < /dev/null`) while dropping a terminal or an ssh
+//! channel's pipes. Trusting the caller to redirect proved unsafe: a
+//! hand-started `serve --daemonize` over plain ssh keeps the channel's pipes
+//! as stdio, and once that channel dies every tracing write returns
+//! EPIPE/EIO — which poisoned request handlers that log (routes that log gave
+//! empty replies while silent routes answered; found live on a cluster). A
+//! foreground `chimaera serve` (no `--daemonize`) keeps the terminal on
+//! purpose.
 //!
 //! The child **re-exec**s a fresh `chimaera serve` rather than continuing in the
 //! forked image. `fork(2)` clones only the calling thread, so any lock another
@@ -26,10 +33,13 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
 
 use anyhow::Context;
+use nix::fcntl::OFlag;
 use nix::sys::signal::{signal, SigHandler, Signal};
-use nix::unistd::{execv, fork, setsid, ForkResult};
+use nix::sys::stat::{fstat, Mode, SFlag};
+use nix::unistd::{close, dup2, execv, fork, setsid, ForkResult};
 
 /// Detach the current process and re-exec a fresh `chimaera serve` (without
 /// `--daemonize`) as the daemon, in its own session with SIGHUP ignored.
@@ -62,18 +72,37 @@ pub fn detach() -> anyhow::Result<()> {
     // default disposition would kill the daemon on startup and `connect` would
     // time out on a manifest that never appears. This is the `nohup` half of the
     // old `setsid nohup`, in-process; an ignored disposition survives both `fork`
-    // and `execve`, so the child is covered throughout.
+    // and `execve`, so the child is covered throughout. Installed before the
+    // stdio prep below to keep the default-disposition window minimal.
     //
     // SAFETY: single-threaded call site (see the doc comment); `SigIgn` installs
     // no Rust handler and is async-signal-safe.
     unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }
         .context("ignore SIGHUP before detaching the daemon")?;
 
+    // Stdio policy, also decided in the parent: the child re-points every
+    // stdio fd that is NOT a regular file at /dev/null — drop anything that
+    // can die with the launching session (the module doc has the failure
+    // story), keep a caller's log-file redirect (connect's start line appends
+    // to one; file writes stay valid whatever happens to the launcher). A
+    // closed fd (fstat EBADF) is redirected too, so the daemon's next open()
+    // can't land on fd 0/1/2 and receive stray tracing writes. /dev/null is
+    // opened WITHOUT CLOEXEC: if a stdio fd was closed at launch, the new fd
+    // may itself be 0/1/2, where the self-dup2 below is a no-op that would
+    // NOT clear a close-on-exec flag — instead the child closes the fd after
+    // the dup2s iff it landed above the stdio range.
+    let devnull = nix::fcntl::open("/dev/null", OFlag::O_RDWR, Mode::empty())
+        .context("open /dev/null for the daemon's stdio")?;
+    let is_regular_file = |fd: RawFd| matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG);
+    let redirect = [0, 1, 2].map(|fd| !is_regular_file(fd));
+
     // Fork so the survivor is NOT a process-group leader (`setsid` EPERMs for a
     // leader — what an interactive shell makes of a foreground `chimaera serve`).
     //
     // SAFETY: single-threaded (see above); the child calls only async-signal-safe
-    // `setsid` / `execv` on the argv prepared above — no allocation, no locks.
+    // `setsid` / `dup2` / `close` / `execv` on state prepared above — no
+    // allocation (error contexts allocate only on the already-doomed error
+    // path, as before), no locks.
     match unsafe { fork() }.context("fork to detach the daemon")? {
         ForkResult::Parent { .. } => {
             // The instant we exit, sshd sees `connect`'s launch command finish
@@ -84,6 +113,17 @@ pub fn detach() -> anyhow::Result<()> {
         ForkResult::Child => {
             // New session (no controlling terminal), then swap in a clean image.
             setsid().context("setsid to detach the daemon")?;
+            // Drop the launcher's channel per the stdio policy above. `dup2`
+            // clears close-on-exec on the copy, so the re-pointed fds survive
+            // the `execv`.
+            for (fd, must_redirect) in redirect.iter().enumerate() {
+                if *must_redirect {
+                    dup2(devnull, fd as RawFd).context("point daemon stdio at /dev/null")?;
+                }
+            }
+            if devnull > 2 {
+                let _ = close(devnull);
+            }
             // `execv` returns only on failure; on success the fresh `serve`
             // takes over this pid and never comes back here.
             let errno = execv(&exe_c, &argv).expect_err("execv returns only on failure");
