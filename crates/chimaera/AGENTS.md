@@ -21,6 +21,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 |---|---|
 | `main.rs` | clap `Cli`/`Command` defs, all flags, `main()` dispatch, `parse_port` (`$PORT` fallback), `#[global_allocator]` mimalloc, tracing→stderr. The crate's only tests (CLI parse assertions). |
 | `connect.rs` | `connect <host>`: calls `chimaera_remote::connect` with a progress closure, records the host, opens the tunnel URL, holds until Ctrl-C. |
+| `daemonize.rs` | `serve --daemonize`: fork + `setsid` + re-exec so the daemon outlives its launching shell/ssh channel; re-points non-regular-file stdio at `/dev/null` (a caller's log redirect is kept). |
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
