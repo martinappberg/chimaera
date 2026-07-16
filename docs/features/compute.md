@@ -90,7 +90,14 @@ Wire: `GET /api/v1/compute` (bearer-authed; `?refresh=true` re-detects).
   launch adopts the newest unrecorded queue row wearing its job name (retried ~6s); a
   refusal never reaches the queue, and then the srun log's tail — Slurm's own
   admin-authored words — is the error the dialog shows. Cards fall back to squeue's
-  `%C`/`%m` for cpu/mem when no record exists. Launch **seeds the job daemon's workspace registry
+  `%C`/`%m` for cpu/mem when no record exists. **State is two-speed**: squeue stays the
+  authoritative registry on its polite 30s cadence, while every list call reads two LOCAL
+  signals fresh at zero controller cost — the process table (each record's script path is
+  the launch's argv fingerprint; a dead srun client flips the card to ENDED *now* —
+  verified live: 2s after an out-of-band scancel, mid-TTL — and a living one keeps an
+  orphan PENDING past any grace) and the shared-FS manifest (daemon booted ⇒ present
+  RUNNING/ready now, node from the manifest, countdown estimated from requested walltime
+  minus daemon uptime; squeue corrects within a round). Launch **seeds the job daemon's workspace registry
   with the host's whole list** (shared-FS roots are equally valid on the node), so the
   compute window opens on the same ready-to-open workspaces as the login window. A job
   that leaves the queue un-cancelled (walltime, failure) stays visible as a dismissable
