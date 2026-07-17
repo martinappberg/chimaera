@@ -27,6 +27,28 @@ pub fn open_ui_window(
     token: &str,
     record: &WindowRecord,
 ) -> tauri::Result<()> {
+    open_ui_window_with_fragment(app, port, token, record, None)
+}
+
+/// Open a local home window whose first page load presents the Caffeinate
+/// consent sheet. Used when the tray is the only visible app surface: an
+/// event cannot target a webview that does not exist yet.
+pub(super) fn open_caffeinate_consent_window(
+    app: &AppHandle,
+    port: u16,
+    token: &str,
+    record: &WindowRecord,
+) -> tauri::Result<()> {
+    open_ui_window_with_fragment(app, port, token, record, Some("caffeinate=consent"))
+}
+
+fn open_ui_window_with_fragment(
+    app: &AppHandle,
+    port: u16,
+    token: &str,
+    record: &WindowRecord,
+    extra_fragment: Option<&str>,
+) -> tauri::Result<()> {
     let mut hash = format!("token={}", urlencoding::encode(token));
     hash.push_str(&format!("&win={}", urlencoding::encode(&record.id)));
     if let Some(ws) = &record.ws {
@@ -34,6 +56,10 @@ pub fn open_ui_window(
     }
     if let Some(alias) = &record.alias {
         hash.push_str(&format!("&host={}", urlencoding::encode(alias)));
+    }
+    if let Some(extra) = extra_fragment {
+        hash.push('&');
+        hash.push_str(extra);
     }
     let url = format!("http://127.0.0.1:{port}/#{hash}");
     let title = match &record.alias {

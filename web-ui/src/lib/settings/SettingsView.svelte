@@ -11,17 +11,25 @@
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
+  import CaffeinateSettings from "./CaffeinateSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
+  import { getHostLabel } from "../net/api";
+  import { isNativeShell } from "../net/native";
+  import { isMac } from "../shared/keys";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
   /**
-   * Nav sections: the schema categories, plus the bespoke Environment section
-   * (store-backed via /api/v1/environment — it has no schema rows) slotted
-   * after Agents.
+   * Nav sections: schema categories plus bespoke device/environment sections.
+   * Caffeinate is local-app state, never part of a remote daemon's settings.
    */
+  const caffeinateAvailable = isNativeShell() && isMac && getHostLabel() === "local";
   const sections = (() => {
     const out = [...CATEGORIES];
+    if (caffeinateAvailable) {
+      const appearance = out.indexOf("Appearance");
+      out.splice(appearance >= 0 ? appearance + 1 : 0, 0, "Caffeinate");
+    }
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment");
     return out;
@@ -61,11 +69,29 @@
    */
   const ENV_KEYWORDS = ["environment", "prelude", "module", "conda", "micromamba", "startup", "activate", "export"];
   const envVisible = $derived(q === "" || ENV_KEYWORDS.some((k) => k.includes(q)));
+  const CAFFEINATE_KEYWORDS = [
+    "caffeinate",
+    "awake",
+    "sleep",
+    "lock",
+    "lid",
+    "ssh",
+    "network",
+    "reconnect",
+    "power",
+  ];
+  const caffeinateVisible = $derived(
+    caffeinateAvailable && (q === "" || CAFFEINATE_KEYWORDS.some((k) => k.includes(q))),
+  );
 
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
     const out: { category: string; defs: SettingDef[] }[] = [];
     for (const cat of sections) {
+      if (cat === "Caffeinate") {
+        if (caffeinateVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
       if (cat === "Environment") {
         if (envVisible) out.push({ category: cat, defs: [] });
         continue;
@@ -202,6 +228,12 @@
                  its own <h2>, so the generic rows are skipped here. -->
             <section data-section={group.category}>
               <AgentsSettings />
+            </section>
+          {:else if group.category === "Caffeinate"}
+            <!-- Device-local native-shell state, intentionally outside the
+                 daemon settings schema and settings.json. -->
+            <section data-section={group.category}>
+              <CaffeinateSettings />
             </section>
           {:else if group.category === "Environment"}
             <!-- Bespoke panel: edits the daemon's prelude map over

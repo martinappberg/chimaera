@@ -45,6 +45,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 | `update.rs` | The auto-updater intent chain (consume-once, expiry). |
 | `menu.rs` | The menu bar. |
 | `tray.rs` | The menu-bar / system-tray status item (`tray-icon` feature). |
+| `caffeinate.rs` | Device-local Caffeinate consent/enabled persistence + the single power-assertion guard. |
 
 ## Invariants / gotchas
 
@@ -65,3 +66,8 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   those holds a non-`0.0.1` value, the sed silently no-ops → ships the wrong version.
 - Signing is a release-only concern (`TAURI_SIGNING_PRIVATE_KEY*`); the PR build
   (`app.yml`) needs no key.
+- **Caffeinate is device state, not daemon settings.** Its preferences live in
+  `data_dir()/caffeinate.json`; the display may sleep/lock while idle/system sleep
+  is inhibited. Lid-close is a separate macOS sleep reason and must not be promised
+  as guaranteed. Extra SSH retry is gated by the live assertion and must disappear
+  completely when the mode is off.

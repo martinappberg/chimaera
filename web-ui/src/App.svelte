@@ -9,6 +9,7 @@
     notifyUnauthorized,
     pollHealth,
     setActiveWorkspaceId,
+    takeCaffeinateConsentPrompt,
     type Health,
   } from "./lib/net/api";
   import {
@@ -56,6 +57,7 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
+  import { retryableCaffeinateError } from "./lib/net/caffeinateRetry";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
   import { imageToAttachment } from "./lib/chat/images";
   import {
@@ -169,6 +171,7 @@
     isNativeShell,
     onAppUpdate,
     onCaffeinateChanged,
+    onCaffeinateConsentRequired,
     onHostStatus,
     onLocalDaemonUpdated,
     onMenu,
@@ -206,6 +209,7 @@
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
+  import CaffeinateConsent from "./lib/settings/CaffeinateConsent.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
@@ -217,24 +221,60 @@
   let health = $state<Health | null>(null);
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
-  /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
-   *  Shown only on a local native window — a remote window's work runs on the
-   *  remote host, so caffeinating this laptop would be pointless — and only on
-   *  macOS, where the clamshell/lid-close keep-awake it exists for applies. */
+  /** Caffeinate (native macOS): device-local keep-running mode. The compact
+   *  control stays on a LOCAL window so a remote host's rail never looks like
+   *  it controls that host's power; remote windows still observe the state to
+  *  opt into its conditional SSH retry policy. */
   let caffeinated = $state(false);
+  // Conservative until native state arrives: a very fast first click should
+  // open the explanation, never race into an unacknowledged IPC call.
+  let caffeinateConsentRequired = $state(true);
+  let showCaffeinateConsent = $state(false);
+  let caffeinateConsentBusy = $state(false);
+  let caffeinateError = $state<string | null>(null);
   const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
+
+  function syncCaffeinate(state: { enabled: boolean; consent_required: boolean }): void {
+    caffeinated = state.enabled;
+    caffeinateConsentRequired = state.consent_required;
+    if (!state.enabled) clearCaffeinateReconnect();
+    else if (reconnectError !== null) scheduleCaffeinateReconnect(reconnectError);
+  }
+
   async function toggleCaffeinate(): Promise<void> {
+    if (!caffeinated && caffeinateConsentRequired) {
+      caffeinateError = null;
+      showCaffeinateConsent = true;
+      return;
+    }
+    const enabling = !caffeinated;
     try {
-      caffeinated = await setCaffeinate(!caffeinated);
+      syncCaffeinate(await setCaffeinate(enabling));
     } catch (e) {
       // The power assertion can fail to acquire; don't leave the button lying
       // about the state — resync from the real one, and surface the reason.
       console.error("caffeinate toggle failed", e);
+      caffeinateError = e instanceof Error ? e.message : String(e);
+      if (enabling) showCaffeinateConsent = true;
       try {
-        caffeinated = await caffeinateState();
+        syncCaffeinate(await caffeinateState());
       } catch {
         /* best-effort resync */
       }
+    }
+  }
+
+  async function confirmCaffeinate(): Promise<void> {
+    if (caffeinateConsentBusy) return;
+    caffeinateConsentBusy = true;
+    caffeinateError = null;
+    try {
+      syncCaffeinate(await setCaffeinate(true, true));
+      showCaffeinateConsent = false;
+    } catch (e) {
+      caffeinateError = e instanceof Error ? e.message : String(e);
+    } finally {
+      caffeinateConsentBusy = false;
     }
   }
   /** Last recents epoch seen on /ws/events (invalidate-and-pull). */
@@ -275,6 +315,38 @@
   /** The user dismissed the overlay; don't auto-reshow until state changes. */
   let reconnectDismissed = $state(false);
   let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
+  let reconnectRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectRetryScheduled = $state(false);
+  let reconnectBackoffMs = 2_000;
+  const RECONNECT_BACKOFF_MAX_MS = 60_000;
+
+  function clearCaffeinateReconnect(resetBackoff = true): void {
+    if (reconnectRetryTimer !== null) {
+      clearTimeout(reconnectRetryTimer);
+      reconnectRetryTimer = null;
+    }
+    reconnectRetryScheduled = false;
+    if (resetBackoff) reconnectBackoffMs = 2_000;
+  }
+
+  function scheduleCaffeinateReconnect(message: string): void {
+    if (
+      !caffeinated ||
+      !canReconnect ||
+      reconnectRetryTimer !== null ||
+      !retryableCaffeinateError(message, navigator.onLine)
+    ) {
+      return;
+    }
+    reconnectRetryScheduled = true;
+    const delay = reconnectBackoffMs;
+    reconnectBackoffMs = Math.min(reconnectBackoffMs * 2, RECONNECT_BACKOFF_MAX_MS);
+    reconnectRetryTimer = setTimeout(() => {
+      reconnectRetryTimer = null;
+      reconnectRetryScheduled = false;
+      void attemptReconnect(false);
+    }, delay);
+  }
 
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
@@ -283,8 +355,9 @@
    *  tunnel goes laptop→node, and rebuilding the login tunnel wouldn't touch
    *  it; the shell probes/rebuilds the job tunnel and pings the composite
    *  status key with the (possibly new) port. */
-  async function attemptReconnect(): Promise<void> {
+  async function attemptReconnect(manual = true): Promise<void> {
     if (!canReconnect || reconnecting) return;
+    clearCaffeinateReconnect(manual);
     reconnecting = true;
     reconnectError = null;
     try {
@@ -297,6 +370,7 @@
       // overlay; a moved port/token re-homes this window via onHostStatus.
     } catch (e) {
       reconnectError = e instanceof Error ? e.message : String(e);
+      scheduleCaffeinateReconnect(reconnectError);
     } finally {
       reconnecting = false;
     }
@@ -306,7 +380,7 @@
     if (!canReconnect || eventsUp) return;
     reconnectDismissed = false;
     showReconnect = true;
-    void attemptReconnect();
+    void attemptReconnect(false);
   }
 
   function dismissReconnect(): void {
@@ -331,6 +405,7 @@
       showReconnect = false;
       reconnectError = null;
       reconnectDismissed = false;
+      clearCaffeinateReconnect();
       return;
     }
     if (reconnectGrace === null && !showReconnect && !reconnectDismissed) {
@@ -740,17 +815,31 @@
     let unlistenHostStatus: (() => void) | null = null;
     let unlistenAppUpdate: (() => void) | null = null;
     let unlistenCaffeinate: (() => void) | null = null;
+    let unlistenCaffeinateConsent: (() => void) | null = null;
     if (isNativeShell()) {
       // Build-skew + app-update signals for the update toast.
       void shellBuild().then((b) => (appBuild = b));
       // Caffeinate state: attach the cross-window broadcast FIRST, then read
       // the current value — so an event fired during startup isn't missed, and
       // the initial read can't clobber a fresher value the listener applied.
-      if (canCaffeinate) {
-        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => {
+      // Every macOS native window tracks this device-global state: only the
+      // local window renders the cup, but remote windows need it to decide
+      // whether eligible SSH failures keep retrying in the background.
+      if (isMac) {
+        void onCaffeinateChanged(syncCaffeinate).then((u) => {
           unlistenCaffeinate = u;
-          void caffeinateState().then((on) => (caffeinated = on));
+          void caffeinateState().then((state) => {
+            syncCaffeinate(state);
+            const promptRequested = takeCaffeinateConsentPrompt();
+            if (canCaffeinate && state.consent_required && promptRequested) {
+              showCaffeinateConsent = true;
+            }
+          });
         });
+        void onCaffeinateConsentRequired(() => {
+          caffeinateError = null;
+          showCaffeinateConsent = true;
+        }).then((u) => (unlistenCaffeinateConsent = u));
       }
       void onAppUpdate((version) => (updateState.appVersion = version)).then(
         (u) => (unlistenAppUpdate = u),
@@ -827,19 +916,28 @@
       void flushSettings();
     };
     const onCopy = () => rememberCopy();
+    const onNetworkOnline = () => {
+      if (!caffeinated || reconnectRetryTimer === null || reconnectError === null) return;
+      clearCaffeinateReconnect(false);
+      void attemptReconnect(false);
+    };
     // Which-key discovery: holding the app modifier fades in the ⌘1–9 badges.
     const stopChordHints = initChordHints();
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("pagehide", onPagehide);
+    window.addEventListener("online", onNetworkOnline);
     document.addEventListener("copy", onCopy);
     return () => {
       window.removeEventListener("keydown", onKeydown, true);
       window.removeEventListener("pagehide", onPagehide);
+      window.removeEventListener("online", onNetworkOnline);
       unlistenMenu?.();
       unlistenDaemonMoved?.();
       unlistenHostStatus?.();
       unlistenAppUpdate?.();
       unlistenCaffeinate?.();
+      unlistenCaffeinateConsent?.();
+      clearCaffeinateReconnect();
       document.removeEventListener("copy", onCopy);
       window.removeEventListener("dragenter", onWindowDragEnter);
       window.removeEventListener("dragover", onWindowDragOver);
@@ -3460,8 +3558,8 @@
             class="daemon-settings caffeinate"
             class:on={caffeinated}
             title={caffeinated
-              ? "caffeinate on — this Mac won’t sleep (lid-closed needs AC power)"
-              : "caffeinate — keep this Mac awake"}
+              ? "caffeinate on — work continues while this Mac is locked"
+              : "caffeinate — keep Chimaera working while this Mac is locked"}
             aria-label="caffeinate"
             aria-pressed={caffeinated}
             onclick={() => void toggleCaffeinate()}
@@ -3676,6 +3774,24 @@
 <!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
      the workbench can prompt just like the home screen. Self-gating. -->
 <AskpassModal />
+
+{#if showCaffeinateConsent}
+  <CaffeinateConsent
+    busy={caffeinateConsentBusy}
+    error={caffeinateError}
+    canOpenSettings={canCaffeinate && activeWsId !== null && layoutReady}
+    onEnable={() => void confirmCaffeinate()}
+    onCancel={() => {
+      showCaffeinateConsent = false;
+      caffeinateError = null;
+    }}
+    onOpenSettings={() => {
+      showCaffeinateConsent = false;
+      caffeinateError = null;
+      openSettingsSurface();
+    }}
+  />
+{/if}
 <!-- The right-click context-menu singleton (rail rows, file tree, Finder,
      pane tabs all open it via contextMenu.openAt). Self-gating. -->
 <ContextMenuHost />
@@ -3742,6 +3858,9 @@
       <p class="reconnect-body">
         {reconnectError ??
           "re-establishing the SSH tunnel — this window resumes where it left off."}
+        {#if reconnectRetryScheduled}
+          <span class="reconnect-auto">Caffeinate will keep trying while it is active.</span>
+        {/if}
       </p>
       <div class="reconnect-actions">
         <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
@@ -4854,6 +4973,13 @@
     font-size: var(--text-md);
     line-height: 1.5;
     color: var(--muted);
+  }
+
+  .reconnect-auto {
+    display: block;
+    margin-top: 7px;
+    color: var(--accent);
+    font-size: var(--text-sm);
   }
 
   .reconnect-actions {

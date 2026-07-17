@@ -55,6 +55,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
+- **Caffeinate recovery (macOS app).** A dropped remote window normally makes the existing single
+  automatic reconnect attempt. While the device-local Caffeinate assertion is active, transport-shaped
+  failures continue at capped backoff and retry promptly on network-online; authentication, host-key,
+  configuration, and deployment failures pause for the existing manual Retry path. Turning Caffeinate
+  off cancels only its pending follow-ups, leaving ordinary connect/reconnect semantics unchanged.
 - **A fresh start version-probes the installed binary** (`ensure_remote_binary` runs
   `~/.chimaera/bin/chimaera --version` over ssh): a dev (`0.0.1`) binary stranded in the real home —
   e.g. deployed by a pre-fix release that trusted the dist stash — is replaced with the release

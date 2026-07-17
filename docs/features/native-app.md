@@ -127,25 +127,41 @@ app-build` (never the root `cargo`).
   entry point when all windows are closed but the app is still resident. The icon is a real **brand-mark
   template** (a C-in-hexagon monogram, black on transparent) that macOS tints to the menu-bar theme
   (`icon_as_template`) — not the full app icon, which the template mask would render as a solid blob. On
-  macOS the menu also carries the **Keep Awake** check item (see Caffeinate). The menu is rebuilt via
+  macOS the menu also carries the **Caffeinate** check item (see Caffeinate). The menu is rebuilt via
   `tray::rebuild` on the events that change it (a window opens/closes/renames, caffeinate flips).
   Enabling the feature pulls **libayatana-appindicator** into the Linux bundle (a packaging dependency).
 
 ## Caffeinate
 
-- A **macOS-only, local-only** whole-machine keep-awake toggle, reachable from **two surfaces** kept in
-  sync: a coffee-cup button in the rail's bottom bar (shown only when
-  `isNativeShell() && isMac && getHostLabel() === "local"` — a remote window's work runs on the remote
-  host, so caffeinating this laptop is pointless; and macOS is where the lid-close keep-awake it exists
-  for applies) **and** the tray's **Keep Awake** check item + the icon filling in when armed. Armed =
-  the machine won't idle-, display-, or system-sleep. Both surfaces call one shared core
-  (`shell::apply_caffeinate`) that holds a single power assertion (the **keepawake** crate: macOS
-  IOKit) as a guard in `Shell` — dropped to disarm, and on quit, so it never outlives the app. The
-  state broadcasts (`caffeinate-changed`), which the in-window toggle and the tray (`tray::rebuild`)
-  both listen to, so flipping it from either surface updates the other. IPC commands remain
-  `set_caffeinate(on)` / `caffeinate_state()`. **macOS caveat, surfaced in the tooltip:**
-  lid-closed-awake additionally requires **AC power** — Apple hard-blocks clamshell wake on battery,
-  which no app can override.
+- **What & when.** A **macOS-only, device-local** keep-running mode for leaving local chats,
+  daemon-owned terminals, and background commands active while the screen is locked or the display is
+  off. It does not unlock the Mac or automate desktop apps. A remote daemon already outlives this
+  laptop's connection; Caffeinate keeps the local app/tunnels awake enough to stay attached or heal.
+- **How it's used.** The compact surfaces remain a coffee-cup button in a local window's rail and the
+  tray's **Caffeinate** check item/fill state. First enable opens one versioned approval dialog; the
+  fuller explanation and control live in the local native window's **Settings → Caffeinate** bespoke
+  section (`CaffeinateConsent.svelte`, `CaffeinateSettings.svelte`). The approved enabled state persists
+  across app restarts in device-local `caffeinate.json`; it is deliberately not a daemon setting and
+  never lands in a remote host's `settings.json`.
+- **Where it lives.** `crates/chimaera-app/src/caffeinate.rs` owns tolerant/atomic preferences and the
+  single **keepawake** IOKit guard; `shell::{apply_caffeinate,toggle_caffeinate_from_tray}` and
+  `tray.rs` own the native surfaces. IPC remains `set_caffeinate(on, acknowledge?)` /
+  `caffeinate_state()` but returns `{enabled,consent_required}`; `caffeinate-changed` broadcasts that
+  state to every macOS app window and `caffeinate-consent-required` targets one window after a first
+  tray click. Client bridge: `web-ui/src/lib/net/native.ts`; rail/conditional reconnect:
+  `web-ui/src/App.svelte`.
+- **Power behavior.** Armed prevents idle/system sleep but deliberately **does not** hold the display
+  awake: the display may dim, turn off, and lock normally. The assertion restores before windows open
+  when the persisted mode is enabled, and drops on quit. Lock/display-off use is the reliable path.
+  Closing a MacBook lid is a separate OS sleep reason: the assertion is best-effort, and a supported
+  closed-display setup normally requires power and the external accessories macOS requires. macOS may
+  also override assertions for low power or thermal protection.
+- **Network behavior.** The normal remote-window reconnect still makes its existing single automatic
+  attempt. Only while the real Caffeinate assertion is held, eligible transport failures continue with
+  capped exponential backoff (2s→60s) and an immediate try on the browser `online` event. Auth,
+  host-key, configuration, and deployment failures stay manual, so passwords/2FA never loop; failed
+  model requests are never replayed. Turning Caffeinate off cancels its pending retries and otherwise
+  leaves the app's reconnect behavior unchanged.
 
 ## Status: partial
 
@@ -176,6 +192,25 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   itself and its teardown UX are additions that can be improved.
 - **Do not change:** the disconnect vs end-sessions vs shut-down distinction; detached daemon
   outlives the app; human host labels.
+
+### Caffeinate — why it keeps work running
+_Captured 2026-07-17 (from the maintainer)._
+
+- **Problem it solves.** Keep the Chimaera daemon, chats, terminals, and SSH-backed work running when
+  the Mac is locked or its lid is closed, and recover connectivity when Wi-Fi returns. This does not
+  need or want desktop-control access, an unlock path, or an authorization plug-in.
+- **How settled it is (addition, deliberate behavior).** Keep the name **Caffeinate**. Enabling it is
+  an explicit, remembered choice; its network persistence exists only while the mode is genuinely
+  active. The implementation may improve, but Caffeinate-off must retain the rest of the app's normal
+  behavior without extra retries or power effects.
+- **Deliberate / non-obvious.** Keep the everyday UI quiet: the existing small cup and tray state are
+  enough. Put the first-use explanation and verbose operational/safety detail in the approval dialog
+  and Settings, and direct the user there when explanation is needed. Retry connectivity, not failed
+  model turns; authentication remains user-mediated.
+- **Do not change.** Do not turn Caffeinate into desktop unlock/control, do not let its retry policy
+  leak into the off state, and do not crowd the rail with status prose. Those are product boundaries;
+  the exact backoff, persistence file, and presentation inside Settings are additions open to
+  improvement.
 
 ### Linux + Windows(WSL2) apps — why they exist
 _Captured 2026-07-11 (from the maintainer, confirming a draft read from the #44 commit body + code)._

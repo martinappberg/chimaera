@@ -19,6 +19,11 @@ No schema rows, an explicit Save (fetch-merge-put — the PUT replaces the whole
 map, so other workspaces' entries must round-trip), and an empty editor deletes
 its scope's entry rather than persisting `{text: ""}`.
 
+**Exception — Caffeinate.** `CaffeinateSettings.svelte` is a macOS native-shell,
+local-window-only device panel. It reads/writes the shell IPC state persisted as
+`caffeinate.json`; it is deliberately absent from the daemon schema and JSON tab,
+so opening Settings against a remote daemon never writes a laptop power choice there.
+
 ## File map
 
 | File | What it owns |
@@ -27,6 +32,8 @@ its scope's entry rather than persisting `{text: ""}`.
 | `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, the sparse-map semantics, and the `dirtySince` echo-guard. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
+| `CaffeinateSettings.svelte` | Native Mac's device-local Caffeinate detail + control (not settings.json). |
+| `CaffeinateConsent.svelte` | Versioned first-enable explanation reached from the compact rail/tray controls. |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
 | `environment.ts` | Wire types + `getEnvironment`/`putEnvironment` for the prelude map. |
 | `SettingRow.svelte` | One schema-driven control. |
