@@ -1808,6 +1808,13 @@ pub(crate) async fn resurrect_chat(
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
     }
+    // A resurrected process has run NO turn yet — it replays the journal and
+    // sits idle until the user speaks. So its honest state is Finished (idle,
+    // alive), not the `AgentRecord::new` default of Unknown, which the UI
+    // renders as a provisional "starting" dot — a finished session coming
+    // back after a restart must not look like it's booting or (mis)read as
+    // active. The first real turn flips it to Running via `apply_chat_event`.
+    record.state = AgentState::Finished;
     crate::lock(&state.agents).insert(entry.id.clone(), record);
     crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
 

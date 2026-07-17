@@ -507,10 +507,14 @@
     background: var(--rate);
     opacity: 1;
   }
+  /* Finished = a calm NEUTRAL ring, not accent green. Green is reserved for
+     an actively-running turn (the filled, pulsing .dot.alive) so an idle
+     session never reads as active; the hollow ring + the unread mark already
+     say "done, worth a look". */
   .dot.done {
     background: transparent;
-    border: 1.5px solid var(--accent);
-    opacity: 0.8;
+    border: 1.5px solid var(--muted);
+    opacity: 0.9;
     width: 6px;
     height: 6px;
   }

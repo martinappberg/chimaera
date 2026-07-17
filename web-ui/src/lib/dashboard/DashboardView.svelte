@@ -1076,10 +1076,11 @@
     background: var(--rate);
     opacity: 1;
   }
+  /* Finished = a calm neutral ring (green is reserved for an active turn). */
   .dot.done {
     background: transparent;
-    border: 1.5px solid var(--accent);
-    opacity: 0.8;
+    border: 1.5px solid var(--muted);
+    opacity: 0.9;
   }
   .dot.idle {
     opacity: 0.55;
