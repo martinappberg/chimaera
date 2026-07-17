@@ -1,5 +1,61 @@
 <script module lang="ts">
   import DOMPurify from "dompurify";
+  import { marked, type MarkedExtension } from "marked";
+  import markedKatex from "marked-katex-extension";
+  import { mathOptions, renderMath } from "./math";
+
+  // Codex commonly emits LaTeX's \(...\) / \[...\] delimiters while the
+  // Markdown ecosystem commonly emits $...$ / $$...$$. Support both. Doing
+  // this in marked tokenizers (instead of a text replacement) means fenced
+  // and inline code keep their literal backslashes and dollar signs.
+  const slashMath = {
+    extensions: [
+      {
+        name: "inlineSlashMath",
+        level: "inline" as const,
+        start(src: string) {
+          const index = src.indexOf("\\(");
+          return index >= 0 ? index : undefined;
+        },
+        tokenizer(src: string) {
+          const match = /^\\\(([^\n]*?)\\\)/.exec(src);
+          if (match === null) return undefined;
+          return {
+            type: "inlineSlashMath",
+            raw: match[0],
+            text: match[1].trim(),
+            displayMode: false,
+          };
+        },
+        renderer(token: Record<string, unknown>) {
+          return renderMath(token.text as string, false);
+        },
+      },
+      {
+        name: "blockSlashMath",
+        level: "block" as const,
+        start(src: string) {
+          const index = src.indexOf("\\[");
+          return index >= 0 ? index : undefined;
+        },
+        tokenizer(src: string) {
+          const match = /^\\\[\s*([\s\S]*?)\s*\\\](?:\n|$)/.exec(src);
+          if (match === null) return undefined;
+          return {
+            type: "blockSlashMath",
+            raw: match[0],
+            text: match[1].trim(),
+            displayMode: true,
+          };
+        },
+        renderer(token: Record<string, unknown>) {
+          return `${renderMath(token.text as string, true)}\n`;
+        },
+      },
+    ],
+  } satisfies MarkedExtension;
+
+  marked.use(markedKatex({ ...mathOptions, nonStandard: false }), slashMath);
 
   // Agent markdown is untrusted model output rendered into the workbench DOM.
   // External links are a phishing / navigate-the-SPA-away vector, so force
@@ -18,7 +74,6 @@
 </script>
 
 <script lang="ts">
-  import { marked } from "marked";
   import { copyText } from "../shared/clipboard";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
 
@@ -162,7 +217,7 @@
     // same affordance. Collect first: wrapping mutates the walked tree.
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n) =>
-        n.parentElement?.closest("pre, code, a, .md-path") == null
+        n.parentElement?.closest("pre, code, a, .md-path, .katex") == null
           ? NodeFilter.FILTER_ACCEPT
           : NodeFilter.FILTER_REJECT,
     });
@@ -288,7 +343,7 @@
   function wrapWords(root: HTMLElement): void {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n) =>
-        (n.textContent ?? "").trim().length > 0
+        (n.textContent ?? "").trim().length > 0 && n.parentElement?.closest(".katex") == null
           ? NodeFilter.FILTER_ACCEPT
           : NodeFilter.FILTER_REJECT,
     });
@@ -438,6 +493,25 @@
   }
   .md :global(p) {
     margin: 0.35em 0;
+  }
+  /* Math is rendered as native MathML inside a KaTeX wrapper. Display math
+     scrolls within the reading column instead of widening the workbench. */
+  .md :global(.katex) {
+    color: inherit;
+    font-size: 1.02em;
+  }
+  .md :global(.katex-display) {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 0.55em 0;
+    padding: 0.1em 0;
+  }
+  .md :global(.katex-display > .katex) {
+    display: block;
+    width: max-content;
+    min-width: 100%;
   }
   .md :global(h1),
   .md :global(h2),

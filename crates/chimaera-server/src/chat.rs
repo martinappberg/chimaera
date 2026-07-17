@@ -1613,16 +1613,6 @@ pub(crate) fn spawn_chat_session(
         AgentKind::Codex => {
             // The app-server resumes in-protocol (thread/resume keeps the
             // id), so the resume handle IS the pinned native id.
-            //
-            // TODO(seam): `recipe.model` is dropped here. The codex chat
-            // driver picks the model in-protocol — `thread/start` takes no
-            // model param (PROTOCOL.md: it's `{cwd, approvalPolicy?}`), and
-            // the model rides `turn/start` / `thread/settings/update` via a
-            // `SetModel` command. Honoring the create-time model for codex
-            // chat therefore needs a driver change (send `SetModel` right
-            // after Init, or thread/start growing a model field) in
-            // chimaera-agent — not something the argv can carry.
-            //
             // Per-session chimaera MCP injection (`-c mcp_servers…`, verified
             // codex 0.144.2): the key comes from the AgentRecord every spawn
             // path inserts BEFORE this runs; a missing record spawns bare
@@ -1694,6 +1684,11 @@ pub(crate) fn spawn_chat_session(
                         crate::workspaces::MastermindMode::Auto => None,
                     },
                 });
+    }
+    // Codex selects its create-time model in-protocol at thread open; Claude
+    // already received the same recipe value through build_chat_command.
+    if recipe.kind == AgentKind::Codex {
+        spec.initial_model = recipe.model.clone();
     }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from

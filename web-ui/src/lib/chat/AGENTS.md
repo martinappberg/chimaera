@@ -39,15 +39,15 @@ hard-resets and rebuilds.
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` | Input: draft, images, `@`-mention + `/`-slash popovers, submit/interrupt. |
-| `Markdown.svelte` | Renders agent prose. **Sanitizes untrusted model output** (marked → DOMPurify, `<style>` forbidden, external links `noopener`); stamps validated file paths as clickable. |
+| `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. |
 | `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). |
 | `AgentsTray.svelte` / `BackgroundTray.svelte` | The pinned work-tray strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. |
-| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field). |
+| `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
 | `RewindDialog.svelte` | The rewind/fork-point confirmation overlay (claude fork + codex `thread/rollback`). |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
-| `UserText.svelte` | User-message bubble. |
+| `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
 | `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. |
@@ -62,6 +62,10 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   file contents it echoes) is attacker-influenced. Render it through
   `Markdown.svelte`'s sanitizer; never `{@html}` raw agent text elsewhere; never
   build a live external link without `rel="noopener"`.
+- **Math stays inside the same trust boundary.** KaTeX emits MathML with
+  `trust:false`; DOMPurify still sanitizes the combined result. Exclude `.katex`
+  descendants from path stamping and streaming word spans — mutating generated
+  math markup corrupts equations.
 - **Never lose a user action to a closed socket.** `socket.send` returns `false`
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.

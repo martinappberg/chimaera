@@ -1,11 +1,14 @@
 <script lang="ts">
+  import MathText from "./MathText.svelte";
+  import { splitUserMath } from "./math";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
 
   /**
    * The user's own message text: plain (never markdown — prompts are not
-   * documents), whitespace preserved, with @-mentions and real paths made
-   * clickable through the same /fs/validate flow as agent prose. Mentions
-   * render as quiet pills — the visual receipt that the tag landed.
+   * documents), whitespace preserved, with recognized LaTeX spans rendered
+   * as math and @-mentions / real paths made clickable through the same
+   * /fs/validate flow as agent prose. Mentions render as quiet pills — the
+   * visual receipt that the tag landed.
    */
   interface Props {
     text: string;
@@ -23,6 +26,7 @@
     /** Validation key (mentions strip the "@" and any trailing slash). */
     candidate: string | null;
     mention: boolean;
+    math: { source: string; display: boolean } | null;
   }
 
   function classify(word: string): Token {
@@ -30,26 +34,56 @@
       const { head, tail } = trimPathWord(word.slice(1));
       const candidate = head.replace(/\/+$/, "");
       if (candidate.length > 0) {
-        return { text: `@${head}`, tail, candidate, mention: true };
+        return { text: `@${head}`, tail, candidate, mention: true, math: null };
       }
     }
     const { head, tail } = trimPathWord(word);
-    if (pathCandidate(head)) return { text: head, tail, candidate: head, mention: false };
-    return { text: word, tail: "", candidate: null, mention: false };
+    if (pathCandidate(head)) {
+      return { text: head, tail, candidate: head, mention: false, math: null };
+    }
+    return { text: word, tail: "", candidate: null, mention: false, math: null };
   }
 
-  const tokens = $derived.by(() => {
-    const out: Token[] = [];
+  function appendPlain(out: Token[], plain: string) {
     let last = 0;
-    for (const m of text.matchAll(/\S+/g)) {
+    for (const m of plain.matchAll(/\S+/g)) {
       if (m.index > last) {
-        out.push({ text: text.slice(last, m.index), tail: "", candidate: null, mention: false });
+        out.push({
+          text: plain.slice(last, m.index),
+          tail: "",
+          candidate: null,
+          mention: false,
+          math: null,
+        });
       }
       out.push(classify(m[0]));
       last = m.index + m[0].length;
     }
-    if (last < text.length) {
-      out.push({ text: text.slice(last), tail: "", candidate: null, mention: false });
+    if (last < plain.length) {
+      out.push({
+        text: plain.slice(last),
+        tail: "",
+        candidate: null,
+        mention: false,
+        math: null,
+      });
+    }
+  }
+
+  const tokens = $derived.by(() => {
+    const out: Token[] = [];
+    for (const run of splitUserMath(text)) {
+      if (run.kind === "text") {
+        appendPlain(out, run.text);
+      } else {
+        out.push({
+          text: "",
+          tail: "",
+          candidate: null,
+          mention: false,
+          math: { source: run.source, display: run.display },
+        });
+      }
     }
     return out;
   });
@@ -80,7 +114,7 @@
      newline/indent between blocks would render as literal extra spacing. -->
 <!-- prettier-ignore -->
 <span class="usertext"
-  >{#each tokens as t, i (i)}{@const hit = hitFor(t)}{#if hit !== undefined}<button
+  >{#each tokens as t, i (i)}{@const hit = hitFor(t)}{#if t.math !== null}<MathText source={t.math.source} display={t.math.display} />{:else if hit !== undefined}<button
         class="path"
         class:mention={t.mention}
         title={hit.kind === "dir" ? `browse ${t.text} in the finder` : `open ${t.text} in a pane`}

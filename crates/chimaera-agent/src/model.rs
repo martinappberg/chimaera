@@ -170,6 +170,11 @@ pub enum AgentEvent {
     QuestionRequest {
         request_id: String,
         questions: Vec<Question>,
+        /// Absolute Unix-millisecond deadline for an agent-owned auto-skip
+        /// (codex `autoResolutionMs`). Absolute, rather than a duration, so a
+        /// reconnect/replay never restarts the countdown. Claude omits it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
     },
     QuestionResolved {
         request_id: String,

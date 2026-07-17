@@ -72,6 +72,10 @@ pub struct SpawnSpec {
     /// The agent's native session handle when known at spawn (claude
     /// `--session-id`/`--resume` value, codex thread id to resume).
     pub pinned_native_id: Option<String>,
+    /// Model selected when the session was created. Codex consumes this on
+    /// `thread/start` / `thread/resume`; Claude already receives its initial
+    /// model through launcher argv and ignores this protocol-side copy.
+    pub initial_model: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -117,6 +121,7 @@ impl SpawnSpec {
             env: Vec::new(),
             env_remove: Vec::new(),
             pinned_native_id: None,
+            initial_model: None,
             agent_version: None,
             rollback_turns: None,
             mcp_auto_approve: None,

@@ -312,6 +312,33 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.running).toBe(false);
     expect(store.activity).toBeNull();
   });
+
+  it("preserves Codex question auto-resolution deadlines across replay", () => {
+    const events = [
+      {
+        type: "question_request",
+        request_id: "codex-91",
+        expires_at_ms: 1_800_000_000_000,
+        questions: [{ id: "scope", question: "Which scope?", options: [] }],
+      },
+    ];
+    const live = fold(events);
+    const replay = fold(events);
+    expect(live.questions[0]).toMatchObject({
+      requestId: "codex-91",
+      expiresAtMs: 1_800_000_000_000,
+    });
+    expect(replay.questions).toEqual(live.questions);
+
+    const oldJournal = fold([
+      {
+        type: "question_request",
+        request_id: "codex-92",
+        questions: [{ id: "scope", question: "Which scope?" }],
+      },
+    ]);
+    expect(oldJournal.questions[0].expiresAtMs).toBeNull();
+  });
 });
 
 describe("ChatStore background tasks", () => {

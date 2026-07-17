@@ -23,6 +23,34 @@
   let { request, onAnswer, answered = null }: Props = $props();
 
   const readOnly = $derived(answered !== null);
+  let remainingMs = $state<number | null>(null);
+  const expired = $derived(remainingMs !== null && remainingMs <= 0);
+  const countdown = $derived(
+    remainingMs === null ? null : Math.max(0, Math.ceil(remainingMs / 1000)),
+  );
+
+  // Codex owns the actual timeout in the driver; this is presentation only.
+  // The event carries an absolute timestamp, so replay/reconnect never grants
+  // the card a fresh countdown. Updating here cannot race the wire truth: the
+  // driver resolves the card authoritatively with QuestionResolved.
+  $effect(() => {
+    const deadline = request.expiresAtMs;
+    if (readOnly || deadline === null) {
+      remainingMs = null;
+      return;
+    }
+    const update = () => {
+      remainingMs = Math.max(0, deadline - Date.now());
+    };
+    const initial = Math.max(0, deadline - Date.now());
+    remainingMs = initial;
+    if (initial === 0) return;
+    const timer = setInterval(() => {
+      update();
+      if (Date.now() >= deadline) clearInterval(timer);
+    }, 250);
+    return () => clearInterval(timer);
+  });
   /** Resolved with no recorded choice (expired ask, or a journal from
    *  before answers were recorded). */
   const unanswered = $derived(
@@ -67,9 +95,10 @@
   }
 
   const complete = $derived(
-    request.questions.every(
+    !expired &&
+      request.questions.every(
       (_q, qi) => (picked[qi] ?? []).length > 0 || (other[qi] ?? "").trim().length > 0,
-    ),
+      ),
   );
 
   function submit() {
@@ -148,6 +177,7 @@
               class:on={(picked[qi] ?? []).includes(oi)}
               title={opt.description}
               aria-pressed={(picked[qi] ?? []).includes(oi)}
+              disabled={expired}
               onclick={() => toggle(qi, oi, q.multiSelect)}
             >
               {opt.label}
@@ -157,6 +187,7 @@
         <input
           class="q-other"
           placeholder="other…"
+          disabled={expired}
           bind:value={other[qi]}
           onkeydown={(e) => {
             if (e.key === "Enter" && complete) {
@@ -168,6 +199,11 @@
       </div>
     {/each}
     <div class="q-actions">
+      {#if countdown !== null}
+        <span class="deadline" class:expired aria-live="polite">
+          {expired ? "skipping…" : `skips in ${countdown}s`}
+        </span>
+      {/if}
       <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
     </div>
   {/if}
@@ -232,6 +268,10 @@
   }
   .q-opt:hover {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+  .q-opt:disabled {
+    cursor: default;
+    opacity: 0.55;
   }
   .q-opt.on {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
@@ -318,8 +358,19 @@
   }
   .q-actions {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
+    gap: 10px;
     margin-top: 10px;
+  }
+  .deadline {
+    margin-right: auto;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+  }
+  .deadline.expired {
+    color: var(--warn);
   }
   /* The answer button is the shared .opt.primary (app.css). */
 </style>

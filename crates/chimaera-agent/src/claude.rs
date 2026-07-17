@@ -1753,6 +1753,7 @@ impl ClaudeMapper {
                 step.events.push(AgentEvent::QuestionRequest {
                     request_id,
                     questions,
+                    expires_at_ms: None,
                 });
                 return;
             }
@@ -4175,6 +4176,7 @@ mod tests {
             AgentEvent::QuestionRequest {
                 request_id,
                 questions,
+                ..
             } => {
                 assert_eq!(request_id, "req-q");
                 assert_eq!(questions[0].id, "Which database?");
