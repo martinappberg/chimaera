@@ -353,3 +353,11 @@ _Captured 2026-07-15 (from the maintainer)._
   has no background lane today (claude-only by wire reality, not by design choice).
 - **Open to change:** fully. **Grade — addition**: no locked rules beyond the repo's standing
   invariants; don't treat any of the current mechanics as a contract.
+
+### Codex subagents (collab / multi-agent) — why it exists
+_Intent pending — not yet captured from the maintainer (shipped 2026-07-16, autonomous session)._
+
+- Derived context, not intent: codex parity for the rich subagent surface was the named open
+  improvement in the PR #63 intent capture, and the two-driver-symmetry rule made claude's Agent-row
+  surface the natural mapping target. The thread-scoping gate is wire-correctness, not a choice —
+  see PROTOCOL.md Pass 16. Run **capture-feature-intent** with the maintainer to replace this stub.
