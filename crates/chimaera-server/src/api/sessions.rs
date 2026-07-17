@@ -313,10 +313,10 @@ async fn spawn_chat_ui(
     // theme themselves. A resumed recent is never a Mastermind (masterminds
     // never retire into recents), so no mastermind gating here.
     let settings = if agent_kind == crate::agents::AgentKind::Claude {
-        let settings_theme =
-            (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path)).then_some(theme);
-        let user_statusline =
-            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &workspace.root);
+        let (theme_set, user_statusline) =
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
+                .await;
+        let settings_theme = (!theme_set).then_some(theme);
         match crate::agents::write_settings(
             &id,
             &key,

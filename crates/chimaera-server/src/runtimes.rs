@@ -653,6 +653,31 @@ pub(crate) fn claude_statusline_config(
     .find_map(|p| claude_user_statusline(p))
 }
 
+/// The two claude settings gates a chat/TUI spawn needs — theme-set and the
+/// resolved statusline — batched under ONE `spawn_blocking` hop off the async
+/// reactor. Each gate does small synchronous `read_to_string`s
+/// (`claude_user_theme_set` + `claude_statusline_config`), and the spawn
+/// paths that call them run on Tokio workers; on an NFS/Lustre home a slow or
+/// dead mount would otherwise pin a worker mid-spawn (daemon rule: no blocking
+/// fs on the reactor). Returns `(theme_set, statusline)`; a join failure
+/// during runtime shutdown degrades to `(false, None)` — no theme injection,
+/// no statusline passthrough — rather than panicking.
+pub(crate) async fn claude_settings_gates(
+    user_settings_path: &Path,
+    workspace_root: &Path,
+) -> (bool, Option<serde_json::Value>) {
+    let user = user_settings_path.to_path_buf();
+    let root = workspace_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        (
+            claude_user_theme_set(&user),
+            claude_statusline_config(&user, &root),
+        )
+    })
+    .await
+    .unwrap_or((false, None))
+}
+
 /// Whether the user's own claude settings file sets a theme — if so,
 /// chimaera respects it and skips injection (fill the gap, never fight an
 /// explicit choice).

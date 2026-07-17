@@ -1079,6 +1079,19 @@ async fn perform_switch(
         tracing::warn!(%id, %err, "failed to journal the view switch");
     }
 
+    // A concurrent Mastermind retire (DELETE / re-PUT of this workspace's
+    // Mastermind) can land while we were parked in stop_for_respawn or the
+    // marker write above: it tears down the shared AgentRecord and kills the
+    // process. That record is the identity a view switch CARRIES across the
+    // respawn, so its absence here means the session was retired mid-switch —
+    // do NOT resurrect the id (that would leave a live, billing process with
+    // no workspace row). Checked immediately before the respawn, which is the
+    // last await-free point, so no retire can slip between here and the spawn.
+    if crate::lock(&state.agents).get(id).is_none() {
+        tracing::info!(%id, "view switch aborted — session retired mid-switch");
+        return Ok(());
+    }
+
     if target_chat {
         let recipe = ChatRecipe {
             workspace_root: workspace_root.clone(),
@@ -1291,6 +1304,15 @@ pub(crate) async fn rewind_session(
         {
             tracing::warn!(%id, %e, "failed to journal the rewind");
         }
+        // A concurrent Mastermind retire can tear down the shared AgentRecord
+        // while we were parked in stop_for_respawn / the journal work above
+        // (see perform_switch): its absence means the session was retired
+        // mid-rewind, so decline to resurrect the id. Last await-free point
+        // before the respawn.
+        if crate::lock(&state.agents).get(&id).is_none() {
+            tracing::info!(%id, "rewind aborted — session retired mid-rewind");
+            return Ok(());
+        }
         let is_codex = record.kind == AgentKind::Codex;
         // A rewind respawns the same session — keep its launch prelude.
         let launch_prelude = crate::lock(&state.chat_recipes)
@@ -1464,10 +1486,10 @@ pub(crate) async fn spawn_fresh_chat(
     // Hook injection + theme (claude-only), unless the user's settings pick a
     // theme themselves. Codex needs no files — its MCP injection rides argv.
     let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
-        let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-            .then_some(spec.theme.as_str());
-        let user_statusline =
-            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &workspace.root);
+        let (theme_set, user_statusline) =
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
+                .await;
+        let settings_theme = (!theme_set).then_some(spec.theme.as_str());
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -1754,10 +1776,9 @@ pub(crate) async fn resurrect_chat(
     // Regenerate the per-session hook/mcp files (claude only) against THIS
     // daemon's port — the runtime dir is not durable across a restart.
     let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
-        let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-            .then_some(entry.theme.as_str());
-        let user_statusline =
-            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &root);
+        let (theme_set, user_statusline) =
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
+        let settings_theme = (!theme_set).then_some(entry.theme.as_str());
         let s = crate::agents::write_settings(
             &entry.id,
             &key,

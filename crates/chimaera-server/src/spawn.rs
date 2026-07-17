@@ -133,13 +133,12 @@ pub(crate) async fn spawn_session(
             // theme rides in the same settings file — unless the user's own
             // settings already set one (respect the explicit choice).
             let settings = if agent_kind == AgentKind::Claude {
-                let settings_theme =
-                    (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-                        .then_some(spec.theme.as_str());
-                let user_statusline = crate::runtimes::claude_statusline_config(
+                let (theme_set, user_statusline) = crate::runtimes::claude_settings_gates(
                     &state.claude_settings_path,
                     &workspace.root,
-                );
+                )
+                .await;
+                let settings_theme = (!theme_set).then_some(spec.theme.as_str());
                 // PTY TUI spawns are never the Mastermind (a chat-only role),
                 // so no permissions block rides these settings.
                 match crate::agents::write_settings(

@@ -1244,6 +1244,44 @@ async fn agent_events_track_subagents_now_line_and_statusline_usage() {
     state.sessions.kill(&id).ok();
 }
 
+/// The statusline curl keeps the session key OFF its argv (F1) by sending it
+/// as `Authorization: Bearer` instead of `?key=` — /proc/<pid>/cmdline is
+/// world-readable on the shared login nodes. The ingest route accepts that
+/// channel (no query key at all), and a wrong bearer is still rejected.
+#[tokio::test]
+async fn statusline_ingest_accepts_the_bearer_key_channel() {
+    let state = test_state();
+    let id = inject_agent(&state, "k");
+
+    let post = |auth: &'static str| {
+        let state = state.clone();
+        let id = id.clone();
+        async move {
+            app(state)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        // No ?key= — the key rides the Bearer header only.
+                        .uri(format!("/api/v1/agent-events/{id}?event=statusline"))
+                        .header(header::AUTHORIZATION, auth)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"cost": {"total_cost_usd": 0.2}}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // The real channel: no query key, the session key in the Bearer header.
+    assert_eq!(post("Bearer k").await, StatusCode::OK);
+    // The header is really authenticating — a wrong bearer is forbidden.
+    assert_eq!(post("Bearer wrong").await, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn agent_title_tail_polls_transcript() {
     let state = test_state();

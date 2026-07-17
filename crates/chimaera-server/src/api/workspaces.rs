@@ -172,42 +172,47 @@ pub(crate) async fn put_mastermind(
         }
     };
 
-    // Resolve the one respawn precondition BEFORE retiring anything (the
-    // crate's kill-then-respawn rule): a re-PUT whose new agent binary is
-    // missing must 409 with the old Mastermind — its session, binding, and
-    // conversation — fully intact, not destroy it and roll back to none.
-    // The positive result is cached, so spawn_fresh_chat's own detect below
-    // is nearly free.
+    // Resolve the binary precondition up front so a missing agent is a clean
+    // 409 before any state moves. (The positive result is cached, so
+    // spawn_fresh_chat's own detect below is nearly free.)
     let detection = crate::launcher::detect(&state, kind, false).await;
     if let Err(msg) = detection.path {
         return err(StatusCode::CONFLICT, msg);
     }
 
-    // Exactly one Mastermind per workspace: retire the old binding AND its
-    // session before minting the new one (it is mastermind-only, never a
-    // roster session).
-    if let Some(old) = workspace.mastermind.clone() {
-        crate::lock(&state.workspaces).set_mastermind(&id, None);
-        retire_mastermind_session(&state, &old.session_id).await;
-    }
+    // Spawn-then-retire (kill-then-respawn is destructive): the OLD Mastermind
+    // — its session, binding, and conversation — stays fully intact until the
+    // successor is confirmed live. A re-PUT that fails AFTER detection (an
+    // unwritable settings dir, a lost spawn slot, a spawn error) must roll
+    // back to the old Mastermind, not destroy it and leave the workspace
+    // unbound.
+    let old = workspace.mastermind.clone();
 
     // Bind BEFORE spawning: the settings-ordering trap — the permission
     // pre-allows must exist in the generated settings (and the roster flag
-    // must resolve true) before the process spawns. A spawn failure rolls
-    // the binding back below.
+    // must resolve true) before the process spawns. The binding change must
+    // also be DURABLE: a privilege grant the disk never recorded would be
+    // forgotten (or the wrong one resurrected) on the next restart, so a
+    // persist failure refuses rather than reporting success.
     let session_id = crate::agents::fresh_session_id();
-    if crate::lock(&state.workspaces)
-        .set_mastermind(
-            &id,
-            Some(crate::workspaces::MastermindCfg {
-                session_id: session_id.clone(),
-                mode,
-                agent: kind.as_str().to_string(),
-            }),
-        )
-        .is_none()
-    {
-        return err(StatusCode::NOT_FOUND, format!("unknown workspace {id}"));
+    match crate::lock(&state.workspaces).set_mastermind(
+        &id,
+        Some(crate::workspaces::MastermindCfg {
+            session_id: session_id.clone(),
+            mode,
+            agent: kind.as_str().to_string(),
+        }),
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(StatusCode::NOT_FOUND, format!("unknown workspace {id}")),
+        Err(e) => {
+            // The in-memory binding moved but didn't reach disk. Nothing was
+            // spawned and the old session is untouched (its on-disk binding is
+            // unchanged) — restore memory to it and refuse.
+            let _ = crate::lock(&state.workspaces).set_mastermind(&id, old);
+            tracing::error!(%e, "failed to persist mastermind binding");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
     }
     match crate::chat::spawn_fresh_chat(
         &state,
@@ -225,9 +230,21 @@ pub(crate) async fn put_mastermind(
     )
     .await
     {
-        Ok(row) => Json(row).into_response(),
+        Ok(row) => {
+            // The successor is live and bound — NOW retire the old one. Its
+            // identity is pre-removed so its exit can't push it into Recents
+            // (the Mastermind is never a roster session).
+            if let Some(old) = &old {
+                retire_mastermind_session(&state, &old.session_id).await;
+            }
+            Json(row).into_response()
+        }
         Err(failure) => {
-            crate::lock(&state.workspaces).set_mastermind(&id, None);
+            // The successor never started (spawn_fresh_chat already dropped
+            // the new id from the registries) and the OLD Mastermind was never
+            // touched — roll the binding back to it so the survivor stays
+            // bound.
+            let _ = crate::lock(&state.workspaces).set_mastermind(&id, old);
             state.changes.notify_waiters();
             match failure {
                 crate::chat::ChatSpawnFailure::AgentUnavailable(msg) => {
@@ -269,7 +286,18 @@ pub(crate) async fn delete_mastermind(
         )
             .into_response();
     };
-    crate::lock(&state.workspaces).set_mastermind(&id, None);
+    if let Err(e) = crate::lock(&state.workspaces).set_mastermind(&id, None) {
+        // The unbind didn't persist — restore memory so it agrees with disk
+        // (the session is still alive and bound) and refuse, rather than
+        // retiring a session whose binding the next restart would resurrect.
+        let _ = crate::lock(&state.workspaces).set_mastermind(&id, Some(cfg));
+        tracing::error!(%e, "failed to persist mastermind unbind");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
     retire_mastermind_session(&state, &cfg.session_id).await;
     StatusCode::NO_CONTENT.into_response()
 }

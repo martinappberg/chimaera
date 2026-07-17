@@ -87,6 +87,15 @@ pub(crate) fn statusline_script_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-statusline.sh"))
 }
 
+/// Path to a session's statusline auth-header file (mode 0600): it holds the
+/// `Authorization: Bearer <key>` line the wrapper's curl reads via `-H @file`.
+/// The key rides this file, NOT the curl argv — `/proc/<pid>/cmdline` is
+/// world-readable on shared login nodes, so the live curl must never carry
+/// the secret as an argument. Same runtime dir / lifecycle as the script.
+pub(crate) fn statusline_header_path(session_id: &str) -> PathBuf {
+    agents_runtime_dir().join(format!("{session_id}-statusline.hdr"))
+}
+
 /// Write the per-agent Claude Code settings file (hooks -> daemon ingest URL)
 /// into the chimaera runtime dir, mode 0600 (it embeds the session secret).
 ///
@@ -211,9 +220,23 @@ fn write_statusline_script(
 ) -> anyhow::Result<String> {
     use std::os::unix::fs::PermissionsExt;
 
-    let url = format!(
-        "http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?key={key}&event=statusline"
-    );
+    // The URL is SECRET-FREE: the key would otherwise ride the curl argv, and
+    // /proc/<pid>/cmdline is world-readable on the shared login nodes — any
+    // other user could scrape the session id + key and reach this session's
+    // MCP endpoint (for a Mastermind, its act tools). Instead the key lives in
+    // a 0600 header file curl reads via `-H @file` (below), off argv entirely.
+    let url = format!("http://127.0.0.1:{port}/api/v1/agent-events/{session_id}?event=statusline");
+    // Write the Bearer-header file (0600) the wrapper's curl authenticates
+    // with. Same runtime dir as the script; regenerated on every spawn.
+    let hdr_path = statusline_header_path(session_id);
+    if let Some(dir) = hdr_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    std::fs::write(&hdr_path, format!("Authorization: Bearer {key}\n"))
+        .with_context(|| format!("failed to write {}", hdr_path.display()))?;
+    std::fs::set_permissions(&hdr_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", hdr_path.display()))?;
     let stamp = statusline_script_path(session_id).with_extension("stamp");
     // The runtime dir usually has a safe charset, but a user-set
     // CHIMAERA_HOME (or a dev build's home dir) can carry spaces or quotes —
@@ -221,6 +244,7 @@ fn write_statusline_script(
     // The URL is generated hex/digits; quoted anyway for uniformity.
     let stamp = sh_quote(&stamp.to_string_lossy());
     let url_q = sh_quote(&url);
+    let hdr_q = sh_quote(&hdr_path.to_string_lossy());
     // The POST is throttled to one per 2s via an epoch stamp file: claude
     // repaints the statusline continuously while streaming, and an
     // unthrottled tee would fork curl per repaint on a shared login node.
@@ -244,7 +268,7 @@ fn write_statusline_script(
          case $last in ''|*[!0-9]*) last=0;; esac\n\
          if [ \"$((now - last))\" -ge 2 ]; then\n\
          printf '%s' \"$now\" > {stamp}\n\
-         printf '%s' \"$input\" | curl -s -m 5 -H 'Content-Type: application/json' \
+         printf '%s' \"$input\" | curl -s -m 5 -H @{hdr_q} -H 'Content-Type: application/json' \
          --data-binary @- {url_q} >/dev/null 2>&1 &\n\
          fi\n"
     );
@@ -313,16 +337,41 @@ pub(crate) struct IngestQuery {
     event: Option<String>,
 }
 
+/// The bare token from an `Authorization: Bearer <token>` header, if present
+/// and well-formed. The statusline wrapper's curl authenticates this way so
+/// the key stays off its argv.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
 /// POST /api/v1/agent-events/{id}?key={secret} — Claude Code hook ingestion.
 ///
 /// Not behind bearer auth (claude's hook cannot know the daemon token); the
-/// per-session random key embedded in the hook URL authorizes it.
+/// per-session random key authorizes it. The hooks (`type:http`, made in
+/// claude's own process) pass it as `?key=`; the statusline wrapper, which
+/// shells out to `curl`, passes it as `Authorization: Bearer` instead so the
+/// secret never rides a world-readable curl argv — both channels carry the
+/// same per-session key and either satisfies the check.
 pub(crate) async fn ingest(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<IngestQuery>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
+    // The presented key rides one of two disjoint channels: the `?key=` query
+    // param (the http hooks — always present) or, when that is absent, the
+    // `Authorization: Bearer` header (the statusline curl, which keeps the key
+    // off its argv). Query-first so an unrelated Authorization header (a
+    // client that always sends the daemon token) can't shadow the hook key.
+    let presented_key = if query.key.is_empty() {
+        bearer_token(&headers).unwrap_or_default()
+    } else {
+        query.key.as_str()
+    };
     // Statusline heartbeat (the generated wrapper posts the TUI's statusline
     // JSON with `?event=statusline`): quantized usage telemetry only — it
     // never touches the hook state machine. Liberal ingest: an unknown shape
@@ -337,7 +386,7 @@ pub(crate) async fn ingest(
                 )
                     .into_response();
             };
-            if record.key != query.key {
+            if record.key != presented_key {
                 return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
             }
             let usage = statusline_usage(&payload);
@@ -380,7 +429,7 @@ pub(crate) async fn ingest(
             )
                 .into_response();
         };
-        if record.key != query.key {
+        if record.key != presented_key {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
         }
 
@@ -781,9 +830,25 @@ mod tests {
         );
         assert!(value["statusLine"].get("padding").is_none());
         let script = std::fs::read_to_string(&script_path).unwrap();
-        let url =
-            format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?key={key}&event=statusline");
+        // The URL is SECRET-FREE — the key must NOT ride the curl argv (it is
+        // world-readable via /proc on shared login nodes).
+        let url = format!("http://127.0.0.1:43999/api/v1/agent-events/{sid}?event=statusline");
         assert!(script.contains(&format!("'{url}'")), "{script}");
+        assert!(
+            !script.contains(&key),
+            "the key must never appear in the argv: {script}"
+        );
+        assert!(!script.contains("?key="), "no key in the URL: {script}");
+        // The key rides a 0600 header file curl reads via `-H @file`.
+        let hdr_path = statusline_header_path(&sid);
+        assert!(
+            script.contains(&format!("-H @'{}'", hdr_path.to_string_lossy())),
+            "{script}"
+        );
+        let hdr = std::fs::read_to_string(&hdr_path).unwrap();
+        assert_eq!(hdr, format!("Authorization: Bearer {key}\n"));
+        let hdr_mode = std::fs::metadata(&hdr_path).unwrap().permissions().mode();
+        assert_eq!(hdr_mode & 0o777, 0o600, "the header file is owner-only");
         // The POST is backgrounded (never delays a user statusline) and the
         // wrapper's only output line is the optional passthrough — absent here.
         assert!(script.contains(">/dev/null 2>&1 &"), "{script}");
@@ -795,12 +860,13 @@ mod tests {
         // fork churn is a review criterion.
         assert!(script.contains("-ge 2"), "{script}");
         assert!(script.contains(".stamp"), "{script}");
-        // Executable, owner-only: the URL embeds the session secret.
+        // Executable, owner-only.
         let mode = std::fs::metadata(&script_path)
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+        std::fs::remove_file(&hdr_path).ok();
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&script_path).ok();
 

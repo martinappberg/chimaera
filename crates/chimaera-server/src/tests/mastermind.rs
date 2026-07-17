@@ -239,14 +239,16 @@ async fn put_mastermind_creates_binds_reputs_and_deletes() {
 /// the MCP tier keys on the binding, not on how the session runs).
 fn bind_as_mastermind(state: &Arc<AppState>, ws: &str, sid: &str) {
     lock(&state.session_workspaces).insert(sid.to_string(), ws.to_string());
-    lock(&state.workspaces).set_mastermind(
-        ws,
-        Some(workspaces::MastermindCfg {
-            session_id: sid.to_string(),
-            mode: workspaces::MastermindMode::Ask,
-            agent: "claude".to_string(),
-        }),
-    );
+    lock(&state.workspaces)
+        .set_mastermind(
+            ws,
+            Some(workspaces::MastermindCfg {
+                session_id: sid.to_string(),
+                mode: workspaces::MastermindMode::Ask,
+                agent: "claude".to_string(),
+            }),
+        )
+        .unwrap();
 }
 
 async fn tool_names(state: &Arc<AppState>, sid: &str, key: &str) -> Vec<String> {
@@ -343,7 +345,7 @@ async fn mcp_tier_gates_on_the_binding() {
     assert!(!ids.contains(&mastermind.as_str()), "{digest}");
 
     // Unbind (fire the Mastermind): the tier drops on the very next call.
-    lock(&state.workspaces).set_mastermind(&ws, None);
+    lock(&state.workspaces).set_mastermind(&ws, None).unwrap();
     let fired = tool_names(&state, &mastermind, "mmk").await;
     assert_eq!(
         fired,

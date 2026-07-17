@@ -119,25 +119,33 @@ impl WorkspaceStore {
         Some(workspace)
     }
 
-    /// Set (or clear) `id`'s Mastermind binding, persisting on change
-    /// (mirrors `touch`). Returns the updated workspace, or None if unknown.
+    /// Set (or clear) `id`'s Mastermind binding, persisting on change.
+    /// `Ok(None)` = unknown workspace; `Ok(Some(ws))` = applied AND durable;
+    /// `Err` = the in-memory change stuck but the on-disk file could not be
+    /// written. A binding that isn't durable is worse than a rejected one —
+    /// it grants privileges the next restart forgets (or resurrects the wrong
+    /// one) — so callers changing privilege MUST surface the error and roll
+    /// the memory back, not report success (unlike `touch`, whose lost
+    /// timestamp is cosmetic).
     pub(crate) fn set_mastermind(
         &mut self,
         id: &str,
         cfg: Option<MastermindCfg>,
-    ) -> Option<Workspace> {
-        let entry = self.items.iter_mut().find(|w| w.id == id)?;
+    ) -> anyhow::Result<Option<Workspace>> {
+        let Some(entry) = self.items.iter_mut().find(|w| w.id == id) else {
+            return Ok(None);
+        };
         entry.mastermind = cfg;
         let workspace = entry.clone();
-        if let Err(err) = self.save() {
-            tracing::warn!(%err, "failed to persist mastermind binding");
-        }
-        Some(workspace)
+        self.save()?;
+        Ok(Some(workspace))
     }
 
     /// Clear `workspace_id`'s Mastermind binding IF it names `session_id`
     /// (the retire path: a dead Mastermind must not stay bound). Returns
-    /// whether it did.
+    /// whether it did. Best-effort persistence: this runs on self-exit
+    /// cleanup (`recents::retire`) where the session is already gone, so a
+    /// failed write is logged, not propagated — there is no caller to abort.
     pub(crate) fn clear_mastermind_if(&mut self, workspace_id: &str, session_id: &str) -> bool {
         let bound = self.items.iter().any(|w| {
             w.id == workspace_id
@@ -146,7 +154,9 @@ impl WorkspaceStore {
                     .is_some_and(|m| m.session_id == session_id)
         });
         if bound {
-            self.set_mastermind(workspace_id, None);
+            if let Err(err) = self.set_mastermind(workspace_id, None) {
+                tracing::warn!(%err, "failed to persist mastermind unbind on retire");
+            }
         }
         bound
     }
@@ -241,7 +251,7 @@ mod tests {
             mode: MastermindMode::Auto,
             agent: "claude".to_string(),
         };
-        let updated = store.set_mastermind(&ws.id, Some(cfg)).unwrap();
+        let updated = store.set_mastermind(&ws.id, Some(cfg)).unwrap().unwrap();
         assert_eq!(
             updated.mastermind.as_ref().unwrap().session_id,
             "s-mm000001"
@@ -268,5 +278,30 @@ mod tests {
         assert!(reloaded.get(&ws.id).unwrap().mastermind.is_none());
 
         std::fs::remove_file(reloaded.path.clone()).ok();
+    }
+
+    /// A binding change whose persistence FAILS surfaces as `Err`, never a
+    /// silent success — a privileged Mastermind that the disk never recorded
+    /// would be forgotten (or the wrong one resurrected) on the next restart.
+    #[test]
+    fn set_mastermind_propagates_save_failure() {
+        let dir = test_dir("mm-savefail");
+        let mut store = WorkspaceStore::load(dir.join("workspaces.json"));
+        let ws = store.add(test_dir("mm-savefail-root")).unwrap();
+        // Redirect the store at a path whose parent is a regular file, so the
+        // atomic temp-write + rename can't create its tempfile.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        store.path = blocker.join("workspaces.json");
+        let cfg = MastermindCfg {
+            session_id: "s-mm000002".to_string(),
+            mode: MastermindMode::Ask,
+            agent: "claude".to_string(),
+        };
+        assert!(
+            store.set_mastermind(&ws.id, Some(cfg)).is_err(),
+            "a failed persist must surface as Err, not silent success"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
