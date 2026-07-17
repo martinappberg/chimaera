@@ -202,10 +202,12 @@
   class="card"
   class:compact
   class:dead={!session.alive}
+  class:unread={isUnread(session.id)}
   role="button"
   tabindex="0"
   onclick={onOpen}
   onkeydown={onKeydown}
+  title={isUnread(session.id) ? "finished — output you haven't looked at" : undefined}
 >
   <div class="top">
     <SessionGlyph
@@ -217,11 +219,6 @@
     />
     <span class="dot {dotState(session)}" title={dotTitle(session)}></span>
     <span class="name" title={name}>{name}</span>
-    {#if isUnread(session.id)}
-      <!-- Finished with output the user hasn't seen — the rail's faint mark,
-           worn card-side too (cleared the moment the session is focused). -->
-      <span class="unread-dot" title="finished — output you haven't looked at"></span>
-    {/if}
     {#if compact && isStalled}
       <!-- Compact rows carry no now-line, but the stall warning is built for
            exactly this density (a wedged agent in a fan-out must not look
@@ -377,6 +374,19 @@
   .card:hover {
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
+  /* Unread = finished with output you haven't looked at. The whole card is
+     the signal (clearer than a tiny mark): a soft accent left-bar + a faint
+     tint + an accent-tinted border draw the eye without shouting, and clear
+     the moment the session is focused. Never the state DOT's job — the dot
+     still shows the true state (done/errored/…); this only says "new". */
+  .card.unread {
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
+    background: color-mix(in srgb, var(--accent) 6%, var(--overlay-bg));
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .card.unread .name {
+    font-weight: 600;
+  }
   .card.dead {
     opacity: 0.75;
   }
@@ -438,29 +448,6 @@
     color: var(--warn);
   }
 
-  /* Finished output the user hasn't seen: the rail's faint fg-toned mark —
-     never a state color (the dot owns state). Same geometry + fade-in as the
-     rail/strip copies in App.svelte (Svelte scopes styles per component, so
-     the rule and its keyframe are repeated, not shared — keep them in step). */
-  .unread-dot {
-    flex: none;
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--fg) 75%, transparent);
-    box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fg) 10%, transparent);
-    animation: unreadfade 0.3s ease-out;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .unread-dot {
-      animation: none;
-    }
-  }
-  @keyframes unreadfade {
-    from {
-      opacity: 0;
-    }
-  }
 
   /* Session state dot — the same modifier vocabulary as the rail. */
   .dot {

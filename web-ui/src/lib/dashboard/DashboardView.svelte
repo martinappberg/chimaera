@@ -74,10 +74,6 @@
   const hero = $derived(lane.length === 0 && roster.length === 1);
   const compact = $derived(roster.length >= 7);
 
-  /** Quiet = nothing needs you and no agent is mid-work — the moment recents
-   *  earn the side column back (decision 10: lean during live work). */
-  const quiet = $derived(lane.length === 0 && !agents.some(isBusy));
-
   /** Roster cards glide instead of teleporting when they REORDER within
    *  their list (the live-before-dead resort, a new sibling pushing the
    *  grid). `animate:flip` only tweens position deltas of the same keyed
@@ -89,27 +85,6 @@
     typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
       ? 0
       : 220;
-
-  /** Hysteresis on the recents section: `quiet` flips at every turn boundary
-   *  (a chat agent is briefly idle between turns), and a side column that
-   *  pops in and out per turn reads as flicker. Showing recents needs quiet
-   *  to HOLD for a beat; hiding stays immediate (kicking off work is a
-   *  deliberate moment). First evaluation is instant so a genuinely quiet
-   *  workspace doesn't open with a bare column. */
-  const QUIET_HOLD_MS = 10_000;
-  let quietSettled = $state(false);
-  let quietSeen = false;
-  $effect(() => {
-    if (!quiet) {
-      quietSeen = true;
-      quietSettled = false;
-      return;
-    }
-    const delay = quietSeen ? QUIET_HOLD_MS : 0;
-    quietSeen = true;
-    const timer = setTimeout(() => (quietSettled = true), delay);
-    return () => clearTimeout(timer);
-  });
 
   const nothingRunning = $derived(wsSessions.length === 0);
 
@@ -569,10 +544,11 @@
             </div>
           {/if}
 
-          <!-- Recents show only in SETTLED quiet moments — during live work
-               the column stays lean (decision 10), and the hold beat keeps
-               per-turn idle gaps from flickering the section in and out. -->
-          {#if quietSettled && dash.recents.length > 0}
+          <!-- Recents live in the activity column, always (a stable place to
+               pick up where you left off). They used to appear only in quiet
+               moments, but that pop-in/out read as a glitch — a predictable
+               always-there section is calmer than a clever one. -->
+          {#if dash.recents.length > 0}
             <div class="sec">
               <div class="sec-title">recents</div>
               {#each dash.recents.slice(0, 5) as r (r.resume ?? `${r.kind}:${r.title}`)}
@@ -1008,7 +984,11 @@
 
   .roster {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    /* auto-FIT (not auto-fill): a lone card fills the column instead of
+       shrinking to 300px and stranding itself against a phantom track; two
+       or three wrap into even columns. Cards cap their own line length via
+       the container, so a single card never becomes a cavernous banner. */
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 8px;
   }
   .roster.compact {

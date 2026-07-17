@@ -3101,6 +3101,7 @@
             <div
               class="row"
               class:active={s.id === focusedSessionId}
+              class:unread={renamingId !== s.id && isUnread(s.id)}
               class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
               style:--hue={s.kind === "agent" ? agentHue(s.id) : null}
               use:linkRow={s}
@@ -3182,13 +3183,6 @@
                     <span class="title" title={s.status_detail}>{s.status_detail}</span>
                   {/if}
                 </span>
-              {/if}
-              {#if renamingId !== s.id && isUnread(s.id)}
-                <!-- Finished with output the user hasn't seen: a faint,
-                     state-color-free mark (the glyph owns state; this only
-                     says "worth a look"). Cleared the moment the row is
-                     focused. -->
-                <span class="unread-dot" title="finished — output you haven't looked at"></span>
               {/if}
               {#if hintsActive() && renamingId !== s.id && chordDigits.has(s.id)}
                 <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
@@ -3729,7 +3723,8 @@
           <button
             class="chip"
             class:focused={s.id === focusedSessionId}
-            title={s.title ?? undefined}
+            class:unread={isUnread(s.id)}
+            title={isUnread(s.id) ? "finished — output you haven't looked at" : (s.title ?? undefined)}
             onclick={() => openSess(s.id)}
           >
             <!-- The type glyph replaces both the dot and the old "$ "
@@ -3742,9 +3737,6 @@
               title={dotTitle(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
-            {#if isUnread(s.id)}
-              <span class="unread-dot" title="finished — output you haven't looked at"></span>
-            {/if}
             {#if hintsActive() && chordDigits.has(s.id)}
               <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
             {/if}
@@ -4093,6 +4085,11 @@
     display: block;
   }
   .dash-label {
+    /* Match the session rows' name type (mono, text-sm) — the dashboard row
+       sits in the same list and must read as one of them, not a stray
+       proportional label. */
+    font-family: var(--mono);
+    font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -4258,20 +4255,24 @@
     }
   }
 
-  /* Unread output: a faint fg-toned mark, deliberately NOT a state color —
-     the glyph owns state, this only whispers "worth a look". Shared by the
-     rail rows and the focus-mode strip chips; cleared on focus. */
-  .unread-dot {
-    flex: none;
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: color-mix(in srgb, var(--fg) 75%, transparent);
-    box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fg) 10%, transparent);
-    animation: hintfade 0.3s ease-out;
+  /* Unread output: finished with output you haven't looked at. One accent
+     language across surfaces (the dashboard card wears the same) — a left
+     accent bar + a bolder name, clearer than a tiny mark and never the state
+     glyph's job (the glyph still shows the true state; this only says "new").
+     A focused row is never unread, so this never fights the active bg. */
+  .row.unread {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    box-shadow: inset 3px 0 0 var(--accent);
   }
-  .row:has(.unread-dot) .name,
-  .chip:has(.unread-dot) .chip-name {
+  .row.unread .name {
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .chip.unread {
+    box-shadow: inset 2px 0 0 var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .chip.unread .chip-name {
     color: var(--fg);
     font-weight: 600;
   }
