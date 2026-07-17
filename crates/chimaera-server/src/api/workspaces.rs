@@ -98,11 +98,11 @@ pub(crate) struct PutMastermind {
 
 /// PUT /api/v1/workspaces/{id}/mastermind — appoint the workspace's
 /// Mastermind: creates the privileged chat session AND binds it in one step
-/// (bind-before-spawn, so the generated settings carry the mode before the
-/// process exists), retiring any previous Mastermind first. Mode changes are
-/// a re-PUT — a running claude never re-reads its settings file, so there is
-/// no in-place mode mutation. Returns the new session row (`mastermind:
-/// true`).
+/// (bind-before-spawn, so the generated gating — claude's settings file,
+/// codex's argv — carries the mode before the process exists), retiring any
+/// previous Mastermind first. Mode changes are a re-PUT — neither agent
+/// re-reads its gating after spawn, so there is no in-place mode mutation.
+/// Returns the new session row (`mastermind: true`).
 pub(crate) async fn put_mastermind(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -137,18 +137,22 @@ pub(crate) async fn put_mastermind(
             );
         }
     };
-    // Claude-only in v1. Codex 0.144.2 DOES load chimaera's streamable-HTTP
-    // MCP tools (workers get them at spawn), but its approval system covers
-    // exec/patch/network only — MCP tool calls raise no per-tool prompt — so
-    // the ask-first mode cannot be enforced through its harness. Shipping a
-    // codex Mastermind whose "ask" toggle does nothing would lie.
-    if kind != crate::agents::AgentKind::Claude {
+    // Claude and codex both enforce the mode through their own harness:
+    // claude via the generated settings' `permissions.allow`, codex via
+    // per-server/per-tool MCP approval config in argv (its per-tool prompt
+    // is an elicitation — the original v1 refusal predated that finding;
+    // see `launcher::build_codex_chat_command`). Other agents have no chat
+    // driver and fail the spawn below with an honest message.
+    if !matches!(
+        kind,
+        crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
+    ) {
         return err(
             StatusCode::BAD_REQUEST,
-            "the Mastermind runs on claude for now: codex loads chimaera's workspace \
-             tools, but it has no per-tool permission gate for MCP calls, so the \
-             ask-first mode can't be enforced"
-                .to_string(),
+            format!(
+                "the Mastermind needs a structured chat driver; {} has none",
+                body.agent
+            ),
         );
     }
     if let Some(model) = &body.model {

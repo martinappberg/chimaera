@@ -34,6 +34,10 @@
 
   /** Setup-card mode choice; ask-first is the default (plan §6). */
   let mode = $state<"ask" | "auto">("ask");
+  /** Setup-card agent choice — both chat-driver agents enforce the mode
+   *  through their own harness (claude: settings pre-allows; codex: MCP
+   *  approval config). */
+  let agent = $state<"claude" | "codex">("claude");
   /** A PUT/DELETE is in flight — buttons disable, the chat gap shows busy. */
   let pending = $state(false);
   /** The server's own words for a refused/failed call, shown verbatim. */
@@ -58,22 +62,20 @@
     ask: "acting on the workspace asks you first — reads never ask",
     auto: "acts without asking; every act is audited",
   };
-  /** The server's refusal, mirrored so nobody has to hit the 400 to learn it. */
-  const CODEX_REASON =
-    "the Mastermind runs on claude for now: codex loads chimaera's workspace " +
-    "tools, but it has no per-tool permission gate for MCP calls, so the " +
-    "ask-first mode can't be enforced";
-
   /** PUT the binding (setup start AND mode switch — a mode change is a
-   *  re-PUT; the daemon restarts the session with the new gating). */
+   *  re-PUT; the daemon restarts the session with the new gating). A mode
+   *  switch keeps the bound agent (never silently rotates a codex
+   *  Mastermind into a claude one); the setup card uses the picker. */
   async function appoint(m: "ask" | "auto"): Promise<void> {
     if (pending) return;
     pending = true;
     error = null;
     confirm = null;
+    const a =
+      cfg !== null ? (session?.agent_kind ?? justCreated?.agent_kind ?? "claude") : agent;
     try {
       // Theme rides along like POST /sessions so the agent boots matched.
-      justCreated = await putMastermind(wsId, { agent: "claude", mode: m, theme: resolvedTheme() });
+      justCreated = await putMastermind(wsId, { agent: a, mode: m, theme: resolvedTheme() });
       await refresh();
     } catch (e) {
       error = e instanceof ApiError ? e.message : String(e);
@@ -207,17 +209,23 @@
 
       <div class="field">agent</div>
       <label class="choice">
-        <input type="radio" name="mm-agent" checked disabled={pending} />
+        <input
+          type="radio"
+          name="mm-agent"
+          value="claude"
+          bind:group={agent}
+          disabled={pending}
+        />
         <span class="cbody">
           <span class="cname">claude</span>
           <span class="csub">Claude Code, as your own account</span>
         </span>
       </label>
-      <label class="choice off" title={CODEX_REASON}>
-        <input type="radio" name="mm-agent" disabled />
+      <label class="choice">
+        <input type="radio" name="mm-agent" value="codex" bind:group={agent} disabled={pending} />
         <span class="cbody">
           <span class="cname">codex</span>
-          <span class="csub">no per-tool permission gate for MCP calls — ask first can't be enforced</span>
+          <span class="csub">Codex, as your own account</span>
         </span>
       </label>
 
@@ -469,15 +477,11 @@
     cursor: pointer;
     transition: border-color 0.12s ease;
   }
-  .choice:hover:not(.off) {
+  .choice:hover {
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
   .choice:has(input:checked) {
     border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
-  }
-  .choice.off {
-    opacity: 0.55;
-    cursor: default;
   }
   .choice input {
     flex: none;

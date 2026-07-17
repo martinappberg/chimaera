@@ -133,13 +133,12 @@ pub(crate) fn write_settings(
     }
     if let Some(mode) = mastermind {
         let allow = match mode {
-            crate::workspaces::MastermindMode::Ask => json!([
-                "mcp__chimaera__workspace_status",
-                "mcp__chimaera__read_session",
-                "mcp__chimaera__list_changed_files",
-                "mcp__chimaera__list_terminals",
-                "mcp__chimaera__read_terminal",
-            ]),
+            // The shared read-tool list (mcp.rs) — codex's ask-mode argv is
+            // generated from the same one, so the two harness gates agree.
+            crate::workspaces::MastermindMode::Ask => json!(crate::mcp::MASTERMIND_READ_TOOLS
+                .iter()
+                .map(|t| format!("mcp__chimaera__{t}"))
+                .collect::<Vec<_>>()),
             crate::workspaces::MastermindMode::Auto => json!(["mcp__chimaera"]),
         };
         settings["permissions"] = json!({ "allow": allow });

@@ -1,8 +1,10 @@
 # The Agent Dashboard — design & plan
 
 Status: **v0.1 + v0.1.x + v0.2 + Mastermind v1 built and live-verified on the PR #62
-branch** (2026-07-16, billed real-agent runs on claude AND codex). Remaining phases:
-v0.3's observe-for-all + codex TUI hook consent, and v1.x (`ask_mastermind`, proactivity
+branch** (2026-07-16, billed real-agent runs on claude AND codex — including
+**codex-as-Mastermind**, gated by the driver answering its MCP elicitations; the
+original claude-only refusal predated that finding). Remaining phases: v0.3's
+observe-for-all + codex TUI hook consent, and v1.x (`ask_mastermind`, proactivity
 opt-in, memory). This document synthesizes a research pass over the
 codebase, the current Claude Code and Codex integration surfaces (verified
 July 2026), and prior art (Conductor, Crystal, claude-squad, Vibe Kanban,
@@ -349,9 +351,13 @@ permission prompt (`PermissionRequest` on the wire) — which renders in the
 dashboard's attention lane like any other permission, answerable inline.
 **Auto** mode pre-allows them (claude: `allowedTools` for
 `mcp__chimaera__*` act tools in the generated `--settings`; codex: the
-equivalent approval policy). No bespoke propose/consent layer to build or
-maintain — the existing permission cards *are* the ask-first mode, and the
-mode toggle lives on the Mastermind dock. In practice most Mastermind
+driver answers its MCP tool-call **elicitations** from the recorded mode —
+its app-server elicits every MCP call regardless of approval-mode config,
+so the pre-allow is applied at the prompt; live-probed, PROTOCOL.md Pass
+16). Both vendors' gates generate from one shared read-tool list, so the
+ask-mode semantics are identical. No bespoke propose/consent layer to build
+or maintain — the existing permission cards *are* the ask-first mode, and
+the mode toggle lives on the Mastermind dock. In practice most Mastermind
 traffic is reads anyway ("what's the status of this workspace", "what
 should I do next") — acts are the rare tail, which is exactly where a
 native ask belongs.

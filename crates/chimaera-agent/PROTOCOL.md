@@ -1438,3 +1438,49 @@ once/decline pair (`codex.rs::on_server_request`, mined-frame test
 unmapped (falls to the generic approval arm). `just chat-smoke` re-run for
 the driver change: 16/16 (253s), plus the targeted live regression (allow →
 `list_terminals` runs) against a spawned codex chat.
+
+## Pass 16 (2026-07-16 — live probes 0.144.2): the app-server elicits EVERY
+MCP tool call; nothing config-side gates it. ADOPTED (driver pre-approval).
+
+Probed while making codex eligible as the workspace Mastermind (the ask/auto
+harness gating needed a codex-side pre-allow). Every result below is a live
+app-server probe against a real turn calling a chimaera tool:
+
+- **`mcp_servers.<s>.default_tools_approval_mode`** (mined enum `auto |
+  prompt | writes | approve`; upstream PR #17843's precedence is per-tool →
+  server default → `auto`) and **`mcp_servers.<s>.tools.<t>.approval_mode`**
+  both PARSE (bogus values name the enum) but are **ignored by the
+  app-server**: with server-wide `auto`, the elicitation still fired.
+  They appear to govern the TUI only.
+- **`approval_policy = {granular = {sandbox_approval=bool, rules=bool,
+  skill_approval=bool, request_permissions=bool, mcp_elicitations=bool}}`**
+  (the `granular` AskForApproval variant; all five fields required) loads
+  and runs — and `mcp_elicitations=false` still did not suppress the
+  elicitation. Neither did a thread-level `thread/start
+  {approvalPolicy:"never"}`.
+- Conclusion: on the app-server surface, an MCP tool call ALWAYS raises
+  `mcpServer/elicitation/request` toward the client. The native quieting is
+  the `_meta.persist` mechanism (`["session","always"]`), whose accept
+  payload is still unmined here.
+- **`InitializeCapabilities`** is `{experimentalApi, requestAttestation,
+  mcpServerOpenaiFormElicitation, optOutNotificationMethods}` (mined; the
+  form-elicitation capability is untested — the simple accept/decline shape
+  is what we speak).
+- The elicitation params carry NO structured tool name — only `serverName`
+  and the pinned `message` shape `Allow the <server> MCP server to run tool
+  "<tool>"?` (plus `_meta.tool_description/tool_params`). The tool is the
+  last double-quoted span.
+- **`developer_instructions`** (a root config string, `-c` injectable) DOES
+  reach app-server turns — a probe instructed via it echoed the expected
+  ack token in its answer. This carries the Mastermind role prompt.
+
+Adopted design: `SpawnSpec.mcp_auto_approve {server, tools: Option<Vec>}` —
+the embedder's standing consent (the Mastermind's user-picked ask/auto
+mode). The codex driver answers matching tool-call elicitations
+(`codex_approval_kind == "mcp_tool_call"`, same server, tool parsed from the
+message) with the verified `{"action":"accept","content":{}}` and surfaces
+everything else (other servers, genuine form elicitations, unparsable
+messages). Mined-frame test `mcp_elicitation_pre_approval_gates_by_tool_list`;
+live: ask-mode reads ran silent, `spawn_terminal` surfaced the native card
+in the dock and ran on Allow, auto mode ran both unprompted. `just
+chat-smoke` re-run after the driver change: 16/16.

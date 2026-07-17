@@ -68,6 +68,20 @@ const CHANGED_FILES_CAP: usize = 100;
 /// runaway Mastermind).
 const MESSAGE_TEXT_MAX: usize = 16 * 1024;
 
+/// The read-only tools an ask-mode Mastermind may call without prompting —
+/// the SHARED list both harness gates are generated from (claude:
+/// `permissions.allow` in the settings file; codex: per-tool
+/// `approval_mode="auto"` config overrides). One list so the two vendors'
+/// ask modes can't drift; everything not on it prompts, including any tool
+/// added later.
+pub(crate) const MASTERMIND_READ_TOOLS: [&str; 5] = [
+    "workspace_status",
+    "read_session",
+    "list_changed_files",
+    "list_terminals",
+    "read_terminal",
+];
+
 /// Instructions injected into the agent's context at initialize.
 const INSTRUCTIONS: &str = "\
 Chimaera linked terminals: the user can link live terminal sessions (often \

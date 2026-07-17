@@ -191,17 +191,20 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether `session_id` is `workspace_id`'s bound Mastermind. The one
-/// predicate every tier check shares (MCP gating, the wire flag, respawns).
-pub(crate) fn is_workspace_mastermind(
+/// `session_id`'s Mastermind mode when it is `workspace_id`'s bound
+/// Mastermind (`None` otherwise). The one binding lookup every respawn path
+/// shares — the mode (not just the flag) because the codex spawn carries it
+/// in argv.
+pub(crate) fn workspace_mastermind_mode(
     state: &crate::AppState,
     workspace_id: &str,
     session_id: &str,
-) -> bool {
+) -> Option<MastermindMode> {
     crate::lock(&state.workspaces)
         .get(workspace_id)
         .and_then(|w| w.mastermind)
-        .is_some_and(|m| m.session_id == session_id)
+        .filter(|m| m.session_id == session_id)
+        .map(|m| m.mode)
 }
 
 #[cfg(test)]

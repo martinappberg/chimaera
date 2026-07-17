@@ -87,18 +87,36 @@ async fn put_mastermind_validates_and_rolls_back() {
         );
     }
 
-    // Codex is rejected with an explanation the UI can show (codex 0.144.2
-    // loads the MCP tools but has no per-tool ask gate — claude-only in v1).
+    // Codex is ACCEPTED (its MCP approval config enforces the mode — the
+    // per-tool prompt is an elicitation): with no codex binary preset the
+    // request clears validation and fails at the spawn with an honest 409,
+    // never the old 400 refusal.
+    preset_agent(
+        &state,
+        agents::AgentKind::Codex,
+        Err("codex not found".to_string()),
+        None,
+    );
     let (status, err) = put_mastermind(
         &state,
         &ws,
         serde_json::json!({"agent": "codex", "mode": "ask"}),
     )
     .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert!(workspace_entry(&state, &ws).await["mastermind"].is_null());
+
+    // Agents without a chat driver are refused with an explanation.
+    let (status, err) = put_mastermind(
+        &state,
+        &ws,
+        serde_json::json!({"agent": "gemini", "mode": "ask"}),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
     assert!(
-        err["error"].as_str().unwrap().contains("claude"),
-        "{err} should point at claude"
+        err["error"].as_str().unwrap().contains("chat driver"),
+        "{err} should explain the missing driver"
     );
 
     // No claude binary: 409, and the just-made binding is rolled back — a

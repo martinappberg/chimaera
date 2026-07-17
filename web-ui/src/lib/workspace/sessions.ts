@@ -353,8 +353,9 @@ export async function deleteWorkspace(id: string): Promise<void> {
  * Appoint the workspace's Mastermind: the daemon creates the privileged chat
  * session AND binds it in one step, retiring any previous one — a mode change
  * is a re-PUT (a running agent never re-reads its generated settings).
- * Returns the new session row. Errors carry UI-showable messages: 400 (codex
- * refusal, bad mode), 409 (agent binary unavailable), 404 (unknown workspace).
+ * Returns the new session row. Errors carry UI-showable messages: 400 (bad
+ * mode, agent without a chat driver), 409 (agent binary unavailable), 404
+ * (unknown workspace).
  */
 export async function putMastermind(
   workspaceId: string,

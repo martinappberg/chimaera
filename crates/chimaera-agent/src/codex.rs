@@ -252,6 +252,7 @@ impl Driver for CodexDriver {
                 hs.thread_id,
                 hs.models,
                 spec.agent_version.clone(),
+                spec.mcp_auto_approve.clone(),
                 hs.next_id,
             ),
             initial,
@@ -595,6 +596,10 @@ struct CodexMapper {
     /// Checkpoint events. Steered/buffered sends join a running turn, and
     /// thread/rollback drops whole turns, so only turn openers anchor.
     last_checkpoint: Option<String>,
+    /// The embedder's standing MCP consent (`SpawnSpec.mcp_auto_approve`):
+    /// matching tool-call elicitations are answered accept without a
+    /// PermissionRequest.
+    mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
     next_id: u64,
 }
 
@@ -616,6 +621,7 @@ impl CodexMapper {
         thread_id: String,
         models: Vec<crate::model::ModelInfo>,
         agent_version: Option<String>,
+        mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
         next_id: u64,
     ) -> Self {
         Self {
@@ -648,6 +654,7 @@ impl CodexMapper {
             out_streamed: HashMap::new(),
             last_usage: Usage::default(),
             last_checkpoint: None,
+            mcp_auto_approve,
             // The handshake minted 0..next_id (init, thread open, optional
             // rollback, model/list) and hands over the next free id.
             next_id,
@@ -2108,6 +2115,36 @@ impl CodexMapper {
                 .filter(|m| !m.is_empty())
                 .map(String::from)
                 .unwrap_or_else(|| format!("{server} MCP tool call"));
+            // The embedder's standing consent (SpawnSpec.mcp_auto_approve):
+            // answered HERE because the app-server elicits every MCP tool
+            // call — approval-mode config, the granular approval_policy, and
+            // a thread-level approvalPolicy "never" were all live-probed and
+            // none gates it (Pass 16). Scoped hard: tool-call approvals only
+            // (`codex_approval_kind`), one server, and the tool name mined
+            // from the pinned message shape (`… run tool "NAME"?`) — a
+            // genuine MCP-server form elicitation, another server, or an
+            // unparsable message all still surface to the user.
+            if params["_meta"]["codex_approval_kind"] == json!("mcp_tool_call") {
+                if let Some(allow) = self
+                    .mcp_auto_approve
+                    .as_ref()
+                    .filter(|a| a.server == server)
+                {
+                    let tool = raw_title.rsplit('"').nth(1);
+                    let approved = match (&allow.tools, tool) {
+                        (None, _) => true,
+                        (Some(list), Some(t)) => list.iter().any(|x| x == t),
+                        (Some(_), None) => false,
+                    };
+                    if approved {
+                        step.outbound.push(json!({
+                            "id": rpc_id,
+                            "result": { "action": "accept", "content": {} },
+                        }));
+                        return;
+                    }
+                }
+            }
             opt(
                 &mut options,
                 &mut decisions,
@@ -2891,7 +2928,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new(), None, 3)
+        CodexMapper::new("thr-1".into(), Vec::new(), None, None, 3)
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -3641,6 +3678,82 @@ mod tests {
             step.outbound[0]["result"],
             json!({ "action": "accept", "content": {} })
         );
+    }
+
+    /// The mined tool-call elicitation frame, parameterized by tool name.
+    fn elicitation_frame(id: u64, tool: &str) -> Value {
+        json!({
+            "id": id,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "serverName": "chimaera",
+                "mode": "form",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"],
+                    "tool_description": "d",
+                    "tool_params": {},
+                },
+                "message": format!("Allow the chimaera MCP server to run tool \"{tool}\"?"),
+                "requestedSchema": { "type": "object", "properties": {} },
+            },
+        })
+    }
+
+    /// The embedder's pre-approval (`SpawnSpec.mcp_auto_approve`): a listed
+    /// tool's elicitation is answered accept with NO PermissionRequest; an
+    /// unlisted tool on the same server still surfaces; `tools: None`
+    /// pre-approves the whole server; a different server never matches.
+    /// This is the codex Mastermind's ask/auto gating — the app-server
+    /// elicits every MCP call regardless of approval-mode config (Pass 16).
+    #[test]
+    fn mcp_elicitation_pre_approval_gates_by_tool_list() {
+        let allow = |tools| crate::driver::McpAutoApprove {
+            server: "chimaera".into(),
+            tools,
+        };
+        // Ask-mode shape: only the read list is silent.
+        let mut m = CodexMapper::new(
+            "thr-1".into(),
+            Vec::new(),
+            None,
+            Some(allow(Some(vec!["workspace_status".into()]))),
+            3,
+        );
+        let step = m.on_frame(&elicitation_frame(80, "workspace_status"));
+        assert!(step.events.is_empty(), "pre-approved tool must not surface");
+        assert_eq!(step.outbound[0]["id"], 80);
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({ "action": "accept", "content": {} })
+        );
+        let step = m.on_frame(&elicitation_frame(81, "spawn_agent"));
+        assert!(
+            matches!(&step.events[0], AgentEvent::PermissionRequest { .. }),
+            "an unlisted act tool still asks"
+        );
+        assert!(step.outbound.is_empty());
+
+        // Auto-mode shape: the whole server is silent.
+        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, Some(allow(None)), 3);
+        let step = m.on_frame(&elicitation_frame(82, "spawn_agent"));
+        assert!(step.events.is_empty());
+        assert_eq!(
+            step.outbound[0]["result"],
+            json!({ "action": "accept", "content": {} })
+        );
+
+        // Another server's tool-call approval never matches the consent.
+        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, Some(allow(None)), 3);
+        let mut frame = elicitation_frame(83, "anything");
+        frame["params"]["serverName"] = json!("other");
+        let step = m.on_frame(&frame);
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::PermissionRequest { .. }
+        ));
     }
 
     #[test]

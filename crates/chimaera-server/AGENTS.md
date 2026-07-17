@@ -71,13 +71,12 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   `GET /workspaces` wire. `mode` is `ask | auto`. Exactly one per workspace.
 - **Routes** (`api/workspaces.rs`) — `PUT /workspaces/{id}/mastermind
   {agent, mode, model?, theme?}` **creates the chat session AND binds it in
-  one step**, bind-before-spawn (the generated settings must carry the mode
+  one step**, bind-before-spawn (the generated gating must carry the mode
   before the process exists), retiring any previous Mastermind first (its
   identity is pre-removed so the exit path can't push it into Recents — the
-  Mastermind is never a roster conversation). Mode changes are a re-PUT: a
-  running claude never re-reads its settings file. `DELETE` unbinds + kills.
-  Claude-only in v1 — codex loads the MCP tools but has no per-tool ask gate
-  (its approvals cover exec/patch/network only), so agent=codex is refused
+  Mastermind is never a roster conversation). Mode changes are a re-PUT:
+  neither agent re-reads its gating after spawn. `DELETE` unbinds + kills.
+  Claude and codex both qualify; agents without a chat driver are refused
   with an explanation.
 - **Wire flag** — additive `"mastermind": true` on the session row (both
   builders: `session_json` / `chat_session_json`; null elsewhere), computed
@@ -96,11 +95,17 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   `[from the workspace Mastermind]` (provenance stamping). Every act call
   logs a `tracing::info!` audit line. Every answer is capped (constants at
   the top of `mcp.rs`); journal tails read under `spawn_blocking`.
-- **Harness gating** (`agents.rs::write_settings`) — ask mode pre-allows
-  ONLY the read tools in `permissions.allow` (acts raise claude's native
-  permission prompt → the attention lane); auto pre-allows `mcp__chimaera`.
-  The role prompt is argv (`launcher::MASTERMIND_SYSTEM_PROMPT`, via
-  `--append-system-prompt`).
+- **Harness gating** — one shared read-tool list (`mcp::MASTERMIND_READ_TOOLS`)
+  generates both vendors' gates so ask modes can't drift. Claude
+  (`agents.rs::write_settings`): ask pre-allows only the read tools in
+  `permissions.allow` (acts raise its native permission prompt); auto
+  pre-allows `mcp__chimaera`; the role prompt is argv
+  (`launcher::MASTERMIND_SYSTEM_PROMPT` via `--append-system-prompt`). Codex:
+  the app-server elicits EVERY MCP tool call regardless of approval-mode
+  config (live-probed — PROTOCOL.md Pass 16), so the mode rides
+  `SpawnSpec.mcp_auto_approve` (chat.rs sets it; the driver answers listed
+  tools' elicitations itself, everything else surfaces); the role prompt is
+  `-c developer_instructions`.
 - **Reactive-only** — the daemon never triggers a Mastermind turn; it speaks
   only when the user (or nothing) does. No event-nudged turns, no
   `ask_mastermind` in v1 (decision 9 in the plan).

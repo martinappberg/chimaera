@@ -68,11 +68,13 @@ pub(crate) struct ChatRecipe {
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
     /// in the ledger, so resurrection re-runs the durable scopes only.
     pub(crate) prelude: Option<String>,
-    /// This session is its workspace's bound Mastermind: the claude spawn
-    /// appends the role prompt. Respawn paths (view switch, rewind,
+    /// This session is its workspace's bound Mastermind, carrying the mode:
+    /// the claude spawn appends the role prompt (the mode itself rides the
+    /// settings file), the codex spawn needs the mode in argv (approval
+    /// config + role prompt). Respawn paths (view switch, rewind,
     /// resurrection) resolve it from the workspace store at recipe build —
     /// the binding, not the recipe, is the source of truth.
-    pub(crate) mastermind: bool,
+    pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
 }
 
 /// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
@@ -1033,9 +1035,9 @@ async fn perform_switch(
     }
     let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
 
-    // The Mastermind flag survives a toggle: the binding (not the old
+    // The Mastermind mode survives a toggle: the binding (not the old
     // recipe) is the source of truth, resolved at respawn time.
-    let mastermind = crate::workspaces::is_workspace_mastermind(state, &workspace_id, id);
+    let mastermind = crate::workspaces::workspace_mastermind_mode(state, &workspace_id, id);
 
     // Stop the current process and wait for its slot to free.
     stop_for_respawn(state, id, currently_chat).await?;
@@ -1276,7 +1278,7 @@ pub(crate) async fn rewind_session(
             workspace_root,
             // A rewound Mastermind keeps its role prompt: resolve the
             // binding at respawn like the view switch does.
-            mastermind: crate::workspaces::is_workspace_mastermind(&state, &workspace_id, &id),
+            mastermind: crate::workspaces::workspace_mastermind_mode(&state, &workspace_id, &id),
             workspace_id,
             kind: record.kind,
             bin,
@@ -1482,7 +1484,7 @@ pub(crate) async fn spawn_fresh_chat(
     }
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
-    let mastermind = spec.mastermind.is_some();
+    let mastermind = spec.mastermind;
     let recipe = ChatRecipe {
         workspace_root: workspace.root.clone(),
         workspace_id: workspace.id.clone(),
@@ -1507,7 +1509,7 @@ pub(crate) async fn spawn_fresh_chat(
                 &info,
                 Some(workspace.id),
                 Some(&record),
-                mastermind,
+                mastermind.is_some(),
             ))
         }
         Err(err) => {
@@ -1555,7 +1557,7 @@ pub(crate) fn spawn_chat_session(
                     recipe.resume.as_deref(),
                     pinned.as_deref(),
                     recipe.fork_at.as_deref(),
-                    recipe.mastermind,
+                    recipe.mastermind.is_some(),
                 ),
                 pinned,
             )
@@ -1582,7 +1584,11 @@ pub(crate) fn spawn_chat_session(
                 .get(&id)
                 .map(|r| crate::agents::mcp_url(&id, &r.key, state.port));
             (
-                crate::launcher::build_codex_chat_command(&recipe.bin, mcp_url.as_deref()),
+                crate::launcher::build_codex_chat_command(
+                    &recipe.bin,
+                    mcp_url.as_deref(),
+                    recipe.mastermind,
+                ),
                 recipe.resume.clone(),
             )
         }
@@ -1605,6 +1611,31 @@ pub(crate) fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
+    // The codex Mastermind's harness gating: its app-server elicits EVERY
+    // MCP tool call (approval-mode config is parsed but ignored on that
+    // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded
+    // mode is applied by the driver answering those elicitations. Ask
+    // pre-approves exactly the shared read-tool list (the same one claude's
+    // settings pre-allow is generated from — the two vendors' ask modes
+    // cannot drift); auto pre-approves the whole chimaera server. Workers
+    // (mastermind: None) keep every prompt.
+    if recipe.kind == AgentKind::Codex {
+        spec.mcp_auto_approve =
+            recipe
+                .mastermind
+                .map(|mode| chimaera_agent::driver::McpAutoApprove {
+                    server: "chimaera".to_string(),
+                    tools: match mode {
+                        crate::workspaces::MastermindMode::Ask => Some(
+                            crate::mcp::MASTERMIND_READ_TOOLS
+                                .iter()
+                                .map(|t| t.to_string())
+                                .collect(),
+                        ),
+                        crate::workspaces::MastermindMode::Auto => None,
+                    },
+                });
+    }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
     // the driver's tested pin. `None` when the probe failed — the harness then
@@ -1755,7 +1786,7 @@ pub(crate) async fn resurrect_chat(
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
         prelude: None,
-        mastermind: mastermind_mode.is_some(),
+        mastermind: mastermind_mode,
     };
     match spawn_chat_session(state, entry.id.clone(), recipe, None) {
         Ok(_) => {

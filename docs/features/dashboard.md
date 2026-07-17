@@ -121,10 +121,14 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   - **Ask first vs auto** is worn on the chip: ask-first means acting on the workspace
     raises the agent's own permission prompt (reads never ask); auto acts without asking,
     every act audited. The gating rides the agent's native harness, set at spawn.
-  - **Claude-only in v1**: codex shows in the setup card but disabled, wearing the
-    server's refusal verbatim (no per-tool permission gate for MCP calls, so ask-first
-    can't be enforced) — the same 400 the daemon would return. PUT errors (the 409
-    missing-binary conflict included) surface inline in the server's own words.
+  - **Claude or codex.** Both enforce the mode through their own harness: claude via
+    the generated settings' pre-allows; codex via the driver answering its MCP
+    tool-call elicitations from the recorded mode (its app-server elicits every MCP
+    call regardless of approval-mode config — live-probed, PROTOCOL.md Pass 16 — so
+    the pre-allow answers at the prompt). Both gates generate from the one shared
+    read-tool list, so ask-mode semantics are identical: reads silent, acts prompt.
+    A mode switch keeps the bound agent. PUT errors (the 409 missing-binary conflict
+    included) surface inline in the server's own words.
   - **Reactive-only**: nothing in the UI ever triggers a Mastermind turn — no briefing
     prompt on setup, no event-nudged sends. It speaks when the user types.
   - **The observer, not the observed**: session rows flagged `mastermind: true` are
@@ -171,6 +175,19 @@ the binding, the mode, and the pre-allow; the `⋯` mode switch to auto (re-PUT,
 carrying the injected MCP URL, listing and calling `chimaera.list_terminals` with its
 approval answered from chimaera (post-fix — see PROTOCOL.md Pass 15); blank-state
 `+ mastermind`; hidden-from-roster across rail/roster/home rollups; light + dark.
+
+**Verified live (2026-07-16, codex-as-Mastermind, billed):** the setup card appointing
+a **codex** Mastermind through the UI; ask mode — `workspace_status` running with zero
+prompts (three separate turns) while `spawn_terminal` raised the native permission card
+inline in the dock and ran on Allow (terminal in the roster); auto mode — both tools
+unprompted, `tracing` audit lines for each act; the role prompt via
+`-c developer_instructions` ("I'm the workspace Mastermind, overseeing and delegating
+work"); a daemon restart resurrecting the codex Mastermind with binding, mode, and
+driver pre-approval intact; retire → setup card → re-appoint through the card. The
+gating mechanism (driver-answered elicitations) exists because codex's app-server
+elicits every MCP tool call regardless of approval-mode config — five live probes,
+recorded in PROTOCOL.md Pass 16. `chat-smoke` after the driver change: 16/16 (one
+claude-side flake passed alone).
 
 **Not exercised live yet:** the compute chip against a real Slurm scheduler (it reuses
 `ComputeStrip`'s exact parsing; needs a Sherlock pass); the output-only TUI now-line

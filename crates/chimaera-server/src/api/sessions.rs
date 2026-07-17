@@ -382,7 +382,9 @@ async fn spawn_chat_ui(
         rollback_turns: None,
         theme: theme.to_string(),
         prelude: body.prelude.clone().filter(|p| !p.trim().is_empty()),
-        mastermind: false,
+        // A resumed recent is never the Mastermind: retiring one clears the
+        // binding and skips Recents, so there is no binding to resolve here.
+        mastermind: None,
     };
 
     // A resumed recent replays no history over the wire — seed the new journal

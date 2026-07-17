@@ -710,13 +710,43 @@ pub(crate) fn build_chat_command(
 /// as TOML, so the URL is embedded in TOML quotes (never relying on the
 /// raw-string fallback). `mcp_url` None spawns bare (no AgentRecord key to
 /// authorize the endpoint).
-pub(crate) fn build_codex_chat_command(bin: &Path, mcp_url: Option<&str>) -> Vec<String> {
+///
+/// `mastermind` adds ONLY the role prompt via `developer_instructions` (a
+/// plain config string, live-verified to reach every turn; the driver's
+/// `thread/start` sends only `{cwd}`, so nothing overrides it). The mode's
+/// harness gating deliberately does NOT ride argv: codex's MCP
+/// approval-mode config (`default_tools_approval_mode`, per-tool
+/// `approval_mode` — mined enum `auto | prompt | writes | approve`) parses
+/// but is IGNORED by the app-server, which elicits every MCP tool call
+/// regardless (live-probed, PROTOCOL.md Pass 16) — so the gate is the
+/// driver's `SpawnSpec.mcp_auto_approve` answering the elicitations
+/// (`chat::spawn_chat_session` sets it from the same shared read-tool list
+/// claude's settings pre-allow uses).
+pub(crate) fn build_codex_chat_command(
+    bin: &Path,
+    mcp_url: Option<&str>,
+    mastermind: Option<crate::workspaces::MastermindMode>,
+) -> Vec<String> {
     let mut cmd = vec![bin.to_string_lossy().into_owned(), "app-server".to_string()];
     if let Some(url) = mcp_url {
         cmd.push("-c".to_string());
         cmd.push(format!("mcp_servers.chimaera.url=\"{url}\""));
     }
+    if mastermind.is_some() {
+        cmd.push("-c".to_string());
+        cmd.push(format!(
+            "developer_instructions=\"{}\"",
+            toml_basic_string(MASTERMIND_SYSTEM_PROMPT)
+        ));
+    }
     cmd
+}
+
+/// Escape a string for embedding in TOML basic-string quotes (`-c key="…"`).
+/// The prompt is a compile-time constant without quotes or backslashes
+/// today; this keeps a future edit from silently breaking the config parse.
+fn toml_basic_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Wrap an agent argv in the user's login shell so the TUI gets the same
@@ -1354,11 +1384,11 @@ mod tests {
     /// the pre-injection spawn.
     #[test]
     fn build_codex_chat_command_injects_mcp_url() {
-        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None);
+        let bare = build_codex_chat_command(Path::new("/usr/bin/codex"), None, None);
         assert_eq!(bare, ["/usr/bin/codex", "app-server"]);
 
         let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d?key=abc";
-        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url));
+        let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), None);
         assert_eq!(
             cmd,
             [
@@ -1368,6 +1398,41 @@ mod tests {
                 "mcp_servers.chimaera.url=\"http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d?key=abc\"",
             ]
         );
+    }
+
+    /// A codex Mastermind's argv carries ONLY the role prompt on top of the
+    /// MCP injection — `developer_instructions`, live-verified to reach the
+    /// model. Approval-mode config keys are deliberately absent: the
+    /// app-server ignores them and elicits every MCP call (Pass 16); the
+    /// mode gate is the driver's `SpawnSpec.mcp_auto_approve`.
+    #[test]
+    fn build_codex_chat_command_mastermind_carries_only_the_role_prompt() {
+        let url = "http://127.0.0.1:4200/api/v1/mcp/s-1a2b3c4d?key=abc";
+        for mode in [
+            crate::workspaces::MastermindMode::Ask,
+            crate::workspaces::MastermindMode::Auto,
+        ] {
+            let cmd = build_codex_chat_command(Path::new("/usr/bin/codex"), Some(url), Some(mode));
+            assert_eq!(
+                cmd,
+                [
+                    "/usr/bin/codex".to_string(),
+                    "app-server".into(),
+                    "-c".into(),
+                    format!("mcp_servers.chimaera.url=\"{url}\""),
+                    "-c".into(),
+                    format!("developer_instructions=\"{MASTERMIND_SYSTEM_PROMPT}\""),
+                ]
+            );
+        }
+
+        // The prompt embeds in TOML quotes verbatim only while it stays free
+        // of quotes/backslashes; toml_basic_string covers a future edit.
+        assert_eq!(
+            toml_basic_string(MASTERMIND_SYSTEM_PROMPT),
+            MASTERMIND_SYSTEM_PROMPT
+        );
+        assert_eq!(toml_basic_string(r#"a "b" \c"#), r#"a \"b\" \\c"#);
     }
 
     /// The well-known fallback covers the official installers' targets — most
