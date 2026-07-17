@@ -89,13 +89,15 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     (zeroed under reduced motion); a card crossing between the lane and the roster is an
     add+remove across two lists, so that boundary cuts — fine, since it marks an
     attention-state change worth noticing.
-  - **Unread output**: an agent that finishes a turn (or a hook-less TUI that goes quiet
-    after streaming) while it is NOT the focused session earns a faint fg-toned "unread"
-    mark — worn on the roster card, the rail row, and the focus-strip chip
-    (`workspace/unread.svelte.ts`). It is per-window and in-memory ("unread" is about
-    this viewer's eyes, not daemon state); focusing the session clears it. The mark is
-    deliberately never a state color — the state dot owns state; this only whispers
-    "worth a look".
+  - **Unread output**: an agent whose whole turn has FINISHED (the main turn handed the
+    floor back AND no subagents are still on the wire) while it is NOT the focused session
+    earns an "unread" highlight — a soft accent left-bar + faint tint + bolder name on the
+    roster card, and a matching accent left-bar on the rail row / focus-strip chip
+    (`workspace/unread.svelte.ts`). It is deliberately NOT triggered by mid-turn output: a
+    paused stream (a hook-less TUI thinking, a gap between tool calls) is still "working",
+    so a genuinely busy session never wears the mark. Per-window and in-memory ("unread"
+    is about this viewer's eyes, not daemon state); focusing the session clears it. Never
+    a state color — the state dot owns state; the highlight only says "new".
   - **Bounded rich detail**: warm chat stores are acquired for attention-lane chat
     sessions always, plus running chats up to a small cap (`RICH_CAP = 4`), so the
     dashboard can never churn the chat pool's LRU out from under open tabs; released on
