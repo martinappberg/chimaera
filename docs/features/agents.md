@@ -130,6 +130,12 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   needs_permission | idle_prompt | errored feeds the home-screen amber rollup. Chimaera owns renaming for **all** session kinds (only claude has an
   in-TUI `/rename`); the pin outranks every derived name on every surface. Kill drops the row locally
   even if the DELETE fails (already-gone/unreachable). Rail rows are drag sources.
+- **Agent status line (chat sessions).** When claude emits a `post_turn_summary` (its own post-turn
+  "where things stand" one-liner, e.g. "workflow launched, 2 agents spawning"), the driver maps it
+  to a latest-wins `SessionStatus` event: the chat row's second line shows the line (`status_detail`
+  on the row JSON), and a summary flagged `needs_action` lands the amber `idle_prompt` attention
+  state. Emission is conditional and CLI-version-dependent (see `chimaera-agent/PROTOCOL.md`
+  Pass 15) — the surface is dormant when the CLI stays quiet. TUI rows never carry it.
 
 ## Attention hooks (claude TUI)
 

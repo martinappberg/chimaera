@@ -236,9 +236,12 @@ async fn post_turn_summary_folds_latest_wins_session_status() {
     let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
     let mut rx = att.live;
 
-    for expected in [
-        "turn 1 reviewed, awaiting your look",
-        "turn 2 reviewed, awaiting your look",
+    // The fake's first summary carries the live-observed EMPTY needs_action
+    // string (= nothing needed); the second a non-empty one — both
+    // truthiness mappings covered.
+    for (expected, expect_action) in [
+        ("turn 1 reviewed, awaiting your look", false),
+        ("turn 2 reviewed, awaiting your look", true),
     ] {
         send_text(&fx, "s-st", "run it").await;
         let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
@@ -279,14 +282,14 @@ async fn post_turn_summary_folds_latest_wins_session_status() {
             } => {
                 assert_eq!(category.as_deref(), Some("review_ready"));
                 assert_eq!(detail, expected);
-                assert!(needs_action, "scripted summary flags the user");
+                assert_eq!(*needs_action, expect_action, "string truthiness maps");
             }
             _ => unreachable!(),
         }
         let info = fx.manager.get("s-st").expect("info");
         assert_eq!(info.status_detail.as_deref(), Some(expected));
         assert_eq!(info.status_category.as_deref(), Some("review_ready"));
-        assert!(info.status_needs_action);
+        assert_eq!(info.status_needs_action, expect_action);
     }
 
     // A new turn means the user acted: the flag clears, the line stays.

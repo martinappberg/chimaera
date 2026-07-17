@@ -40,8 +40,9 @@ use crate::model::{
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-07-15).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.207";
+/// CLI version these frame shapes were verified against (2026-07-16,
+/// full chat-smoke).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.211";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -957,23 +958,31 @@ impl ClaudeMapper {
                 }
             }
             // Post-turn status line `{status_category, status_detail,
-            // needs_action, summarizes_uuid}` (2.1.207+; fires after each
-            // result) — the session's own "where things stand" one-liner.
-            // Mapped latest-wins; `summarizes_uuid` is dropped (nothing here
-            // keys transcript blocks by uuid). A detail-less frame carries
-            // nothing a rail could show, so it maps to nothing.
+            // needs_action, summarizes_uuid}` (2.1.207+) — the session's own
+            // "where things stand" one-liner. Live it follows the result of
+            // workflow-lifecycle turns ONLY (plain echo/tool turns emit
+            // none). Mapped latest-wins; `summarizes_uuid` is dropped
+            // (nothing here keys transcript blocks by uuid). A detail-less
+            // frame carries nothing a rail could show, so it maps to nothing.
             Some("post_turn_summary") => {
                 let detail = frame["status_detail"].as_str().unwrap_or_default().trim();
                 if detail.is_empty() {
                     return;
                 }
+                // `needs_action` rides as a STRING on the live wire (empty =
+                // nothing needed); tolerate a bool spelling too.
+                let needs_action = match &frame["needs_action"] {
+                    Value::Bool(b) => *b,
+                    Value::String(s) => !s.trim().is_empty(),
+                    _ => false,
+                };
                 step.events.push(AgentEvent::SessionStatus {
                     category: frame["status_category"]
                         .as_str()
                         .filter(|c| !c.is_empty())
                         .map(|c| truncate_label(c, STATUS_DETAIL_MAX)),
                     detail: truncate_label(detail, STATUS_DETAIL_MAX),
-                    needs_action: frame["needs_action"].as_bool().unwrap_or(false),
+                    needs_action,
                 });
             }
             // Background-lane status patch: `{task_id, patch:{status,

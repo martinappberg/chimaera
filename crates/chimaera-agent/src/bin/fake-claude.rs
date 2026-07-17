@@ -332,10 +332,13 @@ fn finish_turn(allowed: bool) {
             "total_cost_usd": 0.01, "duration_ms": 42,
             "usage": { "input_tokens": 10, "output_tokens": 5 },
         }));
-        // Post-turn status line, AFTER the result — the live 2.1.207 order.
-        // The counter makes each turn's summary distinct so latest-wins
-        // folds are assertable; summarizes_uuid mirrors the live shape and
-        // must be dropped by the driver.
+        // Post-turn status line, AFTER the result — the live order (real
+        // CLIs emit it on workflow-lifecycle turns). The counter makes each
+        // turn's summary distinct so latest-wins folds are assertable;
+        // `needs_action` is a STRING on the live wire (empty = nothing
+        // needed) — the first turn's is empty, later ones non-empty, so both
+        // truthiness mappings get exercised; summarizes_uuid mirrors the
+        // live shape and must be dropped by the driver.
         use std::sync::atomic::{AtomicU32, Ordering};
         static TURNS: AtomicU32 = AtomicU32::new(0);
         let n = TURNS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -345,7 +348,7 @@ fn finish_turn(allowed: bool) {
             "summarizes_uuid": "uuid-m1",
             "status_category": "review_ready",
             "status_detail": format!("turn {n} reviewed, awaiting your look"),
-            "needs_action": true,
+            "needs_action": if n == 1 { "" } else { "review the workflow output" },
         }));
     } else {
         // The driver's deny sends `interrupt:true`, which ABORTS the turn on

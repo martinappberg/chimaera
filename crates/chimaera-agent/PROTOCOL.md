@@ -76,8 +76,9 @@ extension either), `channel_enable`, `apply_flag_settings`, `reload_skills`,
   ThinkingTokens, throttled to every ~256 tokens, and the status row shows
   "thinking · ~N tokens"), `system/status` `{status}` (seen at turn start,
   value semantics unprobed), `system/post_turn_summary` (`status_category`,
-  `needs_action`, `status_detail`, `summarizes_uuid`) — unmapped; the
-  extension ignores it too.
+  `needs_action`, `status_detail`, `summarizes_uuid`) — ADOPTED pass 15
+  (mapped to `SessionStatus`, latest-wins), but emission is CONDITIONAL:
+  see pass 15 for what actually fires it.
 - Never attach two live processes to one native session id (transcripts
   interleave); the view toggle serializes on the chimaera session id.
 
@@ -512,7 +513,8 @@ file list is therefore honest about exactly what will revert.
   flags are `--max-thinking-tokens 31999 [--thinking-display summarized]` or
   `--thinking disabled`; mid-session = `set_max_thinking_tokens`.
 - `post_turn_summary` is UNUSED by the extension (routed, never consumed) —
-  not mapped here either.
+  chimaera maps it anyway (`SessionStatus`, latest-wins; pass 15): the
+  rail's status line + attention flag.
 
 ### Codex: adopted wire facts
 
@@ -1194,3 +1196,42 @@ e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
 `cancel_queued_after_delivery_is_a_reducer_noop_tombstone`; reducer vitest
 covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
 untouched. `just chat-smoke` re-run for the driver change.
+
+## Pass 15 (2026-07-16 — post_turn_summary → SessionStatus). ADOPTED.
+
+`system/post_turn_summary {summarizes_uuid, status_category, status_detail,
+needs_action}` — the CLI's own post-turn one-liner about where the session
+stands. Mapped to the additive `SessionStatus {category, detail,
+needs_action}` event, folded LATEST-WINS into `ChatInfo`
+(`status_detail`/`status_category`/`status_needs_action`; the flag clears on
+`TurnStarted`, the line stays as context) and onto the session rows — the
+rail's second line, and `needs_action` lands the `idle_prompt` attention
+state on top of TurnCompleted's `finished` (the frame follows the `result`).
+`summarizes_uuid` is dropped (nothing keys transcript blocks by uuid).
+
+Wire facts (live 2026-07-16):
+
+- **`needs_action` is a STRING, not a bool** — captured frames carry
+  `"needs_action": ""` (empty = nothing needed). The driver maps truthiness
+  (non-empty string, or a literal bool `true` if the CLI ever switches);
+  non-empty value semantics beyond truthiness are unprobed.
+- **Emission is CONDITIONAL and version-unstable.** On 2.1.207 it fired
+  after workflow-lifecycle turns (launch: "workflow 'probe' launched, 2
+  agents spawning"; completion: "workflow completed: …", both
+  `status_category: "review_ready"`). On 2.1.211 it was NOT emitted for
+  ANY probed turn — bare echo, Write-tool, background-Bash, or a full
+  Workflow launch+completion (driven live through the daemon). Treat the
+  frame as opportunistic: the mapping is additive and dormant when absent;
+  nothing may depend on it arriving.
+- The vsix routes the subtype but never consumes it — no client-side
+  capability gates it, so its 2.1.211 silence looks like a server/CLI-side
+  gate, not a missing initialize flag.
+
+Tests: hermetic `post_turn_summary_folds_latest_wins_session_status`
+(fake-claude emits the summary after each successful result — empty then
+non-empty `needs_action`, distinct details for the latest-wins assert; the
+TurnStarted clear is asserted too). The live echo test listens 5s
+post-result and pins the shape IF a frame shows up — its absence is the
+expected outcome on 2.1.211 and is printed, not failed. Full
+`just chat-smoke` re-run against 2.1.211 (16/16) and the pin bumped
+2.1.207 → 2.1.211.
