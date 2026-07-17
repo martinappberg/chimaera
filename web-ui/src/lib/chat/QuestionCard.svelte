@@ -24,7 +24,7 @@
 
   const readOnly = $derived(answered !== null);
   let remainingMs = $state<number | null>(null);
-  const expired = $derived(remainingMs !== null && remainingMs <= 0);
+  const deadlinePassed = $derived(remainingMs !== null && remainingMs <= 0);
   const countdown = $derived(
     remainingMs === null ? null : Math.max(0, Math.ceil(remainingMs / 1000)),
   );
@@ -95,10 +95,9 @@
   }
 
   const complete = $derived(
-    !expired &&
-      request.questions.every(
+    request.questions.every(
       (_q, qi) => (picked[qi] ?? []).length > 0 || (other[qi] ?? "").trim().length > 0,
-      ),
+    ),
   );
 
   function submit() {
@@ -177,7 +176,6 @@
               class:on={(picked[qi] ?? []).includes(oi)}
               title={opt.description}
               aria-pressed={(picked[qi] ?? []).includes(oi)}
-              disabled={expired}
               onclick={() => toggle(qi, oi, q.multiSelect)}
             >
               {opt.label}
@@ -187,7 +185,6 @@
         <input
           class="q-other"
           placeholder="other…"
-          disabled={expired}
           bind:value={other[qi]}
           onkeydown={(e) => {
             if (e.key === "Enter" && complete) {
@@ -200,8 +197,8 @@
     {/each}
     <div class="q-actions">
       {#if countdown !== null}
-        <span class="deadline" class:expired aria-live="polite">
-          {expired ? "skipping…" : `skips in ${countdown}s`}
+        <span class="deadline" class:passed={deadlinePassed} aria-live="polite">
+          {deadlinePassed ? "auto-skip pending…" : `skips in ${countdown}s`}
         </span>
       {/if}
       <button class="opt primary" disabled={!complete} onclick={submit}>answer</button>
@@ -268,10 +265,6 @@
   }
   .q-opt:hover {
     border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
-  }
-  .q-opt:disabled {
-    cursor: default;
-    opacity: 0.55;
   }
   .q-opt.on {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
@@ -369,7 +362,7 @@
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
   }
-  .deadline.expired {
+  .deadline.passed {
     color: var(--warn);
   }
   /* The answer button is the shared .opt.primary (app.css). */

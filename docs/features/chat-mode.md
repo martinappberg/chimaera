@@ -200,10 +200,12 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
-  A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, disables at
-  expiry, then auto-skips at the driver deadline (empty answers — the official client's behavior)
-  with a visible "question timed out" notice. The journal stores the absolute deadline so reconnect
-  and replay do not restart the clock; claude's question timeouts run CLI-side.
+  A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips
+  at the driver deadline (empty answers — the official client's behavior) with a visible "question
+  timed out" notice. The countdown is presentation-only and never disables an answer: browser and
+  remote-daemon wall clocks can differ, so only the driver's monotonic deadline and resulting
+  `QuestionResolved` close the card. The journal stores the absolute deadline so reconnect and replay
+  do not restart the clock; claude's question timeouts run CLI-side.
 - **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
   `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
   commands `permission` (optional `destination`, `feedback`) / `answer` / `stop_task`; events
