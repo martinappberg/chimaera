@@ -329,6 +329,20 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     if let Some(next) = next {
         record.state = next;
     }
+    // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
+    // fire during claude chat sessions (the files_touched channel) and
+    // populate now_line/subagents on the record, but the clearing Stop hook
+    // reliably misses under -p stream-json — chat rows hide the staleness
+    // behind explicit nulls, and a later chat→terminal toggle would then
+    // serialize hours-old subagents as live. The protocol is authoritative
+    // in chat mode, so its turn end is the honest clear point.
+    if matches!(
+        ev,
+        AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. }
+    ) {
+        record.now_line = None;
+        record.subagents.clear();
+    }
     // First prompt from the protocol input: the UserPromptSubmit hook does
     // not fire under -p stream-json, so this is the chat path for every
     // agent (a hook duplicate would be a no-op — first write wins).
@@ -1443,7 +1457,8 @@ pub(crate) async fn spawn_fresh_chat(
     let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
         let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
             .then_some(spec.theme.as_str());
-        let user_statusline = crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+        let user_statusline =
+            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &workspace.root);
         let s = crate::agents::write_settings(
             &id,
             &key,
@@ -1579,10 +1594,12 @@ pub(crate) fn spawn_chat_session(
             // codex 0.144.2): the key comes from the AgentRecord every spawn
             // path inserts BEFORE this runs; a missing record spawns bare
             // rather than failing (the endpoint would refuse a wrong key
-            // anyway).
+            // anyway). The URL is SECRET-FREE — argv is world-readable in
+            // /proc on shared login nodes, so the key rides the spawn env
+            // (below) and codex sends it as a bearer header.
             let mcp_url = crate::lock(&state.agents)
                 .get(&id)
-                .map(|r| crate::agents::mcp_url(&id, &r.key, state.port));
+                .map(|_| crate::agents::mcp_url_bare(&id, state.port));
             (
                 crate::launcher::build_codex_chat_command(
                     &recipe.bin,
@@ -1611,6 +1628,15 @@ pub(crate) fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
+    // The codex MCP key rides the env, never argv (see mcp_url_bare): the
+    // record is re-read here rather than threaded — the spawn paths insert
+    // it before this runs, matching the mcp_url lookup above.
+    if recipe.kind == AgentKind::Codex {
+        if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
+            spec.env
+                .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key));
+        }
+    }
     // The codex Mastermind's harness gating: its app-server elicits EVERY
     // MCP tool call (approval-mode config is parsed but ignored on that
     // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded
@@ -1716,7 +1742,8 @@ pub(crate) async fn resurrect_chat(
     let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
         let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
             .then_some(entry.theme.as_str());
-        let user_statusline = crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+        let user_statusline =
+            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &root);
         let s = crate::agents::write_settings(
             &entry.id,
             &key,

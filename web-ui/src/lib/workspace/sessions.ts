@@ -14,7 +14,7 @@ export interface Workspace {
    * the ask/auto gating mode its act tools were spawned with. Absent when
    * none is configured (and on old daemons). Exactly one per workspace.
    */
-  mastermind?: { session_id: string; mode: "ask" | "auto" };
+  mastermind?: { session_id: string; mode: "ask" | "auto"; agent?: string };
 }
 
 export type SessionKind = "shell" | "agent";
@@ -148,6 +148,16 @@ export function displayName(s: Session): string {
 }
 
 /** True when the session is waiting on the user (drives the aggregate count). */
+/**
+ * The workspace Mastermind is the observer, not the observed: every roster
+ * surface (rail, dashboard roster/lane, home rollups, quick-open) filters
+ * flagged rows through THIS predicate — one point of change, so a new
+ * surface can't forget the rule and a richer flag never needs a hunt.
+ */
+export function isMastermind(s: Session): boolean {
+  return s.mastermind === true;
+}
+
 export function needsAttention(s: Session): boolean {
   return (
     s.agent_state === "needs_permission" ||

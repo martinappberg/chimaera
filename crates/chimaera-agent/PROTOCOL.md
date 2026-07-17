@@ -1484,3 +1484,23 @@ messages). Mined-frame test `mcp_elicitation_pre_approval_gates_by_tool_list`;
 live: ask-mode reads ran silent, `spawn_terminal` surfaced the native card
 in the dock and ran on Allow, auto mode ran both unprompted. `just
 chat-smoke` re-run after the driver change: 16/16.
+
+### Pass 16 addendum (2026-07-17, review hardening — live-verified)
+
+- **`mcp_servers.<s>.bearer_token_env_var` IS honored by the app-server**
+  (unlike the approval-mode keys): configured via `-c` with a secret-free
+  `url`, codex read the env var and sent `Authorization: Bearer <key>` — the
+  daemon's `/mcp/{id}` accepted it and `list_terminals` returned real
+  content. This is now how every codex chat spawn carries the per-session
+  key (argv is world-readable in /proc on shared login nodes; the env is
+  owner-only). Claude keeps key-in-URL inside its 0600 `--mcp-config`.
+- The pre-approval tool-name parse is now anchored to the EXACT pinned
+  message shape (`Allow the {server} MCP server to run tool "{name}"?`,
+  name `[A-Za-z0-9_-]+`): the earlier last-quoted-span parse was injectable
+  (a requested name `x" run tool "read_session` would have matched the
+  allow list). Parse failure under a matching consent tracing-warns —
+  pinned-shape drift is diagnosable, not a silent ask-mode degrade.
+- The elicitation arm's `input_preview.params` is now capped via the shared
+  `model::cap_preview` (promoted from claude.rs — driver symmetry): any
+  configured MCP server reaches that arm, and an uncapped `tool_params`
+  would ride the journal/ring whole.

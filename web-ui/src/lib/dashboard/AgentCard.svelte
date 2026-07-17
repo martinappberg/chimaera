@@ -14,11 +14,12 @@
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import WorkTray from "../shared/WorkTray.svelte";
   import WorkTrayRow from "../shared/WorkTrayRow.svelte";
+  import { basename } from "../previews/files";
   import { formatElapsedSeconds } from "../shared/time";
   import { relativeAge } from "../workspace/launcher";
   import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
-  import { provenanceOf, provenanceTitle } from "./dash";
+  import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
 
   interface Props {
     session: Session;
@@ -54,25 +55,27 @@
 
   /** One honest line about what the session is doing right now. */
   const nowLine = $derived.by(() => {
+    // Dead first: a SIGKILLed TUI fires no clearing hook, so the record can
+    // carry a stale present-tense now_line until the watcher retires the
+    // row — "exited" must win over every activity line.
+    if (!session.alive) return "exited";
     if (store !== null) {
       const act = store.activity;
       if (act !== null && act.detail !== "") return act.detail;
       if (act !== null) return act.kind;
       const step = store.plan.find((p) => p.status === "in_progress");
       if (step !== undefined) return step.content;
-      const lastMsg = [...store.blocks].reverse().find((b) => b.kind === "message");
+      const lastMsg = store.blocks.findLast((b) => b.kind === "message");
       if (lastMsg !== undefined) return lastMsg.text.slice(0, 160);
     }
     // The wire now_line (a claude TUI's latest-hook summary) beats the
     // files_touched fallback — fresher and more specific ("ran Bash" vs the
-    // last write); the daemon clears it on exit, so a dead card falls
-    // through honestly.
+    // last write).
     if (session.now_line != null && session.now_line !== "") return session.now_line;
     // Hook-level fallback: the last file the agent wrote.
     if (prov === "hooks" && touched.length > 0) {
       return `edited ${basename(touched[touched.length - 1])}`;
     }
-    if (!session.alive) return "exited";
     if (prov === "none") {
       // Output recency is the only honest signal for unintegrated TUIs
       // (dotTitle's working/quiet vocabulary); absent = an old daemon, so
@@ -155,13 +158,7 @@
     return b.content?.kind === "output" ? (b.content.text ?? "").trim() : "";
   }
 
-  function basename(p: string): string {
-    const i = p.lastIndexOf("/");
-    return i >= 0 ? p.slice(i + 1) : p;
-  }
-  function relPath(p: string): string {
-    return wsRoot !== null && p.startsWith(`${wsRoot}/`) ? p.slice(wsRoot.length + 1) : p;
-  }
+  const relPath = (p: string): string => sharedRelPath(wsRoot, p);
 
   const planEntries = $derived(hero && store !== null ? store.plan.slice(0, 6) : []);
   /** Context meter: the warm store's live figure first, else the claude-TUI
@@ -236,7 +233,7 @@
       class="now stalled"
       title="the agent reports running but its terminal has been silent — it may be stuck"
     >
-      stalled — no output for 3+ min
+      stalled — terminal output has gone quiet
     </div>
   {:else if !compact && nowLine !== null}
     <div class="now" title={nowLine}>{nowLine}</div>

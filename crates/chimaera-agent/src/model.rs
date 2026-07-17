@@ -809,6 +809,26 @@ pub fn truncate_label(text: &str, max: usize) -> String {
     format!("{}…", &text[..floor_char_boundary(text, max)])
 }
 
+/// Cap every string leaf of a permission/approval input preview so a giant
+/// payload can't bloat the journaled/replayed event. Structure is preserved
+/// (the UI renders specific fields); only oversized leaves are
+/// head/tail-truncated. Shared by both drivers (the symmetry invariant):
+/// claude's Write/Edit inputs and codex's MCP elicitation tool_params are
+/// the same attack surface.
+pub fn cap_preview(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(cap_output(s).0),
+        Value::Array(arr) => Value::Array(arr.iter().map(cap_preview).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), cap_preview(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub fn cap_head_tail(text: &str, head: usize, tail: usize) -> (String, bool) {
     if text.len() <= head + tail {
         return (text.to_string(), false);

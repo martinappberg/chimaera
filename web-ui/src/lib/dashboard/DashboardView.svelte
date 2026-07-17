@@ -31,9 +31,10 @@
     isBusy,
     needsAttention,
     type Session,
+    isMastermind,
   } from "../workspace/sessions";
   import type { LayoutCtrl } from "../layout/dnd";
-  import { rosterWeight, type DashCtx } from "./dash";
+  import { rosterWeight, type DashCtx , relPath as sharedRelPath} from "./dash";
 
   interface Props {
     dash: DashCtx;
@@ -52,7 +53,7 @@
   // The Mastermind never joins the roster it observes (its flagged row lives
   // on the dock alone) — same filter App's wsSessions applies for the rail.
   const wsSessions = $derived(
-    [...sessions.values()].filter((s) => s.workspace_id === wsId && s.mastermind !== true),
+    [...sessions.values()].filter((s) => s.workspace_id === wsId && !isMastermind(s)),
   );
   const agents = $derived(wsSessions.filter((s) => s.kind === "agent"));
   const shells = $derived(wsSessions.filter((s) => s.kind !== "agent"));
@@ -138,14 +139,19 @@
 
   // --- bounded rich detail (warm chat stores) -----------------------------------
   //
-  // Attention-lane chat sessions are always acquired — their permission cards
-  // answer inline over the live socket. Beyond those, running chat sessions
-  // get rich detail only while the total stays small (RICH_CAP), so the
-  // dashboard can never churn the chat pool's LRU out from under open tabs.
+  // Attention-lane chat sessions are acquired first — their permission cards
+  // answer inline over the live socket — then running chat sessions top up,
+  // all under one shared cap. The pool refcounts holds (LRU never evicts a
+  // held entry), so the cap here bounds how many sockets the dashboard adds,
+  // not correctness; a lane past the cap still renders from wire state.
   const RICH_CAP = 4;
+  const RICH_LANE_MAX = 8;
   const richIds = $derived.by(() => {
     const out: string[] = [];
-    for (const s of lane) if (s.ui === "chat") out.push(s.id);
+    for (const s of lane) {
+      if (out.length >= RICH_LANE_MAX) break;
+      if (s.ui === "chat") out.push(s.id);
+    }
     for (const s of roster) {
       if (out.length >= RICH_CAP) break;
       if (s.ui === "chat" && s.alive) out.push(s.id);
@@ -287,9 +293,7 @@
     return out.slice(0, 10);
   });
 
-  function relPath(p: string): string {
-    return wsRoot !== null && p.startsWith(`${wsRoot}/`) ? p.slice(wsRoot.length + 1) : p;
-  }
+  const relPath = (p: string): string => sharedRelPath(wsRoot, p);
 
   const dirtyCount = $derived($gitStatus?.entries.length ?? 0);
 </script>

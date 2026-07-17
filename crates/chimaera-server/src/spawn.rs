@@ -136,8 +136,10 @@ pub(crate) async fn spawn_session(
                 let settings_theme =
                     (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
                         .then_some(spec.theme.as_str());
-                let user_statusline =
-                    crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+                let user_statusline = crate::runtimes::claude_statusline_config(
+                    &state.claude_settings_path,
+                    &workspace.root,
+                );
                 // PTY TUI spawns are never the Mastermind (a chat-only role),
                 // so no permissions block rides these settings.
                 match crate::agents::write_settings(

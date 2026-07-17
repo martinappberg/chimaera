@@ -28,6 +28,10 @@ interface ChatEntry {
    *  here, NOT in the reducer, so the elapsed-turn counter survives a remount
    *  (a tab switch mid-turn) without ever leaking a clock into journal replay. */
   turnStart: number | null;
+  /** Outstanding acquireChat holds (mounted ChatViews, dashboard rich cards).
+   *  LRU eviction only ever touches entries at zero — disposing a held
+   *  entry's socket would silently kill a mounted view's event stream. */
+  refs: number;
   lastUsed: number;
 }
 
@@ -75,6 +79,7 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
       scrollTop: 0,
       atBottom: true,
       turnStart: null,
+      refs: 0,
       lastUsed: ++tick,
     };
     pool.set(sessionId, entry);
@@ -86,29 +91,26 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
   } else {
     entry.lastUsed = ++tick;
   }
+  entry.refs += 1;
   return { store: entry.store, socket: entry.socket };
 }
 
-/**
- * The warm store for `sessionId` if one exists, WITHOUT creating a socket or
- * touching LRU order. The dashboard reads through this so a roster card can
- * show live chat detail for sessions that are already warm (an open tab, an
- * answered permission) without spending pool slots on every card.
- */
-export function peekChat(sessionId: string): ChatStore | null {
-  return pool.get(sessionId)?.store ?? null;
-}
-
-/** Release the entry back to the pool, keeping it warm (the socket stays
- *  open). Evicts the least-recently-used warm entries past the cap. */
+/** Release one hold on the entry, keeping it warm (the socket stays open).
+ *  Evicts the least-recently-used PARKED entries (refs === 0) past the cap —
+ *  never a held one, so the pool may transiently exceed the cap while more
+ *  than POOL_CAP views hold entries at once (dashboard lane + open tabs). */
 export function releaseChat(sessionId: string): void {
   const entry = pool.get(sessionId);
-  if (entry !== undefined) entry.lastUsed = ++tick;
-  // Evict beyond the cap, oldest first (never below the cap).
+  if (entry !== undefined) {
+    entry.refs = Math.max(0, entry.refs - 1);
+    entry.lastUsed = ++tick;
+  }
   if (pool.size > POOL_CAP) {
-    const byAge = [...pool.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-    for (const [id] of byAge.slice(0, pool.size - POOL_CAP)) {
-      if (id !== sessionId) disposeChat(id);
+    const parked = [...pool.entries()]
+      .filter(([, e]) => e.refs === 0)
+      .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    for (const [id] of parked.slice(0, Math.min(parked.length, pool.size - POOL_CAP))) {
+      disposeChat(id);
     }
   }
 }

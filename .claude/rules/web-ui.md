@@ -15,8 +15,8 @@ tree + view-state) · **`previews/`** (the file-preview surfaces + their loaders
 **`terminal/`** (the PTY stack: xterm, pool, socket, links) · **`workspace/`** (workbench
 domain surfaces + their stores: files tree, git, sessions, launcher, home) · **`shared/`**
 (cross-cutting leaf primitives: icons + glyphs, keys/keybindings, reference/provenance). The
-`chat/` and `settings/` subsystems keep their own folders (+ maps). `App.svelte` stays at
-`src/`.
+`chat/`, `settings/`, and `dashboard/` subsystems keep their own folders (+ maps).
+`App.svelte` stays at `src/`.
 
 - **There are no JS tests** — only `svelte-check` (types) + the live preview. So a UI
   change is only "verified" once you've driven it in the preview (see **verify-app** /

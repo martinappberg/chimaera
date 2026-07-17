@@ -31,6 +31,7 @@
     type AgentSpawn,
     type Session,
     type Workspace,
+    isMastermind,
   } from "./lib/workspace/sessions";
   import {
     getAgentDefault,
@@ -194,6 +195,7 @@
     getSetting,
     loadSettings,
     setSetting,
+    settingsLoaded,
   } from "./lib/settings/store.svelte";
   import type { DashCtx } from "./lib/dashboard/dash";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
@@ -469,7 +471,7 @@
   // quick-open, and reference targets all derive from here. Lookups by id
   // (sessionsById, the pools' keep-alive sync) stay on the unfiltered list.
   const wsSessions = $derived(
-    sessions.filter((s) => s.workspace_id === activeWsId && s.mastermind !== true),
+    sessions.filter((s) => s.workspace_id === activeWsId && !isMastermind(s)),
   );
 
   /** How this window is named in the shell's tray window-list: the workspace
@@ -765,7 +767,10 @@
     events.watch(activeWsId);
     refreshWorkspaces();
     void bootViewState();
-    void loadSettings();
+    // Re-run the landing one-shot once settings settle: the sessions
+    // snapshot may have arrived first, and pruneAndAutoOpen gates on
+    // settingsLoaded() so an explicit landing choice is never raced.
+    void loadSettings().then(pruneAndAutoOpen);
     void refreshAgents();
 
     // Native menu items the shell forwards to the focused window. Cmd+W
@@ -1438,7 +1443,13 @@
     // a rendered markdown document), so browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
-      if (step !== null) {
+      // The dashboard owns the base-modifier Digit0 chord (the advertised
+      // ⌘0 / Ctrl+Shift+0): a font RESET here would swallow it on every
+      // terminal/markdown pane — the most common focus state. Font reset
+      // keeps its other spellings (⌘Numpad0; plain Ctrl+0 on non-mac,
+      // where the dashboard chord carries Shift).
+      const dashboardChord = step === 0 && chordDigit(e, modifierSetting()) === 0;
+      if (step !== null && !dashboardChord) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
         const sizable =
@@ -1830,7 +1841,13 @@
       else live.add(id);
     }
     layout = pruneSessions(layout, live);
-    if (!autoOpened) {
+    // The one-shot waits for the settings to actually load: getSetting
+    // returns the schema default ("auto") until GET /settings resolves, and
+    // the REST fallback poll can deliver sessions first — latching here on
+    // the default would override an explicit "never". loadSettings flips
+    // loaded even on failure (defaults then genuinely apply) and re-calls
+    // this, so the gate can never wedge the landing.
+    if (!autoOpened && settingsLoaded()) {
       autoOpened = true;
       if (tabCount(layout) === 0) {
         // An empty layout lands on the dashboard — the workspace overview —
@@ -2971,7 +2988,7 @@
          worker: keep it out of the per-workspace live/attention rollups. -->
     <HomeScreen
       {workspaces}
-      sessions={sessions.filter((s) => s.mastermind !== true)}
+      sessions={sessions.filter((s) => !isMastermind(s))}
       hostLabel={getHostLabel()}
       {health}
       connected={eventsUp}

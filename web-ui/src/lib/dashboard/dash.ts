@@ -68,3 +68,8 @@ export function rosterWeight(s: Session): number {
   if (s.agent_state === "finished") return 4;
   return 3; // unknown / starting
 }
+
+/** Workspace-relative display path (verbatim when outside the root). */
+export function relPath(wsRoot: string | null, p: string): string {
+  return wsRoot !== null && p.startsWith(`${wsRoot}/`) ? p.slice(wsRoot.length + 1) : p;
+}

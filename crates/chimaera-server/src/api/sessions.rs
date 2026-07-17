@@ -315,7 +315,8 @@ async fn spawn_chat_ui(
     let settings = if agent_kind == crate::agents::AgentKind::Claude {
         let settings_theme =
             (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path)).then_some(theme);
-        let user_statusline = crate::runtimes::claude_user_statusline(&state.claude_settings_path);
+        let user_statusline =
+            crate::runtimes::claude_statusline_config(&state.claude_settings_path, &workspace.root);
         match crate::agents::write_settings(
             &id,
             &key,

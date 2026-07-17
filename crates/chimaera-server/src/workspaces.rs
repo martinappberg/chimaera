@@ -25,6 +25,13 @@ pub(crate) enum MastermindMode {
 pub(crate) struct MastermindCfg {
     pub(crate) session_id: String,
     pub(crate) mode: MastermindMode,
+    /// The agent CLI behind the binding ("claude"/"codex"). Additive (empty
+    /// for pre-upgrade records): the UI's mode-switch re-PUT must know the
+    /// bound vendor even when the roster row is momentarily absent — the
+    /// gone state, a restart gap — or a fallback guess would silently
+    /// rotate a codex Mastermind into a claude one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) agent: String,
 }
 
 /// A registered workspace: a canonicalized directory the user opened.
@@ -232,6 +239,7 @@ mod tests {
         let cfg = MastermindCfg {
             session_id: "s-mm000001".to_string(),
             mode: MastermindMode::Auto,
+            agent: "claude".to_string(),
         };
         let updated = store.set_mastermind(&ws.id, Some(cfg)).unwrap();
         assert_eq!(

@@ -87,10 +87,10 @@ async fn put_mastermind_validates_and_rolls_back() {
         );
     }
 
-    // Codex is ACCEPTED (its MCP approval config enforces the mode — the
-    // per-tool prompt is an elicitation): with no codex binary preset the
-    // request clears validation and fails at the spawn with an honest 409,
-    // never the old 400 refusal.
+    // Codex is ACCEPTED (the driver enforces the mode by answering its
+    // per-tool MCP elicitations — SpawnSpec.mcp_auto_approve): with no
+    // codex binary preset the request clears validation and fails at the
+    // pre-retire detect with an honest 409, never the old 400 refusal.
     preset_agent(
         &state,
         agents::AgentKind::Codex,
@@ -244,6 +244,7 @@ fn bind_as_mastermind(state: &Arc<AppState>, ws: &str, sid: &str) {
         Some(workspaces::MastermindCfg {
             session_id: sid.to_string(),
             mode: workspaces::MastermindMode::Ask,
+            agent: "claude".to_string(),
         }),
     );
 }

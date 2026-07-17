@@ -425,7 +425,11 @@ export const PINNED = {
   reference: isMac ? "⇧⌘R" : "Ctrl+Shift+R",
   fontPlus: isMac ? "⌘+" : "Ctrl++",
   fontMinus: isMac ? "⌘−" : "Ctrl+-",
-  fontReset: isMac ? "⌘0" : "Ctrl+0",
+  // The base-modifier Digit0 belongs to the dashboard (App.svelte's chord
+  // handler yields it); reset keeps the spellings the dashboard chord
+  // doesn't claim — the numpad zero on mac, plain Ctrl+0 elsewhere (the
+  // non-mac dashboard chord carries Shift).
+  fontReset: isMac ? "⌘Num0" : "Ctrl+0",
 } as const;
 
 /**

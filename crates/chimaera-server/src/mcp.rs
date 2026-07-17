@@ -70,16 +70,31 @@ const MESSAGE_TEXT_MAX: usize = 16 * 1024;
 
 /// The read-only tools an ask-mode Mastermind may call without prompting —
 /// the SHARED list both harness gates are generated from (claude:
-/// `permissions.allow` in the settings file; codex: per-tool
-/// `approval_mode="auto"` config overrides). One list so the two vendors'
-/// ask modes can't drift; everything not on it prompts, including any tool
-/// added later.
+/// `permissions.allow` in the settings file; codex: the driver's
+/// `SpawnSpec.mcp_auto_approve` answering its tool-call elicitations —
+/// codex's approval-mode config is parsed but ignored on the app-server
+/// surface, PROTOCOL.md Pass 16). One list so the two vendors' ask modes
+/// can't drift; everything not on it prompts, including any tool added
+/// later.
 pub(crate) const MASTERMIND_READ_TOOLS: [&str; 5] = [
     "workspace_status",
     "read_session",
     "list_changed_files",
     "list_terminals",
     "read_terminal",
+];
+
+/// Every Mastermind-tier tool name — the dispatch gate's single source, so
+/// adding a tool means extending THIS list + `mastermind_tool_defs` (a
+/// mismatch fails closed as "unknown tool", never as an open gate).
+const MASTERMIND_TOOL_NAMES: [&str; 7] = [
+    "workspace_status",
+    "read_session",
+    "list_changed_files",
+    "spawn_agent",
+    "spawn_terminal",
+    "message_agent",
+    "interrupt_agent",
 ];
 
 /// Instructions injected into the agent's context at initialize.
@@ -117,14 +132,23 @@ pub(crate) struct McpQuery {
     key: String,
 }
 
-/// POST /api/v1/mcp/{agent_id}?key={secret} — the MCP endpoint.
+/// POST /api/v1/mcp/{agent_id}?key={secret} — the MCP endpoint. The session
+/// key may ride the query (claude's `--mcp-config` URL, 0600 on disk) or an
+/// `Authorization: Bearer` header (codex's `bearer_token_env_var` — the URL
+/// then stays secret-free, because codex receives it via argv, which is
+/// world-readable in /proc on the shared login nodes this daemon targets).
 pub(crate) async fn mcp(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
     Query(query): Query<McpQuery>,
+    headers: axum::http::HeaderMap,
     Json(message): Json<Value>,
 ) -> Response {
     {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
         let agents = crate::lock(&state.agents);
         let Some(record) = agents.get(&agent_id) else {
             return (
@@ -133,7 +157,9 @@ pub(crate) async fn mcp(
             )
                 .into_response();
         };
-        if record.key != query.key {
+        let query_ok = !query.key.is_empty() && record.key == query.key;
+        let bearer_ok = bearer.is_some_and(|b| record.key == b);
+        if !query_ok && !bearer_ok {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "bad key"}))).into_response();
         }
     }
@@ -429,24 +455,26 @@ async fn tools_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    // The Mastermind tier gate mirrors tools/list, but a caller can name a
+    // tool it was never offered — enforce here too, once, ahead of the flat
+    // dispatch (one shared list; a tool missing from a match arm fails
+    // closed as "unknown tool", never as an open gate).
+    if MASTERMIND_TOOL_NAMES.contains(&name) && !mastermind {
+        return Err((
+            -32602,
+            format!(
+                "{name} belongs to the workspace Mastermind, and this session \
+                 is not it. Ask the user to appoint one from the workspace \
+                 dashboard, or to ask the Mastermind on your behalf."
+            ),
+        ));
+    }
     match name {
         "list_terminals" => Ok(list_terminals(state, agent_id)),
         "run_in_terminal" => Ok(run_in_terminal(state, agent_id, &args).await),
         "read_terminal" => Ok(read_terminal(state, agent_id, &args)),
-        // The Mastermind tier. The gate mirrors tools/list, but a caller can
-        // name a tool it was never offered — enforce here too.
         "workspace_status" | "read_session" | "list_changed_files" | "spawn_agent"
         | "spawn_terminal" | "message_agent" | "interrupt_agent" => {
-            if !mastermind {
-                return Err((
-                    -32602,
-                    format!(
-                        "{name} belongs to the workspace Mastermind, and this session \
-                         is not it. Ask the user to appoint one from the workspace \
-                         dashboard, or to ask the Mastermind on your behalf."
-                    ),
-                ));
-            }
             let Some(workspace) = workspace_of(state, agent_id) else {
                 return Err((-32602, "this session has no workspace".to_string()));
             };
@@ -467,14 +495,9 @@ async fn tools_call(
 
 // ---- The Mastermind tier -------------------------------------------------
 
-/// Truncate to at most `chars` characters on a char boundary, marking the cut.
-fn head(text: &str, chars: usize) -> String {
-    let mut out: String = text.chars().take(chars).collect();
-    if text.chars().nth(chars).is_some() {
-        out.push('…');
-    }
-    out
-}
+/// One-line truncation with an ellipsis: the agent crate's own label capper
+/// (byte-budgeted, char-boundary safe) — not a second local truncator.
+use chimaera_agent::model::truncate_label as head;
 
 /// The target session id from `args`, scoped to the Mastermind's workspace.
 /// Errors are model-facing text (tool_error), not JSON-RPC failures.
@@ -733,6 +756,49 @@ fn spawn_ceiling_error(live: usize) -> Value {
     ))
 }
 
+/// A reserved slot under the spawn ceiling. The ceiling check runs long
+/// before the spawned session reaches a registry (binary detect, settings
+/// writes, the process spawn — all awaits), so parallel tool calls would
+/// each pass a bare check and blow through the wall together. The
+/// reservation counts in-flight spawns per workspace under one lock:
+/// live + reserved is the number the ceiling gates, and Drop releases the
+/// slot on every path (success, spawn failure, panic).
+struct SpawnReservation {
+    state: Arc<AppState>,
+    workspace_id: String,
+}
+
+impl SpawnReservation {
+    /// Reserve a slot, or return the (live + reserved) count that hit the
+    /// ceiling. The live count is read inside the reservation lock so two
+    /// racers serialize on it.
+    fn acquire(state: &Arc<AppState>, workspace_id: &str) -> Result<Self, usize> {
+        let mut map = crate::lock(&state.spawn_reservations);
+        let reserved = map.get(workspace_id).copied().unwrap_or(0);
+        let live = live_workspace_sessions(state, workspace_id);
+        if live + reserved >= MASTERMIND_SPAWN_CEILING {
+            return Err(live + reserved);
+        }
+        *map.entry(workspace_id.to_string()).or_insert(0) += 1;
+        Ok(Self {
+            state: state.clone(),
+            workspace_id: workspace_id.to_string(),
+        })
+    }
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        let mut map = crate::lock(&self.state.spawn_reservations);
+        if let Some(n) = map.get_mut(&self.workspace_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.workspace_id);
+            }
+        }
+    }
+}
+
 /// Theme for Mastermind-spawned sessions: the user's persisted
 /// `appearance.theme` when it names a concrete scheme (an MCP caller has no
 /// client theme to ride); "system"/unset falls back to dark.
@@ -781,10 +847,12 @@ async fn spawn_agent(
         .and_then(|n| n.as_str())
         .map(|n| head(n.trim(), 200))
         .filter(|n| !n.is_empty());
-    let live = live_workspace_sessions(state, &workspace.id);
-    if live >= MASTERMIND_SPAWN_CEILING {
-        return spawn_ceiling_error(live);
-    }
+    // Held across the spawn await: releases only once the session is
+    // registered (or the spawn failed), closing the check-then-act window.
+    let _slot = match SpawnReservation::acquire(state, &workspace.id) {
+        Ok(slot) => slot,
+        Err(at) => return spawn_ceiling_error(at),
+    };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id, agent = %kind.as_str(),
         "mastermind act: spawn_agent");
     match crate::chat::spawn_fresh_chat(
@@ -830,10 +898,10 @@ async fn spawn_terminal(
         .and_then(|n| n.as_str())
         .map(|n| head(n.trim(), 200))
         .filter(|n| !n.is_empty());
-    let live = live_workspace_sessions(state, &workspace.id);
-    if live >= MASTERMIND_SPAWN_CEILING {
-        return spawn_ceiling_error(live);
-    }
+    let _slot = match SpawnReservation::acquire(state, &workspace.id) {
+        Ok(slot) => slot,
+        Err(at) => return spawn_ceiling_error(at),
+    };
     tracing::info!(mastermind = %agent_id, workspace = %workspace.id,
         "mastermind act: spawn_terminal");
     let spec = crate::spawn::SpawnSpec {

@@ -138,11 +138,12 @@ pub(crate) async fn put_mastermind(
         }
     };
     // Claude and codex both enforce the mode through their own harness:
-    // claude via the generated settings' `permissions.allow`, codex via
-    // per-server/per-tool MCP approval config in argv (its per-tool prompt
-    // is an elicitation — the original v1 refusal predated that finding;
-    // see `launcher::build_codex_chat_command`). Other agents have no chat
-    // driver and fail the spawn below with an honest message.
+    // claude via the generated settings' `permissions.allow`, codex via the
+    // driver answering its per-tool MCP elicitations from the recorded mode
+    // (`SpawnSpec.mcp_auto_approve` — codex's approval-mode config is
+    // parsed but ignored on the app-server surface; the original v1 refusal
+    // predated that finding, PROTOCOL.md Pass 16). Other agents have no
+    // chat driver and are refused with an honest message.
     if !matches!(
         kind,
         crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
@@ -171,6 +172,17 @@ pub(crate) async fn put_mastermind(
         }
     };
 
+    // Resolve the one respawn precondition BEFORE retiring anything (the
+    // crate's kill-then-respawn rule): a re-PUT whose new agent binary is
+    // missing must 409 with the old Mastermind — its session, binding, and
+    // conversation — fully intact, not destroy it and roll back to none.
+    // The positive result is cached, so spawn_fresh_chat's own detect below
+    // is nearly free.
+    let detection = crate::launcher::detect(&state, kind, false).await;
+    if let Err(msg) = detection.path {
+        return err(StatusCode::CONFLICT, msg);
+    }
+
     // Exactly one Mastermind per workspace: retire the old binding AND its
     // session before minting the new one (it is mastermind-only, never a
     // roster session).
@@ -190,6 +202,7 @@ pub(crate) async fn put_mastermind(
             Some(crate::workspaces::MastermindCfg {
                 session_id: session_id.clone(),
                 mode,
+                agent: kind.as_str().to_string(),
             }),
         )
         .is_none()
@@ -314,12 +327,35 @@ async fn retire_mastermind_session(state: &Arc<AppState>, session_id: &str) {
 }
 
 /// DELETE /api/v1/workspaces/{id} — unregister a workspace (files untouched).
+/// Takes the Mastermind guard: removing the record deletes the binding, so a
+/// bound Mastermind must be retired WITH it — otherwise the privileged,
+/// role-prompted session keeps running and billing while its flag flips to
+/// null and no surface tracks it — and an unguarded delete could interleave
+/// a PUT's bind→spawn window, minting a Mastermind orphaned from birth.
 pub(crate) async fn delete_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match crate::lock(&state.workspaces).remove(&id) {
+    let Some(_guard) = MastermindSwitchGuard::acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({"error": "a Mastermind change is in flight for this workspace — try again"}),
+            ),
+        )
+            .into_response();
+    };
+    let mastermind = crate::lock(&state.workspaces)
+        .get(&id)
+        .and_then(|w| w.mastermind);
+    // Bind before matching: a lock guard in the scrutinee would live across
+    // the retire await below and un-Send the handler.
+    let removed = crate::lock(&state.workspaces).remove(&id);
+    match removed {
         Ok(true) => {
+            if let Some(cfg) = mastermind {
+                retire_mastermind_session(&state, &cfg.session_id).await;
+            }
             // Its environment prelude goes with it. Explicit-delete only —
             // no boot sweep (see `environment::EnvPreludes`).
             crate::lock(&state.env_preludes).remove_workspace(&id);

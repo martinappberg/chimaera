@@ -635,6 +635,24 @@ pub(crate) fn claude_user_statusline(settings_path: &Path) -> Option<serde_json:
         .cloned()
 }
 
+/// The statusLine claude itself would resolve for a session at
+/// `workspace_root` — highest-precedence first across the levels our
+/// injected `--settings` outranks: project-local, project, then user. The
+/// gate must see all three, or a project-configured statusline is silently
+/// replaced by the wrapper (which renders nothing without a passthrough).
+pub(crate) fn claude_statusline_config(
+    user_settings_path: &Path,
+    workspace_root: &Path,
+) -> Option<serde_json::Value> {
+    [
+        workspace_root.join(".claude/settings.local.json"),
+        workspace_root.join(".claude/settings.json"),
+        user_settings_path.to_path_buf(),
+    ]
+    .iter()
+    .find_map(|p| claude_user_statusline(p))
+}
+
 /// Whether the user's own claude settings file sets a theme — if so,
 /// chimaera respects it and skips injection (fill the gap, never fight an
 /// explicit choice).

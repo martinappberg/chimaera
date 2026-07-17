@@ -18,7 +18,7 @@
 
   interface Props {
     /** The binding from the workspaces wire; null = unconfigured. */
-    cfg: { session_id: string; mode: "ask" | "auto" } | null;
+    cfg: { session_id: string; mode: "ask" | "auto"; agent?: string } | null;
     /** The live roster row for cfg.session_id (null while the map lacks it). */
     session: Session | null;
     wsId: string;
@@ -35,8 +35,9 @@
   /** Setup-card mode choice; ask-first is the default (plan §6). */
   let mode = $state<"ask" | "auto">("ask");
   /** Setup-card agent choice — both chat-driver agents enforce the mode
-   *  through their own harness (claude: settings pre-allows; codex: MCP
-   *  approval config). */
+   *  through their own harness (claude: settings pre-allows; codex: the
+   *  driver answering its MCP tool-call elicitations from the recorded
+   *  mode). */
   let agent = $state<"claude" | "codex">("claude");
   /** A PUT/DELETE is in flight — buttons disable, the chat gap shows busy. */
   let pending = $state(false);
@@ -62,17 +63,29 @@
     ask: "acting on the workspace asks you first — reads never ask",
     auto: "acts without asking; every act is audited",
   };
+  /** The bound vendor, from the binding itself (additive wire field) with
+   *  the roster row as the pre-upgrade fallback — null when neither knows,
+   *  which disables the mode switch rather than guessing. */
+  const boundAgent = $derived(
+    cfg === null ? null : (cfg.agent ?? session?.agent_kind ?? justCreated?.agent_kind ?? null),
+  );
+
   /** PUT the binding (setup start AND mode switch — a mode change is a
    *  re-PUT; the daemon restarts the session with the new gating). A mode
    *  switch keeps the bound agent (never silently rotates a codex
-   *  Mastermind into a claude one); the setup card uses the picker. */
+   *  Mastermind into a claude one — when the vendor is unknowable the
+   *  switch refuses instead of defaulting); the setup card uses the picker. */
   async function appoint(m: "ask" | "auto"): Promise<void> {
     if (pending) return;
+    if (cfg !== null && boundAgent === null) {
+      error = "can't switch mode: the bound agent is unknown — retire and re-appoint instead";
+      confirm = null;
+      return;
+    }
     pending = true;
     error = null;
     confirm = null;
-    const a =
-      cfg !== null ? (session?.agent_kind ?? justCreated?.agent_kind ?? "claude") : agent;
+    const a = cfg !== null ? (boundAgent ?? "claude") : agent;
     try {
       // Theme rides along like POST /sessions so the agent boots matched.
       justCreated = await putMastermind(wsId, { agent: a, mode: m, theme: resolvedTheme() });
@@ -123,7 +136,7 @@
     {#if cfg !== null}
       <BrandMark size={13} title="Mastermind" />
       <span class="title">Mastermind</span>
-      <span class="chip">{session?.agent_kind ?? "claude"}</span>
+      <span class="chip">{boundAgent ?? "…"}</span>
       <span class="chip" title={MODE_HELP[cfg.mode]}>{modeLabel(cfg.mode)}</span>
       <span class="sp"></span>
       <!-- Default node.contains inside-test: the button + its menu stay open.
