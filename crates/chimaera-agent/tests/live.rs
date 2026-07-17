@@ -114,6 +114,41 @@ async fn claude_echo_turn_streams_deltas_and_reports_cost() {
         "result reports real cost"
     );
 
+    // 2.1.207+ MAY follow the result with a `post_turn_summary` status line
+    // (the SessionStatus event's wire source). Live it fires on
+    // workflow-lifecycle turns, NOT on a bare echo turn (verified against
+    // 2.1.211, 2026-07-16) — so listen briefly and pin the shape only if
+    // one shows up; its absence here is the expected outcome.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            println!("post_turn_summary: not emitted after a bare echo turn (expected)");
+            break;
+        }
+        match chat.recv(left).await {
+            Ok(Some(frame))
+                if frame["type"] == "system" && frame["subtype"] == "post_turn_summary" =>
+            {
+                let detail = frame["status_detail"]
+                    .as_str()
+                    .expect("status_detail is a string");
+                assert!(!detail.is_empty(), "status_detail carries a line");
+                println!(
+                    "post_turn_summary: category={} needs_action={} detail={detail:?}",
+                    frame["status_category"], frame["needs_action"]
+                );
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("claude exited right after the result"),
+            Err(_) => {
+                println!("post_turn_summary: not emitted after a bare echo turn (expected)");
+                break;
+            }
+        }
+    }
+
     chat.shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");

@@ -3087,9 +3087,13 @@
                        Shells never do: the name already resolves to the title
                        (program-set) or the cwd (the shell's "user@host:dir"
                        prompt title is dropped server-side). Agents show their
-                       own PTY title as context when it differs from the name. -->
+                       own PTY title as context when it differs from the name;
+                       chat agents (no PTY title) show the agent's own
+                       post-turn status line instead. -->
                   {#if s.kind === "agent" && s.title && s.title !== displayName(s) && s.title !== s.agent_title}
                     <span class="title">{s.title}</span>
+                  {:else if s.kind === "agent" && s.status_detail && s.status_detail !== displayName(s)}
+                    <span class="title" title={s.status_detail}>{s.status_detail}</span>
                   {/if}
                 </span>
               {/if}

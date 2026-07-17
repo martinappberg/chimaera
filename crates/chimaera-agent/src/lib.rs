@@ -62,6 +62,17 @@ pub struct ChatInfo {
     pub model: Option<String>,
     pub current_mode: Option<String>,
     pub pending_permission: bool,
+    /// Latest `SessionStatus` fold (latest-wins): the agent's own post-turn
+    /// status line, `None` until one arrives. Additive wire fields — old
+    /// clients ignore them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_category: Option<String>,
+    /// The latest status flagged "waiting on the user"; cleared when a new
+    /// turn starts (the user acted) so it never badges a running session.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub status_needs_action: bool,
 }
 
 struct ChatSession {
@@ -136,6 +147,9 @@ impl ChatManager {
             model: None,
             current_mode: None,
             pending_permission: false,
+            status_detail: None,
+            status_category: None,
+            status_needs_action: false,
         };
         let session = Arc::new(ChatSession {
             info: Mutex::new(info.clone()),
@@ -243,9 +257,24 @@ impl ChatManager {
                 }
                 AgentEvent::PermissionResolved { .. }
                 | AgentEvent::QuestionResolved { .. }
-                | AgentEvent::TurnStarted { .. }
                 | AgentEvent::TurnCompleted { .. }
                 | AgentEvent::TurnAborted { .. } => info.pending_permission = false,
+                // A new turn also clears the "needs action" flag — the user
+                // acted — while the status LINE stays as context until the
+                // next summary supersedes it (latest-wins).
+                AgentEvent::TurnStarted { .. } => {
+                    info.pending_permission = false;
+                    info.status_needs_action = false;
+                }
+                AgentEvent::SessionStatus {
+                    category,
+                    detail,
+                    needs_action,
+                } => {
+                    info.status_detail = Some(detail.clone());
+                    info.status_category = category.clone();
+                    info.status_needs_action = *needs_action;
+                }
                 AgentEvent::Exited { status } => {
                     info.alive = false;
                     info.exit_status = *status;

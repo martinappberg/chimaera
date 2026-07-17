@@ -223,6 +223,90 @@ async fn full_turn_with_permission_allow_and_gap_replay() {
     assert_eq!(recorded.as_deref(), Some("s-1"));
 }
 
+/// `post_turn_summary` maps to `SessionStatus` and folds latest-wins into
+/// `ChatInfo`: each turn's summary supersedes the last, and a NEW turn
+/// clears the needs-action flag while the status line stays as context.
+#[tokio::test]
+async fn post_turn_summary_folds_latest_wins_session_status() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-st", &fx.cwd, "normal"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-st", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+
+    // The fake's first summary carries the live-observed EMPTY needs_action
+    // string (= nothing needed); the second a non-empty one — both
+    // truthiness mappings covered.
+    for (expected, expect_action) in [
+        ("turn 1 reviewed, awaiting your look", false),
+        ("turn 2 reviewed, awaiting your look", true),
+    ] {
+        send_text(&fx, "s-st", "run it").await;
+        let permission = wait_for(&mut rx, &mut seen, "PermissionRequest", |ev| {
+            matches!(ev, AgentEvent::PermissionRequest { .. })
+        })
+        .await;
+        fx.manager
+            .command(
+                "s-st",
+                AgentCommand::Permission {
+                    request_id: match &permission.ev {
+                        AgentEvent::PermissionRequest { request_id, .. } => request_id.clone(),
+                        _ => unreachable!(),
+                    },
+                    option_id: "allow_once".into(),
+                    destination: None,
+                    feedback: None,
+                },
+            )
+            .await
+            .expect("permission");
+        // The summary rides AFTER the result frame (live order) — the
+        // TurnCompleted-then-SessionStatus sequence consumers rely on to
+        // land attention state on top of the turn's own transition.
+        wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+            matches!(ev, AgentEvent::TurnCompleted { .. })
+        })
+        .await;
+        let status = wait_for(&mut rx, &mut seen, "SessionStatus", |ev| {
+            matches!(ev, AgentEvent::SessionStatus { .. })
+        })
+        .await;
+        match &status.ev {
+            AgentEvent::SessionStatus {
+                category,
+                detail,
+                needs_action,
+            } => {
+                assert_eq!(category.as_deref(), Some("review_ready"));
+                assert_eq!(detail, expected);
+                assert_eq!(*needs_action, expect_action, "string truthiness maps");
+            }
+            _ => unreachable!(),
+        }
+        let info = fx.manager.get("s-st").expect("info");
+        assert_eq!(info.status_detail.as_deref(), Some(expected));
+        assert_eq!(info.status_category.as_deref(), Some("review_ready"));
+        assert_eq!(info.status_needs_action, expect_action);
+    }
+
+    // A new turn means the user acted: the flag clears, the line stays.
+    send_text(&fx, "s-st", "one more").await;
+    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+        matches!(ev, AgentEvent::TurnStarted { .. })
+    })
+    .await;
+    let info = fx.manager.get("s-st").expect("info");
+    assert!(!info.status_needs_action, "TurnStarted clears needs_action");
+    assert_eq!(
+        info.status_detail.as_deref(),
+        Some("turn 2 reviewed, awaiting your look"),
+        "the status line survives as context until superseded"
+    );
+}
+
 #[tokio::test]
 async fn permission_deny_marks_tool_failed() {
     let fx = fixture();

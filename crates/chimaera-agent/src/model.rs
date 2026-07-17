@@ -29,6 +29,8 @@ pub const BG_LABEL_MAX: usize = 200;
 /// Bound for a close's output-file PATH — never ellipsized (a truncated
 /// path is a corrupt path); an oversized one is dropped whole.
 pub const BG_PATH_MAX: usize = 1024;
+/// One-line cap for the `SessionStatus` fields (a status line, not prose).
+pub const STATUS_DETAIL_MAX: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -307,6 +309,23 @@ pub enum AgentEvent {
         tasks: Vec<BackgroundTask>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         closed: Vec<BackgroundTaskClose>,
+    },
+    /// The agent's own post-turn status line for the whole session (claude
+    /// `system/post_turn_summary`; codex has no equivalent frame today) —
+    /// the at-a-glance "where things stand" row for rails and dashboards.
+    /// LATEST-WINS: each event supersedes the previous one, so a consumer
+    /// keeps only the newest and replay's final state is the last event
+    /// seen. Strictly additive: old journals never carry it, old clients
+    /// skip the unknown tag.
+    SessionStatus {
+        /// Machine-readable category, verbatim (`review_ready`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        /// The human-readable one-liner — capped at construction.
+        detail: String,
+        /// The agent flags this status as waiting on the user.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        needs_action: bool,
     },
 }
 

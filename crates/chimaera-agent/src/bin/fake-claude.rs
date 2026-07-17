@@ -2,7 +2,9 @@
 //! and registry tests run hermetically in CI (no network, no auth, no
 //! billing). It speaks just enough of the live-verified protocol: the
 //! initialize handshake, one canned turn with streaming deltas + a Bash
-//! tool_use, a can_use_tool permission round-trip, and result frames.
+//! tool_use, a can_use_tool permission round-trip, and result frames (each
+//! successful turn is followed by a `post_turn_summary` status line — the
+//! live 2.1.207 order).
 //! Back-to-back user frames queue natively (one content-bearing follow-up turn
 //! each, after the running turn's) and an interrupt ends the turn with an
 //! is_error result that drops the queue — mirroring the real CLI. The driver
@@ -329,6 +331,24 @@ fn finish_turn(allowed: bool) {
             "result": "done", "session_id": "fake-native-1",
             "total_cost_usd": 0.01, "duration_ms": 42,
             "usage": { "input_tokens": 10, "output_tokens": 5 },
+        }));
+        // Post-turn status line, AFTER the result — the live order (real
+        // CLIs emit it on workflow-lifecycle turns). The counter makes each
+        // turn's summary distinct so latest-wins folds are assertable;
+        // `needs_action` is a STRING on the live wire (empty = nothing
+        // needed) — the first turn's is empty, later ones non-empty, so both
+        // truthiness mappings get exercised; summarizes_uuid mirrors the
+        // live shape and must be dropped by the driver.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static TURNS: AtomicU32 = AtomicU32::new(0);
+        let n = TURNS.fetch_add(1, Ordering::Relaxed) + 1;
+        emit(json!({
+            "type": "system", "subtype": "post_turn_summary",
+            "session_id": "fake-native-1",
+            "summarizes_uuid": "uuid-m1",
+            "status_category": "review_ready",
+            "status_detail": format!("turn {n} reviewed, awaiting your look"),
+            "needs_action": if n == 1 { "" } else { "review the workflow output" },
         }));
     } else {
         // The driver's deny sends `interrupt:true`, which ABORTS the turn on
