@@ -1405,3 +1405,102 @@ post-result and pins the shape IF a frame shows up — its absence is the
 expected outcome on 2.1.211 and is printed, not failed. Full
 `just chat-smoke` re-run against 2.1.211 (16/16) and the pin bumped
 2.1.207 → 2.1.211.
+## Pass 18 (2026-07-16 — live probe 0.144.2): codex MCP tool-call approvals
+are ELICITATIONS. ADOPTED.
+
+Reachable only once chimaera started injecting `-c mcp_servers.chimaera.url`
+into codex chat spawns (before that, no MCP server ever existed for codex, so
+this path was dead). With approvals on (`on-request`), a codex MCP tool call
+does NOT raise `item/permissions/requestApproval` — it raises a server→client
+request **`mcpServer/elicitation/request`**:
+
+```json
+{"threadId","turnId","serverName":"chimaera","mode":"form",
+ "_meta":{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],
+          "tool_description":"…","tool_params":{},"tool_params_display":[]},
+ "message":"Allow the chimaera MCP server to run tool \"list_terminals\"?",
+ "requestedSchema":{"type":"object","properties":{}}}
+```
+
+The response is the MCP elicitation shape with a REQUIRED `action` —
+**`{"action":"accept","content":{}}` runs the tool; `{"action":"decline"}`
+rejects it** (both live-verified). An approval-style `{"decision":"accept"}`
+fails server-side deserialization (`failed to deserialize
+McpServerElicitationRequestResponse: missing field 'action'` on codex stderr)
+and codex silently resolves the call as "user rejected MCP tool call" — the
+Allow button lies. `_meta.persist` advertises session/always variants;
+`{"action":"accept","content":{"persist":"session"}}` deserializes and runs,
+but whether it actually persists is unverified, so the driver offers only the
+once/decline pair (`codex.rs::on_server_request`, mined-frame test
+`mcp_elicitation_approval_answers_with_action_shape`). The binary also names
+`item/permissions/requestApproval` (`PermissionsRequestApprovalResponse
+{scope, strictAutoReview, …}`) — never observed live for MCP calls; left
+unmapped (falls to the generic approval arm). `just chat-smoke` re-run for
+the driver change: 16/16 (253s), plus the targeted live regression (allow →
+`list_terminals` runs) against a spawned codex chat.
+
+## Pass 19 (2026-07-16 — live probes 0.144.2): the app-server elicits EVERY
+MCP tool call; nothing config-side gates it. ADOPTED (driver pre-approval).
+
+Probed while making codex eligible as the workspace Mastermind (the ask/auto
+harness gating needed a codex-side pre-allow). Every result below is a live
+app-server probe against a real turn calling a chimaera tool:
+
+- **`mcp_servers.<s>.default_tools_approval_mode`** (mined enum `auto |
+  prompt | writes | approve`; upstream PR #17843's precedence is per-tool →
+  server default → `auto`) and **`mcp_servers.<s>.tools.<t>.approval_mode`**
+  both PARSE (bogus values name the enum) but are **ignored by the
+  app-server**: with server-wide `auto`, the elicitation still fired.
+  They appear to govern the TUI only.
+- **`approval_policy = {granular = {sandbox_approval=bool, rules=bool,
+  skill_approval=bool, request_permissions=bool, mcp_elicitations=bool}}`**
+  (the `granular` AskForApproval variant; all five fields required) loads
+  and runs — and `mcp_elicitations=false` still did not suppress the
+  elicitation. Neither did a thread-level `thread/start
+  {approvalPolicy:"never"}`.
+- Conclusion: on the app-server surface, an MCP tool call ALWAYS raises
+  `mcpServer/elicitation/request` toward the client. The native quieting is
+  the `_meta.persist` mechanism (`["session","always"]`), whose accept
+  payload is still unmined here.
+- **`InitializeCapabilities`** is `{experimentalApi, requestAttestation,
+  mcpServerOpenaiFormElicitation, optOutNotificationMethods}` (mined; the
+  form-elicitation capability is untested — the simple accept/decline shape
+  is what we speak).
+- The elicitation params carry NO structured tool name — only `serverName`
+  and the pinned `message` shape `Allow the <server> MCP server to run tool
+  "<tool>"?` (plus `_meta.tool_description/tool_params`). The tool is the
+  last double-quoted span.
+- **`developer_instructions`** (a root config string, `-c` injectable) DOES
+  reach app-server turns — a probe instructed via it echoed the expected
+  ack token in its answer. This carries the Mastermind role prompt.
+
+Adopted design: `SpawnSpec.mcp_auto_approve {server, tools: Option<Vec>}` —
+the embedder's standing consent (the Mastermind's user-picked ask/auto
+mode). The codex driver answers matching tool-call elicitations
+(`codex_approval_kind == "mcp_tool_call"`, same server, tool parsed from the
+message) with the verified `{"action":"accept","content":{}}` and surfaces
+everything else (other servers, genuine form elicitations, unparsable
+messages). Mined-frame test `mcp_elicitation_pre_approval_gates_by_tool_list`;
+live: ask-mode reads ran silent, `spawn_terminal` surfaced the native card
+in the dock and ran on Allow, auto mode ran both unprompted. `just
+chat-smoke` re-run after the driver change: 16/16.
+
+### Pass 19 addendum (2026-07-17, review hardening — live-verified)
+
+- **`mcp_servers.<s>.bearer_token_env_var` IS honored by the app-server**
+  (unlike the approval-mode keys): configured via `-c` with a secret-free
+  `url`, codex read the env var and sent `Authorization: Bearer <key>` — the
+  daemon's `/mcp/{id}` accepted it and `list_terminals` returned real
+  content. This is now how every codex chat spawn carries the per-session
+  key (argv is world-readable in /proc on shared login nodes; the env is
+  owner-only). Claude keeps key-in-URL inside its 0600 `--mcp-config`.
+- The pre-approval tool-name parse is now anchored to the EXACT pinned
+  message shape (`Allow the {server} MCP server to run tool "{name}"?`,
+  name `[A-Za-z0-9_-]+`): the earlier last-quoted-span parse was injectable
+  (a requested name `x" run tool "read_session` would have matched the
+  allow list). Parse failure under a matching consent tracing-warns —
+  pinned-shape drift is diagnosable, not a silent ask-mode degrade.
+- The elicitation arm's `input_preview.params` is now capped via the shared
+  `model::cap_preview` (promoted from claude.rs — driver symmetry): any
+  configured MCP server reaches that arm, and an uncapped `tool_params`
+  would ride the journal/ring whole.

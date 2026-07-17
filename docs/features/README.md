@@ -42,6 +42,7 @@ core; an addition can change when there's a clear improvement. Don't be too stri
 | Page | What it covers |
 |---|---|
 | [workbench.md](workbench.md) | Workspaces, home screen, the pane/tab/split workbench, drag-and-drop, zoom, focus mode, quick-open, folder picker, layout persistence, keybindings |
+| [dashboard.md](dashboard.md) | The workspace dashboard (landing surface): the attention lane with inline permission answering, density-adaptive agent cards with provenance tiers, subagent drop-down, changed-file attribution, recents & git summary |
 | [terminals.md](terminals.md) | Persistent daemon-owned terminals, reconnect/resize/resync, clickable path links, clipboard & provenance, live theming, the exec engine, the command journal |
 | [agents.md](agents.md) | Launching coding agents (real TUI + structured chat), the launcher, managed install/update, agent detection, the session rail & attention state, rename/kill, recents & resume |
 | [chat-mode.md](chat-mode.md) | Structured chat mode (Tier B): the composer, model/effort/mode/thinking/ultracode controls, tool cards, permission & question prompts, rewind, MCP panel, usage, inline artifacts, the seq journal & gap-replay, view-switch |

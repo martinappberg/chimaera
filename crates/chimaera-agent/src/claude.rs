@@ -3040,22 +3040,9 @@ pub(crate) fn tool_result_text(block: &Value) -> String {
     }
 }
 
-/// Cap every string leaf of a permission input so a giant Write/Edit payload
-/// can't bloat the journaled/replayed event. Structure is preserved (the UI
-/// renders specific fields); only oversized leaves are head/tail-truncated.
-/// The verbatim input is kept separately for the allow-response echo.
-fn cap_preview(value: &Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(crate::model::cap_output(s).0),
-        Value::Array(arr) => Value::Array(arr.iter().map(cap_preview).collect()),
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), cap_preview(v)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
+/// The shared preview capper (model.rs) — the verbatim input is kept
+/// separately for the allow-response echo.
+use crate::model::cap_preview;
 
 #[cfg(test)]
 mod tests {

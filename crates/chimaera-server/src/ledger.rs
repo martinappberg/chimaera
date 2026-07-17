@@ -44,6 +44,11 @@ pub(crate) struct LedgerEntry {
     pub(crate) rows: u16,
     /// The scheme the session was themed for at spawn.
     pub(crate) theme: String,
+    /// Original creation time (unix secs), so a resurrected session keeps its
+    /// age across a restart instead of resetting to "now". 0 = unknown (an
+    /// older ledger, or a session that predates the field) — the resurrection
+    /// path then lets the fresh spawn stamp now, as before.
+    pub(crate) created_at: u64,
     /// `None` = plain shell.
     pub(crate) agent: Option<LedgerAgent>,
 }
@@ -95,6 +100,7 @@ impl LedgerEntry {
             "cols": self.cols,
             "rows": self.rows,
             "theme": self.theme,
+            "created_at": self.created_at,
             "agent": self.agent.as_ref().map(|a| json!({
                 "kind": a.kind.as_str(),
                 "resume": a.resume,
@@ -140,6 +146,11 @@ impl LedgerEntry {
                 .and_then(|t| t.as_str())
                 .unwrap_or("dark")
                 .to_string(),
+            // Additive: an older ledger has no "created_at" — 0 means "unknown".
+            created_at: value
+                .get("created_at")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0),
             agent,
         })
     }
@@ -328,6 +339,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                     .get(&info.id)
                     .cloned()
                     .unwrap_or_else(|| "dark".into()),
+                created_at: info.created_at,
                 agent,
             })
         })
@@ -357,6 +369,7 @@ pub(crate) fn snapshot(state: &AppState) -> (Vec<LedgerEntry>, HashMap<String, S
                 cols: 120,
                 rows: 40,
                 theme: themes.get(&c.id).cloned().unwrap_or_else(|| "dark".into()),
+                created_at: c.created_at_ms / 1000,
                 agent: Some(LedgerAgent {
                     kind,
                     resume: c.native_session_id.clone(),
@@ -624,6 +637,7 @@ mod tests {
             cols: 120,
             rows: 40,
             theme: "dark".into(),
+            created_at: 1_700_000_000,
             agent: None,
         }
     }
@@ -758,9 +772,22 @@ mod tests {
         store.write_if_changed(&entries, &links);
 
         let boot = LedgerStore::new(path.clone()).load_boot();
+        // Full-struct equality → created_at (1_700_000_000 on shell_entry)
+        // survived the disk round-trip, so a resurrected session keeps its age.
         assert_eq!(boot.sessions, entries);
         assert_eq!(boot.links.get("s-1").map(String::as_str), Some("s-2"));
         assert!(boot.written_at > 0);
+
+        // Additive: an OLDER ledger with no "created_at" loads as 0 (unknown),
+        // so resurrection falls back to stamping now — never a panic.
+        std::fs::write(
+            &path,
+            r#"{"sessions":[{"id":"s-old","workspace_id":"w1","cwd":"/tmp","cols":80,"rows":24,"theme":"dark","agent":null}],"links":{}}"#,
+        )
+        .unwrap();
+        let old = LedgerStore::new(path.clone()).load_boot();
+        assert_eq!(old.sessions.len(), 1);
+        assert_eq!(old.sessions[0].created_at, 0);
 
         // Unchanged snapshots skip the write (mtime stays put).
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();

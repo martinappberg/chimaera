@@ -82,7 +82,30 @@ pub struct SpawnSpec {
     /// `thread/rollback` right after `thread/resume`. Claude ignores it — its
     /// fork rides argv (`--fork-session --resume-session-at`).
     pub rollback_turns: Option<u32>,
+    /// MCP tool calls the embedder has already consented to: the driver
+    /// answers their approval prompts accept itself instead of surfacing a
+    /// PermissionRequest. Codex-only today — its app-server elicits EVERY
+    /// MCP tool call regardless of approval-mode config (live-probed,
+    /// PROTOCOL.md Pass 19), so a pre-allow must answer at the prompt.
+    /// Claude ignores it (its pre-allows ride the settings file).
+    pub mcp_auto_approve: Option<McpAutoApprove>,
+    /// Original creation time to stamp on the `ChatInfo` (epoch ms), for a
+    /// session being RESURRECTED — so its age survives a daemon restart
+    /// instead of resetting to "now". `None` on a fresh spawn (stamped at
+    /// creation).
+    pub created_at_ms: Option<u64>,
     pub handshake_timeout: Duration,
+}
+
+/// A standing consent for MCP tool calls, scoped to one configured server.
+/// The embedder (chimaera-server) records WHO consented and why — the
+/// Mastermind's user-picked ask/auto mode; drivers only apply it.
+#[derive(Clone, Debug)]
+pub struct McpAutoApprove {
+    /// The configured MCP server name (e.g. "chimaera").
+    pub server: String,
+    /// Pre-approved tool names; `None` pre-approves the whole server.
+    pub tools: Option<Vec<String>>,
 }
 
 impl SpawnSpec {
@@ -96,6 +119,8 @@ impl SpawnSpec {
             pinned_native_id: None,
             agent_version: None,
             rollback_turns: None,
+            mcp_auto_approve: None,
+            created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }

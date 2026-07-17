@@ -621,6 +621,63 @@ pub(crate) fn codex_theme_name(theme: &str) -> &'static str {
     }
 }
 
+/// The user's own `statusLine` config from their claude settings file, if
+/// any — the generated per-session settings wrap it (pipe the same stdin
+/// through, print its output) so injecting the telemetry statusline never
+/// changes what the user's TUI renders. User-level settings only: the same
+/// file the theme gate reads.
+pub(crate) fn claude_user_statusline(settings_path: &Path) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(settings_path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()?
+        .get("statusLine")
+        .filter(|v| !v.is_null())
+        .cloned()
+}
+
+/// The statusLine claude itself would resolve for a session at
+/// `workspace_root` — highest-precedence first across the levels our
+/// injected `--settings` outranks: project-local, project, then user. The
+/// gate must see all three, or a project-configured statusline is silently
+/// replaced by the wrapper (which renders nothing without a passthrough).
+pub(crate) fn claude_statusline_config(
+    user_settings_path: &Path,
+    workspace_root: &Path,
+) -> Option<serde_json::Value> {
+    [
+        workspace_root.join(".claude/settings.local.json"),
+        workspace_root.join(".claude/settings.json"),
+        user_settings_path.to_path_buf(),
+    ]
+    .iter()
+    .find_map(|p| claude_user_statusline(p))
+}
+
+/// The two claude settings gates a chat/TUI spawn needs — theme-set and the
+/// resolved statusline — batched under ONE `spawn_blocking` hop off the async
+/// reactor. Each gate does small synchronous `read_to_string`s
+/// (`claude_user_theme_set` + `claude_statusline_config`), and the spawn
+/// paths that call them run on Tokio workers; on an NFS/Lustre home a slow or
+/// dead mount would otherwise pin a worker mid-spawn (daemon rule: no blocking
+/// fs on the reactor). Returns `(theme_set, statusline)`; a join failure
+/// during runtime shutdown degrades to `(false, None)` — no theme injection,
+/// no statusline passthrough — rather than panicking.
+pub(crate) async fn claude_settings_gates(
+    user_settings_path: &Path,
+    workspace_root: &Path,
+) -> (bool, Option<serde_json::Value>) {
+    let user = user_settings_path.to_path_buf();
+    let root = workspace_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        (
+            claude_user_theme_set(&user),
+            claude_statusline_config(&user, &root),
+        )
+    })
+    .await
+    .unwrap_or((false, None))
+}
+
 /// Whether the user's own claude settings file sets a theme — if so,
 /// chimaera respects it and skips injection (fill the gap, never fight an
 /// explicit choice).
@@ -1435,6 +1492,32 @@ mod tests {
         assert_eq!(codex_theme_name("light"), "catppuccin-latte");
         assert_eq!(codex_theme_name("dark"), "catppuccin-mocha");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The statusline gate reads the same user settings file as the theme
+    /// gate: present objects come back whole (the settings writer wraps
+    /// them), absent/null/garbage read as "none configured".
+    #[test]
+    fn claude_user_statusline_reads_real_files() {
+        let dir = test_dir("statusline-gate");
+        let settings = dir.join("settings.json");
+        assert_eq!(claude_user_statusline(&settings), None); // absent file
+        std::fs::write(&settings, r#"{"theme": "dark"}"#).unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
+        std::fs::write(&settings, r#"{"statusLine": null}"#).unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
+        std::fs::write(
+            &settings,
+            r#"{"statusLine": {"type": "command", "command": "my-status", "padding": 0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_user_statusline(&settings),
+            Some(json!({"type": "command", "command": "my-status", "padding": 0}))
+        );
+        std::fs::write(&settings, "not json").unwrap();
+        assert_eq!(claude_user_statusline(&settings), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

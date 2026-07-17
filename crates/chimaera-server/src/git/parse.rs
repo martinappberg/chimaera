@@ -90,6 +90,14 @@ pub(super) struct StatusData {
     pub(super) truncated: bool,
 }
 
+impl StatusData {
+    /// Workspace-relative changed paths (untracked included — "changed" as
+    /// the panel counts it), for the workspace MCP's compact git facts.
+    pub(super) fn rel_paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.rel.as_str())
+    }
+}
+
 /// One changed path.
 #[derive(Default, Clone)]
 pub(super) struct Entry {

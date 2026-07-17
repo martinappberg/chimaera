@@ -140,7 +140,9 @@ impl ChatManager {
             id: id.clone(),
             agent: adapter.kind().to_string(),
             cwd: spec.cwd.clone(),
-            created_at_ms: now_ms(),
+            // A resurrected session carries its ORIGINAL creation time so its
+            // age survives the restart; a fresh spawn stamps now.
+            created_at_ms: spec.created_at_ms.unwrap_or_else(now_ms),
             alive: true,
             exit_status: None,
             native_session_id: spec.pinned_native_id.clone(),

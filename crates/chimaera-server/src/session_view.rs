@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 
-use crate::agent_state::AgentState;
+use crate::agent_state::{AgentKind, AgentState};
 use crate::AppState;
 
 /// Quiet window after the last PTY output chunk before a hook-less agent TUI
@@ -13,9 +13,16 @@ use crate::AppState;
 /// the dot settles soon after the turn ends. Tuned against a live codex TUI.
 const OUTPUT_ACTIVITY_QUIET: Duration = Duration::from_secs(2);
 
+/// Quiet window after which a claude TUI that CLAIMS to be working (hook
+/// state Running) reads as stalled instead. A working claude TUI repaints
+/// its spinner continuously, so minutes of PTY silence under a Running state
+/// contradict the claim — the one dishonest signal the dashboard must
+/// surface. Wide enough that a long silent tool never trips it by itself.
+const STALL_QUIET: Duration = Duration::from_secs(180);
+
 /// Milliseconds since the Unix epoch (0 if the clock reads before it) —
 /// the same clock the PTY reader stamps `last_output_at` with.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -28,7 +35,10 @@ fn now_ms() -> u64 {
 /// `agent` is the wrapper record for kind "agent" sessions; `None` means a
 /// plain shell. `polled` / `polled_cwd` are the shell naming watcher's
 /// latest values, if any; `cwd_current` falls back to the spawn cwd (agents,
-/// never-polled shells).
+/// never-polled shells). `mastermind` is the additive wire flag: `true` only
+/// when this session is its workspace's bound Mastermind (a chat session
+/// normally, but a degraded/toggled Mastermind can live as a PTY), `null`
+/// otherwise — the UI hides flagged rows from the roster/rail.
 pub(crate) fn session_json(
     info: &chimaera_pty::SessionInfo,
     workspace_id: Option<String>,
@@ -36,6 +46,7 @@ pub(crate) fn session_json(
     polled: Option<&str>,
     polled_cwd: Option<&std::path::Path>,
     exec_stage: Option<chimaera_pty::ExecStage>,
+    mastermind: bool,
 ) -> serde_json::Value {
     let mut map = match serde_json::to_value(info) {
         Ok(serde_json::Value::Object(map)) => map,
@@ -93,6 +104,50 @@ pub(crate) fn session_json(
         "output_active".to_string(),
         output_active.map_or(serde_json::Value::Null, |b| json!(b)),
     );
+    // The inverse liveness check for the HOOKS tier: a live claude TUI whose
+    // record says Running but whose PTY has been silent past STALL_QUIET is
+    // stalled. Boolean only while the claim is checkable (alive, claude,
+    // Running); null elsewhere — chat rows never reach this builder. The
+    // boundary crossing flips without any hook arriving because the events
+    // bus re-runs this builder on its 1s fallback tick (the same mechanism
+    // that lets `output_active` go false when output stops).
+    let stalled = agent
+        .filter(|a| a.kind == AgentKind::Claude && a.state == AgentState::Running && info.alive)
+        .map(|_| now_ms().saturating_sub(info.last_output_at) >= STALL_QUIET.as_millis() as u64);
+    map.insert(
+        "stalled".to_string(),
+        stalled.map_or(serde_json::Value::Null, |b| json!(b)),
+    );
+    // v0.2 status-feed fields, all from the claude TUI hook/statusline ingest
+    // (see agents.rs). Null whenever nothing is known: hook-less TUIs never
+    // set them, and chat rows carry explicit nulls (the chat client derives
+    // richer versions from its journal).
+    map.insert(
+        "subagents".to_string(),
+        agent
+            .filter(|a| !a.subagents.is_empty())
+            .map_or(serde_json::Value::Null, |a| json!(a.subagents)),
+    );
+    map.insert(
+        "now_line".to_string(),
+        agent
+            .and_then(|a| a.now_line.as_deref())
+            .map_or(serde_json::Value::Null, |l| json!(l)),
+    );
+    map.insert(
+        "usage".to_string(),
+        agent
+            .and_then(|a| a.usage.as_ref())
+            .map_or(serde_json::Value::Null, |u| u.to_json()),
+    );
+    map.insert(
+        "mastermind".to_string(),
+        if mastermind {
+            json!(true)
+        } else {
+            serde_json::Value::Null
+        },
+    );
     // Naming rule zero: the most specific thing known about what the session
     // is DOING. A user-pinned name stays authoritative (`renamed` flags the
     // pin for the UI); agents and shells resolve their own chains.
@@ -111,16 +166,26 @@ pub(crate) fn session_json(
 /// The full session list as JSON values (shared by GET /sessions and the
 /// /ws/events snapshots): PTY rows plus synthetic rows for structured chat
 /// sessions, sorted by creation time so the rail interleaves them honestly.
-/// Lock order: session_workspaces -> agents -> display_names ->
+/// Lock order: workspaces (taken and dropped first, for the mastermind
+/// bindings) -> session_workspaces -> agents -> display_names ->
 /// current_cwds -> exec_status.
 pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
     let sessions = state.sessions.list();
     let chats = state.chat.list();
+    // Mastermind bindings (workspace id -> session id), taken — and dropped —
+    // BEFORE the row locks below so the workspace store never nests inside
+    // them. Computed per snapshot, so the flag can't disagree with the store.
+    let masterminds = crate::lock(&state.workspaces).mastermind_bindings();
     let workspaces = crate::lock(&state.session_workspaces);
     let agents = crate::lock(&state.agents);
     let names = crate::lock(&state.display_names);
     let cwds = crate::lock(&state.current_cwds);
     let execs = crate::lock(&state.exec_status);
+    let is_mastermind = |id: &str| {
+        workspaces
+            .get(id)
+            .is_some_and(|ws| masterminds.get(ws).is_some_and(|sid| sid == id))
+    };
     let mut rows: Vec<(u64, serde_json::Value)> = sessions
         .iter()
         .map(|info| {
@@ -131,6 +196,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 names.get(&info.id).map(String::as_str),
                 cwds.get(&info.id).map(PathBuf::as_path),
                 execs.get(&info.id).copied(),
+                is_mastermind(&info.id),
             );
             if let serde_json::Value::Object(map) = &mut row {
                 map.insert("ui".to_string(), json!("term"));
@@ -147,6 +213,7 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 info,
                 workspaces.get(&info.id).cloned(),
                 agents.get(&info.id),
+                is_mastermind(&info.id),
             ),
         )
     }));
@@ -185,6 +252,11 @@ pub(crate) fn sessions_json(state: &AppState) -> Vec<serde_json::Value> {
                 "agent_title": record.title(),
                 "files_touched": record.files_touched,
                 "output_active": null,
+                "stalled": null,
+                "subagents": null,
+                "now_line": null,
+                "usage": null,
+                "mastermind": if is_mastermind(id) { json!(true) } else { json!(null) },
                 "display_name": record.display_name(None),
                 "ui": target,
                 "chat_capable": true,
@@ -225,7 +297,7 @@ mod tests {
     #[test]
     fn output_active_gates_on_unknown_live_agent_rows() {
         let active = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
-            session_json(&info, None, agent, None, None, None)["output_active"].clone()
+            session_json(&info, None, agent, None, None, None, false)["output_active"].clone()
         };
 
         // Shell rows (no agent record): null.
@@ -246,5 +318,93 @@ mod tests {
         let mut running = AgentRecord::new("k".into(), AgentKind::Claude);
         running.state = AgentState::Running;
         assert_eq!(active(info(true, now_ms()), Some(&running)), json!(null));
+    }
+
+    /// `stalled` is part of the wire contract: a boolean only for a LIVE
+    /// claude row (the hooks tier) whose state claims Running — true once
+    /// the PTY has been silent past the stall window, null everywhere the
+    /// claim isn't checkable. Pinned here; the UI has no tests of its own.
+    #[test]
+    fn stalled_gates_on_running_live_claude_rows() {
+        let stalled = |info: chimaera_pty::SessionInfo, agent: Option<&AgentRecord>| {
+            session_json(&info, None, agent, None, None, None, false)["stalled"].clone()
+        };
+        let quiet_ms = now_ms() - STALL_QUIET.as_millis() as u64 - 1_000;
+
+        let mut running = AgentRecord::new("k".into(), AgentKind::Claude);
+        running.state = AgentState::Running;
+        // Running claude TUI: false while output flows, true once silent
+        // past the window.
+        assert_eq!(stalled(info(true, now_ms()), Some(&running)), json!(false));
+        assert_eq!(stalled(info(true, quiet_ms), Some(&running)), json!(true));
+        // Not checkable: shells, dead sessions, non-Running states, and
+        // hook-less kinds (whose Running could only be a stale carry-over).
+        assert_eq!(stalled(info(true, quiet_ms), None), json!(null));
+        assert_eq!(stalled(info(false, quiet_ms), Some(&running)), json!(null));
+        let unknown = AgentRecord::new("k".into(), AgentKind::Claude);
+        assert_eq!(stalled(info(true, quiet_ms), Some(&unknown)), json!(null));
+        let mut codex = AgentRecord::new("k".into(), AgentKind::Codex);
+        codex.state = AgentState::Running;
+        assert_eq!(stalled(info(true, quiet_ms), Some(&codex)), json!(null));
+    }
+
+    /// The v0.2 status-feed fields are part of the wire contract: null when
+    /// nothing is known, and exactly these key names/shapes when the claude
+    /// TUI ingest populated the record.
+    #[test]
+    fn status_feed_fields_ride_agent_rows() {
+        let row = |agent: Option<&AgentRecord>| {
+            session_json(&info(true, now_ms()), None, agent, None, None, None, false)
+        };
+
+        // Nothing known: all three are null (shells and fresh agents alike).
+        let fresh = AgentRecord::new("k".into(), AgentKind::Claude);
+        for key in ["subagents", "now_line", "usage"] {
+            assert_eq!(row(None)[key], json!(null), "{key}");
+            assert_eq!(row(Some(&fresh))[key], json!(null), "{key}");
+        }
+
+        let mut record = AgentRecord::new("k".into(), AgentKind::Claude);
+        record.subagent_started("a1", "Explore", 42);
+        record.now_line = Some("ran Bash".into());
+        record.usage = Some(crate::agent_state::AgentUsage {
+            model: Some("Opus".into()),
+            context_pct: Some(42),
+            cost_cents: Some(12),
+        });
+        let row = row(Some(&record));
+        assert_eq!(
+            row["subagents"],
+            json!([{"id": "a1", "label": "Explore", "started_at": 42}])
+        );
+        assert_eq!(row["now_line"], json!("ran Bash"));
+        assert_eq!(
+            row["usage"],
+            json!({"model": "Opus", "context_pct": 42, "cost_usd": 0.12})
+        );
+    }
+
+    /// `mastermind` is part of the wire contract: `true` only for the
+    /// workspace's bound Mastermind (the UI hides flagged rows from the
+    /// roster/rail), null on every other row — shells included. Pinned here;
+    /// the UI has no tests of its own.
+    #[test]
+    fn mastermind_flag_rides_session_rows() {
+        let record = AgentRecord::new("k".into(), AgentKind::Claude);
+        let row = |agent: Option<&AgentRecord>, mastermind: bool| {
+            session_json(
+                &info(true, now_ms()),
+                None,
+                agent,
+                None,
+                None,
+                None,
+                mastermind,
+            )["mastermind"]
+                .clone()
+        };
+        assert_eq!(row(Some(&record), true), json!(true));
+        assert_eq!(row(Some(&record), false), json!(null));
+        assert_eq!(row(None, false), json!(null));
     }
 }

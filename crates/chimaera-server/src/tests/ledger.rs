@@ -60,6 +60,7 @@ async fn ledger_resurrects_sessions_across_restart() {
         cols: 80,
         rows: 24,
         theme: "dark".to_string(),
+        created_at: 0,
         agent: Some(ledger::LedgerAgent {
             kind: agents::AgentKind::Codex,
             resume: None,
@@ -147,6 +148,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                 cols: 80,
                 rows: 24,
                 theme: "dark".to_string(),
+                created_at: 0,
                 agent: None,
             },
             ledger::LedgerEntry {
@@ -157,6 +159,7 @@ async fn ledger_restore_disabled_still_lands_recents() {
                 cols: 80,
                 rows: 24,
                 theme: "dark".to_string(),
+                created_at: 0,
                 agent: Some(ledger::LedgerAgent {
                     kind: agents::AgentKind::Claude,
                     resume: Some("conv-1".to_string()),

@@ -9,6 +9,12 @@ export interface Workspace {
   name: string;
   /** Unix seconds of the last open/activity; 0/absent on old daemons. */
   last_opened_at?: number;
+  /**
+   * The workspace's Mastermind binding: the privileged chat session's id +
+   * the ask/auto gating mode its act tools were spawned with. Absent when
+   * none is configured (and on old daemons). Exactly one per workspace.
+   */
+  mastermind?: { session_id: string; mode: "ask" | "auto"; agent?: string };
 }
 
 export type SessionKind = "shell" | "agent";
@@ -79,6 +85,41 @@ export interface Session {
    */
   output_active?: boolean | null;
   /**
+   * The inverse liveness check for the hooks tier (claude TUIs): true when
+   * the record claims "running" but the PTY has been silent past the
+   * daemon's stall window (180s) — the state claim is likely stale. Boolean
+   * only while the claim is checkable (a live claude TUI in state
+   * "running"); null elsewhere, absent on old daemons.
+   */
+  stalled?: boolean | null;
+  /**
+   * Live claude-TUI subagents from the SubagentStart/Stop hooks: the
+   * agent's own id + label (canonical, never relabeled) and the daemon's
+   * epoch-ms start stamp. Null (never []) when none, for chat rows (the
+   * chat client derives richer rows from its journal), and for hook-less
+   * TUIs; absent on old daemons.
+   */
+  subagents?: { id: string; label: string; started_at: number }[] | null;
+  /**
+   * One-line latest-hook summary of what a claude TUI just did ("ran Bash",
+   * "editing foo.rs"); replaced per hook, cleared on exit. Null for chat
+   * rows and hook-less TUIs; absent on old daemons.
+   */
+  now_line?: string | null;
+  /**
+   * The claude-TUI statusline heartbeat: model name, context-window use
+   * (whole percent), session cost (dollars, quantized to whole cents). Null
+   * for chat rows and hook-less TUIs; absent on old daemons.
+   */
+  usage?: { model: string | null; context_pct: number | null; cost_usd: number | null } | null;
+  /**
+   * True when this session is a workspace's Mastermind — the observer, not
+   * the observed: the UI keeps flagged rows out of the rail, the dashboard
+   * roster/lane, and every recents-like surface (the dashboard dock is its
+   * one home). Null on ordinary rows; absent on old daemons.
+   */
+  mastermind?: boolean | null;
+  /**
    * Which surface the session's process runs behind: "chat" (structured
    * stream-json driver) or "term" (a PTY). Server truth — the pane renders
    * whichever the daemon says. Optional on old daemons (= "term").
@@ -107,6 +148,16 @@ export function displayName(s: Session): string {
 }
 
 /** True when the session is waiting on the user (drives the aggregate count). */
+/**
+ * The workspace Mastermind is the observer, not the observed: every roster
+ * surface (rail, dashboard roster/lane, home rollups, quick-open) filters
+ * flagged rows through THIS predicate — one point of change, so a new
+ * surface can't forget the rule and a richer flag never needs a hunt.
+ */
+export function isMastermind(s: Session): boolean {
+  return s.mastermind === true;
+}
+
 export function needsAttention(s: Session): boolean {
   return (
     s.agent_state === "needs_permission" ||
@@ -306,6 +357,32 @@ export async function touchWorkspace(id: string): Promise<Workspace> {
 /** Unregister a workspace from the daemon (the folder itself is untouched). */
 export async function deleteWorkspace(id: string): Promise<void> {
   await json<void>(await api(`/workspaces/${id}`, { method: "DELETE" }));
+}
+
+/**
+ * Appoint the workspace's Mastermind: the daemon creates the privileged chat
+ * session AND binds it in one step, retiring any previous one — a mode change
+ * is a re-PUT (a running agent never re-reads its generated settings).
+ * Returns the new session row. Errors carry UI-showable messages: 400 (bad
+ * mode, agent without a chat driver), 409 (agent binary unavailable), 404
+ * (unknown workspace).
+ */
+export async function putMastermind(
+  workspaceId: string,
+  body: { agent: string; mode: "ask" | "auto"; model?: string; theme?: "light" | "dark" },
+): Promise<Session> {
+  return json(
+    await api(`/workspaces/${workspaceId}/mastermind`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** Retire the workspace's Mastermind: unbind + end its session (204). */
+export async function deleteMastermind(workspaceId: string): Promise<void> {
+  await json<void>(await api(`/workspaces/${workspaceId}/mastermind`, { method: "DELETE" }));
 }
 
 export async function listSessions(): Promise<Session[]> {

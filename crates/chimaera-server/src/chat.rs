@@ -68,6 +68,17 @@ pub(crate) struct ChatRecipe {
     /// so a view-switch/rewind/degrade respawn keeps the launch scope; not
     /// in the ledger, so resurrection re-runs the durable scopes only.
     pub(crate) prelude: Option<String>,
+    /// This session is its workspace's bound Mastermind, carrying the mode:
+    /// the claude spawn appends the role prompt (the mode itself rides the
+    /// settings file), the codex spawn needs the mode in argv (approval
+    /// config + role prompt). Respawn paths (view switch, rewind,
+    /// resurrection) resolve it from the workspace store at recipe build —
+    /// the binding, not the recipe, is the source of truth.
+    pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
+    /// Original creation time (epoch ms) for a RESURRECTED session, so its age
+    /// survives a daemon restart instead of resetting to "now". `None` on a
+    /// fresh create / view-switch / rewind — the spawn stamps now.
+    pub(crate) created_at_ms: Option<u64>,
 }
 
 /// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
@@ -321,6 +332,20 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
     };
     if let Some(next) = next {
         record.state = next;
+    }
+    // Turn end clears the hook-fed activity fields. Tool-adjacent hooks DO
+    // fire during claude chat sessions (the files_touched channel) and
+    // populate now_line/subagents on the record, but the clearing Stop hook
+    // reliably misses under -p stream-json — chat rows hide the staleness
+    // behind explicit nulls, and a later chat→terminal toggle would then
+    // serialize hours-old subagents as live. The protocol is authoritative
+    // in chat mode, so its turn end is the honest clear point.
+    if matches!(
+        ev,
+        AgentEvent::TurnCompleted { .. } | AgentEvent::TurnAborted { .. }
+    ) {
+        record.now_line = None;
+        record.subagents.clear();
     }
     // First prompt from the protocol input: the UserPromptSubmit hook does
     // not fire under -p stream-json, so this is the chat path for every
@@ -578,11 +603,14 @@ pub(crate) fn session_alive(state: &AppState, id: &str) -> bool {
 
 /// Synthetic session row for a chat session — same shape as the PTY rows in
 /// `sessions_json` (the client's Session type is one interface), with
-/// `ui:"chat"` marking the surface.
+/// `ui:"chat"` marking the surface. `mastermind` is the additive wire flag:
+/// `true` only for the workspace's bound Mastermind (the UI hides it from
+/// the roster/rail — the observer, not the observed), `null` otherwise.
 pub(crate) fn chat_session_json(
     info: &ChatInfo,
     workspace_id: Option<String>,
     agent: Option<&crate::agent_state::AgentRecord>,
+    mastermind: bool,
 ) -> serde_json::Value {
     let display_name = agent
         .map(|a| a.display_name(None))
@@ -614,6 +642,13 @@ pub(crate) fn chat_session_json(
         // PTY-row signal only (same key; null like any row whose state
         // comes from a better signal).
         "output_active": null,
+        // The v0.2 status-feed fields are hooks/PTY-tier signals: `stalled`
+        // needs a PTY to be silent, and the chat client derives richer
+        // subagents/now-line/usage from its own journal — always null here.
+        "stalled": null,
+        "subagents": null,
+        "now_line": null,
+        "usage": null,
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,
@@ -626,6 +661,7 @@ pub(crate) fn chat_session_json(
         "status_detail": info.status_detail,
         "status_category": info.status_category,
         "status_needs_action": info.status_needs_action,
+        "mastermind": if mastermind { json!(true) } else { serde_json::Value::Null },
     })
 }
 
@@ -1017,6 +1053,10 @@ async fn perform_switch(
     }
     let theme = "dark".to_string(); // scheme re-injection needs a client hint; TUI re-themes on attach
 
+    // The Mastermind mode survives a toggle: the binding (not the old
+    // recipe) is the source of truth, resolved at respawn time.
+    let mastermind = crate::workspaces::workspace_mastermind_mode(state, &workspace_id, id);
+
     // Stop the current process and wait for its slot to free.
     stop_for_respawn(state, id, currently_chat).await?;
 
@@ -1039,6 +1079,19 @@ async fn perform_switch(
         tracing::warn!(%id, %err, "failed to journal the view switch");
     }
 
+    // A concurrent Mastermind retire (DELETE / re-PUT of this workspace's
+    // Mastermind) can land while we were parked in stop_for_respawn or the
+    // marker write above: it tears down the shared AgentRecord and kills the
+    // process. That record is the identity a view switch CARRIES across the
+    // respawn, so its absence here means the session was retired mid-switch —
+    // do NOT resurrect the id (that would leave a live, billing process with
+    // no workspace row). Checked immediately before the respawn, which is the
+    // last await-free point, so no retire can slip between here and the spawn.
+    if crate::lock(&state.agents).get(id).is_none() {
+        tracing::info!(%id, "view switch aborted — session retired mid-switch");
+        return Ok(());
+    }
+
     if target_chat {
         let recipe = ChatRecipe {
             workspace_root: workspace_root.clone(),
@@ -1054,6 +1107,10 @@ async fn perform_switch(
             rollback_turns: None,
             theme: theme.clone(),
             prelude: launch_prelude.clone(),
+            mastermind,
+            // A view switch respawns in place; age isn't preserved across it
+            // today (the ledger path is what fixes resurrection).
+            created_at_ms: None,
         };
         spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
     } else {
@@ -1071,6 +1128,8 @@ async fn perform_switch(
             rollback_turns: None,
             theme,
             prelude: launch_prelude,
+            mastermind,
+            created_at_ms: None,
         };
         degrade_to_pty(state, id, recipe, pinned_name).await;
     }
@@ -1245,6 +1304,15 @@ pub(crate) async fn rewind_session(
         {
             tracing::warn!(%id, %e, "failed to journal the rewind");
         }
+        // A concurrent Mastermind retire can tear down the shared AgentRecord
+        // while we were parked in stop_for_respawn / the journal work above
+        // (see perform_switch): its absence means the session was retired
+        // mid-rewind, so decline to resurrect the id. Last await-free point
+        // before the respawn.
+        if crate::lock(&state.agents).get(&id).is_none() {
+            tracing::info!(%id, "rewind aborted — session retired mid-rewind");
+            return Ok(());
+        }
         let is_codex = record.kind == AgentKind::Codex;
         // A rewind respawns the same session — keep its launch prelude.
         let launch_prelude = crate::lock(&state.chat_recipes)
@@ -1252,6 +1320,9 @@ pub(crate) async fn rewind_session(
             .and_then(|r| r.prelude.clone());
         let recipe = ChatRecipe {
             workspace_root,
+            // A rewound Mastermind keeps its role prompt: resolve the
+            // binding at respawn like the view switch does.
+            mastermind: crate::workspaces::workspace_mastermind_mode(&state, &workspace_id, &id),
             workspace_id,
             kind: record.kind,
             bin,
@@ -1264,6 +1335,7 @@ pub(crate) async fn rewind_session(
             rollback_turns: if is_codex { dropped_turns } else { None },
             theme: "dark".to_string(),
             prelude: launch_prelude,
+            created_at_ms: None,
         };
         spawn_chat_session(&state, id.clone(), recipe, None).map_err(|e| e.to_string())?;
         Ok(())
@@ -1359,6 +1431,143 @@ pub(crate) fn seed_resumed_journal(state: &Arc<AppState>, id: &str, recipe: &Cha
     }
 }
 
+/// A validated fresh chat-session request (no resume — resumed recents keep
+/// their own path in `api::sessions`). Shared by `POST /sessions {ui:"chat"}`,
+/// `PUT /workspaces/{id}/mastermind`, and the Mastermind's `spawn_agent` MCP
+/// tool, so all three ride identical identity plumbing (id, hook key,
+/// settings/mcp files, AgentRecord, workspace mapping, watcher).
+pub(crate) struct FreshChat {
+    /// Session id to use; `None` mints one. The mastermind route pre-mints so
+    /// it can bind BEFORE the spawn (the generated settings must carry the
+    /// mode before the process exists).
+    pub(crate) id: Option<String>,
+    pub(crate) kind: AgentKind,
+    pub(crate) model: Option<String>,
+    /// Pins the row's display name (`custom_title` authority).
+    pub(crate) name: Option<String>,
+    /// Seeds the soft `ai_title` when no name pins the row.
+    pub(crate) title_hint: Option<String>,
+    /// "light" | "dark" (validated by the caller).
+    pub(crate) theme: String,
+    /// Launch-scope environment prelude (see `environment`).
+    pub(crate) prelude: Option<String>,
+    /// `Some(mode)` spawns this session as its workspace's Mastermind: the
+    /// generated settings carry the mode's permission pre-allows and the
+    /// argv appends the role prompt. The caller owns the workspace binding.
+    pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
+}
+
+/// Why a fresh chat spawn could not happen (mirrors `spawn::SpawnFailure`).
+pub(crate) enum ChatSpawnFailure {
+    /// The agent binary is missing/broken (HTTP 409).
+    AgentUnavailable(String),
+    /// Everything else (HTTP 500).
+    Internal(anyhow::Error),
+}
+
+/// Spawn a fresh structured chat session in `workspace`, returning the same
+/// session-row JSON `GET /sessions` lists it with. The caller has validated
+/// the request (chat-capable kind, safe model arg).
+pub(crate) async fn spawn_fresh_chat(
+    state: &Arc<AppState>,
+    workspace: crate::workspaces::Workspace,
+    spec: FreshChat,
+) -> Result<serde_json::Value, ChatSpawnFailure> {
+    let id = spec.id.unwrap_or_else(crate::agents::fresh_session_id);
+    // Take the path AND its probed version from one detection so the chat
+    // driver's version notice reflects the binary it actually spawns.
+    let detection = crate::launcher::detect(state, spec.kind, false).await;
+    let agent_version = detection.version.clone();
+    let bin = match detection.path {
+        Ok(path) => path,
+        Err(msg) => return Err(ChatSpawnFailure::AgentUnavailable(msg)),
+    };
+    let key = crate::agents::fresh_agent_key();
+    // Hook injection + theme (claude-only), unless the user's settings pick a
+    // theme themselves. Codex needs no files — its MCP injection rides argv.
+    let (settings, mcp_config) = if spec.kind == AgentKind::Claude {
+        let (theme_set, user_statusline) =
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &workspace.root)
+                .await;
+        let settings_theme = (!theme_set).then_some(spec.theme.as_str());
+        let s = crate::agents::write_settings(
+            &id,
+            &key,
+            state.port,
+            settings_theme,
+            user_statusline.as_ref(),
+            spec.mastermind,
+        )
+        .map_err(ChatSpawnFailure::Internal)?;
+        let m = crate::agents::write_mcp_config(&id, &key, state.port)
+            .map_err(ChatSpawnFailure::Internal)?;
+        (Some(s), Some(m))
+    } else {
+        (None, None)
+    };
+
+    let mut record = crate::agents::AgentRecord::new(key, spec.kind);
+    // A name supplied at creation pins the row (customTitle authority);
+    // absent one, a title hint seeds the soft ai_title (a later
+    // generate_session_title still refines it).
+    if let Some(name) = spec
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        record.custom_title = Some(name.to_string());
+    }
+    if record.custom_title.is_none() {
+        if let Some(hint) = spec
+            .title_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            record.ai_title = Some(crate::agents::truncate_prompt(hint));
+        }
+    }
+    crate::lock(&state.agents).insert(id.clone(), record.clone());
+    crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
+    let mastermind = spec.mastermind;
+    let recipe = ChatRecipe {
+        workspace_root: workspace.root.clone(),
+        workspace_id: workspace.id.clone(),
+        kind: spec.kind,
+        bin,
+        version: agent_version,
+        settings,
+        mcp_config,
+        model: spec.model,
+        resume: None,
+        fork_at: None,
+        rollback_turns: None,
+        theme: spec.theme,
+        prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
+        mastermind,
+        // Fresh create — the spawn stamps now.
+        created_at_ms: None,
+    };
+    match spawn_chat_session(state, id.clone(), recipe, None) {
+        Ok(info) => {
+            crate::agents::spawn_agent_watch(state.clone(), id.clone());
+            state.changes.notify_waiters();
+            Ok(chat_session_json(
+                &info,
+                Some(workspace.id),
+                Some(&record),
+                mastermind.is_some(),
+            ))
+        }
+        Err(err) => {
+            crate::lock(&state.agents).remove(&id);
+            crate::lock(&state.session_workspaces).remove(&id);
+            Err(ChatSpawnFailure::Internal(err))
+        }
+    }
+}
+
 pub(crate) fn spawn_chat_session(
     state: &Arc<AppState>,
     id: String,
@@ -1396,6 +1605,7 @@ pub(crate) fn spawn_chat_session(
                     recipe.resume.as_deref(),
                     pinned.as_deref(),
                     recipe.fork_at.as_deref(),
+                    recipe.mastermind.is_some(),
                 ),
                 pinned,
             )
@@ -1412,11 +1622,23 @@ pub(crate) fn spawn_chat_session(
             // chat therefore needs a driver change (send `SetModel` right
             // after Init, or thread/start growing a model field) in
             // chimaera-agent — not something the argv can carry.
+            //
+            // Per-session chimaera MCP injection (`-c mcp_servers…`, verified
+            // codex 0.144.2): the key comes from the AgentRecord every spawn
+            // path inserts BEFORE this runs; a missing record spawns bare
+            // rather than failing (the endpoint would refuse a wrong key
+            // anyway). The URL is SECRET-FREE — argv is world-readable in
+            // /proc on shared login nodes, so the key rides the spawn env
+            // (below) and codex sends it as a bearer header.
+            let mcp_url = crate::lock(&state.agents)
+                .get(&id)
+                .map(|_| crate::agents::mcp_url_bare(&id, state.port));
             (
-                vec![
-                    recipe.bin.to_string_lossy().into_owned(),
-                    "app-server".to_string(),
-                ],
+                crate::launcher::build_codex_chat_command(
+                    &recipe.bin,
+                    mcp_url.as_deref(),
+                    recipe.mastermind,
+                ),
                 recipe.resume.clone(),
             )
         }
@@ -1439,6 +1661,40 @@ pub(crate) fn spawn_chat_session(
     // the chat agent it spawns.
     spec.env_remove = crate::api::spawn_env_remove(&spec.env);
     spec.pinned_native_id = pinned;
+    // The codex MCP key rides the env, never argv (see mcp_url_bare): the
+    // record is re-read here rather than threaded — the spawn paths insert
+    // it before this runs, matching the mcp_url lookup above.
+    if recipe.kind == AgentKind::Codex {
+        if let Some(key) = crate::lock(&state.agents).get(&id).map(|r| r.key.clone()) {
+            spec.env
+                .push((crate::launcher::CODEX_MCP_KEY_ENV.to_string(), key));
+        }
+    }
+    // The codex Mastermind's harness gating: its app-server elicits EVERY
+    // MCP tool call (approval-mode config is parsed but ignored on that
+    // surface — live-probed, PROTOCOL.md Pass 16), so the user's recorded
+    // mode is applied by the driver answering those elicitations. Ask
+    // pre-approves exactly the shared read-tool list (the same one claude's
+    // settings pre-allow is generated from — the two vendors' ask modes
+    // cannot drift); auto pre-approves the whole chimaera server. Workers
+    // (mastermind: None) keep every prompt.
+    if recipe.kind == AgentKind::Codex {
+        spec.mcp_auto_approve =
+            recipe
+                .mastermind
+                .map(|mode| chimaera_agent::driver::McpAutoApprove {
+                    server: "chimaera".to_string(),
+                    tools: match mode {
+                        crate::workspaces::MastermindMode::Ask => Some(
+                            crate::mcp::MASTERMIND_READ_TOOLS
+                                .iter()
+                                .map(|t| t.to_string())
+                                .collect(),
+                        ),
+                        crate::workspaces::MastermindMode::Auto => None,
+                    },
+                });
+    }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
     // the driver's tested pin. `None` when the probe failed — the harness then
@@ -1447,6 +1703,9 @@ pub(crate) fn spawn_chat_session(
     // Conversation rewind (codex): the driver rolls the resumed thread back
     // right after thread/resume. Claude's driver ignores it (fork rides argv).
     spec.rollback_turns = recipe.rollback_turns;
+    // Resurrection carries the original creation time so age survives the
+    // restart; every other path leaves it None → the spawn stamps now.
+    spec.created_at_ms = recipe.created_at_ms;
 
     // Resuming a finished conversation mints a NEW chimaera session id, and the
     // agents replay no history over the wire — seed the new journal so attach
@@ -1506,12 +1765,28 @@ pub(crate) async fn resurrect_chat(
 
     // One agent key for both the per-session files and the AgentRecord below.
     let key = crate::agents::fresh_agent_key();
+    // A resurrected Mastermind must come back AS the Mastermind: the mode is
+    // persisted on the Workspace (the binding survives the restart), so the
+    // regenerated settings carry the same harness gating.
+    let mastermind_mode = workspace
+        .mastermind
+        .as_ref()
+        .filter(|m| m.session_id == entry.id)
+        .map(|m| m.mode);
     // Regenerate the per-session hook/mcp files (claude only) against THIS
     // daemon's port — the runtime dir is not durable across a restart.
     let (settings, mcp_config) = if agent.kind == AgentKind::Claude {
-        let settings_theme = (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-            .then_some(entry.theme.as_str());
-        let s = crate::agents::write_settings(&entry.id, &key, state.port, settings_theme)?;
+        let (theme_set, user_statusline) =
+            crate::runtimes::claude_settings_gates(&state.claude_settings_path, &root).await;
+        let settings_theme = (!theme_set).then_some(entry.theme.as_str());
+        let s = crate::agents::write_settings(
+            &entry.id,
+            &key,
+            state.port,
+            settings_theme,
+            user_statusline.as_ref(),
+            mastermind_mode,
+        )?;
         let m = crate::agents::write_mcp_config(&entry.id, &key, state.port)?;
         (Some(s), Some(m))
     } else {
@@ -1554,6 +1829,13 @@ pub(crate) async fn resurrect_chat(
     if record.custom_title.is_none() && agent.title != agent.kind.as_str() {
         record.ai_title = Some(crate::agents::truncate_prompt(&agent.title));
     }
+    // A resurrected process has run NO turn yet — it replays the journal and
+    // sits idle until the user speaks. So its honest state is Finished (idle,
+    // alive), not the `AgentRecord::new` default of Unknown, which the UI
+    // renders as a provisional "starting" dot — a finished session coming
+    // back after a restart must not look like it's booting or (mis)read as
+    // active. The first real turn flips it to Running via `apply_chat_event`.
+    record.state = AgentState::Finished;
     crate::lock(&state.agents).insert(entry.id.clone(), record);
     crate::lock(&state.session_workspaces).insert(entry.id.clone(), workspace.id.clone());
 
@@ -1573,6 +1855,10 @@ pub(crate) async fn resurrect_chat(
         // The ledger doesn't persist launch text: a resurrected session
         // re-runs the durable scopes (host ⊕ workspace) only.
         prelude: None,
+        mastermind: mastermind_mode,
+        // Keep the original age across the restart (0 = an older ledger with
+        // no stamp → let the spawn stamp now, as before).
+        created_at_ms: (entry.created_at > 0).then(|| entry.created_at * 1000),
     };
     match spawn_chat_session(state, entry.id.clone(), recipe, None) {
         Ok(_) => {

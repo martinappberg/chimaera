@@ -425,7 +425,11 @@ export const PINNED = {
   reference: isMac ? "⇧⌘R" : "Ctrl+Shift+R",
   fontPlus: isMac ? "⌘+" : "Ctrl++",
   fontMinus: isMac ? "⌘−" : "Ctrl+-",
-  fontReset: isMac ? "⌘0" : "Ctrl+0",
+  // The base-modifier Digit0 belongs to the dashboard (App.svelte's chord
+  // handler yields it); reset keeps the spellings the dashboard chord
+  // doesn't claim — the numpad zero on mac, plain Ctrl+0 elsewhere (the
+  // non-mac dashboard chord carries Shift).
+  fontReset: isMac ? "⌘Num0" : "Ctrl+0",
 } as const;
 
 /**
@@ -478,15 +482,16 @@ export function fontChord(e: KeyboardEvent): 1 | -1 | 0 | null {
 }
 
 /**
- * Digit 1..9 when the event carries exactly the base modifier (openN is
- * pinned to Mod+1–9; the digit comes from the physical key so Shift-digit
- * symbol layouts don't break it). Null otherwise.
+ * Digit 0..9 when the event carries exactly the base modifier (openN is
+ * pinned to Mod+1–9 and Mod+0 is the workspace dashboard; the digit comes
+ * from the physical key so Shift-digit symbol layouts don't break it).
+ * Null otherwise.
  */
 export function chordDigit(e: KeyboardEvent, setting: ModifierSetting): number | null {
   const m = resolveMod(setting);
   if (e.metaKey !== m.meta || e.ctrlKey !== m.ctrl || e.altKey !== m.alt || e.shiftKey !== m.shift) {
     return null;
   }
-  const match = /^Digit([1-9])$/.exec(e.code);
+  const match = /^Digit([0-9])$/.exec(e.code);
   return match === null ? null : Number.parseInt(match[1], 10);
 }

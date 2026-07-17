@@ -31,7 +31,9 @@
     type AgentSpawn,
     type Session,
     type Workspace,
+    isMastermind,
   } from "./lib/workspace/sessions";
+  import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
     getAgentDefault,
     installAgent,
@@ -110,6 +112,7 @@
     findFinder,
     freshFinderTab,
     setFinderPath,
+    openDashboard,
     openGit,
     openSession,
     openSettings,
@@ -159,7 +162,13 @@
     type LayoutCtrl,
   } from "./lib/layout/dnd";
   import { chordDigit, fontChord, isMac, matchChord, REFERENCE_CHORD } from "./lib/shared/keys";
-  import { isCapturing, keyHint, matchAction, modifierSetting } from "./lib/shared/keybindings";
+  import {
+    activeModLabel,
+    isCapturing,
+    keyHint,
+    matchAction,
+    modifierSetting,
+  } from "./lib/shared/keybindings";
   import {
     askpassActive,
     caffeinateState,
@@ -184,9 +193,12 @@
   import {
     applyRemoteSettings,
     flushSettings,
+    getSetting,
     loadSettings,
     setSetting,
+    settingsLoaded,
   } from "./lib/settings/store.svelte";
+  import type { DashCtx } from "./lib/dashboard/dash";
   import { flushViewState, loadViewState, saveViewState, windowKey } from "./lib/layout/viewState";
   import {
     FILES_FRAC_MAX,
@@ -455,7 +467,13 @@
   }
 
   const workspace = $derived(workspaces.find((w) => w.id === activeWsId) ?? null);
-  const wsSessions = $derived(sessions.filter((s) => s.workspace_id === activeWsId));
+  // The Mastermind is the observer, not the observed: its flagged row never
+  // enters the workspace roster — the rail, chord map, attention counts,
+  // quick-open, and reference targets all derive from here. Lookups by id
+  // (sessionsById, the pools' keep-alive sync) stay on the unfiltered list.
+  const wsSessions = $derived(
+    sessions.filter((s) => s.workspace_id === activeWsId && !isMastermind(s)),
+  );
 
   /** How this window is named in the shell's tray window-list: the workspace
    *  name (with the host on a remote window), or "Home" for the home screen —
@@ -520,6 +538,12 @@
   /** Sessions in the active workspace waiting on the user. */
   const needsYou = $derived(wsSessions.filter(needsAttention).length);
 
+  /** The focused pane is showing the dashboard (its rail row highlights). */
+  const dashboardOpen = $derived.by(() => {
+    const p = findPane(layout.root, layout.focusedPaneId);
+    return p?.tabs[p.active]?.surface === "dashboard";
+  });
+
   // --- context bridge: reference target resolution ---------------------------
 
   /** Agent sessions this window focused, most recent first. */
@@ -529,6 +553,28 @@
     if (sid === null || sessionsById.get(sid)?.kind !== "agent") return;
     if (agentMru[0] === sid) return;
     agentMru = [sid, ...agentMru.filter((x) => x !== sid)].slice(0, 16);
+  });
+
+  // Looking at a session clears its unread mark (the rail rows and
+  // dashboard cards wear it until then).
+  $effect(() => {
+    const sid = focusedSessionId;
+    if (sid !== null) markSeen(sid);
+  });
+
+  /** App-level context the dashboard surface needs beyond the pane props. */
+  const dashCtx = $derived<DashCtx>({
+    wsName: workspace?.name ?? "",
+    ready: gotSessions,
+    recents: visibleRecents,
+    mru: agentMru,
+    mastermind: workspace?.mastermind ?? null,
+    refreshWorkspaces,
+    onOpenRecent: openRecent,
+    onNewTerminal: newShell,
+    onNewAgent: newAgentPrimary,
+    onOpenGit: openGitPanel,
+    onOpenSession: openSess,
   });
 
   /**
@@ -729,7 +775,10 @@
     events.watch(activeWsId);
     refreshWorkspaces();
     void bootViewState();
-    void loadSettings();
+    // Re-run the landing one-shot once settings settle: the sessions
+    // snapshot may have arrived first, and pruneAndAutoOpen gates on
+    // settingsLoaded() so an explicit landing choice is never raced.
+    void loadSettings().then(pruneAndAutoOpen);
     void refreshAgents();
 
     // Native menu items the shell forwards to the focused window. Cmd+W
@@ -1402,7 +1451,13 @@
     // a rendered markdown document), so browser zoom keeps working elsewhere.
     if (!pickerOpen && !quickOpenOpen && layoutReady) {
       const step = fontChord(e);
-      if (step !== null) {
+      // The dashboard owns the base-modifier Digit0 chord (the advertised
+      // ⌘0 / Ctrl+Shift+0): a font RESET here would swallow it on every
+      // terminal/markdown pane — the most common focus state. Font reset
+      // keeps its other spellings (⌘Numpad0; plain Ctrl+0 on non-mac,
+      // where the dashboard chord carries Shift).
+      const dashboardChord = step === 0 && chordDigit(e, modifierSetting()) === 0;
+      if (step !== null && !dashboardChord) {
         const p = findPane(layout.root, layout.focusedPaneId);
         const active = p?.tabs[p.active];
         const sizable =
@@ -1458,9 +1513,12 @@
         }
         return;
       }
-      // Pinned Mod+1–9: open the Nth rail session.
+      // Pinned Mod+1–9: open the Nth rail session; Mod+0 is the dashboard.
       const n = chordDigit(e, modifierSetting());
-      if (n !== null && n <= railSessions.length) {
+      if (n === 0) {
+        intercept();
+        openDashboardSurface();
+      } else if (n !== null && n <= railSessions.length) {
         intercept();
         openSess(railSessions[n - 1].id);
       }
@@ -1566,9 +1624,11 @@
   /**
    * Refresh the workspace list; if the tab's stored workspace no longer
    * exists on the daemon, clear it and fall back to the empty state.
+   * Resolves once the fresh list is applied (never rejects) — the dashboard's
+   * Mastermind dock awaits it after a PUT/DELETE to pick up the binding.
    */
-  function refreshWorkspaces(): void {
-    void listWorkspaces()
+  function refreshWorkspaces(): Promise<void> {
+    return listWorkspaces()
       .then((list) => {
         workspaces = list;
         if (activeWsId !== null && !list.some((w) => w.id === activeWsId)) {
@@ -1732,6 +1792,10 @@
     const sortKey = (s: Session): number =>
       s.created_at !== 0 ? s.created_at : (lastCreatedAt.get(s.id) ?? 0);
     list.sort((a, b) => sortKey(a) - sortKey(b) || a.id.localeCompare(b.id));
+    // Unread marks fold BEFORE the swap: the transitions ("was running, now
+    // finished") need the previous rows. The focused session is exempt —
+    // output that ended under the user's eyes was seen.
+    foldUnread(new Map(sessions.map((s) => [s.id, s])), list, focusedSessionId);
     sessions = list;
     gotSessions = true;
     // A session now running as chat has no PTY: dispose any warm terminal
@@ -1789,10 +1853,24 @@
       else live.add(id);
     }
     layout = pruneSessions(layout, live);
-    if (!autoOpened) {
+    // The one-shot waits for the settings to actually load: getSetting
+    // returns the schema default ("auto") until GET /settings resolves, and
+    // the REST fallback poll can deliver sessions first — latching here on
+    // the default would override an explicit "never". loadSettings flips
+    // loaded even on failure (defaults then genuinely apply) and re-calls
+    // this, so the gate can never wedge the landing.
+    if (!autoOpened && settingsLoaded()) {
       autoOpened = true;
-      if (tabCount(layout) === 0 && railSessions.length > 0) {
-        layout = openSession(layout, railSessions[0].id);
+      if (tabCount(layout) === 0) {
+        // An empty layout lands on the dashboard — the workspace overview —
+        // unless the setting restores the old first-session behavior. A
+        // NON-empty restored layout is never touched: the dashboard earns
+        // the center only when the stage was empty.
+        if (getSetting("dashboard.landing") !== "never") {
+          layout = openDashboard(layout);
+        } else if (railSessions.length > 0) {
+          layout = openSession(layout, railSessions[0].id);
+        }
       }
     }
   }
@@ -1894,6 +1972,13 @@
   function openSettingsSurface(): void {
     if (activeWsId === null || !layoutReady) return;
     layout = openSettings(layout);
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** Open/focus the workspace dashboard (rail row, ⌘0, the landing default). */
+  function openDashboardSurface(): void {
+    if (activeWsId === null || !layoutReady) return;
+    layout = openDashboard(layout);
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
@@ -2911,10 +2996,11 @@
 <div class="shell">
   {#if activeWsId === null}
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
-         exist once a workspace scopes this window. -->
+         exist once a workspace scopes this window. A Mastermind is never a
+         worker: keep it out of the per-workspace live/attention rollups. -->
     <HomeScreen
       {workspaces}
-      {sessions}
+      sessions={sessions.filter((s) => !isMastermind(s))}
       hostLabel={getHostLabel()}
       {health}
       connected={eventsUp}
@@ -3015,6 +3101,7 @@
             <div
               class="row"
               class:active={s.id === focusedSessionId}
+              class:unread={renamingId !== s.id && isUnread(s.id)}
               class:link-target={dropSpot?.kind === "linkrow" && dropSpot.sessionId === s.id}
               style:--hue={s.kind === "agent" ? agentHue(s.id) : null}
               use:linkRow={s}
@@ -3046,13 +3133,16 @@
                 ])}
             >
               <!-- Session-type glyph carrying the state color — the same
-                   mark as the pane tab (surface parity, rail included). -->
+                   mark as the pane tab (surface parity, rail included). It
+                   breathes while alive (pulse): the rail's activity cue,
+                   since the row shows only the glyph, no separate dot. -->
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
                 state={dotState(s)}
                 size={11}
                 title={dotTitle(s)}
+                pulse
               />
               {#if renamingId === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
@@ -3114,6 +3204,29 @@
             </div>
           {/if}
         {/snippet}
+
+        <!-- The workspace dashboard: the fixed home row above the sessions —
+             the overview of everything below it. ⌘0, matching the ⌘1–9 rows. -->
+        <button
+          class="row dash-row"
+          class:dash-active={dashboardOpen}
+          title="workspace dashboard ({activeModLabel()}0)"
+          onclick={openDashboardSurface}
+        >
+          <svg class="dash-glyph" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <path
+              d="M8 1.8l5.4 3.1v6.2L8 14.2l-5.4-3.1V4.9z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="dash-label">dashboard</span>
+          {#if hintsActive()}
+            <span class="kbd-badge" aria-hidden="true">0</span>
+          {/if}
+        </button>
 
         <!-- Terminals first (there are few), agents below (there are many);
              this order is also the mod+1–9 order and the strip order. -->
@@ -3541,6 +3654,7 @@
             wsRoot={workspace?.root ?? null}
             wsId={activeWsId}
             {bandPanes}
+            dash={dashCtx}
             {ctrl}
           />
         {:else}
@@ -3557,6 +3671,7 @@
             wsId={activeWsId}
             {bandPanes}
             soloPane={panesOf(layout.root).length === 1}
+            dash={dashCtx}
             {ctrl}
           />
         {/if}
@@ -3611,17 +3726,20 @@
           <button
             class="chip"
             class:focused={s.id === focusedSessionId}
-            title={s.title ?? undefined}
+            class:unread={isUnread(s.id)}
+            title={isUnread(s.id) ? "finished — output you haven't looked at" : (s.title ?? undefined)}
             onclick={() => openSess(s.id)}
           >
             <!-- The type glyph replaces both the dot and the old "$ "
-                 prefix — same mark as tabs and rail rows (parity). -->
+                 prefix — same mark as tabs and rail rows (parity), breathing
+                 while alive. -->
             <SessionGlyph
               kind={s.kind}
               agentKind={s.agent_kind}
               state={dotState(s)}
               size={10}
               title={dotTitle(s)}
+              pulse
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
             {#if hintsActive() && chordDigits.has(s.id)}
@@ -3948,6 +4066,40 @@
     transition: background-color 0.12s ease;
   }
 
+  /* The dashboard home row: fixed above the session sections, quiet until
+     hovered or active — furniture, not a session. */
+  .dash-row {
+    appearance: none;
+    border: none;
+    background: none;
+    font: inherit;
+    color: var(--muted);
+    text-align: left;
+    width: 100%;
+    margin-bottom: 2px;
+  }
+  .dash-row:hover {
+    color: var(--fg);
+  }
+  .dash-row.dash-active {
+    background: var(--row-active);
+    color: var(--fg);
+  }
+  .dash-glyph {
+    flex: none;
+    display: block;
+  }
+  .dash-label {
+    /* Match the session rows' name type (mono, text-sm) — the dashboard row
+       sits in the same list and must read as one of them, not a stray
+       proportional label. */
+    font-family: var(--mono);
+    font-size: var(--text-sm);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .row:hover {
     background: var(--row-hover);
   }
@@ -4106,6 +4258,17 @@
     from {
       opacity: 0;
     }
+  }
+
+  /* Unread output: finished with output you haven't looked at. The quietest
+     cue that still reads — a bolder name (the unread-mail convention), no bar
+     or wash in the dense rail so it never looks like a hover/active state.
+     The dashboard card wears the same bold name over a faint wash. A focused
+     row is never unread, so this never fights the active state. */
+  .row.unread .name,
+  .chip.unread .chip-name {
+    color: var(--fg);
+    font-weight: 600;
   }
 
   .row.new {

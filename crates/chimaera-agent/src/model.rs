@@ -46,6 +46,15 @@ pub const WF_AGENTS_CAP: usize = 24;
 pub const WF_AGENTS_SET_BUDGET: usize = 96;
 /// One-line cap for a workflow agent's label and result preview.
 pub const WF_AGENT_LABEL_MAX: usize = 120;
+/// Total serialized-size backstop for a permission/approval input preview
+/// ([`cap_preview`]). Leaf-capping alone bounds each string, but a WIDE
+/// structure (an array/object with thousands of small leaves — a codex MCP
+/// `tool_params`) can still overrun the journal's 256 KiB entry cap, which
+/// replaces the whole `PermissionRequest` with an Error while the driver's
+/// `pending_approvals` keeps waiting on its now-invisible request id — a turn
+/// stuck with no way to approve or deny. Kept well under 256 KiB so the
+/// event stays admissible even beside its sibling fields.
+pub const PREVIEW_TOTAL_BUDGET: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -809,6 +818,42 @@ pub fn truncate_label(text: &str, max: usize) -> String {
     format!("{}…", &text[..floor_char_boundary(text, max)])
 }
 
+/// Cap every string leaf of a permission/approval input preview so a giant
+/// payload can't bloat the journaled/replayed event, THEN backstop the whole
+/// value's serialized size ([`PREVIEW_TOTAL_BUDGET`]): leaf-capping bounds
+/// each string but not the breadth of a wide array/object, which could still
+/// overrun the journal cap and strand the approval. Structure is preserved
+/// (the UI renders specific fields); only oversized leaves are
+/// head/tail-truncated, and only a preview that is STILL too big after that
+/// collapses to a `{_truncated, _omitted_bytes}` marker (the field-reading
+/// renderers degrade to "nothing recognized" rather than break). Shared by
+/// both drivers (the symmetry invariant): claude's Write/Edit inputs and
+/// codex's MCP elicitation tool_params are the same attack surface.
+pub fn cap_preview(value: &serde_json::Value) -> serde_json::Value {
+    let capped = cap_preview_leaves(value);
+    // Wide structures survive leaf-capping — bound the whole thing so a
+    // preview can never be the reason a PermissionRequest exceeds the cap.
+    let len = serde_json::to_vec(&capped).map(|v| v.len()).unwrap_or(0);
+    if len > PREVIEW_TOTAL_BUDGET {
+        return serde_json::json!({ "_truncated": true, "_omitted_bytes": len });
+    }
+    capped
+}
+
+fn cap_preview_leaves(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(cap_output(s).0),
+        Value::Array(arr) => Value::Array(arr.iter().map(cap_preview_leaves).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), cap_preview_leaves(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub fn cap_head_tail(text: &str, head: usize, tail: usize) -> (String, bool) {
     if text.len() <= head + tail {
         return (text.to_string(), false);
@@ -986,6 +1031,33 @@ mod tests {
         let (small, truncated) = cap_output("short output");
         assert!(!truncated);
         assert_eq!(small, "short output");
+    }
+
+    #[test]
+    fn cap_preview_bounds_a_wide_structure() {
+        // A narrow preview passes through with its shape intact (only leaves
+        // are capped) — the common case must not collapse.
+        let small = serde_json::json!({"cmd": "ls", "args": ["-la", "/tmp"]});
+        assert_eq!(cap_preview(&small), small);
+
+        // A giant single leaf is head/tail-capped but structure survives.
+        let big_leaf = serde_json::json!({"script": "x".repeat(200 * 1024)});
+        let capped = cap_preview(&big_leaf);
+        assert!(capped.get("script").is_some(), "leaf-cap keeps the shape");
+        assert!(serde_json::to_vec(&capped).unwrap().len() <= PREVIEW_TOTAL_BUDGET);
+
+        // A WIDE structure (many small leaves) survives leaf-capping yet
+        // overruns the budget — it collapses to the marker so the event
+        // stays under the journal cap instead of stranding the approval.
+        let wide = serde_json::json!({
+            "items": (0..20_000)
+                .map(|i| serde_json::json!({"k": i, "v": "small"}))
+                .collect::<Vec<_>>()
+        });
+        assert!(serde_json::to_vec(&wide).unwrap().len() > PREVIEW_TOTAL_BUDGET);
+        let capped = cap_preview(&wide);
+        assert_eq!(capped["_truncated"], serde_json::json!(true));
+        assert!(serde_json::to_vec(&capped).unwrap().len() <= PREVIEW_TOTAL_BUDGET);
     }
 
     #[test]

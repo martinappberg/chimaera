@@ -98,6 +98,53 @@ impl AgentState {
 /// Cap on the per-session touched-files list.
 const FILES_TOUCHED_CAP: usize = 100;
 
+/// Cap on the live-subagent set per session — bounded memory: a runaway
+/// fan-out must not bloat the record or every events-bus snapshot.
+const SUBAGENTS_CAP: usize = 32;
+
+/// Cap (chars) on the small derived strings kept on the record (`now_line`,
+/// subagent labels, usage model name): they ride every snapshot.
+const SMALL_STRING_MAX: usize = 80;
+
+/// One live subagent of a claude TUI session, from `SubagentStart` hook
+/// payloads. Serialized straight onto the session row (`subagents[]`) —
+/// additive wire shape, don't rename fields.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SubagentInfo {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    /// ms since the Unix epoch, stamped at ingest (same clock as the PTY's
+    /// `last_output_at`).
+    pub(crate) started_at: u64,
+}
+
+/// Statusline-heartbeat telemetry for a claude TUI session. Values are
+/// quantized at ingest (whole percent, whole cents) so micro-changes between
+/// heartbeats don't defeat the events-bus snapshot dedupe.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AgentUsage {
+    pub(crate) model: Option<String>,
+    /// Context-window use, whole percent 0–100.
+    pub(crate) context_pct: Option<u8>,
+    /// Session cost, whole US cents (serialized as dollars).
+    pub(crate) cost_cents: Option<u64>,
+}
+
+impl AgentUsage {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.model.is_none() && self.context_pct.is_none() && self.cost_cents.is_none()
+    }
+
+    /// The wire shape: `{model, context_pct, cost_usd}`, every field optional.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "context_pct": self.context_pct,
+            "cost_usd": self.cost_cents.map(|c| c as f64 / 100.0),
+        })
+    }
+}
+
 /// Server-side wrapper state for one agent session.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentRecord {
@@ -130,6 +177,17 @@ pub(crate) struct AgentRecord {
     /// view switch, which respawns the process but keeps the record and the
     /// conversation — must not repeat it. Never true off-cluster.
     pub(crate) compute_ctx_delivered: bool,
+    /// Live subagents (SubagentStart/Stop hooks), capped at
+    /// [`SUBAGENTS_CAP`]; cleared when the turn ends (Stop) or the session
+    /// exits (the record dies with it).
+    pub(crate) subagents: Vec<SubagentInfo>,
+    /// One-line "what it's doing now" from the most recent hook event
+    /// (claude TUIs only — chat rows derive richer state from the journal);
+    /// replaced per event, cleared on Stop/exit.
+    pub(crate) now_line: Option<String>,
+    /// Latest statusline-heartbeat telemetry (claude TUIs only), quantized
+    /// at ingest.
+    pub(crate) usage: Option<AgentUsage>,
 }
 
 impl AgentRecord {
@@ -145,7 +203,40 @@ impl AgentRecord {
             resumed_from: None,
             files_touched: Vec::new(),
             compute_ctx_delivered: false,
+            subagents: Vec::new(),
+            now_line: None,
+            usage: None,
         }
+    }
+
+    /// Record a subagent start: an already-known id refreshes its label in
+    /// place; past the cap the OLDEST entry falls off (a stuck stale row
+    /// must never block the live one). Returns whether anything changed.
+    pub(crate) fn subagent_started(&mut self, id: &str, label: &str, started_at: u64) -> bool {
+        let label: String = label.chars().take(SMALL_STRING_MAX).collect();
+        if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
+            if existing.label == label {
+                return false;
+            }
+            existing.label = label;
+            return true;
+        }
+        if self.subagents.len() >= SUBAGENTS_CAP {
+            self.subagents.remove(0);
+        }
+        self.subagents.push(SubagentInfo {
+            id: id.to_string(),
+            label,
+            started_at,
+        });
+        true
+    }
+
+    /// Drop a subagent by id; returns whether it was present.
+    pub(crate) fn subagent_stopped(&mut self, id: &str) -> bool {
+        let before = self.subagents.len();
+        self.subagents.retain(|s| s.id != id);
+        self.subagents.len() != before
     }
 
     /// Record a file write: a re-touched path moves to the end (newest last),
@@ -255,6 +346,106 @@ pub(crate) fn touched_file(payload: &serde_json::Value) -> Option<&str> {
         .get(field)?
         .as_str()
         .filter(|path| !path.is_empty())
+}
+
+/// The subagent identity in a `SubagentStart`/`SubagentStop` payload.
+/// Verified shape (claude 2.1.20x): `agent_id` + `agent_type`; parsed
+/// liberally (camelCase accepted, label optional) — `None` means an unknown
+/// shape the caller logs and drops.
+pub(crate) fn subagent_identity(payload: &serde_json::Value) -> Option<(&str, &str)> {
+    let id = payload
+        .get("agent_id")
+        .or_else(|| payload.get("agentId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let label = payload
+        .get("agent_type")
+        .or_else(|| payload.get("agentType"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("subagent");
+    Some((id, label))
+}
+
+/// The `now_line` update a hook event implies: `Some(Some(line))` replaces
+/// it, `Some(None)` clears it (a turn boundary — the old line is stale),
+/// `None` keeps the current one. Tool events yield the task's one-line
+/// answer to "what is it doing": "edited foo.rs" beats "ran Edit".
+pub(crate) fn now_line_update(event: &str, payload: &serde_json::Value) -> Option<Option<String>> {
+    let tool = || {
+        payload
+            .get("tool_name")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+    };
+    let line = |s: String| Some(Some(s.chars().take(SMALL_STRING_MAX).collect()));
+    match event {
+        "PreToolUse" => match touched_file(payload).and_then(file_basename) {
+            Some(name) => line(format!("editing {name}")),
+            None => tool().and_then(|t| line(format!("running {t}"))),
+        },
+        "PostToolUse" => match touched_file(payload).and_then(file_basename) {
+            Some(name) => line(format!("edited {name}")),
+            None => tool().and_then(|t| line(format!("ran {t}"))),
+        },
+        "SubagentStart" => {
+            let (_, label) = subagent_identity(payload)?;
+            line(format!("delegating to {label}"))
+        }
+        // A new prompt or a turn/session end: whatever the line said is over.
+        "UserPromptSubmit" | "Stop" | "StopFailure" | "SessionEnd" => Some(None),
+        _ => None,
+    }
+}
+
+/// The path's final component, for the compact now-line.
+fn file_basename(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Parse a statusline-heartbeat payload into quantized usage. Liberal on
+/// purpose — every field optional, unknown shapes yield an empty usage the
+/// caller drops. Field names per the claude statusline stdin JSON
+/// (`model.display_name`, `context_window.used_percentage`,
+/// `cost.total_cost_usd`), with a tokens-ratio fallback for the percentage.
+pub(crate) fn statusline_usage(payload: &serde_json::Value) -> AgentUsage {
+    let model = payload
+        .get("model")
+        .and_then(|m| {
+            m.get("display_name")
+                .or_else(|| m.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(SMALL_STRING_MAX).collect());
+    let window = payload.get("context_window");
+    let context_pct = window
+        .and_then(|w| {
+            w.get("used_percentage")
+                .or_else(|| w.get("used_pct"))
+                .and_then(|v| v.as_f64())
+        })
+        .or_else(|| {
+            // Some builds report tokens, not a percentage.
+            let used = window?.get("used_tokens")?.as_f64()?;
+            let max = window?.get("max_tokens")?.as_f64()?;
+            (max > 0.0).then(|| used / max * 100.0)
+        })
+        .filter(|p| p.is_finite())
+        .map(|p| p.round().clamp(0.0, 100.0) as u8);
+    let cost_cents = payload
+        .get("cost")
+        .and_then(|c| c.get("total_cost_usd"))
+        .and_then(|v| v.as_f64())
+        .filter(|c| c.is_finite() && (0.0..1e9).contains(c))
+        .map(|c| (c * 100.0).round() as u64);
+    AgentUsage {
+        model,
+        context_pct,
+        cost_cents,
+    }
 }
 
 /// Map a hook event to the agent state it implies, if any. `SessionEnd`
@@ -473,6 +664,119 @@ mod tests {
         assert_eq!(record.files_touched.len(), FILES_TOUCHED_CAP);
         assert_eq!(record.files_touched.first().unwrap(), "/w/f50");
         assert_eq!(record.files_touched.last().unwrap(), "/w/f149");
+    }
+
+    #[test]
+    fn subagent_set_dedupes_caps_and_stops() {
+        let mut record = AgentRecord::new("k".into(), AgentKind::Claude);
+        assert!(record.subagent_started("a1", "Explore", 10));
+        assert!(record.subagent_started("a2", "Plan", 20));
+        // Same id, same label: no change. Same id, new label: refreshed.
+        assert!(!record.subagent_started("a1", "Explore", 30));
+        assert!(record.subagent_started("a1", "Explore v2", 30));
+        assert_eq!(record.subagents.len(), 2);
+        assert_eq!(record.subagents[0].started_at, 10); // start time kept
+                                                        // Stop removes by id; a second stop is a no-op.
+        assert!(record.subagent_stopped("a1"));
+        assert!(!record.subagent_stopped("a1"));
+        assert_eq!(record.subagents.len(), 1);
+        // The cap drops the OLDEST entry, never blocks the live one.
+        for i in 0..40 {
+            record.subagent_started(&format!("s{i}"), "w", i);
+        }
+        assert_eq!(record.subagents.len(), SUBAGENTS_CAP);
+        assert_eq!(record.subagents.last().unwrap().id, "s39");
+    }
+
+    #[test]
+    fn subagent_identity_is_liberal_but_requires_an_id() {
+        assert_eq!(
+            subagent_identity(&json!({"agent_id": "a1", "agent_type": "Explore"})),
+            Some(("a1", "Explore"))
+        );
+        // camelCase accepted; a missing label falls back generically.
+        assert_eq!(
+            subagent_identity(&json!({"agentId": "a2"})),
+            Some(("a2", "subagent"))
+        );
+        // No id (or an empty one): unknown shape, caller logs and drops.
+        assert_eq!(subagent_identity(&json!({"agent_type": "Explore"})), None);
+        assert_eq!(subagent_identity(&json!({"agent_id": ""})), None);
+    }
+
+    #[test]
+    fn now_line_tracks_tools_and_clears_on_boundaries() {
+        let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "/w/src/foo.rs"}});
+        assert_eq!(
+            now_line_update("PreToolUse", &edit),
+            Some(Some("editing foo.rs".into()))
+        );
+        assert_eq!(
+            now_line_update("PostToolUse", &edit),
+            Some(Some("edited foo.rs".into()))
+        );
+        let bash = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+        assert_eq!(
+            now_line_update("PreToolUse", &bash),
+            Some(Some("running Bash".into()))
+        );
+        assert_eq!(
+            now_line_update("PostToolUse", &bash),
+            Some(Some("ran Bash".into()))
+        );
+        assert_eq!(
+            now_line_update(
+                "SubagentStart",
+                &json!({"agent_id": "a", "agent_type": "Explore"})
+            ),
+            Some(Some("delegating to Explore".into()))
+        );
+        // Turn boundaries clear; everything else keeps the current line.
+        for boundary in ["UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"] {
+            assert_eq!(now_line_update(boundary, &json!({})), Some(None));
+        }
+        assert_eq!(now_line_update("Notification", &json!({})), None);
+        assert_eq!(now_line_update("PreToolUse", &json!({})), None);
+        // Long values are capped — these strings ride every snapshot.
+        let long = json!({"tool_name": "x".repeat(500)});
+        let line = now_line_update("PreToolUse", &long).unwrap().unwrap();
+        assert!(line.chars().count() <= SMALL_STRING_MAX);
+    }
+
+    #[test]
+    fn statusline_usage_quantizes_and_tolerates_unknown_shapes() {
+        // The documented statusline stdin shape.
+        let usage = statusline_usage(&json!({
+            "hook_event_name": "Status",
+            "model": {"id": "claude-opus-4", "display_name": "Opus"},
+            "context_window": {"used_percentage": 41.7},
+            "cost": {"total_cost_usd": 0.1249},
+        }));
+        assert_eq!(usage.model.as_deref(), Some("Opus"));
+        assert_eq!(usage.context_pct, Some(42)); // whole percent
+        assert_eq!(usage.cost_cents, Some(12)); // whole cents
+        assert_eq!(
+            usage.to_json(),
+            json!({"model": "Opus", "context_pct": 42, "cost_usd": 0.12})
+        );
+        // Tokens-ratio fallback; model id when no display name.
+        let usage = statusline_usage(&json!({
+            "model": {"id": "claude-sonnet-4"},
+            "context_window": {"used_tokens": 50_000, "max_tokens": 200_000},
+        }));
+        assert_eq!(usage.model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(usage.context_pct, Some(25));
+        assert_eq!(usage.cost_cents, None);
+        // Hostile/odd values are clamped or dropped, never trusted.
+        let usage = statusline_usage(&json!({
+            "context_window": {"used_percentage": 1e12},
+            "cost": {"total_cost_usd": -3.0},
+        }));
+        assert_eq!(usage.context_pct, Some(100));
+        assert_eq!(usage.cost_cents, None);
+        // Unknown shape: empty, and the caller drops it.
+        assert!(statusline_usage(&json!({"whatever": true})).is_empty());
+        assert!(statusline_usage(&json!("not an object")).is_empty());
     }
 
     #[test]

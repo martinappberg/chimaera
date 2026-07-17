@@ -15,6 +15,8 @@
   import SessionChangesView from "../workspace/SessionChangesView.svelte";
   import SettingsView from "../settings/SettingsView.svelte";
   import FinderView from "../previews/FinderView.svelte";
+  import DashboardView from "../dashboard/DashboardView.svelte";
+  import type { DashCtx } from "../dashboard/dash";
 
   interface Props {
     node: PaneNode;
@@ -36,6 +38,8 @@
     wsId: string | null;
     /** Panes whose bottom band is armed for the current drag. */
     bandPanes: ReadonlySet<string>;
+    /** App-level context for the dashboard surface. */
+    dash: DashCtx;
     ctrl: LayoutCtrl;
   }
 
@@ -53,6 +57,7 @@
     wsRoot,
     wsId,
     bandPanes,
+    dash,
     ctrl,
   }: Props = $props();
 
@@ -204,6 +209,8 @@
     {:else}
       <div class="hint"><span>session closed</span></div>
     {/if}
+  {:else if tab.surface === "dashboard"}
+    <DashboardView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} />
   {:else if tab.surface === "settings"}
     <SettingsView />
   {/if}

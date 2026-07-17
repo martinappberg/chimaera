@@ -133,10 +133,22 @@ pub(crate) async fn spawn_session(
             // theme rides in the same settings file — unless the user's own
             // settings already set one (respect the explicit choice).
             let settings = if agent_kind == AgentKind::Claude {
-                let settings_theme =
-                    (!crate::runtimes::claude_user_theme_set(&state.claude_settings_path))
-                        .then_some(spec.theme.as_str());
-                match crate::agents::write_settings(&id, &key, state.port, settings_theme) {
+                let (theme_set, user_statusline) = crate::runtimes::claude_settings_gates(
+                    &state.claude_settings_path,
+                    &workspace.root,
+                )
+                .await;
+                let settings_theme = (!theme_set).then_some(spec.theme.as_str());
+                // PTY TUI spawns are never the Mastermind (a chat-only role),
+                // so no permissions block rides these settings.
+                match crate::agents::write_settings(
+                    &id,
+                    &key,
+                    state.port,
+                    settings_theme,
+                    user_statusline.as_ref(),
+                    None,
+                ) {
                     Ok(path) => Some(path),
                     Err(err) => {
                         tracing::error!(%err, "failed to write agent settings");
@@ -222,8 +234,9 @@ pub(crate) async fn spawn_session(
                 Some(workspace.id),
                 agent.as_ref(),
                 polled.as_deref(),
-                None, // fresh session: cwd_current is the spawn cwd
-                None, // no exec in flight
+                None,  // fresh session: cwd_current is the spawn cwd
+                None,  // no exec in flight
+                false, // a fresh PTY spawn is never a bound Mastermind
             ))
         }
         Err(err) => {
