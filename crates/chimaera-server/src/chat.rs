@@ -75,6 +75,10 @@ pub(crate) struct ChatRecipe {
     /// resurrection) resolve it from the workspace store at recipe build —
     /// the binding, not the recipe, is the source of truth.
     pub(crate) mastermind: Option<crate::workspaces::MastermindMode>,
+    /// Original creation time (epoch ms) for a RESURRECTED session, so its age
+    /// survives a daemon restart instead of resetting to "now". `None` on a
+    /// fresh create / view-switch / rewind — the spawn stamps now.
+    pub(crate) created_at_ms: Option<u64>,
 }
 
 /// Signal-channel depth. Bounded (the repo forbids unbounded buffers on the
@@ -1091,6 +1095,9 @@ async fn perform_switch(
             theme: theme.clone(),
             prelude: launch_prelude.clone(),
             mastermind,
+            // A view switch respawns in place; age isn't preserved across it
+            // today (the ledger path is what fixes resurrection).
+            created_at_ms: None,
         };
         spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
     } else {
@@ -1109,6 +1116,7 @@ async fn perform_switch(
             theme,
             prelude: launch_prelude,
             mastermind,
+            created_at_ms: None,
         };
         degrade_to_pty(state, id, recipe, pinned_name).await;
     }
@@ -1305,6 +1313,7 @@ pub(crate) async fn rewind_session(
             rollback_turns: if is_codex { dropped_turns } else { None },
             theme: "dark".to_string(),
             prelude: launch_prelude,
+            created_at_ms: None,
         };
         spawn_chat_session(&state, id.clone(), recipe, None).map_err(|e| e.to_string())?;
         Ok(())
@@ -1515,6 +1524,8 @@ pub(crate) async fn spawn_fresh_chat(
         theme: spec.theme,
         prelude: spec.prelude.filter(|p| !p.trim().is_empty()),
         mastermind,
+        // Fresh create — the spawn stamps now.
+        created_at_ms: None,
     };
     match spawn_chat_session(state, id.clone(), recipe, None) {
         Ok(info) => {
@@ -1670,6 +1681,9 @@ pub(crate) fn spawn_chat_session(
     // Conversation rewind (codex): the driver rolls the resumed thread back
     // right after thread/resume. Claude's driver ignores it (fork rides argv).
     spec.rollback_turns = recipe.rollback_turns;
+    // Resurrection carries the original creation time so age survives the
+    // restart; every other path leaves it None → the spawn stamps now.
+    spec.created_at_ms = recipe.created_at_ms;
 
     // Resuming a finished conversation mints a NEW chimaera session id, and the
     // agents replay no history over the wire — seed the new journal so attach
@@ -1814,6 +1828,9 @@ pub(crate) async fn resurrect_chat(
         // re-runs the durable scopes (host ⊕ workspace) only.
         prelude: None,
         mastermind: mastermind_mode,
+        // Keep the original age across the restart (0 = an older ledger with
+        // no stamp → let the spawn stamp now, as before).
+        created_at_ms: (entry.created_at > 0).then(|| entry.created_at * 1000),
     };
     match spawn_chat_session(state, entry.id.clone(), recipe, None) {
         Ok(_) => {

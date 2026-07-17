@@ -115,6 +115,16 @@
    *  BackgroundTray renders, promoted card-side the same way. A card that
    *  showed only subagents would lie by omission (design decision 12). */
   const bgTasks = $derived(store?.backgroundTasks ?? []);
+  /** The turn is idle but a background task is STILL running: the session
+   *  isn't "done", it's working off-screen. The glyph pulses gray for this
+   *  (vs the alive dot's green pulse for an active turn) — so a card with
+   *  ongoing background work never reads as finished. Only warm-store cards
+   *  know their background tasks (the wire row doesn't carry them). */
+  const backgrounded = $derived(
+    session.alive &&
+      session.agent_state !== "running" &&
+      bgTasks.some((t) => t.status === "running"),
+  );
   /** Exactly one subagent source is populated (see wireAgents), so the sum
    *  is the count — the summary label reads the same either way. */
   const subCount = $derived(activeAgents.length + wireAgents.length);
@@ -204,6 +214,7 @@
   class:compact
   class:dead={!session.alive}
   class:unread={isUnread(session.id)}
+  class:backgrounded
   role="button"
   tabindex="0"
   onclick={onOpen}
@@ -395,6 +406,19 @@
   }
   .card.dead {
     opacity: 0.75;
+  }
+  /* Idle turn but a background task is still running: the type glyph breathes
+     in GRAY (the alive dot's green pulse is reserved for an active turn), so
+     the card reads as "still working off-screen", not finished. `pulse` is
+     the global keyframe (app.css). */
+  .card.backgrounded :global(.sglyph) {
+    color: var(--muted);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .card.backgrounded :global(.sglyph) {
+      animation: none;
+    }
   }
   .card.compact {
     flex-direction: row;

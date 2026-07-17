@@ -86,9 +86,14 @@ pub struct SpawnSpec {
     /// answers their approval prompts accept itself instead of surfacing a
     /// PermissionRequest. Codex-only today — its app-server elicits EVERY
     /// MCP tool call regardless of approval-mode config (live-probed,
-    /// PROTOCOL.md Pass 16), so a pre-allow must answer at the prompt.
+    /// PROTOCOL.md Pass 19), so a pre-allow must answer at the prompt.
     /// Claude ignores it (its pre-allows ride the settings file).
     pub mcp_auto_approve: Option<McpAutoApprove>,
+    /// Original creation time to stamp on the `ChatInfo` (epoch ms), for a
+    /// session being RESURRECTED — so its age survives a daemon restart
+    /// instead of resetting to "now". `None` on a fresh spawn (stamped at
+    /// creation).
+    pub created_at_ms: Option<u64>,
     pub handshake_timeout: Duration,
 }
 
@@ -115,6 +120,7 @@ impl SpawnSpec {
             agent_version: None,
             rollback_turns: None,
             mcp_auto_approve: None,
+            created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
         }
     }

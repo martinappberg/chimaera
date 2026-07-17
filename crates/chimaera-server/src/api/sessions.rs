@@ -386,6 +386,8 @@ async fn spawn_chat_ui(
         // A resumed recent is never the Mastermind: retiring one clears the
         // binding and skips Recents, so there is no binding to resolve here.
         mastermind: None,
+        // A fresh session id resuming an old conversation — "now" is correct.
+        created_at_ms: None,
     };
 
     // A resumed recent replays no history over the wire — seed the new journal
