@@ -200,6 +200,10 @@ _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the 
   grow.
 - **Do not change:** Tier A staying fully supported and one toggle from chat.
 
+### Why the rail shows the agent's own status line — _Intent pending_
+_Shipped 2026-07-16 (claude `post_turn_summary` → `SessionStatus`). The maintainer's why has
+not been captured yet — run **capture-feature-intent** for this entry._
+
 ### Why recents replay full history (and fall back to the terminal)
 _Captured 2026-07-09 (from the maintainer, in-session)._
 
