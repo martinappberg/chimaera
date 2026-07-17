@@ -35,8 +35,9 @@ use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, BackgroundTask,
     BackgroundTaskClose, ChunkKind, Coalescer, ContentBlock, ModeInfo, PermissionOption,
     PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
-    Usage, UsageWindow, UserMessageState, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, STATUS_DETAIL_MAX,
+    Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
+    WF_AGENT_LABEL_MAX,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -131,7 +132,85 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         description: truncate_label(t["description"].as_str().unwrap_or(task_type), BG_LABEL_MAX),
         status: "running".into(),
         started_at_ms: now,
+        // task_started carries these; background_tasks_changed doesn't —
+        // the started-path fold (on_background_started) patches them onto
+        // an entry the set change adopted first (live order at spawn).
+        workflow_name: wire_workflow_name(t),
+        agents: Vec::new(),
+        agents_total: 0,
+        agents_done: 0,
+        tool_use_id: wire_tool_use_id(t),
     })
+}
+
+/// The two workflow-binding fields, extracted ONCE for both adopt paths
+/// (task_started and the set change) so their sanitization can't drift.
+/// A whitespace-only `meta.name` counts as absent — the UI branches on the
+/// name being present, and a blank title would beat the description fallback.
+fn wire_workflow_name(v: &Value) -> Option<String> {
+    v["workflow_name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_label(s, BG_LABEL_MAX))
+}
+
+fn wire_tool_use_id(v: &Value) -> Option<String> {
+    v["tool_use_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// One shape for every line the driver lands on a workflow's launching card
+/// (the mid-run count ticks and the close verdict) — the client applies the
+/// content and lets terminal statuses through its in-progress guard.
+fn card_update(card: String, status: ToolStatus, text: String) -> AgentEvent {
+    AgentEvent::ToolCallUpdate {
+        id: card,
+        status,
+        content: Some(ToolContent::Output {
+            text,
+            truncated: false,
+        }),
+    }
+}
+
+/// The final line a workflow run leaves on its launching card — the launch
+/// text it held was scaffolding; verdict + agent count + elapsed is what the
+/// transcript should keep. Terminal status always applies client-side, so a
+/// `failed` verdict flips the (launch-completed) card red. None when the
+/// task isn't a card-bound workflow (bash lanes tell their own story).
+fn workflow_card_close(
+    task: &BackgroundTask,
+    status: &str,
+    elapsed_ms: Option<u64>,
+) -> Option<AgentEvent> {
+    if task.task_type != "local_workflow" {
+        return None;
+    }
+    let card = task.tool_use_id.clone()?;
+    let mut line = match &task.workflow_name {
+        Some(name) => format!("workflow “{name}” {status}"),
+        None => format!("workflow {status}"),
+    };
+    if task.agents_total > 0 {
+        line.push_str(&format!(
+            " · {}/{} agents",
+            task.agents_done, task.agents_total
+        ));
+    }
+    if let Some(ms) = elapsed_ms.filter(|ms| *ms >= 1000) {
+        line.push_str(&format!(" · {}", fmt_elapsed_secs(ms / 1000)));
+    }
+    Some(card_update(
+        card,
+        if status == "failed" {
+            ToolStatus::Failed
+        } else {
+            ToolStatus::Completed
+        },
+        line,
+    ))
 }
 
 fn permission_response_frame(request_id: &Value, response: Value) -> Value {
@@ -827,6 +906,13 @@ impl ClaudeMapper {
                 }
             }
             Some("task_progress") => {
+                // A workflow lane's progress carries the per-agent
+                // `workflow_progress` array — fold it into the background
+                // set (the tray's dot row). Workflow lanes are never in
+                // task_rows, so the row path below no-ops for them.
+                if frame["workflow_progress"].is_array() {
+                    self.on_workflow_progress(frame, step);
+                }
                 let task_id = frame["task_id"].as_str().unwrap_or_default();
                 let Some(row) = self.task_rows.get(task_id).cloned() else {
                     return;
@@ -857,12 +943,7 @@ impl ClaudeMapper {
                     if !line.is_empty() {
                         line.push_str(" · ");
                     }
-                    let s = ms / 1000;
-                    if s >= 60 {
-                        line.push_str(&format!("{}m {:02}s", s / 60, s % 60));
-                    } else {
-                        line.push_str(&format!("{s}s"));
-                    }
+                    line.push_str(&fmt_elapsed_secs(ms / 1000));
                 }
                 step.events.push(AgentEvent::ToolCallUpdate {
                     id: row,
@@ -1086,6 +1167,18 @@ impl ClaudeMapper {
                 // the row close below must also run so a failed/stopped
                 // agent never renders green.
                 if let Some(task) = self.take_background(task_id) {
+                    let status = frame["status"].as_str().unwrap_or("completed");
+                    // A workflow's launching card gets the run's final line —
+                    // the launch text it held was scaffolding; the verdict +
+                    // agent count + elapsed is what the transcript should
+                    // keep. Terminal status always applies client-side, so a
+                    // failed run flips the (launch-completed) card red.
+                    let elapsed_ms = frame["usage"]["duration_ms"]
+                        .as_u64()
+                        .unwrap_or_else(|| crate::now_ms().saturating_sub(task.started_at_ms));
+                    if let Some(ev) = workflow_card_close(&task, status, Some(elapsed_ms)) {
+                        step.events.push(ev);
+                    }
                     let summary = frame["summary"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -1097,10 +1190,7 @@ impl ClaudeMapper {
                         vec![BackgroundTaskClose {
                             id: task.id,
                             description: task.description,
-                            status: truncate_label(
-                                frame["status"].as_str().unwrap_or("completed"),
-                                BG_LABEL_MAX,
-                            ),
+                            status: truncate_label(status, BG_LABEL_MAX),
                             summary,
                             // A PATH, not prose: ellipsizing would corrupt it
                             // into a nonexistent file — an oversized one is
@@ -1175,7 +1265,18 @@ impl ClaudeMapper {
         let Some(task_id) = frame["task_id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
-        if self.background_tasks.iter().any(|t| t.id == task_id) {
+        if let Some(existing) = self.background_tasks.iter_mut().find(|t| t.id == task_id) {
+            // At spawn the set change PRECEDES task_started (live order), and
+            // only task_started carries workflow_name/tool_use_id — fold them
+            // onto the adopted entry instead of no-opping the duplicate.
+            if let Some(id) = wire_tool_use_id(frame) {
+                existing.tool_use_id = Some(id);
+            }
+            let name = wire_workflow_name(frame);
+            if name.is_some() && existing.workflow_name != name {
+                existing.workflow_name = name;
+                self.emit_background_tasks(Vec::new(), step);
+            }
             return;
         }
         // A re-listed id that already departed REVIVES (original stamp) —
@@ -1200,6 +1301,120 @@ impl ClaudeMapper {
             self.park_departed(evicted);
         }
         self.emit_background_tasks(Vec::new(), step);
+    }
+
+    /// A workflow lane's per-agent progress (`task_progress` with a
+    /// `workflow_progress` array — live-probed 2.1.207, PROTOCOL.md Pass
+    /// 15). Folds the wire's agent list into the task's `agents` (newest
+    /// [`WF_AGENTS_CAP`] kept; totals counted over the whole list so the
+    /// count stays honest beyond the cap) and re-emits the level-set ONLY
+    /// on a transition — the stored fields exclude the wire's per-tick
+    /// churn (tokens-while-running, lastProgressAt), so equality between
+    /// ticks is the common case and the journal stays quiet. Also ticks a
+    /// "N/M agents done" content line onto the launching Workflow card:
+    /// the client's status guard keeps the (long-completed) card's status,
+    /// content still applies.
+    fn on_workflow_progress(&mut self, frame: &Value, step: &mut DriverStep) {
+        let task_id = frame["task_id"].as_str().unwrap_or_default();
+        let empty = Vec::new();
+        let wire = frame["workflow_progress"].as_array().unwrap_or(&empty);
+        let mut total = 0u64;
+        let mut done = 0u64;
+        // Walk the untrusted list from the TAIL so the kept entries are the
+        // newest however long the frame is; reversed back to wire order.
+        // The seen-set dedupes the WHOLE frame (newest occurrence wins), so
+        // the totals stay honest even for dupes beyond the storage cap and
+        // the client's keyed dot render never sees a repeated index.
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut agents: Vec<WorkflowAgent> = Vec::new();
+        for a in wire.iter().rev() {
+            if a["type"].as_str() != Some("workflow_agent") {
+                continue;
+            }
+            let index = a["index"].as_u64().unwrap_or(0);
+            if !seen.insert(index) {
+                continue;
+            }
+            total += 1;
+            let state = a["state"].as_str().unwrap_or("start");
+            if state == "done" {
+                done += 1;
+            }
+            if agents.len() < WF_AGENTS_CAP {
+                agents.push(WorkflowAgent {
+                    index,
+                    label: truncate_label(
+                        a["label"]
+                            .as_str()
+                            .or(a["promptPreview"].as_str())
+                            .unwrap_or("agent"),
+                        WF_AGENT_LABEL_MAX,
+                    ),
+                    state: truncate_label(state, WF_AGENT_LABEL_MAX),
+                    result_preview: a["resultPreview"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| truncate_label(s, WF_AGENT_LABEL_MAX)),
+                });
+            }
+        }
+        // A frame that parsed to NOTHING never overwrites folded state: the
+        // wire omits the array on aggregate ticks today, but an explicit []
+        // (unversioned wire) must not wipe a live dot row back to 0/0.
+        if total == 0 {
+            return;
+        }
+        agents.reverse();
+        // The settle order removes the task from the live set ms before the
+        // verdict; a trailing progress frame in that window still patches
+        // the PARKED task in place — silently (no level-set emit, no card
+        // tick: it is not in the emitted set, and the imminent close prints
+        // the corrected counts) — so the final line can't undercount.
+        let Some(idx) = self.background_tasks.iter().position(|t| t.id == task_id) else {
+            if let Some(parked) = self
+                .departed_background
+                .iter_mut()
+                .find(|t| t.id == task_id)
+            {
+                parked.agents = agents;
+                parked.agents_total = total;
+                parked.agents_done = done;
+            }
+            return;
+        };
+        let task = &mut self.background_tasks[idx];
+        if task.agents == agents && task.agents_total == total && task.agents_done == done {
+            return;
+        }
+        task.agents = agents;
+        task.agents_total = total;
+        task.agents_done = done;
+        let card = task.tool_use_id.clone();
+        // Set-wide dot-row budget: the level-set event carries EVERY task,
+        // and the journal replaces an oversized entry with an Error that
+        // would wipe the tray — shed the OLDEST other tasks' dot rows
+        // (aggregates stay) before this event is built.
+        let mut stored: usize = self.background_tasks.iter().map(|t| t.agents.len()).sum();
+        if stored > WF_AGENTS_SET_BUDGET {
+            for (i, task) in self.background_tasks.iter_mut().enumerate() {
+                if i == idx || task.agents.is_empty() {
+                    continue;
+                }
+                stored -= task.agents.len();
+                task.agents = Vec::new();
+                if stored <= WF_AGENTS_SET_BUDGET {
+                    break;
+                }
+            }
+        }
+        self.emit_background_tasks(Vec::new(), step);
+        if let Some(card) = card {
+            step.events.push(card_update(
+                card,
+                ToolStatus::InProgress,
+                format!("{done}/{total} agents done"),
+            ));
+        }
     }
 
     /// One `BackgroundTasks` event carrying the WHOLE current set (level-set
@@ -2541,6 +2756,18 @@ impl ClaudeMapper {
         // consumer (not just the chat reducer) see the tasks end, instead of
         // each re-deriving "cleared on exit".
         if !self.background_tasks.is_empty() || !self.departed_background.is_empty() {
+            // A workflow's launching card would otherwise be stranded at its
+            // last "N/M agents done" tick with no verdict — land an honest
+            // interrupted line before the identities are dropped.
+            for task in self
+                .background_tasks
+                .iter()
+                .chain(self.departed_background.iter())
+            {
+                if let Some(ev) = workflow_card_close(task, "interrupted", None) {
+                    events.push(ev);
+                }
+            }
             self.background_tasks.clear();
             self.departed_background.clear();
             events.push(AgentEvent::BackgroundTasks {
@@ -2678,6 +2905,20 @@ pub(crate) fn tool_kind(name: &str) -> ToolKind {
         // 2.1.207 (live-verified — the old name stays for older CLIs).
         "Task" | "Agent" => ToolKind::Agent,
         _ => ToolKind::Other,
+    }
+}
+
+/// `93s` → `1m 33s`, `4800s` → `1h 20m 00s`: the one elapsed spelling every
+/// driver-built progress and close line shares — the same ladder as the
+/// client tray's `shared/time.ts::formatElapsedSeconds`, so one run never
+/// shows two spellings across the card and the tray.
+fn fmt_elapsed_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -4372,6 +4613,342 @@ mod tests {
         assert!(step.events.is_empty());
     }
 
+    /// One workflow_agent entry in the wire's `workflow_progress` shape
+    /// (live-probed 2.1.207 — PROTOCOL.md Pass 15).
+    fn wf_agent(index: u64, state: &str) -> Value {
+        json!({
+            "type": "workflow_agent", "index": index,
+            "label": format!("agent {index}"), "agentId": format!("a{index}"),
+            "model": "claude-haiku-4-5-20251001", "state": state,
+            "startedAt": 1_784_239_037_359u64, "queuedAt": 1_784_239_037_357u64,
+            "attempt": 1, "promptPreview": format!("agent {index}"),
+            "lastProgressAt": 1_784_239_037_359u64,
+        })
+    }
+
+    #[test]
+    fn workflow_started_enriches_the_set_adopted_entry_with_its_name() {
+        // Live order at spawn: background_tasks_changed (id/type/description
+        // only) PRECEDES task_started (which alone carries workflow_name +
+        // tool_use_id) — the started fold must patch the adopted entry.
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{ "task_id": "wf-1", "task_type": "local_workflow",
+                        "description": "sweep the repo" }],
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-1",
+            "tool_use_id": "tu-w1", "workflow_name": "probe",
+            "description": "sweep the repo", "prompt": "export const meta = …",
+        }));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].workflow_name.as_deref(), Some("probe"));
+        // The same started again changes nothing — no event spam.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-1",
+            "tool_use_id": "tu-w1", "workflow_name": "probe",
+            "description": "sweep the repo",
+        }));
+        assert!(step.events.is_empty());
+    }
+
+    #[test]
+    fn workflow_progress_folds_agents_and_emits_on_transitions_only() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-2",
+            "tool_use_id": "tu-w2", "workflow_name": "probe",
+            "description": "two agents",
+        }));
+        let progress = |agents: Vec<Value>, tokens: u64| {
+            json!({
+                "type": "system", "subtype": "task_progress", "task_id": "wf-2",
+                "tool_use_id": "tu-w2", "description": "two agents",
+                "usage": { "total_tokens": tokens, "tool_uses": 0, "duration_ms": tokens },
+                "workflow_progress": agents,
+            })
+        };
+        let step = m.on_frame(&progress(
+            vec![wf_agent(1, "start"), wf_agent(2, "start")],
+            10,
+        ));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].agents.len(), 2);
+        assert_eq!(tasks[0].agents_total, 2);
+        assert_eq!(tasks[0].agents_done, 0);
+        assert_eq!(tasks[0].agents[0].index, 1);
+        assert_eq!(tasks[0].agents[0].label, "agent 1");
+        assert_eq!(tasks[0].agents[0].state, "start");
+        // The card gets the count line; the client's status guard keeps the
+        // completed launch card completed (content still applies).
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::InProgress,
+                content: Some(ToolContent::Output { text, .. }) }
+                if id == "tu-w2" && text == "0/2 agents done")));
+        // A per-tick re-send (same states, new token/duration counters) is
+        // silent — the stored fields exclude the wire's churn.
+        let step = m.on_frame(&progress(
+            vec![wf_agent(1, "start"), wf_agent(2, "start")],
+            999,
+        ));
+        assert!(step.events.is_empty());
+        // A state transition emits: agent 1 finished with a result preview.
+        let mut a1 = wf_agent(1, "done");
+        a1["resultPreview"] = json!("ok");
+        a1["tokens"] = json!(11_488);
+        a1["durationMs"] = json!(1_243);
+        let step = m.on_frame(&progress(vec![a1, wf_agent(2, "start")], 11_500));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].agents_done, 1);
+        assert_eq!(tasks[0].agents[0].state, "done");
+        assert_eq!(tasks[0].agents[0].result_preview.as_deref(), Some("ok"));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { content: Some(ToolContent::Output { text, .. }), .. }
+                if text == "1/2 agents done")));
+    }
+
+    #[test]
+    fn workflow_agents_cap_keeps_newest_and_totals_stay_honest() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-3",
+            "description": "big fan-out",
+        }));
+        let wire: Vec<Value> = (1..=(WF_AGENTS_CAP as u64 + 10))
+            .map(|i| wf_agent(i, if i <= 5 { "done" } else { "start" }))
+            .collect();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-3",
+            "workflow_progress": wire,
+        }));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].agents.len(), WF_AGENTS_CAP);
+        assert_eq!(tasks[0].agents_total, WF_AGENTS_CAP as u64 + 10);
+        assert_eq!(tasks[0].agents_done, 5, "totals count the WHOLE list");
+        assert_eq!(
+            tasks[0].agents[0].index, 11,
+            "the cap keeps the newest entries"
+        );
+    }
+
+    #[test]
+    fn workflow_progress_dedupes_repeated_indexes_newest_wins() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-6", "description": "d",
+        }));
+        // Index 1 appears twice — the tail (newest) occurrence wins, and the
+        // dupe inflates neither the dot row nor the totals.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-6",
+            "workflow_progress": [wf_agent(1, "start"), wf_agent(2, "start"), wf_agent(1, "done")],
+        }));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(tasks[0].agents.len(), 2);
+        assert_eq!(tasks[0].agents_total, 2);
+        assert_eq!(tasks[0].agents_done, 1);
+        assert_eq!(tasks[0].agents[0].index, 2);
+        assert_eq!(tasks[0].agents[1].index, 1);
+        assert_eq!(
+            tasks[0].agents[1].state, "done",
+            "the newest occurrence wins"
+        );
+    }
+
+    #[test]
+    fn workflow_progress_empty_frame_never_wipes_folded_state() {
+        // The wire OMITS the array on aggregate ticks today; an explicit []
+        // (unversioned wire) must not wipe a live dot row back to 0/0.
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-7",
+            "tool_use_id": "tu-w7", "description": "d",
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-7",
+            "workflow_progress": [wf_agent(1, "start")],
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-7",
+            "workflow_progress": [],
+        }));
+        assert!(step.events.is_empty(), "an empty frame is not a wipe");
+    }
+
+    #[test]
+    fn workflow_progress_after_settle_removal_patches_the_parked_counts() {
+        // The live settle order removes the task ms before the verdict — a
+        // trailing all-done progress frame in that window must still correct
+        // the counts the close line prints (silently: no level-set emit, no
+        // card tick for a task that already left the set).
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-8",
+            "tool_use_id": "tu-w8", "workflow_name": "probe", "description": "d",
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-8",
+            "workflow_progress": [wf_agent(1, "done"), wf_agent(2, "start")],
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed", "tasks": [],
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-8",
+            "workflow_progress": [wf_agent(1, "done"), wf_agent(2, "done")],
+        }));
+        assert!(step.events.is_empty(), "a parked patch is silent");
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "wf-8", "status": "completed",
+            "usage": { "duration_ms": 5_000 },
+        }));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { content: Some(ToolContent::Output { text, .. }), .. }
+                if text == "workflow “probe” completed · 2/2 agents · 5s")));
+    }
+
+    #[test]
+    fn workflow_set_budget_sheds_oldest_dot_rows_keeping_totals() {
+        // The level-set event carries EVERY task — the set-wide agent budget
+        // keeps its serialized size far under the journal's entry cap by
+        // shedding the OLDEST tasks' dot rows (their aggregates stay).
+        let mut m = mapper();
+        let over = WF_AGENTS_SET_BUDGET / WF_AGENTS_CAP + 1;
+        for i in 0..over {
+            m.on_frame(&json!({
+                "type": "system", "subtype": "task_started",
+                "task_type": "local_workflow", "task_id": format!("wf-b{i}"),
+                "description": format!("wf {i}"),
+            }));
+            let wire: Vec<Value> = (1..=(WF_AGENTS_CAP as u64))
+                .map(|n| wf_agent(n, "start"))
+                .collect();
+            m.on_frame(&json!({
+                "type": "system", "subtype": "task_progress",
+                "task_id": format!("wf-b{i}"), "workflow_progress": wire,
+            }));
+        }
+        let stored: usize = m.background_tasks.iter().map(|t| t.agents.len()).sum();
+        assert!(stored <= WF_AGENTS_SET_BUDGET, "budget enforced ({stored})");
+        assert!(
+            m.background_tasks[0].agents.is_empty(),
+            "the oldest task shed its dot row"
+        );
+        assert_eq!(
+            m.background_tasks[0].agents_total, WF_AGENTS_CAP as u64,
+            "aggregates survive the shed"
+        );
+        assert_eq!(
+            m.background_tasks[over - 1].agents.len(),
+            WF_AGENTS_CAP,
+            "the newest keeps its dots"
+        );
+    }
+
+    #[test]
+    fn whitespace_workflow_name_counts_as_absent() {
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-9",
+            "workflow_name": "  ", "description": "real description",
+        }));
+        let (tasks, _) = background_event(&step);
+        assert_eq!(
+            tasks[0].workflow_name, None,
+            "blank name never beats the description fallback"
+        );
+    }
+
+    #[test]
+    fn elapsed_spelling_matches_the_client_ladder() {
+        assert_eq!(fmt_elapsed_secs(59), "59s");
+        assert_eq!(fmt_elapsed_secs(93), "1m 33s");
+        assert_eq!(fmt_elapsed_secs(4800), "1h 20m 00s");
+    }
+
+    #[test]
+    fn workflow_close_lands_the_final_line_on_the_launching_card() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-4",
+            "tool_use_id": "tu-w4", "workflow_name": "probe",
+            "description": "two agents",
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-4",
+            "workflow_progress": [wf_agent(1, "done"), wf_agent(2, "done")],
+        }));
+        // The live settle order: removal first, verdict after — the card
+        // binding and the folded counts must survive the departed buffer.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed", "tasks": [],
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "wf-4", "tool_use_id": "tu-w4", "status": "completed",
+            "summary": "Dynamic workflow \"two agents\" completed",
+            "usage": { "total_tokens": 22_978, "tool_uses": 0, "duration_ms": 435_000 },
+        }));
+        let (_, closed) = background_event(&step);
+        assert_eq!(closed.len(), 1);
+        let card = step
+            .events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolCallUpdate {
+                    id,
+                    status,
+                    content: Some(ToolContent::Output { text, .. }),
+                } if id == "tu-w4" => Some((status, text)),
+                _ => None,
+            })
+            .expect("the launching card gets the final line");
+        assert_eq!(*card.0, ToolStatus::Completed);
+        assert_eq!(card.1, "workflow “probe” completed · 2/2 agents · 7m 15s");
+    }
+
+    #[test]
+    fn workflow_failed_close_flips_the_card_and_bash_closes_leave_cards_alone() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-5",
+            "tool_use_id": "tu-w5", "workflow_name": "probe", "description": "d",
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "wf-5", "status": "failed", "summary": "script threw",
+        }));
+        assert!(step.events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. } if id == "tu-w5")));
+        // A backgrounded Bash close never touches its Bash card — the card's
+        // own tool_result already told that story.
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_bash", "task_id": "bg-9",
+            "tool_use_id": "tu-b9", "description": "sleep 30",
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "bg-9", "status": "completed",
+        }));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCallUpdate { .. })));
+    }
+
     #[test]
     fn background_tasks_changed_is_the_authoritative_level_set() {
         let mut m = mapper();
@@ -4606,11 +5183,26 @@ mod tests {
             "type": "system", "subtype": "task_started",
             "task_type": "local_bash", "task_id": "bg-t", "description": "sleep 600",
         }));
+        // A card-bound workflow gets an honest interrupted line before its
+        // identity is dropped — the card must not strand at "N/M agents done".
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_workflow", "task_id": "wf-t",
+            "tool_use_id": "tu-wt", "workflow_name": "probe", "description": "d",
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_progress", "task_id": "wf-t",
+            "workflow_progress": [wf_agent(1, "done"), wf_agent(2, "start")],
+        }));
         let events = Mapper::drain_pending(&mut m);
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::BackgroundTasks { tasks, closed } if tasks.is_empty() && closed.is_empty()
         )));
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::ToolCallUpdate { id, status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }) }
+                if id == "tu-wt" && text == "workflow “probe” interrupted · 1/2 agents")));
         assert!(
             Mapper::drain_pending(&mut m)
                 .iter()

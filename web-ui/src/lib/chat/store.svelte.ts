@@ -191,6 +191,24 @@ export interface BackgroundTask {
   status: string;
   /** Driver-stamped epoch ms at first sight — the elapsed display's anchor. */
   startedAtMs: number;
+  /** The workflow's meta.name (local_workflow lanes) — the row's title. */
+  workflowName: string | null;
+  /** Per-agent progress (capped server-side, newest kept) — the dot row. */
+  agents: WorkflowAgent[];
+  /** Aggregates counted over the WHOLE wire list — honest beyond the cap. */
+  agentsTotal: number;
+  agentsDone: number;
+}
+
+/** One workflow agent's progress (a `BackgroundTask.agents` member). */
+export interface WorkflowAgent {
+  /** The workflow's own 1-based agent number. */
+  index: number;
+  label: string;
+  /** The wire's state word verbatim (start | done | …) — never remapped. */
+  state: string;
+  /** Head of the agent's final text, once done. */
+  resultPreview: string | null;
 }
 
 export interface ModeInfo {
@@ -424,6 +442,20 @@ export class ChatStore {
             description: (t.description as string) ?? "",
             status: (t.status as string) ?? "running",
             startedAtMs: (t.started_at_ms as number) ?? 0,
+            workflowName: (t.workflow_name as string) ?? null,
+            // Same keyed-render defense as the task ids above, one level
+            // down: the dot row is keyed by agent.index, and a duplicate
+            // (corrupt line, a journal from an older build) would throw.
+            agents: ((t.agents as Record<string, unknown>[]) ?? [])
+              .map((a) => ({
+                index: (a.index as number) ?? 0,
+                label: (a.label as string) ?? "",
+                state: (a.state as string) ?? "start",
+                resultPreview: (a.result_preview as string) ?? null,
+              }))
+              .filter((a, i, arr) => arr.findIndex((b) => b.index === a.index) === i),
+            agentsTotal: (t.agents_total as number) ?? 0,
+            agentsDone: (t.agents_done as number) ?? 0,
           }))
           .filter((t) => t.id !== "");
         // Tasks that left the set WITH a verdict fold into history as quiet
@@ -579,10 +611,8 @@ export class ChatStore {
         // never walk a finished tool back to running — mirror the tool_call
         // re-emit guard above. Content still applies below.
         const status = ev.status as "completed" | "failed" | "in_progress";
-        if (
-          status !== "in_progress" ||
-          (block.status !== "completed" && block.status !== "failed")
-        ) {
+        const wasTerminal = block.status === "completed" || block.status === "failed";
+        if (status !== "in_progress" || !wasTerminal) {
           block.status = status;
         }
         const content = ev.content as ToolContent | null | undefined;
@@ -592,10 +622,15 @@ export class ChatStore {
           block.content = content;
           block.streaming = false;
         }
-        // A finished tool hands the floor back to the model: the status row
-        // returns to "working" until the next delta names a phase.
+        // A tool that JUST finished hands the floor back to the model: the
+        // status row returns to "working" until the next delta names a
+        // phase. Gated on the transition — updates to an already-terminal
+        // card (a background workflow's "N/M agents done" ticks and its
+        // close verdict, landing on the long-completed launch card) must
+        // not flick the live activity of an unrelated running turn.
         if (
           this.running &&
+          !wasTerminal &&
           (block.status === "completed" || block.status === "failed") &&
           this.activity?.kind === "tool"
         ) {

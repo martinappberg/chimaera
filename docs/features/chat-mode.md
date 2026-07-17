@@ -128,6 +128,24 @@ TUI (see [view switch](#view-switch-and-rewind)).
   order). The ■ stop sends `stop_task` with the native task key — the CLI's stop is generic over its
   task registry and acks a raced not-found as success. Codex has no background lane — the tray never
   renders there.
+- **Rich workflow rows + card verdicts (claude).** A `local_workflow` lane renders richer than a
+  bare bash row: the tray row leads with the workflow's `meta.name` (from `task_started
+  .workflow_name`; lane + description stay in the tooltip) and carries a per-agent **dot row**
+  (filled = done, red = error-ish states, hollow = anything else — at most 24 dots, newest win,
+  per-dot tooltip = label — state: result preview) plus an honest "done/total agents" count. The
+  driver folds `task_progress.workflow_progress` (per-agent `{index, label, state, resultPreview…}`,
+  live-probed shape — PROTOCOL.md Pass 15) into the level-set — 24 stored agents per task (exactly
+  the dot-row budget) plus a set-wide 96-entry budget that sheds the oldest tasks' dot rows so one
+  `BackgroundTasks` event can never blow the journal's 256 KiB entry cap — with totals deduped and
+  counted over the whole wire list, and re-emits **only on state transitions** (the stored fields
+  exclude per-tick token churn, so the journal stays quiet). A trailing progress frame that races
+  the settle removal still patches the parked counts, and teardown lands an honest
+  `workflow "name" interrupted · N/M agents` line on any card-bound run that dies with the CLI. The launching `Workflow`
+  tool card ticks "N/M agents done" while the run lives and lands a final
+  `workflow "name" completed · 4/4 agents · 7m 15s` line at the close (a `failed` verdict flips the
+  card red); the count/elapsed survive the departed buffer because they ride the task identity.
+  Inner workflow agents' permission asks ride the normal `can_use_tool` path — they surface as
+  ordinary permission cards, and a denied agent shows as an error dot.
 - **Live subagents tray + active plan step.** Subagents running *right now* are promoted out of the
   (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
   glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"
@@ -261,6 +279,20 @@ TUI (see [view switch](#view-switch-and-rewind)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Rich workflow rows — why they exist
+_Captured 2026-07-16 (from the maintainer, PR #69)._
+
+- **Problem it solves:** "parity with the claude app" — the official chat UI renders Workflow runs
+  as a rich card (name, agent count, elapsed, per-agent dots); Chimaera's chat mode should show the
+  same run, not an anonymous tool card.
+- **How settled it is:** nothing here is a promise — it's "subject to change if how claude works
+  changed." The feature tracks the upstream wire (PROTOCOL.md Pass 15) and should follow it when it
+  moves.
+- **Deliberately open / non-obvious decisions:** none named by the maintainer. (The tray-as-live-
+  surface / card-as-transcript-artifact split is the implementer's fit to the existing workbench
+  design, not a maintainer constraint.)
+- **Do not change:** nothing — the **whole area is open**. Grade: an addition, no core bets.
 
 ### Why chat mode exists
 _Captured 2026-07-09 — drafted from DESIGN.md + code, confirmed live with the maintainer._

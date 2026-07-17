@@ -340,6 +340,108 @@ describe("ChatStore background tasks", () => {
     });
   });
 
+  it("parses a workflow lane's name and per-agent progress", () => {
+    const store = fold([
+      {
+        type: "background_tasks",
+        tasks: [
+          BG({
+            id: "wf-1",
+            task_type: "local_workflow",
+            description: "sweep the repo",
+            workflow_name: "probe",
+            agents: [
+              { index: 1, label: "agent 1", state: "done", result_preview: "ok" },
+              { index: 2, label: "agent 2", state: "start" },
+            ],
+            agents_total: 2,
+            agents_done: 1,
+          }),
+        ],
+      },
+    ]);
+    expect(store.backgroundTasks[0]).toMatchObject({
+      workflowName: "probe",
+      agentsTotal: 2,
+      agentsDone: 1,
+    });
+    expect(store.backgroundTasks[0].agents).toEqual([
+      { index: 1, label: "agent 1", state: "done", resultPreview: "ok" },
+      { index: 2, label: "agent 2", state: "start", resultPreview: null },
+    ]);
+    // Absent workflow fields (a bash lane, an old journal) parse to calm
+    // defaults — no undefined leaking into the tray's render.
+    const bash = fold([{ type: "background_tasks", tasks: [BG()] }]);
+    expect(bash.backgroundTasks[0]).toMatchObject({
+      workflowName: null,
+      agents: [],
+      agentsTotal: 0,
+      agentsDone: 0,
+    });
+  });
+
+  it("background card ticks never flick a running turn's activity", () => {
+    // A workflow's "N/M agents done" updates land on its long-COMPLETED
+    // launch card while an unrelated turn runs a tool. Only a genuine
+    // in_progress→terminal transition hands the floor back — repeated
+    // updates to an already-terminal card must leave the activity alone.
+    const store = fold([
+      // The workflow launched in an earlier turn; its card completed.
+      { type: "tool_call", id: "wf-card", kind: "other", title: "Workflow", status: "in_progress" },
+      { type: "tool_call_update", id: "wf-card", status: "completed" },
+      // A new turn is running a tool — that's the live activity.
+      { type: "turn_started", turn_id: "t2" },
+      { type: "tool_call", id: "c9", kind: "execute", title: "make -j", status: "in_progress" },
+      // Background workflow transition ticks the completed card.
+      {
+        type: "tool_call_update",
+        id: "wf-card",
+        status: "in_progress",
+        content: { kind: "output", text: "1/4 agents done" },
+      },
+      // …and its close verdict re-completes it.
+      {
+        type: "tool_call_update",
+        id: "wf-card",
+        status: "completed",
+        content: { kind: "output", text: "workflow “probe” completed · 4/4 agents · 4s" },
+      },
+    ]);
+    expect(store.activity).toMatchObject({ kind: "tool", detail: "make -j" });
+    // The genuine completion of the RUNNING tool still hands the floor back.
+    const done = fold([
+      { type: "turn_started", turn_id: "t2" },
+      { type: "tool_call", id: "c9", kind: "execute", title: "make -j", status: "in_progress" },
+      { type: "tool_call_update", id: "c9", status: "completed" },
+    ]);
+    expect(done.activity).toMatchObject({ kind: "waiting" });
+  });
+
+  it("dedupes agent indexes so the keyed dot render can't throw", () => {
+    // Same defense as the task-id filter one level down: a corrupt line or
+    // an older build's journal can carry duplicate indexes, and Svelte's
+    // keyed each throws on a repeated key.
+    const store = fold([
+      {
+        type: "background_tasks",
+        tasks: [
+          BG({
+            id: "wf-1",
+            task_type: "local_workflow",
+            agents: [
+              { index: 1, label: "a", state: "start" },
+              { index: 1, label: "b", state: "done" },
+              { label: "no index", state: "start" },
+              { label: "also none", state: "start" },
+            ],
+          }),
+        ],
+      },
+    ]);
+    const indexes = store.backgroundTasks[0].agents.map((a) => a.index);
+    expect(indexes).toEqual([...new Set(indexes)]);
+  });
+
   it("folds a close verdict into history as a notice and empties the set", () => {
     const store = fold([
       { type: "background_tasks", tasks: [BG()] },

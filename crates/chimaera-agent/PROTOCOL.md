@@ -1198,12 +1198,80 @@ e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
 covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
 untouched. `just chat-smoke` re-run for the driver change.
 
-<<<<<<< HEAD
-## Pass 16 (2026-07-16 — live probe codex 0.144.2): multi-agent / collab. ADOPTED.
+## Pass 15 (2026-07-16 — live probe 2.1.207: Workflow runs). ADOPTED.
 
-> Pass 15 (claude Workflow-run wire facts) lives on the `rich workflow rows`
-> branch (PR #69), still unmerged when this pass landed — the number is
-> reserved for it, not skipped by accident.
+A minimal ultracode-keyword Workflow (2 trivial agents, haiku, ~6¢) in
+`-p stream-json`, to see what the official rich workflow card is built from.
+Everything below is already on the 2.1.207 wire — no newer CLI needed
+(changelog through 2.1.211 adds no workflow frames; 2.1.211 does add
+`--forward-subagent-text`, opt-in subagent text/thinking in stream-json).
+
+- **A Workflow run is a background lane end to end.** The `Workflow` tool_use
+  (input `{script}`, the `meta` literal inline) returns immediately —
+  tool_result is launch text ("Workflow launched in background. Task ID: …
+  Transcript dir: … Script file: …"). Frames: `background_tasks_changed
+  {tasks:[{task_id, task_type:"local_workflow", description}]}` →
+  `task_started {task_id, tool_use_id, description, task_type:
+  "local_workflow", workflow_name, prompt:<the script>}` → repeated
+  `task_progress` → the Pass-known settle triple (`background_tasks_changed
+  []` → `task_updated {status:"completed", end_time}` → `task_notification
+  {status, output_file, summary, usage{total_tokens, tool_uses,
+  duration_ms}}`).
+- **`task_started` carries `workflow_name`** (the script's `meta.name`) —
+  the official card's title. We don't read it.
+- **`task_progress` carries `workflow_progress`** — the per-agent state the
+  official card's "N agents" count and dot row render: an array of
+  `{type:"workflow_agent", index, label, agentId, model, state
+  ("start"|"done"), startedAt, queuedAt, attempt, promptPreview,
+  lastProgressAt}` plus, once done, `{tokens, toolCalls, durationMs,
+  resultPreview}`. Some `task_progress` ticks omit the array (aggregate
+  `usage` only). **Today the driver drops ALL of it**: `task_progress` only
+  lands on `task_rows` (subagent tool cards), and background lanes never get
+  a row — the tray shows a static description + elapsed while the per-agent
+  progress falls on the floor. `task_progress` carries `tool_use_id`, so a
+  rich card could bind straight to the Workflow tool card.
+- Also seen, unmapped: `post_turn_summary {summarizes_uuid, status_category
+  (e.g. "review_ready"), status_detail, needs_action}` after each turn —
+  dashboard/status material — since ADOPTED as `SessionStatus` (Pass 17).
+- ADOPTION (same day, verified live against 2.1.211 in the isolated
+  preview — three workflow runs, journal inspected): the driver folds
+  `workflow_name` + `workflow_progress` into the `background_tasks`
+  level-set (per-task agents capped at `WF_AGENTS_CAP`, newest kept;
+  `agents_total`/`agents_done` counted over the whole wire list; re-emit on
+  STATE TRANSITIONS only — the stored fields exclude per-tick churn) and
+  lands "N/M agents done" ticks + a final `workflow "name" {status} ·
+  done/total agents · elapsed` line on the launching Workflow card via
+  `tool_use_id`. New live facts from the adoption runs: agent `state` also
+  takes `progress` (mid-run) and `error`; an agent() with no label gets a
+  CLI-derived `{meta.name}:{index}` label; a workflow whose EVERY agent
+  errors still closes `task_notification {status:"completed"}` (the card's
+  honest 0/N is the tell); inner workflow agents' permission requests ride
+  the ordinary `can_use_tool` control path mid-lane. `just chat-smoke`
+  16/16 on 2.1.211 + codex 0.144.2; TESTED_CLAUDE_VERSION bumped
+  2.1.207 → 2.1.211.
+- HARDENED (same day, xhigh review pass): per-task agent cap 24 (= the
+  client's dot-row budget) + a set-wide `WF_AGENTS_SET_BUDGET` (96) that
+  sheds the oldest tasks' dot rows — the level-set event carries the whole
+  set and the journal REPLACES an over-256 KiB entry with an Error, which
+  would wipe the tray for every client; the budget keeps the worst case far
+  under it. An explicit `workflow_progress: []` never wipes folded state
+  (the wire omits the key on aggregate ticks; treat empty as absent). A
+  trailing progress frame racing the settle removal patches the PARKED
+  task's counts in place (silent — the imminent close prints them).
+  Teardown (`drain_pending`) lands `workflow "name" interrupted · N/M
+  agents` on card-bound runs. Whole-frame index dedupe via seen-set (totals
+  stay honest past the cap). Whitespace-only `workflow_name` counts as
+  absent. Driver-built elapsed gained the hours rung ("1h 20m 00s"),
+  matching the client's `shared/time.ts` ladder.
+- Codex counterpart (0.144.2 binary mine + docs, no live probe yet): collab
+  tools `SpawnAgent`/`SendInput`/`ResumeAgent`/`CloseAgent`, thread-item
+  `collabAgentToolCall`, activity variants `subAgentThreadSpawn`/
+  `subAgentActivity`/`subAgentCompact`, `SubagentStart`/`SubagentStop` hook
+  events; app-server delegation config (disabled / explicit-request-only /
+  proactive). Entirely unmapped in our codex driver — needs its own live
+  probe before adoption.
+
+## Pass 16 (2026-07-16 — live probe codex 0.144.2): multi-agent / collab. ADOPTED.
 
 Codex ships multi-agent ("collab") support; 0.144.2 uses it out of the box
 when asked (raw app-server probes, three runs; no config needed). The model's
