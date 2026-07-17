@@ -6,7 +6,8 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 (`TESTED_*_VERSION`).
 
 Sources:
-- **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5).
+- **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
+  codex 0.144.2 from Pass 16 on).
 - **vsix**: mined from the official VS Code extension bundles
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
@@ -1194,3 +1195,90 @@ e2e `interrupt_classifies_user_stop_and_queue_still_delivers`,
 `cancel_queued_after_delivery_is_a_reducer_noop_tombstone`; reducer vitest
 covers abort→flush ordering and the tombstone dismiss/no-op pair. Wire SHAPE
 untouched. `just chat-smoke` re-run for the driver change.
+
+## Pass 16 (2026-07-16 — live probe codex 0.144.2): multi-agent / collab. ADOPTED.
+
+> Pass 15 (claude Workflow-run wire facts) lives on the `rich workflow rows`
+> branch (PR #69), still unmerged when this pass landed — the number is
+> reserved for it, not skipped by accident.
+
+Codex ships multi-agent ("collab") support; 0.144.2 uses it out of the box
+when asked (raw app-server probes, three runs; no config needed). The model's
+tools are SpawnAgent/SendInput/ResumeAgent/CloseAgent (binary-mined names) —
+but the WIRE surfaces them as items on the parent thread plus whole extra
+threads, as follows.
+
+### The connection multiplexes every thread — the one load-bearing fact
+
+A spawned subagent is a REAL THREAD (its own thread id, rollout file, turns),
+and its ENTIRE transcript — `turn/started`, `item/*` (reasoning,
+agentMessage + deltas, commands…), `thread/tokenUsage/updated`,
+`thread/status/changed`, `mcpServer/startupStatus/updated`, `turn/completed`
+— streams interleaved on the SAME app-server connection, distinguished only
+by `params.threadId` (every `item/*` notification carries `threadId` +
+`turnId`). Observed order at spawn: the parent's `subAgentActivity` marker,
+THEN the subagent's `turn/started`; at answer: the subagent's final
+`agentMessage` + `turn/completed` land BEFORE the parent's `wait` item
+completes. A driver that doesn't scope by threadId renders the subagent's
+answer as the parent's prose and closes the parent turn on the subagent's
+`turn/completed`. The driver now gates every notification on
+`params.threadId` (absent or matching = the parent's; anything else feeds
+the subagent lane). `serverRequest/resolved` is exempt — JSON-RPC ids are
+connection-scoped, and a subagent-thread ask must still withdraw its card.
+Server→client REQUESTS (approvals, requestUserInput) also carry the
+subagent's threadId but answer by rpc id, so the existing card path already
+routes them correctly regardless of thread.
+
+### Parent-thread items
+
+- `subAgentActivity` — the spawn/input/close markers. Arrives as
+  `item/completed` ONLY (no started). Shape: `{type, id (the collab CALL id,
+  "call_…"), kind, agentThreadId, agentPath}`. `agentPath` is a namespace
+  path whose last segment is the model's own name for the agent
+  ("/root/agent_a"). Kinds seen live: `started` (spawn), `interacted`
+  (send_input — the follow-up then runs as a NEW TURN on the agent's
+  thread), `interrupted` (close/shutdown). Binary mining also names
+  compaction and a catch-all variant (subAgentThreadSpawn/subAgentActivity/
+  subAgentCompact/subAgentOther) — unseen kinds are folded onto the row
+  verbatim rather than dropped.
+- `collabAgentToolCall` — a collab tool call as an item. Live, only
+  `tool:"wait"` surfaces this way (started + completed pair); spawn/input/
+  close produce only the activity markers above. Shape: `{type, id
+  ("call_…"), tool, status (inProgress|completed), senderThreadId (= the
+  parent), receiverThreadIds[], prompt, model, reasoningEffort,
+  agentsStates{}}` — the last four were null/empty in every probe (likely
+  populated for targeted waits/spawns; shapes unprobed).
+
+### Delegation config
+
+The thread/settings surface calls it `multiAgentMode`; `thread/start`'s
+result echoes the default: `explicitRequestOnly`. Full enum, pinned by the
+server's own -32600 error text: `none | custom | explicitRequestOnly |
+proactive` (camelCase on the wire — "disabled"/"explicit-request-only" are
+rejected). `thread/settings/update {threadId, multiAgentMode}` accepts it
+live (0.144.2); it also rides `turn/start` per-turn (pass-2 mining). Not
+exposed in chimaera yet — the default already delegates when asked.
+
+### Chimaera's mapping (claude-symmetric)
+
+The subagent surface is claude's exactly: an `Agent: {name}` tool row
+(`ToolKind::Agent`, row id `agent:{agentThreadId}`, name = last agentPath
+segment) that the AgentsTray derives from. `started` opens the row;
+foreign-thread frames fold into its progress line ("{last} · N tools · M
+tokens" — claude's task_progress format; tokens from the agent thread's
+`tokenUsage`, tools counted from its completed tool-ish items); the agent
+thread's `turn/completed` closes the row ("answered" — it sits idle
+awaiting follow-ups); `interacted` re-opens it; `interrupted` closes it
+("closed"). Subagent transcripts are hidden from the parent's (claude hides
+parent_tool_use_id frames the same way). The set lives per parent turn like
+claude's task map: an aborted/failed/watchdogged parent turn first fails
+still-open rows ("subagent stopped with the turn"), a normal end just
+clears the set. `wait` renders as an ordinary tool row ("waiting for
+subagents"), upserted-on-completed so an instant call without item/started
+still lands. Nested delegation (a subagent spawning its own) shows as that
+agent's "delegating" progress — no nested rows. No stop affordance: the
+collab tools are the MODEL's, and no client→server RPC to stop a single
+subagent is known (`turn/interrupt` on the subagent's thread/turn is
+unprobed) — the tray's stop stays claude-only. SubagentStart/SubagentStop
+HOOK events (binary-mined) are codex's hook system, not this wire — not
+consumed.

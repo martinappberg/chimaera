@@ -979,6 +979,88 @@ async fn codex_echo_turn_deltas_usage_and_completion() {
         .expect("shutdown");
 }
 
+/// The multi-agent (collab) wire facts the driver's thread-scoping leans on
+/// (PROTOCOL.md Pass 16): a delegation request produces `subAgentActivity`
+/// markers on the parent thread, and the subagent's OWN thread streams its
+/// transcript interleaved on this same connection under its own threadId —
+/// so the parent's turn end must be filtered by threadId to be found at all.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills a small multi-agent turn"]
+async fn codex_collab_subagent_surface() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let thread_id = chat
+        .thread_start(dir.path(), HANDSHAKE)
+        .await
+        .expect("thread/start");
+    chat.turn_start(
+        &thread_id,
+        "Use your subagent/collaboration tools for this: spawn ONE subagent \
+         whose task is to compute 6*7 and reply with just the number. Wait \
+         for it, then report its answer. Do not run shell commands, do not \
+         change files — delegate to a subagent and relay its answer.",
+    )
+    .await
+    .expect("turn/start");
+
+    let mut agent_thread = String::new();
+    let mut saw_foreign_frame = false;
+    let mut saw_foreign_turn_end = false;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("codex exited before turn completed");
+        let frame_thread = frame["params"]["threadId"].as_str().unwrap_or_default();
+        let item = &frame["params"]["item"];
+        match frame["method"].as_str() {
+            Some("item/completed") if item["type"] == "subAgentActivity" => {
+                assert_eq!(frame_thread, thread_id, "activity markers ride the parent");
+                if item["kind"] == "started" {
+                    agent_thread = item["agentThreadId"]
+                        .as_str()
+                        .expect("subAgentActivity carries agentThreadId")
+                        .to_string();
+                    assert_ne!(agent_thread, thread_id, "a subagent is its own thread");
+                    assert!(item["agentPath"].is_string(), "agentPath names the agent");
+                }
+            }
+            // The subagent's own transcript multiplexes onto this connection.
+            Some("turn/completed") if frame_thread == agent_thread && !agent_thread.is_empty() => {
+                saw_foreign_turn_end = true;
+            }
+            Some(_) if !agent_thread.is_empty() && frame_thread == agent_thread => {
+                saw_foreign_frame = true;
+            }
+            // The parent's end arrives AFTER (and despite) the subagent's —
+            // exactly what the driver's threadId gate exists for.
+            Some("turn/completed") if frame_thread == thread_id => {
+                assert_eq!(frame["params"]["turn"]["status"], "completed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !agent_thread.is_empty(),
+        "the model delegated (subAgentActivity started)"
+    );
+    assert!(
+        saw_foreign_frame,
+        "the subagent thread's transcript streamed on this connection"
+    );
+    assert!(
+        saw_foreign_turn_end,
+        "the subagent's own turn/completed arrived (threadId-scoped)"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// Feature-detects the codex control surface the driver leans on: turn/steer
 /// (exists; errors sanely without an active turn), thread/settings/update
 /// (supported or -32601 → the driver's per-turn fallback), account/read

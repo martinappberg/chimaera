@@ -14,6 +14,9 @@
 //!   tokenUsage notification on this version).
 //! - Approvals arrive as server→client JSON-RPC *requests* (they carry an
 //!   `id` and a `method`) and must be answered by that id.
+//! - The connection multiplexes EVERY thread: a collab subagent's whole
+//!   transcript streams interleaved with the parent's, distinguished only by
+//!   `params.threadId` (multi-agent, live 0.144.2 — PROTOCOL.md Pass 16).
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,8 +26,8 @@ use serde_json::{json, Value};
 
 use crate::ndjson::JsonlChild;
 
-/// CLI version these frame shapes were verified against (2026-07-07).
-pub const TESTED_CODEX_VERSION: &str = "0.142.5";
+/// CLI version these frame shapes were verified against (2026-07-16).
+pub const TESTED_CODEX_VERSION: &str = "0.144.2";
 
 /// The `initialize` request both the probe client and the driver handshake
 /// send. Declares `experimentalApi` so `thread/settings/update` is available
@@ -441,6 +444,69 @@ struct PendingQuestion {
     deadline: Option<std::time::Instant>,
 }
 
+/// How many collab subagent rows we track at once. Real fan-outs are a
+/// handful; the cap only guards a runaway turn (login-node budgets).
+const COLLAB_AGENTS_CAP: usize = 32;
+
+/// One spawned collab subagent (multi-agent, 0.144.x): the parent thread's
+/// `subAgentActivity` markers open/close it, and every frame of the agent's
+/// OWN thread — which multiplexes onto this same connection — folds into its
+/// row. The row is claude's exact subagent surface: an `Agent: {name}` tool
+/// card whose output line carries the latest progress.
+struct CollabAgent {
+    /// The subagent's thread id — the key every foreign frame carries.
+    thread_id: String,
+    /// Transcript row id (`agent:{thread_id}`), the Agent tool card.
+    row_id: String,
+    /// The row renders in-progress right now (feeds the AgentsTray). A
+    /// closed row stays parked here so late frames from its thread don't
+    /// re-open anything; an "interacted" marker re-opens it.
+    open: bool,
+    /// Tool-ish items completed on the agent's thread.
+    tools: u64,
+    /// Latest cumulative token total for the agent's thread.
+    tokens: u64,
+    /// Latest activity label ("thinking", a command title, "answered", …).
+    last: String,
+}
+
+impl CollabAgent {
+    /// The row's one-line progress — claude's task_progress format
+    /// ("{last} · {n} tools · {tok} tokens"), driver-built so replay
+    /// reproduces it byte-identically.
+    fn progress(&self) -> Option<String> {
+        let mut line = String::new();
+        if !self.last.is_empty() {
+            line.push_str(&self.last);
+        }
+        if self.tools > 0 {
+            if !line.is_empty() {
+                line.push_str(" · ");
+            }
+            line.push_str(&format!("{} tools", self.tools));
+        }
+        if self.tokens > 0 {
+            if !line.is_empty() {
+                line.push_str(" · ");
+            }
+            line.push_str(&format!("{} tokens", self.tokens));
+        }
+        (!line.is_empty()).then_some(line)
+    }
+
+    /// The in-progress row update carrying [`Self::progress`].
+    fn progress_event(&self) -> AgentEvent {
+        AgentEvent::ToolCallUpdate {
+            id: self.row_id.clone(),
+            status: ToolStatus::InProgress,
+            content: self.progress().map(|text| ToolContent::Output {
+                text,
+                truncated: false,
+            }),
+        }
+    }
+}
+
 /// Protocol → normalized-model translator for the app-server stream. Pure
 /// state machine (no I/O), mirroring claude's `Mapper`.
 struct CodexMapper {
@@ -497,6 +563,9 @@ struct CodexMapper {
     /// trace ("harness is blocking").
     decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
+    /// Collab subagents by their thread id, insertion-ordered (see
+    /// [`CollabAgent`]). Lives per parent turn, like claude's task map.
+    collab_agents: Vec<CollabAgent>,
     /// fileChange item id → touched paths (approval titles look them up).
     item_locations: HashMap<String, Vec<String>>,
     /// Live output bytes already streamed per item (caps the deltas; the
@@ -555,6 +624,7 @@ impl CodexMapper {
             safety_notified: false,
             decline_notified: false,
             pending_rpcs: HashMap::new(),
+            collab_agents: Vec::new(),
             item_locations: HashMap::new(),
             out_streamed: HashMap::new(),
             last_usage: Usage::default(),
@@ -602,6 +672,25 @@ impl CodexMapper {
                 self.on_response(id, frame, &mut step);
             }
             return step;
+        }
+
+        // One app-server connection multiplexes EVERY thread: a collab
+        // subagent's whole transcript (turn/*, item/*, tokenUsage) streams
+        // interleaved with the parent's, distinguished only by
+        // params.threadId (live 0.144.2). Frames for another thread feed the
+        // subagent lane — without this gate a subagent's final answer renders
+        // as the parent's prose and its turn/completed closes the parent turn
+        // early. serverRequest/resolved stays global: JSON-RPC request ids
+        // are connection-scoped, and a subagent-thread ask must still
+        // withdraw its card.
+        if method != "serverRequest/resolved" {
+            if let Some(thread) = frame["params"]["threadId"].as_str() {
+                if thread != self.thread_id {
+                    let thread = thread.to_string();
+                    self.on_foreign_frame(&thread, method, frame, &mut step);
+                    return step;
+                }
+            }
         }
 
         match method {
@@ -833,6 +922,11 @@ impl CodexMapper {
                     usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
                     let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
                     if turn["status"] == "interrupted" {
+                        // The turn died with its subagents still open: close
+                        // their rows as failed BEFORE the abort marker, so
+                        // the UI's turn-end reconcile can't flip them green
+                        // (claude parity).
+                        self.fail_dangling_collab_agents(&mut step);
                         // status "interrupted" only follows a turn/interrupt RPC
                         // — codex's wire carries the user-stop fact structurally.
                         step.events.push(AgentEvent::TurnAborted {
@@ -876,6 +970,9 @@ impl CodexMapper {
                 let was_active = self.turn_active;
                 self.turn_active = false;
                 if was_active {
+                    // Subagent rows die with the failed turn (claude parity —
+                    // never reconciled green by the UI's turn-end sweep).
+                    self.fail_dangling_collab_agents(&mut step);
                     step.events.push(AgentEvent::TurnAborted {
                         turn_id: self.turn_id.clone(),
                         reason: frame["params"]["error"]["message"]
@@ -919,6 +1016,12 @@ impl CodexMapper {
         // Approvals only ever reference items of the current turn; keeping
         // these forever is unbounded growth over a long session.
         self.item_locations.clear();
+        // Collab subagents live per parent turn, like claude's task map
+        // (wiped on result). Rows still open on a NORMAL end were left
+        // running deliberately — the UI's turn-end reconcile closes them
+        // (green), exactly as it does claude's; the abort paths fail them
+        // explicitly before this runs.
+        self.collab_agents.clear();
     }
 
     /// A response to one of our client→server requests.
@@ -1395,6 +1498,83 @@ impl CodexMapper {
                     });
                 }
             }
+            // A collab tool call the model made (multi-agent, 0.144.x). Live,
+            // only "wait" surfaces as an item — spawn/input/close appear as
+            // subAgentActivity markers instead — but unseen tools render too.
+            Some("collabAgentToolCall") => {
+                let tool = item["tool"].as_str().unwrap_or("collab");
+                let title = match tool {
+                    "wait" => "waiting for subagents".to_string(),
+                    other => match item["prompt"].as_str() {
+                        Some(p) if !p.is_empty() => {
+                            format!("collab {other}: {}", truncate_label(p, 120))
+                        }
+                        _ => format!("collab {other}"),
+                    },
+                };
+                if let Some(flushed) = self.coalescer.flush() {
+                    step.events.push(flushed);
+                }
+                // Upsert the row even on completed: an instant call may
+                // never emit item/started (clients upsert tool rows by id).
+                step.events.push(AgentEvent::ToolCall {
+                    id: id.clone(),
+                    kind: ToolKind::Other,
+                    title,
+                    locations: Vec::new(),
+                    status: ToolStatus::InProgress,
+                });
+                if completed {
+                    let failed =
+                        matches!(item["status"].as_str(), Some("failed") | Some("declined"));
+                    step.events.push(AgentEvent::ToolCallUpdate {
+                        id,
+                        status: if failed {
+                            ToolStatus::Failed
+                        } else {
+                            ToolStatus::Completed
+                        },
+                        content: None,
+                    });
+                }
+            }
+            // A collab tool acted on a subagent: spawn ("started"), follow-up
+            // input ("interacted"), shutdown ("interrupted"). The marker
+            // arrives as item/completed only; item.id is the collab CALL id,
+            // so the subagent's THREAD id is the stable row key.
+            Some("subAgentActivity") if completed => {
+                let thread = item["agentThreadId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if thread.is_empty() {
+                    return;
+                }
+                // The model's own name for the agent is the last agentPath
+                // segment ("/root/agent_a" → "agent_a").
+                let name = item["agentPath"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("subagent")
+                    .to_string();
+                let name = truncate_label(&name, 60);
+                match item["kind"].as_str().unwrap_or_default() {
+                    "started" => self.collab_agent_open(&thread, &name, "", step),
+                    "interacted" => self.collab_agent_open(&thread, &name, "follow-up input", step),
+                    "interrupted" => {
+                        self.collab_agent_close(&thread, ToolStatus::Completed, "closed", step)
+                    }
+                    // Unseen kinds (binary mining also names compaction and a
+                    // catch-all): show the agent's own word on the row.
+                    other => {
+                        let label = truncate_label(other, 40);
+                        self.collab_agent_note(&thread, &label, step);
+                    }
+                }
+            }
             Some("contextCompaction") if completed => {
                 step.events.push(AgentEvent::Notice {
                     text: "context compacted".into(),
@@ -1460,6 +1640,251 @@ impl CodexMapper {
     /// abort), and an error re-drives it as a fresh turn via `on_response`'s
     /// steer-error arms. Call AFTER `reset_turn_state` (which clears the
     /// `turn_pending` window this re-drive opens).
+    /// Find-or-create the Agent tool row for a subagent thread and (re)open
+    /// it. The row is claude's exact subagent surface — `Agent: {name}`,
+    /// `ToolKind::Agent`, progress folded into its output line — which is
+    /// also what the AgentsTray derives from.
+    fn collab_agent_open(&mut self, thread: &str, name: &str, note: &str, step: &mut DriverStep) {
+        if let Some(agent) = self
+            .collab_agents
+            .iter_mut()
+            .find(|a| a.thread_id == thread)
+        {
+            let reopened = !agent.open;
+            agent.open = true;
+            if !note.is_empty() {
+                agent.last = note.to_string();
+            }
+            if reopened || !note.is_empty() {
+                step.events.push(agent.progress_event());
+            }
+            return;
+        }
+        // Cap: forget the oldest CLOSED row first; if every slot is somehow a
+        // live agent, close the oldest so the set stays bounded.
+        if self.collab_agents.len() >= COLLAB_AGENTS_CAP {
+            let idx = self.collab_agents.iter().position(|a| !a.open).unwrap_or(0);
+            let evicted = self.collab_agents.remove(idx);
+            if evicted.open {
+                step.events.push(AgentEvent::ToolCallUpdate {
+                    id: evicted.row_id,
+                    status: ToolStatus::Completed,
+                    content: None,
+                });
+            }
+        }
+        let row_id = format!("agent:{thread}");
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
+        }
+        step.events.push(AgentEvent::ToolCall {
+            id: row_id.clone(),
+            kind: ToolKind::Agent,
+            title: format!("Agent: {name}"),
+            locations: Vec::new(),
+            status: ToolStatus::InProgress,
+        });
+        let agent = CollabAgent {
+            thread_id: thread.to_string(),
+            row_id,
+            open: true,
+            tools: 0,
+            tokens: 0,
+            last: note.to_string(),
+        };
+        if !note.is_empty() {
+            step.events.push(agent.progress_event());
+        }
+        self.collab_agents.push(agent);
+    }
+
+    /// Close a subagent's row: it answered (its own turn completed), was shut
+    /// down ("interrupted" activity), or its turn failed. The entry stays
+    /// parked so trailing frames from its thread don't resurrect the row.
+    fn collab_agent_close(
+        &mut self,
+        thread: &str,
+        status: ToolStatus,
+        note: &str,
+        step: &mut DriverStep,
+    ) {
+        let Some(agent) = self
+            .collab_agents
+            .iter_mut()
+            .find(|a| a.thread_id == thread)
+        else {
+            return;
+        };
+        if !agent.open {
+            return;
+        }
+        agent.open = false;
+        agent.last = note.to_string();
+        step.events.push(AgentEvent::ToolCallUpdate {
+            id: agent.row_id.clone(),
+            status,
+            content: agent.progress().map(|text| ToolContent::Output {
+                text,
+                truncated: false,
+            }),
+        });
+    }
+
+    /// Fold an activity label into a subagent's progress line.
+    fn collab_agent_note(&mut self, thread: &str, label: &str, step: &mut DriverStep) {
+        let Some(agent) = self
+            .collab_agents
+            .iter_mut()
+            .find(|a| a.thread_id == thread)
+        else {
+            return;
+        };
+        agent.last = label.to_string();
+        if agent.open {
+            step.events.push(agent.progress_event());
+        }
+    }
+
+    /// The parent turn died (interrupt, failure, watchdog): close every
+    /// still-open subagent row as failed — their own turn ends will never
+    /// render, and the UI's turn-end reconcile would otherwise flip them to a
+    /// green "completed". Same wording and semantics as claude's
+    /// `fail_dangling_tasks`. Clears the set it drains.
+    fn fail_dangling_collab_agents(&mut self, step: &mut DriverStep) {
+        for agent in std::mem::take(&mut self.collab_agents) {
+            if !agent.open {
+                continue;
+            }
+            step.events.push(AgentEvent::ToolCallUpdate {
+                id: agent.row_id,
+                status: ToolStatus::Failed,
+                content: Some(ToolContent::Output {
+                    text: "subagent stopped with the turn".into(),
+                    truncated: false,
+                }),
+            });
+        }
+    }
+
+    /// A frame for a thread that is not ours: a collab subagent working (its
+    /// entire transcript multiplexes onto this one connection, live 0.144.2).
+    /// The official surfaces keep subagent transcripts out of the parent's —
+    /// claude hides parent_tool_use_id-tagged frames the same way — so
+    /// nothing here reaches the main transcript; the visible surface is the
+    /// Agent row's progress line.
+    fn on_foreign_frame(
+        &mut self,
+        thread: &str,
+        method: &str,
+        frame: &Value,
+        step: &mut DriverStep,
+    ) {
+        match method {
+            "item/started" | "item/completed" => {
+                let item = &frame["params"]["item"];
+                let completed = method == "item/completed";
+                let (label, is_tool): (String, bool) = match item["type"].as_str() {
+                    Some("commandExecution") => (command_title(item), true),
+                    Some("fileChange") => {
+                        let n = item["changes"].as_array().map_or(0, |c| c.len());
+                        let label = if n > 1 {
+                            format!("editing {n} files")
+                        } else {
+                            "editing a file".to_string()
+                        };
+                        (label, true)
+                    }
+                    Some("mcpToolCall") => (
+                        format!(
+                            "{}.{}",
+                            item["server"].as_str().unwrap_or("mcp"),
+                            item["tool"].as_str().unwrap_or("tool"),
+                        ),
+                        true,
+                    ),
+                    Some("webSearch") => (
+                        format!(
+                            "search: {}",
+                            truncate_label(item["query"].as_str().unwrap_or("the web"), 60),
+                        ),
+                        true,
+                    ),
+                    Some("imageGeneration") => ("generating an image".to_string(), true),
+                    // A subagent delegating further (nested agents get no
+                    // rows of their own; their work reads as this agent's).
+                    Some("collabAgentToolCall") => ("delegating".to_string(), true),
+                    Some("reasoning") => ("thinking".to_string(), false),
+                    Some("agentMessage") => ("replying".to_string(), false),
+                    _ => return,
+                };
+                let Some(agent) = self
+                    .collab_agents
+                    .iter_mut()
+                    .find(|a| a.thread_id == thread)
+                else {
+                    return;
+                };
+                agent.last = label;
+                if completed && is_tool {
+                    agent.tools += 1;
+                }
+                if agent.open {
+                    step.events.push(agent.progress_event());
+                }
+            }
+            // A new turn on the agent's thread — a follow-up/resume set it
+            // working again, so the row re-opens (the tray re-shows it).
+            "turn/started" => {
+                if let Some(agent) = self
+                    .collab_agents
+                    .iter_mut()
+                    .find(|a| a.thread_id == thread)
+                {
+                    agent.open = true;
+                    agent.last = "running".to_string();
+                    step.events.push(agent.progress_event());
+                }
+            }
+            // The agent's turn ended: it answered and sits idle awaiting
+            // follow-ups — the row closes; an "interacted" marker re-opens it.
+            "turn/completed" => {
+                let word = if frame["params"]["turn"]["status"] == "interrupted" {
+                    "interrupted"
+                } else {
+                    "answered"
+                };
+                self.collab_agent_close(thread, ToolStatus::Completed, word, step);
+            }
+            "turn/failed" => {
+                let reason = frame["params"]["error"]["message"]
+                    .as_str()
+                    .unwrap_or("turn failed");
+                let reason = truncate_label(reason, 80);
+                self.collab_agent_close(thread, ToolStatus::Failed, &reason, step);
+            }
+            "thread/tokenUsage/updated" => {
+                let Some(agent) = self
+                    .collab_agents
+                    .iter_mut()
+                    .find(|a| a.thread_id == thread)
+                else {
+                    return;
+                };
+                if let Some(total) = frame["params"]["tokenUsage"]["total"]["totalTokens"].as_u64()
+                {
+                    agent.tokens = total;
+                }
+                if agent.open {
+                    step.events.push(agent.progress_event());
+                }
+            }
+            // Everything else on a foreign thread (status flips, mcp startup,
+            // name updates, deltas, model reroutes) is that thread's own
+            // business — never the parent transcript's.
+            _ => {}
+        }
+    }
+
     fn redrive_queued_after_abort(&mut self, step: &mut DriverStep) {
         if self.buffered_sends.is_empty() {
             return;
@@ -2164,6 +2589,8 @@ impl CodexMapper {
             return step;
         }
         self.turn_active = false;
+        // The synthesized abort closes subagent rows exactly like a real one.
+        self.fail_dangling_collab_agents(&mut step);
         step.events.push(AgentEvent::TurnAborted {
             turn_id: self.turn_id.clone(),
             reason: "interrupted".into(),
@@ -3630,5 +4057,214 @@ mod tests {
             }
             other => panic!("expected UsageReport, got {other:?}"),
         }
+    }
+
+    /// Live 0.144.2 shape: the spawn marker on the PARENT thread
+    /// (item/completed only; item.id is the collab call id).
+    fn sub_agent_activity(kind: &str, agent_thread: &str) -> Value {
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1",
+                "turnId": "turn-A",
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "call_spawn1",
+                    "kind": kind,
+                    "agentThreadId": agent_thread,
+                    "agentPath": "/root/agent_a",
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn collab_spawn_creates_an_agent_row_and_foreign_frames_fold_progress() {
+        let mut m = mapper();
+        active_turn(&mut m);
+
+        let step = m.on_frame(&sub_agent_activity("started", "sub-1"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCall {
+                id: "agent:sub-1".into(),
+                kind: ToolKind::Agent,
+                title: "Agent: agent_a".into(),
+                locations: Vec::new(),
+                status: ToolStatus::InProgress,
+            }]
+        );
+
+        // The agent thread's own frames fold into the row's progress line.
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": { "threadId": "sub-1", "turnId": "t-s1",
+                        "item": { "type": "reasoning", "id": "rs-1" } },
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCallUpdate {
+                id: "agent:sub-1".into(),
+                status: ToolStatus::InProgress,
+                content: Some(ToolContent::Output {
+                    text: "thinking".into(),
+                    truncated: false,
+                }),
+            }]
+        );
+        let step = m.on_frame(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": { "threadId": "sub-1",
+                        "tokenUsage": { "total": { "totalTokens": 1234 } } },
+        }));
+        match &step.events[0] {
+            AgentEvent::ToolCallUpdate {
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            } => assert_eq!(text, "thinking · 1234 tokens"),
+            other => panic!("expected progress update, got {other:?}"),
+        }
+
+        // Its turn completing closes the row (answered, idle)…
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "sub-1",
+                        "turn": { "id": "t-s1", "status": "completed" } },
+        }));
+        match &step.events[0] {
+            AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }),
+            } => {
+                assert_eq!(id, "agent:sub-1");
+                assert!(text.starts_with("answered"), "close note: {text}");
+            }
+            other => panic!("expected close update, got {other:?}"),
+        }
+        // …and the parent turn is untouched by any of it.
+        assert!(m.turn_active, "foreign turn end must not close the parent");
+
+        // A follow-up (send_input) re-opens the same row.
+        let step = m.on_frame(&sub_agent_activity("interacted", "sub-1"));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ToolCallUpdate {
+                id: "agent:sub-1".into(),
+                status: ToolStatus::InProgress,
+                content: Some(ToolContent::Output {
+                    // reasoning items aren't tools — only the token total
+                    // rides along with the note.
+                    text: "follow-up input · 1234 tokens".into(),
+                    truncated: false,
+                }),
+            }]
+        );
+
+        // An explicit shutdown (close_agent) closes it for good.
+        let step = m.on_frame(&sub_agent_activity("interrupted", "sub-1"));
+        match &step.events[0] {
+            AgentEvent::ToolCallUpdate {
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }),
+                ..
+            } => assert!(text.starts_with("closed"), "close note: {text}"),
+            other => panic!("expected close update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_thread_frames_never_touch_the_parent_transcript() {
+        let mut m = mapper();
+        active_turn(&mut m);
+
+        // A subagent's prose, turn end, name, and reroute frames — all tagged
+        // with its own threadId — must not leak into the parent's stream.
+        let mut events = Vec::new();
+        for frame in [
+            json!({ "method": "item/agentMessage/delta",
+                    "params": { "threadId": "sub-9", "itemId": "m1", "delta": "42" } }),
+            json!({ "method": "item/completed",
+                    "params": { "threadId": "sub-9", "turnId": "t",
+                                "item": { "type": "agentMessage", "id": "m1", "text": "42" } } }),
+            json!({ "method": "turn/completed",
+                    "params": { "threadId": "sub-9",
+                                "turn": { "id": "t", "status": "completed" } } }),
+            json!({ "method": "thread/name/updated",
+                    "params": { "threadId": "sub-9", "threadName": "sub thread" } }),
+            json!({ "method": "thread/tokenUsage/updated",
+                    "params": { "threadId": "sub-9",
+                                "tokenUsage": { "total": { "totalTokens": 9 },
+                                                 "last": { "totalTokens": 9 },
+                                                 "modelContextWindow": 100 } } }),
+        ] {
+            events.extend(m.on_frame(&frame).events);
+            events.extend(m.flush());
+        }
+        assert_eq!(events, Vec::new(), "foreign frames leaked: {events:?}");
+        assert!(m.turn_active, "parent turn survives foreign turn ends");
+    }
+
+    #[test]
+    fn parent_abort_fails_dangling_agent_rows_before_the_abort_marker() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        m.on_frame(&sub_agent_activity("started", "sub-1"));
+
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "thr-1",
+                        "turn": { "id": "turn-A", "status": "interrupted",
+                                   "durationMs": 10 } },
+        }));
+        let close = step
+            .events
+            .iter()
+            .position(|e| {
+                matches!(e, AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. }
+                             if id == "agent:sub-1")
+            })
+            .expect("dangling row closes failed");
+        let abort = step
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnAborted { .. }))
+            .expect("abort marker");
+        assert!(
+            close < abort,
+            "row must close before the abort so the UI reconcile can't flip it green"
+        );
+        assert!(m.collab_agents.is_empty(), "the set clears with the turn");
+    }
+
+    #[test]
+    fn collab_wait_tool_renders_an_upserted_tool_row() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        // Completed WITHOUT a prior item/started (instant call): the arm
+        // upserts the row, then resolves it.
+        let step = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": { "threadId": "thr-1", "turnId": "turn-A",
+                        "item": { "type": "collabAgentToolCall", "id": "call_w1",
+                                   "tool": "wait", "status": "completed" } },
+        }));
+        assert_eq!(
+            step.events,
+            vec![
+                AgentEvent::ToolCall {
+                    id: "call_w1".into(),
+                    kind: ToolKind::Other,
+                    title: "waiting for subagents".into(),
+                    locations: Vec::new(),
+                    status: ToolStatus::InProgress,
+                },
+                AgentEvent::ToolCallUpdate {
+                    id: "call_w1".into(),
+                    status: ToolStatus::Completed,
+                    content: None,
+                },
+            ]
+        );
     }
 }

@@ -136,6 +136,15 @@ TUI (see [view switch](#view-switch-and-rewind)).
   (reconciled shut at turn end). The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
+- **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
+  identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
+  `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·
+  N tools · M tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
+  the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
+  from the parent's (claude symmetry), re-opens the row on follow-up input, and closes it when the
+  agent answers ("answered"), is shut down ("closed"), or dies with an aborted parent turn. The
+  model's `wait` renders as a "waiting for subagents" tool row. No per-agent stop for codex (no
+  such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Pass 16.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
