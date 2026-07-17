@@ -19,6 +19,7 @@
   import { relativeAge } from "../workspace/launcher";
   import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
+  import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
 
@@ -253,7 +254,13 @@
       stalled — terminal output has gone quiet
     </div>
   {:else if !compact && nowLine !== null}
-    <div class="now" title={nowLine}>{nowLine}</div>
+    <!-- The now-line often carries the agent's own markdown ("**Workflow 1**
+         — done"): render the inline subset so the markers become emphasis,
+         not literal `*` noise. Safe by construction (escape-then-format +
+         DOMPurify allowlist — see inlineMarkdown); the raw text stays the
+         hover title. -->
+    <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized in inlineMarkdown -->
+    <div class="now" title={nowLine}>{@html inlineMarkdown(nowLine)}</div>
   {/if}
 
   {#if planEntries.length > 0}
@@ -374,18 +381,14 @@
   .card:hover {
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
-  /* Unread = finished with output you haven't looked at. The whole card is
-     the signal (clearer than a tiny mark): a soft accent left-bar + a faint
-     tint + an accent-tinted border draw the eye without shouting, and clear
-     the moment the session is focused. Never the state DOT's job — the dot
-     still shows the true state (done/errored/…); this only says "new". */
+  /* Unread = finished with output you haven't looked at. A SUBTLE cue, not a
+     takeover: a thin accent left-bar + a barely-there tint mark the card
+     without dominating the roster, and clear the moment the session is
+     focused. Never the state DOT's job — the dot still shows the true state
+     (done/errored/…); this only whispers "new". */
   .card.unread {
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--edge));
-    background: color-mix(in srgb, var(--accent) 6%, var(--overlay-bg));
-    box-shadow: inset 3px 0 0 var(--accent);
-  }
-  .card.unread .name {
-    font-weight: 600;
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
+    background: color-mix(in srgb, var(--accent) 3%, var(--overlay-bg));
   }
   .card.dead {
     opacity: 0.75;
@@ -507,6 +510,19 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Inline markdown in the now-line (inlineMarkdown): emphasis reads as a
+     firmer ink on the muted line; the line is already mono, so code needs no
+     pill — just a hair more presence. */
+  .now :global(strong) {
+    font-weight: 600;
+    color: color-mix(in srgb, var(--fg) 80%, var(--muted));
+  }
+  .now :global(code) {
+    color: color-mix(in srgb, var(--fg) 80%, var(--muted));
+  }
+  .now :global(del) {
+    opacity: 0.7;
   }
   /* The stall warning wears the warn token (the attn/output-only family) —
      a caution about a stale claim, not an error. */

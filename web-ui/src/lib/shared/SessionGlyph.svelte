@@ -24,9 +24,15 @@
     size?: number;
     /** Accessible name / hover title for the mark. */
     title?: string;
+    /** Opt-in gentle breathing while the mark is "alive" (green) — the
+     *  activity cue in surfaces that show only the glyph (the rail rows, the
+     *  focus-strip chips), where a working agent has no separate pulsing dot.
+     *  Off by default so tabs / quick-open / the dashboard (which carries its
+     *  own dot) stay still. */
+    pulse?: boolean;
   }
 
-  let { kind, agentKind = null, state = "", size = 10, title }: Props = $props();
+  let { kind, agentKind = null, state = "", size = 10, title, pulse = false }: Props = $props();
 
   const PATHS: Record<string, string> = {
     shell: "M3 4.5L6.5 8 3 11.5M8.5 12h4.5",
@@ -41,7 +47,14 @@
   );
 </script>
 
-<svg class="sglyph {state}" viewBox="0 0 16 16" width={size} height={size} aria-hidden={title === undefined}>
+<svg
+  class="sglyph {state}"
+  class:pulse={pulse && state === "alive"}
+  viewBox="0 0 16 16"
+  width={size}
+  height={size}
+  aria-hidden={title === undefined}
+>
   {#if title !== undefined}
     <title>{title}</title>
   {/if}
@@ -65,6 +78,18 @@
 
   .sglyph.alive {
     color: var(--accent);
+  }
+  /* Opt-in breathing for glyph-only surfaces (the `pulse` prop): the same
+     2.4s rhythm as the dashboard card's alive dot, so a working agent in the
+     rail reads as active without an extra icon. `pulse` is the global
+     keyframe in app.css. */
+  .sglyph.pulse.alive {
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sglyph.pulse.alive {
+      animation: none;
+    }
   }
 
   .sglyph.attn {

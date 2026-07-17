@@ -3133,13 +3133,16 @@
                 ])}
             >
               <!-- Session-type glyph carrying the state color — the same
-                   mark as the pane tab (surface parity, rail included). -->
+                   mark as the pane tab (surface parity, rail included). It
+                   breathes while alive (pulse): the rail's activity cue,
+                   since the row shows only the glyph, no separate dot. -->
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
                 state={dotState(s)}
                 size={11}
                 title={dotTitle(s)}
+                pulse
               />
               {#if renamingId === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
@@ -3728,13 +3731,15 @@
             onclick={() => openSess(s.id)}
           >
             <!-- The type glyph replaces both the dot and the old "$ "
-                 prefix — same mark as tabs and rail rows (parity). -->
+                 prefix — same mark as tabs and rail rows (parity), breathing
+                 while alive. -->
             <SessionGlyph
               kind={s.kind}
               agentKind={s.agent_kind}
               state={dotState(s)}
               size={10}
               title={dotTitle(s)}
+              pulse
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
             {#if hintsActive() && chordDigits.has(s.id)}
@@ -4255,26 +4260,16 @@
     }
   }
 
-  /* Unread output: finished with output you haven't looked at. One accent
-     language across surfaces (the dashboard card wears the same) — a left
-     accent bar + a bolder name, clearer than a tiny mark and never the state
-     glyph's job (the glyph still shows the true state; this only says "new").
-     A focused row is never unread, so this never fights the active bg. */
+  /* Unread output: finished with output you haven't looked at. A SUBTLE cue,
+     one accent language across surfaces (the dashboard card wears the same) —
+     a thin accent left-bar, never the state glyph's job (the glyph still
+     shows the true state; this only whispers "new"). A focused row is never
+     unread, so this never fights the active bg. */
   .row.unread {
-    background: color-mix(in srgb, var(--accent) 7%, transparent);
-    box-shadow: inset 3px 0 0 var(--accent);
-  }
-  .row.unread .name {
-    color: var(--fg);
-    font-weight: 600;
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
   }
   .chip.unread {
-    box-shadow: inset 2px 0 0 var(--accent);
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-  .chip.unread .chip-name {
-    color: var(--fg);
-    font-weight: 600;
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
   }
 
   .row.new {
