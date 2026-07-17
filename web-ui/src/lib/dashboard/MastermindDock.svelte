@@ -79,9 +79,18 @@
 
   // A second refcounted hold on the SAME pool entry the embedded ChatView
   // uses — read-only, for the native-mode cross-check below.
+  //
+  // Key the effect on the id STRING, not the `live` object: every /ws/events
+  // snapshot hands us a fresh session-object identity, so depending on `live`
+  // would tear down + re-acquire the same pool entry once per second. The
+  // intermediate mmId derived collapses those snapshots to a stable string,
+  // so the acquire/release fires only when the bound session id truly changes.
+  const mmId = $derived(
+    cfg !== null && live !== null && live.ui === "chat" ? live.id : null,
+  );
   let mmStore = $state<ChatStore | null>(null);
   $effect(() => {
-    const id = cfg !== null && live !== null && live.ui === "chat" ? live.id : null;
+    const id = mmId;
     if (id === null) {
       mmStore = null;
       return;
@@ -93,17 +102,27 @@
     };
   });
 
+  /** Claude's native permission modes that DON'T raise a prompt for a
+   *  non-allowlisted MCP act — the set that makes our ask-first gate moot.
+   *  Framed as the opposite of the asking modes (default / acceptEdits /
+   *  plan still prompt for a non-edit MCP act) so a new non-asking mode is
+   *  caught by adding it here, and the two edit/plan modes never false-fire.
+   *  claude's vocabulary: default, acceptEdits, plan, auto, dontAsk,
+   *  bypassPermissions (claude_modes()). */
+  const CLAUDE_NONASKING_MODES = ["auto", "dontAsk", "bypassPermissions"];
+
   /** The honest cross-check between the TWO mode machines on this surface:
    *  our binding gates acts by not pre-allowing them — which only bites
    *  while claude's own permission mode actually asks. If the user flips
-   *  claude's native mode to auto/bypass (its own picker in the chat header,
-   *  or shift+tab), ask-first is silently moot — say so instead of wearing
-   *  a badge that no longer means what it says. Claude-only: codex's gate
-   *  is the driver answering elicitations, which no native mode bypasses. */
+   *  claude's native mode to one that doesn't ask (auto / "Don't ask" /
+   *  bypass — its own picker in the chat header, or shift+tab), ask-first is
+   *  silently moot — say so instead of wearing a badge that no longer means
+   *  what it says. Claude-only: codex's gate is the driver answering
+   *  elicitations, which no native mode bypasses. */
   const nativeModeCaveat = $derived.by(() => {
     if (cfg === null || cfg.mode !== "ask" || boundAgent !== "claude") return null;
     const m = mmStore?.currentMode ?? null;
-    if (m === null || !["auto", "bypassPermissions"].includes(m)) return null;
+    if (m === null || !CLAUDE_NONASKING_MODES.includes(m)) return null;
     return mmStore?.modes.find((x) => x.id === m)?.label ?? m;
   });
 

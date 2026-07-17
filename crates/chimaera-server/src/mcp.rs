@@ -188,12 +188,18 @@ pub(crate) async fn mcp(
     // stateless): re-binding the workspace's Mastermind changes what the
     // very next call sees, with no session restart.
     let mastermind = mastermind_of(&state, &agent_id);
-    let supervised = !mastermind
-        && workspace_of(&state, &agent_id)
-            .and_then(|w| w.mastermind)
-            .is_some();
     let result = match method {
-        "initialize" => Ok(initialize_result(&params, mastermind, supervised)),
+        // `supervised` (is a NON-Mastermind worker in a workspace that has
+        // one) is read only here — compute it lazily in the arm, not per
+        // message: it costs a second `workspace_of` (two locks + a Workspace
+        // clone), wasted on the ping/tools flood a busy worker sends.
+        "initialize" => {
+            let supervised = !mastermind
+                && workspace_of(&state, &agent_id)
+                    .and_then(|w| w.mastermind)
+                    .is_some();
+            Ok(initialize_result(&params, mastermind, supervised))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_defs(mastermind) })),
         "tools/call" => tools_call(&state, &agent_id, mastermind, &params).await,
@@ -641,9 +647,10 @@ async fn read_session(
 ///
 /// Permission/question asks are HISTORY here — a reader (the Mastermind)
 /// once mistook an old "waiting on permission" line for live state. Asks
-/// resolved later in the journal render "(answered)"; whether one is waiting
-/// RIGHT NOW comes only from `pending_now` (the registry's live flag), as a
-/// trailing line.
+/// resolved later in the journal render "(answered)"; whether the session is
+/// waiting on a human decision RIGHT NOW comes only from `pending_now` (the
+/// registry's live flag, set by a permission prompt OR a structured
+/// question), as a trailing line.
 fn render_journal_tail(
     path: &std::path::Path,
     max_items: usize,
@@ -747,9 +754,12 @@ fn render_journal_tail(
         items.drain(..items.len() - max_items);
     }
     // Liveness comes from the registry, never from transcript archaeology:
-    // this line is the ONLY "right now" claim in the output.
+    // this line is the ONLY "right now" claim in the output. The flag covers
+    // BOTH a permission prompt AND a structured question (both block the turn
+    // on a human decision — see ChatInfo.pending_permission), so the wording
+    // is generic: the tail body above already names which kind it is.
     if pending_now {
-        items.push("[live] a permission ask is waiting on the user RIGHT NOW".to_string());
+        items.push("[live] a decision is waiting on the user RIGHT NOW".to_string());
     }
     let mut out = items.join("\n");
     // Byte cap, tail wins (the newest turns matter most).
@@ -1484,7 +1494,7 @@ mod tests {
 
         let live = render_journal_tail(&path, 10, true).unwrap();
         assert!(
-            live.ends_with("[live] a permission ask is waiting on the user RIGHT NOW"),
+            live.ends_with("[live] a decision is waiting on the user RIGHT NOW"),
             "{live}"
         );
     }

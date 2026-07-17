@@ -439,7 +439,9 @@
   }
 
   /* Finished output the user hasn't seen: the rail's faint fg-toned mark —
-     never a state color (the dot owns state). */
+     never a state color (the dot owns state). Same geometry + fade-in as the
+     rail/strip copies in App.svelte (Svelte scopes styles per component, so
+     the rule and its keyframe are repeated, not shared — keep them in step). */
   .unread-dot {
     flex: none;
     width: 5px;
@@ -447,6 +449,17 @@
     border-radius: 50%;
     background: color-mix(in srgb, var(--fg) 75%, transparent);
     box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fg) 10%, transparent);
+    animation: unreadfade 0.3s ease-out;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .unread-dot {
+      animation: none;
+    }
+  }
+  @keyframes unreadfade {
+    from {
+      opacity: 0;
+    }
   }
 
   /* Session state dot — the same modifier vocabulary as the rail. */

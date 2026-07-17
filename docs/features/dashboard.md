@@ -84,8 +84,11 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
     NOT per activity state — a chat agent cycles running↔finished every turn, and a
     roster that re-ranks on each turn boundary reads as chaos (the state dot + strip
     sentence + attention lane already say who's working). Within a bucket the order is
-    stable (created_at). Cards that DO move (into/out of the attention lane) glide via
-    Svelte `animate:flip` rather than teleporting (zeroed under reduced motion).
+    stable (created_at). Cards that REORDER within a list (the live-before-dead resort, a
+    new sibling shifting the grid) glide via Svelte `animate:flip` rather than teleporting
+    (zeroed under reduced motion); a card crossing between the lane and the roster is an
+    add+remove across two lists, so that boundary cuts — fine, since it marks an
+    attention-state change worth noticing.
   - **Unread output**: an agent that finishes a turn (or a hook-less TUI that goes quiet
     after streaming) while it is NOT the focused session earns a faint fg-toned "unread"
     mark — worn on the roster card, the rail row, and the focus-strip chip

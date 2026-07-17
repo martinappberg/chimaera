@@ -78,8 +78,13 @@
    *  earn the side column back (decision 10: lean during live work). */
   const quiet = $derived(lane.length === 0 && !agents.some(isBusy));
 
-  /** Cards glide instead of teleporting when the lane/roster reshuffles;
-   *  zero under reduced motion (flip has no media-query awareness). */
+  /** Roster cards glide instead of teleporting when they REORDER within
+   *  their list (the live-before-dead resort, a new sibling pushing the
+   *  grid). `animate:flip` only tweens position deltas of the same keyed
+   *  element inside ONE each-block, so a card crossing between the lane and
+   *  the roster (an add here + a remove there) still cuts — that boundary is
+   *  an attention-state change and reads fine as an instant move. Zero under
+   *  reduced motion (flip has no media-query awareness). */
   const flipMs =
     typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
       ? 0
