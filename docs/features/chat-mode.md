@@ -134,9 +134,13 @@ TUI (see [view switch](#view-switch-and-rewind)).
   (filled = done, red = error-ish states, hollow = anything else — at most 24 dots, newest win,
   per-dot tooltip = label — state: result preview) plus an honest "done/total agents" count. The
   driver folds `task_progress.workflow_progress` (per-agent `{index, label, state, resultPreview…}`,
-  live-probed shape — PROTOCOL.md Pass 15) into the level-set, capped at 64 stored agents per task
-  with totals counted over the whole wire list, and re-emits **only on state transitions** (the
-  stored fields exclude per-tick token churn, so the journal stays quiet). The launching `Workflow`
+  live-probed shape — PROTOCOL.md Pass 15) into the level-set — 24 stored agents per task (exactly
+  the dot-row budget) plus a set-wide 96-entry budget that sheds the oldest tasks' dot rows so one
+  `BackgroundTasks` event can never blow the journal's 256 KiB entry cap — with totals deduped and
+  counted over the whole wire list, and re-emits **only on state transitions** (the stored fields
+  exclude per-tick token churn, so the journal stays quiet). A trailing progress frame that races
+  the settle removal still patches the parked counts, and teardown lands an honest
+  `workflow "name" interrupted · N/M agents` line on any card-bound run that dies with the CLI. The launching `Workflow`
   tool card ticks "N/M agents done" while the run lives and lands a final
   `workflow "name" completed · 4/4 agents · 7m 15s` line at the close (a `failed` verdict flips the
   card red); the count/elapsed survive the departed buffer because they ride the task identity.

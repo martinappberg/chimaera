@@ -31,10 +31,19 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
-/// Per-workflow bound on stored per-agent entries (the dot row). A workflow
-/// can spawn up to 1000 agents lifetime; the newest entries win and the
-/// `agents_total`/`agents_done` aggregates stay honest beyond the cap.
-pub const WF_AGENTS_CAP: usize = 64;
+/// Per-workflow bound on stored per-agent entries — exactly the client's
+/// dot-row budget (`DOTS_MAX` in BackgroundTray), so nothing is journaled
+/// that never paints. A workflow can spawn up to 1000 agents lifetime; the
+/// newest entries win and the `agents_total`/`agents_done` aggregates stay
+/// honest beyond the cap.
+pub const WF_AGENTS_CAP: usize = 24;
+/// Set-wide bound on stored agent entries ACROSS the whole background set.
+/// The `BackgroundTasks` event carries the entire set, and the journal
+/// replaces any entry over its 256 KiB cap with an Error — which would wipe
+/// the tray for every client. This budget keeps the worst-case event far
+/// under that cap; when exceeded, the oldest tasks' dot rows are shed
+/// (their honest aggregates remain).
+pub const WF_AGENTS_SET_BUDGET: usize = 96;
 /// One-line cap for a workflow agent's label and result preview.
 pub const WF_AGENT_LABEL_MAX: usize = 120;
 
@@ -388,10 +397,6 @@ pub struct WorkflowAgent {
     /// The wire's state word verbatim (`start`, `done`, …) — rendered
     /// generically, never remapped.
     pub state: String,
-    /// The CLI's epoch-ms start stamp (CLI and daemon share a host/clock).
-    /// 0 = not reported.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub started_at_ms: u64,
     /// Head of the agent's final text, once done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,

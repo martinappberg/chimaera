@@ -1232,7 +1232,7 @@ Everything below is already on the 2.1.207 wire — no newer CLI needed
   rich card could bind straight to the Workflow tool card.
 - Also seen, unmapped: `post_turn_summary {summarizes_uuid, status_category
   (e.g. "review_ready"), status_detail, needs_action}` after each turn —
-  dashboard/status material, deliberately not adopted yet.
+  dashboard/status material — since ADOPTED as `SessionStatus` (Pass 17).
 - ADOPTION (same day, verified live against 2.1.211 in the isolated
   preview — three workflow runs, journal inspected): the driver folds
   `workflow_name` + `workflow_progress` into the `background_tasks`
@@ -1249,6 +1249,20 @@ Everything below is already on the 2.1.207 wire — no newer CLI needed
   the ordinary `can_use_tool` control path mid-lane. `just chat-smoke`
   16/16 on 2.1.211 + codex 0.144.2; TESTED_CLAUDE_VERSION bumped
   2.1.207 → 2.1.211.
+- HARDENED (same day, xhigh review pass): per-task agent cap 24 (= the
+  client's dot-row budget) + a set-wide `WF_AGENTS_SET_BUDGET` (96) that
+  sheds the oldest tasks' dot rows — the level-set event carries the whole
+  set and the journal REPLACES an over-256 KiB entry with an Error, which
+  would wipe the tray for every client; the budget keeps the worst case far
+  under it. An explicit `workflow_progress: []` never wipes folded state
+  (the wire omits the key on aggregate ticks; treat empty as absent). A
+  trailing progress frame racing the settle removal patches the PARKED
+  task's counts in place (silent — the imminent close prints them).
+  Teardown (`drain_pending`) lands `workflow "name" interrupted · N/M
+  agents` on card-bound runs. Whole-frame index dedupe via seen-set (totals
+  stay honest past the cap). Whitespace-only `workflow_name` counts as
+  absent. Driver-built elapsed gained the hours rung ("1h 20m 00s"),
+  matching the client's `shared/time.ts` ladder.
 - Codex counterpart (0.144.2 binary mine + docs, no live probe yet): collab
   tools `SpawnAgent`/`SendInput`/`ResumeAgent`/`CloseAgent`, thread-item
   `collabAgentToolCall`, activity variants `subAgentThreadSpawn`/
