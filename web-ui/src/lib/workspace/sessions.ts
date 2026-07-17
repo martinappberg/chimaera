@@ -84,6 +84,19 @@ export interface Session {
    * whichever the daemon says. Optional on old daemons (= "term").
    */
   ui?: "chat" | "term";
+  /**
+   * The agent's own post-turn status line (claude post_turn_summary,
+   * latest-wins): a one-line "where things stand" shown as the rail row's
+   * second line. Chat sessions only; null/absent elsewhere or on old
+   * daemons.
+   */
+  status_detail?: string | null;
+  /** Machine-readable category behind status_detail ("review_ready", …). */
+  status_category?: string | null;
+  /** The latest status flagged "waiting on the user"; the daemon already
+   *  folds it into agent_state ("idle_prompt"), carried raw for future
+   *  surfaces. Cleared when a new turn starts. */
+  status_needs_action?: boolean;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
 }

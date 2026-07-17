@@ -309,6 +309,14 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
             limit_reached: true,
             ..
         } => Some(AgentState::RateLimited),
+        // The agent's own post-turn verdict that it waits on the user
+        // (post_turn_summary rides AFTER the result frame, so this lands on
+        // top of TurnCompleted's Finished) — the same attention state the
+        // TUI's idle-prompt notification hook drives. needs_action=false
+        // keeps Finished: the summary is context, not attention.
+        AgentEvent::SessionStatus {
+            needs_action: true, ..
+        } => Some(AgentState::IdlePrompt),
         _ => None,
     };
     if let Some(next) = next {
@@ -612,6 +620,12 @@ pub(crate) fn chat_session_json(
         "chat_model": info.model,
         "chat_mode": info.current_mode,
         "pending_permission": info.pending_permission,
+        // The agent's own post-turn status line (latest-wins fold): the
+        // rail's at-a-glance second line. Chat rows only — a PTY TUI emits
+        // no such signal, and a toggled session shouldn't carry a stale one.
+        "status_detail": info.status_detail,
+        "status_category": info.status_category,
+        "status_needs_action": info.status_needs_action,
     })
 }
 

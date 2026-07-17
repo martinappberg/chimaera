@@ -36,7 +36,7 @@ use crate::model::{
     BackgroundTaskClose, ChunkKind, Coalescer, ContentBlock, ModeInfo, PermissionOption,
     PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
     Usage, UsageWindow, UserMessageState, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, STATUS_DETAIL_MAX,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -955,6 +955,26 @@ impl ClaudeMapper {
                     self.thinking_emitted = tokens.max(1);
                     step.events.push(AgentEvent::ThinkingTokens { tokens });
                 }
+            }
+            // Post-turn status line `{status_category, status_detail,
+            // needs_action, summarizes_uuid}` (2.1.207+; fires after each
+            // result) — the session's own "where things stand" one-liner.
+            // Mapped latest-wins; `summarizes_uuid` is dropped (nothing here
+            // keys transcript blocks by uuid). A detail-less frame carries
+            // nothing a rail could show, so it maps to nothing.
+            Some("post_turn_summary") => {
+                let detail = frame["status_detail"].as_str().unwrap_or_default().trim();
+                if detail.is_empty() {
+                    return;
+                }
+                step.events.push(AgentEvent::SessionStatus {
+                    category: frame["status_category"]
+                        .as_str()
+                        .filter(|c| !c.is_empty())
+                        .map(|c| truncate_label(c, STATUS_DETAIL_MAX)),
+                    detail: truncate_label(detail, STATUS_DETAIL_MAX),
+                    needs_action: frame["needs_action"].as_bool().unwrap_or(false),
+                });
             }
             // Background-lane status patch: `{task_id, patch:{status,
             // end_time}}`. A terminal status removes the task from the live
