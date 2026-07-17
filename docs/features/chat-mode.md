@@ -136,6 +136,16 @@ TUI (see [view switch](#view-switch-and-rewind)).
   (reconciled shut at turn end). The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
+- **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
+  identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
+  `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·
+  N tools · M tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
+  the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
+  from the parent's (claude symmetry), and closes the row when the agent answers ("answered"), is
+  shut down ("closed"), or dies with an aborted parent turn or the process itself. A follow-up to a
+  closed agent opens a fresh row (a finished card never walks back to running). The
+  model's `wait` renders as a "waiting for subagents" tool row. No per-agent stop for codex (no
+  such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Pass 16.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
@@ -203,9 +213,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   size-capped per dir (`100 MiB` / `200 files`). Resuming a finished conversation seed-copies the old
   journal so `attach` replays the whole history (via a native-id → chimaera-session index).
 - **Pinned protocols** (`claude.rs`/`codex.rs`): the `stream-json` and `app-server` wire formats are
-  **unversioned and pinned, not trusted** — each driver is verified against `TESTED_CLAUDE_VERSION`
-  (`2.1.204`) / `TESTED_CODEX_VERSION` (`0.142.5`). Touching a driver or bumping a CLI **requires
-  `just chat-smoke`** (live, bills a few cents). The two drivers must stay **symmetric**.
+  **unversioned and pinned, not trusted** — each driver is verified against its `TESTED_*_VERSION`
+  constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or
+  bumping a CLI **requires `just chat-smoke`** (live, bills a few cents). The two drivers must stay
+  **symmetric**.
 - **Handshake watchdog → degrade-to-PTY** (`driver.rs`, `chat.rs`): a chat session that can't prove
   its protocol in 20s fails fast and respawns as the real TUI on the same session id (one attempt),
   so a pane never hangs.
@@ -344,3 +355,11 @@ _Captured 2026-07-15 (from the maintainer)._
   has no background lane today (claude-only by wire reality, not by design choice).
 - **Open to change:** fully. **Grade — addition**: no locked rules beyond the repo's standing
   invariants; don't treat any of the current mechanics as a contract.
+
+### Codex subagents (collab / multi-agent) — why it exists
+_Intent pending — not yet captured from the maintainer (shipped 2026-07-16, autonomous session)._
+
+- Derived context, not intent: codex parity for the rich subagent surface was the named open
+  improvement in the PR #63 intent capture, and the two-driver-symmetry rule made claude's Agent-row
+  surface the natural mapping target. The thread-scoping gate is wire-correctness, not a choice —
+  see PROTOCOL.md Pass 16. Run **capture-feature-intent** with the maintainer to replace this stub.

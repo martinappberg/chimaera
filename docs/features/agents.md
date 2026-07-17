@@ -135,7 +135,7 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   to a latest-wins `SessionStatus` event: the chat row's second line shows the line (`status_detail`
   on the row JSON), and a summary flagged `needs_action` lands the amber `idle_prompt` attention
   state. Emission is conditional and CLI-version-dependent (see `chimaera-agent/PROTOCOL.md`
-  Pass 15) — the surface is dormant when the CLI stays quiet. TUI rows never carry it.
+  Pass 17) — the surface is dormant when the CLI stays quiet. TUI rows never carry it.
 
 ## Attention hooks (claude TUI)
 
