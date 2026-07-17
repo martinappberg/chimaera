@@ -1266,19 +1266,32 @@ The subagent surface is claude's exactly: an `Agent: {name}` tool row
 segment) that the AgentsTray derives from. `started` opens the row;
 foreign-thread frames fold into its progress line ("{last} · N tools · M
 tokens" — claude's task_progress format; tokens from the agent thread's
-`tokenUsage`, tools counted from its completed tool-ish items); the agent
+`tokenUsage`, throttled to ≥256-token moves; tools counted from its
+completed tool-ish items, label changes emitted on item/started); the agent
 thread's `turn/completed` closes the row ("answered" — it sits idle
-awaiting follow-ups); `interacted` re-opens it; `interrupted` closes it
-("closed"). Subagent transcripts are hidden from the parent's (claude hides
+awaiting follow-ups; a deliberate stop closes quietly, like claude's
+stopped verdicts); `interrupted` closes it ("closed"). **A follow-up/resume
+to a CLOSED agent opens a NEW row** (`agent:{thread}#N`): the chat UI's
+tool-status guard is monotonic by design (a finished row never walks back
+to running — it exists to drop straggling subagent updates), so fresh work
+gets a fresh card instead of an update the client would rightly drop.
+Unseen `subAgentActivity` kinds open-or-note the row (an unmined spawn
+variant must not leave a subagent invisible). A subagent's `fileChange`
+items also record `item_locations`, so its approval card still names the
+touched files; its `error` notifications fold into the progress line.
+Subagent transcripts are hidden from the parent's (claude hides
 parent_tool_use_id frames the same way). The set lives per parent turn like
-claude's task map: an aborted/failed/watchdogged parent turn first fails
-still-open rows ("subagent stopped with the turn"), a normal end just
-clears the set. `wait` renders as an ordinary tool row ("waiting for
-subagents"), upserted-on-completed so an instant call without item/started
-still lands. Nested delegation (a subagent spawning its own) shows as that
-agent's "delegating" progress — no nested rows. No stop affordance: the
-collab tools are the MODEL's, and no client→server RPC to stop a single
-subagent is known (`turn/interrupt` on the subagent's thread/turn is
-unprobed) — the tray's stop stays claude-only. SubagentStart/SubagentStop
-HOOK events (binary-mined) are codex's hook system, not this wire — not
-consumed.
+claude's task map: an aborted/failed/watchdogged parent turn — and driver
+teardown (`drain_pending`), where the subagents die with the process —
+first fails still-open rows ("subagent stopped with the turn"); a normal
+end just clears the set. Over the 32-row cap, closed rows are evicted
+first; when every slot is live the newest agents are NOT tracked (a
+synthetic close would lie) and a once-per-turn Notice says so. `wait`
+renders as an ordinary tool row ("waiting for subagents"),
+upserted-on-completed so an instant call without item/started still lands.
+Nested delegation (a subagent spawning its own) shows as that agent's
+"delegating" progress — no nested rows. No stop affordance: the collab
+tools are the MODEL's, and no client→server RPC to stop a single subagent
+is known (`turn/interrupt` on the subagent's thread/turn is unprobed) — the
+tray's stop stays claude-only. SubagentStart/SubagentStop HOOK events
+(binary-mined) are codex's hook system, not this wire — not consumed.

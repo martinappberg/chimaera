@@ -141,8 +141,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
   `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·
   N tools · M tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
-  from the parent's (claude symmetry), re-opens the row on follow-up input, and closes it when the
-  agent answers ("answered"), is shut down ("closed"), or dies with an aborted parent turn. The
+  from the parent's (claude symmetry), and closes the row when the agent answers ("answered"), is
+  shut down ("closed"), or dies with an aborted parent turn or the process itself. A follow-up to a
+  closed agent opens a fresh row (a finished card never walks back to running). The
   model's `wait` renders as a "waiting for subagents" tool row. No per-agent stop for codex (no
   such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Pass 16.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
@@ -212,9 +213,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   size-capped per dir (`100 MiB` / `200 files`). Resuming a finished conversation seed-copies the old
   journal so `attach` replays the whole history (via a native-id → chimaera-session index).
 - **Pinned protocols** (`claude.rs`/`codex.rs`): the `stream-json` and `app-server` wire formats are
-  **unversioned and pinned, not trusted** — each driver is verified against `TESTED_CLAUDE_VERSION`
-  (`2.1.204`) / `TESTED_CODEX_VERSION` (`0.142.5`). Touching a driver or bumping a CLI **requires
-  `just chat-smoke`** (live, bills a few cents). The two drivers must stay **symmetric**.
+  **unversioned and pinned, not trusted** — each driver is verified against its `TESTED_*_VERSION`
+  constant (the current pins live at the top of `claude.rs` / `codex.rs`). Touching a driver or
+  bumping a CLI **requires `just chat-smoke`** (live, bills a few cents). The two drivers must stay
+  **symmetric**.
 - **Handshake watchdog → degrade-to-PTY** (`driver.rs`, `chat.rs`): a chat session that can't prove
   its protocol in 20s fails fast and respawns as the real TUI on the same session id (one attempt),
   so a pane never hangs.
