@@ -381,14 +381,17 @@
   .card:hover {
     border-color: color-mix(in srgb, var(--accent) 45%, var(--edge));
   }
-  /* Unread = finished with output you haven't looked at. A SUBTLE cue, not a
-     takeover: a thin accent left-bar + a barely-there tint mark the card
-     without dominating the roster, and clear the moment the session is
-     focused. Never the state DOT's job — the dot still shows the true state
-     (done/errored/…); this only whispers "new". */
+  /* Unread = finished with output you haven't looked at. The quietest cue
+     that still reads: a bolder name (the unread-mail convention) over a
+     barely-there accent wash — no bar, no border, nothing that dominates the
+     roster. Clears the moment the session is focused. Never the state DOT's
+     job — the dot still shows the true state (done/errored/…). */
   .card.unread {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
     background: color-mix(in srgb, var(--accent) 3%, var(--overlay-bg));
+  }
+  .card.unread .name {
+    font-weight: 600;
+    color: var(--fg);
   }
   .card.dead {
     opacity: 0.75;

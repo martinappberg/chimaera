@@ -4260,16 +4260,15 @@
     }
   }
 
-  /* Unread output: finished with output you haven't looked at. A SUBTLE cue,
-     one accent language across surfaces (the dashboard card wears the same) —
-     a thin accent left-bar, never the state glyph's job (the glyph still
-     shows the true state; this only whispers "new"). A focused row is never
-     unread, so this never fights the active bg. */
-  .row.unread {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
-  }
-  .chip.unread {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 80%, transparent);
+  /* Unread output: finished with output you haven't looked at. The quietest
+     cue that still reads — a bolder name (the unread-mail convention), no bar
+     or wash in the dense rail so it never looks like a hover/active state.
+     The dashboard card wears the same bold name over a faint wash. A focused
+     row is never unread, so this never fights the active state. */
+  .row.unread .name,
+  .chip.unread .chip-name {
+    color: var(--fg);
+    font-weight: 600;
   }
 
   .row.new {
