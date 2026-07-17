@@ -10,6 +10,8 @@
    */
   import BrandMark from "../shared/BrandMark.svelte";
   import ChatView from "../chat/ChatView.svelte";
+  import { acquireChat, releaseChat } from "../chat/chatPool";
+  import type { ChatStore } from "../chat/store.svelte";
   import { dismiss } from "../shared/dismiss";
   import { resolvedTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
@@ -28,9 +30,14 @@
     refresh: () => Promise<void>;
     /** Collapse the dock back to the edge pill / close the overlay. */
     onCollapse: () => void;
+    /** The dock currently fills the whole dashboard surface. */
+    expanded: boolean;
+    /** Toggle between the sidebar width and the full surface. */
+    onToggleExpand: () => void;
   }
 
-  let { cfg, session, wsId, paneId, ctrl, refresh, onCollapse }: Props = $props();
+  let { cfg, session, wsId, paneId, ctrl, refresh, onCollapse, expanded, onToggleExpand }: Props =
+    $props();
 
   /** Setup-card mode choice; ask-first is the default (plan §6). */
   let mode = $state<"ask" | "auto">("ask");
@@ -69,6 +76,36 @@
   const boundAgent = $derived(
     cfg === null ? null : (cfg.agent ?? session?.agent_kind ?? justCreated?.agent_kind ?? null),
   );
+
+  // A second refcounted hold on the SAME pool entry the embedded ChatView
+  // uses — read-only, for the native-mode cross-check below.
+  let mmStore = $state<ChatStore | null>(null);
+  $effect(() => {
+    const id = cfg !== null && live !== null && live.ui === "chat" ? live.id : null;
+    if (id === null) {
+      mmStore = null;
+      return;
+    }
+    mmStore = acquireChat(id).store;
+    return () => {
+      releaseChat(id);
+      mmStore = null;
+    };
+  });
+
+  /** The honest cross-check between the TWO mode machines on this surface:
+   *  our binding gates acts by not pre-allowing them — which only bites
+   *  while claude's own permission mode actually asks. If the user flips
+   *  claude's native mode to auto/bypass (its own picker in the chat header,
+   *  or shift+tab), ask-first is silently moot — say so instead of wearing
+   *  a badge that no longer means what it says. Claude-only: codex's gate
+   *  is the driver answering elicitations, which no native mode bypasses. */
+  const nativeModeCaveat = $derived.by(() => {
+    if (cfg === null || cfg.mode !== "ask" || boundAgent !== "claude") return null;
+    const m = mmStore?.currentMode ?? null;
+    if (m === null || !["auto", "bypassPermissions"].includes(m)) return null;
+    return mmStore?.modes.find((x) => x.id === m)?.label ?? m;
+  });
 
   /** PUT the binding (setup start AND mode switch — a mode change is a
    *  re-PUT; the daemon restarts the session with the new gating). A mode
@@ -137,7 +174,17 @@
       <BrandMark size={13} title="Mastermind" />
       <span class="title">Mastermind</span>
       <span class="chip">{boundAgent ?? "…"}</span>
-      <span class="chip" title={MODE_HELP[cfg.mode]}>{modeLabel(cfg.mode)}</span>
+      <!-- The badge IS the control: this is the Mastermind's act gate (ours,
+           not the agent's own permission mode) — click to switch it. -->
+      <button
+        class="chip modechip"
+        title="how workspace acts are gated: {MODE_HELP[cfg.mode]} — click to switch"
+        onclick={() => {
+          confirm = { kind: "mode", to: cfg.mode === "ask" ? "auto" : "ask" };
+        }}
+      >
+        acts: {modeLabel(cfg.mode)}
+      </button>
       <span class="sp"></span>
       <!-- Default node.contains inside-test: the button + its menu stay open.
            (Never the .menu-host class — that selector belongs to ChatView's
@@ -180,10 +227,25 @@
     {:else}
       <span class="sp"></span>
     {/if}
+    <button
+      class="hbtn"
+      title={expanded ? "restore the dock width" : "expand the dock to the whole surface"}
+      aria-label={expanded ? "restore the dock width" : "expand the dock"}
+      onclick={onToggleExpand}>{expanded ? "⤡" : "⤢"}</button
+    >
     <button class="hbtn" title="collapse the dock" aria-label="collapse the dock" onclick={onCollapse}
       >»</button
     >
   </header>
+
+  {#if nativeModeCaveat !== null}
+    <!-- Two mode machines, one honest line: claude's own permission mode
+         currently outranks our ask-first gate. -->
+    <div class="warnline">
+      claude's own permission mode is “{nativeModeCaveat}” — while it's on, claude may act
+      without asking, so <b>ask first</b> only bites once it's back to a mode that asks.
+    </div>
+  {/if}
 
   {#if confirm !== null}
     {@const c = confirm}
@@ -346,6 +408,32 @@
     border-radius: 999px;
     padding: 0 6px;
     white-space: nowrap;
+  }
+  /* The act-gate badge doubles as its own switch. */
+  button.modechip {
+    appearance: none;
+    background: none;
+    font-family: var(--mono);
+    line-height: inherit;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+  button.modechip:hover {
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--edge));
+  }
+
+  /* The native-mode caveat: a quiet warn line, the stall-pill tone. */
+  .warnline {
+    flex: none;
+    font-size: var(--text-xs);
+    line-height: 1.45;
+    color: var(--warn);
+    padding: 6px 12px;
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 30%, var(--edge));
+  }
+  .warnline b {
+    font-weight: 600;
   }
   .sp {
     flex: 1;

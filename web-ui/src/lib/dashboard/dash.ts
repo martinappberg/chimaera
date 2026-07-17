@@ -9,7 +9,7 @@
 
 import type { RecentConvo } from "../workspace/launcher";
 import type { Session } from "../workspace/sessions";
-import { agentKind, isBusy, needsAttention } from "../workspace/sessions";
+import { agentKind } from "../workspace/sessions";
 
 export interface DashCtx {
   /** Active workspace display name (the folder basename). */
@@ -23,7 +23,7 @@ export interface DashCtx {
   mru: string[];
   /** The workspace's Mastermind binding (the additive `GET /workspaces`
    *  field); null when none is configured. The dock renders from this. */
-  mastermind: { session_id: string; mode: "ask" | "auto" } | null;
+  mastermind: { session_id: string; mode: "ask" | "auto"; agent?: string } | null;
   /** Re-fetch the workspaces list — the Mastermind binding lives there, so
    *  the dock calls this after a PUT/DELETE. Resolves once applied. */
   refreshWorkspaces: () => Promise<void>;
@@ -59,14 +59,16 @@ export function provenanceTitle(p: Provenance): string {
   }
 }
 
-/** Roster sort weight: the most alive work first, dead sessions last. */
+/**
+ * Roster sort weight: live sessions first, dead ones last — deliberately NOT
+ * re-ranked per activity state. A chat agent cycles running↔finished every
+ * turn, and a roster that reshuffles on each turn end reads as chaos; the
+ * state dot, the strip sentence, and the attention lane already say who is
+ * working and who needs you. Within a bucket the order is stable (created_at,
+ * applied by the caller).
+ */
 export function rosterWeight(s: Session): number {
-  if (!s.alive) return 5;
-  if (s.agent_state === "running" || isBusy(s)) return 0;
-  if (s.agent_state === "rate_limited") return 1;
-  if (needsAttention(s)) return 2; // errored roster leftovers (lane handles live asks)
-  if (s.agent_state === "finished") return 4;
-  return 3; // unknown / starting
+  return s.alive ? 0 : 1;
 }
 
 /** Workspace-relative display path (verbatim when outside the root). */

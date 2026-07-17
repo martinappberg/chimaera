@@ -18,6 +18,7 @@
   import { formatElapsedSeconds } from "../shared/time";
   import { relativeAge } from "../workspace/launcher";
   import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
+  import { isUnread } from "../workspace/unread.svelte";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
   import { provenanceOf, provenanceTitle , relPath as sharedRelPath} from "./dash";
 
@@ -72,6 +73,12 @@
     // files_touched fallback — fresher and more specific ("ran Bash" vs the
     // last write).
     if (session.now_line != null && session.now_line !== "") return session.now_line;
+    // The agent's own post-turn status line (SessionStatus): "where things
+    // stand" for a chat row with no warm store — the same line the rail's
+    // second row wears.
+    if (session.status_detail != null && session.status_detail !== "") {
+      return session.status_detail;
+    }
     // Hook-level fallback: the last file the agent wrote.
     if (prov === "hooks" && touched.length > 0) {
       return `edited ${basename(touched[touched.length - 1])}`;
@@ -210,6 +217,11 @@
     />
     <span class="dot {dotState(session)}" title={dotTitle(session)}></span>
     <span class="name" title={name}>{name}</span>
+    {#if isUnread(session.id)}
+      <!-- Finished with output the user hasn't seen — the rail's faint mark,
+           worn card-side too (cleared the moment the session is focused). -->
+      <span class="unread-dot" title="finished — output you haven't looked at"></span>
+    {/if}
     {#if compact && isStalled}
       <!-- Compact rows carry no now-line, but the stall warning is built for
            exactly this density (a wedged agent in a fan-out must not look
@@ -220,10 +232,18 @@
         >stalled</span
       >
     {/if}
-    <span class="chip">{agentKind(session)} · {session.ui === "chat" ? "chat" : "term"}</span>
-    <span class="prov {prov}" title={provenanceTitle(prov)}>
-      {prov === "protocol" ? "protocol" : prov === "hooks" ? "hooks" : "output-only"}
-    </span>
+    <!-- The kind chip carries the provenance story in its tooltip; a chat
+         row IS the authoritative tier ("chat" already says so), so only the
+         degraded tiers wear an extra chip — in words a user can read, not
+         the old "protocol" jargon. -->
+    <span class="chip" title={provenanceTitle(prov)}
+      >{agentKind(session)} · {session.ui === "chat" ? "chat" : "term"}</span
+    >
+    {#if prov !== "protocol"}
+      <span class="prov {prov}" title={provenanceTitle(prov)}>
+        {prov === "hooks" ? "status via hooks" : "output only"}
+      </span>
+    {/if}
   </div>
 
   {#if !compact && isStalled}
@@ -282,8 +302,17 @@
             onStop={onStopTask !== undefined ? () => onStopTask(t.id) : undefined}
             stopTitle="stop this background task"
           >
-            <!-- The lane name (local_bash, …) stays canonical in the tooltip. -->
-            <span class="bgname" title={t.taskType}>{t.description}</span>
+            <!-- The lane name (local_bash, …) stays canonical in the tooltip;
+                 workflow lanes wear their meta.name + agent tally (the
+                 BackgroundTray's rich-row facts, card-density). -->
+            <span class="bgname" title={t.taskType}
+              >{t.workflowName !== null && t.workflowName !== ""
+                ? t.workflowName
+                : t.description}</span
+            >
+            {#if t.agentsTotal > 0}
+              <span class="bgagents">{t.agentsDone}/{t.agentsTotal} agents</span>
+            {/if}
             {#if t.status !== "running"}
               <span class="bgstatus">{t.status}</span>
             {/if}
@@ -392,7 +421,9 @@
     padding: 0 6px;
   }
 
-  /* The honesty axis: which tier this card's status truthfully comes from. */
+  /* The honesty axis: which tier this card's status truthfully comes from.
+     Worn only by the degraded tiers — a chat row's kind chip already says
+     it's the authoritative one (tooltip carries the words). */
   .prov {
     flex: none;
     font-family: var(--mono);
@@ -400,14 +431,22 @@
     cursor: help;
     opacity: 0.85;
   }
-  .prov.protocol {
-    color: var(--accent);
-  }
   .prov.hooks {
     color: var(--muted);
   }
   .prov.none {
     color: var(--warn);
+  }
+
+  /* Finished output the user hasn't seen: the rail's faint fg-toned mark —
+     never a state color (the dot owns state). */
+  .unread-dot {
+    flex: none;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--fg) 75%, transparent);
+    box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fg) 10%, transparent);
   }
 
   /* Session state dot — the same modifier vocabulary as the rail. */
@@ -574,6 +613,12 @@
     white-space: nowrap;
     color: var(--fg);
     font-family: var(--mono, monospace);
+  }
+  .bgagents {
+    flex: none;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
   }
   .bgstatus {
     flex: none;

@@ -12,6 +12,7 @@
    * deliberately never lists.
    */
   import { onMount, untrack } from "svelte";
+  import { flip } from "svelte/animate";
   import BrandMark from "../shared/BrandMark.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import AgentCard from "./AgentCard.svelte";
@@ -77,6 +78,34 @@
    *  earn the side column back (decision 10: lean during live work). */
   const quiet = $derived(lane.length === 0 && !agents.some(isBusy));
 
+  /** Cards glide instead of teleporting when the lane/roster reshuffles;
+   *  zero under reduced motion (flip has no media-query awareness). */
+  const flipMs =
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? 0
+      : 220;
+
+  /** Hysteresis on the recents section: `quiet` flips at every turn boundary
+   *  (a chat agent is briefly idle between turns), and a side column that
+   *  pops in and out per turn reads as flicker. Showing recents needs quiet
+   *  to HOLD for a beat; hiding stays immediate (kicking off work is a
+   *  deliberate moment). First evaluation is instant so a genuinely quiet
+   *  workspace doesn't open with a bare column. */
+  const QUIET_HOLD_MS = 10_000;
+  let quietSettled = $state(false);
+  let quietSeen = false;
+  $effect(() => {
+    if (!quiet) {
+      quietSeen = true;
+      quietSettled = false;
+      return;
+    }
+    const delay = quietSeen ? QUIET_HOLD_MS : 0;
+    quietSeen = true;
+    const timer = setTimeout(() => (quietSettled = true), delay);
+    return () => clearTimeout(timer);
+  });
+
   const nothingRunning = $derived(wsSessions.length === 0);
 
   // --- the Mastermind dock -------------------------------------------------------
@@ -111,6 +140,56 @@
   let overlayOpen = $state(false);
   const dockOverlay = $derived(!dockWide && overlayOpen);
   const showDock = $derived((dockWide && !dockCollapsed) || dockOverlay);
+
+  // --- dock width: draggable, expandable to the whole surface ------------------
+  //
+  // The dock is a sidebar the user can pull out — anywhere from the slim
+  // default to the FULL dashboard (the surface underneath is a summary; the
+  // Mastermind conversation is sometimes the main event). Width persists
+  // per browser profile (the rail-width idiom); expanded is a transient
+  // focus mode, deliberately not persisted.
+  const DOCK_MIN = 300;
+  const DOCK_DEFAULT = 360;
+  const DOCK_WIDTH_KEY = "chimaera.dashboard.dockWidth";
+  let dockWidth = $state(DOCK_DEFAULT);
+  let dockExpanded = $state(false);
+  onMount(() => {
+    const saved = Number(localStorage.getItem(DOCK_WIDTH_KEY));
+    if (Number.isFinite(saved) && saved >= DOCK_MIN) dockWidth = Math.round(saved);
+  });
+  /** Clamp so the surface keeps a readable remainder — or goes full. */
+  const dockMax = $derived(Math.max(DOCK_MIN, dashWidth - 320));
+  const dockPx = $derived(Math.min(dockWidth, dockMax));
+
+  let dockResizing = $state(false);
+  function onDockResizeDown(e: PointerEvent): void {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.setPointerCapture(e.pointerId);
+    dockResizing = true;
+    const startX = e.clientX;
+    const startW = dockExpanded ? dashWidth : dockPx;
+    const move = (ev: PointerEvent) => {
+      const w = startW + (startX - ev.clientX);
+      // Dragging past the clamp toward the left edge snaps to full.
+      dockExpanded = w > dockMax + 40;
+      dockWidth = Math.min(Math.max(w, DOCK_MIN), dockMax);
+    };
+    const up = () => {
+      dockResizing = false;
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      localStorage.setItem(DOCK_WIDTH_KEY, String(Math.round(dockWidth)));
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+  }
+  function resetDockWidth(): void {
+    dockExpanded = false;
+    dockWidth = DOCK_DEFAULT;
+    localStorage.setItem(DOCK_WIDTH_KEY, String(DOCK_DEFAULT));
+  }
 
   function openDock(): void {
     if (dockWide) dockCollapsed = false;
@@ -363,13 +442,21 @@
       </header>
 
       {#if continueTarget !== null && agents.length > 1}
-        <button class="continue" onclick={() => dash.onOpenSession(continueTarget.id)}>
+        <!-- A shortcut, not a status: "last active" names what the row IS
+             (the session you were in most recently) — the old bare
+             "continue" label read as a stuck state/instruction. -->
+        <button
+          class="continue"
+          title="jump back into your most recent session"
+          onclick={() => dash.onOpenSession(continueTarget.id)}
+        >
           <span class="dot {dotState(continueTarget)}" title={dotTitle(continueTarget)}></span>
-          <span class="clabel">continue</span>
+          <span class="clabel">last active</span>
           <span class="cname">{names.get(continueTarget.id) ?? continueTarget.name}</span>
           <span class="cmeta"
             >{agentKind(continueTarget)} · {relativeAge(continueTarget.created_at)}</span
           >
+          <span class="carrow" aria-hidden="true">↳</span>
         </button>
       {/if}
 
@@ -391,7 +478,8 @@
             <div class="sec-title">needs you</div>
             <div class="lane">
               {#each lane as s (s.id)}
-                <AttentionCard
+                <div animate:flip={{ duration: flipMs }}>
+                  <AttentionCard
                   session={s}
                   name={names.get(s.id) ?? s.name}
                   store={rich.get(s.id)?.store ?? null}
@@ -400,7 +488,8 @@
                     ? (requestId, optionId, destination, feedback) =>
                         decide(s.id, requestId, optionId, destination, feedback)
                     : undefined}
-                />
+                  />
+                </div>
               {/each}
             </div>
           {/if}
@@ -409,19 +498,21 @@
             <div class="sec-title">{lane.length > 0 ? "the rest" : "agents"}</div>
             <div class="roster" class:compact>
               {#each roster as s (s.id)}
-                <AgentCard
-                  session={s}
-                  name={names.get(s.id) ?? s.name}
-                  store={rich.get(s.id)?.store ?? null}
-                  {compact}
-                  hero={hero && s.alive}
-                  {wsRoot}
-                  onOpen={() => dash.onOpenSession(s.id)}
-                  onOpenChanges={() => ctrl.openChangesFrom(paneId, s.id, false)}
-                  onStopTask={s.ui === "chat" && agentKind(s) === "claude"
-                    ? (taskId) => stopTask(s.id, taskId)
-                    : undefined}
-                />
+                <div class="cardwrap" animate:flip={{ duration: flipMs }}>
+                  <AgentCard
+                    session={s}
+                    name={names.get(s.id) ?? s.name}
+                    store={rich.get(s.id)?.store ?? null}
+                    {compact}
+                    hero={hero && s.alive}
+                    {wsRoot}
+                    onOpen={() => dash.onOpenSession(s.id)}
+                    onOpenChanges={() => ctrl.openChangesFrom(paneId, s.id, false)}
+                    onStopTask={s.ui === "chat" && agentKind(s) === "claude"
+                      ? (taskId) => stopTask(s.id, taskId)
+                      : undefined}
+                  />
+                </div>
               {/each}
             </div>
           {/if}
@@ -473,9 +564,10 @@
             </div>
           {/if}
 
-          <!-- Recents show only in quiet moments — during live work the
-               column stays lean (decision 10); the blank state keeps its own. -->
-          {#if quiet && dash.recents.length > 0}
+          <!-- Recents show only in SETTLED quiet moments — during live work
+               the column stays lean (decision 10), and the hold beat keeps
+               per-turn idle gaps from flickering the section in and out. -->
+          {#if quietSettled && dash.recents.length > 0}
             <div class="sec">
               <div class="sec-title">recents</div>
               {#each dash.recents.slice(0, 5) as r (r.resume ?? `${r.kind}:${r.title}`)}
@@ -508,7 +600,24 @@
 
       {#if wsId !== null}
         {#if showDock}
-          <div class="dockcol" class:overlay={dockOverlay}>
+          <div
+            class="dockcol"
+            class:overlay={dockOverlay}
+            class:expanded={dockExpanded}
+            class:resizing={dockResizing}
+            style:width={dockExpanded ? "100%" : `${dockPx}px`}
+          >
+            <!-- Pull the dock wider (up to the whole surface) — the rail-
+                 resize idiom: drag the edge, double-click to reset. -->
+            <div
+              class="dock-resize"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="resize the Mastermind dock"
+              title="drag to resize · double-click to reset"
+              onpointerdown={onDockResizeDown}
+              ondblclick={resetDockWidth}
+            ></div>
             <MastermindDock
               cfg={dash.mastermind}
               session={mmSession}
@@ -517,6 +626,8 @@
               {ctrl}
               refresh={dash.refreshWorkspaces}
               onCollapse={collapseDock}
+              expanded={dockExpanded}
+              onToggleExpand={() => (dockExpanded = !dockExpanded)}
             />
           </div>
         {:else}
@@ -652,11 +763,12 @@
   }
 
   /* The Mastermind dock: a full-height third column right of the activity
-     column. Narrow panes swap it for the edge pill; the pill opens it as an
-     overlay pinned to the pane's right edge (see .dockcol.overlay). */
+     column, user-resizable up to the whole surface (width set inline).
+     Narrow panes swap it for the edge pill; the pill opens it as an overlay
+     pinned to the pane's right edge (see .dockcol.overlay). */
   .dockcol {
+    position: relative;
     flex: none;
-    width: 360px;
     min-width: 0;
     min-height: 0;
     display: flex;
@@ -669,9 +781,28 @@
     top: 0;
     right: 0;
     bottom: 0;
-    width: min(380px, calc(100% - 44px));
+    max-width: calc(100% - 44px);
     z-index: 6;
     box-shadow: -10px 0 32px rgba(0, 0, 0, 0.22);
+  }
+  .dockcol.overlay.expanded {
+    max-width: 100%;
+  }
+
+  /* The width handle: a quiet splitter on the dock's left edge (the
+     rail-resize idiom — invisible until hovered/dragged). */
+  .dock-resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -3px;
+    width: 7px;
+    cursor: col-resize;
+    z-index: 7;
+  }
+  .dock-resize:hover,
+  .dockcol.resizing .dock-resize {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
   }
 
   /* The collapsed dock: a slim right-edge strip, always reachable. */
@@ -806,6 +937,17 @@
   }
   .clabel {
     flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+  .carrow {
+    flex: none;
+    margin-left: auto;
+    color: var(--muted);
+  }
+  .continue:hover .carrow {
+    color: var(--accent);
   }
   .cname {
     min-width: 0;
@@ -867,6 +1009,16 @@
   .roster.compact {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
+  }
+  /* The flip-animation wrapper (animate: needs a keyed-each child); the
+     card stretches to keep grid rows even. */
+  .cardwrap {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .cardwrap > :global(.card) {
+    flex: 1;
   }
 
   .shells {

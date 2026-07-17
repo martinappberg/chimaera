@@ -91,8 +91,10 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   a mastermind) / `message_agent` / `interrupt_agent` (**chat sessions in
   the same workspace only** — the exec-409 wall: nothing types into a TUI;
   those answers say "propose to the user"). `message_agent` rides the same
-  `ChatManager::command` path a `/ws/chat` Send takes, prefixed
-  `[from the workspace Mastermind]` (provenance stamping). Every act call
+  `ChatManager::command` path a `/ws/chat` Send takes, prefixed with a
+  `[via the workspace Mastermind — …]` attribution naming the user-appointed
+  chain of authority (provenance stamping that reads as sanctioned direction,
+  not a suspicious second-hand instruction). Every act call
   logs a `tracing::info!` audit line. Every answer is capped (constants at
   the top of `mcp.rs`); journal tails read under `spawn_blocking`.
 - **Harness gating** — one shared read-tool list (`mcp::MASTERMIND_READ_TOOLS`)
@@ -102,7 +104,7 @@ One privileged chat session per workspace (the dashboard plan §6/§7 —
   pre-allows `mcp__chimaera`; the role prompt is argv
   (`launcher::MASTERMIND_SYSTEM_PROMPT` via `--append-system-prompt`). Codex:
   the app-server elicits EVERY MCP tool call regardless of approval-mode
-  config (live-probed — PROTOCOL.md Pass 16), so the mode rides
+  config (live-probed — PROTOCOL.md Pass 19), so the mode rides
   `SpawnSpec.mcp_auto_approve` (chat.rs sets it; the driver answers listed
   tools' elicitations itself, everything else surfaces); the role prompt is
   `-c developer_instructions`.

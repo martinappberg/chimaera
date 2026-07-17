@@ -9,9 +9,9 @@ Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 
 | File | What it owns |
 |---|---|
-| `DashboardView.svelte` | The surface: attention lane (inline permission answering over warm chat sockets), roster (hero/grid/compact by density), activity column (changed files + git), the vital-signs strip incl. the Slurm compute chip, quiet-gated recents, and the Mastermind dock column/pill wiring. |
-| `AgentCard.svelte` | One roster card: provenance tier, state dot, now-line, ctx meter/cost, the work drop-down (subagents ∪ background tasks on the shared `WorkTray` shell), evidence rows. |
-| `MastermindDock.svelte` | The Mastermind's only home: setup card (agent + ask/auto), embedded `ChatView` on the chat pool, mode-switch/retire, the honest gone/degraded states. |
+| `DashboardView.svelte` | The surface: attention lane (inline permission answering over warm chat sockets), roster (hero/grid/compact by density, flip-animated), activity column (changed files + git), the vital-signs strip incl. the Slurm compute chip + the "last active" jump-back chip, settled-quiet recents, and the Mastermind dock column/pill wiring (user-resizable to full width). |
+| `AgentCard.svelte` | One roster card: provenance tier (worn as words by the degraded tiers only), state dot, unread mark, now-line (incl. the post-turn `status_detail`), ctx meter/cost, the work drop-down (subagents ∪ background tasks — workflow rows carry name + agent tally), evidence rows. |
+| `MastermindDock.svelte` | The Mastermind's only home: setup card (agent + ask/auto), embedded `ChatView` on the chat pool, the clickable `acts:` gate badge, the native-permission-mode caveat line, expand/collapse, mode-switch/retire, the honest gone/degraded states. |
 | `TerminalRow.svelte` | The compact terminal-session row. |
 | `dash.ts` | Shared derivations: `provenanceOf`, `rosterWeight`, `relPath`, the `DashCtx` type. |
 

@@ -445,7 +445,7 @@ async fn message_agent_stamps_journal_and_walls_tuis() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let content = std::fs::read_to_string(&journal).unwrap_or_default();
-        if content.contains("[from the workspace Mastermind]")
+        if content.contains("[via the workspace Mastermind")
             && content.contains("status check: report progress")
             && content.contains("user_message")
         {

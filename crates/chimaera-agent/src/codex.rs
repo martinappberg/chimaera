@@ -2119,7 +2119,7 @@ impl CodexMapper {
             // answered HERE because the app-server elicits every MCP tool
             // call — approval-mode config, the granular approval_policy, and
             // a thread-level approvalPolicy "never" were all live-probed and
-            // none gates it (Pass 16). Scoped hard: tool-call approvals only
+            // none gates it (Pass 19). Scoped hard: tool-call approvals only
             // (`codex_approval_kind`), one server, and the tool name parsed
             // against the EXACT pinned message shape with a quote-free
             // charset — the model-requested name is interpolated verbatim
@@ -2928,7 +2928,7 @@ fn mode_wire_fields(mode_id: &str, model: Option<&str>, effort: Option<&str>) ->
 }
 
 /// The tool name from a codex MCP tool-call elicitation message, parsed
-/// against the EXACT pinned shape (Pass 16): `Allow the {server} MCP server
+/// against the EXACT pinned shape (Pass 19): `Allow the {server} MCP server
 /// to run tool "{name}"?` — prefix/suffix anchored, and the name must be
 /// quote-free `[A-Za-z0-9_-]+` (every real MCP tool name; an injected name
 /// carrying quotes or spaces fails closed to the user-facing prompt).
@@ -3743,7 +3743,7 @@ mod tests {
     /// unlisted tool on the same server still surfaces; `tools: None`
     /// pre-approves the whole server; a different server never matches.
     /// This is the codex Mastermind's ask/auto gating — the app-server
-    /// elicits every MCP call regardless of approval-mode config (Pass 16).
+    /// elicits every MCP call regardless of approval-mode config (Pass 19).
     #[test]
     fn mcp_elicitation_pre_approval_gates_by_tool_list() {
         let allow = |tools| crate::driver::McpAutoApprove {

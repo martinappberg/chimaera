@@ -142,7 +142,7 @@ pub(crate) async fn put_mastermind(
     // driver answering its per-tool MCP elicitations from the recorded mode
     // (`SpawnSpec.mcp_auto_approve` — codex's approval-mode config is
     // parsed but ignored on the app-server surface; the original v1 refusal
-    // predated that finding, PROTOCOL.md Pass 16). Other agents have no
+    // predated that finding, PROTOCOL.md Pass 19). Other agents have no
     // chat driver and are refused with an honest message.
     if !matches!(
         kind,

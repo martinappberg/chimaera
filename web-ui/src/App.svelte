@@ -33,6 +33,7 @@
     type Workspace,
     isMastermind,
   } from "./lib/workspace/sessions";
+  import { foldUnread, isUnread, markSeen } from "./lib/workspace/unread.svelte";
   import {
     getAgentDefault,
     installAgent,
@@ -552,6 +553,13 @@
     if (sid === null || sessionsById.get(sid)?.kind !== "agent") return;
     if (agentMru[0] === sid) return;
     agentMru = [sid, ...agentMru.filter((x) => x !== sid)].slice(0, 16);
+  });
+
+  // Looking at a session clears its unread mark (the rail rows and
+  // dashboard cards wear it until then).
+  $effect(() => {
+    const sid = focusedSessionId;
+    if (sid !== null) markSeen(sid);
   });
 
   /** App-level context the dashboard surface needs beyond the pane props. */
@@ -1784,6 +1792,10 @@
     const sortKey = (s: Session): number =>
       s.created_at !== 0 ? s.created_at : (lastCreatedAt.get(s.id) ?? 0);
     list.sort((a, b) => sortKey(a) - sortKey(b) || a.id.localeCompare(b.id));
+    // Unread marks fold BEFORE the swap: the transitions ("was running, now
+    // finished") need the previous rows. The focused session is exempt —
+    // output that ended under the user's eyes was seen.
+    foldUnread(new Map(sessions.map((s) => [s.id, s])), list, focusedSessionId);
     sessions = list;
     gotSessions = true;
     // A session now running as chat has no PTY: dispose any warm terminal
@@ -3171,6 +3183,13 @@
                   {/if}
                 </span>
               {/if}
+              {#if renamingId !== s.id && isUnread(s.id)}
+                <!-- Finished with output the user hasn't seen: a faint,
+                     state-color-free mark (the glyph owns state; this only
+                     says "worth a look"). Cleared the moment the row is
+                     focused. -->
+                <span class="unread-dot" title="finished — output you haven't looked at"></span>
+              {/if}
               {#if hintsActive() && renamingId !== s.id && chordDigits.has(s.id)}
                 <!-- Which-key discovery: the ⌘1–9 digit for this row, faded in
                      while the modifier is held. Pure teaching chrome. -->
@@ -3723,6 +3742,9 @@
               title={dotTitle(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
+            {#if isUnread(s.id)}
+              <span class="unread-dot" title="finished — output you haven't looked at"></span>
+            {/if}
             {#if hintsActive() && chordDigits.has(s.id)}
               <span class="chip-badge" aria-hidden="true">{chordDigits.get(s.id)}</span>
             {/if}
@@ -4234,6 +4256,24 @@
     from {
       opacity: 0;
     }
+  }
+
+  /* Unread output: a faint fg-toned mark, deliberately NOT a state color —
+     the glyph owns state, this only whispers "worth a look". Shared by the
+     rail rows and the focus-mode strip chips; cleared on focus. */
+  .unread-dot {
+    flex: none;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--fg) 75%, transparent);
+    box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--fg) 10%, transparent);
+    animation: hintfade 0.3s ease-out;
+  }
+  .row:has(.unread-dot) .name,
+  .chip:has(.unread-dot) .chip-name {
+    color: var(--fg);
+    font-weight: 600;
   }
 
   .row.new {

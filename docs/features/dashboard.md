@@ -13,7 +13,7 @@ any time. This is the larger dashboard/Mastermind design
 key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
 + rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
 `dashCtx`). The surface renders from the existing `/ws/events` roster, the chat journal
-via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`peekChat`), the git status store,
+via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`releaseChat`, refcounted), the git status store,
 and the rail's recents; the dock additionally rides the Mastermind daemon surface
 (`PUT`/`DELETE /api/v1/workspaces/{id}/mastermind` in
 `crates/chimaera-server/src/api/workspaces.rs`, the `mastermind` fields on the
@@ -64,9 +64,12 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   TUI hooks): label + relative age, read-only — hooks can't stop a TUI subagent, and the
   wire and store rows never merge (double counting).
 - **Key behaviors.**
-  - **Provenance is worn openly**: every card carries its fidelity tier — `protocol`
-    (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs) — with a
-    tooltip saying what that means (`dash.ts::provenanceOf`). Output-only cards read the
+  - **Provenance is worn openly, in plain words**: the fidelity tier is `protocol`
+    (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs)
+    (`dash.ts::provenanceOf`), but the card never shows the raw jargon. A chat row's
+    kind chip (`claude · chat`) already says it's the authoritative tier — the tier
+    story rides its tooltip. Only the degraded tiers wear an extra chip, worded for a
+    human: `status via hooks` / `output only`. Output-only cards read the
     daemon's output-recency signal for the now-line ("working — terminal output flowing" /
     "quiet — no recent output"); "state unknown" survives only on old daemons. Hooks
     cards read the v0.2 status-feed fields: the wire `now_line` ("ran Bash" /
@@ -77,6 +80,19 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   - **Density-adaptive**: one agent → a hero card (plan snapshot, subagents open by
     default); 2–6 → a card grid; 7+ → compact triage rows. The side column collapses under
     the pane's own width (container query), not the window's.
+  - **Calm ordering**: the roster sorts live-before-dead only (`dash.ts::rosterWeight`),
+    NOT per activity state — a chat agent cycles running↔finished every turn, and a
+    roster that re-ranks on each turn boundary reads as chaos (the state dot + strip
+    sentence + attention lane already say who's working). Within a bucket the order is
+    stable (created_at). Cards that DO move (into/out of the attention lane) glide via
+    Svelte `animate:flip` rather than teleporting (zeroed under reduced motion).
+  - **Unread output**: an agent that finishes a turn (or a hook-less TUI that goes quiet
+    after streaming) while it is NOT the focused session earns a faint fg-toned "unread"
+    mark — worn on the roster card, the rail row, and the focus-strip chip
+    (`workspace/unread.svelte.ts`). It is per-window and in-memory ("unread" is about
+    this viewer's eyes, not daemon state); focusing the session clears it. The mark is
+    deliberately never a state color — the state dot owns state; this only whispers
+    "worth a look".
   - **Bounded rich detail**: warm chat stores are acquired for attention-lane chat
     sessions always, plus running chats up to a small cap (`RICH_CAP = 4`), so the
     dashboard can never churn the chat pool's LRU out from under open tabs; released on
@@ -96,8 +112,15 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   a per-agent chip) and uncommitted git paths no agent claimed (chip `you`, tooltip states
   attribution is best-effort). Click opens the file in the active pane. Cap 10.
 - **Recents** — the rail's daemon-persisted recents, resumable, cap 5. Shown only in
-  quiet moments (attention lane empty, no agent mid-work) — during live work the column
-  stays lean; the blank state keeps its own recents regardless.
+  **settled** quiet moments (attention lane empty, no agent mid-work) — during live work
+  the column stays lean, and quiet must HOLD for a beat (~10s) before recents reappear so
+  the per-turn idle gap of a chat agent doesn't flicker the section in and out (hiding
+  stays immediate — kicking off work is a deliberate moment). The blank state keeps its
+  own recents regardless.
+- **"Last active"** — above the columns, a one-click jump back into this window's most
+  recently active agent (shown only when there's more than one agent, so it isn't the
+  whole story). Named for what it IS (the row you were last in), not the old bare
+  "continue" that read like a stuck state.
 - **Git** — branch, ahead/behind, change count; opens the source-control panel. Reads the
   live `gitStatus` store (epoch-driven, never polled).
 
@@ -111,20 +134,29 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   ask-first/auto mode choice, and Start.
 - **How it's used.** Start `PUT`s `/workspaces/{id}/mastermind {agent, mode, theme}`; the
   daemon creates the chat session AND binds it in one step and the dock swaps to the
-  identity header (mark · "Mastermind" · agent + mode chips) over an **embedded
-  `ChatView`** — the same component the panes use, on the same chat pool, so permission
-  prompts of an ask-mode Mastermind render inline in its own chat (never in the attention
-  lane). The header's `⋯` menu offers "switch to ask/auto" (an inline confirm — a mode
-  change is a re-PUT that restarts the session; a running claude never re-reads its
-  settings) and "retire" (inline confirm → `DELETE`, which unbinds and ends the session).
+  identity header (mark · "Mastermind" · agent chip · the clickable `acts:` gate badge)
+  over an **embedded `ChatView`** — the same component the panes use, on the same chat
+  pool, so permission prompts of an ask-mode Mastermind render inline in its own chat
+  (never in the attention lane). The header's `acts:` badge (and its `⋯` menu) switches
+  the gate with an inline confirm — a mode change is a re-PUT that restarts the session;
+  neither agent re-reads its gating after spawn — and the menu's "retire" (inline confirm
+  → `DELETE`) unbinds and ends the session.
 - **Key behaviors.**
-  - **Ask first vs auto** is worn on the chip: ask-first means acting on the workspace
-    raises the agent's own permission prompt (reads never ask); auto acts without asking,
-    every act audited. The gating rides the agent's native harness, set at spawn.
+  - **The act gate (ask first vs auto) is its own badge — `acts:`** — deliberately named
+    for what it gates (the Mastermind's OWN workspace acts), not to be confused with the
+    embedded agent's native permission-mode picker in the chat header. Ask-first raises
+    the agent's own permission prompt on an act (reads never ask); auto acts without
+    asking, every act audited. The gating rides the agent's native harness, set at spawn.
+  - **The two-mode caveat (claude, ask mode).** The ask-first gate works by NOT
+    pre-allowing acts — which only bites while claude's own permission mode actually
+    asks. If the user flips claude's native mode to auto/bypass (its header picker or
+    shift+tab), the dock says so in a warn line rather than wearing an `acts: ask first`
+    badge that's silently moot. Codex has no such caveat — its gate is the driver
+    answering elicitations, which no native mode bypasses.
   - **Claude or codex.** Both enforce the mode through their own harness: claude via
     the generated settings' pre-allows; codex via the driver answering its MCP
     tool-call elicitations from the recorded mode (its app-server elicits every MCP
-    call regardless of approval-mode config — live-probed, PROTOCOL.md Pass 16 — so
+    call regardless of approval-mode config — live-probed, PROTOCOL.md Pass 19 — so
     the pre-allow answers at the prompt). Both gates generate from the one shared
     read-tool list, so ask-mode semantics are identical: reads silent, acts prompt.
     A mode switch keeps the bound agent. PUT errors (the 409 missing-binary conflict
@@ -134,10 +166,14 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   - **The observer, not the observed**: session rows flagged `mastermind: true` are
     filtered out of the rail, the roster/lane, the chord map, quick-open, the home-screen
     rollups, and the recents-adjacent surfaces. The dock is the only place it renders.
-  - **Collapse**: panes ≥ ~1240px (the pane's own measured width, not the window's) get
-    the docked 360px column with a header `»` collapse; narrower panes get a slim
+  - **Collapse + resize**: panes ≥ ~1240px (the pane's own measured width, not the
+    window's) get the docked column with a header `»` collapse; narrower panes get a slim
     right-edge pill ("mastermind" + the mark, plus an amber dot when it waits on you)
-    that opens the dock as a right-pinned overlay. No horizontal scroll, no overlap.
+    that opens the dock as a right-pinned overlay. The docked column is **drag-resizable**
+    from a left-edge handle (the rail-resize idiom: drag to size, double-click to reset;
+    width persists per browser profile) all the way up to the **whole surface** — dragging
+    past the clamp, or the header's `⤢` button, expands it to fill the dashboard (a
+    transient focus mode, not persisted). No horizontal scroll, no overlap.
   - **Honest gone-state**: a binding whose session is missing/dead says "the Mastermind
     session is gone — set it up again" with a reset (DELETE, then the setup card) —
     never a ghost chat.
@@ -173,7 +209,7 @@ attention lane and was answered there (docstring on disk); daemon restart resurr
 the binding, the mode, and the pre-allow; the `⋯` mode switch to auto (re-PUT, whole
 `mcp__chimaera` pre-allow) acting with no prompt + the `tracing` audit line; codex chat
 carrying the injected MCP URL, listing and calling `chimaera.list_terminals` with its
-approval answered from chimaera (post-fix — see PROTOCOL.md Pass 15); blank-state
+approval answered from chimaera (post-fix — see PROTOCOL.md Pass 18); blank-state
 `+ mastermind`; hidden-from-roster across rail/roster/home rollups; light + dark.
 
 **Verified live (2026-07-16, codex-as-Mastermind, billed):** the setup card appointing
@@ -186,7 +222,7 @@ work"); a daemon restart resurrecting the codex Mastermind with binding, mode, a
 driver pre-approval intact; retire → setup card → re-appoint through the card. The
 gating mechanism (driver-answered elicitations) exists because codex's app-server
 elicits every MCP tool call regardless of approval-mode config — five live probes,
-recorded in PROTOCOL.md Pass 16. `chat-smoke` after the driver change: 16/16 (one
+recorded in PROTOCOL.md Pass 19. `chat-smoke` after the driver change: 16/16 (one
 claude-side flake passed alone).
 
 **Not exercised live yet:** the compute chip against a real Slurm scheduler (it reuses

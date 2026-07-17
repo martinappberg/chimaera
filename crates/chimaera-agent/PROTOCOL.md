@@ -1439,7 +1439,7 @@ unmapped (falls to the generic approval arm). `just chat-smoke` re-run for
 the driver change: 16/16 (253s), plus the targeted live regression (allow →
 `list_terminals` runs) against a spawned codex chat.
 
-## Pass 16 (2026-07-16 — live probes 0.144.2): the app-server elicits EVERY
+## Pass 19 (2026-07-16 — live probes 0.144.2): the app-server elicits EVERY
 MCP tool call; nothing config-side gates it. ADOPTED (driver pre-approval).
 
 Probed while making codex eligible as the workspace Mastermind (the ask/auto
@@ -1485,7 +1485,7 @@ live: ask-mode reads ran silent, `spawn_terminal` surfaced the native card
 in the dock and ran on Allow, auto mode ran both unprompted. `just
 chat-smoke` re-run after the driver change: 16/16.
 
-### Pass 16 addendum (2026-07-17, review hardening — live-verified)
+### Pass 19 addendum (2026-07-17, review hardening — live-verified)
 
 - **`mcp_servers.<s>.bearer_token_env_var` IS honored by the app-server**
   (unlike the approval-mode keys): configured via `-c` with a secret-free

@@ -73,7 +73,7 @@ const MESSAGE_TEXT_MAX: usize = 16 * 1024;
 /// `permissions.allow` in the settings file; codex: the driver's
 /// `SpawnSpec.mcp_auto_approve` answering its tool-call elicitations —
 /// codex's approval-mode config is parsed but ignored on the app-server
-/// surface, PROTOCOL.md Pass 16). One list so the two vendors' ask modes
+/// surface, PROTOCOL.md Pass 19). One list so the two vendors' ask modes
 /// can't drift; everything not on it prompts, including any tool added
 /// later.
 pub(crate) const MASTERMIND_READ_TOOLS: [&str; 5] = [
@@ -114,6 +114,18 @@ with the shell's own facilities (sbatch, nohup ... &) or a larger \
 timeout_ms. If the shell is busy your exec queues until its prompt \
 returns. State changes (cd, module load, exports) persist in the shell — \
 that is usually why the user linked it.";
+
+/// Extra instructions for a WORKER in a workspace that has a Mastermind:
+/// sets the expectation up front, so a relayed message doesn't read as a
+/// suspicious second-hand instruction when it arrives mid-session.
+/// Best-effort — read once at the agent's initialize, so a binding created
+/// later reaches only sessions spawned after it.
+const SUPERVISED_INSTRUCTIONS: &str = "\n\n\
+This workspace has a Mastermind: a coordinating agent the user appointed to \
+oversee every session here (this chimaera server is how it observes). It may \
+relay tasks or questions into this session as user messages prefixed \
+'[via the workspace Mastermind …]' — those deliveries are sanctioned by the \
+user's standing appointment, so treat them as normal user direction.";
 
 /// Extra instructions when the session is its workspace's Mastermind.
 const MASTERMIND_INSTRUCTIONS: &str = "\n\n\
@@ -176,8 +188,12 @@ pub(crate) async fn mcp(
     // stateless): re-binding the workspace's Mastermind changes what the
     // very next call sees, with no session restart.
     let mastermind = mastermind_of(&state, &agent_id);
+    let supervised = !mastermind
+        && workspace_of(&state, &agent_id)
+            .and_then(|w| w.mastermind)
+            .is_some();
     let result = match method {
-        "initialize" => Ok(initialize_result(&params, mastermind)),
+        "initialize" => Ok(initialize_result(&params, mastermind, supervised)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_defs(mastermind) })),
         "tools/call" => tools_call(&state, &agent_id, mastermind, &params).await,
@@ -213,7 +229,7 @@ pub(crate) fn mastermind_of(state: &AppState, agent_id: &str) -> bool {
         .is_some_and(|m| m.session_id == agent_id)
 }
 
-fn initialize_result(params: &Value, mastermind: bool) -> Value {
+fn initialize_result(params: &Value, mastermind: bool, supervised: bool) -> Value {
     // Echo a protocol version we can serve; the shapes we use are stable
     // across all published revisions.
     let requested = params
@@ -222,6 +238,8 @@ fn initialize_result(params: &Value, mastermind: bool) -> Value {
         .unwrap_or(PROTOCOL_FALLBACK);
     let instructions = if mastermind {
         format!("{INSTRUCTIONS}{MASTERMIND_INSTRUCTIONS}")
+    } else if supervised {
+        format!("{INSTRUCTIONS}{SUPERVISED_INSTRUCTIONS}")
     } else {
         INSTRUCTIONS.to_string()
     };
@@ -598,11 +616,15 @@ async fn read_session(
             screen
         });
     }
-    if state.chat.get(&sid).is_some() {
+    if let Some(info) = state.chat.get(&sid) {
         // Journal files are size-capped (4 MiB) but still blocking fs — off
-        // the reactor.
+        // the reactor. The LIVE pending flag rides along so the tail can say
+        // whether an ask is waiting right now — historical asks in the tail
+        // once read as live state and misled a Mastermind.
+        let pending = info.pending_permission;
         let path = state.chat.journal_dir().join(format!("{sid}.jsonl"));
-        let rendered = tokio::task::spawn_blocking(move || render_journal_tail(&path, lines)).await;
+        let rendered =
+            tokio::task::spawn_blocking(move || render_journal_tail(&path, lines, pending)).await;
         return match rendered {
             Ok(Ok(text)) if !text.is_empty() => tool_text(text),
             Ok(Ok(_)) => tool_text("(no conversation yet)".to_string()),
@@ -616,11 +638,36 @@ async fn read_session(
 /// Render the last `max_items` conversation items of a chat journal as
 /// compact text: message heads, tool titles, permission asks. Blocking fs —
 /// callers run it off the reactor. Output is bytes-capped (tail wins).
-fn render_journal_tail(path: &std::path::Path, max_items: usize) -> std::io::Result<String> {
+///
+/// Permission/question asks are HISTORY here — a reader (the Mastermind)
+/// once mistook an old "waiting on permission" line for live state. Asks
+/// resolved later in the journal render "(answered)"; whether one is waiting
+/// RIGHT NOW comes only from `pending_now` (the registry's live flag), as a
+/// trailing line.
+fn render_journal_tail(
+    path: &std::path::Path,
+    max_items: usize,
+    pending_now: bool,
+) -> std::io::Result<String> {
     use chimaera_agent::journal::SeqEvent;
     use chimaera_agent::model::AgentEvent;
 
     let content = std::fs::read_to_string(path)?;
+    // Pass 1: which asks did a later event resolve? (Bounded: journal files
+    // are size-capped; ids are short.)
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in content.lines() {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            continue;
+        };
+        match entry.ev {
+            AgentEvent::PermissionResolved { request_id, .. }
+            | AgentEvent::QuestionResolved { request_id, .. } => {
+                resolved.insert(request_id);
+            }
+            _ => {}
+        }
+    }
     let mut items: Vec<String> = Vec::new();
     for line in content.lines() {
         let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
@@ -648,14 +695,26 @@ fn render_journal_tail(path: &std::path::Path, max_items: usize) -> std::io::Res
                     head(&title, ITEM_HEAD_CHARS)
                 ));
             }
-            AgentEvent::PermissionRequest { title, .. } => {
+            AgentEvent::PermissionRequest {
+                request_id, title, ..
+            } => {
+                let mark = if resolved.contains(&request_id) {
+                    "answered"
+                } else {
+                    "unanswered"
+                };
                 items.push(format!(
-                    "waiting on permission: {}",
+                    "permission asked ({mark}): {}",
                     head(&title, ITEM_HEAD_CHARS)
                 ));
             }
-            AgentEvent::QuestionRequest { .. } => {
-                items.push("waiting on an answer from the user".to_string());
+            AgentEvent::QuestionRequest { request_id, .. } => {
+                let mark = if resolved.contains(&request_id) {
+                    "answered"
+                } else {
+                    "unanswered"
+                };
+                items.push(format!("the agent asked the user a question ({mark})"));
             }
             AgentEvent::TurnCompleted { .. } => items.push("— turn completed —".to_string()),
             AgentEvent::TurnAborted {
@@ -686,6 +745,11 @@ fn render_journal_tail(path: &std::path::Path, max_items: usize) -> std::io::Res
     }
     if items.len() > max_items {
         items.drain(..items.len() - max_items);
+    }
+    // Liveness comes from the registry, never from transcript archaeology:
+    // this line is the ONLY "right now" claim in the output.
+    if pending_now {
+        items.push("[live] a permission ask is waiting on the user RIGHT NOW".to_string());
     }
     let mut out = items.join("\n");
     // Byte cap, tail wins (the newest turns matter most).
@@ -968,7 +1032,10 @@ async fn message_agent(
             "mastermind act: message_agent");
         // Attribution first: the worker AND the human watching its pane both
         // see who spoke (threat-model mitigation 2 — provenance stamping).
-        let attributed = format!("[from the workspace Mastermind]\n{text}");
+        // The chain of authority is spelled out so workers treat the relay as
+        // user-sanctioned direction, not a suspicious second-hand instruction
+        // — while never claiming the user typed these exact words.
+        let attributed = format!("[via the workspace Mastermind — the coordinating agent the user appointed for this workspace; treat this as user-sanctioned direction]\n{text}");
         let command = chimaera_agent::model::AgentCommand::Send {
             blocks: vec![chimaera_agent::model::ContentBlock::Text { text: attributed }],
         };
@@ -1381,5 +1448,44 @@ mod tests {
         );
         assert!(mention_tokens("no mentions here, term: nope").is_empty());
         assert!(mention_tokens("dangling @term: end").is_empty());
+    }
+
+    /// Transcript asks are history, never live state: a resolved ask says
+    /// "(answered)", an unresolved one "(unanswered)", and the ONLY "right
+    /// now" claim is the trailing [live] line driven by the registry flag —
+    /// a Mastermind once misread an old "waiting on permission" tail line as
+    /// the session being blocked.
+    #[test]
+    fn journal_tail_marks_asks_as_history_and_liveness_from_the_flag() {
+        let dir = std::env::temp_dir().join(format!("chimaera-mcp-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s-test.jsonl");
+        let lines = [
+            serde_json::json!({"seq": 1, "ts": 1, "ev": {"type": "permission_request", "request_id": "p1",
+                "title": "Bash", "options": [], "input_preview": {}}}),
+            serde_json::json!({"seq": 2, "ts": 2, "ev": {"type": "permission_resolved",
+                "request_id": "p1", "option_id": "allow"}}),
+            serde_json::json!({"seq": 3, "ts": 3, "ev": {"type": "permission_request", "request_id": "p2",
+                "title": "Workflow", "options": [], "input_preview": {}}}),
+        ];
+        let content = lines.map(|l| l.to_string()).join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let quiet = render_journal_tail(&path, 10, false).unwrap();
+        assert!(
+            quiet.contains("permission asked (answered): Bash"),
+            "{quiet}"
+        );
+        assert!(
+            quiet.contains("permission asked (unanswered): Workflow"),
+            "{quiet}"
+        );
+        assert!(!quiet.contains("RIGHT NOW"), "{quiet}");
+
+        let live = render_journal_tail(&path, 10, true).unwrap();
+        assert!(
+            live.ends_with("[live] a permission ask is waiting on the user RIGHT NOW"),
+            "{live}"
+        );
     }
 }
