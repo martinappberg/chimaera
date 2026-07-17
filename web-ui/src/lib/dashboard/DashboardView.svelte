@@ -68,7 +68,10 @@
   );
 
   const working = $derived(agents.filter((s) => s.alive && s.agent_state === "running").length);
-  const finished = $derived(agents.filter((s) => s.agent_state === "finished").length);
+  // Alive-guarded like `working`: a dead row already reads "exited" on its
+  // card, so counting its stale "finished" state would make the vital-signs
+  // strip disagree with the roster.
+  const finished = $derived(agents.filter((s) => s.alive && s.agent_state === "finished").length);
   const busyShells = $derived(shells.filter(isBusy).length);
 
   const hero = $derived(lane.length === 0 && roster.length === 1);
@@ -191,7 +194,17 @@
   const continueTarget = $derived.by(() => {
     for (const id of dash.mru) {
       const s = sessions.get(id);
-      if (s !== undefined && s.alive && s.workspace_id === wsId && s.kind === "agent") return s;
+      if (
+        s !== undefined &&
+        s.alive &&
+        s.workspace_id === wsId &&
+        s.kind === "agent" &&
+        // The Mastermind is the observer, never a roster/continue target —
+        // the same isMastermind gate every roster surface routes through, so
+        // this branch can't leak it in even if it ever lands in the MRU.
+        !isMastermind(s)
+      )
+        return s;
     }
     return agents.filter((s) => s.alive).toSorted((a, b) => b.created_at - a.created_at)[0] ?? null;
   });
