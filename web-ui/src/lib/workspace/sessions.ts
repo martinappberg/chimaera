@@ -393,7 +393,7 @@ export async function listSessions(): Promise<Session[]> {
 export interface AgentSpawn {
   /** Which agent CLI ("claude" when omitted). */
   agent?: string;
-  /** Claude session id to resume (`claude --resume <id>`). */
+  /** Native conversation handle (Claude session id / Codex thread id). */
   resume?: string;
   /** A title to seed a resumed conversation with (a recents row's title),
    *  carried across the fresh id an "open recent" mints. Seeds the soft

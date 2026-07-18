@@ -41,8 +41,8 @@ pub(crate) struct CreateSession {
     /// GET /api/v1/agents); the agent's own default when omitted.
     #[serde(default)]
     model: Option<String>,
-    /// Claude session id to resume (`--resume <id>`, claude-only), from
-    /// GET /api/v1/agents/claude/sessions.
+    /// Native conversation handle to resume (Claude session id / Codex thread
+    /// id), from Recents or the Claude transcript catalog.
     #[serde(default)]
     resume: Option<String>,
     /// A display title to seed a resumed conversation with — the recents row's
@@ -164,8 +164,16 @@ pub(crate) async fn create_session(
                     }
                 },
             };
-            if body.resume.is_some() && agent_kind != crate::agents::AgentKind::Claude {
-                return bad_request("resume is only supported for claude sessions".to_string());
+            if body.resume.is_some()
+                && !matches!(
+                    agent_kind,
+                    crate::agents::AgentKind::Claude | crate::agents::AgentKind::Codex
+                )
+            {
+                return bad_request(format!(
+                    "resume is not supported for {} sessions",
+                    agent_kind.as_str()
+                ));
             }
             // Argv cannot shell-inject, but flag-shaped or control-byte values
             // have no business in --model/--resume.
@@ -528,12 +536,13 @@ pub(crate) async fn delete_session(
             state.chat.kill(&id);
         } else {
             state.chat.remove(&id);
-            crate::recents::retire(
+            crate::recents::retire_with_resume(
                 &state,
                 &id,
                 None,
                 None,
                 chimaera_agent::model::SessionUi::Chat,
+                info.native_session_id,
             );
         }
         state.changes.notify_waiters();

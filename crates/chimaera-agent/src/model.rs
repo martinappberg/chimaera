@@ -115,8 +115,8 @@ pub enum AgentEvent {
         /// Absent on pre-upgrade journals and transcript-seeded messages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        /// The agent has NOT consumed this message yet (claude queues
-        /// mid-turn stdin frames; codex steers/buffers into a running turn).
+        /// The agent has NOT consumed this message yet (both drivers hold
+        /// mid-turn follow-ups; codex can explicitly promote one via Steer).
         /// Resolved by a `UserMessageUpdate`; default false = delivered.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         queued: bool,
@@ -309,10 +309,9 @@ pub enum AgentEvent {
         status: Option<i32>,
     },
     /// Delivery resolution for a `queued` UserMessage, matched by `id`:
-    /// claude dequeues one message per finished turn (and an aborted turn
-    /// drops the whole native queue; a coalesced surplus the CLI never runs
-    /// separately resolves `sent` when the driver goes idle); codex resolves
-    /// on the steer RPC answer. `cancelled` is the user's own pull-back
+    /// claude flushes its held FIFO after the current turn settles; codex
+    /// resolves when the FIFO opens its next turn or the steer RPC answers.
+    /// `cancelled` is the user's own pull-back
     /// (`CancelQueued`). Replay is self-correcting — the journal carries the
     /// queued echo and this update through the same reducer, so a
     /// queued-then-sent message renders exactly once, a queued-never-sent one
@@ -435,11 +434,11 @@ pub struct BackgroundTaskClose {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserMessageState {
-    /// The agent consumed it (claude ran it as the next turn — or coalesced it
-    /// into a running one; codex steered it into the running turn).
+    /// The agent consumed it (claude flushed it after the current turn; codex
+    /// opened its queued turn or steered it).
     Sent,
-    /// The agent never saw it (claude's queue dies with an aborted turn;
-    /// a codex steer failed for good).
+    /// The agent never saw it (the driver died with a held queue, or a codex
+    /// steer failed for good).
     Dropped,
     /// The user pulled it back before the agent consumed it (the `CancelQueued`
     /// command, honored only while the message is still queued). A cancelled
@@ -541,13 +540,20 @@ pub enum AgentCommand {
     },
     /// Pull back a still-queued user message before the agent consumes it
     /// (`id` = the queued `UserMessage.id`). Honored only while the message is
-    /// genuinely queued: claude removes it from its native mid-turn queue (a
-    /// `cancel_async_message` control request) and codex drops it from the
-    /// pre-steer buffer, both emitting `UserMessageUpdate{Cancelled}`. Once the
+    /// genuinely queued: both drivers remove it from their held FIFO and emit
+    /// `UserMessageUpdate{Cancelled}`. Once the
     /// agent has already taken the message, the driver answers with a `Notice`
     /// instead (it can't be un-said). APPENDED last: strictly additive, so a
     /// pre-upgrade client that never sends it is unaffected.
     CancelQueued {
+        id: String,
+    },
+    /// Promote one queued Codex follow-up into the currently running turn.
+    /// The Codex driver maps this to `turn/steer`; if the run ended before
+    /// the command arrived, the selected message opens the next turn instead.
+    /// Claude has no separate queue-vs-steer control and ignores this command.
+    /// APPENDED last so existing command tags and clients remain untouched.
+    SteerQueued {
         id: String,
     },
 }

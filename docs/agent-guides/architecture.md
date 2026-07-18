@@ -426,8 +426,11 @@ codex launch did not work in the field.
   once the rail had it): GET /api/v1/recents merges the daemon's own history
   (recents.json — any agent kind, ended under its watch) with the claude transcript store
   (conversations from before chimaera or run outside it); daemon entries win identity
-  collisions. Click resumes when the agent supports it (claude `--resume <id>`); if an
-  agent can't resume, the row starts a fresh conversation with an honest tooltip. Live
+  collisions. Click resumes when the daemon captured a native handle (claude
+  `--resume <id>`; codex `thread/resume` in chat or `codex resume <id>` in the TUI);
+  a handle-less row starts fresh with an honest per-row tooltip rather than claiming the
+  agent lacks resume support. A finished Codex chat copies its `ChatInfo` thread id into
+  Recents before removing the registry entry. Live
   conversations never appear; resuming one moves it out (claude forks a new session id
   per resume — records track `resumed_from`, and a resumed-then-ended conversation
   supersedes its ancestor entry). The section order is also the mod+1–9 chord order and

@@ -222,7 +222,8 @@ export interface RecentConvo {
   /** Which agent CLI ran it ("claude"/"codex"/"gemini") — drives the glyph. */
   kind: string;
   title: string;
-  /** Claude session id to resume; null = clicking starts a fresh one. */
+  /** Native conversation handle (Claude session id / Codex thread id);
+   *  null = clicking starts a fresh session. */
   resume: string | null;
   /** When the session ended, unix seconds. */
   lastActive: number;

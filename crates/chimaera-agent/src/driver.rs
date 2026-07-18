@@ -39,20 +39,10 @@ pub const INTERRUPT_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
 
 /// Idle-flush deadline, counted in harness `tick`s (~1.5s at
 /// `COALESCE_INTERVAL_MS`), armed while the driver is idle with messages still
-/// queued. Both mappers use it to settle a queue the agent has drained without
-/// producing a per-message result.
-///
-/// Why it's needed: claude COALESCES rapid mid-turn sends — it runs FEWER turns
-/// (fewer `result` frames) than there were messages (live-verified: 3 sends → 2
-/// turns), so the surplus queued ids never get popped by a result and their
-/// bubbles would stay faded "queued" forever. Once the CLI is idle again it has
-/// drained/coalesced the queue, so those messages DID reach it: resolve them
-/// `sent`. The grace guards against flushing a message that a genuinely
-/// in-flight next turn is about to open (a real turn opens within it and
-/// disarms the flush); a premature flush would only be `sent` early, which is
-/// the message's correct terminal state anyway (an idle driver has no live turn
-/// left to abort it). codex uses the same deadline for the symmetric defensive
-/// case (a buffer stranded when a turn ended under it).
+/// queued. Codex uses it as a defensive rescue when a turn ends underneath an
+/// unidentified `turn/start`, leaving the next-run FIFO idle with no ordinary
+/// completion edge left to promote it. Claude's held queue flushes directly on
+/// every result and no longer needs this timer (see PROTOCOL.md Pass 13).
 pub const IDLE_FLUSH_GRACE_TICKS: u32 = (1500 / COALESCE_INTERVAL_MS) as u32;
 
 /// Everything needed to start a driver. `argv` is COMPLETE (binary plus all

@@ -4,8 +4,8 @@ use crate::*;
 /// The stateful-restart contract end to end: a live shell recorded in
 /// the ledger comes back UNDER THE SAME SESSION ID after a "restart"
 /// (a second AppState over the same data dir) — at its cwd, with its
-/// pinned name and theme — while a non-resumable agent entry retires
-/// into the workspace's recents instead of vanishing.
+/// pinned name and theme — while an agent entry lacking a captured native
+/// handle retires into the workspace's recents instead of vanishing.
 #[tokio::test]
 async fn ledger_resurrects_sessions_across_restart() {
     let data = test_dir("ledger-restart");

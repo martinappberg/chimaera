@@ -18,7 +18,8 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
 
 - **What & when.** Start a coding agent in the focused pane, as a TUI or a chat session.
 - **How it's used.** `POST /api/v1/sessions` with `kind:"agent"`, `agent:"claude"|"codex"|…`,
-  optional `model` (from the curated list), `resume` (claude only), `theme`, `cols`/`rows`, and
+  optional `model` (from the curated list), `resume` (Claude session id or Codex thread id),
+  `theme`, `cols`/`rows`, and
   `ui:"term"` (default, real TUI) or `ui:"chat"` (structured driver). New agent sessions default
   to chat when `agents.defaultView === "chat"` and the agent is chat-capable.
 - **Where it lives.** `api/sessions.rs` (`create_session`, `spawn_chat_ui`); TUI spawn `spawn.rs`;
@@ -30,8 +31,9 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   hit is cached for the daemon's life, a miss left uncached to self-heal. `model`/`resume` are
   charset-validated (`safe_arg` refuses flag-shaped/control-byte values). The launcher env scrubs
   the daemon's own `CLAUDE_CODE_*`/`CLAUDE_AGENT_*` markers so a spawned claude doesn't think it's
-  a nested child. `resume` is claude-only (400 otherwise). Chat is gated to `chat_capable()`
-  agents (claude / codex); gemini/agy are refused chat.
+  a nested child. `resume` is accepted for Claude and Codex (400 for agents without a native
+  resume contract); Codex TUI resumes map to `codex resume <thread-id>`. Chat is gated to
+  `chat_capable()` agents (claude / codex); gemini/agy are refused chat.
 
 ## The launcher — split button & popover
 
@@ -165,11 +167,13 @@ spawn.rs,recents.rs}`. Wire: `POST/GET/DELETE/PATCH /api/v1/sessions*`, `GET /ap
   previous life — copied when a chat journal exists, otherwise **imported from the claude
   transcript** (`~/.claude/projects/<enc>/<id>.jsonl` → `AgentEvent`s, bounded newest-tail with an
   explicit `Truncated` marker). A claude recent whose history can't be reconstructed opens **in
-  the terminal instead** (`claude --resume` renders natively there) — never a blank chat. Codex
-  resumes in-protocol, so it always chats. Resume stays **honest per agent**: only promises what a
-  transcript can deliver — claude 2.1.x interactive sessions persist *no* transcript, so an
-  unverified id is refused rather than minting a row that dies with "No conversation found". Cap
-  20/workspace; live conversations are hidden at read time (they return when the session ends).
+  the terminal instead** (`claude --resume` renders natively there) — never a blank chat. A Codex
+  recent resumes on its last surface: `thread/resume` in chat, `codex resume <thread-id>` in the
+  TUI. A normally finished Codex chat copies its native `ChatInfo` thread id into Recents before
+  registry removal. Resume stays **honest per row**: a row with no captured native handle starts
+  fresh and says so without claiming the agent lacks resume support; Claude handles additionally
+  require a real transcript (Claude 2.1.x interactive sessions can persist none). Cap 20/workspace;
+  live conversations are hidden at read time (they return when the session ends).
 
 ## Status: partial
 

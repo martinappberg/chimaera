@@ -34,8 +34,10 @@ PTY snapshot-on-attach ([terminals.md](terminals.md)) and the chat seq-journal g
   pinned name, dims, theme, linked-terminal edges). On boot the daemon **resurrects**: shells respawn at
   their last cwd, claude TUI agents respawn with `--resume`, **chat sessions respawn as chat** — both
   agents, via `chat::resurrect_chat`, resuming the native conversation (claude `--resume`, codex
-  `thread/resume`) and replaying the on-disk journal — and the non-resumable retire into Recents (a TUI
-  codex, or a chat when `restoreSessions` is off) so a survivor is offered for manual resume.
+  `thread/resume`) and replaying the on-disk journal. Sessions Chimaera cannot resurrect live retire
+  into Recents; a row resumes when its native handle was captured, otherwise its tooltip honestly
+  says that this specific row must start fresh. A finished Codex chat carries its `ChatInfo` thread id
+  into Recents before the chat registry entry is removed.
 - **How it's used.** No route — this is boot/shutdown lifecycle, gated by `daemon.restoreSessions`
   (default true). A graceful stop also writes a **handoff** (port + token) so a successor daemon rebinds
   the same port with the same token — ssh forwards stay valid and every client heals with a plain

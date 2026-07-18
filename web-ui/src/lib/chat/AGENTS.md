@@ -80,6 +80,9 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   any pending bubble rides `socket.send({type:"cancel_queued", id})`: it pulls
   back a queued send, dismisses a dropped one (the driver's tombstone
   `Cancelled` makes that survive replay), and no-ops for one already delivered.
+  Codex rows additionally expose `socket.send({type:"steer_queued", id})`:
+  that removes only the selected FIFO entry and maps it to `turn/steer`; plain
+  Enter remains queue-for-next-turn.
   All pure reducer, so replay rebuilds the identical order — see
   `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do

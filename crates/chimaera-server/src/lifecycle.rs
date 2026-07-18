@@ -138,12 +138,13 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // the reconciler already captured.
     for info in state.chat.list() {
         if !info.alive {
-            recents::retire(
+            recents::retire_with_resume(
                 &state,
                 &info.id,
                 None,
                 None,
                 chimaera_agent::model::SessionUi::Chat,
+                info.native_session_id,
             );
         }
     }

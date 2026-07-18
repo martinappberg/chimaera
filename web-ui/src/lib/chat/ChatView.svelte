@@ -181,10 +181,10 @@
   }
 
   function onSubmit(text: string, images: ImageAttachment[]): boolean {
-    // Type-through, official-client semantics: mid-turn sends go straight to
-    // the agent — claude's CLI queues them natively, codex steers them into
-    // the running turn. No client-side queue to manage or lose. Returns false
-    // when the socket isn't open so the composer keeps the draft.
+    // The daemon owns delivery semantics so reconnect/replay stay exact:
+    // mid-turn sends queue for the next run; Codex entries can be explicitly
+    // promoted with Steer. Returns false when the socket isn't open so the
+    // composer keeps the draft.
     return sendNow(text, images);
   }
 
@@ -228,6 +228,14 @@
   function cancelQueued(id: string) {
     const sent = socket.send({ type: "cancel_queued", id });
     if (!sent) store.notice("not connected — couldn't cancel, try again in a moment", "error");
+  }
+
+  /** Promote one Codex follow-up from the next-run FIFO into the active turn.
+   *  The pending bubble stays until the driver's turn/steer RPC resolves, so
+   *  a disconnect or rejection never lies about delivery. */
+  function steerQueued(id: string) {
+    const sent = socket.send({ type: "steer_queued", id });
+    if (!sent) store.notice("not connected — couldn't steer, try again in a moment", "error");
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -923,6 +931,17 @@
       {#each store.pendingSends as send (send.id)}
         <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
           <div class="bubble-row">
+            <div class="bubble">
+              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
+            </div>
+            {#if agentKind === "codex" && send.state === "queued" && store.running}
+              <button
+                class="steer-btn"
+                title="add this message to the current run"
+                aria-label="steer queued message into current run"
+                onclick={() => steerQueued(send.id)}
+              >↪ Steer</button>
+            {/if}
             <button
               class="cancel-btn"
               title={send.state === "dropped"
@@ -935,9 +954,6 @@
             >
               ✕
             </button>
-            <div class="bubble">
-              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
-            </div>
           </div>
           <span class="delivery" class:dropped={send.state === "dropped"}>
             {send.state === "dropped" ? "not delivered" : "queued"}
@@ -1100,11 +1116,30 @@
     outline: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
     outline-offset: -1px;
   }
-  /* Dropped (e.g. claude dropped its queue on interrupt): the text stays
+  /* Dropped (e.g. the agent process died before delivery): the text stays
      readable — no strikethrough — so it can be copied and re-sent by hand. */
   .pending-msg.dropped .bubble {
     outline-style: solid;
     outline-color: color-mix(in srgb, var(--err) 45%, transparent);
+  }
+  .steer-btn {
+    flex: none;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+    padding: 3px 4px;
+    border-radius: 6px;
+    transition:
+      color 0.12s ease,
+      background 0.12s ease;
+  }
+  .steer-btn:hover,
+  .steer-btn:focus-visible {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
   }
   .delivery {
     color: var(--muted);

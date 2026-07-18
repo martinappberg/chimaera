@@ -2264,8 +2264,8 @@
     refreshRecents();
   });
 
-  /** A Recents row: resume when the CLI supports it (claude), else an
-   *  honest fresh start of the same agent (the tooltip says which). The row's
+  /** A Recents row: resume when the daemon captured a native conversation
+   *  handle, else an honest fresh start (the tooltip says why). The row's
    *  title rides along so the restored conversation keeps its name instead of
    *  showing a bare "claude" until a new turn regenerates one. */
   function openRecent(r: RecentConvo): void {
@@ -2286,7 +2286,7 @@
   function recentTooltip(r: RecentConvo): string {
     return r.resume !== null
       ? `resume “${r.title}”`
-      : `${r.kind} can't resume a finished conversation yet — starts a fresh one`;
+      : `no saved conversation handle was recorded — starts a fresh ${r.kind} session`;
   }
 
   /** Kill the session's process on the daemon and drop it locally — OPTIMISTIC:
@@ -3297,8 +3297,8 @@
         {/if}
 
         <!-- Recents: ended agent conversations, any agent type, newest
-             first — the daemon remembers them across restarts. Click
-             resumes (claude) or honestly starts fresh (the tooltip says). -->
+             first — the daemon remembers them across restarts. Click resumes
+             when a native handle exists, otherwise starts fresh honestly. -->
         {#if visibleRecents.length > 0}
           <div class="recents">
             <div class="recents-head">recent</div>

@@ -177,14 +177,30 @@ pub(crate) async fn spawn_session(
             } else {
                 None
             };
-            let mut argv = crate::launcher::build_agent_command(
-                agent_kind,
-                &bin,
-                settings.as_deref(),
-                model.as_deref(),
-                resume.as_deref(),
-                codex_theme,
-            );
+            // Codex resume is a subcommand (`codex resume <thread>`), not a
+            // flag. Fresh Codex and every Claude/Gemini spawn keep the normal
+            // builder; the dedicated resume builder pins Codex's argv order.
+            let mut argv = if agent_kind == AgentKind::Codex && resume.is_some() {
+                crate::launcher::build_agent_resume_command(
+                    agent_kind,
+                    &bin,
+                    settings.as_deref(),
+                    model.as_deref(),
+                    resume.as_deref(),
+                    None,
+                    None,
+                    codex_theme,
+                )
+            } else {
+                crate::launcher::build_agent_command(
+                    agent_kind,
+                    &bin,
+                    settings.as_deref(),
+                    model.as_deref(),
+                    resume.as_deref(),
+                    codex_theme,
+                )
+            };
             if let Some(mcp) = &mcp_config {
                 argv.push("--mcp-config".to_string());
                 argv.push(mcp.to_string_lossy().into_owned());

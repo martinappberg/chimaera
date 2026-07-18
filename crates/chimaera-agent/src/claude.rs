@@ -2704,6 +2704,10 @@ impl ClaudeMapper {
                     state: UserMessageState::Cancelled,
                 });
             }
+            // Codex alone exposes queue-vs-steer as two user actions. Claude's
+            // held FIFO has no native way to inject one entry into the open
+            // turn, and the chat UI never offers this command for Claude.
+            AgentCommand::SteerQueued { .. } => {}
         }
         step
     }

@@ -183,6 +183,20 @@ fn cancel_queued_command_is_additive() {
     assert_eq!(interrupt, AgentCommand::Interrupt);
 }
 
+/// `SteerQueued` is the explicit Codex queue-promotion action. It is additive
+/// to the public WS command vocabulary; ordinary sends keep their old shape.
+#[test]
+fn steer_queued_command_is_additive() {
+    let cmd: AgentCommand = serde_json::from_str(r#"{"type":"steer_queued","id":"u1"}"#).unwrap();
+    assert_eq!(cmd, AgentCommand::SteerQueued { id: "u1".into() });
+    assert_eq!(
+        serde_json::to_value(AgentCommand::SteerQueued { id: "u1".into() }).unwrap(),
+        json!({ "type": "steer_queued", "id": "u1" })
+    );
+    let send: AgentCommand = serde_json::from_str(r#"{"type":"send","blocks":[]}"#).unwrap();
+    assert_eq!(send, AgentCommand::Send { blocks: Vec::new() });
+}
+
 /// `interrupted` is additive the same way: false vanishes from the wire, old
 /// lines deserialize false, and only a deliberate user stop sets it.
 #[test]

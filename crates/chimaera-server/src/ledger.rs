@@ -464,9 +464,10 @@ enum RestorePlan {
 
 /// Pure restore policy, split out for tests: shells and claude respawn
 /// (claude resumes its conversation; a claude that never got a transcript
-/// has nothing to lose and boots fresh). A TUI codex has no *verified* resume
-/// mechanism — respawning a fresh TUI while pretending it is the same
-/// conversation would be a lie, so it retires into Recents instead.
+/// has nothing to lose and boots fresh). The ledger does not capture a fresh
+/// Codex TUI's native thread id, so it cannot target `codex resume <id>`
+/// precisely; respawning fresh while pretending continuity would be a lie,
+/// so that entry retires into Recents instead.
 ///
 /// A **chat** session respawns for BOTH agents: the chat drivers resume
 /// in-band (claude `--resume`, codex `thread/resume`) and the on-disk journal
