@@ -354,6 +354,23 @@ fn open_setup_window(handle: &tauri::AppHandle) -> tauri::Result<()> {
 /// Build and run the Tauri app.
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first: the plugin intercepts a second launch
+        // before any other plugin or process-global shell resource starts.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Bring the existing instance forward. During the first process's
+            // early daemon startup there may not be a window yet; its normal
+            // startup path will open one as soon as the daemon is ready.
+            let windows = app.webview_windows();
+            let target = windows
+                .values()
+                .find(|window| window.is_focused().unwrap_or(false))
+                .or_else(|| windows.values().next());
+            if let Some(window) = target {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![

@@ -41,17 +41,29 @@
     session: "only for this session (not saved)",
   };
   const DEST_KEY = "chimaera-permission-destination";
-  let destination = $state(
-    DESTINATIONS.includes(localStorage.getItem(DEST_KEY) as (typeof DESTINATIONS)[number])
-      ? (localStorage.getItem(DEST_KEY) as string)
-      : "localSettings",
-  );
+  function loadDestination(): string {
+    try {
+      const stored = localStorage.getItem(DEST_KEY);
+      return DESTINATIONS.includes(stored as (typeof DESTINATIONS)[number])
+        ? (stored as string)
+        : "localSettings";
+    } catch {
+      // Storage can be disabled in hardened/private WebViews. A permission
+      // card is security-critical UI and must remain answerable regardless.
+      return "localSettings";
+    }
+  }
+  let destination = $state(loadDestination());
   const hasDestination = $derived(request.options.some((o) => o.id === "allow_always"));
   function cycleDestination() {
     const next =
       DESTINATIONS[(DESTINATIONS.indexOf(destination as never) + 1) % DESTINATIONS.length];
     destination = next;
-    localStorage.setItem(DEST_KEY, next);
+    try {
+      localStorage.setItem(DEST_KEY, next);
+    } catch {
+      // Keep the in-memory choice usable even when persistence is unavailable.
+    }
   }
   function decide(optionId: string) {
     onDecide(optionId, optionId === "allow_always" ? destination : undefined);

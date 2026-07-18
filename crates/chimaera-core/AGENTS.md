@@ -29,8 +29,9 @@ versions). Run `cargo test` in the app workspace too when you touch core deps.
 - **`generate_token` is the general-purpose random-hex source**, not just auth: the
   server slices it (`[..8]`/`[..16]`/`[..32]`) for session/ticket/workspace ids and
   agent keys. Don't narrow its contract to "tokens."
-- **`Manifest` is atomic + 0600.** Written tmp+rename at mode 0600 because it carries
-  the bearer token. `Manifest.build` serde-defaults to an ancient sentinel so an
+- **`Manifest` is atomic + 0600.** Written through a unique `create_new` temp opened
+  at mode 0600, then renamed, because it carries the bearer token. `Manifest.build`
+  serde-defaults to an ancient sentinel so an
   old manifest still parses.
 - **`Handoff` is consume-once, ~120s fresh, 0600**, and is written by the **daemon
   on its own graceful shutdown** (a crash leaves none) — not by "the app/connect".

@@ -50,7 +50,9 @@ app-build` (never the root `cargo`).
   Closing a window removes its record (macOS convention) **except during quit** (guarded by an
   `AtomicBool quitting` so teardown doesn't forget every window). Geometry is stored in logical pixels
   (correct across scale factors) on a slow 2s tick. Opening a workspace already shown raises that
-  window instead of duplicating.
+  window instead of duplicating. The shell is process-singleton because its registry, tunnels, and
+  askpass endpoint are process-global; launching the app again raises an existing window rather than
+  starting a competing owner.
 
 ## Signed self-update (app + daemon)
 

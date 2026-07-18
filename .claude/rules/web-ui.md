@@ -1,5 +1,5 @@
 ---
-description: Hard constraints for the Svelte web UI — verify live (no JS tests), sanitize untrusted agent output, theme tokens, canonical agent vocabulary, runes discipline.
+description: Hard constraints for the Svelte web UI — verify live (no browser/component tests), sanitize untrusted agent output, theme tokens, canonical agent vocabulary, runes discipline.
 paths: ["web-ui/**"]
 ---
 
@@ -7,6 +7,7 @@ paths: ["web-ui/**"]
 
 Svelte 5 (runes). Build/check needs **Node 22** (`nvm use 22`; the nvm default 16
 errors). Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
+[dashboard/AGENTS.md](../../web-ui/src/lib/dashboard/AGENTS.md), and
 [settings/AGENTS.md](../../web-ui/src/lib/settings/AGENTS.md).
 
 `src/lib/` is grouped by concern, not flat: **`net/`** (api, ws-adjacent transport,

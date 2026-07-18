@@ -59,6 +59,10 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   `capabilities/wsl-setup.json` (window label `wsl-setup*`, local-only), NEVER by
   `daemon-ui.json`: `wsl_install` pops UAC and daemon-served pages include
   REMOTE hosts' UIs.
+- **The single-instance plugin must stay first** in `shell.rs`'s builder. The
+  shell owns process-global window persistence, tunnels, and askpass state; two
+  app processes would race and corrupt that ownership. A repeated launch raises
+  an existing window instead.
 - **Version stamping matches the literal `0.0.1` sentinel** via `sed` across
   `tauri.conf.json` + `crates/chimaera-app/Cargo.toml` + root `Cargo.toml` (release
   reads `chimaera-core::VERSION` to fetch the matching remote daemon). If any of

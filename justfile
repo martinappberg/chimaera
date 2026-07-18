@@ -44,7 +44,7 @@ app-dev-isolated: ui
     bash .claude/skills/develop/run-app-isolated.sh
 
 app-check:
-    cd crates/chimaera-app && cargo fmt --check && cargo clippy --all-targets -- -D warnings
+    cd crates/chimaera-app && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 app-build:
     cd crates/chimaera-app && npm install && npx tauri build

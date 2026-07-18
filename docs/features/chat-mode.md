@@ -37,8 +37,12 @@ TUI (see [view switch](#view-switch-and-rewind)).
   and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
   order and delivery truth (see PROTOCOL.md passes 8 and 21).
 - **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
-  1568px max dim, 2 MiB post-encode cap (oversized silently dropped); the journal stores a
-  placeholder, never the bytes.
+  1568px max dim, 2 MiB post-encode cap, at most four images (8 MiB total); oversized images
+  are silently dropped. The daemon independently enforces those image budgets plus 256 KiB of
+  text, a 10 MiB pre-deserialization WebSocket envelope, and a per-session 32 MiB / 64-message
+  aggregate across the manager channel and driver-held send queue. A refused command raises a
+  visible, nonfatal notice; the socket stays healthy. The journal stores a placeholder, never the
+  bytes.
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`

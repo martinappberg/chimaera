@@ -4,8 +4,11 @@
 pub mod shellint;
 
 use std::io::ErrorKind;
+use std::io::Write;
+#[cfg(all(unix, test))]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -222,6 +225,36 @@ pub fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Atomically replace a small token-bearing JSON file without ever exposing
+/// its contents through a default-mode temporary file. This daemon runs on
+/// shared login nodes, where the usual `write` then `chmod(0600)` sequence has
+/// a real read window between the two syscalls. A random `create_new` sibling
+/// also keeps concurrent writers from truncating each other's temporary file.
+fn atomic_write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", &generate_token()[..16]));
+
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// On-disk record of a running chimaera daemon.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Manifest {
@@ -257,12 +290,7 @@ impl Manifest {
     /// Atomically write the manifest (tmp file + rename), mode 0600.
     pub fn write(&self) -> anyhow::Result<()> {
         let path = Self::path();
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        atomic_write_private(&path, &serde_json::to_vec_pretty(self)?)
     }
 
     /// Remove the manifest file. Ok if it does not exist.
@@ -337,12 +365,7 @@ impl Handoff {
     /// [`Handoff::write`] against an explicit path (pure of [`data_dir`], so
     /// tests need no HOME mutation — the same split as [`data_dir_in`]).
     pub fn write_at(&self, path: &Path) -> anyhow::Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        atomic_write_private(path, &serde_json::to_vec_pretty(self)?)
     }
 
     /// [`Handoff::consume`] against an explicit path.

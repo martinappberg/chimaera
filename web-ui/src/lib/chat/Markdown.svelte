@@ -171,6 +171,9 @@
   function markPath(node: Element, label: string, hit: PathHit) {
     node.classList.add("md-path");
     node.setAttribute("role", "button");
+    // Generated prose/code spans are not naturally focusable. Anchors already
+    // are, so only add a tab stop to the synthetic controls.
+    if (node.tagName !== "A") node.setAttribute("tabindex", "0");
     node.setAttribute("data-path", hit.path);
     node.setAttribute("data-kind", hit.kind);
     node.setAttribute(
@@ -208,7 +211,17 @@
       const href = a.getAttribute("href") ?? "";
       if (href === "" || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#")) continue;
       a.classList.add("md-local");
-      const cand = decodeURI(href).replace(/^\.\//, "").replace(/\/+$/, "");
+      // Agent-authored hrefs are untrusted. A malformed percent escape makes
+      // decodeURI throw; without this guard one bad link aborts the whole
+      // post-render effect on every streaming chunk (paths/copy/reveal all
+      // stop updating). It is still neutralized as a local link below.
+      let decoded: string;
+      try {
+        decoded = decodeURI(href);
+      } catch {
+        continue;
+      }
+      const cand = decoded.replace(/^\.\//, "").replace(/\/+$/, "");
       if (!pathCandidate(cand)) continue;
       const hit = want(cand);
       if (hit !== null) markPath(a, cand, hit);
@@ -296,6 +309,18 @@
     // stale relative href can't replace the whole workbench with a 404.
     const local = target?.closest?.("a.md-local");
     if (local !== null && local !== undefined) e.preventDefault();
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const target = e.target as Element | null;
+    const node = target?.closest?.(".md-path");
+    if (node === null || node === undefined || onOpenPath === undefined) return;
+    const path = node.getAttribute("data-path");
+    const kind = node.getAttribute("data-kind");
+    if (path === null || (kind !== "file" && kind !== "dir")) return;
+    e.preventDefault();
+    onOpenPath(path, kind);
   }
 
   // Agent prose is untrusted model output rendered into the workbench DOM:
@@ -460,8 +485,8 @@
   });
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-<div class="md" bind:this={el} onclick={onClick}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="md" bind:this={el} onclick={onClick} onkeydown={onKeydown}>
   <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized above -->
   {@html html}
 </div>

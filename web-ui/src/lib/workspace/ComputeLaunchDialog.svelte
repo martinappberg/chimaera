@@ -8,6 +8,7 @@
     parseSlurmTimeLeft,
     type ComputePartition,
   } from "./compute";
+  import { modalFocus } from "../shared/modalFocus";
 
   interface Props {
     /** The host the job submits on — display only; the submission goes to
@@ -127,7 +128,14 @@
 
 <div class="overlay">
   <button class="scrim" aria-label="close" tabindex="-1" onclick={onClose}></button>
-  <div class="panel" role="dialog" aria-modal="true" aria-label="new compute session">
+  <div
+    class="panel"
+    role="dialog"
+    aria-modal="true"
+    aria-label="new compute session"
+    tabindex="-1"
+    use:modalFocus
+  >
     <form
       class="body"
       onsubmit={(e) => {

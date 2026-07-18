@@ -389,11 +389,33 @@ fn apply_chat_event(state: &Arc<AppState>, id: &str, ev: &AgentEvent) {
 /// session id (one attempt), otherwise retire the session like the PTY
 /// watcher would.
 async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
+    // A handshake failure may automatically degrade into a PTY, which is the
+    // same non-atomic stop/mutate/respawn lifecycle as a user view switch.
+    // Acquire that ownership atomically up front: the old check-then-insert in
+    // the HandshakeFailed arm could overwrite a switch that landed between
+    // those two locks (and, for a term target, one cleanup could erase the
+    // other's indistinguishable marker).
+    let _degrade_guard = if matches!(&exit, DriverExit::HandshakeFailed { .. }) {
+        match ChatSwitchGuard::acquire(state, id, "term") {
+            Some(guard) => Some(guard),
+            None => {
+                // A deliberate switch already owns this exit. Preserve the
+                // existing early-exit contract: free the old registry slot and
+                // stale recipe so its respawn can install the successor.
+                state.chat.remove(id);
+                crate::lock(&state.chat_recipes).remove(id);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // A view switch kills the driver on purpose: free the registry slot for
     // the respawn and keep the AgentRecord/workspace mapping intact. Drop the
     // stale recipe too — perform_switch builds a fresh one; leaving it here
     // leaks one ChatRecipe per toggled session for the daemon's lifetime.
-    if crate::lock(&state.chat_switching).contains_key(id) {
+    if _degrade_guard.is_none() && crate::lock(&state.chat_switching).contains_key(id) {
         state.chat.remove(id);
         crate::lock(&state.chat_recipes).remove(id);
         return;
@@ -434,7 +456,6 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
                     // chat→term switch uses, so the WS Closed arm reports
                     // `degraded` and a concurrent user switch 409s instead of
                     // racing the respawn.
-                    crate::lock(&state.chat_switching).insert(id.to_string(), "term".to_string());
                     state.chat.remove(id);
                     if degrade_to_pty(state, id, recipe, pinned).await {
                         // Stamp the transition like a deliberate switch so a
@@ -454,7 +475,6 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
                             tracing::warn!(%id, %err, "failed to journal the degrade");
                         }
                     }
-                    crate::lock(&state.chat_switching).remove(id);
                 }
                 // No respawn recipe: keep the dead session registered and
                 // visible (like the ProtocolError arm) rather than silently
@@ -693,6 +713,50 @@ pub(crate) fn fresh_native_uuid() -> String {
 /// reap), so we wait for the slot to free.
 const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Per-session ownership of a non-atomic stop/mutate/respawn operation.
+///
+/// The marker has to be acquired before the operation's first `.await`: two
+/// requests can otherwise both snapshot the old surface, then run one after
+/// the other with stale `currently_chat`/journal state. That can leave a PTY
+/// and a chat driver alive under the same id, or let two rewinds race the same
+/// journal rewrite. Drop-based cleanup keeps every early-return/error path from
+/// stranding the session in a permanent "switching" state.
+struct ChatSwitchGuard {
+    state: Arc<AppState>,
+    id: String,
+    target: String,
+}
+
+impl ChatSwitchGuard {
+    fn acquire(state: &Arc<AppState>, id: &str, target: &str) -> Option<Self> {
+        use std::collections::hash_map::Entry;
+
+        let mut switching = crate::lock(&state.chat_switching);
+        match switching.entry(id.to_string()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                slot.insert(target.to_string());
+                Some(Self {
+                    state: Arc::clone(state),
+                    id: id.to_string(),
+                    target: target.to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl Drop for ChatSwitchGuard {
+    fn drop(&mut self) {
+        let mut switching = crate::lock(&self.state.chat_switching);
+        // Do not erase a newer owner if another lifecycle path ever replaces
+        // the marker after this guard lost ownership.
+        if switching.get(&self.id) == Some(&self.target) {
+            switching.remove(&self.id);
+        }
+    }
+}
 
 /// Poll `freed` until it returns true or the stop deadline elapses. The
 /// stop-wait semantics live here once — every respawn (view switch, rewind)
@@ -962,6 +1026,16 @@ pub(crate) async fn switch_view(
         );
     };
 
+    // Serialize before the first await below. Acquiring after transcript
+    // validation allowed a fast competing switch/rewind to complete while
+    // this request still held a stale snapshot of the old surface.
+    let Some(_switch_guard) = ChatSwitchGuard::acquire(&state, &id, &body.ui) else {
+        return err(
+            StatusCode::CONFLICT,
+            "a view switch or rewind is already in progress for this session".to_string(),
+        );
+    };
+
     // The resume handle: chat side knows its native id from Init; TUI side
     // from the transcript path hooks report. Missing handle = fresh start in
     // the other mode (still the same chimaera session identity).
@@ -1003,27 +1077,6 @@ pub(crate) async fn switch_view(
         other => other,
     };
 
-    // Serialize per id: a concurrent toggle (double-click) that slipped past
-    // the guards above would race the non-atomic kill→respawn, and the first
-    // finisher's unconditional `remove` below would clear the second's marker —
-    // making its intentional kill look like a real exit that retires the
-    // session. Refuse the overlap instead. `busy` is absent so the client
-    // treats it as "try again", not the mid-task confirmation prompt.
-    {
-        use std::collections::hash_map::Entry;
-        let mut switching = crate::lock(&state.chat_switching);
-        match switching.entry(id.clone()) {
-            Entry::Occupied(_) => {
-                return err(
-                    StatusCode::CONFLICT,
-                    "a view switch is already in progress for this session".to_string(),
-                );
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(body.ui.clone());
-            }
-        }
-    }
     // A ProtocolError-dead chat entry is kept in the registry so the surface
     // can show the failure, but a switch must clear it first (resume handle is
     // already captured above): otherwise a term target leaves two rows under
@@ -1043,7 +1096,6 @@ pub(crate) async fn switch_view(
         &record,
     )
     .await;
-    crate::lock(&state.chat_switching).remove(&id);
 
     match result {
         Ok(()) => {
@@ -1264,6 +1316,17 @@ pub(crate) async fn rewind_session(
         );
     };
 
+    // Own the whole preflight + stop + journal rewrite + respawn window. The
+    // old unconditional insert below could overwrite a live view-switch
+    // marker; acquiring only after async preflight also let this request act
+    // on a surface a competing operation had already replaced.
+    let Some(_switch_guard) = ChatSwitchGuard::acquire(&state, &id, "chat") else {
+        return err(
+            StatusCode::CONFLICT,
+            "a view switch or rewind is already in progress for this session".to_string(),
+        );
+    };
+
     // Resolve every respawn precondition BEFORE the kill (same discipline as
     // the view switch): a post-kill failure would strand the session. Only
     // claude needs the per-session settings/mcp files.
@@ -1298,9 +1361,6 @@ pub(crate) async fn rewind_session(
         }
     }
 
-    // Same choreography as the view switch: flag the deliberate stop so the
-    // exit path neither retires nor degrades, stop, respawn.
-    crate::lock(&state.chat_switching).insert(id.clone(), "chat".to_string());
     let result = async {
         // Stop the driver (a dead-but-registered ProtocolError entry is dropped
         // directly rather than waited on — see `stop_for_respawn`).
@@ -1393,7 +1453,6 @@ pub(crate) async fn rewind_session(
         Ok(())
     }
     .await;
-    crate::lock(&state.chat_switching).remove(&id);
     state.changes.notify_waiters();
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

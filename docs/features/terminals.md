@@ -96,8 +96,9 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 - **Where it lives.** `termPool.ts` (`registerTerminalClipboard`), `web-ui/src/lib/shared/reference.ts`,
   `PaneTabs.svelte`.
 - **Key behaviors.** Bare Ctrl is never intercepted — it stays SIGINT/tmux/EOF for the PTY. OSC 52
-  *writes* are honored (a remote agent's only path back to the Mac clipboard); OSC 52 *reads* are
-  silently swallowed so a process can't exfiltrate the clipboard over the PTY.
+  *writes* are honored (a remote agent's only path back to the Mac clipboard), but rejected before
+  decode above 1.4M base64 characters (about 1 MiB decoded); OSC 52 *reads* are silently swallowed
+  so a process can't exfiltrate the clipboard over the PTY.
 
 ## Live theming
 

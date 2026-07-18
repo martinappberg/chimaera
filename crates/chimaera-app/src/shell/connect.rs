@@ -132,11 +132,17 @@ pub(super) async fn do_connect(
             // Probe liveness WITHOUT holding the tunnels lock: `is_up` is a
             // ~2s HTTP round-trip, and holding the map locked across it would
             // stall every other tunnel op (an `open_window`, another window's
-            // health check) behind it. Grab the port, drop the lock, probe,
-            // then re-lock only to build the reply.
-            let port = state.tunnels.lock().await.get(&alias).map(|t| t.local_port);
-            if let Some(port) = port {
-                if chimaera_remote::http_alive(port).await {
+            // health check) behind it. Grab the endpoint identity, drop the
+            // lock, probe, then re-lock only to build the reply. A 401 from a
+            // stale/foreign daemon on a recycled port is not a live tunnel.
+            let endpoint = state
+                .tunnels
+                .lock()
+                .await
+                .get(&alias)
+                .map(|t| (t.local_port, t.manifest.token.clone()));
+            if let Some((port, token)) = endpoint {
+                if chimaera_remote::http_alive_authed(port, &token).await {
                     let tunnels = state.tunnels.lock().await;
                     if let Some(t) = tunnels.get(&alias) {
                         let entry = host_entry(&alias);

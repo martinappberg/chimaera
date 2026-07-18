@@ -42,7 +42,7 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
 | `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |
-| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) |
+| `web-ui/` | the Svelte 5 client the daemon serves | [chat](web-ui/src/lib/chat/AGENTS.md) · [dashboard](web-ui/src/lib/dashboard/AGENTS.md) · [settings](web-ui/src/lib/settings/AGENTS.md) |
 
 The maps above tell you how the code is *structured*. For what the app **does** — feature
 by feature, with how each is used and where it's wired — see the **[feature catalog](docs/features/README.md)**
@@ -63,9 +63,12 @@ Node 22 (`.nvmrc`; the nvm default 16 errors). The Rust toolchain is pinned in
 
 ```sh
 just check                         # fmt --check + clippy -D warnings + test (pinned toolchain)
-npm --prefix web-ui run check      # svelte-check — the UI has no other automated tests
+npm --prefix web-ui run check      # svelte-check
+npm --prefix web-ui run test       # targeted Vitest suites (not browser/component tests)
 npm --prefix web-ui run build      # emits web-ui/dist, which the daemon embeds (rust-embed)
 node scripts/check-doc-links.mjs   # every relative markdown link + #anchor resolves
+node scripts/check-agent-assets.mjs # Claude/Codex skill + agent bridges stay in sync
+node scripts/check-workflow-security.mjs # immutable Actions pins + explicit permissions
 ```
 
 **Isolated preview — use this in a worktree.** A debug daemon on its own state dir
@@ -80,8 +83,8 @@ loop + gotchas: the **[develop](.claude/skills/develop/SKILL.md)** skill.
 - **Verify live, don't just unit-test.** Terminal state, reconnect, resize, and
   agent integrations have all had bugs that pass tests but break against the real
   thing. Drive the flow (the **[verify-app](.claude/skills/verify-app/SKILL.md)**
-  skill); the PR says what you ran and observed. The web UI has **no JS tests** —
-  the live preview is its only runtime net.
+  skill); the PR says what you ran and observed. The web UI has targeted Vitest
+  coverage, but no browser/component tests — the live preview remains its runtime net.
 - **The daemon runs on shared HPC login nodes.** ~150 MB RSS, no unbounded buffers,
   no busy loops, hard preview ceilings. **No SQLite near NFS/Lustre**; durable state
   is append-only, size-capped JSONL under `~/.chimaera`; hot state is reconstructible.
@@ -101,10 +104,10 @@ loop + gotchas: the **[develop](.claude/skills/develop/SKILL.md)** skill.
 
 CI + releases are automatic. `ci.yml` (fmt/clippy/test + UI + musl cross-builds)
 gates every PR; `app.yml` build-checks the Tauri bundle when the app or UI change;
-**every merge to `main` cuts a published GitHub release** whose version the
-squash-commit prefix decides. Get the prefix right — or add `[skip release]` — via
-the **[ship-pr](.claude/skills/ship-pr/SKILL.md)** skill, which owns the exact
-version mapping and the no-release path.
+`release.yml` evaluates every merge to `main`, but publishes only for a releasing
+squash-commit prefix. Get the prefix right — or add `[skip release]` — via the
+**[ship-pr](.claude/skills/ship-pr/SKILL.md)** skill, which owns the exact version
+mapping and the no-release path.
 
 ## PR checklist
 
@@ -119,7 +122,8 @@ version mapping and the no-release path.
 
 - **Skills** (`/name`): Codex discovers lightweight bridges in `.agents/skills/`;
   Claude Code discovers the canonical workflows in `.claude/skills/`.
-  **develop** (run + iterate), **verify-app** (drive a change
+  **audit-repo** (parallel repository health pass), **develop** (run + iterate),
+  **verify-app** (drive a change
   live), **debug-live-app** (read daemon/UI logs, reproduce, common failure modes),
   **ship-pr** (open a PR + version bump), **chat-mode** (the structured chat stack),
   **document-feature** (add/update a docs/features page), **capture-feature-intent**

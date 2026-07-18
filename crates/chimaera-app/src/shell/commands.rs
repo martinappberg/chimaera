@@ -542,12 +542,14 @@ pub(super) async fn connect_compute_session(
             // double-building. Probe like the health monitor does: ssh's
             // local listener can outlive its dead connection, so absence
             // alone is not the test.
-            let login_port = {
+            let login_endpoint = {
                 let tunnels = state.tunnels.lock().await;
-                tunnels.get(&alias).map(|t| t.local_port)
+                tunnels
+                    .get(&alias)
+                    .map(|t| (t.local_port, t.manifest.token.clone()))
             };
-            let login_up = match login_port {
-                Some(port) => chimaera_remote::http_alive(port).await,
+            let login_up = match login_endpoint {
+                Some((port, token)) => chimaera_remote::http_alive_authed(port, &token).await,
                 None => false,
             };
             if !login_up {

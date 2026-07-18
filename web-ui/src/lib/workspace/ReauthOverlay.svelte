@@ -5,6 +5,7 @@
     unauthorized,
   } from "../net/api";
   import { focusOnMount } from "../shared/focusOnMount";
+  import { modalFocus } from "../shared/modalFocus";
 
   let authRetryMsg = $state<string | null>(null);
   let authRetrying = $state(false);
@@ -30,8 +31,15 @@
 {#if $unauthorized}
   <!-- Blocking re-auth overlay: the daemon rejected this window's token
        (restart or expiry). Nothing behind it is trustworthy until re-auth. -->
-  <div class="auth-overlay" role="alertdialog" aria-modal="true" aria-label="reconnect">
-    <div class="auth-panel">
+  <div class="auth-overlay">
+    <div
+      class="auth-panel"
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="reconnect"
+      tabindex="-1"
+      use:modalFocus
+    >
       <div class="auth-title">disconnected — unauthorized</div>
       <p class="auth-body">
         The daemon rejected this window's token (it likely restarted). Paste a fresh URL from

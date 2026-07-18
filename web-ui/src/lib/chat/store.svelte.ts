@@ -317,6 +317,12 @@ export class ChatStore {
   markThinkingPushed(): void {
     this.thinkingPushed = true;
   }
+  /** A preference change missed the socket. Re-arm the reconnect effect so
+   *  the pooled UI state cannot claim a thinking setting the driver never
+   *  received. */
+  markThinkingPending(): void {
+    this.thinkingPushed = false;
+  }
 
   /** Queued/undelivered user messages, in order — rendered in a holding stack
    *  pinned above the composer (the send point), NEVER inline in history: a
@@ -942,6 +948,10 @@ export class ChatStore {
    *  intercepted commands) — they are NOT journaled, deliberately. */
   notice(text: string, tone: "info" | "error"): void {
     this.blocks.push({ kind: "notice", text, tone });
+    // Local notices do not pass through `apply`, whose epilogue normally
+    // enforces the transcript cap. Repeated disconnected-action feedback must
+    // not become an unbounded side channel around that cap.
+    this.trimBlocks();
   }
 
   /** Withdraw every pending ask whose reply route is gone (driver exit or a

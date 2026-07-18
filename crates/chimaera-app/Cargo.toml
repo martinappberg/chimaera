@@ -29,6 +29,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (tray.rs). On Linux this pulls libayatana-appindicator into the bundle — a
 # packaging dependency, accepted deliberately for the tray affordance.
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# The shell owns process-global resources (window persistence, ssh tunnels,
+# askpass), so a second process must hand off to the first instead of racing
+# independent copies of that state.
+tauri-plugin-single-instance = "2"
 # Self-update: check GitHub releases, verify against the embedded minisign
 # pubkey, download+swap the bundle. All updater ops run in Rust (the web
 # UI only calls our check/install commands); relaunch uses core restart().

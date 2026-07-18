@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -36,6 +36,10 @@ const MAX_WRITE_BYTES: usize = 1024 * 1024;
 /// bounds that work (and defuses gzip bombs) at the cost of an honest
 /// "truncated" answer for very deep reads.
 const MAX_GZ_DECOMPRESS: u64 = 64 * 1024 * 1024;
+/// Maximum bytes a paged table request scans from the start of a plain file.
+/// CSV has no row index, so a hostile giant `offset_rows` would otherwise tie
+/// up one blocking worker walking an arbitrarily large dataset.
+const MAX_TABLE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest markdown source `fs/markdown` will render.
 const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard cap on `fs/table` rows per page.
@@ -49,6 +53,12 @@ const MAX_TABLE_ROWS: usize = 1000;
 /// an over-cap file gets an honest "too large" message. Typical result-table
 /// spreadsheets are well under this; huge ones belong in a CSV export.
 const MAX_XLSX_BYTES: u64 = 8 * 1024 * 1024;
+/// Aggregate uncompressed ZIP payload accepted for xlsx/xlsm/ods previews.
+/// A tiny highly-compressible workbook can otherwise expand far beyond the
+/// source-size gate before calamine materializes its sheet and shared strings.
+const MAX_XLSX_EXPANDED_BYTES: u64 = 64 * 1024 * 1024;
+/// ZIP entry ceiling for the same preflight (bounds workbook structure work).
+const MAX_XLSX_ENTRIES: usize = 4096;
 /// Hard cap on candidates per `fs/validate` request (the UI batches one
 /// request per visible-viewport scan).
 const MAX_VALIDATE_CANDIDATES: usize = 50;
@@ -60,6 +70,9 @@ const MAX_VALIDATE_CANDIDATES: usize = 50;
 const MAX_DIR_ENTRIES: usize = 4000;
 /// How long a raw-access ticket stays valid.
 const TICKET_TTL: Duration = Duration::from_secs(600);
+/// In-memory capability ceiling. A buggy or hostile bearer-authenticated
+/// client must not grow the ticket map without bound during that TTL.
+const MAX_TICKETS: usize = 4096;
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -203,12 +216,13 @@ struct DirEntry {
 
 /// GET /api/v1/fs/dirs?path=<path>&hidden=<bool>
 pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
-    blocking_listing(move || list_dirs(&query.path, query.hidden)).await
+    blocking_json(move || list_dirs(&query.path, query.hidden)).await
 }
 
-/// Run a directory-listing on a blocking thread and shape the result — a slow
-/// Lustre `read_dir` must never wedge a tokio worker.
-async fn blocking_listing<F>(work: F) -> Response
+/// Run JSON-producing filesystem/preview work on a blocking thread. NFS and
+/// Lustre can stall even a metadata lookup, while gzip/markdown parsing is
+/// CPU-heavy; neither belongs on a Tokio worker.
+async fn blocking_json<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
 {
@@ -217,7 +231,23 @@ where
         Ok(Err(err)) => bad_request(&err),
         Err(join) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("listing task failed: {join}")})),
+            Json(json!({"error": format!("filesystem task failed: {join}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// Response-shaped companion to [`blocking_json`] for byte-range reads.
+async fn blocking_response<F>(work: F) -> Response
+where
+    F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => bad_request(&err),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("filesystem task failed: {join}")})),
         )
             .into_response(),
     }
@@ -313,7 +343,7 @@ struct FsEntry {
 /// GET /api/v1/fs/list?path=<path>&hidden=<bool> — full directory listing
 /// (dirs and files) for the file tree.
 pub(crate) async fn list(Query(query): Query<DirsQuery>) -> Response {
-    blocking_listing(move || list_entries(&query.path, query.hidden)).await
+    blocking_json(move || list_entries(&query.path, query.hidden)).await
 }
 
 /// List all entries of a directory: dirs first then files, each group sorted
@@ -431,10 +461,7 @@ pub(crate) async fn file(Query(query): Query<FileQuery>) -> Response {
         .limit
         .unwrap_or(DEFAULT_FILE_CHUNK)
         .min(MAX_FILE_CHUNK);
-    match read_file_response(&query.path, query.offset, limit) {
-        Ok(response) => response,
-        Err(err) => bad_request(&err),
-    }
+    blocking_response(move || read_file_response(&query.path, query.offset, limit)).await
 }
 
 /// Build the `fs/file` response for a plain or gzip-compressed file.
@@ -578,11 +605,21 @@ pub(crate) async fn put_file(
         )
             .into_response();
     }
-    match write_file_atomic(&query.path, &body, query.expect_mtime.as_deref()) {
-        Ok(WriteOutcome::Written(mtime)) => {
+    let dirty_path = query.path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        write_file_atomic(&query.path, &body, query.expect_mtime.as_deref())
+    })
+    .await;
+    match result {
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("file-write task failed: {join}")})),
+        )
+            .into_response(),
+        Ok(Ok(WriteOutcome::Written(mtime))) => {
             // A save is a git-relevant change: nudge the workspace(s) holding
             // this path so the tree/panel refetch without any polling.
-            crate::git::mark_path_dirty(&state, &query.path).await;
+            crate::git::mark_path_dirty(&state, &dirty_path).await;
             let mut response = StatusCode::NO_CONTENT.into_response();
             response.headers_mut().insert(
                 HeaderName::from_static("x-mtime"),
@@ -591,12 +628,12 @@ pub(crate) async fn put_file(
             );
             response
         }
-        Ok(WriteOutcome::Conflict) => (
+        Ok(Ok(WriteOutcome::Conflict)) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "file changed on disk"})),
         )
             .into_response(),
-        Err(err) => bad_request(&err),
+        Ok(Err(err)) => bad_request(&err),
     }
 }
 
@@ -680,10 +717,7 @@ pub(crate) struct MarkdownQuery {
 
 /// GET /api/v1/fs/markdown?path= — the file rendered as sanitized GFM HTML.
 pub(crate) async fn markdown(Query(query): Query<MarkdownQuery>) -> Response {
-    match render_markdown(&query.path) {
-        Ok(html) => Json(json!({"html": html})).into_response(),
-        Err(err) => bad_request(&err),
-    }
+    blocking_json(move || Ok(json!({"html": render_markdown(&query.path)?}))).await
 }
 
 /// Render the markdown file at `raw` with comrak (GFM extensions), then
@@ -735,10 +769,8 @@ pub(crate) struct TableQuery {
 pub(crate) async fn table(Query(query): Query<TableQuery>) -> Response {
     let limit = query.limit_rows.unwrap_or(200).min(MAX_TABLE_ROWS);
     let delim = query.delim.as_deref().unwrap_or("auto");
-    match read_table(&query.path, query.offset_rows, limit, delim) {
-        Ok(body) => Json(body).into_response(),
-        Err(err) => bad_request(&err),
-    }
+    let delim = delim.to_string();
+    blocking_json(move || read_table(&query.path, query.offset_rows, limit, &delim)).await
 }
 
 /// Parse one page of the delimited (possibly gzip-compressed) file at `raw`.
@@ -772,13 +804,16 @@ fn read_table(
         }
         (columns, rows, truncated)
     } else {
-        let (columns, rows, truncated, _) = page_records(
-            std::io::BufReader::new(file),
+        let (columns, rows, mut truncated, rest) = page_records(
+            std::io::BufReader::new(file).take(MAX_TABLE_SCAN_BYTES),
             delimiter,
             offset_rows,
             limit_rows,
             &path,
         )?;
+        if rest.limit() == 0 {
+            truncated = true;
+        }
         (columns, rows, truncated)
     };
 
@@ -911,6 +946,8 @@ fn read_xlsx(
         );
     }
 
+    preflight_workbook_expansion(&path)?;
+
     let mut workbook = calamine::open_workbook_auto(&path)
         .with_context(|| format!("{}: not a readable spreadsheet", path.display()))?;
     let sheets: Vec<String> = workbook.sheet_names().to_vec();
@@ -953,6 +990,45 @@ fn read_xlsx(
         "offset": offset_rows,
         "truncated": truncated,
     }))
+}
+
+/// Budget ZIP-backed spreadsheet formats before calamine decompresses them.
+/// Legacy `.xls` is not a ZIP container and is already bounded directly by
+/// [`MAX_XLSX_BYTES`]. Central-directory sizes are cheap to inspect and give
+/// us a hard expansion/entry ceiling for xlsx/xlsm/ods.
+fn preflight_workbook_expansion(path: &Path) -> anyhow::Result<()> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(extension.as_deref(), Some("xlsx" | "xlsm" | "ods")) {
+        return Ok(());
+    }
+
+    let file =
+        std::fs::File::open(path).with_context(|| format!("{}: failed to open", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("{}: invalid spreadsheet ZIP", path.display()))?;
+    if archive.len() > MAX_XLSX_ENTRIES {
+        anyhow::bail!(
+            "spreadsheet contains {} ZIP entries — over the {MAX_XLSX_ENTRIES}-entry preview cap",
+            archive.len()
+        );
+    }
+    let mut expanded = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(index)
+            .with_context(|| format!("{}: invalid ZIP entry", path.display()))?;
+        expanded = expanded.saturating_add(entry.size());
+        if expanded > MAX_XLSX_EXPANDED_BYTES {
+            anyhow::bail!(
+                "spreadsheet expands past the {} MB preview cap (export to CSV for larger data)",
+                MAX_XLSX_EXPANDED_BYTES / (1024 * 1024)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `.tsv` -> tab, `.csv` -> comma, judged from the end of a file name.
@@ -1635,6 +1711,19 @@ impl TicketStore {
     /// Mint a ticket for `path`, valid for `ttl`.
     fn create(&mut self, path: PathBuf, ttl: Duration) -> String {
         self.purge();
+        if self.tickets.len() >= MAX_TICKETS {
+            // Expiries preserve creation order for a common TTL. Evicting the
+            // soonest-to-expire capability keeps the store bounded while
+            // retaining the freshest previews/downloads.
+            if let Some(oldest) = self
+                .tickets
+                .iter()
+                .min_by_key(|(_, ticket)| ticket.expires)
+                .map(|(key, _)| key.clone())
+            {
+                self.tickets.remove(&oldest);
+            }
+        }
         let ticket = format!("t-{}", &chimaera_core::generate_token()[..32]);
         self.tickets.insert(
             ticket.clone(),
@@ -1667,6 +1756,25 @@ impl TicketStore {
     }
 }
 
+#[cfg(test)]
+mod ticket_store_tests {
+    use super::*;
+
+    #[test]
+    fn ticket_store_evicts_oldest_at_hard_cap() {
+        let mut store = TicketStore::default();
+        let first = store.create(PathBuf::from("/first"), TICKET_TTL);
+        for n in 1..=MAX_TICKETS {
+            store.create(PathBuf::from(format!("/{n}")), TICKET_TTL);
+        }
+        assert_eq!(store.tickets.len(), MAX_TICKETS);
+        assert!(
+            store.lookup(&first).is_none(),
+            "oldest ticket was not evicted"
+        );
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct TicketRequest {
     path: String,
@@ -1682,9 +1790,16 @@ pub(crate) async fn create_ticket(
     State(state): State<Arc<AppState>>,
     Json(body): Json<TicketRequest>,
 ) -> Response {
-    let path = match canonical(&body.path) {
-        Ok(path) => path,
-        Err(err) => return bad_request(&err),
+    let path = match tokio::task::spawn_blocking(move || canonical(&body.path)).await {
+        Ok(Ok(path)) => path,
+        Ok(Err(err)) => return bad_request(&err),
+        Err(join) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("ticket path task failed: {join}")})),
+            )
+                .into_response();
+        }
     };
     let ticket = crate::lock(&state.tickets).create(path, TICKET_TTL);
     Json(json!({"ticket": ticket})).into_response()
@@ -1778,25 +1893,24 @@ pub(crate) async fn raw(
 
     let (start, end) = span;
     let len = if total == 0 { 0 } else { end - start + 1 };
-    let mut bytes = vec![0u8; len as usize];
-    let read = async {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        file.seek(SeekFrom::Start(start)).await?;
-        file.read_exact(&mut bytes).await
-    };
-    if let Err(err) = read.await {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if let Err(err) = file.seek(SeekFrom::Start(start)).await {
         tracing::warn!(path = %path.display(), %err, "ticketed file read failed");
         return not_found();
     }
 
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    // Stream the selected span. The previous `vec![0; len]` loaded an
+    // un-ranged file (or attacker-chosen large range) wholly into daemon RSS.
+    let body = Body::from_stream(tokio_util::io::ReaderStream::new(file.take(len)));
     let mut response = (
         status,
         [
             (header::CONTENT_TYPE, mime.essence_str().to_string()),
             (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
         ],
-        bytes,
+        body,
     )
         .into_response();
     if status == StatusCode::PARTIAL_CONTENT {

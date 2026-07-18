@@ -21,14 +21,14 @@ the module you need and read its header doc.
 | `exec.rs` | `run_exec` — the transport-neutral "type a command into a live shell, with sentinel policy" helper, shared by `api::exec_session` (REST) and `mcp::run_in_terminal` (so `mcp` doesn't depend on `api`). |
 | `persist.rs` | `atomic_write_json` — the shared temp-write + rename dance for the small JSON state stores (view-state/ledger/workspaces/recents/settings). |
 | `session_view.rs` | The session-row JSON builders (`session_json`/`sessions_json`), shared by `api/` and `ws.rs` (so `ws` doesn't depend on `api`). |
-| `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe), **`/ws/chat/{id}`** (structured events), `/ws/events` (the session-list bus). |
+| `ws.rs` | WebSockets: `/ws/sessions/{id}` (PTY byte pipe; 1 MiB frames chunked to the input queue), **`/ws/chat/{id}`** (structured events; 10 MiB command frames and ~512 KiB replay batches), `/ws/events` (the session-list bus). |
 | `chat.rs` | **The chat-mode glue** (see below). |
 | `launcher.rs` | argv assembly (`build_agent_command`, `build_chat_command`, `build_agent_resume_command` — the degrade/toggle-to-TUI argv), binary `detect`, login-shell wrapping, per-agent binary resolution. Unit-tested — argv logic lives HERE, not in drivers or `chat.rs`. |
 | `agent_state.rs` | The pure state core: `AgentKind`/`AgentState`/`AgentRecord` + the hook→state / title helpers. A leaf (no transport/fs/`AppState`) — this is what lets `chat.rs` depend on it without the old agents↔chat cycle. |
 | `agents.rs` | The agent glue over `agent_state`: hook ingest, settings/mcp writers, the transcript watcher. |
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
 | `git/` | Read-only git, split into `resolve`/`parse`/`service`/`worktree`/`http`: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
-| `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, ranged raw reads, atomic writes, create/rename/delete for the file-manager menus, `/raw` tickets — tickets may name directories for downloads). There is no separate `previews` module — previews live here. |
+| `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, streamed ranged raw reads, bounded archive/table parsing, atomic writes, create/rename/delete for the file-manager menus, `/raw` tickets — tickets may name directories for downloads). There is no separate `previews` module — previews live here. |
 | `download.rs` | `GET /download/{ticket}` — browser downloads via the ticket pattern: files stream as attachments, folders stream a zip built on the fly (bounded memory, symlinks never followed). |
 | `upload.rs` | `POST /sessions/{id}/upload?name=` — the landing pad for OS-desktop drops + pasted screenshots. STREAMS the body to `uploads_root/<session-id>/` (hidden-tmp-then-rename), capped 32 MB/file + 256 MB/session + 256 files, strict basename sanitize (no traversal), bearer-authed; the per-session dir is pruned on session delete/retire/shutdown/boot-sweep. |
 | `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |

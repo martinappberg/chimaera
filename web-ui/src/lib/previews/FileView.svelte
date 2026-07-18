@@ -10,12 +10,8 @@
   import { looksBinary, midTruncate, viewKindFor, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import ImageView from "./ImageView.svelte";
-  import MarkdownView from "./MarkdownView.svelte";
-  import HtmlView from "./HtmlView.svelte";
   import TableView from "./TableView.svelte";
-  import XlsxView from "./XlsxView.svelte";
   import BinaryView from "./BinaryView.svelte";
-  import PdfView from "./PdfView.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
@@ -41,9 +37,49 @@
   // CodeMirror is by far the heaviest dependency in the app; load it only
   // when a text file is actually opened so the terminal-only path stays lean.
   let CodeView = $state<Component<{ path: string; first: FileChunk }> | null>(null);
+  let MarkdownView = $state<Component<{ path: string; fontSize?: number }> | null>(null);
+  let HtmlView = $state<Component<{ path: string }> | null>(null);
+  let XlsxView = $state<Component<{ path: string }> | null>(null);
+  let PdfView = $state<Component<{ path: string }> | null>(null);
+  let lazyError = $state<string | null>(null);
   $effect(() => {
     if (kind !== "text" || CodeView !== null) return;
-    void import("./CodeView.svelte").then((m) => (CodeView = m.default));
+    void import("./CodeView.svelte").then(
+      (m) => (CodeView = m.default),
+      () => (lazyError = "failed to load the text preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "markdown" || MarkdownView !== null) return;
+    void import("./MarkdownView.svelte").then(
+      (m) => (MarkdownView = m.default),
+      () => (lazyError = "failed to load the markdown preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "html" || HtmlView !== null) return;
+    void import("./HtmlView.svelte").then(
+      (m) => (HtmlView = m.default),
+      () => (lazyError = "failed to load the HTML preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "xlsx" || XlsxView !== null) return;
+    void import("./XlsxView.svelte").then(
+      (m) => (XlsxView = m.default),
+      () => (lazyError = "failed to load the spreadsheet preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "pdf" || PdfView !== null) return;
+    void import("./PdfView.svelte").then(
+      (m) => (PdfView = m.default),
+      () => (lazyError = "failed to load the PDF preview"),
+    );
+  });
+  $effect(() => {
+    void path;
+    lazyError = null;
   });
 
   type TextProbe =
@@ -101,20 +137,46 @@
       {#if kind === "image"}
         <ImageView {path} />
       {:else if kind === "markdown"}
-        <MarkdownView {path} {fontSize} />
+        {#if MarkdownView !== null}
+          <MarkdownView {path} {fontSize} />
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
+        {:else}
+          <Spinner />
+        {/if}
       {:else if kind === "html"}
-        <HtmlView {path} />
+        {#if HtmlView !== null}
+          <HtmlView {path} />
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
+        {:else}
+          <Spinner />
+        {/if}
       {:else if kind === "table"}
         <TableView {path} />
       {:else if kind === "xlsx"}
-        <XlsxView {path} />
+        {#if XlsxView !== null}
+          <XlsxView {path} />
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
+        {:else}
+          <Spinner />
+        {/if}
       {:else if kind === "pdf"}
-        <PdfView {path} />
+        {#if PdfView !== null}
+          <PdfView {path} />
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
+        {:else}
+          <Spinner />
+        {/if}
       {:else if kind === "binary"}
         <BinaryView {path} />
       {:else if probe.state === "text"}
         {#if CodeView !== null}
           <CodeView {path} first={probe.chunk} />
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
         {:else}
           <Spinner />
         {/if}

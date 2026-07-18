@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tabKey, type PaneNode, type Tab } from "./layout";
-  import { untrack } from "svelte";
+  import { untrack, type Component } from "svelte";
   import type { Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
   import { registerPane, unregisterPane } from "./dnd";
@@ -10,13 +10,13 @@
   import TerminalView from "../terminal/Terminal.svelte";
   import ChatView from "../chat/ChatView.svelte";
   import FileView from "../previews/FileView.svelte";
-  import DiffView from "../previews/DiffView.svelte";
   import GitView from "../workspace/GitView.svelte";
   import SessionChangesView from "../workspace/SessionChangesView.svelte";
-  import SettingsView from "../settings/SettingsView.svelte";
   import FinderView from "../previews/FinderView.svelte";
   import DashboardView from "../dashboard/DashboardView.svelte";
+  import Spinner from "../previews/Spinner.svelte";
   import type { DashCtx } from "../dashboard/dash";
+  import type { DiffMode } from "../workspace/git";
 
   interface Props {
     node: PaneNode;
@@ -151,6 +151,36 @@
     node.tabs.filter((t) => t === activeTab || liveKeys.includes(tabKey(t))),
   );
 
+  // CodeMirror's merge/settings editors are substantial but uncommon on the
+  // terminal/dashboard path. Load each surface only once this pane actually
+  // mounts such a tab; the view keep-alive preserves it after that.
+  let DiffView = $state<
+    Component<{ path: string; mode: DiffMode; wsId: string | null }> | null
+  >(null);
+  let SettingsView = $state<Component | null>(null);
+  let diffLoadError = $state(false);
+  let settingsLoadError = $state(false);
+  $effect(() => {
+    if (DiffView !== null || diffLoadError || !mountedTabs.some((tab) => tab.surface === "diff"))
+      return;
+    void import("../previews/DiffView.svelte").then(
+      (m) => (DiffView = m.default),
+      () => (diffLoadError = true),
+    );
+  });
+  $effect(() => {
+    if (
+      SettingsView !== null ||
+      settingsLoadError ||
+      !mountedTabs.some((tab) => tab.surface === "settings")
+    )
+      return;
+    void import("../settings/SettingsView.svelte").then(
+      (m) => (SettingsView = m.default),
+      () => (settingsLoadError = true),
+    );
+  });
+
   let rootEl = $state<HTMLElement | null>(null);
   let contentEl = $state<HTMLDivElement | null>(null);
   let tabbarEl = $state<HTMLElement | null>(null);
@@ -199,7 +229,13 @@
       onNavigate={(p) => ctrl.navigateFinder(tab.id, p)}
     />
   {:else if tab.surface === "diff"}
-    <DiffView path={tab.path} mode={tab.mode} {wsId} />
+    {#if DiffView !== null}
+      <DiffView path={tab.path} mode={tab.mode} {wsId} />
+    {:else if diffLoadError}
+      <div class="hint"><span>could not load diff view — reload to retry</span></div>
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "git"}
     <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
   {:else if tab.surface === "changes"}
@@ -212,7 +248,13 @@
   {:else if tab.surface === "dashboard"}
     <DashboardView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} />
   {:else if tab.surface === "settings"}
-    <SettingsView />
+    {#if SettingsView !== null}
+      <SettingsView />
+    {:else if settingsLoadError}
+      <div class="hint"><span>could not load settings — reload to retry</span></div>
+    {:else}
+      <Spinner />
+    {/if}
   {/if}
 {/snippet}
 

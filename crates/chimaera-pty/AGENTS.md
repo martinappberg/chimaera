@@ -29,8 +29,10 @@ has subtle repaint invariants — read the architecture guide before touching th
 ## Invariants (breaking these is a review failure)
 
 - **Bounded allocations.** The daemon runs on shared HPC login nodes (~150 MB RSS).
-  The per-session output broadcast is capped; a lagging client is `Lagged`→resynced,
-  not buffered without bound.
+  Viewports are capped at 500×200 cells and scrollback at 200,000 lines; validate
+  dimensions before constructing or resizing a `Term`. The per-session output
+  broadcast is capped; a lagging client is `Lagged`→resynced, not buffered without
+  bound.
 - **Snapshot must round-trip.** `snapshot_replay_matches_live_grid` is the contract:
   a snapshot fed back through a fresh `Term` reproduces the live grid. Keep it green.
 - **Known accepted gap:** a resync while on the alternate screen can't restore the

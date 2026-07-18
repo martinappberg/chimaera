@@ -141,10 +141,10 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // composite key ("alias#job{id}") — a job window listens on
             // that key, NEVER on the login alias (listening on the alias
             // made every login-tunnel blip re-home job windows onto the
-            // login daemon — found live). Their `token` field stays None
-            // on the wire: compute tokens never leave Rust, and a probe
-            // is authed with the tunnel's own token instead (identity,
-            // not just liveness — a stale relay can answer for the port).
+            // login daemon — found live). Their `token` field stays None on
+            // the wire. Every probe is authed with its tunnel's own token:
+            // identity, not just liveness, because a stale relay or unrelated
+            // loopback server can answer on a recycled port.
             let mut snap: Vec<(String, u16, String, bool)> = {
                 let tunnels = shell.tunnels.lock().await;
                 tunnels
@@ -164,11 +164,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // them without emitting a spurious `down`.
             prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
             for (key, port, token, is_compute) in &snap {
-                let up = if *is_compute {
-                    chimaera_remote::http_alive_authed(*port, token).await
-                } else {
-                    chimaera_remote::http_alive(*port).await
-                };
+                let up = chimaera_remote::http_alive_authed(*port, token).await;
                 if prev.insert(key.clone(), up) == Some(up) {
                     continue; // no transition
                 }

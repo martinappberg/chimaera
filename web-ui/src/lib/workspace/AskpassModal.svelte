@@ -17,6 +17,8 @@
     onAskpassDone,
     type AskpassPrompt,
   } from "../net/native";
+  import { asyncDisposer } from "../shared/asyncDisposer";
+  import { modalFocus } from "../shared/modalFocus";
 
   /** Prompts awaiting an answer, oldest first; the head is on screen. */
   let queue = $state<AskpassPrompt[]>([]);
@@ -41,13 +43,16 @@
   }
 
   onMount(() => {
-    const unlisteners: Array<() => void> = [];
-    void onAskpass(enqueue).then((u) => unlisteners.push(u));
+    const unlisteners = [asyncDisposer(onAskpass(enqueue))];
     // A prompt resolved elsewhere (another window answered, or ssh gave up
     // waiting) must leave this window's queue too.
-    void onAskpassDone((id) => {
-      queue = queue.filter((q) => q.id !== id);
-    }).then((u) => unlisteners.push(u));
+    unlisteners.push(
+      asyncDisposer(
+        onAskpassDone((id) => {
+          queue = queue.filter((q) => q.id !== id);
+        }),
+      ),
+    );
     // Pick up prompts raised before this window existed (startup restore
     // connects before any webview loads; the emit-only path would lose them).
     void listAskpass().then((pending) => pending.forEach(enqueue));
@@ -94,6 +99,7 @@
       aria-modal="true"
       aria-label="SSH authentication"
       tabindex="-1"
+      use:modalFocus={{ priority: 1 }}
       onclick={(e) => e.stopPropagation()}
     >
       <div class="askpass-head">
@@ -140,7 +146,9 @@
   .askpass-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 50;
+    /* SSH is synchronously blocked on this answer. Keep it above every
+       ordinary picker, confirm dialog, toast, and reconnect overlay. */
+    z-index: 230;
     display: grid;
     place-items: center;
     padding: 24px;

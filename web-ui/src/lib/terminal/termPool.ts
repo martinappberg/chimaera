@@ -21,6 +21,10 @@ import { copyText } from "../shared/clipboard";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
+/** A PTY controls OSC 52 payloads. Bound decode + clipboard IPC memory so a
+ * hostile process cannot turn one escape sequence into an unbounded client
+ * allocation (roughly 1 MiB decoded text after base64 overhead). */
+const OSC52_MAX_BASE64_BYTES = 1_400_000;
 /**
  * Built-in default terminal font size (the terminal.fontSize schema default;
  * baseFontSize() is the live value). Readability pass 2026-07-06: 13 was
@@ -220,6 +224,7 @@ function registerTerminalClipboard(term: Terminal): void {
     if (semi === -1) return false; // malformed; let xterm's default run
     const payload = data.slice(semi + 1);
     if (payload === "" || payload === "?") return true; // read/clear: swallow, never leak
+    if (payload.length > OSC52_MAX_BASE64_BYTES) return true;
     let text: string;
     try {
       text = new TextDecoder().decode(Uint8Array.from(atob(payload), (c) => c.charCodeAt(0)));

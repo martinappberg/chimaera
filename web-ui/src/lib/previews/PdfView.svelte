@@ -7,6 +7,7 @@
     scrollLeft: number;
   }
   const memory = new Map<string, PdfMem>();
+  const MEMORY_CAP = 100;
 </script>
 
 <script lang="ts">
@@ -56,7 +57,14 @@
   const renderingPages = new Set<number>();
   const renderedScale = new Map<number, number>();
   let observer: IntersectionObserver | null = null;
+  /** Pages inside the observer margin; never evict a canvas the user is at. */
+  const nearbyPages = new Set<number>();
   const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
+  /** Bound decoded raster memory while retaining a generous high-DPI page. */
+  const MAX_CANVAS_PIXELS = 12_000_000;
+  /** Canvases outside the viewport margin are an LRU, not a document-long leak. */
+  const MAX_RENDERED_PAGES = 8;
+  const PAGE_INFO_BATCH = 24;
 
   // Effective CSS scale: fit-width divides the container by the widest page,
   // clamped so a tiny pane doesn't render illegibly small.
@@ -97,9 +105,14 @@
           const vp = page.getViewport({ scale: 1 });
           infos.push({ num: n, w: vp.width, h: vp.height });
           page.cleanup();
+          // A large PDF should paint its first pages without waiting for a
+          // serial metadata walk across the whole document. Batch updates
+          // avoid O(n²) array churn while letting the observer start early.
+          if (n === 1 || n % PAGE_INFO_BATCH === 0 || n === d.numPages) {
+            pages = [...infos];
+            loading = false;
+          }
         }
-        pages = infos;
-        loading = false;
       } catch (e) {
         if (!cancelled) {
           error = e instanceof Error ? e.message : "failed to open pdf";
@@ -116,6 +129,7 @@
       rendered.clear();
       renderingPages.clear();
       renderedScale.clear();
+      nearbyPages.clear();
       doc = null;
       const tk = task;
       task = null;
@@ -126,7 +140,13 @@
   function saveMemory(): void {
     const el = scroller;
     if (el === null) return;
+    memory.delete(path);
     memory.set(path, { zoom, scrollTop: el.scrollTop, scrollLeft: el.scrollLeft });
+    while (memory.size > MEMORY_CAP) {
+      const oldest = memory.keys().next().value;
+      if (oldest === undefined) break;
+      memory.delete(oldest);
+    }
   }
 
   // Track container width for fit-scaling.
@@ -143,7 +163,14 @@
 
   // Restore remembered scroll once pages have laid out.
   $effect(() => {
-    if (restored || pages.length === 0 || scroller === null || containerWidth === 0) return;
+    if (
+      restored ||
+      pages.length === 0 ||
+      pages.length !== numPages ||
+      scroller === null ||
+      containerWidth === 0
+    )
+      return;
     const mem = memory.get(path);
     restored = true;
     if (mem !== undefined) {
@@ -164,9 +191,14 @@
     const io = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
-          if (!entry.isIntersecting) continue;
           const n = Number((entry.target as HTMLElement).dataset.page);
-          if (Number.isFinite(n)) void renderPage(n, entry.target as HTMLElement);
+          if (!Number.isFinite(n)) continue;
+          if (!entry.isIntersecting) {
+            nearbyPages.delete(n);
+            continue;
+          }
+          nearbyPages.add(n);
+          void renderPage(n, entry.target as HTMLElement);
         }
       },
       { root: el, rootMargin: "600px 0px" },
@@ -175,6 +207,7 @@
     for (const slot of el.querySelectorAll<HTMLElement>("[data-page]")) io.observe(slot);
     return () => {
       io.disconnect();
+      nearbyPages.clear();
       observer = null;
     };
   });
@@ -196,20 +229,29 @@
       reRenderTimer = null;
       for (const [n] of rendered) {
         const slot = scroller?.querySelector<HTMLElement>(`[data-page="${n}"]`);
-        if (slot !== null && slot !== undefined) void renderPage(n, slot, true);
+        if (slot !== null && slot !== undefined) void renderPage(n, slot);
       }
     }, 140);
   });
 
-  async function renderPage(n: number, slot: HTMLElement, force = false): Promise<void> {
+  async function renderPage(n: number, slot: HTMLElement): Promise<void> {
     const d = doc;
     if (d === null) return;
     const s = zoom === "fit" ? fitScale : zoom;
-    if (!force && (renderingPages.has(n) || renderedScale.get(n) === s)) return;
+    if (renderingPages.has(n) || renderedScale.get(n) === s) return;
     renderingPages.add(n);
+    let page: PDFPageProxy | null = null;
+    let renderedAtScale = false;
     try {
-      const page: PDFPageProxy = await d.getPage(n);
-      const viewport = page.getViewport({ scale: s * dpr });
+      page = await d.getPage(n);
+      const cssViewport = page.getViewport({ scale: s });
+      const desired = page.getViewport({ scale: s * dpr });
+      const desiredPixels = desired.width * desired.height;
+      if (!Number.isFinite(desiredPixels) || desiredPixels <= 0) {
+        throw new Error("invalid PDF page dimensions");
+      }
+      const rasterFactor = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / desiredPixels));
+      const viewport = page.getViewport({ scale: s * dpr * rasterFactor });
       let canvas = rendered.get(n) ?? null;
       if (canvas === null) {
         canvas = document.createElement("canvas");
@@ -220,19 +262,42 @@
       }
       const ctx = canvas.getContext("2d");
       if (ctx === null) return;
-      canvas.width = Math.floor(viewport.width);
-      canvas.height = Math.floor(viewport.height);
-      canvas.style.width = `${viewport.width / dpr}px`;
-      canvas.style.height = `${viewport.height / dpr}px`;
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      canvas.style.width = `${cssViewport.width}px`;
+      canvas.style.height = `${cssViewport.height}px`;
       await page.render({ canvas, canvasContext: ctx, viewport }).promise;
       renderedScale.set(n, s);
+      renderedAtScale = true;
+      rememberRendered(n, canvas);
       // Selectable text layer, positioned by --total-scale-factor.
       await renderTextLayer(page, slot, s);
-      page.cleanup();
     } catch {
       // a page failed to render; leave its placeholder in place
     } finally {
+      page?.cleanup();
       renderingPages.delete(n);
+      // A zoom/fit change may land while this page is rasterizing. Never
+      // render into the same canvas concurrently; finish once, then catch up.
+      const currentScale = zoom === "fit" ? fitScale : zoom;
+      if (renderedAtScale && currentScale !== s && slot.isConnected) {
+        void renderPage(n, slot);
+      }
+    }
+  }
+
+  /** Touch one rendered page and evict inactive LRU canvases/text layers. */
+  function rememberRendered(n: number, canvas: HTMLCanvasElement): void {
+    rendered.delete(n);
+    rendered.set(n, canvas);
+    if (rendered.size <= MAX_RENDERED_PAGES) return;
+    for (const [old, oldCanvas] of rendered) {
+      if (rendered.size <= MAX_RENDERED_PAGES) break;
+      if (old === n || nearbyPages.has(old) || renderingPages.has(old)) continue;
+      oldCanvas.remove();
+      scroller?.querySelector<HTMLElement>(`[data-page="${old}"] .textLayer`)?.remove();
+      rendered.delete(old);
+      renderedScale.delete(old);
     }
   }
 

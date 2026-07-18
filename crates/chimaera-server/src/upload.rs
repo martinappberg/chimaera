@@ -126,7 +126,12 @@ pub(crate) async fn upload(
     // visible under its final name (an agent could read it mid-write).
     let token = &chimaera_core::generate_token()[..8];
     let tmp = dir.join(format!(".{name}.{token}.tmp"));
-    let mut file = match tokio::fs::File::create(&tmp).await {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await
+    {
         Ok(file) => file,
         Err(err) => return internal(&tmp, "failed to open upload file", &err.into()),
     };
@@ -173,6 +178,19 @@ pub(crate) async fn upload(
     }
     drop(file);
 
+    // Re-check with every in-flight tmp included. Two concurrent uploads can
+    // both pass the initial snapshot; at completion at least the later check
+    // observes their combined bytes/count and rejects before publication.
+    let (current, current_count) = dir_usage(&dir).await;
+    if current > MAX_SESSION_UPLOAD_BYTES || current_count > MAX_SESSION_UPLOAD_FILES {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "session upload quota reached during concurrent uploads"})),
+        )
+            .into_response();
+    }
+
     // Keep the dropped file's own name when free; a taken name gets a short
     // random prefix instead of clobbering. The exists→rename window is racy
     // only against the same user re-dropping the same name in the same
@@ -180,7 +198,27 @@ pub(crate) async fn upload(
     let mut target = dir.join(&name);
     let mut final_name = name.clone();
     if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-        final_name = format!("{token}-{name}");
+        let mut available = None;
+        for _ in 0..16 {
+            let prefix = &chimaera_core::generate_token()[..8];
+            let candidate = format!("{prefix}-{name}");
+            if !tokio::fs::try_exists(dir.join(&candidate))
+                .await
+                .unwrap_or(true)
+            {
+                available = Some(candidate);
+                break;
+            }
+        }
+        let Some(candidate) = available else {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "could not choose a free upload name"})),
+            )
+                .into_response();
+        };
+        final_name = candidate;
         target = dir.join(&final_name);
     }
     if let Err(err) = tokio::fs::rename(&tmp, &target).await {
@@ -247,7 +285,12 @@ pub(crate) async fn upload_to_dir(
     // final name.
     let token = &chimaera_core::generate_token()[..8];
     let tmp = dir.join(format!(".{name}.{token}.tmp"));
-    let mut file = match tokio::fs::File::create(&tmp).await {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await
+    {
         Ok(file) => file,
         Err(err) => return internal(&tmp, "failed to open upload file", &err.into()),
     };
@@ -299,6 +342,7 @@ pub(crate) async fn upload_to_dir(
             Some((s, e)) => (s.to_string(), format!(".{e}")),
             None => (name.clone(), String::new()),
         };
+        let mut available = None;
         for n in 1..10_000 {
             let candidate = if n == 1 {
                 format!("{stem} copy{ext}")
@@ -309,10 +353,19 @@ pub(crate) async fn upload_to_dir(
                 .await
                 .unwrap_or(true)
             {
-                final_name = candidate;
+                available = Some(candidate);
                 break;
             }
         }
+        let Some(candidate) = available else {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "no free copy name available"})),
+            )
+                .into_response();
+        };
+        final_name = candidate;
         target = dir.join(&final_name);
     }
     if let Err(err) = tokio::fs::rename(&tmp, &target).await {

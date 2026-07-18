@@ -15,7 +15,7 @@ use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
     AgentCommand, AgentEvent, BackgroundTask, ContentBlock, ToolStatus, UserMessageState,
 };
-use chimaera_agent::{ChatManager, EventHook, ExitHook};
+use chimaera_agent::{ChatManager, CommandQueueFull, EventHook, ExitHook, RETAINED_SENDS_MAX};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
 const WAIT: Duration = Duration::from_secs(5);
@@ -1045,6 +1045,43 @@ async fn interrupt_recovers_a_hung_turn_via_watchdog() {
     );
 }
 
+#[tokio::test]
+async fn repeated_valid_sends_hit_the_shared_retained_queue_budget() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-budget", &fx.cwd, "hang"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-budget", 0).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    send_text(&fx, "s-budget", "hold this turn open").await;
+    wait_for(&mut rx, &mut seen, "TurnStarted", |ev| {
+        matches!(ev, AgentEvent::TurnStarted { .. })
+    })
+    .await;
+
+    // Empty sends are individually valid and consume essentially no payload
+    // bytes. They exercise the item dimension that prevents an authenticated
+    // client growing either driver's pending VecDeque without bound.
+    for _ in 0..RETAINED_SENDS_MAX {
+        fx.manager
+            .command("s-budget", AgentCommand::Send { blocks: vec![] })
+            .await
+            .expect("send within retained-item budget");
+    }
+    let err = fx
+        .manager
+        .command("s-budget", AgentCommand::Send { blocks: vec![] })
+        .await
+        .expect_err("one more retained send must be refused");
+    assert!(
+        err.downcast_ref::<CommandQueueFull>().is_some(),
+        "refusal stays distinguishable from driver death: {err:#}"
+    );
+    assert!(fx.manager.kill("s-budget"));
+}
+
 /// Feature 2 — cancelling a still-held message un-queues it: the driver emits
 /// `Cancelled` (not sent/dropped) with no CLI round-trip (the message was never
 /// written), and it resolves exactly once as cancelled on replay.
@@ -1686,4 +1723,22 @@ async fn kill_ends_driver_and_emits_exited() {
 
     assert!(fx.manager.remove("s-5").is_some());
     assert!(!fx.manager.contains("s-5"));
+}
+
+#[tokio::test]
+async fn stale_attach_reports_the_clamped_replay_cursor() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-stale", &fx.cwd, "normal"))
+        .expect("spawn");
+
+    // Simulate a warm browser store reconnecting after its on-disk journal
+    // was pruned/recreated. The server sends `head` so the store resets, and
+    // must also dedupe future live events from the same effective cursor used
+    // for replay (0), even when the replay happens to be empty at this instant.
+    let att = fx.manager.attach("s-stale", u64::MAX).expect("attach");
+    assert_eq!(att.replay_from, 0);
+    assert!(att.head_seq < u64::MAX);
+
+    assert!(fx.manager.kill("s-stale"));
 }

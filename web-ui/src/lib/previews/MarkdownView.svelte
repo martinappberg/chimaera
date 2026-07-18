@@ -10,13 +10,13 @@
    * survives every toggle, so flipping modes never drops an unsaved buffer.
    * Editing is offered only for files under the 1MB cap; larger markdown stays
    * preview-only.
-   */
+  */
+  import type { Component } from "svelte";
   import { EDIT_MAX_BYTES, type FileChunk } from "./files";
   import { retain, release, type FileEntry } from "./fileStore.svelte";
   import { clearSelection, setSelection } from "../shared/reference";
   import { getSetting } from "../settings/store.svelte";
   import { renderMarkdown } from "./mdRender";
-  import CodeView from "./CodeView.svelte";
   import SplitEditPreview from "./SplitEditPreview.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
@@ -43,6 +43,17 @@
   /** The editor mounts on the first split/edit and then persists (CSS-hidden in
    *  preview) so no toggle drops the unsaved buffer. */
   let entered = $state(false);
+  let CodeView = $state<
+    Component<{ path: string; first: FileChunk; onDoc?: (text: string) => void }> | null
+  >(null);
+  let codeLoadError = $state<string | null>(null);
+  $effect(() => {
+    if (!entered || CodeView !== null) return;
+    void import("./CodeView.svelte").then(
+      (m) => (CodeView = m.default),
+      () => (codeLoadError = "failed to load the editor"),
+    );
+  });
   /** The editor's live buffer, and its debounced mirror for the split preview —
    *  marked.parse + DOMPurify.sanitize over the whole buffer is too heavy to run
    *  on every keystroke (HtmlView debounces its iframe for the same reason). */
@@ -76,6 +87,7 @@
     chunkError = null;
     editable = null;
     entered = false;
+    codeLoadError = null;
     liveSource = "";
     liveDebounced = "";
   });
@@ -213,19 +225,25 @@
     {#if entered && chunk !== null}
       {@const first = chunk}
       <div class="edit-layer" class:hidden={mode === "preview"}>
-        <SplitEditPreview split={mode === "split"}>
-          {#snippet editor()}
-            <CodeView {path} {first} onDoc={(t) => (liveSource = t)} />
-          {/snippet}
-          {#snippet preview()}
-            <div class="md-scroll">
-              <article class="md-body" style:font-size="{bodyFont}px">
-                <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized in renderMarkdown -->
-                {@html liveHtml}
-              </article>
-            </div>
-          {/snippet}
-        </SplitEditPreview>
+        {#if CodeView !== null}
+          <SplitEditPreview split={mode === "split"}>
+            {#snippet editor()}
+              <CodeView {path} {first} onDoc={(t) => (liveSource = t)} />
+            {/snippet}
+            {#snippet preview()}
+              <div class="md-scroll">
+                <article class="md-body" style:font-size="{bodyFont}px">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags — sanitized in renderMarkdown -->
+                  {@html liveHtml}
+                </article>
+              </div>
+            {/snippet}
+          </SplitEditPreview>
+        {:else if codeLoadError !== null}
+          <div class="file-error">{codeLoadError}</div>
+        {:else}
+          <Spinner />
+        {/if}
       </div>
     {/if}
   </div>

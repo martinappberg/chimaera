@@ -119,7 +119,10 @@ impl SettingsStore {
     /// Daemon-consumed key: scrollback lines for newly spawned sessions.
     pub(crate) fn scrollback_lines(&mut self) -> Option<usize> {
         let v = self.current().get("daemon.scrollbackLines")?.as_u64()?;
-        Some(v.clamp(200, 1_000_000) as usize)
+        // Keep hand-edited / agent-edited settings on the same resource
+        // boundary the settings UI advertises. The previous 1,000,000-line
+        // server ceiling silently accepted 5x the UI maximum per session.
+        Some(v.clamp(1_000, chimaera_pty::MAX_SCROLLBACK_LINES as u64) as usize)
     }
 
     /// Daemon-consumed key: resurrect sessions from the ledger when the

@@ -84,6 +84,8 @@
     workspaceRelative,
   } from "./lib/shared/reference";
   import { provenanceFor, rememberCopy } from "./lib/shared/provenance";
+  import { asyncDisposer } from "./lib/shared/asyncDisposer";
+  import { modalFocus } from "./lib/shared/modalFocus";
   import {
     activateTab,
     adjacentPane,
@@ -800,45 +802,53 @@
       // the current value — so an event fired during startup isn't missed, and
       // the initial read can't clobber a fresher value the listener applied.
       if (canCaffeinate) {
-        void onCaffeinateChanged((on) => (caffeinated = on)).then((u) => {
-          unlistenCaffeinate = u;
-          void caffeinateState().then((on) => (caffeinated = on));
-        });
+        const listening = onCaffeinateChanged((on) => (caffeinated = on));
+        unlistenCaffeinate = asyncDisposer(listening);
+        void listening.then(
+          () => {
+            void caffeinateState().then((on) => (caffeinated = on));
+          },
+          () => {},
+        );
       }
-      void onAppUpdate((version) => (updateState.appVersion = version)).then(
-        (u) => (unlistenAppUpdate = u),
+      unlistenAppUpdate = asyncDisposer(
+        onAppUpdate((version) => (updateState.appVersion = version)),
       );
-      void onMenu((action) => {
-        switch (action) {
-          case "close-view":
-            if (activeWsId === null) closeThisWindow();
-            else if (layoutReady) closeView(layout.focusedPaneId);
-            break;
-          case "new-terminal":
-            newShell();
-            break;
-          case "new-agent":
-            newAgentPrimary();
-            break;
-          case "settings":
-            openSettingsSurface();
-            break;
-        }
-      }).then((u) => (unlistenMenu = u));
+      unlistenMenu = asyncDisposer(
+        onMenu((action) => {
+          switch (action) {
+            case "close-view":
+              if (activeWsId === null) closeThisWindow();
+              else if (layoutReady) closeView(layout.focusedPaneId);
+              break;
+            case "new-terminal":
+              newShell();
+              break;
+            case "new-agent":
+              newAgentPrimary();
+              break;
+            case "settings":
+              openSettingsSurface();
+              break;
+          }
+        }),
+      );
       // The local daemon was replaced (self-update). With the restart
       // handoff the new daemon usually keeps the port AND token — then the
       // origin is intact and the sockets just reconnect; reloading would
       // only flicker. Re-home (carrying the window id, so the layout
       // follows) only when the origin actually moved.
-      void onLocalDaemonUpdated(({ port, token }) => {
-        if (getHostLabel() !== "local") return;
-        if (String(port) === location.port && token === getToken()) return;
-        const params = new URLSearchParams();
-        params.set("token", token);
-        params.set("win", windowKey());
-        if (activeWsId !== null) params.set("ws", activeWsId);
-        location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
-      }).then((u) => (unlistenDaemonMoved = u));
+      unlistenDaemonMoved = asyncDisposer(
+        onLocalDaemonUpdated(({ port, token }) => {
+          if (getHostLabel() !== "local") return;
+          if (String(port) === location.port && token === getToken()) return;
+          const params = new URLSearchParams();
+          params.set("token", token);
+          params.set("win", windowKey());
+          if (activeWsId !== null) params.set("ws", activeWsId);
+          location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
+        }),
+      );
       // This remote window's tunnel dropped or came back. "down" → reconnect
       // now (the shell confirmed the forward is dead); "connected" → re-home
       // only if the origin actually moved (daemon restart / update / rebuilt
@@ -846,33 +856,35 @@
       // reconnects. Matching is on statusAlias: a job window heeds ONLY its
       // composite key's events — the login alias's port/token are a
       // different daemon entirely.
-      void onHostStatus((e) => {
-        if (!canReconnect || e.alias !== statusAlias) return;
-        if (e.status === "down") {
-          beginReconnect();
-          return;
-        }
-        const port = e.local_port;
-        // Compute-status events carry no token (compute tokens stay in the
-        // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
-        // so this window's own token still holds — carry it across the
-        // origin move ourselves.
-        const token = e.token ?? (jobCtx !== null ? getToken() : null);
-        const portMoved = port !== null && String(port) !== location.port;
-        const tokenMoved = token !== null && token !== getToken();
-        if (portMoved || tokenMoved) {
-          const params = new URLSearchParams();
-          if (token !== null) params.set("token", token);
-          params.set("win", windowKey());
-          if (activeWsId !== null) params.set("ws", activeWsId);
-          params.set("host", hostAlias);
-          if (jobCtx !== null) {
-            params.set("job", jobCtx.jobId);
-            if (jobCtx.node !== null) params.set("node", jobCtx.node);
+      unlistenHostStatus = asyncDisposer(
+        onHostStatus((e) => {
+          if (!canReconnect || e.alias !== statusAlias) return;
+          if (e.status === "down") {
+            beginReconnect();
+            return;
           }
-          location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
-        }
-      }).then((u) => (unlistenHostStatus = u));
+          const port = e.local_port;
+          // Compute-status events carry no token (compute tokens stay in the
+          // shell's Rust side); a rebuilt job tunnel lands on the SAME daemon,
+          // so this window's own token still holds — carry it across the
+          // origin move ourselves.
+          const token = e.token ?? (jobCtx !== null ? getToken() : null);
+          const portMoved = port !== null && String(port) !== location.port;
+          const tokenMoved = token !== null && token !== getToken();
+          if (portMoved || tokenMoved) {
+            const params = new URLSearchParams();
+            if (token !== null) params.set("token", token);
+            params.set("win", windowKey());
+            if (activeWsId !== null) params.set("ws", activeWsId);
+            params.set("host", hostAlias);
+            if (jobCtx !== null) {
+              params.set("job", jobCtx.jobId);
+              if (jobCtx.node !== null) params.set("node", jobCtx.node);
+            }
+            location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
+          }
+        }),
+      );
     }
 
     const onPagehide = () => {
@@ -3878,8 +3890,15 @@
        answered (or there is no prompt) the overlay returns to its quiet status
        line. A same-port heal resumes this window in place; a moved daemon
        re-homes. -->
-  <div class="reconnect-overlay" role="alertdialog" aria-modal="true" aria-label="reconnecting">
-    <div class="reconnect-panel">
+  <div class="reconnect-overlay">
+    <div
+      class="reconnect-panel"
+      role="alertdialog"
+      aria-modal="true"
+      aria-label="reconnecting"
+      tabindex="-1"
+      use:modalFocus
+    >
       <div class="reconnect-head">
         <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
         <span class="reconnect-title">

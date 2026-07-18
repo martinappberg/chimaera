@@ -29,10 +29,10 @@ be disciplined.
 
 ## Verify before you claim done
 - `cargo +1.96.0 fmt` on changed Rust; `just check` (fmt + clippy -D warnings + test)
-  for daemon changes; `npm --prefix web-ui run check` for UI changes.
+  for daemon changes; run web-ui `check`, `test`, and `build` for UI changes.
 - If the change is observable at runtime (terminal, reconnect, resize, previews,
   agent launch, chat, any UI), **drive it against the live preview** (the develop +
-  verify-app skills) — the UI has no JS tests, so the preview is the only net.
+  verify-app skills) — targeted Vitest suites do not replace browser-level verification.
 - For agent-driver / CLI changes: `just chat-smoke` (live, billed).
 
 ## Report

@@ -9,7 +9,7 @@
  */
 
 import { writable } from "svelte/store";
-import { getToken } from "./api";
+import { getHostLabel, getJobContext, getToken } from "./api";
 import type { Workspace } from "../workspace/sessions";
 import type { ComputeSessionList } from "../workspace/computeSessions";
 
@@ -466,6 +466,19 @@ export async function openWindow(
   const params = new URLSearchParams();
   if (token !== null) params.set("token", token);
   if (wsId !== null) params.set("ws", wsId);
+  // `window.open` clones the opener's sessionStorage into the new browsing
+  // context. Without an explicit fresh id, both tabs therefore persist into
+  // the same daemon-side view-state key and overwrite each other's layouts.
+  params.set("win", `w-${crypto.randomUUID()}`);
+  const host = getHostLabel();
+  if (host !== "local") params.set("host", host);
+  const job = getJobContext();
+  if (job !== null) {
+    params.set("job", job.jobId);
+    if (job.node !== null) params.set("node", job.node);
+  }
   const hash = params.size > 0 ? `#${params.toString()}` : "";
-  window.open(`${location.origin}/${hash}`);
+  // The hash now carries every piece of per-window state, so severing opener
+  // access is safe and avoids coupling the two app tabs.
+  window.open(`${location.origin}/${hash}`, "_blank", "noopener");
 }

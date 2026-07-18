@@ -49,9 +49,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **In-app auth.** ssh has no tty under the native shell, so an `SSH_ASKPASS` relay surfaces the raw
   prompt (password, keyboard-interactive Duo passcode) in `AskpassModal.svelte`. Prompts **queue**
   (ssh asks sequentially) and any window can answer them.
-- **Liveness is an HTTP probe, not a bare TCP connect** (`http_alive`) — after laptop sleep an ssh
-  forward's local listener still accepts while the connection behind it is dead; any HTTP status
-  (even 401) proves the daemon end to end.
+- **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
+  listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
+  HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring
+  require a bearer-authenticated 200 (`http_alive_authed`), so a 401 or a foreign service on a
+  recycled port cannot be mistaken for the intended daemon.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
@@ -63,7 +65,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
 - **Never force-kill a remote daemon.** `stop_remote` is SIGTERM-only (a daemon that won't die may
   hold sessions that mustn't be torn out — it errors honestly). `TunnelPhaseError` is
   downcast-distinguished so the app retries *only* tunnel-phase failures on a fresh port (re-running
-  connect on an auth failure would re-prompt 2FA). Fetched daemons are cached per triple-and-version.
+  connect on an auth failure would re-prompt 2FA). Child control-plane output is collected
+  concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock limits; overflow or timeout kills
+  and reaps the process. Fetched daemons are cached per triple-and-version.
 
 ## Dev builds — the isolated dev daemon on a host
 

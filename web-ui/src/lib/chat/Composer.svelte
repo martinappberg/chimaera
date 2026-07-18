@@ -3,7 +3,11 @@
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
   import { registerComposer, registerComposerAttach } from "./composerBus";
-  import { imageToAttachment, type ImageAttachment } from "./images";
+  import {
+    imageToAttachment,
+    IMAGE_MAX_ATTACHMENTS,
+    type ImageAttachment,
+  } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
   import type { SlashCommand } from "./store.svelte";
 
@@ -57,7 +61,18 @@
   // svelte-ignore state_referenced_locally
   const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
   let draft = $state(savedDraft.text);
-  let images = $state<ImageAttachment[]>(savedDraft.images);
+  let images = $state<ImageAttachment[]>(savedDraft.images.slice(0, IMAGE_MAX_ATTACHMENTS));
+  let attachmentError = $state<string | null>(null);
+
+  function addImage(image: ImageAttachment): boolean {
+    if (images.length >= IMAGE_MAX_ATTACHMENTS) {
+      attachmentError = `maximum ${IMAGE_MAX_ATTACHMENTS} images per message`;
+      return false;
+    }
+    images.push(image);
+    attachmentError = null;
+    return true;
+  }
 
   // Write-through persistence: every draft/attachment change (typing, paste,
   // popover picks, the post-send clear) lands in the session's draft slot.
@@ -108,7 +123,7 @@
   $effect(() => {
     if (sessionId === null) return;
     return registerComposerAttach(sessionId, (image) => {
-      images.push(image);
+      addImage(image);
       el?.focus();
     });
   });
@@ -363,7 +378,7 @@
       if (file === null) continue;
       // Unreadable/oversized clipboard images resolve null: nothing to attach.
       const attachment = await imageToAttachment(file);
-      if (attachment !== null) images.push(attachment);
+      if (attachment !== null && !addImage(attachment)) break;
     }
   }
 </script>
@@ -438,11 +453,17 @@
           <button
             class="attachment-x"
             aria-label="remove attachment"
-            onclick={() => (images = images.filter((_, j) => j !== i))}>×</button
+            onclick={() => {
+              images = images.filter((_, j) => j !== i);
+              attachmentError = null;
+            }}>×</button
           >
         </span>
       {/each}
     </div>
+  {/if}
+  {#if attachmentError !== null}
+    <div class="attachment-error" role="status">{attachmentError}</div>
   {/if}
 
   <div class="input-row">
@@ -553,6 +574,11 @@
     flex-wrap: wrap;
     gap: 6px;
     padding-bottom: 6px;
+  }
+  .attachment-error {
+    color: var(--warn);
+    font-size: var(--text-xs);
+    margin: 0 4px 4px;
   }
   .attachment {
     display: inline-flex;

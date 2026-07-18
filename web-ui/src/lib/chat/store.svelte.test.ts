@@ -227,8 +227,18 @@ describe("ChatStore pending-send ordering", () => {
     const store = fold([{ type: "turn_started", turn_id: "t1" }]);
     store.markThinkingPushed();
     expect(store.thinkingPushed).toBe(true);
+    store.markThinkingPending();
+    expect(store.thinkingPushed).toBe(false);
+    store.markThinkingPushed();
     store.apply({ seq: 99, ts: 99, ev: { type: "init", model: "claude-x" } } as SeqEvent);
     expect(store.thinkingPushed).toBe(false);
+  });
+
+  it("keeps client-side notices under the transcript cap", () => {
+    const store = new ChatStore();
+    for (let i = 0; i < 2_100; i++) store.notice(`offline ${i}`, "error");
+    expect(store.blocks).toHaveLength(2_000);
+    expect(store.blocks[0]).toMatchObject({ kind: "notice", text: "earlier history trimmed" });
   });
 
   it("leaves an already-completed tool from a prior turn untouched on a later turn end", () => {

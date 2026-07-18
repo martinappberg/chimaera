@@ -4,7 +4,8 @@
 //! /api/v1/fs/ticket, authorizes each fetch (the route is mounted outside the
 //! auth layer). Files stream as-is with an attachment disposition;
 //! directories stream as a zip built on the fly — memory is bounded by the
-//! duplex pipe plus the deflate window, and nothing is spooled to disk.
+//! duplex pipe, deflate window, and entry-capped traversal stack; nothing is
+//! spooled to disk.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,9 +31,47 @@ use crate::AppState;
 /// into an archive that looks complete.
 const MAX_ZIP_ENTRIES: usize = 250_000;
 
+struct ZipEntryBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl ZipEntryBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn ensure_available(&self) -> anyhow::Result<()> {
+        if self.used >= self.limit {
+            anyhow::bail!("more than {} entries — refusing to zip", self.limit);
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self) -> anyhow::Result<()> {
+        self.ensure_available()?;
+        self.used += 1;
+        Ok(())
+    }
+}
+
+/// Reserve an archive entry before retaining its path. Charging directories
+/// at discovery keeps a very wide tree from filling the traversal stack
+/// before the archive-entry ceiling is reached.
+fn queue_zip_directory(
+    stack: &mut Vec<PathBuf>,
+    budget: &mut ZipEntryBudget,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    budget.reserve()?;
+    stack.push(path);
+    Ok(())
+}
+
 /// Capacity of the duplex pipe between the zip task and the response body.
-/// This (plus the deflate window) is the per-download RSS cost; backpressure
-/// from a slow client suspends the walk rather than buffering.
+/// This bounds buffered archive bytes; traversal paths have the separate
+/// entry ceiling above. Backpressure from a slow client suspends the walk
+/// rather than buffering file contents.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
 /// GET /download/{ticket} — the ticketed path as a browser download. A file
@@ -124,22 +163,18 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::
 
     let root_name = root
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(safe_zip_component)
         .unwrap_or_else(|| "folder".to_string());
     let mut zip = async_zip::base::write::ZipFileWriter::with_tokio(pipe);
-    let mut stack = vec![root.clone()];
-    let mut entries = 0usize;
+    let mut stack = Vec::new();
+    let mut budget = ZipEntryBudget::new(MAX_ZIP_ENTRIES);
+    queue_zip_directory(&mut stack, &mut budget, root.clone())?;
 
     while let Some(dir) = stack.pop() {
         let rel = dir
             .strip_prefix(&root)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let dir_entry = if rel.is_empty() {
-            format!("{root_name}/")
-        } else {
-            format!("{root_name}/{rel}/")
-        };
+            .unwrap_or_else(|_| std::path::Path::new(""));
+        let dir_entry = zip_entry_name(&root_name, rel, true);
         let dir_meta = tokio::fs::metadata(&dir).await.ok();
         zip.write_entry_whole(
             stamp(
@@ -151,7 +186,6 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::
             &[],
         )
         .await?;
-        entries += 1;
 
         let Ok(mut listing) = tokio::fs::read_dir(&dir).await else {
             continue; // unreadable dir: skipped, matching fs/list
@@ -163,24 +197,20 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::
             if file_type.is_symlink() {
                 continue;
             }
-            if entries >= MAX_ZIP_ENTRIES {
-                anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
-            }
+            // Preserve the old fail-fast behavior: once full, do not keep
+            // opening entries merely to discover whether they are readable.
+            budget.ensure_available()?;
             if file_type.is_dir() {
-                stack.push(entry.path());
+                queue_zip_directory(&mut stack, &mut budget, entry.path())?;
                 continue;
             }
             let Ok(file) = tokio::fs::File::open(entry.path()).await else {
                 continue; // vanished or unreadable: skipped
             };
-            let name = format!(
-                "{root_name}/{}",
-                entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(&entry.path())
-                    .to_string_lossy()
-            );
+            budget.reserve()?;
+            let entry_path = entry.path();
+            let rel = entry_path.strip_prefix(&root).unwrap_or(&entry_path);
+            let name = zip_entry_name(&root_name, rel, false);
             let meta = file.metadata().await.ok();
             let builder = stamp(
                 ZipEntryBuilder::new(name.into(), Compression::Deflate),
@@ -191,11 +221,39 @@ async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::
             let mut entry_writer = zip.write_entry_stream(builder).await?;
             futures::io::copy(&mut file.compat(), &mut entry_writer).await?;
             entry_writer.close().await?;
-            entries += 1;
         }
     }
     zip.close().await?;
     Ok(())
+}
+
+/// One filesystem name as a safe cross-platform ZIP path component. ZIP uses
+/// `/` separators, but Windows extractors commonly also treat `\` as one;
+/// replacing it (plus drive-colon/control characters) prevents a repository
+/// filename such as `..\startup` or `C:` from becoming an extraction path.
+fn safe_zip_component(name: &std::ffi::OsStr) -> String {
+    name.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
+fn zip_entry_name(root_name: &str, relative: &std::path::Path, directory: bool) -> String {
+    let mut name = root_name.to_string();
+    for component in relative.components() {
+        if let std::path::Component::Normal(part) = component {
+            name.push('/');
+            name.push_str(&safe_zip_component(part));
+        }
+    }
+    if directory {
+        name.push('/');
+    }
+    name
 }
 
 /// The daemon host's current UTC offset in seconds, via `date +%z` (POSIX;
@@ -387,6 +445,40 @@ mod tests {
             value.contains("filename*=UTF-8''%C3%A5%20plot.png"),
             "{value}"
         );
+    }
+
+    #[test]
+    fn zip_entry_names_cannot_encode_windows_traversal_or_drive_paths() {
+        assert_eq!(
+            zip_entry_name(
+                &safe_zip_component(std::ffi::OsStr::new("C:")),
+                std::path::Path::new(r"..\startup.cmd"),
+                false,
+            ),
+            "C_/.._startup.cmd"
+        );
+        assert_eq!(
+            zip_entry_name("folder", std::path::Path::new("sub/file.txt"), false),
+            "folder/sub/file.txt"
+        );
+    }
+
+    #[test]
+    fn directory_budget_is_charged_before_the_path_is_queued() {
+        let mut stack = Vec::new();
+        let mut budget = ZipEntryBudget::new(2);
+
+        queue_zip_directory(&mut stack, &mut budget, PathBuf::from("root")).unwrap();
+        queue_zip_directory(&mut stack, &mut budget, PathBuf::from("child")).unwrap();
+        let err =
+            queue_zip_directory(&mut stack, &mut budget, PathBuf::from("too-wide")).unwrap_err();
+
+        assert_eq!(
+            stack.len(),
+            2,
+            "a rejected directory must not grow the stack"
+        );
+        assert!(err.to_string().contains("more than 2 entries"), "{err}");
     }
 
     #[test]

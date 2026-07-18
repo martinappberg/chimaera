@@ -15,6 +15,9 @@ export interface ImageAttachment {
 export const IMAGE_MAX_DIM = 1568;
 /** Post-encode payload cap; the journal stores a placeholder anyway. */
 export const IMAGE_MAX_BASE64 = 2 * 1024 * 1024;
+/** Per-message attachment bound. Without a count cap, repeated paste/drop
+ *  could retain and serialize an unbounded number of 2 MiB base64 images. */
+export const IMAGE_MAX_ATTACHMENTS = 4;
 
 /**
  * Downscale an image blob to the API-optimal size, re-encode as PNG, and cap

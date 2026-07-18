@@ -24,7 +24,8 @@ pub mod model;
 pub mod ndjson;
 pub mod transcript;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +49,145 @@ pub type ExitHook = Box<dyn Fn(&str, &DriverExit) + Send + Sync>;
 const CMD_QUEUE: usize = 32;
 const EVENT_QUEUE: usize = 256;
 const BROADCAST_QUEUE: usize = 256;
+/// Bulk Send payload retained across the manager channel and either driver's
+/// pending FIFO. This is deliberately far below the daemon's ~150 MiB RSS
+/// target; one maximum browser send is ~8.25 MiB.
+pub const RETAINED_SEND_BYTES_MAX: usize = 32 * 1024 * 1024;
+/// A second dimension for empty/tiny sends, which otherwise consume little of
+/// the byte budget but still grow driver metadata and journal work forever.
+pub const RETAINED_SENDS_MAX: usize = 64;
+
+/// A valid command was refused because this session already holds the maximum
+/// amount of undelivered user input. Transports should report this as a
+/// recoverable one-command failure, not as a dead driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandQueueFull;
+
+impl fmt::Display for CommandQueueFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "queued input limit reached ({} MiB or {} messages); wait for delivery or cancel a queued message",
+            RETAINED_SEND_BYTES_MAX / (1024 * 1024),
+            RETAINED_SENDS_MAX
+        )
+    }
+}
+
+impl std::error::Error for CommandQueueFull {}
+
+#[derive(Clone, Copy, Debug)]
+struct SendReservation {
+    token: u64,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct CommandBudget {
+    bytes: usize,
+    sends: usize,
+    next_token: u64,
+    /// Commands accepted by the manager but not echoed by the driver yet.
+    unassigned: VecDeque<SendReservation>,
+    /// Driver-held sends, keyed by the delivery id resolved in the journal.
+    queued: HashMap<String, SendReservation>,
+}
+
+impl CommandBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<u64, CommandQueueFull> {
+        if self.sends >= RETAINED_SENDS_MAX
+            || bytes > RETAINED_SEND_BYTES_MAX.saturating_sub(self.bytes)
+        {
+            return Err(CommandQueueFull);
+        }
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.sends = self.sends.saturating_add(1);
+        self.unassigned.push_back(SendReservation { token, bytes });
+        Ok(token)
+    }
+
+    fn release(&mut self, reservation: SendReservation) {
+        self.bytes = self.bytes.saturating_sub(reservation.bytes);
+        self.sends = self.sends.saturating_sub(1);
+    }
+
+    fn release_unassigned(&mut self, token: u64) {
+        if let Some(pos) = self.unassigned.iter().position(|r| r.token == token) {
+            if let Some(reservation) = self.unassigned.remove(pos) {
+                self.release(reservation);
+            }
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            // Command-originated Send echoes always carry their driver-minted
+            // delivery id. Id-less UserMessages come from transcript import
+            // or permission-denial feedback and must not consume the next
+            // reservation waiting for a real Send echo.
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued,
+                ..
+            } => {
+                let Some(reservation) = self.unassigned.pop_front() else {
+                    return;
+                };
+                if *queued {
+                    if let Some(previous) = self.queued.remove(id) {
+                        self.release(previous);
+                    }
+                    self.queued.insert(id.clone(), reservation);
+                    return;
+                }
+                // An immediately delivered send cannot leave bulk input in a
+                // driver FIFO.
+                self.release(reservation);
+            }
+            AgentEvent::UserMessageUpdate { id, .. } => {
+                if let Some(reservation) = self.queued.remove(id) {
+                    self.release(reservation);
+                }
+            }
+            AgentEvent::Exited { .. } => self.clear(),
+            _ => {}
+        }
+    }
+
+    fn clear(&mut self) {
+        self.bytes = 0;
+        self.sends = 0;
+        self.unassigned.clear();
+        self.queued.clear();
+    }
+}
+
+/// Cancellation-safe ownership of a reservation that has not reached the
+/// driver channel yet. Dropping an async `command` future while `send().await`
+/// is backpressured must release its quota just like an explicit send error.
+struct EnqueueReservation<'a> {
+    budget: &'a Mutex<CommandBudget>,
+    token: Option<u64>,
+}
+
+impl EnqueueReservation<'_> {
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for EnqueueReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            self.budget
+                .lock()
+                .expect("command budget lock")
+                .release_unassigned(token);
+        }
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ChatInfo {
@@ -91,6 +231,10 @@ struct ChatSession {
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
     kill_tx: watch::Sender<bool>,
+    /// Serializes reservations with channel enqueue so driver echoes consume
+    /// the manager's FIFO in exactly the command order.
+    command_order: tokio::sync::Mutex<()>,
+    command_budget: Mutex<CommandBudget>,
 }
 
 /// What a WS bridge gets on attach. `replay` covers everything after the
@@ -102,6 +246,11 @@ pub struct ChatAttachment {
     pub info: ChatInfo,
     pub replay: Vec<Arc<SeqEvent>>,
     pub live: broadcast::Receiver<Arc<SeqEvent>>,
+    /// Effective replay cursor. Usually the caller's `last_seq`; reset to 0
+    /// when that cursor is ahead of a recreated journal's head. The WS bridge
+    /// must dedupe live events against THIS value, not the stale client value
+    /// (an empty replay otherwise leaves the stale cursor in force forever).
+    pub replay_from: u64,
     pub head_seq: u64,
 }
 
@@ -185,6 +334,8 @@ impl ChatManager {
             cmd_tx,
             events_tx: events_tx.clone(),
             kill_tx,
+            command_order: tokio::sync::Mutex::new(()),
+            command_budget: Mutex::new(CommandBudget::default()),
         });
 
         let handle = adapter
@@ -223,6 +374,11 @@ impl ChatManager {
             while let Some(ev) = ev_rx.recv().await {
                 manager.absorb(&id, &session, ev).await;
             }
+            session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .clear();
             // Driver dropped its event sender. Drain the journal writer before
             // announcing the exit, so the registry slot only frees once the
             // file is settled — otherwise a view toggle's append_marker could
@@ -248,6 +404,11 @@ impl ChatManager {
 
     /// Journal + broadcast one event and fold it into the session info.
     async fn absorb(&self, id: &str, session: &ChatSession, ev: AgentEvent) {
+        session
+            .command_budget
+            .lock()
+            .expect("command budget lock")
+            .observe(&ev);
         // Native id to record in the resume index, captured under the info
         // lock but recorded AFTER it drops: index.record does a blocking
         // atomic write on possibly-NFS `~/.chimaera`, and holding the info
@@ -359,13 +520,35 @@ impl ChatManager {
             info,
             replay,
             live,
+            replay_from: from,
             head_seq,
         })
     }
 
     pub async fn command(&self, id: &str, cmd: AgentCommand) -> Result<()> {
-        let tx = self.get_session(id)?.cmd_tx.clone();
-        tx.send(cmd).await.context("driver gone")
+        cmd.validate_ingress().context("invalid agent command")?;
+        let session = self.get_session(id)?;
+        let _order = session.command_order.lock().await;
+        let mut reservation = if let Some(bytes) = cmd.retained_send_bytes() {
+            let token = session
+                .command_budget
+                .lock()
+                .expect("command budget lock")
+                .reserve(bytes)?;
+            Some(EnqueueReservation {
+                budget: &session.command_budget,
+                token: Some(token),
+            })
+        } else {
+            None
+        };
+        session.cmd_tx.send(cmd).await.context("driver gone")?;
+        if let Some(reservation) = &mut reservation {
+            // The driver channel now owns the command. Keep its quota until
+            // the pump observes delivery/update/exit.
+            reservation.disarm();
+        }
+        Ok(())
     }
 
     /// Ask the driver to shut the child down (polite, then SIGKILL after the
@@ -462,4 +645,92 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_budget_bounds_bytes_and_releases_on_delivery() {
+        let mut budget = CommandBudget::default();
+        let first = budget.reserve(RETAINED_SEND_BYTES_MAX - 1).unwrap();
+        assert_eq!(budget.reserve(2), Err(CommandQueueFull));
+        budget.observe(&AgentEvent::UserMessage {
+            text: "queued".to_string(),
+            attachments: 0,
+            id: Some("q1".to_string()),
+            queued: true,
+        });
+        assert_eq!(budget.bytes, RETAINED_SEND_BYTES_MAX - 1);
+        budget.observe(&AgentEvent::UserMessageUpdate {
+            id: "q1".to_string(),
+            state: model::UserMessageState::Sent,
+        });
+        assert_eq!(budget.bytes, 0);
+        assert_eq!(budget.sends, 0);
+        // The reservation was assigned, so a late enqueue-failure cleanup is
+        // harmless rather than releasing some unrelated future command.
+        budget.release_unassigned(first);
+        assert_eq!(budget.sends, 0);
+    }
+
+    #[test]
+    fn command_budget_bounds_tiny_send_count_and_clears_on_exit() {
+        let mut budget = CommandBudget::default();
+        for _ in 0..RETAINED_SENDS_MAX {
+            budget.reserve(0).unwrap();
+        }
+        assert_eq!(budget.reserve(0), Err(CommandQueueFull));
+        budget.observe(&AgentEvent::Exited { status: None });
+        assert_eq!(budget.bytes, 0);
+        assert_eq!(budget.sends, 0);
+        assert!(budget.unassigned.is_empty());
+    }
+
+    #[test]
+    fn idless_feedback_does_not_consume_a_send_reservation() {
+        let mut budget = CommandBudget::default();
+        budget.reserve(1024).unwrap();
+        budget.observe(&AgentEvent::UserMessage {
+            text: "try a dry run first".to_string(),
+            attachments: 0,
+            id: None,
+            queued: false,
+        });
+        assert_eq!(budget.bytes, 1024);
+        assert_eq!(budget.unassigned.len(), 1);
+
+        budget.observe(&AgentEvent::UserMessage {
+            text: "the actual send".to_string(),
+            attachments: 0,
+            id: Some("q1".to_string()),
+            queued: true,
+        });
+        assert!(budget.unassigned.is_empty());
+        assert!(budget.queued.contains_key("q1"));
+    }
+
+    #[test]
+    fn enqueue_reservation_drop_releases_quota_unless_disarmed() {
+        let budget = Mutex::new(CommandBudget::default());
+        let token = budget.lock().unwrap().reserve(1024).unwrap();
+        {
+            let _guard = EnqueueReservation {
+                budget: &budget,
+                token: Some(token),
+            };
+        }
+        assert_eq!(budget.lock().unwrap().bytes, 0);
+
+        let token = budget.lock().unwrap().reserve(2048).unwrap();
+        {
+            let mut guard = EnqueueReservation {
+                budget: &budget,
+                token: Some(token),
+            };
+            guard.disarm();
+        }
+        assert_eq!(budget.lock().unwrap().bytes, 2048);
+    }
 }

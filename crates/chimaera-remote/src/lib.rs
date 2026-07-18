@@ -117,20 +117,83 @@ fn curl_command() -> Command {
     c
 }
 
-/// Collect a command's output with a hard deadline. Under the WSL transport
-/// a wedged wsl.exe would otherwise hang forever — ssh's own
-/// `ConnectTimeout` only bounds the TCP connect *inside* the distro, not the
-/// relay process. Applied to every one-shot ssh/scp `.output()`.
+/// Per-child output ceilings. Every caller expects small control-plane JSON,
+/// version text, or diagnostics; downloads write to a file. Keeping the caps
+/// here prevents a noisy/malicious endpoint from exhausting the GUI process
+/// before the wall-clock timeout fires.
+const CHILD_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CHILD_STDERR_MAX_BYTES: usize = 1024 * 1024;
+
+async fn read_bounded<R>(reader: R, cap: usize, stream: &str) -> anyhow::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+    reader
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("failed to read child {stream}"))?;
+    if bytes.len() > cap {
+        bail!("child {stream} exceeded the {cap}-byte limit");
+    }
+    Ok(bytes)
+}
+
+/// Collect an already-spawned child's piped output with byte and time bounds.
+/// On overflow/timeout the child is killed and reaped; dropping a read future
+/// closes its pipe, so a producer cannot remain wedged behind backpressure.
+async fn collect_child_bounded(
+    mut child: Child,
+    secs: u64,
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    let stdout = child.stdout.take().context("child stdout was not piped")?;
+    let stderr = child.stderr.take().context("child stderr was not piped")?;
+    let collect = async {
+        let (stdout, stderr) = tokio::try_join!(
+            read_bounded(stdout, CHILD_STDOUT_MAX_BYTES, "stdout"),
+            read_bounded(stderr, CHILD_STDERR_MAX_BYTES, "stderr"),
+        )?;
+        let status = child.wait().await.context("failed to wait for child")?;
+        Ok::<_, anyhow::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+
+    match tokio::time::timeout(Duration::from_secs(secs), collect).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(err).with_context(|| format!("failed to collect {what}"))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("{what} timed out after {secs}s")
+        }
+    }
+}
+
+/// Collect a command's output with hard byte and time bounds. Under the WSL
+/// transport a wedged wsl.exe would otherwise hang forever — ssh's own
+/// `ConnectTimeout` only bounds the TCP connect *inside* the distro.
 async fn output_bounded(
     cmd: &mut Command,
     secs: u64,
     what: &str,
 ) -> anyhow::Result<std::process::Output> {
     cmd.kill_on_drop(true);
-    tokio::time::timeout(Duration::from_secs(secs), cmd.output())
-        .await
-        .with_context(|| format!("{what} timed out after {secs}s"))?
-        .with_context(|| format!("failed to run {what}"))
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to run {what}"))?;
+    collect_child_bounded(child, secs, what).await
 }
 
 /// ssh runs inside the distro, so its ControlMaster socket must live on a
@@ -851,23 +914,21 @@ pub async fn remote_sessions_count(
         "curl -fsS -m 5 --config - http://127.0.0.1:{}/api/v1/sessions",
         manifest.port
     );
-    let mut child = ssh_cmd(host)
+    let mut command = ssh_cmd(host);
+    command
         .arg(cmd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to run ssh")?;
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("failed to run ssh")?;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         let line = format!("header = \"Authorization: Bearer {}\"\n", manifest.token);
         stdin.write_all(line.as_bytes()).await.ok();
         // Dropping stdin sends EOF, which ends the config for curl.
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to run ssh")?;
+    let output = collect_child_bounded(child, SSH_ONESHOT_SECS, "ssh session count").await?;
     if !output.status.success() {
         tracing::debug!(
             "session count on {host} unavailable: {}",
@@ -1936,18 +1997,19 @@ async fn login_daemon_api(
             curl_config_escape(&body.to_string())
         ));
     }
-    let mut child = ssh_cmd(host)
+    let mut command = ssh_cmd(host);
+    command
         .arg(format!("curl -fsS -m {timeout_secs} --config -"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to run ssh")?;
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("failed to run ssh")?;
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin.write_all(config.as_bytes()).await.ok();
     }
-    let output = child.wait_with_output().await.context("ssh curl failed")?;
+    let output = collect_child_bounded(child, SSH_ONESHOT_SECS, "ssh curl").await?;
     if !output.status.success() {
         bail!(
             "daemon API {method} {path} on {host} failed: {}",
@@ -2012,6 +2074,14 @@ pub async fn compute_cancel(host: &str, manifest: &Manifest, job_id: &str) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn child_stream_reader_fails_at_byte_cap() {
+        let err = read_bounded(tokio::io::repeat(b'x'), 32, "test")
+            .await
+            .expect_err("infinite output must hit the byte ceiling");
+        assert!(err.to_string().contains("32-byte limit"), "{err:#}");
+    }
 
     /// Every ssh/scp call must carry the ControlMaster trio (so one auth
     /// covers the whole session; socket path uses ssh's short `%C` token),

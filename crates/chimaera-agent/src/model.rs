@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{collections::HashMap, fmt};
 
 /// Stored tool output cap: enough to read a failure, never a log dump.
 pub const TOOL_OUTPUT_HEAD: usize = 12 * 1024;
@@ -70,6 +71,26 @@ pub const WF_AGENT_LABEL_MAX: usize = 120;
 /// stuck with no way to approve or deny. Kept well under 256 KiB so the
 /// event stays admissible even beside its sibling fields.
 pub const PREVIEW_TOTAL_BUDGET: usize = 64 * 1024;
+
+// AgentCommand ingress budgets. These are enforced again by ChatManager
+// immediately before enqueue, so non-WebSocket callers cannot bypass them.
+// The browser's current legitimate maximum is one text block plus four images.
+pub const COMMAND_BLOCKS_MAX: usize = 5;
+pub const COMMAND_IMAGES_MAX: usize = 4;
+pub const COMMAND_TEXT_BLOCK_MAX: usize = 256 * 1024;
+pub const COMMAND_TEXT_TOTAL_MAX: usize = 256 * 1024;
+pub const COMMAND_IMAGE_BASE64_MAX: usize = 2 * 1024 * 1024;
+pub const COMMAND_IMAGE_BASE64_TOTAL_MAX: usize = 8 * 1024 * 1024;
+pub const COMMAND_MEDIA_TYPE_MAX: usize = 64;
+pub const COMMAND_ID_MAX: usize = 1024;
+pub const COMMAND_SELECTOR_MAX: usize = 256;
+pub const COMMAND_DESTINATION_MAX: usize = 64;
+pub const COMMAND_FEEDBACK_MAX: usize = 64 * 1024;
+pub const COMMAND_ANSWER_QUESTIONS_MAX: usize = 16;
+pub const COMMAND_ANSWER_CHOICES_MAX: usize = 16;
+pub const COMMAND_ANSWER_VALUE_MAX: usize = 16 * 1024;
+pub const COMMAND_ANSWER_TOTAL_MAX: usize = 64 * 1024;
+pub const COMMAND_MCP_SERVER_MAX: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -514,7 +535,7 @@ pub enum AgentCommand {
     /// rides as a label).
     Answer {
         request_id: String,
-        answers: std::collections::HashMap<String, Vec<String>>,
+        answers: HashMap<String, Vec<String>>,
     },
     /// Ask the agent for account usage (claude get_usage -> UsageReport).
     GetUsage,
@@ -571,6 +592,176 @@ pub enum AgentCommand {
     SteerQueued {
         id: String,
     },
+}
+
+/// A client command exceeded one of the daemon's bounded-ingress budgets.
+/// Kept separate from driver availability errors so transports can report a
+/// precise one-command refusal without terminating a healthy agent session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandValidationError {
+    message: String,
+}
+
+impl CommandValidationError {
+    fn limit(field: &str, actual: usize, max: usize) -> Self {
+        Self {
+            message: format!("{field} exceeds {max} byte/item limit (got {actual})"),
+        }
+    }
+}
+
+impl fmt::Display for CommandValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandValidationError {}
+
+fn check_command_len(field: &str, actual: usize, max: usize) -> Result<(), CommandValidationError> {
+    if actual > max {
+        Err(CommandValidationError::limit(field, actual, max))
+    } else {
+        Ok(())
+    }
+}
+
+impl AgentCommand {
+    /// Validate every client-controlled collection and string before this
+    /// command enters the driver's bounded channel. WebSocket framing has its
+    /// own earlier byte ceiling; this remains authoritative for programmatic
+    /// callers such as the workspace Mastermind MCP.
+    pub fn validate_ingress(&self) -> Result<(), CommandValidationError> {
+        match self {
+            Self::Send { blocks } => {
+                check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
+                let mut images = 0usize;
+                let mut text_total = 0usize;
+                let mut image_total = 0usize;
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            check_command_len("text block", text.len(), COMMAND_TEXT_BLOCK_MAX)?;
+                            text_total = text_total.saturating_add(text.len());
+                        }
+                        ContentBlock::Image { media_type, data } => {
+                            images = images.saturating_add(1);
+                            check_command_len(
+                                "image media_type",
+                                media_type.len(),
+                                COMMAND_MEDIA_TYPE_MAX,
+                            )?;
+                            check_command_len(
+                                "image base64",
+                                data.len(),
+                                COMMAND_IMAGE_BASE64_MAX,
+                            )?;
+                            image_total = image_total.saturating_add(data.len());
+                        }
+                    }
+                }
+                check_command_len("send images", images, COMMAND_IMAGES_MAX)?;
+                check_command_len("send text", text_total, COMMAND_TEXT_TOTAL_MAX)?;
+                check_command_len(
+                    "send image base64",
+                    image_total,
+                    COMMAND_IMAGE_BASE64_TOTAL_MAX,
+                )?;
+            }
+            Self::Permission {
+                request_id,
+                option_id,
+                destination,
+                feedback,
+            } => {
+                check_command_len("request_id", request_id.len(), COMMAND_ID_MAX)?;
+                check_command_len("option_id", option_id.len(), COMMAND_SELECTOR_MAX)?;
+                if let Some(destination) = destination {
+                    check_command_len(
+                        "permission destination",
+                        destination.len(),
+                        COMMAND_DESTINATION_MAX,
+                    )?;
+                }
+                if let Some(feedback) = feedback {
+                    check_command_len("permission feedback", feedback.len(), COMMAND_FEEDBACK_MAX)?;
+                }
+            }
+            Self::SetMode { mode_id } => {
+                check_command_len("mode_id", mode_id.len(), COMMAND_SELECTOR_MAX)?;
+            }
+            Self::SetModel { model_id } => {
+                check_command_len("model_id", model_id.len(), COMMAND_SELECTOR_MAX)?;
+            }
+            Self::SetEffort { effort_id } => {
+                check_command_len("effort_id", effort_id.len(), COMMAND_SELECTOR_MAX)?;
+            }
+            Self::Answer {
+                request_id,
+                answers,
+            } => {
+                check_command_len("request_id", request_id.len(), COMMAND_ID_MAX)?;
+                check_command_len(
+                    "answer questions",
+                    answers.len(),
+                    COMMAND_ANSWER_QUESTIONS_MAX,
+                )?;
+                let mut answer_total = 0usize;
+                for (question_id, choices) in answers {
+                    check_command_len("question id", question_id.len(), COMMAND_ID_MAX)?;
+                    check_command_len("answer choices", choices.len(), COMMAND_ANSWER_CHOICES_MAX)?;
+                    for choice in choices {
+                        check_command_len("answer value", choice.len(), COMMAND_ANSWER_VALUE_MAX)?;
+                        answer_total = answer_total.saturating_add(choice.len());
+                    }
+                }
+                check_command_len("answer text", answer_total, COMMAND_ANSWER_TOTAL_MAX)?;
+            }
+            Self::Rewind {
+                user_message_id, ..
+            } => {
+                check_command_len("user_message_id", user_message_id.len(), COMMAND_ID_MAX)?;
+            }
+            Self::BackgroundTool { tool_call_id } => {
+                check_command_len("tool_call_id", tool_call_id.len(), COMMAND_ID_MAX)?;
+            }
+            Self::StopTask { task_id } => {
+                check_command_len("task_id", task_id.len(), COMMAND_ID_MAX)?;
+            }
+            Self::SetMcpEnabled { server, .. } | Self::ReconnectMcp { server } => {
+                check_command_len("MCP server", server.len(), COMMAND_MCP_SERVER_MAX)?;
+            }
+            Self::CancelQueued { id } | Self::SteerQueued { id } => {
+                check_command_len("queued message id", id.len(), COMMAND_ID_MAX)?;
+            }
+            Self::Interrupt
+            | Self::SetThinking { .. }
+            | Self::SetUltracode { .. }
+            | Self::GetUsage
+            | Self::Compact
+            | Self::GetMcp => {}
+        }
+        Ok(())
+    }
+
+    /// Heap bytes this command can leave resident while waiting for the agent
+    /// to consume it. Only sends retain bulk payloads; the other variants are
+    /// independently leaf-capped and live only in the bounded command channel.
+    pub fn retained_send_bytes(&self) -> Option<usize> {
+        let Self::Send { blocks } = self else {
+            return None;
+        };
+        let mut bytes = std::mem::size_of_val(blocks.as_slice());
+        for block in blocks {
+            bytes = bytes.saturating_add(match block {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::Image { media_type, data } => {
+                    media_type.len().saturating_add(data.len())
+                }
+            });
+        }
+        Some(bytes)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1061,6 +1252,84 @@ mod tests {
                 feedback: Some("use rg".into()),
             }
         );
+    }
+
+    #[test]
+    fn command_ingress_accepts_the_browser_send_budget() {
+        let mut blocks = vec![ContentBlock::Text {
+            text: "x".repeat(COMMAND_TEXT_TOTAL_MAX),
+        }];
+        blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+        }));
+        assert!(AgentCommand::Send { blocks }.validate_ingress().is_ok());
+    }
+
+    #[test]
+    fn command_ingress_rejects_oversized_send_fields_and_aggregates() {
+        let oversized_image = AgentCommand::Send {
+            blocks: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "x".repeat(COMMAND_IMAGE_BASE64_MAX + 1),
+            }],
+        };
+        assert!(oversized_image.validate_ingress().is_err());
+
+        let too_many_blocks = AgentCommand::Send {
+            blocks: (0..COMMAND_BLOCKS_MAX + 1)
+                .map(|_| ContentBlock::Text {
+                    text: String::new(),
+                })
+                .collect(),
+        };
+        assert!(too_many_blocks.validate_ingress().is_err());
+
+        let aggregate_text = AgentCommand::Send {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "x".repeat(COMMAND_TEXT_TOTAL_MAX / 2 + 1),
+                },
+                ContentBlock::Text {
+                    text: "x".repeat(COMMAND_TEXT_TOTAL_MAX / 2),
+                },
+            ],
+        };
+        assert!(aggregate_text.validate_ingress().is_err());
+    }
+
+    #[test]
+    fn command_ingress_bounds_non_send_collections_and_strings() {
+        let oversized_selector = AgentCommand::SetModel {
+            model_id: "x".repeat(COMMAND_SELECTOR_MAX + 1),
+        };
+        assert!(oversized_selector.validate_ingress().is_err());
+
+        let answers = (0..COMMAND_ANSWER_QUESTIONS_MAX + 1)
+            .map(|i| (format!("q{i}"), vec!["yes".to_string()]))
+            .collect();
+        let too_many_answers = AgentCommand::Answer {
+            request_id: "r".to_string(),
+            answers,
+        };
+        assert!(too_many_answers.validate_ingress().is_err());
+    }
+
+    #[test]
+    fn retained_send_bytes_counts_bulk_payload_and_excludes_controls() {
+        let command = AgentCommand::Send {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "hello".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "base64".to_string(),
+                },
+            ],
+        };
+        assert!(command.retained_send_bytes().unwrap() >= 5 + 9 + 6);
+        assert_eq!(AgentCommand::Interrupt.retained_send_bytes(), None);
     }
 
     #[test]
