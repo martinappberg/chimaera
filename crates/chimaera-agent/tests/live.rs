@@ -286,7 +286,10 @@ async fn claude_background_task_lanes_start_and_settle() {
     // the result they fall on.
     let mut started = Value::Null;
     let mut changed_with_task = false;
-    let mut notification = Value::Null;
+    // Every notification seen, not just the last: a second lane's verdict
+    // would otherwise clobber the one we're waiting for, and the id check
+    // below would then send us back to a 60s wait for a frame already gone.
+    let mut notifications: Vec<Value> = Vec::new();
     let mut emptied = false;
     loop {
         let frame = chat
@@ -312,7 +315,7 @@ async fn claude_background_task_lanes_start_and_settle() {
             // Only counts as the SETTLE emptying once the task was listed.
             emptied |= changed_with_task && tasks.is_some_and(|t| t.is_empty());
         } else if frame["type"] == "system" && frame["subtype"] == "task_notification" {
-            notification = frame;
+            notifications.push(frame);
         } else if frame["type"] == "result" {
             break;
         }
@@ -334,9 +337,10 @@ async fn claude_background_task_lanes_start_and_settle() {
 
     // Whatever the turn didn't already carry settles outside it (~5s): the
     // verdict notification plus the set-emptying level-set.
-    if notification["task_id"].as_str() != Some(task_id.as_str()) {
-        notification = Value::Null;
-    }
+    let mut notification = notifications
+        .into_iter()
+        .find(|f| f["task_id"].as_str() == Some(task_id.as_str()))
+        .unwrap_or(Value::Null);
     while notification.is_null() || !emptied {
         let frame = chat
             .recv(Duration::from_secs(60))
@@ -421,16 +425,24 @@ async fn claude_foreground_bash_never_enters_the_background_set() {
             break;
         }
     }
-    assert_eq!(
-        started["task_type"],
-        json!("local_bash"),
-        "a foreground bash rides the SAME task_started shape as a backgrounded one"
-    );
+    // THE contract: the absence of an announcement is the only thing that
+    // distinguishes a foreground command from backgrounded work.
     assert!(
         !announced_any,
-        "a foreground command is never announced in a background_tasks_changed set — \
-         this absence is the only thing that distinguishes the two lanes"
+        "a foreground command is never announced in a background_tasks_changed set"
     );
+    // The companion fact (foreground rides the SAME task_started shape) is
+    // what makes that absence load-bearing — but a CLI that stopped emitting
+    // it would be moving in the SAFE direction, so report rather than fail.
+    if started.is_null() {
+        println!("foreground bash: no task_started emitted (wire moved; harmless)");
+    } else {
+        assert_eq!(
+            started["task_type"],
+            json!("local_bash"),
+            "a foreground bash rides the SAME task_started shape as a backgrounded one"
+        );
+    }
 
     chat.shutdown(Duration::from_secs(5))
         .await

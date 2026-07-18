@@ -1705,6 +1705,19 @@ task_started + …) feeds the level-set": non-`local_agent` `task_started` still
 ROUTES away from the subagent Agent-row lane (a `local_bash` must never
 synthesize an "Agent:" row), it just no longer adopts.
 
+**Ctrl-B still reaches the tray — live-verified 2.1.212.** The obvious worry
+about set-change-only adoption is the ⤓ "continue in the background" path,
+since that task's `task_started` already went by (as a foreground one) before
+the user backgrounds it. Probed end to end through the daemon: sending the
+`background_tasks` control for a running foreground Bash's `tool_use_id`
+produces a `background_tasks_changed` carrying the task, so it lands in the
+set exactly like a natively-backgrounded one, then settles through the normal
+triple. Sequence observed: `{"subtype":"background_tasks", tool_use_id}` →
+`background_tasks_changed {tasks:[{local_bash, …}]}` → "tool moved to the
+background" notice → (later) `background_tasks_changed []` → the verdict. So
+**every** transition INTO background work is announced by a set change — which
+is what makes the set change safe to treat as the sole authority.
+
 **Live gate.** Full `just chat-smoke` re-run against 2.1.212 + codex 0.144.2:
 **18/18**, with a new claude case (`claude_foreground_bash_never_enters_the_
 background_set`) pinning the counter-fact above. `TESTED_CLAUDE_VERSION`

@@ -117,12 +117,13 @@ fn control_request_frame(id: &str, request: Value) -> Value {
     })
 }
 
-/// One construction site for a wire-adopted background task, shared by BOTH
-/// adopt paths (task_started and background_tasks_changed carry the same
-/// task_id/task_type/description fields) so caps and fallbacks can't drift
-/// between them. `now` is the driver's first sight — the wire carries no
-/// start time, and the stamp is journaled so replayed ages stay truthful.
-/// The description falls back to the lane name so a tray row is never blank.
+/// One construction site for a wire-adopted background task. There is exactly
+/// ONE adopt path — `background_tasks_changed` — because only that frame can
+/// tell a backgrounded task from a foreground one (see
+/// [`ClaudeMapper::on_background_started`]). `now` is the driver's first sight
+/// — the wire carries no start time, and the stamp is journaled so replayed
+/// ages stay truthful. The description falls back to the lane name so a tray
+/// row is never blank.
 fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
     let id = t["task_id"].as_str().filter(|id| !id.is_empty())?;
     let task_type = t["task_type"].as_str().unwrap_or("unknown");
@@ -132,9 +133,10 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         description: truncate_label(t["description"].as_str().unwrap_or(task_type), BG_LABEL_MAX),
         status: "running".into(),
         started_at_ms: now,
-        // task_started carries these; background_tasks_changed doesn't —
-        // the started-path fold (on_background_started) patches them onto
-        // an entry the set change adopted first (live order at spawn).
+        // Always None on today's wire: only task_started carries these, and
+        // it no longer constructs. Parsed anyway because the wire is pinned,
+        // not trusted — if a set change ever starts carrying them we take
+        // them for free. Until then on_background_started folds them on.
         workflow_name: wire_workflow_name(t),
         agents: Vec::new(),
         agents_total: 0,
@@ -143,10 +145,11 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
     })
 }
 
-/// The two workflow-binding fields, extracted ONCE for both adopt paths
-/// (task_started and the set change) so their sanitization can't drift.
-/// A whitespace-only `meta.name` counts as absent — the UI branches on the
-/// name being present, and a blank title would beat the description fallback.
+/// The two workflow-binding fields, extracted ONCE for both frames that can
+/// carry them — the set change (adoption) and task_started (enrichment) — so
+/// their sanitization can't drift. A whitespace-only `meta.name` counts as
+/// absent: the UI branches on the name being present, and a blank title would
+/// beat the description fallback.
 fn wire_workflow_name(v: &Value) -> Option<String> {
     opt_label(&v["workflow_name"], BG_LABEL_MAX)
 }
@@ -1266,9 +1269,10 @@ impl ClaudeMapper {
     ///
     /// `background_tasks_changed` is the SOLE authority for set membership.
     /// This frame cannot decide it, because a FOREGROUND long-running Bash
-    /// emits a `task_started` that is byte-identical in shape to a
-    /// backgrounded one — same `task_type: "local_bash"`, same fields, no
-    /// discriminator (live-probed 2.1.212). What actually separates the two
+    /// emits a `task_started` with the same field set and the same
+    /// `task_type: "local_bash"` as a backgrounded one — the values differ
+    /// (ids, description), but no field's PRESENCE or value distinguishes the
+    /// two lanes (live-probed 2.1.212). What actually separates them
     /// is that only a genuinely backgrounded task is announced in a
     /// `background_tasks_changed` set; a foreground command never appears in
     /// one. Adopting from this frame therefore parked every slow foreground
@@ -5247,13 +5251,10 @@ mod tests {
             "tool_use_id": "tu-b1", "description": "sleep 30",
         }));
         assert!(
-            !step
-                .events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
-            "background lanes must not synthesize Agent rows"
+            step.events.is_empty(),
+            "an already-adopted task's start is a pure no-op — no second copy, \
+             and never an Agent row for a background lane"
         );
-        assert!(step.events.is_empty(), "a duplicate start is a no-op");
     }
 
     #[test]
