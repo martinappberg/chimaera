@@ -76,13 +76,15 @@ selection references (see [terminals.md](terminals.md)).
   default).
 - **Key behaviors.** The route **streams** the body chunk-by-chunk to a hidden tmp sibling then
   renames (a partial upload is never visible under its final name) — the whole file **never sits in
-  RAM** (the daemon lives on shared login nodes). Hard caps: **32 MB per file, 256 MB per session
-  dir**; overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
+  RAM** (the daemon lives on shared login nodes). Hard caps: **32 MB per file, 256 MB and 256 files
+  per session dir**; completion rechecks those aggregate quotas including in-flight temp files,
+  and overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
   basename (no separators, no control bytes, no dot-dirs, ≤200 chars) before becoming a path on a
   shared host; a taken name dedupes with a short random prefix instead of clobbering. Uploads land
   in `~/.chimaera/uploads/<session-id>/` and are **session-lifetime**: pruned on `DELETE`
   (`sessions.rs` + `recents::retire`), on close-all/shutdown (`shutdown.rs`), and swept at boot for
-  sessions that died unwatched (`spawn_boot_prune`). Bearer-authed like every REST route; an unknown
+  sessions that died unwatched (`spawn_boot_prune`). Temp names use exclusive creation and
+  exhausted collision retries fail instead of falling back to a known name. Bearer-authed like every REST route; an unknown
   session id `404`s and never mints a directory. A drop caps at **8 files**; **folders** dropped
   from the OS are rejected with a toast (recursive upload is a follow-up).
 

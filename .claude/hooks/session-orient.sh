@@ -10,7 +10,7 @@ echo "Chimaera orientation (.claude/hooks/session-orient.sh):"
 echo "- git: branch '${branch:-detached}', ${dirty} uncommitted path(s)."
 echo "- Start at AGENTS.md (the index). Deep docs: docs/agent-guides/. Area rules auto-load from .claude/rules/."
 echo "- What the app DOES, feature by feature: docs/features/ (index → per-feature pages). Read the one page you're touching."
-echo "- Run it live: preview_start 'chimaerad-isolated' (see the develop skill). Gate: 'just check' + 'npm --prefix web-ui run check'."
+echo "- Run it live: preview_start 'chimaerad-isolated' (see the develop skill). Gate: 'just check' + web-ui check/test/build."
 if [ -f "$root/.chimaera-dev/manifest.json" ]; then
   echo "- An isolated dev-daemon manifest exists (.chimaera-dev) — a preview may already be running."
 fi

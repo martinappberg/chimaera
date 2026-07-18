@@ -10,7 +10,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::connect::{do_connect, HostStatus};
-use super::{lock, Shell, WindowScope};
+use super::{authorize_daemon_origin, daemon_navigation_allowed, lock, Shell, WindowScope};
 use crate::windows::WindowRecord;
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -66,9 +66,18 @@ fn open_shell_window(
     record: &WindowRecord,
     scope_alias: Option<String>,
 ) -> tauri::Result<()> {
-    let url = url.parse().expect("daemon url is always valid");
+    let url: tauri::Url = url.parse().expect("daemon url is always valid");
+    let port = url
+        .port()
+        .expect("daemon URLs always carry an explicit loopback port");
     let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
+    authorize_daemon_origin(app, &label, port)?;
+    let navigation_app = app.clone();
+    let navigation_label = label.clone();
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
+        .on_navigation(move |url| {
+            daemon_navigation_allowed(&navigation_app, &navigation_label, url)
+        })
         .title(title)
         // Tauri's own drag-drop handler intercepts OS file drops and suppresses
         // the webview's DOM drop events. The workbench handles drops itself in
@@ -96,7 +105,12 @@ fn open_shell_window(
     if let (Some(x), Some(y)) = (record.x, record.y) {
         builder = builder.position(x, y);
     }
-    builder.build()?;
+    if let Err(error) = builder.build() {
+        if let Some(shell) = app.try_state::<Shell>() {
+            lock(&shell.allowed_daemon_ports).remove(&label);
+        }
+        return Err(error);
+    }
     // Track the new window's scope so focus-existing can raise it, and
     // persist it so the next launch reopens it. Startup manages Shell before
     // opening any window, so every window registers.
@@ -141,10 +155,10 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // composite key ("alias#job{id}") — a job window listens on
             // that key, NEVER on the login alias (listening on the alias
             // made every login-tunnel blip re-home job windows onto the
-            // login daemon — found live). Their `token` field stays None
-            // on the wire: compute tokens never leave Rust, and a probe
-            // is authed with the tunnel's own token instead (identity,
-            // not just liveness — a stale relay can answer for the port).
+            // login daemon — found live). Their `token` field stays None on
+            // the wire. Every probe is authed with its tunnel's own token:
+            // identity, not just liveness, because a stale relay or unrelated
+            // loopback server can answer on a recycled port.
             let mut snap: Vec<(String, u16, String, bool)> = {
                 let tunnels = shell.tunnels.lock().await;
                 tunnels
@@ -164,11 +178,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
             // them without emitting a spurious `down`.
             prev.retain(|a, _| snap.iter().any(|(s, ..)| s == a));
             for (key, port, token, is_compute) in &snap {
-                let up = if *is_compute {
-                    chimaera_remote::http_alive_authed(*port, token).await
-                } else {
-                    chimaera_remote::http_alive(*port).await
-                };
+                let up = chimaera_remote::http_alive_authed(*port, token).await;
                 if prev.insert(key.clone(), up) == Some(up) {
                     continue; // no transition
                 }

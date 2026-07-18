@@ -42,6 +42,7 @@
   } from "./compute";
   import ComputeBanner from "./ComputeBanner.svelte";
   import { getJobContext, type Health } from "../net/api";
+  import { asyncDisposer } from "../shared/asyncDisposer";
 
   interface Props {
     workspaces: Workspace[];
@@ -266,50 +267,60 @@
     };
     document.addEventListener("visibilitychange", onVis);
     unlisteners.push(() => document.removeEventListener("visibilitychange", onVis));
-    void onConnectProgress((p) => {
-      phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
-    }).then((u) => unlisteners.push(u));
+    unlisteners.push(
+      asyncDisposer(
+        onConnectProgress((p) => {
+          phases = new Map(phases).set(p.alias, PHASE_LABEL[p.phase] ?? p.phase);
+        }),
+      ),
+    );
     // Keep host rows live: the shell's health monitor reports a dropped or
     // recovered tunnel, and connect flights report their outcome — including
     // ones this window didn't start (startup restore, another window's
     // reconnect), which otherwise leave the row "connecting" forever.
-    void onHostStatus((e) => {
-      hosts = hosts.map((h) =>
-        h.alias === e.alias
-          ? {
-              ...h,
-              status: e.status === "connected" ? "connected" : "disconnected",
-              local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+    unlisteners.push(
+      asyncDisposer(
+        onHostStatus((e) => {
+          hosts = hosts.map((h) =>
+            h.alias === e.alias
+              ? {
+                  ...h,
+                  status: e.status === "connected" ? "connected" : "disconnected",
+                  local_port: e.status === "connected" ? (e.local_port ?? h.local_port) : null,
+                }
+              : h,
+          );
+          // Any terminal transition ends the phase line, whoever ran the connect.
+          phases = mapWithout(phases, e.alias);
+          if (e.status === "down") {
+            remoteWs = mapWithout(remoteWs, e.alias);
+            remoteCompute = mapWithout(remoteCompute, e.alias);
+          }
+          if (e.status === "error" && e.error !== undefined) {
+            hostErrors = new Map(hostErrors).set(e.alias, e.error);
+          } else if (e.status === "connected") {
+            hostErrors = mapWithout(hostErrors, e.alias);
+            // A connect this window didn't run (startup restore, another
+            // window) still gets its workspace list, so the row is browsable.
+            if (!remoteWs.has(e.alias)) {
+              void remoteWorkspaces(e.alias)
+                .then((list) => {
+                  remoteWs = new Map(remoteWs).set(
+                    e.alias,
+                    [...list].sort(
+                      (a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0),
+                    ),
+                  );
+                })
+                .catch(() => {
+                  // dropped again in between; the next transition retries
+                });
             }
-          : h,
-      );
-      // Any terminal transition ends the phase line, whoever ran the connect.
-      phases = mapWithout(phases, e.alias);
-      if (e.status === "down") {
-        remoteWs = mapWithout(remoteWs, e.alias);
-        remoteCompute = mapWithout(remoteCompute, e.alias);
-      }
-      if (e.status === "error" && e.error !== undefined) {
-        hostErrors = new Map(hostErrors).set(e.alias, e.error);
-      } else if (e.status === "connected") {
-        hostErrors = mapWithout(hostErrors, e.alias);
-        // A connect this window didn't run (startup restore, another
-        // window) still gets its workspace list, so the row is browsable.
-        if (!remoteWs.has(e.alias)) {
-          void remoteWorkspaces(e.alias)
-            .then((list) => {
-              remoteWs = new Map(remoteWs).set(
-                e.alias,
-                [...list].sort((a, b) => (b.last_opened_at ?? 0) - (a.last_opened_at ?? 0)),
-              );
-            })
-            .catch(() => {
-              // dropped again in between; the next transition retries
-            });
-        }
-        if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
-      }
-    }).then((u) => unlisteners.push(u));
+            if (!remoteCompute.has(e.alias)) void refreshCompute(e.alias);
+          }
+        }),
+      ),
+    );
     return () => unlisteners.forEach((u) => u());
   });
 

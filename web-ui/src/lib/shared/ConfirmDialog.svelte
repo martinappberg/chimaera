@@ -5,8 +5,9 @@
    * Cancel (the safe default), Escape cancels, Enter activates the focused
    * button. A failure keeps the dialog open with an inline error, so the
    * caller passes `error` instead of closing.
-   */
+  */
   import { focusOnMount } from "./focusOnMount";
+  import { modalFocus } from "./modalFocus";
 
   interface Props {
     title: string;
@@ -49,6 +50,7 @@
     aria-modal="true"
     aria-label={title}
     tabindex="-1"
+    use:modalFocus
     onclick={(e) => e.stopPropagation()}
   >
     <div class="title">{title}</div>

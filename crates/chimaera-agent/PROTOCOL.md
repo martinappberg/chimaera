@@ -8,9 +8,33 @@ KNOW, how we know it, and what we have not adopted yet. Re-verify with
 Sources:
 - **live**: probed against the real CLIs (claude 2.1.206, codex 0.142.5;
   codex 0.144.2 from Pass 16 on).
+- **official schema/docs**: Codex's upstream `codex-rs/app-server/README.md`
+  and the version-specific output of `codex app-server generate-ts` /
+  `generate-json-schema` (the preferred shape inventory for the installed
+  pin; live probes still establish ordering and conditional behavior).
 - **vsix**: mined from the official VS Code extension bundles
   (Anthropic.claude-code 2.1.204, openai.chatgpt 26.5623.141536 — the
   extensions are GUIs over these same protocols).
+
+## Upstream app-server integration guidance (audited 2026-07-18)
+
+The official Codex app-server documentation now exposes two integration aids
+that post-date the original extension-mining workflow:
+
+- `codex app-server generate-ts --out DIR` and
+  `generate-json-schema --out DIR` emit schemas guaranteed to match that Codex
+  binary. Run one as a free preflight whenever `codex.rs` changes, diff only
+  the relevant v2 types, and keep the generated bulk out of the repository.
+- App-server transport ingress is bounded. Saturation rejects a request with
+  JSON-RPC code `-32001` (`Server overloaded; retry later.`); upstream asks
+  clients to retry with exponential backoff and jitter. Chimaera's channels
+  are already bounded, but targeted retry of this response is **not adopted**:
+  adding it needs idempotency analysis per RPC, hermetic coverage, and the
+  billed live smoke gate rather than a blanket resend.
+
+These aids strengthen — and do not replace — the pinned-version + live-probe
+rule below. Schemas cannot prove notification order, whether a notification is
+conditional, or what a CLI does after cancellation/reconnect.
 
 ## Claude Code — bidirectional stream-json
 

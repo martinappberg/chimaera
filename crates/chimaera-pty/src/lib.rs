@@ -28,6 +28,25 @@ use anyhow::{anyhow, Context};
 
 pub type SessionId = String;
 
+/// Hard viewport bounds enforced by the PTY engine. The normal UI already
+/// fits panes within these limits; enforcing them here protects every caller
+/// (including raw WebSocket clients) from allocating an attacker-sized
+/// terminal grid.
+pub const MAX_TERMINAL_COLS: u16 = 500;
+pub const MAX_TERMINAL_ROWS: u16 = 200;
+/// Per-session history ceiling. Callers may choose less, but the leaf engine
+/// never permits an unbounded scrollback allocation.
+pub const MAX_SCROLLBACK_LINES: usize = 200_000;
+
+fn validate_dimensions(cols: u16, rows: u16) -> anyhow::Result<()> {
+    if cols == 0 || rows == 0 || cols > MAX_TERMINAL_COLS || rows > MAX_TERMINAL_ROWS {
+        return Err(anyhow!(
+            "invalid size {cols}x{rows} (maximum {MAX_TERMINAL_COLS}x{MAX_TERMINAL_ROWS})"
+        ));
+    }
+    Ok(())
+}
+
 /// Metadata describing a session, live or exited.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SessionInfo {
@@ -214,9 +233,7 @@ impl SessionManager {
     /// Resize the PTY and the server-side terminal together. The last resize
     /// wins for every attachment; a `Resized` event is broadcast.
     pub fn resize(&self, id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
-        if cols == 0 || rows == 0 {
-            return Err(anyhow!("invalid size {cols}x{rows}"));
-        }
+        validate_dimensions(cols, rows)?;
         let session = self
             .session(id)
             .ok_or_else(|| anyhow!("unknown session: {id}"))?;

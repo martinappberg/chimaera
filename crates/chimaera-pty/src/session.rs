@@ -20,8 +20,8 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
-    lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, Attachment,
-    SessionEvent, SessionId, SessionInfo, SpawnOpts,
+    lock_unpoisoned, marks::now_ms, marks::Marks, marks::ShellPhase, snapshot, validate_dimensions,
+    Attachment, SessionEvent, SessionId, SessionInfo, SpawnOpts,
 };
 
 /// How long `kill()` waits after SIGHUP before force-killing a still-living
@@ -38,8 +38,10 @@ const SCROLLBACK_LINES: usize = 10_000;
 const OUTPUT_CHANNEL_CAPACITY: usize = 4096;
 /// Capacity of the session-event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-/// Capacity of the stdin mpsc channel.
-const INPUT_CHANNEL_CAPACITY: usize = 256;
+/// Capacity of the stdin mpsc channel. Terminal WebSocket input is split into
+/// 64 KiB chunks before it reaches this queue, so a stalled PTY can retain at
+/// most about 4 MiB of interactive input rather than hundreds of large frames.
+const INPUT_CHANNEL_CAPACITY: usize = 64;
 
 /// Minimal `Dimensions` impl for constructing/resizing the headless `Term`.
 struct TermDimensions {
@@ -128,13 +130,9 @@ impl Session {
         opts: &SpawnOpts,
         on_exit: Box<dyn FnOnce() + Send + 'static>,
     ) -> anyhow::Result<Arc<Session>> {
-        // A 0-dimension PTY is invalid: openpty yields a nonsensical winsize
-        // and the headless Term's grid math would operate on a zero axis.
-        // `resize` already rejects this; spawn must too, so a session can't be
-        // born in a state `resize` would refuse.
-        if opts.cols == 0 || opts.rows == 0 {
-            anyhow::bail!("invalid size {}x{}", opts.cols, opts.rows);
-        }
+        // openpty and the headless Term must never see an invalid or
+        // allocation-hostile grid. `resize` shares this exact boundary.
+        validate_dimensions(opts.cols, opts.rows)?;
         let cwd = opts.cwd.clone();
         let explicit_name = opts.name.clone().filter(|n| !n.is_empty());
         let renamed = explicit_name.is_some();
@@ -203,7 +201,10 @@ impl Session {
             title: Arc::clone(&title),
         };
         let term_config = TermConfig {
-            scrolling_history: opts.scrollback.unwrap_or(SCROLLBACK_LINES),
+            scrolling_history: opts
+                .scrollback
+                .unwrap_or(SCROLLBACK_LINES)
+                .min(crate::MAX_SCROLLBACK_LINES),
             ..TermConfig::default()
         };
         let dims = TermDimensions {

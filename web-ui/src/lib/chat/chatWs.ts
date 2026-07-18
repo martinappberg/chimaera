@@ -40,8 +40,8 @@ export interface ChatSocketHandlers {
   onExited(status: number | null): void;
   /** Fatal server-side error; the socket will not reconnect. */
   onError(message: string): void;
-  /** One command was refused (code=command_failed, e.g. the driver is gone):
-   *  the socket stays up and keeps reconnecting — surface it, don't die. */
+  /** One command was refused (`command_failed` or `invalid_command`): the
+   *  socket stays up and keeps reconnecting — surface it, don't die. */
   onCommandFailed(message: string): void;
   /** The socket dropped and is reconnecting; the UI is no longer live. */
   onDisconnected(): void;
@@ -141,7 +141,7 @@ export class ChatSocket {
           // healthy and the session may come back (respawn, toggle). Going
           // fatal here permanently stopped reconnects after a single answer
           // sent into a dead driver.
-          if (msg.code === "command_failed") {
+          if (msg.code === "command_failed" || msg.code === "invalid_command") {
             this.handlers.onCommandFailed((msg.message as string) ?? "command failed");
             break;
           }

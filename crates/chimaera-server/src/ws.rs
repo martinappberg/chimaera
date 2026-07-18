@@ -18,6 +18,16 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::AppState;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// One interactive terminal message may contain a sizeable paste, but must
+/// not be allowed to use tungstenite's much larger default allocation.
+const MAX_TERMINAL_INPUT_MESSAGE: usize = 1024 * 1024;
+/// Structured commands can contain four 2 MiB base64 images plus a 256 KiB
+/// text block. Leave room for JSON escaping and field overhead, but reject a
+/// giant frame in tungstenite before serde allocates the command tree.
+const MAX_CHAT_COMMAND_MESSAGE: usize = 10 * 1024 * 1024;
+/// Queue terminal input in bounded pieces so the PTY channel's item capacity
+/// also implies a byte capacity.
+const TERMINAL_INPUT_CHUNK: usize = 64 * 1024;
 /// Coalesce window for repaints triggered by *other* clients' resizes: an
 /// interactive divider drag fires resizes in bursts, and every repaint is a
 /// full-screen rewrite.
@@ -56,7 +66,9 @@ pub(crate) async fn session_ws(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle(socket, id, state))
+    ws.max_message_size(MAX_TERMINAL_INPUT_MESSAGE)
+        .max_frame_size(MAX_TERMINAL_INPUT_MESSAGE)
+        .on_upgrade(move |socket| handle(socket, id, state))
 }
 
 async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
@@ -221,14 +233,21 @@ async fn handle(mut socket: WebSocket, id: String, state: Arc<AppState>) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if attachment.input.send(bytes).await.is_err() {
-                        // Session is gone; tell the client and hang up.
-                        let _ = send_json(
-                            &mut socket,
-                            &json!({"type": "exited", "status": null}),
-                        )
-                        .await;
-                        return;
+                    for chunk in bytes.chunks(TERMINAL_INPUT_CHUNK) {
+                        if attachment
+                            .input
+                            .send(Bytes::copy_from_slice(chunk))
+                            .await
+                            .is_err()
+                        {
+                            // Session is gone; tell the client and hang up.
+                            let _ = send_json(
+                                &mut socket,
+                                &json!({"type": "exited", "status": null}),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
@@ -302,12 +321,19 @@ pub(crate) async fn chat_ws(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_chat(socket, id, state))
+    ws.max_message_size(MAX_CHAT_COMMAND_MESSAGE)
+        .max_frame_size(MAX_CHAT_COMMAND_MESSAGE)
+        .on_upgrade(move |socket| handle_chat(socket, id, state))
 }
 
 /// Chat replay batch size: bounds per-frame size without flooding the socket
 /// with one frame per event on a cold attach.
 const CHAT_BATCH: usize = 128;
+/// Byte budget per replay frame. Count-only batching admitted 128 maximum-size
+/// journal entries into one ~32 MiB JSON frame, creating a large allocation
+/// and long main-thread parse pause on cold reconnect. One entry may approach
+/// the journal's 256 KiB cap; otherwise frames stay near this ceiling.
+const CHAT_BATCH_BYTES: usize = 512 * 1024;
 
 async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let Some(last_seq) = chat_authenticate(&mut socket, &state).await else {
@@ -342,7 +368,9 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
     let ready = json!({
         "type": "ready",
         "session": attachment.info,
-        "replay_from": last_seq,
+        // Tell every client the cursor the daemon actually honored. This can
+        // differ from auth.last_seq after a server-side journal reset.
+        "replay_from": attachment.replay_from,
         // The journal's highest seq now. A client whose own last_seq exceeds
         // this is stale (the journal was recreated and numbering restarted);
         // it hard-resets rather than silently dropping every replayed event.
@@ -352,7 +380,11 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
         return;
     }
 
-    let mut sent_seq = last_seq;
+    // `attach` may clamp a stale client cursor back to 0 when its journal was
+    // recreated. Dedupe live events against that effective cursor: if replay
+    // is empty, retaining the client's old (higher) seq would silently skip
+    // every event the new journal ever emits.
+    let mut sent_seq = attachment.replay_from;
     if !send_chat_batches(&mut socket, &attachment.replay, &mut sent_seq).await {
         return;
     }
@@ -419,6 +451,19 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<chimaera_agent::model::AgentCommand>(&text) {
                         Ok(cmd) => {
+                            if let Err(err) = cmd.validate_ingress() {
+                                tracing::debug!(%id, %err, "chat command exceeds ingress budget");
+                                // Reject only this command. The authenticated
+                                // socket and agent remain healthy, so the UI
+                                // can correct the payload and retry.
+                                let _ = send_json(
+                                    &mut socket,
+                                    &json!({"type": "error", "code": "invalid_command",
+                                            "message": err.to_string()}),
+                                )
+                                .await;
+                                continue;
+                            }
                             if let Err(err) = state.chat.command(&id, cmd).await {
                                 tracing::debug!(%id, %err, "chat command failed");
                                 // code=command_failed: one refused command is
@@ -427,10 +472,18 @@ async fn handle_chat(mut socket: WebSocket, id: String, state: Arc<AppState>) {
                                 // reconnecting forever (additive field; old
                                 // clients ignore unknown codes and keep their
                                 // previous behavior).
+                                let (code, message) = if err
+                                    .downcast_ref::<chimaera_agent::CommandQueueFull>()
+                                    .is_some()
+                                {
+                                    ("invalid_command", err.to_string())
+                                } else {
+                                    ("command_failed", "agent unavailable".to_string())
+                                };
                                 let _ = send_json(
                                     &mut socket,
-                                    &json!({"type": "error", "code": "command_failed",
-                                            "message": "agent unavailable"}),
+                                    &json!({"type": "error", "code": code,
+                                            "message": message}),
                                 )
                                 .await;
                             }
@@ -453,7 +506,10 @@ async fn send_chat_batches(
     replay: &[Arc<chimaera_agent::journal::SeqEvent>],
     sent_seq: &mut u64,
 ) -> bool {
-    for chunk in replay.chunks(CHAT_BATCH) {
+    let mut start = 0;
+    while start < replay.len() {
+        let end = chat_batch_end(replay, start);
+        let chunk = &replay[start..end];
         let events: Vec<serde_json::Value> = chunk
             .iter()
             .map(|e| json!({"seq": e.seq, "ts": e.ts, "ev": e.ev}))
@@ -467,8 +523,32 @@ async fn send_chat_batches(
         if let Some(last) = chunk.last() {
             *sent_seq = last.seq;
         }
+        start = end;
     }
     true
+}
+
+/// End index for the next replay batch, bounded by both entry count and
+/// serialized bytes. Always admits at least one entry so a single large (but
+/// journal-valid) event makes progress.
+fn chat_batch_end(replay: &[Arc<chimaera_agent::journal::SeqEvent>], start: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut end = start;
+    let count_end = replay.len().min(start.saturating_add(CHAT_BATCH));
+    while end < count_end {
+        // SeqEvent is the same three fields the batch embeds. The surrounding
+        // array/object punctuation is tiny; leave a small fixed allowance per
+        // row so the target remains an honest upper bound in practice.
+        let next = serde_json::to_vec(&*replay[end])
+            .map(|v| v.len().saturating_add(2))
+            .unwrap_or(CHAT_BATCH_BYTES);
+        if end > start && bytes.saturating_add(next) > CHAT_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(next);
+        end += 1;
+    }
+    end.max(start.saturating_add(1).min(replay.len()))
 }
 
 /// First-frame auth for the chat channel: carries `last_seq` instead of grid
@@ -734,4 +814,57 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<Option
 
 async fn send_json(socket: &mut WebSocket, value: &serde_json::Value) -> Result<(), axum::Error> {
     socket.send(Message::Text(value.to_string().into())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chimaera_agent::journal::SeqEvent;
+    use chimaera_agent::model::{
+        AgentCommand, AgentEvent, ContentBlock, COMMAND_IMAGES_MAX, COMMAND_IMAGE_BASE64_MAX,
+        COMMAND_TEXT_TOTAL_MAX,
+    };
+
+    fn replay_entry(seq: u64, text: &str) -> Arc<SeqEvent> {
+        Arc::new(SeqEvent {
+            seq,
+            ts: 0,
+            ev: AgentEvent::MessageChunk {
+                turn_id: "t".to_string(),
+                text: text.to_string(),
+            },
+        })
+    }
+
+    #[test]
+    fn chat_replay_batch_is_bounded_by_count() {
+        let replay: Vec<_> = (1..=CHAT_BATCH as u64 + 1)
+            .map(|seq| replay_entry(seq, "x"))
+            .collect();
+        assert_eq!(chat_batch_end(&replay, 0), CHAT_BATCH);
+        assert_eq!(chat_batch_end(&replay, CHAT_BATCH), CHAT_BATCH + 1);
+    }
+
+    #[test]
+    fn chat_replay_batch_is_bounded_by_bytes_but_always_progresses() {
+        let large = "x".repeat(CHAT_BATCH_BYTES / 2 + 1024);
+        let replay = vec![replay_entry(1, &large), replay_entry(2, &large)];
+        assert_eq!(chat_batch_end(&replay, 0), 1);
+        assert_eq!(chat_batch_end(&replay, 1), 2);
+    }
+
+    #[test]
+    fn maximum_valid_browser_command_fits_transport_envelope() {
+        let mut blocks = vec![ContentBlock::Text {
+            // NUL takes the widest common JSON escape (`\\u0000`), proving
+            // the transport envelope covers payload caps, not just ASCII.
+            text: "\0".repeat(COMMAND_TEXT_TOTAL_MAX),
+        }];
+        blocks.extend((0..COMMAND_IMAGES_MAX).map(|_| ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
+        }));
+        let encoded = serde_json::to_vec(&AgentCommand::Send { blocks }).unwrap();
+        assert!(encoded.len() <= MAX_CHAT_COMMAND_MESSAGE);
+    }
 }

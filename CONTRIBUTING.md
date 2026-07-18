@@ -106,5 +106,6 @@ I have read the CLA Document and I hereby sign the CLA
 
 The bot records your signature and the check goes green; you only sign once, and it
 remembers you for every future PR. Signing is self-hosted — it runs entirely in GitHub
-Actions (`.github/workflows/cla.yml`), with signatures stored on the `cla-signatures`
-branch, so no third-party service ever sees your data.
+Actions using the repository-owned `.github/scripts/cla.mjs` gate, with signatures stored
+on the `cla-signatures` branch, so no third-party CLA service ever sees your data. The gate
+keys signatures to GitHub's immutable user id and checks every linked commit co-author.

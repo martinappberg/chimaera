@@ -43,7 +43,7 @@ async fn settings_round_trip_and_validation() {
         })),
     )
     .await;
-    assert_eq!(lock(&state.settings).scrollback_lines(), Some(200));
+    assert_eq!(lock(&state.settings).scrollback_lines(), Some(1_000));
     assert_eq!(
         lock(&state.settings).quickopen_ignore_dirs(),
         Some(vec!["node_modules".to_string(), ".git".to_string()]),
@@ -56,6 +56,19 @@ async fn settings_round_trip_and_validation() {
     )
     .await;
     assert_eq!(lock(&state.settings).scrollback_lines(), None);
+
+    let (_, _) = request(
+        &state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(serde_json::json!({"daemon.scrollbackLines": 9_000_000})),
+    )
+    .await;
+    assert_eq!(
+        lock(&state.settings).scrollback_lines(),
+        Some(200_000),
+        "hand-edited settings must honor the UI's memory ceiling"
+    );
 }
 
 #[tokio::test]

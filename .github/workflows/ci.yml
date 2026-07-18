@@ -19,15 +19,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
-      - run: npm install
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
         working-directory: web-ui
       - run: npm run check
         working-directory: web-ui
@@ -35,38 +40,50 @@ jobs:
         working-directory: web-ui
       - run: npm run build
         working-directory: web-ui
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: web-ui-dist
           path: web-ui/dist
 
   # Fast repo-hygiene checks, no build needed: the release semver decision
   # (the most behavior-critical release piece), the destructive-command guard,
-  # and every markdown link/anchor. jq is preinstalled on ubuntu-latest.
+  # docs, and agent-asset parity. jq is preinstalled on ubuntu-latest.
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: .nvmrc
       - run: bash scripts/version-bump.test.sh
       - run: bash .claude/hooks/guard-bash.test.sh
       - run: node scripts/check-doc-links.mjs
+      - run: node scripts/check-agent-assets.mjs
+      - run: node scripts/check-workflow-security.mjs
+      - run: node --test .github/scripts/*.test.mjs
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
 
   rust:
     needs: ui
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: web-ui-dist
           path: web-ui/dist
       # No toolchain arg: rustup installs the channel + components pinned in
       # rust-toolchain.toml, so CI lints against the same compiler as local.
       - run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         # Main saves, PRs restore. A PR-scoped cache is unreadable by every
         # other PR, yet still consumes the repo's 10 GiB LRU cache quota — left
         # unchecked it evicts the very main entries this job exists to prime.
@@ -83,20 +100,20 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: web-ui-dist
           path: web-ui/dist
       # rust-toolchain.toml pins the channel and both musl targets.
       - run: rustup show
-      - uses: mlugg/setup-zig@v2
-      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-zigbuild
       - run: cargo zigbuild --release --target ${{ matrix.target }} -p chimaera
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: chimaera-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chimaera

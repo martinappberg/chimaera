@@ -187,6 +187,11 @@ handle `WebglAddon.onContextLoss` explicitly; keep the Terminal instance out of 
 (Svelte adapter) for large tables/lists, CodeMirror 6 read-mostly for code viewing
 (framework-agnostic), pdf.js vendored.
 
+The production entry is an application shell, not a roll-up of every surface: pane views are
+dynamic feature boundaries, and xterm/WebGL sits behind a lightweight pool facade so it is fetched
+only with the first terminal (in parallel with that view chunk). Vite enforces a 500 kB minified
+entry budget in `vite.config.ts`; a regression reports the largest contributing modules.
+
 Layout: left rail = workspace switcher + session list with attention badges + Slurm strip;
 center = active session (structured transcript or terminal); right = file tree + preview pane;
 Cmd-K global switcher across sessions and workspaces.

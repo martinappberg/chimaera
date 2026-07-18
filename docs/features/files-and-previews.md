@@ -79,8 +79,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   on older daemons). Downloads ride the ticket pattern: `POST /api/v1/fs/ticket` accepts
   directories too, and the unauthenticated `GET /download/{ticket}` streams a file (with
   `Content-Disposition: attachment`, RFC 5987 unicode names) or a zip built on the fly
-  (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool; symlinks never
-  followed; 250k-entry ceiling aborts loudly). `/raw/{ticket}` stays file-only.
+  (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool). The ticket target is
+  opened once without following symlinks; folder traversal stays anchored to that descriptor and
+  opens every component relative to it with symlink following disabled. A 250k-entry ceiling plus
+  separate 8 MiB ceilings for one directory's retained names and the DFS stack's full relative
+  paths abort loudly before a wide/deep tree can amplify traversal memory. `/raw/{ticket}` stays
+  file-only and streams byte ranges from disk instead of materializing the whole file.
 - **Key behaviors.** Every mutation bumps the client `fsEpoch` (tree + Finder re-list from any
   surface's change) and nudges `git::mark_path_dirty`. App subscribes to `lastFsMutation`:
   a rename/move **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
@@ -120,7 +124,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   parses the workbook server-side (**calamine**) into the same paged `TablePage` (first row = header),
   plus the workbook's `sheets` list. `XlsxView.svelte` renders a sheet picker over the shared
   `TableView` grid — so selection/resize/paging come for free. calamine loads a whole sheet into
-  memory, so the SOURCE file is size-capped (`MAX_XLSX_BYTES`, 8 MB) before parsing, off the reactor
+  memory, so the SOURCE file is size-capped (`MAX_XLSX_BYTES`, 8 MB) before parsing, and ZIP-backed
+  workbooks are preflighted at 64 MiB expanded / 4096 entries before calamine runs off the reactor
   (`spawn_blocking`); over-cap files get an honest "too large" message. No live-on-disk refresh (no
   store entry) and no editing (a spreadsheet isn't a text file). **Gotcha:** XlsxView must NOT hand
   its own `$state` page object to `TableView` — the shared deeply-reactive proxy cross-links the two
@@ -133,6 +138,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   its split live-preview is a `sandbox="allow-scripts"` `srcdoc` iframe fed the (debounced) editor
   buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
   preview, so that mode stays the fidelity reference.
+  PDF metadata arrives progressively so the first pages paint before a long document is scanned;
+  rasters cap at 12M pixels and inactive canvases use an 8-page LRU.
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
 
@@ -178,6 +185,8 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   worker. Directory listings cap at `MAX_DIR_ENTRIES = 4000` with an honest `truncated` flag.
 - Previews **stream**; a preview of a huge Parquet/HTML/CSV must never balloon memory. This is a
   review criterion, not a nice-to-have (see [rules/daemon.md](../../.claude/rules/daemon.md)).
+- Capability tickets expire after 10 minutes and the in-memory store is capped at 4096; expiry-first
+  eviction keeps unauthenticated preview URLs bounded even under repeated minting.
 
 ---
 

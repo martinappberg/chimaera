@@ -190,37 +190,45 @@
     return sendNow(text, images);
   }
 
+  /** One never-lose-a-click path for every interactive AgentCommand. A closed
+   *  socket cannot queue locally (replay would make that ambiguous), so keep
+   *  the authoritative UI state unchanged and tell the user to retry. */
+  function sendCommand(command: Record<string, unknown>, failure: string): boolean {
+    if (socket.send(command)) return true;
+    store.notice(`not connected — ${failure}, try again in a moment`, "error");
+    return false;
+  }
+
   function decide(requestId: string, optionId: string, destination?: string, feedback?: string) {
-    const sent = socket.send({
-      type: "permission",
-      request_id: requestId,
-      option_id: optionId,
-      ...(destination !== undefined ? { destination } : {}),
-      ...(feedback !== undefined ? { feedback } : {}),
-    });
     // Never lose a decision to a closed socket: the card stays answerable
     // (no resolved event will arrive), so say why nothing happened.
-    if (!sent) store.notice("not connected — decision not sent, try again in a moment", "error");
+    sendCommand(
+      {
+        type: "permission",
+        request_id: requestId,
+        option_id: optionId,
+        ...(destination !== undefined ? { destination } : {}),
+        ...(feedback !== undefined ? { feedback } : {}),
+      },
+      "decision not sent",
+    );
   }
 
   function answer(requestId: string, answers: Record<string, string[]>) {
-    const sent = socket.send({ type: "answer", request_id: requestId, answers });
-    if (!sent) store.notice("not connected — answer not sent, try again in a moment", "error");
+    sendCommand({ type: "answer", request_id: requestId, answers }, "answer not sent");
   }
 
   function interrupt() {
-    socket.send({ type: "interrupt" });
+    sendCommand({ type: "interrupt" }, "stop not sent");
   }
 
   // Stop/background ride the same never-lose-a-click contract as decide():
   // a send into a closed socket says why nothing happened.
   function stopTask(id: string) {
-    const sent = socket.send({ type: "stop_task", task_id: id });
-    if (!sent) store.notice("not connected — stop not sent, try again in a moment", "error");
+    sendCommand({ type: "stop_task", task_id: id }, "stop not sent");
   }
   function backgroundTool(id: string) {
-    const sent = socket.send({ type: "background_tool", tool_call_id: id });
-    if (!sent) store.notice("not connected — try again in a moment", "error");
+    sendCommand({ type: "background_tool", tool_call_id: id }, "background request not sent");
   }
 
   /** Pull back a still-queued message before the agent consumes it. The store
@@ -228,16 +236,14 @@
    *  from the wire, so replay agrees). Respect the closed-socket rule: if it
    *  can't send, the message stays queued and the user can retry. */
   function cancelQueued(id: string) {
-    const sent = socket.send({ type: "cancel_queued", id });
-    if (!sent) store.notice("not connected — couldn't cancel, try again in a moment", "error");
+    sendCommand({ type: "cancel_queued", id }, "couldn't cancel");
   }
 
   /** Promote one Codex follow-up from the next-run FIFO into the active turn.
    *  The pending bubble stays until the driver's turn/steer RPC resolves, so
    *  a disconnect or rejection never lies about delivery. */
   function steerQueued(id: string) {
-    const sent = socket.send({ type: "steer_queued", id });
-    if (!sent) store.notice("not connected — couldn't steer, try again in a moment", "error");
+    sendCommand({ type: "steer_queued", id }, "couldn't steer");
   }
 
   /** Dialog-only slash commands get native UI here instead of the CLI's
@@ -266,7 +272,7 @@
           (m) => m.id.toLowerCase() === arg || m.label.toLowerCase() === arg,
         );
         if (arg.length > 0 && hit !== undefined) {
-          pickModel(hit.id);
+          return pickModel(hit.id);
         } else {
           menu = "model";
         }
@@ -277,7 +283,7 @@
           (m) => m.id.toLowerCase() === arg || m.label.toLowerCase() === arg,
         );
         if (arg.length > 0 && hit !== undefined) {
-          pickMode(hit.id);
+          return pickMode(hit.id);
         } else if (store.modes.length > 0) {
           menu = "mode";
         } else {
@@ -290,21 +296,19 @@
         // Answered by a usage_report event (plan-limit windows — the honest
         // signal on subscription plans; dollars are not shown). Codex reads
         // the same data from account/read.
-        socket.send({ type: "get_usage" });
-        return true;
+        return sendCommand({ type: "get_usage" }, "usage request not sent");
       case "compact":
         // Codex has no slash catalog; thread/compact/start is the native
         // path (the compaction turn's notice confirms completion). Claude's
         // own /compact rides its catalog — fall through to the CLI send.
         if (agentKind !== "codex") return false;
-        if (socket.send({ type: "compact" })) {
-          store.notice("compacting context…", "info");
-        }
+        if (!sendCommand({ type: "compact" }, "compact request not sent")) return false;
+        store.notice("compacting context…", "info");
         return true;
       case "mcp":
         if (agentKind === "claude") {
+          if (!sendCommand({ type: "get_mcp" }, "MCP request not sent")) return false;
           store.mcpServers = null;
-          socket.send({ type: "get_mcp" });
           menu = "mcp";
           return true;
         }
@@ -312,7 +316,7 @@
       case "effort":
         if (!hasEffort) return false;
         if (arg.length > 0 && effortChoices.includes(arg)) {
-          pickEffort(arg);
+          return pickEffort(arg);
         } else {
           menu = "effort";
         }
@@ -320,11 +324,10 @@
       case "ultracode":
         if (!hasUltracode) return false;
         if (arg === "on" || arg === "off") {
-          socket.send({ type: "set_ultracode", enabled: arg === "on" });
+          return setUltracode(arg === "on");
         } else {
-          toggleUltracode();
+          return toggleUltracode();
         }
-        return true;
       case "login":
         // /login is an interactive OAuth / setup-token / SSO flow the `-p`
         // stream-json CLI can't run ("/login isn't available in this
@@ -341,8 +344,12 @@
     }
   }
 
-  function toggleUltracode() {
-    socket.send({ type: "set_ultracode", enabled: !store.ultracode });
+  function setUltracode(enabled: boolean): boolean {
+    return sendCommand({ type: "set_ultracode", enabled }, "ultracode change not sent");
+  }
+
+  function toggleUltracode(): boolean {
+    return setUltracode(!store.ultracode);
   }
 
   /** Prose path candidates validate against the daemon relative to the
@@ -425,7 +432,16 @@
       rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: true, stage: "confirm" };
     } else {
       rewindIntent = { id: checkpoint.id, preceding: checkpoint.preceding, fork: false, stage: "dry" };
-      socket.send({ type: "rewind", user_message_id: checkpoint.id, dry_run: true });
+      if (
+        !sendCommand(
+          { type: "rewind", user_message_id: checkpoint.id, dry_run: true },
+          "rewind check not sent",
+        )
+      ) {
+        // Do not leave the dialog forever in its loading state. The user can
+        // retry the rewind button once the socket is ready.
+        rewindIntent = null;
+      }
     }
   }
 
@@ -445,12 +461,20 @@
         .catch((e: unknown) => {
           rewindIntent = null;
           store.notice(`rewind failed: ${String(e)}`, "error");
-        });
+      });
       return;
     }
-    rewindIntent = { ...rewindIntent, fork, stage: "applying" };
+    const intent = rewindIntent;
+    if (
+      !sendCommand(
+        { type: "rewind", user_message_id: intent.id, dry_run: false },
+        "rewind request not sent",
+      )
+    ) {
+      return;
+    }
+    rewindIntent = { ...intent, fork, stage: "applying" };
     store.rewind = null;
-    socket.send({ type: "rewind", user_message_id: rewindIntent.id, dry_run: false });
   }
 
   // The apply answer arrived: finish (and fork the conversation if asked).
@@ -472,14 +496,16 @@
     }
   });
 
-  function pickModel(id: string) {
+  function pickModel(id: string): boolean {
+    if (!sendCommand({ type: "set_model", model_id: id }, "model change not sent")) return false;
     menu = null;
-    socket.send({ type: "set_model", model_id: id });
+    return true;
   }
 
-  function pickMode(id: string) {
+  function pickMode(id: string): boolean {
+    if (!sendCommand({ type: "set_mode", mode_id: id }, "mode change not sent")) return false;
     menu = null;
-    socket.send({ type: "set_mode", mode_id: id });
+    return true;
   }
 
   /** Shift+Tab from the composer advances to the next permission mode, wrapping
@@ -489,13 +515,14 @@
     if (store.modes.length === 0) return;
     const cur = store.modes.findIndex((m) => m.id === store.currentMode);
     const next = store.modes[(cur + 1) % store.modes.length];
-    if (next.id !== store.currentMode) socket.send({ type: "set_mode", mode_id: next.id });
+    if (next.id !== store.currentMode) pickMode(next.id);
   }
 
-  function pickEffort(id: string) {
-    menu = null;
+  function pickEffort(id: string): boolean {
+    if (!sendCommand({ type: "set_effort", effort_id: id }, "effort change not sent")) return false;
     effort = id;
-    socket.send({ type: "set_effort", effort_id: id });
+    menu = null;
+    return true;
   }
 
   const EFFORT_HINT: Record<string, string> = {
@@ -517,7 +544,11 @@
   function toggleThinking() {
     const next = !thinkingOn;
     store.setThinking(next);
-    socket.send({ type: "set_thinking", enabled: next });
+    if (!sendCommand({ type: "set_thinking", enabled: next }, "thinking change not sent")) {
+      // Keep the user's preference, but mark it unsynchronized so the existing
+      // connected-effect retries it on the next ready frame.
+      store.markThinkingPending();
+    }
   }
   // Push the effective preference to the live driver, once per driver process.
   // It pushes whatever the user's effective choice IS (never forces a value),

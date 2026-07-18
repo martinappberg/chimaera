@@ -13,7 +13,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::{Attachment, SessionEvent, SessionManager, SpawnOpts};
+use crate::{Attachment, SessionEvent, SessionManager, SpawnOpts, MAX_TERMINAL_COLS};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -386,6 +386,29 @@ fn spawn_rejects_zero_dims() {
     let mut zero_rows = opts(bash());
     zero_rows.rows = 0;
     assert!(mgr.spawn(zero_rows).is_err(), "0 rows must be rejected");
+}
+
+/// The PTY boundary, not just the UI, rejects allocation-hostile viewports.
+/// Raw WebSocket clients can send arbitrary u16 dimensions, so accepting the
+/// type's maximum here would attempt to allocate a multi-billion-cell grid.
+#[test]
+fn spawn_and_resize_reject_oversized_dims() {
+    let mgr = SessionManager::new();
+    let mut oversized = opts(bash());
+    oversized.cols = MAX_TERMINAL_COLS + 1;
+    assert!(
+        mgr.spawn(oversized).is_err(),
+        "oversized spawn must be rejected before openpty/Term allocation"
+    );
+
+    let info = mgr.spawn(opts(bash())).expect("normal spawn");
+    assert!(
+        mgr.resize(&info.id, MAX_TERMINAL_COLS + 1, info.rows)
+            .is_err(),
+        "oversized resize must leave the live grid untouched"
+    );
+    assert_eq!(mgr.get(&info.id).expect("session present").cols, info.cols);
+    mgr.kill(&info.id).expect("kill failed");
 }
 
 /// (d) resize() changes the child's winsize (visible via `stty size`) and

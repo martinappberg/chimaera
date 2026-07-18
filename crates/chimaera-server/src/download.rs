@@ -4,9 +4,13 @@
 //! /api/v1/fs/ticket, authorizes each fetch (the route is mounted outside the
 //! auth layer). Files stream as-is with an attachment disposition;
 //! directories stream as a zip built on the fly — memory is bounded by the
-//! duplex pipe plus the deflate window, and nothing is spooled to disk.
+//! duplex pipe, deflate window, and entry-capped traversal stack; nothing is
+//! spooled to disk.
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, Metadata};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,10 +33,110 @@ use crate::AppState;
 /// stream is aborted (an honest failed download), never silently truncated
 /// into an archive that looks complete.
 const MAX_ZIP_ENTRIES: usize = 250_000;
+/// Raw filesystem-name bytes retained while one directory is classified.
+/// Combined with the entry cap (which bounds `OsString` allocation overhead),
+/// this prevents one very wide directory from consuming the daemon's RSS.
+const MAX_ZIP_DIRECTORY_NAME_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes owned by relative paths waiting on the descriptor-relative DFS stack.
+/// Full prefixes are charged, so a deep, wide tree cannot amplify a small set
+/// of component names into hundreds of megabytes of queued `PathBuf`s.
+const MAX_ZIP_QUEUED_PATH_BYTES: usize = 8 * 1024 * 1024;
+
+struct ZipEntryBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl ZipEntryBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn ensure_available(&self) -> anyhow::Result<()> {
+        if self.used >= self.limit {
+            anyhow::bail!("more than {} entries — refusing to zip", self.limit);
+        }
+        Ok(())
+    }
+
+    fn reserve(&mut self) -> anyhow::Result<()> {
+        self.ensure_available()?;
+        self.used += 1;
+        Ok(())
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit - self.used
+    }
+}
+
+struct ZipPathBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl ZipPathBudget {
+    fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn reserve(&mut self, path: &FsPath) -> anyhow::Result<()> {
+        let bytes = path.as_os_str().as_bytes().len();
+        let Some(next) = self.used.checked_add(bytes) else {
+            anyhow::bail!("zip traversal path budget overflow");
+        };
+        if next > self.limit {
+            anyhow::bail!(
+                "zip traversal needs more than {} bytes of queued paths",
+                self.limit
+            );
+        }
+        self.used = next;
+        Ok(())
+    }
+
+    fn release(&mut self, path: &FsPath) {
+        self.used -= path.as_os_str().as_bytes().len();
+    }
+}
+
+fn charge_directory_name_bytes(
+    retained: &mut usize,
+    additional: usize,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let Some(next) = retained.checked_add(additional) else {
+        anyhow::bail!("zip directory-name budget overflow");
+    };
+    if next > limit {
+        anyhow::bail!("zip directory names exceed {limit} retained bytes");
+    }
+    *retained = next;
+    Ok(())
+}
+
+/// Reserve an archive entry before retaining its path. Charging directories
+/// at discovery keeps a very wide tree from filling the traversal stack
+/// before the archive-entry ceiling is reached.
+fn queue_zip_directory(
+    stack: &mut Vec<PathBuf>,
+    budget: &mut ZipEntryBudget,
+    paths: &mut ZipPathBudget,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    budget.ensure_available()?;
+    paths.reserve(&path)?;
+    // `ensure_available` above makes this infallible; keep `reserve` as the
+    // single place that advances the entry counter.
+    budget.reserve()?;
+    stack.push(path);
+    Ok(())
+}
 
 /// Capacity of the duplex pipe between the zip task and the response body.
-/// This (plus the deflate window) is the per-download RSS cost; backpressure
-/// from a slow client suspends the walk rather than buffering.
+/// This bounds buffered archive bytes; traversal paths have the separate
+/// entry and byte ceilings above. Backpressure from a slow client suspends the
+/// walk rather than buffering file contents.
 const PIPE_CAPACITY: usize = 64 * 1024;
 
 /// GET /download/{ticket} — the ticketed path as a browser download. A file
@@ -50,7 +154,7 @@ pub(crate) async fn download(
     let Some(path) = crate::lock(&state.tickets).lookup(&ticket) else {
         return not_found();
     };
-    let Ok(meta) = tokio::fs::metadata(&path).await else {
+    let Ok(target) = open_ticket_target(path.clone()).await else {
         tracing::warn!(path = %path.display(), "ticketed download path unstattable");
         return not_found();
     };
@@ -59,16 +163,17 @@ pub(crate) async fn download(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".to_string());
 
-    if meta.is_dir() {
+    if let OpenedTicketTarget::Directory(root_fd) = &target {
         let (writer, reader) = tokio::io::duplex(PIPE_CAPACITY);
         let root = path.clone();
+        let root_fd = Arc::clone(root_fd);
         let utc_offset = local_utc_offset().await;
         tokio::spawn(async move {
             // A failure mid-walk drops the writer: the client sees a
             // truncated/failed download, never an incomplete archive
             // presented as success. A client disconnect closes the read
             // half, the next write errors, and the task exits.
-            if let Err(err) = zip_dir(root.clone(), writer, utc_offset).await {
+            if let Err(err) = zip_dir(root.clone(), root_fd, writer, utc_offset).await {
                 tracing::warn!(path = %root.display(), %err, "folder download aborted");
             }
         });
@@ -89,13 +194,10 @@ pub(crate) async fn download(
             .into_response();
     }
 
-    let file = match tokio::fs::File::open(&path).await {
-        Ok(file) => file,
-        Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "ticketed download unreadable");
-            return not_found();
-        }
+    let OpenedTicketTarget::File(file, meta) = target else {
+        unreachable!("directory target returned above");
     };
+    let file = tokio::fs::File::from_std(file);
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
     (
         StatusCode::OK,
@@ -119,83 +221,262 @@ pub(crate) async fn download(
 /// Every directory gets an explicit `name/` entry so empty ones survive
 /// extraction; entry names are rooted at the folder's own name, so unzipping
 /// yields a single top-level folder.
-async fn zip_dir(root: PathBuf, pipe: DuplexStream, utc_offset: i64) -> anyhow::Result<()> {
+async fn zip_dir(
+    root: PathBuf,
+    root_fd: Arc<File>,
+    pipe: DuplexStream,
+    utc_offset: i64,
+) -> anyhow::Result<()> {
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let root_name = root
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(safe_zip_component)
         .unwrap_or_else(|| "folder".to_string());
     let mut zip = async_zip::base::write::ZipFileWriter::with_tokio(pipe);
-    let mut stack = vec![root.clone()];
-    let mut entries = 0usize;
+    let mut stack = Vec::new();
+    let mut budget = ZipEntryBudget::new(MAX_ZIP_ENTRIES);
+    let mut path_budget = ZipPathBudget::new(MAX_ZIP_QUEUED_PATH_BYTES);
+    queue_zip_directory(&mut stack, &mut budget, &mut path_budget, PathBuf::new())?;
 
-    while let Some(dir) = stack.pop() {
-        let rel = dir
-            .strip_prefix(&root)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let dir_entry = if rel.is_empty() {
-            format!("{root_name}/")
-        } else {
-            format!("{root_name}/{rel}/")
+    while let Some(rel) = stack.pop() {
+        path_budget.release(&rel);
+        let Some((dir_meta, names)) =
+            list_zip_directory(Arc::clone(&root_fd), rel.clone(), budget.remaining()).await?
+        else {
+            continue; // renamed/unreadable after discovery
         };
-        let dir_meta = tokio::fs::metadata(&dir).await.ok();
+        let dir_entry = zip_entry_name(&root_name, &rel, true);
         zip.write_entry_whole(
             stamp(
                 ZipEntryBuilder::new(dir_entry.into(), Compression::Stored),
-                dir_meta.as_ref(),
+                Some(&dir_meta),
                 utc_offset,
                 0o040_755, // drwxr-xr-x
             ),
             &[],
         )
         .await?;
-        entries += 1;
 
-        let Ok(mut listing) = tokio::fs::read_dir(&dir).await else {
-            continue; // unreadable dir: skipped, matching fs/list
-        };
-        while let Ok(Some(entry)) = listing.next_entry().await {
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
+        for entry_name in names {
+            // Preserve the old fail-fast behavior: once full, do not keep
+            // opening entries merely to discover whether they are readable.
+            budget.ensure_available()?;
+            let entry_rel = rel.join(entry_name);
+            match open_zip_entry(Arc::clone(&root_fd), entry_rel.clone()).await? {
+                Some(OpenedZipEntry::Directory) => {
+                    queue_zip_directory(&mut stack, &mut budget, &mut path_budget, entry_rel)?;
+                }
+                Some(OpenedZipEntry::File(file, meta)) => {
+                    budget.reserve()?;
+                    let name = zip_entry_name(&root_name, &entry_rel, false);
+                    let builder = stamp(
+                        ZipEntryBuilder::new(name.into(), Compression::Deflate),
+                        Some(&meta),
+                        utc_offset,
+                        0o100_644, // -rw-r--r--
+                    );
+                    let file = tokio::fs::File::from_std(file);
+                    let mut entry_writer = zip.write_entry_stream(builder).await?;
+                    futures::io::copy(&mut file.compat(), &mut entry_writer).await?;
+                    entry_writer.close().await?;
+                }
+                None => {} // symlink, special file, vanished, or unreadable
             }
-            if entries >= MAX_ZIP_ENTRIES {
-                anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
-            }
-            if file_type.is_dir() {
-                stack.push(entry.path());
-                continue;
-            }
-            let Ok(file) = tokio::fs::File::open(entry.path()).await else {
-                continue; // vanished or unreadable: skipped
-            };
-            let name = format!(
-                "{root_name}/{}",
-                entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(&entry.path())
-                    .to_string_lossy()
-            );
-            let meta = file.metadata().await.ok();
-            let builder = stamp(
-                ZipEntryBuilder::new(name.into(), Compression::Deflate),
-                meta.as_ref(),
-                utc_offset,
-                0o100_644, // -rw-r--r--
-            );
-            let mut entry_writer = zip.write_entry_stream(builder).await?;
-            futures::io::copy(&mut file.compat(), &mut entry_writer).await?;
-            entry_writer.close().await?;
-            entries += 1;
         }
     }
     zip.close().await?;
     Ok(())
+}
+
+enum OpenedZipEntry {
+    Directory,
+    File(File, Metadata),
+}
+
+enum OpenedTicketTarget {
+    Directory(Arc<File>),
+    File(File, Metadata),
+}
+
+/// Open and classify the ticket path once. Metadata and bytes now come from
+/// the same no-follow descriptor: a file swapped to a symlink cannot redirect
+/// a plain download, and a folder walk inherits this already-anchored root.
+async fn open_ticket_target(path: PathBuf) -> anyhow::Result<OpenedTicketTarget> {
+    tokio::task::spawn_blocking(move || {
+        let fd = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )?;
+        let file = File::from(fd);
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            Ok(OpenedTicketTarget::Directory(Arc::new(file)))
+        } else if metadata.is_file() {
+            Ok(OpenedTicketTarget::File(file, metadata))
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ticket path is not a regular file or directory",
+            ))
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("download open task failed: {e}"))?
+    .map_err(Into::into)
+}
+
+/// List a directory opened beneath `root`. The raw-name cap is conservative:
+/// symlinks and special files count while enumerating so an attacker cannot
+/// use millions of skipped entries to defeat the archive's memory ceiling.
+async fn list_zip_directory(
+    root: Arc<File>,
+    relative: PathBuf,
+    remaining: usize,
+) -> anyhow::Result<Option<(Metadata, Vec<OsString>)>> {
+    tokio::task::spawn_blocking(move || {
+        let directory = match open_beneath(
+            &root,
+            &relative,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+        ) {
+            Ok(directory) => directory,
+            Err(_) => return Ok(None),
+        };
+        let metadata = directory.metadata()?;
+        let mut names = Vec::new();
+        let mut retained_name_bytes = 0;
+        let mut listing = match rustix::fs::Dir::read_from(&directory) {
+            Ok(listing) => listing,
+            Err(_) => return Ok(None),
+        };
+        while let Some(entry) = listing.read() {
+            let Ok(entry) = entry else {
+                break; // unreadable remainder: preserve the usable prefix
+            };
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            if names.len() >= remaining {
+                anyhow::bail!("more than {MAX_ZIP_ENTRIES} entries — refusing to zip");
+            }
+            charge_directory_name_bytes(
+                &mut retained_name_bytes,
+                bytes.len(),
+                MAX_ZIP_DIRECTORY_NAME_BYTES,
+            )?;
+            names.push(OsStr::from_bytes(bytes).to_os_string());
+        }
+        Ok(Some((metadata, names)))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("zip directory task failed: {e}"))?
+}
+
+/// Safely classify and open one discovered name. O_NONBLOCK prevents a FIFO
+/// or device planted during the walk from stalling a blocking worker; only
+/// regular files and directories are retained.
+async fn open_zip_entry(
+    root: Arc<File>,
+    relative: PathBuf,
+) -> anyhow::Result<Option<OpenedZipEntry>> {
+    tokio::task::spawn_blocking(move || {
+        let file = match open_beneath(
+            &root,
+            &relative,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
+        ) {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let metadata = file.metadata()?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            Ok(Some(OpenedZipEntry::Directory))
+        } else if file_type.is_file() {
+            Ok(Some(OpenedZipEntry::File(file, metadata)))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("zip entry task failed: {e}"))?
+}
+
+/// Open `relative` by walking from an already-open root descriptor. Every
+/// intermediate and final component is `O_NOFOLLOW`; no path lookup is ever
+/// restarted from the process cwd after the root is anchored.
+fn open_beneath(
+    root: &File,
+    relative: &FsPath,
+    final_flags: rustix::fs::OFlags,
+) -> std::io::Result<File> {
+    if relative.as_os_str().is_empty() {
+        return root.try_clone();
+    }
+    let mut directory = root.try_clone()?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "zip path contains a non-normal component",
+            ));
+        };
+        let flags = if components.peek().is_none() {
+            final_flags
+        } else {
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+        };
+        directory = File::from(
+            rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                .map_err(std::io::Error::from)?,
+        );
+    }
+    Ok(directory)
+}
+
+/// One filesystem name as a safe cross-platform ZIP path component. ZIP uses
+/// `/` separators, but Windows extractors commonly also treat `\` as one;
+/// replacing it (plus drive-colon/control characters) prevents a repository
+/// filename such as `..\startup` or `C:` from becoming an extraction path.
+fn safe_zip_component(name: &std::ffi::OsStr) -> String {
+    name.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
+fn zip_entry_name(root_name: &str, relative: &std::path::Path, directory: bool) -> String {
+    let mut name = root_name.to_string();
+    for component in relative.components() {
+        if let std::path::Component::Normal(part) = component {
+            name.push('/');
+            name.push_str(&safe_zip_component(part));
+        }
+    }
+    if directory {
+        name.push('/');
+    }
+    name
 }
 
 /// The daemon host's current UTC offset in seconds, via `date +%z` (POSIX;
@@ -387,6 +668,105 @@ mod tests {
             value.contains("filename*=UTF-8''%C3%A5%20plot.png"),
             "{value}"
         );
+    }
+
+    #[test]
+    fn zip_entry_names_cannot_encode_windows_traversal_or_drive_paths() {
+        assert_eq!(
+            zip_entry_name(
+                &safe_zip_component(std::ffi::OsStr::new("C:")),
+                std::path::Path::new(r"..\startup.cmd"),
+                false,
+            ),
+            "C_/.._startup.cmd"
+        );
+        assert_eq!(
+            zip_entry_name("folder", std::path::Path::new("sub/file.txt"), false),
+            "folder/sub/file.txt"
+        );
+    }
+
+    #[test]
+    fn directory_budget_is_charged_before_the_path_is_queued() {
+        let mut stack = Vec::new();
+        let mut budget = ZipEntryBudget::new(2);
+        let mut paths = ZipPathBudget::new(usize::MAX);
+
+        queue_zip_directory(&mut stack, &mut budget, &mut paths, PathBuf::from("root")).unwrap();
+        queue_zip_directory(&mut stack, &mut budget, &mut paths, PathBuf::from("child")).unwrap();
+        let err = queue_zip_directory(
+            &mut stack,
+            &mut budget,
+            &mut paths,
+            PathBuf::from("too-wide"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            stack.len(),
+            2,
+            "a rejected directory must not grow the stack"
+        );
+        assert!(err.to_string().contains("more than 2 entries"), "{err}");
+    }
+
+    #[test]
+    fn traversal_retained_bytes_are_bounded_before_allocation_is_queued() {
+        let mut stack = Vec::new();
+        let mut entries = ZipEntryBudget::new(10);
+        let mut paths = ZipPathBudget::new(8);
+
+        queue_zip_directory(&mut stack, &mut entries, &mut paths, PathBuf::from("1234")).unwrap();
+        let err = queue_zip_directory(&mut stack, &mut entries, &mut paths, PathBuf::from("56789"))
+            .unwrap_err();
+        assert_eq!(stack, [PathBuf::from("1234")]);
+        assert!(err.to_string().contains("8 bytes of queued paths"), "{err}");
+
+        let mut retained_names = 4;
+        let err = charge_directory_name_bytes(&mut retained_names, 5, 8).unwrap_err();
+        assert_eq!(retained_names, 4, "a rejected name must not consume budget");
+        assert!(err.to_string().contains("8 retained bytes"), "{err}");
+    }
+
+    #[test]
+    fn descriptor_walk_cannot_escape_after_root_path_is_swapped() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "chimaera-zip-descriptor-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        let anchored = base.join("anchored");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("safe.txt"), "safe").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        let root_fd = File::from(
+            rustix::fs::open(
+                &root,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap(),
+        );
+        std::fs::rename(&root, &anchored).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        let flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        assert!(open_beneath(&root_fd, FsPath::new("safe.txt"), flags).is_ok());
+        assert!(open_beneath(&root_fd, FsPath::new("secret.txt"), flags).is_err());
+
+        std::fs::remove_file(&root).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

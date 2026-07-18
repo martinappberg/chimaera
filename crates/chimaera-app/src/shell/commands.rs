@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::connect::{do_connect, state_for, HostState, HostStatus};
 use super::restore::{open_compute_window, open_ui_window};
-use super::{lock, ComputeEndpoint, Shell, WindowScope};
+use super::{authorize_scope_origin, lock, ComputeEndpoint, Shell, WindowScope};
 use crate::windows::{ComputeScope, WindowRecord};
 
 /// The local daemon's build parity, as the home screen sees it.
@@ -227,6 +227,8 @@ pub(super) async fn update_local_daemon(
         port: fresh.port,
         token: fresh.token.clone(),
     };
+    authorize_scope_origin(&app, None, fresh.port)
+        .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
     *lock(&state.local) = fresh;
     let _ = app.emit("local-daemon-updated", moved);
     Ok(())
@@ -542,12 +544,14 @@ pub(super) async fn connect_compute_session(
             // double-building. Probe like the health monitor does: ssh's
             // local listener can outlive its dead connection, so absence
             // alone is not the test.
-            let login_port = {
+            let login_endpoint = {
                 let tunnels = state.tunnels.lock().await;
-                tunnels.get(&alias).map(|t| t.local_port)
+                tunnels
+                    .get(&alias)
+                    .map(|t| (t.local_port, t.manifest.token.clone()))
             };
-            let login_up = match login_port {
-                Some(port) => chimaera_remote::http_alive(port).await,
+            let login_up = match login_endpoint {
+                Some((port, token)) => chimaera_remote::http_alive_authed(port, &token).await,
                 None => false,
             };
             if !login_up {
@@ -608,6 +612,8 @@ pub(super) async fn connect_compute_session(
             .ok_or_else(|| format!("{key} disconnected while connecting"))?;
         (t.url(), t.node.clone(), t.local_port)
     };
+    authorize_scope_origin(&app, Some(&key), local_port)
+        .map_err(|e| format!("could not authorize {key}'s daemon origin: {e}"))?;
     // A window already on this job → raise it; the status ping below tells
     // it the (possibly rebuilt) tunnel's port, and it re-homes itself if
     // that moved. Otherwise open a fresh window on the tunnel URL. Matched on

@@ -42,9 +42,9 @@ gap-replay idea as the PTY transport, realized for structured streams.
 
 | File | What it owns | Start here when… |
 |---|---|---|
-| `lib.rs` | `ChatManager`: the session registry + the pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`. | adding session lifecycle, changing fan-out, touching `ChatInfo`. |
+| `lib.rs` | `ChatManager`: the session registry + pump task (`absorb`) + `spawn`/`attach`/`command`/`kill`/`remove`; owns the 32 MiB / 64-message retained-Send budget across its channel and both drivers' pending FIFOs. | adding session lifecycle, changing fan-out, touching `ChatInfo`, or command admission. |
 | `driver.rs` | The `AgentAdapter`/`Mapper` traits, `SpawnSpec` (incl. protocol-side `initial_model`, `agent_version`, `rollback_turns`), `DriverIo`, `DriverExit`, handshake/kill timeouts; the harness `run_driver` (journals the probed version on `Init` + a non-fatal drift Notice vs `tested_version()`, surfaces startup-failure as a visible event, and drives the `tick`/`drain_pending` mapper hooks). | adding a new agent, changing spawn inputs, exit classification, or the version/startup/teardown harness. |
-| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), `Usage`, the delta `Coalescer`, and the size caps (`cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
+| `model.rs` | The normalized `AgentEvent` / `AgentCommand` types (ACP-shaped), authoritative command-ingress validation, `Usage`, the delta `Coalescer`, and the size caps (`COMMAND_*`, `cap_output`, `cap_head_tail`, `DIFF_*_BUDGET`, `BG_*`). | adding an event/command kind, or a cap. |
 | `claude.rs` | The Claude Code driver: bidirectional `stream-json` + the `control_response` protocol. Pinned to `TESTED_CLAUDE_VERSION`. | claude protocol work. |
 | `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn/steer lifecycle, questions, approvals + auto-review, model/mode settings. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
 | `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index + dir pruning. The gap-replay crown jewel. | anything touching durability, replay, or seq numbering. |
@@ -58,8 +58,12 @@ gap-replay idea as the PTY transport, realized for structured streams.
 1. **Bounded allocations, always.** The daemon runs on shared HPC login nodes
    (target ~150 MB RSS). Every channel is bounded; the journal ring and file are
    capped; per-line reads are capped in `ndjson.rs`; oversized events are
-   *replaced*, not stored. Caps live **at event construction** (`model.rs`) so a
-   giant tool input never reaches the journal, the ring, or a client.
+   *replaced*, not stored. Event caps live **at event construction** (`model.rs`)
+   so a giant tool input never reaches the journal, the ring, or a client;
+   every `AgentCommand` is validated before enqueue so WS and programmatic
+   callers share the same allocation budgets. `ChatManager` then reserves every
+   Send until its `UserMessage`/`UserMessageUpdate` says the driver consumed or
+   dropped it, bounding repeated individually-valid commands too.
 2. **Never block the async pump.** `Journal::append` is `async` and yields under
    backpressure; the writer thread does the blocking fs. Never hold the `info`
    mutex across an `.await`, and never do blocking fs on the pump's worker

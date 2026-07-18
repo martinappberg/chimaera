@@ -26,7 +26,11 @@ check 'crates/chimaera-server/src/'   'crates/chimaera-server/AGENTS.md' 'chimae
 check 'crates/chimaera-agent/src/'    'crates/chimaera-agent/AGENTS.md'  'chimaera-agent'
 check 'crates/chimaera-pty/src/'      'crates/chimaera-pty/AGENTS.md'    'chimaera-pty'
 check 'crates/chimaera-app/src/'      'crates/chimaera-app/AGENTS.md'    'chimaera-app'
+check 'crates/chimaera-core/src/'     'crates/chimaera-core/AGENTS.md'   'chimaera-core'
+check 'crates/chimaera/src/'          'crates/chimaera/AGENTS.md'        'chimaera CLI'
 check 'web-ui/src/lib/chat/'          'web-ui/src/lib/chat/AGENTS.md'     'chat UI'
+check 'web-ui/src/lib/dashboard/'     'web-ui/src/lib/dashboard/AGENTS.md' 'dashboard UI'
+check 'web-ui/src/lib/settings/'      'web-ui/src/lib/settings/AGENTS.md'  'settings UI'
 
 # Feature pages — docs/features/<page> describes what a capability DOES. Prefixes are
 # a feature's entry points; a change there usually wants its page updated too. Warn-only.

@@ -51,6 +51,17 @@ break, reset, or renumber it anywhere.
    non-negotiable for driver/protocol edits — hermetic tests cannot see it.
    Record any new wire fact in `PROTOCOL.md` the moment you learn it.
 
+### Codex schema preflight (free, before the live gate)
+
+Current Codex app-server builds can emit a version-matched TypeScript or JSON
+schema (`codex app-server generate-ts --out DIR` / `generate-json-schema --out
+DIR`). Before editing `codex.rs`, generate into a temporary directory and diff
+the request/notification types you are touching against the mapper and
+`PROTOCOL.md`. This is a fast, non-billable drift check and the authoritative
+shape inventory for that installed binary; it **does not replace**
+`just chat-smoke`, because ordering, conditional emission, and lifecycle
+behavior are not proven by a schema.
+
 ## Rules that bite (all enforced in review)
 
 - **Bounded everything** — the daemon lives on shared HPC login nodes (~150 MB
@@ -69,6 +80,6 @@ break, reset, or renumber it anywhere.
 ## When you're done
 
 - `just check` green (fmt + clippy + workspace tests); if `web-ui/**` changed,
-  `npm --prefix web-ui run check` too (Node 22).
+  run its `check`, `test`, and `build` scripts too (Node 22).
 - Say in the PR what you ran and observed (hermetic + live; chat-smoke if a
   driver changed), per the repo's verify-live rule.

@@ -11,6 +11,7 @@
   import { fsQuickOpen, type QuickOpenEntry } from "../previews/files";
   import { dotState, dotTitle, type Session } from "./sessions";
   import { getSetting } from "../settings/store.svelte";
+  import { modalFocus } from "../shared/modalFocus";
   import FileIcon from "../shared/FileIcon.svelte";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
 
@@ -151,7 +152,14 @@
 
 <div class="overlay">
   <button class="scrim" aria-label="close" tabindex="-1" onclick={onClose}></button>
-  <div class="panel" role="dialog" aria-modal="true" aria-label="quick open">
+  <div
+    class="panel"
+    role="dialog"
+    aria-modal="true"
+    aria-label="quick open"
+    tabindex="-1"
+    use:modalFocus
+  >
     <input
       class="filter"
       bind:value={input}

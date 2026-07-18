@@ -5,17 +5,19 @@ description: Open a pull request for Chimaera correctly — the CI gates that mu
 
 # Shipping a PR on Chimaera
 
-Merges to `main` are automated: **every merge cuts a published release** unless
-you opt out. So the PR *title* and *commit prefix* are load-bearing. See
-[AGENTS.md](../../../AGENTS.md) → "Releases & how to skip one" for the full rules.
+Merges to `main` use an automated release decision: shipping prefixes publish a
+release, while docs/chore/refactor-only prefixes do not. The PR *title* and
+commit prefix are therefore load-bearing. See [AGENTS.md](../../../AGENTS.md) →
+"Releases" for the full rules.
 
 ## Before opening
 
 1. **Rebase on latest main.** The remote is `upstream`:
    `git fetch upstream && git rebase upstream/main`.
 2. **Gate is green:** `just check` (fmt + clippy + test). If you touched
-   `web-ui/**` or `crates/chimaera-app/**`, `app.yml` will also build the Tauri
-   bundle on the PR — make sure the UI builds (`npm --prefix web-ui run check`).
+   `web-ui/**`, run its `check`, `test`, and `build` scripts. If you touched
+   `crates/chimaera-app/**`, run `just app-check`; `app.yml` also builds the
+   Tauri bundle on the PR.
 3. **Verified live**, not just tested (see the **verify-app** skill). The PR body
    should say what you ran and observed.
 4. **Shipping a `feat:`? It carries its docs.** A new user-facing capability must update
@@ -76,5 +78,6 @@ Claude Code uses its corresponding Claude Code trailer instead.
 
 Watch that the intended workflow ran: for a normal PR, `release.yml` should
 publish a release with the bumped version; for a `[skip release]` PR, the
-`version` job should be **skipped** and no release cut. If it cut one you didn't
-intend, the marker didn't make it into the squash message.
+`version` job should report `release=false`, all build/publish jobs should be
+skipped, and no release should be cut. If it cut one you didn't intend, the
+marker didn't make it into the squash message.

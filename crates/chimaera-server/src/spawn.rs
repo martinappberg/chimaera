@@ -87,8 +87,12 @@ pub(crate) async fn spawn_session(
     let mut opts = chimaera_pty::SpawnOpts {
         cwd,
         name: spec.name,
-        cols: spec.cols.map_or(80, |c| c.clamp(20, 500)),
-        rows: spec.rows.map_or(24, |r| r.clamp(5, 200)),
+        cols: spec
+            .cols
+            .map_or(80, |c| c.clamp(20, chimaera_pty::MAX_TERMINAL_COLS)),
+        rows: spec
+            .rows
+            .map_or(24, |r| r.clamp(5, chimaera_pty::MAX_TERMINAL_ROWS)),
         command: None,
         id: Some(id.clone()),
         env,

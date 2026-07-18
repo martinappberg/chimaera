@@ -3,6 +3,7 @@
   import { ApiError, getHostLabel } from "../net/api";
   import { openWindow } from "../net/native";
   import { validateEntryName } from "../shared/fsNames";
+  import { modalFocus } from "../shared/modalFocus";
   import {
     createWorkspace,
     fsDirs,
@@ -450,7 +451,14 @@
 
 <div class="overlay">
   <button class="scrim" aria-label="close" tabindex="-1" onclick={onClose}></button>
-  <div class="panel" role="dialog" aria-modal="true" aria-label="open folder">
+  <div
+    class="panel"
+    role="dialog"
+    aria-modal="true"
+    aria-label="open folder"
+    tabindex="-1"
+    use:modalFocus
+  >
     <input
       class="filter"
       bind:this={filterEl}

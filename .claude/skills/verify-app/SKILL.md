@@ -15,6 +15,8 @@ the real thing. Your PR should say what you ran and what you observed.
 ```sh
 just check         # cargo fmt --check + clippy -D warnings + cargo test --workspace
 npm --prefix web-ui run check      # svelte-check, if you touched the UI
+npm --prefix web-ui run test       # targeted reducer/unit coverage
+npm --prefix web-ui run build      # production bundle and generated assets
 ```
 
 `crates/chimaera-pty` has real PTY tests (`tests.rs`, `snapshot.rs`) — extend
