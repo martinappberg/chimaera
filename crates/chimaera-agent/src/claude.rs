@@ -2884,10 +2884,6 @@ fn claude_modes() -> Vec<ModeInfo> {
             id: "dontAsk".into(),
             label: "Don't ask".into(),
         },
-        ModeInfo {
-            id: "bypassPermissions".into(),
-            label: "Bypass permissions".into(),
-        },
     ]
 }
 
@@ -3055,6 +3051,15 @@ mod tests {
             None,
             &json!({ "commands": [{ "name": "compact", "description": "Compact history" }] }),
         )
+    }
+
+    #[test]
+    fn advertised_modes_exclude_launch_gated_bypass() {
+        let modes = claude_modes();
+        assert!(
+            modes.iter().all(|mode| mode.id != "bypassPermissions"),
+            "chat sessions omit --dangerously-skip-permissions, so the CLI rejects this mode"
+        );
     }
 
     #[test]
