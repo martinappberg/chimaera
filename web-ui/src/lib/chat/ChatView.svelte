@@ -5,7 +5,7 @@
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer } from "./composerBus";
-  import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool.svelte";
+  import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import { formatElapsedSeconds } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";

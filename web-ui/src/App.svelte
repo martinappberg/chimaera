@@ -12,6 +12,7 @@
     type Health,
   } from "./lib/net/api";
   import {
+    backgrounded,
     createSession,
     deleteSession,
     deleteWorkspace,
@@ -189,7 +190,7 @@
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
-  import * as chatPool from "./lib/chat/chatPool.svelte";
+  import * as chatPool from "./lib/chat/chatPool";
   import {
     applyRemoteSettings,
     flushSettings,
@@ -527,17 +528,6 @@
   const chordDigits = $derived(
     new Map(railSessions.slice(0, 9).map((s, i) => [s.id, i + 1] as const)),
   );
-  /**
-   * The agent's turn is idle but it still has background work running — the
-   * glyph-only surfaces (rail rows, focus-strip chips) breathe muted for it,
-   * exactly as the dashboard card pulses its dot. Same condition and same
-   * warm-store source as the card, so the two surfaces never disagree; a
-   * session whose store isn't pooled simply doesn't cue (the wire row carries
-   * no background tasks, and guessing would be worse than staying quiet).
-   */
-  function isBackgrounded(s: Session): boolean {
-    return s.alive && s.agent_state !== "running" && chatPool.hasBackgroundWork(s.id);
-  }
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
@@ -3174,7 +3164,7 @@
                 size={11}
                 title={dotTitle(s)}
                 pulse
-                backgrounded={isBackgrounded(s)}
+                backgrounded={backgrounded(s)}
               />
               {#if renamingId === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
@@ -3772,7 +3762,7 @@
               size={10}
               title={dotTitle(s)}
               pulse
-              backgrounded={isBackgrounded(s)}
+              backgrounded={backgrounded(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
             {#if hintsActive() && chordDigits.has(s.id)}

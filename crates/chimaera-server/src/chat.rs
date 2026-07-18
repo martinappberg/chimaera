@@ -652,10 +652,17 @@ pub(crate) fn chat_session_json(
         // The v0.2 status-feed fields are hooks/PTY-tier signals: `stalled`
         // needs a PTY to be silent, and the chat client derives richer
         // subagents/now-line/usage from its own journal — always null here.
+        //
+        // `background_running` below is the deliberate EXCEPTION to that rule.
+        // "derive it from the journal" only holds for a client attached to
+        // THIS session's socket; the rail renders every session and is
+        // attached to none of them, so warm-store-only truth left an agent
+        // working off-screen looking idle. The count rides the row instead.
         "stalled": null,
         "subagents": null,
         "now_line": null,
         "usage": null,
+        "background_running": info.background_running,
         "display_name": display_name,
         "ui": "chat",
         "chat_capable": true,

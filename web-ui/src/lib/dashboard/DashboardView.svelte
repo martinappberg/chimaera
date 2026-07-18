@@ -18,7 +18,7 @@
   import AgentCard from "./AgentCard.svelte";
   import AttentionCard from "./AttentionCard.svelte";
   import MastermindDock from "./MastermindDock.svelte";
-  import { acquireChat, releaseChat } from "../chat/chatPool.svelte";
+  import { acquireChat, releaseChat } from "../chat/chatPool";
   import type { ChatStore } from "../chat/store.svelte";
   import type { ChatSocket } from "../chat/chatWs";
   import { gitStatus } from "../workspace/git";

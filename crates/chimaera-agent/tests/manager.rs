@@ -360,6 +360,24 @@ async fn background_tasks_outlive_their_turn_and_accumulate() {
         })
         .expect("a background set");
     assert_eq!(last.len(), 2, "turn two ADDED to the set: {last:#?}");
+
+    // And the pump folded that level-set to a COUNT on ChatInfo — the whole
+    // point of the fold: readable without attaching a socket, which is how
+    // the session row (and so the rail) learns about off-screen work at all.
+    let info = fx.manager.get("s-bg").expect("info");
+    assert_eq!(info.background_running, 2);
+
+    // The tasks were the CLI's children — they die with it, and no final
+    // empty level-set follows an exit. Without the explicit zero, a dead
+    // session's row would sit there claiming work forever.
+    assert!(fx.manager.kill("s-bg"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    let info = fx.manager.get("s-bg").expect("info");
+    assert_eq!(info.background_running, 0, "an exit clears the count");
+    assert!(!info.alive);
 }
 
 #[tokio::test]

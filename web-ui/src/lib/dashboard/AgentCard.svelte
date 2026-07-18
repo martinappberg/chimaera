@@ -17,7 +17,13 @@
   import { basename } from "../previews/files";
   import { formatElapsedSeconds } from "../shared/time";
   import { relativeAge } from "../workspace/launcher";
-  import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
+  import {
+    agentKind,
+    backgrounded,
+    dotState,
+    dotTitle,
+    type Session,
+  } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
@@ -115,18 +121,16 @@
 
   /** Background work (backgrounded Bash / workflows) — the level-set the
    *  BackgroundTray renders, promoted card-side the same way. A card that
-   *  showed only subagents would lie by omission (design decision 12). */
+   *  showed only subagents would lie by omission (design decision 12).
+   *  Warm-store only: the ROWS need the full set, which rides the chat
+   *  socket. The cue below doesn't — it reads the count off the wire. */
   const bgTasks = $derived(store?.backgroundTasks ?? []);
   /** The turn is idle but a background task is STILL running: the session
-   *  isn't "done", it's working off-screen. The glyph pulses gray for this
-   *  (vs the alive dot's green pulse for an active turn) — so a card with
-   *  ongoing background work never reads as finished. Only warm-store cards
-   *  know their background tasks (the wire row doesn't carry them). */
-  const backgrounded = $derived(
-    session.alive &&
-      session.agent_state !== "running" &&
-      bgTasks.some((t) => t.status === "running"),
-  );
+   *  isn't "done", it's working off-screen, so the state dot keeps pulsing
+   *  and the card never reads as finished. The shared session predicate, so
+   *  this card and that session's rail row always cue together — including
+   *  for a card with no warm store, which knows the count but not the rows. */
+  const isBackgrounded = $derived(backgrounded(session));
   /** Exactly one subagent source is populated (see wireAgents), so the sum
    *  is the count — the summary label reads the same either way. */
   const subCount = $derived(activeAgents.length + wireAgents.length);
@@ -223,7 +227,7 @@
   class:compact
   class:dead={!session.alive}
   class:unread={isUnread(session.id)}
-  class:backgrounded
+  class:backgrounded={isBackgrounded}
   role="button"
   tabindex="0"
   onclick={onOpen}

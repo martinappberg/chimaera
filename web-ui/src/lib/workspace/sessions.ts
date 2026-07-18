@@ -138,6 +138,17 @@ export interface Session {
    *  folds it into agent_state ("idle_prompt"), carried raw for future
    *  surfaces. Cleared when a new turn starts. */
   status_needs_action?: boolean;
+  /**
+   * How many background tasks (backgrounded Bash / workflows) this agent has
+   * running right now — the daemon's fold of the `background_tasks` level-set.
+   * Chat sessions only; null on PTY rows (a TUI's Ctrl-B raises no hook, so
+   * null means "unknown", not "none") and absent on old daemons.
+   *
+   * A count, not the set: it rides every session-list snapshot, and the
+   * surfaces reading it only need "is work still going". A view wanting the
+   * rows themselves reads its own ChatStore, which has the full set.
+   */
+  background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
 }
@@ -238,6 +249,20 @@ export function dotState(s: Session): string {
       }
       return "starting";
   }
+}
+
+/**
+ * The turn is idle but background work (backgrounded Bash / workflows) is
+ * still running — "working off-screen", not finished. Every surface that cues
+ * it reads THIS predicate (the rail glyph's muted breathing, the focus-strip
+ * chip, the dashboard card's pulsing dot) so they can never disagree.
+ *
+ * Wire truth, so it holds for a session no window has ever opened — the whole
+ * reason the daemon folds the count onto the row instead of leaving it to
+ * whichever client happens to be attached.
+ */
+export function backgrounded(s: Session): boolean {
+  return s.alive && s.agent_state !== "running" && (s.background_running ?? 0) > 0;
 }
 
 /** Hover tooltip naming the state behind a session dot. */
