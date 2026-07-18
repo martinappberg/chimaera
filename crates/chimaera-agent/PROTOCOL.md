@@ -1590,6 +1590,10 @@ same action. The corrected mapping is:
 - additive `AgentCommand::SteerQueued{id}` → remove only that entry and issue
   `turn/steer`; a click during the `turn/start`→`turn/started` window records
   the intent until `expectedTurnId` is known;
+- a turn end with one or more Steer RPCs still unresolved gates ordinary FIFO
+  promotion. Accepted steers release the FIFO after the last acknowledgement;
+  failed steers re-drive first in click order, so no late response can race a
+  second concurrent `turn/start` or reorder the promoted messages;
 - `CancelQueued{id}` still removes a held entry; process death/watchdog still
   resolves genuinely undeliverable held entries `dropped`; Stop never discards
   the FIFO.
@@ -1604,8 +1608,11 @@ has neither a phantom pending bubble nor a seq gap.
 
 Hermetic coverage: `mid_turn_send_queues_until_explicit_steer`,
 `steer_clicked_during_start_window_waits_for_turn_id`,
-`queued_followups_open_one_fresh_turn_at_a_time`, the existing steer retry / stop
-/ cancel cases, the additive wire-contract test for `{type:"steer_queued",id}`,
+`queued_followups_open_one_fresh_turn_at_a_time`,
+`turn_end_waits_for_inflight_steer_before_fifo_promotion`,
+`settled_steer_releases_waiting_fifo_after_turn_end`,
+`failed_concurrent_steers_redrive_in_click_order`, the existing steer retry / stop /
+cancel cases, the additive wire-contract test for `{type:"steer_queued",id}`,
 and server `truncate_journal_neutralizes_early_queued_echo_at_late_checkpoint`.
 Live verification against Codex 0.144.2 exercised queued-row persistence,
 one-at-a-time FIFO promotion, and explicit Steer in the isolated web UI with no
