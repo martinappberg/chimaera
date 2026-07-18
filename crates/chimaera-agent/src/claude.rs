@@ -36,8 +36,8 @@ use crate::model::{
     BackgroundTaskClose, ChunkKind, Coalescer, ContentBlock, ModeInfo, PermissionOption,
     PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
     Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
-    WF_AGENT_LABEL_MAX,
+    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX,
+    PLAN_TASKS_CAP, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -148,10 +148,7 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
 /// A whitespace-only `meta.name` counts as absent — the UI branches on the
 /// name being present, and a blank title would beat the description fallback.
 fn wire_workflow_name(v: &Value) -> Option<String> {
-    v["workflow_name"]
-        .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| truncate_label(s, BG_LABEL_MAX))
+    opt_label(&v["workflow_name"], BG_LABEL_MAX)
 }
 
 fn wire_tool_use_id(v: &Value) -> Option<String> {
@@ -572,6 +569,9 @@ struct ClaudeMapper {
     task_rows: HashMap<String, String>,
     /// Open Task tool cards: tool_use_id → description, for that correlation.
     agent_tools: HashMap<String, String>,
+    /// The agent's todo list, rebuilt from the `Task*` family (see
+    /// [`TaskTracker`]). Cross-turn, like the list it mirrors.
+    task_list: TaskTracker,
     /// The agent's live background tasks (backgrounded Bash / workflows on
     /// the same `task_*` frames, non-`local_agent` task types), in start
     /// order. Survives turn ends — background work is cross-turn by
@@ -703,6 +703,7 @@ impl ClaudeMapper {
             noticed_controls: HashSet::new(),
             task_rows: HashMap::new(),
             agent_tools: HashMap::new(),
+            task_list: TaskTracker::default(),
             background_tasks: Vec::new(),
             departed_background: VecDeque::new(),
             queued_sends: VecDeque::new(),
@@ -1604,24 +1605,32 @@ impl ClaudeMapper {
         let name = block["name"].as_str().unwrap_or_default();
         let input = &block["input"];
 
-        // The todo list is a first-class plan panel, not a tool card.
+        // The todo list is a first-class plan panel, not a tool card. Two
+        // spellings reach us: `TodoWrite` on older CLIs (a level-set — the
+        // whole list every call, so it translates in place), and the `Task*`
+        // family from 2.1.207 on (incremental, so `TaskTracker` holds the
+        // list and its snapshot lands once the call's RESULT confirms it).
         if name == "TodoWrite" {
             if let Some(todos) = input["todos"].as_array() {
                 let entries = todos
                     .iter()
                     .filter_map(|t| {
                         Some(PlanEntry {
-                            content: t["content"].as_str()?.to_string(),
-                            status: match t["status"].as_str() {
-                                Some("in_progress") => PlanStatus::InProgress,
-                                Some("completed") => PlanStatus::Done,
-                                _ => PlanStatus::Todo,
-                            },
+                            content: truncate_label(t["content"].as_str()?, PLAN_LABEL_MAX),
+                            status: plan_status(t["status"].as_str().unwrap_or_default()),
+                            active_form: opt_label(&t["activeForm"], PLAN_LABEL_MAX),
+                            ..Default::default()
                         })
                     })
+                    .take(PLAN_TASKS_CAP)
                     .collect();
                 step.events.push(AgentEvent::Plan { entries });
             }
+            self.tool_kinds.insert(id, ToolKind::Think);
+            return;
+        }
+        if TaskTracker::is_task_tool(name) {
+            self.task_list.on_tool_use(&id, name, input);
             self.tool_kinds.insert(id, ToolKind::Think);
             return;
         }
@@ -1674,6 +1683,21 @@ impl ClaudeMapper {
                 .to_string();
             let failed = block["is_error"] == json!(true);
             let kind = self.tool_kinds.get(&id).copied();
+            // A task-list call's id/state only exists in its RESULT text, so
+            // the plan snapshot lands here rather than at the tool_use. The
+            // ToolCallUpdate below still fires and is harmless — the client
+            // ignores updates for a row it never rendered (as for TodoWrite).
+            // Gated on `tracks` so this doesn't build the result text for
+            // every OTHER tool — notably the edit family, which deliberately
+            // skips that work below.
+            if self.task_list.tracks(&id) {
+                if let Some(entries) =
+                    self.task_list
+                        .on_tool_result(&id, failed, &tool_result_text(block))
+                {
+                    step.events.push(AgentEvent::Plan { entries });
+                }
+            }
             // Edit-family cards already carry their diff; the "File updated"
             // acknowledgement adds nothing.
             let content = if matches!(kind, Some(ToolKind::Edit)) && !failed {
@@ -2891,6 +2915,401 @@ fn claude_modes() -> Vec<ModeInfo> {
     ]
 }
 
+/// Bound on in-flight `Task*` calls awaiting their result. Results land in
+/// the same turn, so this only stops an aborted turn from stranding entries.
+const PENDING_TASK_CAP: usize = 64;
+
+/// The agent's task list, reconstructed from claude's `Task*` tool family.
+///
+/// `TodoWrite` was a LEVEL-SET — every call carried the whole list, so the
+/// driver was a pure translator. `TaskCreate`/`TaskUpdate` are INCREMENTAL
+/// (create one, patch one by id), so the list has to be held here and
+/// re-emitted whole as `AgentEvent::Plan`. Keeping the wire event a full
+/// snapshot is deliberate: the client reducer stays a replace, and journal
+/// replay still converges on the last event alone.
+///
+/// Ids are assigned by the harness and appear ONLY in the tool RESULT text
+/// (`Task #1 created successfully: …`), never in the input — so a create is
+/// held pending until its result lands. Updates apply on their result too, so
+/// a failed call never mutates our view of the list.
+///
+/// Lives ACROSS turns (a task list outlives the turn that wrote it) and dies
+/// with the process. A resumed session therefore starts blind — no wire frame
+/// carries task state at startup (live-verified) — which is why a `TaskList`
+/// result is parsed as an authoritative resync: that is exactly the call the
+/// agent is told to make before creating tasks.
+#[derive(Default)]
+pub(crate) struct TaskTracker {
+    /// Tasks in harness id order.
+    tasks: Vec<PlanEntry>,
+    /// tool_use_id → what that in-flight call intends, applied on its result.
+    pending: HashMap<String, PendingTask>,
+    /// `pending` insertion order, so the bound evicts the OLDEST rather than
+    /// dropping the whole map. One assistant frame can carry more Task* calls
+    /// than the bound, and every tool_use lands before any tool_result — so a
+    /// clear-all would strand every create in that burst instead of keeping
+    /// the newest, exactly inverting `PLAN_TASKS_CAP`'s newest-wins rule.
+    pending_order: VecDeque<String>,
+}
+
+enum PendingTask {
+    Create(Box<PlanEntry>),
+    Update {
+        id: String,
+        patch: TaskPatch,
+    },
+    /// A `TaskList` whose result text is a full-state resync.
+    List,
+}
+
+#[derive(Default)]
+struct TaskPatch {
+    /// `deleted` included — it removes the task.
+    status: Option<String>,
+    subject: Option<String>,
+    description: Option<String>,
+    active_form: Option<String>,
+    owner: Option<String>,
+    add_blocked_by: Vec<String>,
+}
+
+/// One parsed `TaskList` row.
+struct TaskRow {
+    id: String,
+    status: PlanStatus,
+    subject: String,
+    owner: Option<String>,
+    blocked_by: Vec<String>,
+}
+
+impl TaskTracker {
+    /// The task-list bookkeeping tools — the todo list, so the plan panel and
+    /// not transcript rows. Deliberately NOT `TaskStop`/`TaskOutput`: those
+    /// are BACKGROUND-lane tools keyed by `task_id` (not `taskId`), and
+    /// suppressing them would blank rows the tray depends on.
+    pub(crate) fn is_task_tool(name: &str) -> bool {
+        matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet")
+    }
+
+    /// Records what an in-flight task-list call intends; the caller suppresses
+    /// its row. `TaskGet` records nothing — it only reads, and its row is
+    /// bookkeeping noise either way.
+    pub(crate) fn on_tool_use(&mut self, tool_use_id: &str, name: &str, input: &Value) {
+        while self.pending.len() >= PENDING_TASK_CAP {
+            match self.pending_order.pop_front() {
+                Some(oldest) => {
+                    self.pending.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        let pending = match name {
+            "TaskCreate" => {
+                let Some(subject) = input["subject"].as_str().filter(|s| !s.is_empty()) else {
+                    return;
+                };
+                PendingTask::Create(Box::new(PlanEntry {
+                    content: truncate_label(subject, PLAN_LABEL_MAX),
+                    active_form: opt_label(&input["activeForm"], PLAN_LABEL_MAX),
+                    description: opt_label(&input["description"], PLAN_DESC_MAX),
+                    ..Default::default()
+                }))
+            }
+            "TaskUpdate" => {
+                let Some(id) = input["taskId"].as_str().filter(|s| !s.is_empty()) else {
+                    return;
+                };
+                PendingTask::Update {
+                    id: id.to_string(),
+                    patch: TaskPatch {
+                        status: input["status"].as_str().map(str::to_string),
+                        subject: opt_label(&input["subject"], PLAN_LABEL_MAX),
+                        description: opt_label(&input["description"], PLAN_DESC_MAX),
+                        active_form: opt_label(&input["activeForm"], PLAN_LABEL_MAX),
+                        owner: opt_label(&input["owner"], PLAN_LABEL_MAX),
+                        add_blocked_by: blocker_ids(&input["addBlockedBy"]),
+                    },
+                }
+            }
+            "TaskList" => PendingTask::List,
+            _ => return,
+        };
+        if self
+            .pending
+            .insert(tool_use_id.to_string(), pending)
+            .is_none()
+        {
+            self.pending_order.push_back(tool_use_id.to_string());
+        }
+    }
+
+    /// Whether this tool_use_id is one of ours — lets the caller skip building
+    /// the result text for the overwhelming majority of results that are not
+    /// task-list calls.
+    pub(crate) fn tracks(&self, tool_use_id: &str) -> bool {
+        self.pending.contains_key(tool_use_id)
+    }
+
+    /// Applies a finished task-list call. `Some(snapshot)` ⇒ emit a `Plan`.
+    pub(crate) fn on_tool_result(
+        &mut self,
+        tool_use_id: &str,
+        failed: bool,
+        text: &str,
+    ) -> Option<Vec<PlanEntry>> {
+        let pending = self.pending.remove(tool_use_id)?;
+        self.pending_order.retain(|id| id != tool_use_id);
+        // A rejected or errored call did not change the agent's list, so it
+        // must not change ours.
+        if failed {
+            return None;
+        }
+        match pending {
+            PendingTask::Create(mut entry) => {
+                entry.id = Some(parse_created_id(text).unwrap_or_else(|| self.next_id()));
+                self.tasks.push(*entry);
+                // Agent-created and unbounded upstream: keep the newest.
+                let overflow = self.tasks.len().saturating_sub(PLAN_TASKS_CAP);
+                self.tasks.drain(..overflow);
+            }
+            PendingTask::Update { id, patch } => self.apply(&id, patch)?,
+            // A refused resync changed nothing, so emitting would re-journal
+            // the whole list for a no-op (the same churn the background set
+            // guards against by comparing before re-emitting).
+            PendingTask::List => self.resync(text).then_some(())?,
+        }
+        Some(self.snapshot())
+    }
+
+    /// `None` ⇒ an update for an id we don't know (nothing to emit).
+    fn apply(&mut self, id: &str, patch: TaskPatch) -> Option<()> {
+        let idx = self
+            .tasks
+            .iter()
+            .position(|t| t.id.as_deref() == Some(id))?;
+        if patch.status.as_deref() == Some("deleted") {
+            self.tasks.remove(idx);
+            return Some(());
+        }
+        let task = &mut self.tasks[idx];
+        if let Some(status) = patch.status {
+            task.status = plan_status(&status);
+        }
+        if let Some(subject) = patch.subject {
+            task.content = subject;
+        }
+        if patch.description.is_some() {
+            task.description = patch.description;
+        }
+        if patch.active_form.is_some() {
+            task.active_form = patch.active_form;
+        }
+        if patch.owner.is_some() {
+            task.owner = patch.owner;
+        }
+        for id in patch.add_blocked_by {
+            if task.blocked_by.len() >= PLAN_BLOCKED_CAP {
+                break;
+            }
+            if !task.blocked_by.contains(&id) {
+                task.blocked_by.push(id);
+            }
+        }
+        Some(())
+    }
+
+    /// A `TaskList` result is the whole list — the one authoritative level-set
+    /// on the wire. Status and blockers come from it (they genuinely change,
+    /// and both parse unambiguously). Subject/description/active-form/owner
+    /// keep the values we tracked from tool INPUTS, which are exact, because
+    /// the row's are recovered from free text whose subject may itself end in
+    /// a parenthetical. Parsed text fills only gaps we cannot otherwise know —
+    /// an id we never saw created, i.e. the resumed-session case.
+    /// `false` ⇒ the listing was not trustworthy and the list is unchanged.
+    fn resync(&mut self, text: &str) -> bool {
+        let mut rebuilt: Vec<PlanEntry> = Vec::new();
+        let mut unparsed = 0usize;
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(row) = parse_task_row(line) else {
+                unparsed += 1;
+                continue;
+            };
+            let prior = self
+                .tasks
+                .iter()
+                .find(|t| t.id.as_deref() == Some(row.id.as_str()));
+            rebuilt.push(PlanEntry {
+                content: prior.map_or(row.subject, |p| p.content.clone()),
+                status: row.status,
+                id: Some(row.id),
+                active_form: prior.and_then(|p| p.active_form.clone()),
+                description: prior.and_then(|p| p.description.clone()),
+                owner: match prior {
+                    Some(p) => p.owner.clone(),
+                    None => row.owner,
+                },
+                blocked_by: row.blocked_by,
+            });
+            if rebuilt.len() >= PLAN_TASKS_CAP {
+                break;
+            }
+        }
+        // A resync REPLACES the list, so it may only run on output we fully
+        // understood. Any unparsed non-blank line means the format moved (or
+        // a subject wrapped): replacing then would silently delete the tasks
+        // behind those lines, which is worse than staying stale — and worse
+        // than the all-unparsed case ("No tasks found") that also lands here.
+        // The next create/update corrects a stale list anyway.
+        if unparsed > 0 && !self.tasks.is_empty() {
+            return false;
+        }
+        self.tasks = rebuilt;
+        true
+    }
+
+    /// The list as the client should see it. `blocked_by` is filtered to
+    /// blockers that are still OPEN — the harness does the same in its own
+    /// `TaskList` output ("open task IDs"), and a task whose blocker finished
+    /// is not blocked. Accumulating `addBlockedBy` without this would pin a
+    /// stale "blocked by #1" on a task that is ready to run.
+    fn snapshot(&self) -> Vec<PlanEntry> {
+        let open: HashSet<&str> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status != PlanStatus::Done)
+            .filter_map(|t| t.id.as_deref())
+            .collect();
+        self.tasks
+            .iter()
+            .map(|t| {
+                let mut entry = t.clone();
+                entry.blocked_by.retain(|id| open.contains(id.as_str()));
+                entry
+            })
+            .collect()
+    }
+
+    /// Creation order IS id order upstream, so the fallback for an unparseable
+    /// create result agrees with what the harness assigned.
+    fn next_id(&self) -> String {
+        let max = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.id.as_deref()?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        (max + 1).to_string()
+    }
+}
+
+pub(crate) fn plan_status(status: &str) -> PlanStatus {
+    match status {
+        "in_progress" => PlanStatus::InProgress,
+        "completed" => PlanStatus::Done,
+        _ => PlanStatus::Todo,
+    }
+}
+
+/// A wire string worth showing, capped. Whitespace-only counts as ABSENT —
+/// the UI branches on presence, and a blank owner chip or detail line is worse
+/// than none. (The label keeps its original spacing; only the test trims.)
+pub(crate) fn opt_label(value: &Value, max: usize) -> Option<String> {
+    value
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_label(s, max))
+}
+
+fn blocker_ids(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .take(PLAN_BLOCKED_CAP)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `Task #1 created successfully: Alpha step` → `1` (live-captured wording).
+fn parse_created_id(text: &str) -> Option<String> {
+    let digits: String = text
+        .strip_prefix("Task #")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+/// `#3 [pending] Ccc (scout) [blocked by #1, #2]` — the shape claude's
+/// `TaskList` prints (live-captured). The two suffixes are stripped from the
+/// END and in either order: only their presence is documented, not their
+/// order, so nothing here depends on one.
+fn parse_task_row(line: &str) -> Option<TaskRow> {
+    let (id, rest) = line.trim().strip_prefix('#')?.split_once(' ')?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (status, mut rest) = rest.strip_prefix('[')?.split_once("] ")?;
+    let mut owner = None;
+    let mut blocked_by = Vec::new();
+    // Exactly two suffixes are possible, so two passes settle either order and
+    // the loop provably terminates.
+    for _ in 0..2 {
+        if blocked_by.is_empty() {
+            if let Some((head, ids)) = strip_blocked_suffix(rest) {
+                rest = head;
+                blocked_by = ids;
+                continue;
+            }
+        }
+        if owner.is_none() {
+            if let Some((head, name)) = strip_owner_suffix(rest) {
+                rest = head;
+                owner = Some(name);
+                continue;
+            }
+        }
+        break;
+    }
+    Some(TaskRow {
+        id: id.to_string(),
+        status: plan_status(status),
+        subject: truncate_label(rest.trim(), PLAN_LABEL_MAX),
+        owner,
+        blocked_by,
+    })
+}
+
+fn strip_blocked_suffix(line: &str) -> Option<(&str, Vec<String>)> {
+    let line = line.trim_end();
+    let inner = line.strip_suffix(']')?;
+    let at = inner.rfind("[blocked by ")?;
+    let ids: Vec<String> = inner[at + "[blocked by ".len()..]
+        .split(',')
+        .filter_map(|id| id.trim().strip_prefix('#'))
+        .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        .take(PLAN_BLOCKED_CAP)
+        .map(str::to_string)
+        .collect();
+    (!ids.is_empty()).then(|| (line[..at].trim_end(), ids))
+}
+
+/// ` (scout)` — an owner is a single bare token, so a subject that merely ends
+/// in a parenthetical ("Fix parser (v2)") is only misread for a task we never
+/// saw created; for tracked tasks the caller keeps its own exact owner.
+fn strip_owner_suffix(line: &str) -> Option<(&str, String)> {
+    let line = line.trim_end();
+    let inner = line.strip_suffix(')')?;
+    let at = inner.rfind(" (")?;
+    let owner = &inner[at + 2..];
+    let bare = !owner.is_empty() && !owner.contains(|c: char| c.is_whitespace() || c == '(');
+    bare.then(|| (&line[..at], truncate_label(owner, PLAN_LABEL_MAX)))
+}
+
 // The tool-block translators below are `pub(crate)` because the offline
 // transcript importer (`transcript.rs`) reuses them verbatim: history imported
 // from claude's own transcript must render identically to a live session and
@@ -2932,11 +3351,11 @@ pub(crate) fn tool_title(name: &str, input: &Value) -> String {
         "WebFetch" => input["url"].as_str(),
         "WebSearch" => input["query"].as_str(),
         "Task" | "Agent" => input["description"].as_str(),
-        // Harness task-list + monitor tools: surface the subject so the card
-        // reads as what it does, not a bare internal name.
-        "TaskCreate" => input["subject"].as_str(),
-        "TaskUpdate" | "TaskGet" | "TaskStop" => input["taskId"].as_str(),
-        "TaskOutput" => input["task_id"].as_str(),
+        // BACKGROUND-lane tools, so still real rows — the todo-list `Task*`
+        // tools never reach here (intercepted into the plan panel). Both key
+        // off `task_id`, NOT the todo list's `taskId`: titling `TaskStop` with
+        // the latter surfaced nothing at all.
+        "TaskStop" | "TaskOutput" => input["task_id"].as_str(),
         "Monitor" => input["description"].as_str(),
         _ => None,
     };
@@ -3793,7 +4212,8 @@ mod tests {
                 { "type": "tool_use", "id": "tu1", "name": "TodoWrite",
                   "input": { "todos": [
                       { "content": "a", "status": "completed" },
-                      { "content": "b", "status": "in_progress" },
+                      { "content": "b", "status": "in_progress",
+                        "activeForm": "doing b" },
                   ]}},
             ]},
         });
@@ -3804,15 +4224,331 @@ mod tests {
                 entries: vec![
                     PlanEntry {
                         content: "a".into(),
-                        status: PlanStatus::Done
+                        status: PlanStatus::Done,
+                        ..Default::default()
                     },
                     PlanEntry {
                         content: "b".into(),
-                        status: PlanStatus::InProgress
+                        status: PlanStatus::InProgress,
+                        active_form: Some("doing b".into()),
+                        ..Default::default()
                     },
                 ]
             }]
         );
+    }
+
+    // ---- the `Task*` task list (TodoWrite's successor from 2.1.207) ----
+    //
+    // Every result string below is verbatim from a live 2.1.212 capture; the
+    // whole mapping hangs off that exact wording, so these double as the
+    // record of it.
+
+    fn task_use(m: &mut ClaudeMapper, id: &str, name: &str, input: Value) -> DriverStep {
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": input },
+            ]},
+        }))
+    }
+
+    fn task_result(m: &mut ClaudeMapper, id: &str, text: &str) -> DriverStep {
+        m.on_frame(&json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "content": text },
+            ]},
+        }))
+    }
+
+    fn plan_of(step: &DriverStep) -> Vec<PlanEntry> {
+        step.events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Plan { entries } => Some(entries.clone()),
+                _ => None,
+            })
+            .expect("a Plan event")
+    }
+
+    /// The id exists ONLY in the result text, so the create must not land a
+    /// plan until its result arrives — and must never land a tool row.
+    #[test]
+    fn task_create_lands_on_its_result_not_its_use() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = task_use(
+            &mut m,
+            "tu1",
+            "TaskCreate",
+            json!({ "subject": "Alpha step", "description": "First.",
+                    "activeForm": "Doing Alpha" }),
+        );
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Plan { .. } | AgentEvent::ToolCall { .. })),
+            "no plan yet (no id) and never a row: {:?}",
+            step.events
+        );
+
+        let step = task_result(&mut m, "tu1", "Task #1 created successfully: Alpha step");
+        assert_eq!(
+            plan_of(&step),
+            vec![PlanEntry {
+                content: "Alpha step".into(),
+                status: PlanStatus::Todo,
+                id: Some("1".into()),
+                active_form: Some("Doing Alpha".into()),
+                description: Some("First.".into()),
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn task_update_patches_status_owner_and_blockers() {
+        let mut m = mapper();
+        m.turn_active = true;
+        for (tu, n, subject) in [("tu1", "1", "Alpha"), ("tu2", "2", "Beta")] {
+            task_use(&mut m, tu, "TaskCreate", json!({ "subject": subject }));
+            task_result(
+                &mut m,
+                tu,
+                &format!("Task #{n} created successfully: {subject}"),
+            );
+        }
+
+        task_use(
+            &mut m,
+            "tu3",
+            "TaskUpdate",
+            json!({ "taskId": "2", "addBlockedBy": ["1"] }),
+        );
+        let step = task_result(&mut m, "tu3", "Updated task #2 blockedBy");
+        assert_eq!(plan_of(&step)[1].blocked_by, vec!["1".to_string()]);
+
+        task_use(
+            &mut m,
+            "tu4",
+            "TaskUpdate",
+            json!({ "taskId": "1", "status": "in_progress", "owner": "scout" }),
+        );
+        let step = task_result(&mut m, "tu4", "Updated task #1 status");
+        let plan = plan_of(&step);
+        assert_eq!(plan[0].status, PlanStatus::InProgress);
+        assert_eq!(plan[0].owner.as_deref(), Some("scout"));
+
+        // Finishing the blocker clears the dependency: the harness itself
+        // reports only OPEN blockers, so a stale "blocked by #1" would be a
+        // task shown as unrunnable when it is ready.
+        task_use(
+            &mut m,
+            "tu5",
+            "TaskUpdate",
+            json!({ "taskId": "1", "status": "completed" }),
+        );
+        let step = task_result(&mut m, "tu5", "Updated task #1 status");
+        assert!(
+            plan_of(&step)[1].blocked_by.is_empty(),
+            "a completed blocker no longer blocks"
+        );
+    }
+
+    #[test]
+    fn task_delete_removes_the_entry() {
+        let mut m = mapper();
+        m.turn_active = true;
+        task_use(&mut m, "tu1", "TaskCreate", json!({ "subject": "Alpha" }));
+        task_result(&mut m, "tu1", "Task #1 created successfully: Alpha");
+        task_use(
+            &mut m,
+            "tu2",
+            "TaskUpdate",
+            json!({ "taskId": "1", "status": "deleted" }),
+        );
+        assert!(plan_of(&task_result(&mut m, "tu2", "Updated task #1 deleted")).is_empty());
+    }
+
+    /// A rejected call did not change the agent's list, so it must not change
+    /// ours — otherwise a denied update leaves the panel lying.
+    #[test]
+    fn failed_task_call_does_not_mutate_the_plan() {
+        let mut m = mapper();
+        m.turn_active = true;
+        task_use(&mut m, "tu1", "TaskCreate", json!({ "subject": "Alpha" }));
+        let step = m.on_frame(&json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "tu1",
+                  "content": "denied", "is_error": true },
+            ]},
+        }));
+        assert!(!step
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Plan { .. })));
+    }
+
+    /// `TaskList` is the one full-state level-set on the wire — the only way a
+    /// RESUMED session (which starts blind: no frame carries task state at
+    /// startup) ever recovers a list it never saw created.
+    #[test]
+    fn task_list_result_resyncs_unseen_tasks() {
+        let mut m = mapper();
+        m.turn_active = true;
+        task_use(&mut m, "tu1", "TaskList", json!({}));
+        let step = task_result(
+            &mut m,
+            "tu1",
+            "#1 [in_progress] Alpha step\n\
+             #2 [pending] Beta step (scout)\n\
+             #3 [pending] Gamma step [blocked by #1, #2]",
+        );
+        let plan = plan_of(&step);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].status, PlanStatus::InProgress);
+        assert_eq!(plan[0].id.as_deref(), Some("1"));
+        assert_eq!(plan[1].content, "Beta step");
+        assert_eq!(plan[1].owner.as_deref(), Some("scout"));
+        assert_eq!(plan[2].blocked_by, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    /// Output we can't parse a row out of must not blank a populated panel —
+    /// and must not re-journal the whole list to say nothing changed.
+    #[test]
+    fn unparseable_task_list_keeps_the_existing_plan() {
+        let mut m = mapper();
+        m.turn_active = true;
+        task_use(&mut m, "tu1", "TaskCreate", json!({ "subject": "Alpha" }));
+        task_result(&mut m, "tu1", "Task #1 created successfully: Alpha");
+        task_use(&mut m, "tu2", "TaskList", json!({}));
+        let step = task_result(&mut m, "tu2", "No tasks found.");
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Plan { .. })),
+            "a refused resync emits nothing"
+        );
+        // Alpha survived: a later update still finds it.
+        task_use(
+            &mut m,
+            "tu3",
+            "TaskUpdate",
+            json!({ "taskId": "1", "status": "completed" }),
+        );
+        let plan = plan_of(&task_result(&mut m, "tu3", "Updated task #1 status"));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].status, PlanStatus::Done);
+    }
+
+    /// A resync REPLACES the list, so a PARTIALLY understood listing is the
+    /// dangerous case: taking it would delete the tasks behind the lines we
+    /// failed to parse. Worse than the all-unparsed case, and easy to miss.
+    #[test]
+    fn partially_parsed_task_list_does_not_drop_tasks() {
+        let mut m = mapper();
+        m.turn_active = true;
+        for (tu, n) in [("tu1", "1"), ("tu2", "2"), ("tu3", "3")] {
+            task_use(
+                &mut m,
+                tu,
+                "TaskCreate",
+                json!({ "subject": format!("T{n}") }),
+            );
+            task_result(&mut m, tu, &format!("Task #{n} created successfully: T{n}"));
+        }
+        task_use(&mut m, "tu4", "TaskList", json!({}));
+        // Row 2 in a shape we don't understand (a reworded format upstream).
+        let step = task_result(
+            &mut m,
+            "tu4",
+            "#1 [pending] T1\n  * 2 — pending — T2\n#3 [pending] T3",
+        );
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Plan { .. })),
+            "a partial listing must not replace the list"
+        );
+        // The list itself is untouched — the next update still sees all three.
+        task_use(
+            &mut m,
+            "tu5",
+            "TaskUpdate",
+            json!({ "taskId": "2", "status": "completed" }),
+        );
+        let plan = plan_of(&task_result(&mut m, "tu5", "Updated task #2 status"));
+        assert_eq!(plan.len(), 3, "task #2 survived the partial listing");
+        assert_eq!(plan[1].status, PlanStatus::Done);
+    }
+
+    /// One assistant frame can carry more Task* calls than the pending bound,
+    /// and every tool_use lands before any tool_result — so the bound must
+    /// evict the OLDEST, not drop the whole map (which would strand the entire
+    /// burst instead of keeping the newest, inverting PLAN_TASKS_CAP).
+    #[test]
+    fn pending_overflow_evicts_oldest_and_keeps_the_newest_creates() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let burst = PENDING_TASK_CAP + 4;
+        for i in 0..burst {
+            task_use(
+                &mut m,
+                &format!("tu{i}"),
+                "TaskCreate",
+                json!({ "subject": format!("T{i}") }),
+            );
+        }
+        // The newest call still resolves into the plan.
+        let last = burst - 1;
+        let step = task_result(
+            &mut m,
+            &format!("tu{last}"),
+            &format!("Task #{} created successfully: T{last}", last + 1),
+        );
+        let plan = plan_of(&step);
+        assert_eq!(plan.last().unwrap().content, format!("T{last}"));
+    }
+
+    /// The background lane shares the `Task` prefix but is NOT the todo list —
+    /// suppressing these would blank rows the tray depends on.
+    #[test]
+    fn background_task_tools_still_render_rows() {
+        let mut m = mapper();
+        m.turn_active = true;
+        let step = task_use(&mut m, "tu1", "TaskStop", json!({ "task_id": "bg-7" }));
+        match step
+            .events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolCall { .. }))
+        {
+            Some(AgentEvent::ToolCall { title, .. }) => assert_eq!(title, "TaskStop: bg-7"),
+            other => panic!("expected a TaskStop row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_row_parser_handles_suffix_order_and_junk() {
+        // Either suffix order settles; a bare subject keeps its parentheses.
+        let row = parse_task_row("#4 [pending] Do it (scout) [blocked by #2]").unwrap();
+        assert_eq!(row.subject, "Do it");
+        assert_eq!(row.owner.as_deref(), Some("scout"));
+        assert_eq!(row.blocked_by, vec!["2".to_string()]);
+
+        let row = parse_task_row("#5 [completed] Fix the parser (v2)").unwrap();
+        assert_eq!(row.status, PlanStatus::Done);
+        // A single trailing token is indistinguishable from an owner here —
+        // which is why a tracked task keeps its own exact owner and only an
+        // id we never saw created takes the parsed one.
+        assert_eq!(row.subject, "Fix the parser");
+
+        assert!(parse_task_row("not a task row").is_none());
+        assert!(parse_task_row("#x [pending] bad id").is_none());
     }
 
     #[test]

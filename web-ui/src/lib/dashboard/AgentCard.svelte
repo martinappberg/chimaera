@@ -65,8 +65,10 @@
       const act = store.activity;
       if (act !== null && act.detail !== "") return act.detail;
       if (act !== null) return act.kind;
+      // `activeForm` is the agent's own present-continuous phrasing for a
+      // "what's happening now" line — exactly this one.
       const step = store.plan.find((p) => p.status === "in_progress");
-      if (step !== undefined) return step.content;
+      if (step !== undefined) return step.activeForm ?? step.content;
       const lastMsg = store.blocks.findLast((b) => b.kind === "message");
       if (lastMsg !== undefined) return lastMsg.text.slice(0, 160);
     }
@@ -178,7 +180,14 @@
 
   const relPath = (p: string): string => sharedRelPath(wsRoot, p);
 
-  const planEntries = $derived(hero && store !== null ? store.plan.slice(0, 6) : []);
+  /** A card answers "what is this agent on?", so finished rows yield to live
+   *  ones: with a plain slice, a plan whose first six tasks are done showed
+   *  six ✓ and hid the work in flight entirely. Finished work becomes a count;
+   *  a fully-finished plan still shows its rows, since nothing else remains. */
+  const planAll = $derived(hero && store !== null ? store.plan : []);
+  const planLive = $derived(planAll.filter((p) => p.status !== "done"));
+  const planEntries = $derived((planLive.length > 0 ? planLive : planAll).slice(0, 6));
+  const planDoneCount = $derived(planLive.length > 0 ? planAll.length - planLive.length : 0);
   /** Context meter: the warm store's live figure first, else the claude-TUI
    *  statusline heartbeat — same meter, same thresholds, only the source
    *  differs (chat rows carry wire usage null, so the two never overlap). */
@@ -276,10 +285,16 @@
 
   {#if planEntries.length > 0}
     <div class="plan">
-      {#each planEntries as p, i (i)}
-        <div class="plan-row {p.status}">
+      {#if planDoneCount > 0}
+        <div class="plan-done-count">{planDoneCount} done</div>
+      {/if}
+      {#each planEntries as p, i (p.id ? `id:${p.id}` : `ix:${i}`)}
+        <div class="plan-row {p.status}" class:blocked={p.status !== "done" && p.blockedBy.length > 0}>
           <span class="plan-mark" aria-hidden="true"></span>
           <span class="plan-text">{p.content}</span>
+          <!-- Who holds it: the signal that earns its space on a workspace
+               card, where several agents can share one task list. -->
+          {#if p.owner}<span class="plan-owner">@{p.owner}</span>{/if}
         </div>
       {/each}
     </div>
@@ -605,6 +620,23 @@
   }
   .plan-row.done .plan-mark {
     border-color: var(--accent);
+  }
+  /* Blocked is still `todo` on the wire, so without this a task that CAN'T
+     start looks exactly like one that merely hasn't. */
+  .plan-row.blocked .plan-mark {
+    border-style: dashed;
+  }
+  .plan-done-count {
+    font-size: var(--text-xs);
+    color: var(--muted);
+    padding-bottom: 1px;
+  }
+  /* Mixed toward --fg, not --muted: accent-over-muted lands near 3.5:1 on the
+     light background, too weak for an 11px chip. */
+  .plan-owner {
+    flex: none;
+    font-size: var(--text-xs);
+    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
   }
   .plan-row.done .plan-text {
     text-decoration: line-through;

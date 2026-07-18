@@ -14,6 +14,8 @@
   import ToolGroup from "./ToolGroup.svelte";
   import AgentsTray from "./AgentsTray.svelte";
   import BackgroundTray from "./BackgroundTray.svelte";
+  import WorkTray from "../shared/WorkTray.svelte";
+  import Chevron from "../shared/Chevron.svelte";
   import ArtifactGallery from "./ArtifactGallery.svelte";
   import PermissionCard from "./PermissionCard.svelte";
   import PlanApprovalCard from "./PlanApprovalCard.svelte";
@@ -23,7 +25,7 @@
   import RewindDialog from "./RewindDialog.svelte";
   import Composer from "./Composer.svelte";
   import type { ImageAttachment } from "./images";
-  import type { ChatBlock } from "./store.svelte";
+  import type { ChatBlock, PlanEntry } from "./store.svelte";
 
   interface Props {
     session: Session;
@@ -604,8 +606,46 @@
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
   /** The step the agent is on now — surfaced in the plan summary so the
-   *  current goal is legible without expanding the panel. */
-  const planActive = $derived(store.plan.find((p) => p.status === "in_progress")?.content ?? null);
+   *  current goal is legible without expanding the panel. `activeForm` is the
+   *  agent's own present-continuous phrasing for exactly this spot ("Running
+   *  tests"), so prefer it and fall back to the subject. */
+  const planActive = $derived.by(() => {
+    const active = store.plan.find((p) => p.status === "in_progress");
+    return active ? (active.activeForm ?? active.content) : null;
+  });
+
+  /** Blocked is orthogonal to status: a blocked task is still `todo`, so it
+   *  would otherwise render identically to one that simply hasn't started.
+   *  The server already filters `blockedBy` to blockers that are still open. */
+  const isBlocked = (entry: PlanEntry) => entry.status !== "done" && entry.blockedBy.length > 0;
+  const planMark = (entry: PlanEntry) =>
+    entry.status === "done"
+      ? "✓"
+      : entry.status === "in_progress"
+        ? "◐"
+        : isBlocked(entry)
+          ? "⊘"
+          : "○";
+  /** Agents often restate the subject as the description; showing both then is
+   *  pure noise in a panel this small. */
+  const planDetail = (entry: PlanEntry) => {
+    const detail = entry.description?.trim();
+    return detail && detail !== entry.content.trim() ? detail : null;
+  };
+  /** Finished work folds away: on a long plan the ✓ rows are the majority and
+   *  push what's actually next out of view. They stay one click away, and when
+   *  EVERYTHING is done there is nothing else to show, so the fold steps
+   *  aside rather than leaving an empty panel. */
+  let showFinished = $state(false);
+  let planOpen = $state(false);
+  const planLive = $derived(store.plan.filter((p) => p.status !== "done"));
+  const planFinished = $derived(store.plan.filter((p) => p.status === "done"));
+  const planFolds = $derived(planLive.length > 0 && planFinished.length > 0);
+  const planRows = $derived(planFolds && !showFinished ? planLive : store.plan);
+  const planLabel = $derived(
+    `plan · ${planDone}/${store.plan.length}` +
+      (planActive !== null ? ` · ◐ ${planActive}` : planLive.length === 0 ? " · all done" : ""),
+  );
 
   /** Subagents in flight right now — promoted into the live tray above the
    *  composer. They also keep their in-place "Agent:" rows in the transcript
@@ -860,21 +900,38 @@
   {/if}
 
   {#if store.plan.length > 0}
-    <details class="plan">
-      <summary
-        >plan · {planDone}/{store.plan.length}{#if planActive !== null}<span class="plan-active"
-            > · ◐ {planActive}</span
-          >{/if}</summary
-      >
-      {#each store.plan as entry, i (i)}
-        <div class="plan-row" class:done={entry.status === "done"}>
-          <span class="plan-mark">
-            {entry.status === "done" ? "✓" : entry.status === "in_progress" ? "◐" : "○"}
+    <!-- Same shell as the subagent/background strips: one collapsible family
+         above the composer instead of three different-looking bars. The glyph
+         only breathes while a step is actually in flight. -->
+    <WorkTray glyph="≡" label={planLabel} bind:open={planOpen} pulse={planActive !== null}>
+      {#if planFolds}
+        <button class="plan-fold" onclick={() => (showFinished = !showFinished)}>
+          <Chevron open={showFinished} />
+          <span>{planFinished.length} done</span>
+        </button>
+      {/if}
+      {#each planRows as entry, i (entry.id ? `id:${entry.id}` : `ix:${i}`)}
+        <div
+          class="plan-row"
+          class:done={entry.status === "done"}
+          class:blocked={isBlocked(entry)}
+        >
+          <span class="plan-mark">{planMark(entry)}</span>
+          <span class="plan-body">
+            <span class="plan-line">
+              <span class="plan-subject">{entry.content}</span>
+              {#if entry.owner}<span class="plan-owner">@{entry.owner}</span>{/if}
+              {#if isBlocked(entry)}<span class="plan-blocked"
+                  >blocked by {entry.blockedBy.map((id) => `#${id}`).join(", ")}</span
+                >{/if}
+            </span>
+            {#if planDetail(entry)}
+              <span class="plan-desc">{planDetail(entry)}</span>
+            {/if}
           </span>
-          <span>{entry.content}</span>
         </div>
       {/each}
-    </details>
+    </WorkTray>
   {/if}
 
   {#if rewindIntent !== null}
@@ -1031,7 +1088,9 @@
   .chat > :global(.composer),
   .chat > .suggestion-row,
   .chat > .pending,
-  .chat > .plan {
+  /* Every pinned strip (subagents, background, plan) — they were full-bleed
+     while the plan alone was inset, so the group never lined up. */
+  .chat > :global(.tray) {
     width: 100%;
     max-width: calc(var(--chat-measure) + 36px);
     margin-left: auto;
@@ -1244,25 +1303,21 @@
       animation: none;
     }
   }
-  .plan {
-    flex: none;
-    border-top: 1px solid var(--edge);
-    padding: 4px 14px;
-    font-size: var(--text-sm);
-    max-height: 160px;
-    overflow-y: auto;
-  }
-  .plan summary {
+  /* The strip chrome (border, padding, collapse header, bounded scroll) now
+     comes from the shared WorkTray, so only the rows are styled here. */
+  .plan-fold {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 1px 0 3px;
+    background: none;
+    border: none;
     color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    text-align: left;
     cursor: pointer;
-    user-select: none;
-    list-style-position: inside;
-    padding: 2px 0;
-  }
-  /* The current step, shown right in the summary so the active goal is legible
-     without expanding — clipped so a long todo can't wrap the header. */
-  .plan-active {
-    color: color-mix(in srgb, var(--accent) 85%, var(--fg));
   }
   .plan-row {
     display: flex;
@@ -1275,6 +1330,46 @@
   .plan-mark {
     color: var(--accent);
     flex: none;
+  }
+  /* Blocked reads as "waiting", not "active": the mark drops to muted so a
+     ⊘ can't be mistaken for progress at a glance. */
+  .plan-row.blocked .plan-mark {
+    color: var(--muted);
+  }
+  .plan-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .plan-line {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
+  /* Every text span clips rather than wraps — the panel is a glance surface,
+     and an agent subject can be arbitrarily long. */
+  .plan-subject,
+  .plan-desc {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plan-owner,
+  .plan-blocked {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  /* Mixed toward --fg, not --muted: accent-over-muted lands near 3.5:1 on the
+     light background, too weak for an 11px chip. Same blend as .plan-active. */
+  .plan-owner {
+    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
+  }
+  .plan-desc {
+    color: var(--muted);
+    font-size: var(--text-xs);
   }
   .bubble-row {
     display: flex;

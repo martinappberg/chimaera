@@ -21,9 +21,22 @@ export interface ToolContent {
   diffs?: ToolContent[];
 }
 
+/** One plan row. `content` is the display text every agent fills; the rest is
+ *  richness only claude's `Task*` family carries, so it is all nullable — a
+ *  TodoWrite or codex plan simply has none of it. */
 export interface PlanEntry {
   content: string;
   status: "todo" | "in_progress" | "done";
+  /** The agent's own task id ("1", "2", …) — what `blockedBy` refers to. */
+  id: string | null;
+  /** Present-continuous form ("Running tests"), shown while in progress. */
+  activeForm: string | null;
+  description: string | null;
+  /** Owning agent name, once claimed. */
+  owner: string | null;
+  /** Ids of still-open tasks that must finish first (server-filtered to the
+   *  ones still open). Orthogonal to `status` — a blocked task is still todo. */
+  blockedBy: string[];
 }
 
 export interface PermissionOption {
@@ -657,7 +670,25 @@ export class ChatStore {
         break;
       }
       case "plan":
-        this.plan = (ev.entries as PlanEntry[]) ?? [];
+        // LEVEL-SET, like background_tasks: every Plan carries the whole list,
+        // so replace. Mapped field-by-field (not cast) because the rich fields
+        // are omitted entirely by older journals, TodoWrite, and codex — the
+        // panel reads `blockedBy.length`, which must never be undefined.
+        this.plan = ((ev.entries as Record<string, unknown>[]) ?? [])
+          .map((e) => ({
+            content: (e.content as string) ?? "",
+            status: (e.status as PlanEntry["status"]) ?? "todo",
+            id: (e.id as string) ?? null,
+            activeForm: (e.active_form as string) ?? null,
+            description: (e.description as string) ?? null,
+            owner: (e.owner as string) ?? null,
+            blockedBy: (e.blocked_by as string[]) ?? [],
+          }))
+          // Same keyed-render defense as backgroundTasks: both the plan panel
+          // and the dashboard card key rows by `id`, and a duplicate (a
+          // reworded TaskList line parsed twice, a journal from another build)
+          // would throw and take the whole view down.
+          .filter((e, i, arr) => e.id === null || arr.findIndex((o) => o.id === e.id) === i);
         break;
       case "permission_request":
         this.pending.push({

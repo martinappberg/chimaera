@@ -865,7 +865,10 @@ impl CodexMapper {
                         .iter()
                         .filter_map(|p| {
                             Some(crate::model::PlanEntry {
-                                content: p["step"].as_str()?.to_string(),
+                                content: truncate_label(
+                                    p["step"].as_str()?,
+                                    crate::model::PLAN_LABEL_MAX,
+                                ),
                                 status: match p["status"].as_str() {
                                     Some("inProgress") | Some("in_progress") => {
                                         crate::model::PlanStatus::InProgress
@@ -873,8 +876,12 @@ impl CodexMapper {
                                     Some("completed") => crate::model::PlanStatus::Done,
                                     _ => crate::model::PlanStatus::Todo,
                                 },
+                                // codex's plan is a bare step list — it has no
+                                // id/owner/dependency notion to carry.
+                                ..Default::default()
                             })
                         })
+                        .take(crate::model::PLAN_TASKS_CAP)
                         .collect();
                     step.events.push(AgentEvent::Plan { entries });
                 }
@@ -4700,11 +4707,13 @@ mod tests {
                 entries: vec![
                     crate::model::PlanEntry {
                         content: "a".into(),
-                        status: crate::model::PlanStatus::Done
+                        status: crate::model::PlanStatus::Done,
+                        ..Default::default()
                     },
                     crate::model::PlanEntry {
                         content: "b".into(),
-                        status: crate::model::PlanStatus::InProgress
+                        status: crate::model::PlanStatus::InProgress,
+                        ..Default::default()
                     },
                 ]
             }

@@ -1617,3 +1617,45 @@ and server `truncate_journal_neutralizes_early_queued_echo_at_late_checkpoint`.
 Live verification against Codex 0.144.2 exercised queued-row persistence,
 one-at-a-time FIFO promotion, and explicit Steer in the isolated web UI with no
 browser warnings; the `just chat-smoke` recipe passed 17/17 afterward.
+
+## Pass 22 (2026-07-17 — live probe 2.1.212: the `Task*` task list). ADOPTED.
+
+### Claude: `TodoWrite` was replaced by an INCREMENTAL task-list family
+
+The todo list the plan panel renders now arrives as `TaskCreate` /
+`TaskUpdate` / `TaskList` / `TaskGet` (`TodoWrite` still ships on older CLIs
+and is unchanged). The shift that matters is **level-set → incremental**:
+`TodoWrite` carried the whole list on every call, so the driver was a pure
+translator; the new family creates one task and patches one by id, so the
+driver holds the list (`claude.rs::TaskTracker`) and re-emits it whole as
+`AgentEvent::Plan`. The wire event stays a full snapshot on purpose — the
+client reducer stays a replace and replay still converges on the last event.
+
+**Task ids exist only in the RESULT text**, never in the tool input (probed,
+verbatim wording):
+
+| Call | Input | Result |
+|---|---|---|
+| `TaskCreate` | `{subject, description, activeForm?}` | `Task #1 created successfully: Alpha step` |
+| `TaskUpdate` | `{taskId, status?, subject?, description?, activeForm?, owner?, addBlocks?, addBlockedBy?}` | `Updated task #1 status` (field name varies; `deleted` for a delete) |
+| `TaskList` | `{}` | `#1 [in_progress] Alpha step`<br>`#2 [pending] Beta step (scout)`<br>`#3 [pending] Gamma step [blocked by #1, #2]` |
+
+So a create is held pending until its result lands, and an update applies on
+its result too — a failed call must not mutate our view. Ids are assigned in
+creation order starting at `1`, which is the fallback when the create result
+is unparseable.
+
+- **`TaskList`'s result is the only full-state level-set on the wire**, and the
+  only way a RESUMED session recovers a list it never saw created: no frame
+  carries task state at startup (verified — `system/init` has none). Parsed as
+  an authoritative resync for ids/status/blockers; subject/description/owner
+  keep the values tracked from tool INPUTS, which are exact, since a row's
+  subject may itself end in a parenthetical.
+- **The harness reports only OPEN blockers** — a completed blocker silently
+  drops out of `[blocked by …]`, and deleted tasks vanish from the listing. So
+  accumulated `addBlockedBy` is filtered against still-open tasks at snapshot
+  time; without that a finished dependency pins a stale "blocked by #1" on a
+  task that is ready to run.
+- **`TaskStop` / `TaskOutput` are NOT this family.** They are background-lane
+  tools keyed by `task_id` (not `taskId`) and still render as ordinary rows —
+  suppressing them would blank rows the background tray depends on.

@@ -31,6 +31,21 @@ pub const BG_LABEL_MAX: usize = 200;
 pub const BG_PATH_MAX: usize = 1024;
 /// One-line cap for the `SessionStatus` fields (a status line, not prose).
 pub const STATUS_DETAIL_MAX: usize = 256;
+/// Bound on tracked plan entries. Same reasoning as [`BG_TASKS_CAP`]: the plan
+/// is a glance surface and every `Plan` event carries the whole list, so the
+/// list size IS the event size. Claude's task list is agent-created and
+/// unbounded upstream; the oldest entries are shed past this.
+pub const PLAN_TASKS_CAP: usize = 64;
+/// One-line cap for a plan entry's subject / active form / owner.
+pub const PLAN_LABEL_MAX: usize = 200;
+/// Cap for a plan entry's description (a sentence or two in a panel, not
+/// prose). Worst case `PLAN_TASKS_CAP` × this stays far under the journal's
+/// 256 KiB per-entry cap, which would otherwise replace the whole `Plan`
+/// event with an Error and blank the panel for every client.
+pub const PLAN_DESC_MAX: usize = 500;
+/// Bound on a plan entry's `blocked_by` list. Ids are tiny ("1", "2"); this
+/// only stops a hostile stream from growing the set without end.
+pub const PLAN_BLOCKED_CAP: usize = 16;
 /// Per-workflow bound on stored per-agent entries — exactly the client's
 /// dot-row budget (`DOTS_MAX` in BackgroundTray), so nothing is journaled
 /// that never paints. A workflow can spawn up to 1000 agents lifetime; the
@@ -735,15 +750,39 @@ pub enum ToolContent {
     Batch { diffs: Vec<ToolContent> },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// One plan row. `content` is the display text every source fills (claude's
+/// task `subject`, a TodoWrite `content`, a codex plan `step`); everything
+/// below it is richness only claude's `Task*` family carries, so it is all
+/// optional-and-omitted. That is what keeps older claude CLIs (TodoWrite) and
+/// codex serializing byte-identically to before these fields existed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEntry {
     pub content: String,
     pub status: PlanStatus,
+    /// The agent's own task id ("1", "2", …) — the key `TaskUpdate` addresses
+    /// and the id `blocked_by` refers to. Absent for TodoWrite/codex plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Present-continuous form ("Running tests") shown while in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+    /// What the task actually entails — the detail behind the subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Owning agent name, once claimed. The multi-agent "who has this" signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Ids of still-open tasks that must finish first. Orthogonal to `status`
+    /// (a blocked task is still `Todo`) — the client derives its own glyph, so
+    /// "not started" and "can't start" stop looking identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
+    #[default]
     Todo,
     InProgress,
     Done,
