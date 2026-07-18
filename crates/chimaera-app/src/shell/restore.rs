@@ -79,6 +79,17 @@ fn open_shell_window(
         .disable_drag_drop_handler()
         .inner_size(1280.0, 840.0)
         .min_inner_size(680.0, 440.0);
+    // The workbench already carries its workspace identity in the rail and
+    // pane tabs, so a separate title row only repeats context and steals
+    // vertical room. On macOS keep the native traffic lights, but let them
+    // overlay the webview and keep the dynamic title as OS metadata only.
+    // App.svelte provides the custom drag region Overlay requires.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true);
+    }
     if let (Some(w), Some(h)) = (record.width, record.height) {
         builder = builder.inner_size(w, h);
     }

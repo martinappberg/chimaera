@@ -102,6 +102,13 @@ app, the `--daemon` it spawns (a free port, THIS worktree's build), and the
 shells that daemon spawns all inherit `CHIMAERA_HOME`, the whole stack is isolated
 — nothing lands in the shared `~/.chimaera` — yet still per-worktree.
 
+The launcher also runs a generated `chimaera-dev` identity rather than
+`chimaera` (on macOS, a small `target/debug/chimaera-dev.app` wrapper with its
+own bundle id; elsewhere, a `target/debug/chimaera-dev` hard link). This keeps
+the isolated GUI process distinct in Activity Monitor and Computer Use while
+the released app is open; for live automation, target **`chimaera-dev`**, never
+the user's `chimaera`.
+
 **Why `~/…` and not `<worktree>/.chimaera-dev-app`:** the state dir holds unix
 sockets (the askpass relay, the ssh ControlMaster) whose *full path* must fit the
 ~104-byte `sun_path` limit. A CHIMAERA_HOME inside the deep worktree path
@@ -189,7 +196,9 @@ bash .claude/skills/develop/run-app-isolated.sh      # run in background — ope
 ```
 
 State lives under `CHIMAERA_HOME=~/.chimaera-dev-app/<worktree>`; the script
-scrubs `CLAUDE*`/`ANTHROPIC*` env (else the app's spawned agents die on start).
+scrubs `CLAUDE*`/`ANTHROPIC*` env (else the app's spawned agents die on start)
+and launches the generated `chimaera-dev` app identity. Computer Use must
+target `chimaera-dev`, which prevents it from driving the user's released app.
 Then tell the human: open a folder → start an agent → here's what to click.
 
 **2. To test against a REMOTE host from that isolated app** (e.g. Sherlock): a
