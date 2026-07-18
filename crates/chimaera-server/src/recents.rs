@@ -2,8 +2,8 @@
 //! conversations (DESIGN.md "The agent launcher" — Rail Recents). When an
 //! agent session's PTY dies, its record retires here instead of vanishing,
 //! so the conversation can still be found — and resumed where the CLI
-//! supports it (`claude --resume`; codex/gemini restart fresh until their
-//! resume story is verified against real binaries).
+//! supports it (`claude --resume`; codex `thread/resume` / `codex resume`).
+//! A row starts fresh only when Chimaera did not capture a native handle.
 //!
 //! Live sessions never appear here: entries whose conversation is running
 //! again (resumed in some session) are hidden at read time, not deleted —
@@ -36,7 +36,8 @@ pub(crate) struct RecentEntry {
     /// Which agent CLI ran it (drives the rail glyph).
     pub(crate) kind: AgentKind,
     pub(crate) title: String,
-    /// Claude session id (`--resume <id>`); None = can only start fresh.
+    /// Native conversation handle (Claude session id / Codex thread id);
+    /// None = Chimaera can only start a fresh session from this row.
     pub(crate) resume: Option<String>,
     /// Ancestor session ids this conversation absorbed across resume cycles
     /// (claude forks a new id per resume; the ancestors' transcripts stay on
@@ -226,6 +227,21 @@ pub(crate) fn retire(
     osc: Option<&str>,
     ui: SessionUi,
 ) {
+    retire_with_resume(state, session_id, pinned, osc, ui, None);
+}
+
+/// Retire a session while carrying the structured driver's native handle.
+/// `AgentRecord::resume_id` is transcript-derived (the TUI/Claude path), so a
+/// Codex chat's thread id must cross from `ChatInfo` before its registry entry
+/// is removed. Claude hints still pass the transcript-existence gate below.
+pub(crate) fn retire_with_resume(
+    state: &Arc<AppState>,
+    session_id: &str,
+    pinned: Option<&str>,
+    osc: Option<&str>,
+    ui: SessionUi,
+    resume_hint: Option<String>,
+) {
     let Some(record) = crate::lock(&state.agents).remove(session_id) else {
         return;
     };
@@ -262,16 +278,23 @@ pub(crate) fn retire(
     let skip =
         was_mastermind || (record.kind == AgentKind::Claude && title == record.kind.as_str());
     if let Some(workspace_id) = workspace_id.filter(|_| !skip) {
-        // Only promise resumption a transcript can deliver: claude 2.1.204
+        // Codex owns its durable thread store and resumes by id in-protocol;
+        // there is no Claude-style transcript path to validate. ChatInfo is
+        // therefore the authority, with resumed_from as the fallback for a
+        // resumed process that died before initialization completed.
+        //
+        // Claude only promises resumption a transcript can deliver: 2.1.204
         // interactive sessions persist NO transcript (verified 2026-07-07),
         // so an unverified id would mint a row whose click dies with "No
-        // conversation found". The resumed-from ancestor is the fallback
-        // target when the session's own transcript never materialized.
+        // conversation found". The hint lets structured chat name its native
+        // id; it still has to resolve to an actual transcript file.
         let workspace_root = crate::lock(&state.workspaces)
             .get(&workspace_id)
             .map(|w| w.root);
-        let resume =
-            [record.resume_id(), record.resumed_from.clone()]
+        let resume = if record.kind == AgentKind::Codex {
+            resume_hint.or_else(|| record.resumed_from.clone())
+        } else {
+            [resume_hint, record.resume_id(), record.resumed_from.clone()]
                 .into_iter()
                 .flatten()
                 .find(|id| {
@@ -285,7 +308,8 @@ pub(crate) fn retire(
                             .with_extension("jsonl")
                             .is_file()
                     })
-                });
+                })
+        };
         let entry = RecentEntry {
             kind: record.kind,
             title,

@@ -477,13 +477,17 @@ async fn handle_chat_exit(state: &Arc<AppState>, id: &str, exit: DriverExit) {
             }
         }
         DriverExit::Clean(_) | DriverExit::Killed => {
-            state.chat.remove(id);
-            crate::recents::retire(
+            let resume = state
+                .chat
+                .remove(id)
+                .and_then(|info| info.native_session_id);
+            crate::recents::retire_with_resume(
                 state,
                 id,
                 None,
                 None,
                 chimaera_agent::model::SessionUi::Chat,
+                resume,
             );
         }
     }
@@ -499,6 +503,7 @@ async fn degrade_to_pty(
     recipe: ChatRecipe,
     pinned_name: Option<String>,
 ) -> bool {
+    let resume_hint = recipe.resume.clone();
     // A degrade often follows an agent update: the recipe's bin was resolved
     // at chat spawn and may have been replaced/moved since (the npm-reinstall
     // window). Re-detect a dangling path before building the argv, or the
@@ -515,12 +520,13 @@ async fn degrade_to_pty(
             }
             Err(err) => {
                 tracing::error!(%id, %err, "degrade respawn failed: agent binary missing");
-                crate::recents::retire(
+                crate::recents::retire_with_resume(
                     state,
                     id,
                     None,
                     None,
                     chimaera_agent::model::SessionUi::Chat,
+                    resume_hint,
                 );
                 return false;
             }
@@ -578,12 +584,13 @@ async fn degrade_to_pty(
         }
         Err(err) => {
             tracing::error!(%id, %err, "degrade respawn failed");
-            crate::recents::retire(
+            crate::recents::retire_with_resume(
                 state,
                 id,
                 None,
                 None,
                 chimaera_agent::model::SessionUi::Chat,
+                resume_hint,
             );
             false
         }
@@ -753,42 +760,64 @@ async fn resolve_respawn_inputs(
     Ok((settings, mcp_config, bin, detection.version))
 }
 
+type ForkCut = (usize, u32, Option<(usize, String)>);
+
 /// Locate the rewind cut for `resume_at` in a journal's content: the line
 /// index where dropped history starts, plus the number of turns
-/// (`TurnStarted` events) at/after it — codex's `thread/rollback` count.
+/// (`TurnStarted` events) at/after it — codex's `thread/rollback` count — and
+/// an optional earlier queued-message line to neutralize (see below).
 ///
 /// `resume_at` is the uuid of the message PRECEDING the selected user message
-/// (the fork's resume point). The cut is the `UserMessage` line whose
-/// `Checkpoint` (the pair is emitted UserMessage-then-Checkpoint) carries
-/// that `preceding_uuid`. `None` = no anchor match.
-fn find_fork_cut(content: &str, resume_at: &str) -> Option<(usize, u32)> {
+/// (the fork's resume point). Fresh sends emit UserMessage-then-Checkpoint.
+/// A Codex follow-up queued during the previous turn receives its Checkpoint
+/// only when it later opens a turn, so its original queued echo can be earlier
+/// than the cut. In that case the third return member identifies the echo:
+/// truncation replaces it in-place with a Cancelled tombstone (same seq),
+/// preserving the completed previous turn without replaying a phantom queue.
+/// `None` = no anchor match.
+fn find_fork_cut(content: &str, resume_at: &str) -> Option<ForkCut> {
     let lines: Vec<&str> = content.lines().collect();
     let is_user_message = |line: &str| {
         serde_json::from_str::<SeqEvent>(line)
             .map(|e| matches!(e.ev, AgentEvent::UserMessage { .. }))
             .unwrap_or(false)
     };
-    let mut cut: Option<usize> = None;
+    let mut found: Option<(usize, Option<(usize, String)>)> = None;
     for (i, line) in lines.iter().enumerate() {
         let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
             continue;
         };
         if let AgentEvent::Checkpoint {
+            user_message_id,
             preceding_uuid: Some(preceding),
-            ..
         } = &entry.ev
         {
             if preceding == resume_at {
-                cut = Some(if i > 0 && is_user_message(lines[i - 1]) {
-                    i - 1
+                found = Some(if i > 0 && is_user_message(lines[i - 1]) {
+                    (i - 1, None)
                 } else {
-                    i
+                    // Native queue timing: find the earlier queued echo by
+                    // delivery id. Cut at the later checkpoint so every event
+                    // from the previous turn stays; neutralize only the echo.
+                    let queued = lines[..i].iter().enumerate().rev().find_map(|(idx, line)| {
+                        serde_json::from_str::<SeqEvent>(line)
+                            .ok()
+                            .and_then(|entry| match entry.ev {
+                                AgentEvent::UserMessage {
+                                    id: Some(id),
+                                    queued: true,
+                                    ..
+                                } if id == *user_message_id => Some((idx, user_message_id.clone())),
+                                _ => None,
+                            })
+                    });
+                    (i, queued)
                 });
                 break;
             }
         }
     }
-    let cut = cut.filter(|&c| c < lines.len())?;
+    let (cut, neutralize) = found.filter(|(c, _)| *c < lines.len())?;
     // Every turn the journal saw open at/after the cut is a turn codex's
     // history holds past the checkpoint (chat turns, steers folded into
     // them, and compaction turns alike). Turns run outside this journal
@@ -802,7 +831,7 @@ fn find_fork_cut(content: &str, resume_at: &str) -> Option<(usize, u32)> {
                 .unwrap_or(false)
         })
         .count() as u32;
-    Some((cut, turns))
+    Some((cut, turns, neutralize))
 }
 
 /// Truncate a rewound session's journal at the conversation-fork point.
@@ -824,11 +853,27 @@ fn truncate_journal_at_fork(
     resume_at: &str,
 ) -> std::io::Result<Option<u32>> {
     let content = std::fs::read_to_string(path)?;
-    let Some((cut, turns)) = find_fork_cut(&content, resume_at) else {
+    let Some((cut, turns, neutralize)) = find_fork_cut(&content, resume_at) else {
         return Ok(None);
     };
     let mut kept = String::with_capacity(content.len());
-    for line in content.lines().take(cut) {
+    for (idx, line) in content.lines().take(cut).enumerate() {
+        if let Some((neutralize_idx, id)) = &neutralize {
+            if idx == *neutralize_idx {
+                let mut entry: SeqEvent = serde_json::from_str(line)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+                entry.ev = AgentEvent::UserMessageUpdate {
+                    id: id.clone(),
+                    state: chimaera_agent::model::UserMessageState::Cancelled,
+                };
+                kept.push_str(
+                    &serde_json::to_string(&entry)
+                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+                );
+                kept.push('\n');
+                continue;
+            }
+        }
         kept.push_str(line);
         kept.push('\n');
     }
@@ -1985,6 +2030,112 @@ mod tests {
             None
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 9);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A queued Codex follow-up is echoed while the PREVIOUS turn is still
+    /// streaming, then receives its checkpoint only when promoted to the next
+    /// turn. Rewind must keep the completed previous turn, remove the selected
+    /// queued bubble, and still roll back the promoted turn exactly once.
+    #[test]
+    fn truncate_journal_neutralizes_early_queued_echo_at_late_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-fork-queued-truncate-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let lines = [
+            seq_line(
+                1,
+                AgentEvent::UserMessage {
+                    text: "first".into(),
+                    attachments: 0,
+                    id: Some("m1".into()),
+                    queued: false,
+                },
+            ),
+            seq_line(
+                2,
+                AgentEvent::Checkpoint {
+                    user_message_id: "m1".into(),
+                    preceding_uuid: None,
+                },
+            ),
+            seq_line(
+                3,
+                AgentEvent::TurnStarted {
+                    turn_id: "t1".into(),
+                },
+            ),
+            seq_line(
+                4,
+                AgentEvent::UserMessage {
+                    text: "next".into(),
+                    attachments: 0,
+                    id: Some("q2".into()),
+                    queued: true,
+                },
+            ),
+            seq_line(
+                5,
+                AgentEvent::MessageChunk {
+                    turn_id: "t1".into(),
+                    text: "finished previous reply".into(),
+                },
+            ),
+            seq_line(
+                6,
+                AgentEvent::TurnCompleted {
+                    turn_id: "t1".into(),
+                    usage: Default::default(),
+                },
+            ),
+            seq_line(
+                7,
+                AgentEvent::Checkpoint {
+                    user_message_id: "q2".into(),
+                    preceding_uuid: Some("m1".into()),
+                },
+            ),
+            seq_line(
+                8,
+                AgentEvent::UserMessageUpdate {
+                    id: "q2".into(),
+                    state: chimaera_agent::model::UserMessageState::Sent,
+                },
+            ),
+            seq_line(
+                9,
+                AgentEvent::TurnStarted {
+                    turn_id: "t2".into(),
+                },
+            ),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        assert_eq!(truncate_journal_at_fork(&path, "m1").unwrap(), Some(1));
+        let kept: Vec<SeqEvent> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            kept.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert!(matches!(
+            &kept[3].ev,
+            AgentEvent::UserMessageUpdate {
+                id,
+                state: chimaera_agent::model::UserMessageState::Cancelled,
+            } if id == "q2"
+        ));
+        assert!(matches!(
+            &kept[5].ev,
+            AgentEvent::TurnCompleted { turn_id, .. } if turn_id == "t1"
+        ));
 
         std::fs::remove_dir_all(&dir).ok();
     }

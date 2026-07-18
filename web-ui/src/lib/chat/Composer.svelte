@@ -459,7 +459,7 @@
       placeholder={disabled
         ? "chat ended"
         : running
-          ? "type through — the agent hears you mid-run (Esc to stop)"
+          ? "queue a follow-up for the next run (Esc to stop)"
           : "message the agent… (Enter to send · / commands · @ files)"}
       rows={1}
       {disabled}

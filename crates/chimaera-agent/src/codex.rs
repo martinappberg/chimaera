@@ -183,7 +183,7 @@ impl CodexChat {
 
 // --- structured driver -------------------------------------------------------
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use tokio::task::JoinHandle;
 
@@ -443,6 +443,9 @@ enum PendingRpc {
         input: Value,
         client_msg_id: String,
         retried: bool,
+        /// Stable request order across the one allowed expected-turn retry.
+        /// Failed steers re-drive in click order before the ordinary FIFO.
+        order: u64,
     },
     Interrupt,
     /// thread/settings/update probe; falls back to per-turn fields on
@@ -459,6 +462,18 @@ enum PendingRpc {
     /// thread/compact/start ack; the compaction itself runs as its own turn
     /// whose contextCompaction item lands the "context compacted" notice.
     Compact,
+}
+
+/// A Codex follow-up held by Chimaera until either the current turn finishes
+/// (FIFO: it opens the next turn) or the user explicitly promotes it with the
+/// native-style Steer action (`turn/steer`). Keeping this client-side is the
+/// app-server contract: queuing is a host policy, steering is the protocol RPC.
+struct QueuedSend {
+    input: Value,
+    client_msg_id: String,
+    /// A Steer click can race the `turn/start` → `turn/started` window. Keep
+    /// the intent on the queued entry and issue the RPC once the turn id lands.
+    steer_when_active: bool,
 }
 
 /// An outstanding item/tool/requestUserInput prompt.
@@ -572,9 +587,16 @@ struct CodexMapper {
     /// this window must NOT fire a second turn/start (the server rejects it and
     /// the already-echoed user message is lost) — they buffer instead.
     turn_pending: bool,
-    /// Sends captured during the turn/start→turn/started window; flushed as
-    /// steers once the turn id arrives (or re-driven if the start fails).
-    buffered_sends: Vec<(Value, String)>,
+    /// Mid-turn follow-ups, FIFO. Unlike the old type-through path, ordinary
+    /// sends stay here for subsequent turns; only `SteerQueued` promotes one
+    /// into the running turn. This mirrors Codex's native queue-vs-steer split.
+    queued_sends: VecDeque<QueuedSend>,
+    /// Steers whose target turn ended before their RPC answer. Multiple Steer
+    /// requests can be in flight; collect their failures by original request
+    /// order, then start exactly one after every outstanding steer settles.
+    /// They outrank the ordinary FIFO because the user explicitly promoted
+    /// them into the earlier run.
+    deferred_steer_redrives: BTreeMap<u64, QueuedSend>,
     /// Interrupt watchdog: ticks remaining before we synthesize the abort the
     /// app-server never sent. Armed on `Interrupt`, counted down in `tick`,
     /// disarmed when a turn ends (`reset_turn_state`) or a fresh turn opens.
@@ -582,8 +604,8 @@ struct CodexMapper {
     interrupt_grace: Option<u32>,
     /// Idle-flush watchdog: ticks remaining before we rescue a stranded
     /// buffer. Managed in `tick`, armed when the driver is idle (no active or
-    /// pending turn) with `buffered_sends` still holding messages a turn end
-    /// left un-steered. Symmetric to claude's idle-flush; see
+    /// pending turn) with queued or deferred-steer input a turn end left
+    /// stranded. Symmetric to claude's idle-flush; see
     /// `IDLE_FLUSH_GRACE_TICKS`.
     idle_flush_grace: Option<u32>,
     coalescer: Coalescer,
@@ -617,8 +639,9 @@ struct CodexMapper {
     /// Latest cumulative token usage (turn/completed carries none here).
     last_usage: Usage,
     /// The last turn-OPENING send's minted uuid — the fork anchor chain for
-    /// Checkpoint events. Steered/buffered sends join a running turn, and
-    /// thread/rollback drops whole turns, so only turn openers anchor.
+    /// Checkpoint events. Steered sends join a running turn, while a held
+    /// follow-up anchors only when promoted to its own turn; thread/rollback
+    /// drops whole turns, so only actual turn openers belong in this chain.
     last_checkpoint: Option<String>,
     /// The embedder's standing MCP consent (`SpawnSpec.mcp_auto_approve`):
     /// matching tool-call elicitations are answered accept without a
@@ -664,7 +687,8 @@ impl CodexMapper {
             turn_id: String::new(),
             turn_active: false,
             turn_pending: false,
-            buffered_sends: Vec::new(),
+            queued_sends: VecDeque::new(),
+            deferred_steer_redrives: BTreeMap::new(),
             interrupt_grace: None,
             idle_flush_grace: None,
             coalescer: Coalescer::new(),
@@ -759,9 +783,10 @@ impl CodexMapper {
                 step.events.push(AgentEvent::TurnStarted {
                     turn_id: self.turn_id.clone(),
                 });
-                // Sends captured during the start window steer into the
-                // now-identified turn instead of being lost.
-                self.flush_buffered(&mut step);
+                // Ordinary follow-ups remain queued for later turns. Only an
+                // explicit Steer click captured during the unidentified start
+                // window is promoted now that the turn id is known.
+                self.flush_requested_steers(&mut step);
             }
             // A new reasoning-summary section: keep the thought stream
             // readable with a paragraph break instead of one run-on blob.
@@ -983,7 +1008,6 @@ impl CodexMapper {
                 // claude on_result's `was_active` guard).
                 let was_active = self.turn_active;
                 self.turn_active = false;
-                let mut aborted = false;
                 if was_active {
                     let turn = &frame["params"]["turn"];
                     let mut usage = self.last_usage.clone();
@@ -1002,7 +1026,6 @@ impl CodexMapper {
                             reason: "interrupted".into(),
                             interrupted: true,
                         });
-                        aborted = true;
                     } else {
                         step.events
                             .push(AgentEvent::TurnCompleted { turn_id, usage });
@@ -1018,15 +1041,12 @@ impl CodexMapper {
                     }));
                 }
                 self.reset_turn_state();
-                if aborted {
-                    // A stop ends only THIS turn, never the user's queued
-                    // messages (claude parity, maintainer decision 2026-07-11):
-                    // re-drive the buffered queue as the next turn, and leave
-                    // in-flight steers tracked — codex is alive, so their
-                    // post-abort error answers re-drive them through the same
-                    // fresh-turn path. AFTER reset_turn_state, which would
-                    // clobber the re-drive's turn_pending start window.
-                    self.redrive_queued_after_abort(&mut step);
+                if was_active {
+                    // Queue means NEXT run whether this turn completed or was
+                    // stopped: promote one FIFO entry, leave the rest queued.
+                    // AFTER reset_turn_state, which would clobber the new
+                    // turn_pending start window.
+                    self.start_next_queued(&mut step);
                 }
             }
             "turn/failed" => {
@@ -1055,12 +1075,9 @@ impl CodexMapper {
                 // stream/location maps leak into the next turn.
                 self.reset_turn_state();
                 if was_active {
-                    // Only THIS turn died — the queued messages behind it still
-                    // deliver (claude parity): re-drive the buffer as the next
-                    // turn (after reset_turn_state, which would clobber its
-                    // turn_pending window); in-flight steers stay tracked and
-                    // re-drive off their own error answers.
-                    self.redrive_queued_after_abort(&mut step);
+                    // Only THIS turn died; the oldest queued follow-up still
+                    // opens the next turn. The rest remain queued.
+                    self.start_next_queued(&mut step);
                 }
             }
             _ => {}
@@ -1104,20 +1121,20 @@ impl CodexMapper {
                 self.turn_pending = false;
                 let msg = err["message"].as_str().unwrap_or_default();
                 // If a turn was already active, the error names it: adopt that
-                // turn and steer the buffered sends rather than erroring.
+                // turn and service only explicit start-window Steer requests
+                // rather than erroring; ordinary follow-ups remain queued.
                 if let Some(live) = parse_expected_turn_id(msg) {
                     self.turn_id = live;
                     self.turn_active = true;
-                    self.flush_buffered(step);
+                    self.flush_requested_steers(step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("turn/start failed: {}", err["message"]),
                         fatal: false,
                     });
-                    // Re-drive any buffered sends so they aren't stranded.
-                    if !self.buffered_sends.is_empty() {
-                        let (input, client_msg_id) = self.buffered_sends.remove(0);
-                        self.redrive_as_fresh_turn(input, client_msg_id, step);
+                    // Promote one queued send so it isn't stranded.
+                    if let Some(queued) = self.queued_sends.pop_front() {
+                        self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
                     }
                 }
             }
@@ -1126,6 +1143,7 @@ impl CodexMapper {
                     input,
                     client_msg_id,
                     retried: false,
+                    order,
                 },
                 Some(err),
             ) => {
@@ -1142,6 +1160,7 @@ impl CodexMapper {
                                 input: input.clone(),
                                 client_msg_id: client_msg_id.clone(),
                                 retried: true,
+                                order,
                             },
                         );
                         step.outbound.push(json!({
@@ -1156,9 +1175,11 @@ impl CodexMapper {
                     }
                     // Not a turn-id mismatch: if the turn ended between our send
                     // and this steer, re-drive the saved input as a fresh turn
-                    // instead of dropping the already-echoed user message.
+                    // instead of dropping the already-echoed user message. A
+                    // sibling steer may still be unresolved, so defer by click
+                    // order and let the shared scheduler open only one turn.
                     None if !self.turn_active => {
-                        self.redrive_as_fresh_turn(input, client_msg_id, step)
+                        self.defer_steer_redrive(order, input, client_msg_id, step)
                     }
                     None => {
                         step.events.push(AgentEvent::Error {
@@ -1178,11 +1199,12 @@ impl CodexMapper {
                     input,
                     client_msg_id,
                     retried: true,
+                    order,
                 },
                 Some(err),
             ) => {
                 if !self.turn_active {
-                    self.redrive_as_fresh_turn(input, client_msg_id, step);
+                    self.defer_steer_redrive(order, input, client_msg_id, step);
                 } else {
                     step.events.push(AgentEvent::Error {
                         message: format!("steer failed: {}", err["message"]),
@@ -1242,6 +1264,10 @@ impl CodexMapper {
                     id: client_msg_id,
                     state: UserMessageState::Sent,
                 });
+                // A turn-end frame can precede the steer acknowledgement. It
+                // deliberately held the ordinary FIFO; the last steer answer
+                // releases exactly one next turn when the driver is idle.
+                self.start_next_queued(step);
             }
             // Compact's ack is an empty result; the compaction turn's
             // contextCompaction item carries the visible notice.
@@ -2050,38 +2076,74 @@ impl CodexMapper {
         }
     }
 
-    /// After a user stop or a failed turn, the not-yet-delivered queue still
-    /// delivers — the abort ends only the CURRENT turn (claude parity,
-    /// maintainer decision 2026-07-11). Re-drive the FIRST buffered send as a
-    /// fresh turn; the rest stay buffered and steer into it once its
-    /// `turn/started` lands (the existing start-window path). In-flight steer
-    /// RPCs are deliberately NOT touched: codex is alive on these paths, so it
-    /// answers each steer — success resolves `sent` (it landed before the
-    /// abort), and an error re-drives it as a fresh turn via `on_response`'s
-    /// steer-error arms. Call AFTER `reset_turn_state` (which clears the
-    /// `turn_pending` window this re-drive opens).
-    fn redrive_queued_after_abort(&mut self, step: &mut DriverStep) {
-        if self.buffered_sends.is_empty() {
+    fn steer_in_flight(&self) -> bool {
+        self.pending_rpcs
+            .values()
+            .any(|pending| matches!(pending, PendingRpc::Steer { .. }))
+    }
+
+    /// A steer missed the turn it targeted. Keep it ahead of the ordinary
+    /// FIFO, but do not open a turn until every sibling steer has answered —
+    /// otherwise two late failures can race two `turn/start` requests.
+    fn defer_steer_redrive(
+        &mut self,
+        order: u64,
+        input: Value,
+        client_msg_id: String,
+        step: &mut DriverStep,
+    ) {
+        self.deferred_steer_redrives.insert(
+            order,
+            QueuedSend {
+                input,
+                client_msg_id,
+                steer_when_active: false,
+            },
+        );
+        self.start_next_queued(step);
+    }
+
+    /// Deliver exactly one waiting follow-up as the next fresh turn. Failed
+    /// explicit steers go first in click order, then the ordinary FIFO. The
+    /// rest stay queued for later turns (native Codex queue semantics).
+    ///
+    /// A live/pending turn or any unresolved steer gates promotion. A late
+    /// steer response calls this again, so the final acknowledgement releases
+    /// one request without ever issuing concurrent `turn/start`s. Turn-end
+    /// callers run this AFTER `reset_turn_state`, which clears `turn_pending`.
+    fn start_next_queued(&mut self, step: &mut DriverStep) {
+        if self.turn_active || self.turn_pending || self.steer_in_flight() {
             return;
         }
-        let (input, client_msg_id) = self.buffered_sends.remove(0);
-        self.redrive_as_fresh_turn(input, client_msg_id, step);
+        let queued = self
+            .deferred_steer_redrives
+            .pop_first()
+            .map(|(_, queued)| queued)
+            .or_else(|| self.queued_sends.pop_front());
+        let Some(queued) = queued else { return };
+        self.redrive_as_fresh_turn(queued.input, queued.client_msg_id, step);
     }
 
     /// Drop every user message still queued behind the current turn — the
-    /// not-yet-sent `buffered_sends` and any in-flight `Steer` RPC. This is
+    /// not-yet-sent `queued_sends` and any in-flight `Steer` RPC. This is
     /// the DEAD-OR-UNRESPONSIVE-agent resolution only (teardown, and the
     /// interrupt watchdog whose firing means codex stopped answering): with
     /// no live agent to deliver to or answer a steer, `dropped` is the honest
     /// terminal state — and removing the pending steers stops a late error
     /// from resurrecting a message against a gone process. A LIVE abort
-    /// (turn/completed interrupted, turn/failed) re-drives instead — see
-    /// `redrive_queued_after_abort`.
+    /// (turn/completed interrupted, turn/failed) starts the next queued turn
+    /// instead — see `start_next_queued`.
     fn drain_queued_sends(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        for (_input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
+        for (_, queued) in std::mem::take(&mut self.deferred_steer_redrives) {
             events.push(AgentEvent::UserMessageUpdate {
-                id: client_msg_id,
+                id: queued.client_msg_id,
+                state: UserMessageState::Dropped,
+            });
+        }
+        for queued in std::mem::take(&mut self.queued_sends) {
+            events.push(AgentEvent::UserMessageUpdate {
+                id: queued.client_msg_id,
                 state: UserMessageState::Dropped,
             });
         }
@@ -2486,6 +2548,7 @@ impl CodexMapper {
                 input: input.clone(),
                 client_msg_id: client_msg_id.clone(),
                 retried: false,
+                order: id,
             },
         );
         step.outbound.push(json!({
@@ -2530,12 +2593,19 @@ impl CodexMapper {
         }));
     }
 
-    /// Steer every send buffered during the start window into the turn whose
-    /// id just became known.
-    fn flush_buffered(&mut self, step: &mut DriverStep) {
-        for (input, client_msg_id) in std::mem::take(&mut self.buffered_sends) {
-            self.emit_steer(input, client_msg_id, step);
+    /// A Steer click may arrive after `turn/start` but before `turn/started`.
+    /// Promote only explicitly marked entries once the id is known; ordinary
+    /// follow-ups stay queued for later turns.
+    fn flush_requested_steers(&mut self, step: &mut DriverStep) {
+        let mut queued = VecDeque::new();
+        for send in std::mem::take(&mut self.queued_sends) {
+            if send.steer_when_active {
+                self.emit_steer(send.input, send.client_msg_id, step);
+            } else {
+                queued.push_back(send);
+            }
         }
+        self.queued_sends = queued;
     }
 
     /// A queued send whose steer/start window collapsed becomes a fresh
@@ -2548,6 +2618,17 @@ impl CodexMapper {
         client_msg_id: String,
         step: &mut DriverStep,
     ) {
+        debug_assert!(
+            !self.turn_active && !self.turn_pending,
+            "fresh-turn redrive must be serialized behind the current turn"
+        );
+        // A queued message becomes a rewindable boundary only NOW, when it
+        // opens its own turn. An explicitly steered message never gets one.
+        let preceding = self.last_checkpoint.replace(client_msg_id.clone());
+        step.events.push(AgentEvent::Checkpoint {
+            user_message_id: client_msg_id.clone(),
+            preceding_uuid: preceding,
+        });
         step.events.push(AgentEvent::UserMessageUpdate {
             id: client_msg_id.clone(),
             state: UserMessageState::Sent,
@@ -2566,10 +2647,13 @@ impl CodexMapper {
             // Type-through: inject into the RUNNING turn (steer).
             self.emit_steer(input, client_msg_id, step);
         } else if self.turn_pending {
-            // A turn/start is in flight but unidentified: buffer to steer
-            // once turn/started lands, so we don't race a second turn/start
-            // (rejected) and lose the echoed message.
-            self.buffered_sends.push((input, client_msg_id));
+            // Decline feedback is explicit type-through (not a queued user
+            // bubble). Remember that intent until turn/started supplies the id.
+            self.queued_sends.push_back(QueuedSend {
+                input,
+                client_msg_id,
+                steer_when_active: true,
+            });
         } else {
             self.emit_turn_start(input, client_msg_id, step);
         }
@@ -2598,9 +2682,9 @@ impl CodexMapper {
                 }
                 let input = json!(input);
                 let client_msg_id = crate::model::fresh_uuid();
-                // A steered/buffered send is not consumed by the agent yet:
-                // it echoes queued and resolves via UserMessageUpdate when
-                // the steer RPC answers (or the buffered flush's steer does).
+                // Queue and steer are separate Codex-native actions. A send
+                // during a live/pending run is held for the NEXT turn; the
+                // UI's Steer button explicitly promotes it via `turn/steer`.
                 let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
                 step.events.push(AgentEvent::UserMessage {
                     text: text.clone(),
@@ -2608,14 +2692,12 @@ impl CodexMapper {
                     id: Some(client_msg_id.clone()),
                     queued,
                 });
-                if self.turn_active && !self.turn_id.is_empty() {
-                    // Type-through: inject into the RUNNING turn (steer).
-                    self.emit_steer(input, client_msg_id, &mut step);
-                } else if self.turn_pending {
-                    // A turn/start is in flight but unidentified: buffer to
-                    // steer once turn/started lands, so we don't race a second
-                    // turn/start (rejected) and lose the echoed message.
-                    self.buffered_sends.push((input, client_msg_id));
+                if queued {
+                    self.queued_sends.push_back(QueuedSend {
+                        input,
+                        client_msg_id,
+                        steer_when_active: false,
+                    });
                 } else {
                     // Only a turn-OPENING send anchors a checkpoint: rewind
                     // rolls back whole turns (thread/rollback numTurns), so a
@@ -2789,8 +2871,8 @@ impl CodexMapper {
                     "params": { "threadId": self.thread_id },
                 }));
             }
-            // Pull back a still-queued message. A send still in the pre-steer
-            // buffer is genuinely pulled back (it never reached codex). A send
+            // Pull back a still-queued message. A send still in the next-run
+            // FIFO is genuinely pulled back (it never reached codex). A send
             // whose steer RPC is IN FLIGHT is mid-delivery — it's on the wire
             // and its `sent`/re-drive resolution is still coming, so a
             // tombstone now would vanish a bubble the agent may consume:
@@ -2810,10 +2892,42 @@ impl CodexMapper {
                             .into(),
                     });
                 } else {
-                    self.buffered_sends.retain(|(_, cid)| cid != &id);
+                    self.queued_sends.retain(|send| send.client_msg_id != id);
                     step.events.push(AgentEvent::UserMessageUpdate {
                         id,
                         state: UserMessageState::Cancelled,
+                    });
+                }
+            }
+            // Promote one native queued follow-up. With a known active turn it
+            // steers now; during the start window it remembers the click until
+            // turn/started supplies expectedTurnId; if the run ended in the
+            // meantime, the selected message simply opens the next turn.
+            AgentCommand::SteerQueued { id } => {
+                let steer_in_flight = self.pending_rpcs.values().any(
+                    |p| matches!(p, PendingRpc::Steer { client_msg_id, .. } if *client_msg_id == id),
+                );
+                if steer_in_flight {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that message is already being steered".into(),
+                    });
+                } else if let Some(pos) = self
+                    .queued_sends
+                    .iter()
+                    .position(|send| send.client_msg_id == id)
+                {
+                    if self.turn_active && !self.turn_id.is_empty() {
+                        let send = self.queued_sends.remove(pos).expect("position exists");
+                        self.emit_steer(send.input, send.client_msg_id, &mut step);
+                    } else if self.turn_pending {
+                        self.queued_sends[pos].steer_when_active = true;
+                    } else {
+                        let send = self.queued_sends.remove(pos).expect("position exists");
+                        self.redrive_as_fresh_turn(send.input, send.client_msg_id, &mut step);
+                    }
+                } else {
+                    step.events.push(AgentEvent::Notice {
+                        text: "that message is no longer queued".into(),
                     });
                 }
             }
@@ -2904,18 +3018,17 @@ impl CodexMapper {
 
     /// The idle-flush (see `IDLE_FLUSH_GRACE_TICKS`). codex normally resolves
     /// every queued message at a well-defined point (a steer's RPC answer, a
-    /// live abort's re-drive, or the teardown drain), so this is the defensive
+    /// turn-end promotion, or the teardown drain), so this is the defensive
     /// rescue for the one seam where it can't: a turn end that fires while a
-    /// `turn/start` was still in flight (`turn_pending`) leaves
-    /// `buffered_sends` stranded with no turn to steer them into. When the
-    /// driver is idle with a stranded buffer past the grace, re-drive the
-    /// oldest as a fresh turn (delivering it, resolving `sent`); the rest
-    /// re-buffer and steer once it starts — the same path a `turn/start` error
-    /// takes. A codex buffer was never sent, so we DELIVER it rather than
-    /// declare it sent unseen.
+    /// `turn/start` was still in flight (`turn_pending`) leaves waiting input
+    /// stranded with no turn to promote it from. When the driver is idle with
+    /// a stranded queue past the grace, open the oldest as a fresh turn; the
+    /// rest remain queued. A queued entry was never sent, so we DELIVER it
+    /// rather than declare it sent unseen.
     fn idle_flush(&mut self) -> DriverStep {
         let mut step = DriverStep::default();
-        if self.turn_active || self.turn_pending || self.buffered_sends.is_empty() {
+        let queue_empty = self.queued_sends.is_empty() && self.deferred_steer_redrives.is_empty();
+        if self.turn_active || self.turn_pending || self.steer_in_flight() || queue_empty {
             self.idle_flush_grace = None;
             return step;
         }
@@ -2928,8 +3041,7 @@ impl CodexMapper {
             }
             Some(_) => {
                 self.idle_flush_grace = None;
-                let (input, client_msg_id) = self.buffered_sends.remove(0);
-                self.redrive_as_fresh_turn(input, client_msg_id, &mut step);
+                self.start_next_queued(&mut step);
             }
         }
         step
@@ -3190,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn mid_turn_send_steers_with_expected_turn_id() {
+    fn mid_turn_send_queues_until_explicit_steer() {
         let mut m = mapper();
         active_turn(&mut m);
         let step = m.on_command(AgentCommand::Send {
@@ -3198,20 +3310,26 @@ mod tests {
                 text: "also do X".into(),
             }],
         });
-        // The echo marks the message queued until the steer RPC answers.
+        // Enter queues for the next turn; it does not implicitly steer.
         let msg_id = match &step.events[0] {
             AgentEvent::UserMessage { id, queued, .. } => {
-                assert!(queued, "a steered send echoes queued");
-                id.clone().expect("steered send carries a delivery id")
+                assert!(queued, "a mid-turn send echoes queued");
+                id.clone().expect("queued send carries a delivery id")
             }
             other => panic!("expected UserMessage, got {other:?}"),
         };
+        assert!(step.outbound.is_empty(), "queue sends nothing to codex yet");
+        assert_eq!(m.queued_sends.len(), 1);
+
+        // The separate Steer action promotes exactly this entry.
+        let step = m.on_command(AgentCommand::SteerQueued { id: msg_id.clone() });
         assert_eq!(step.outbound[0]["method"], "turn/steer");
         assert_eq!(step.outbound[0]["params"]["expectedTurnId"], "turn-A");
         assert_eq!(
             step.outbound[0]["params"]["clientUserMessageId"],
             json!(msg_id)
         );
+        assert!(m.queued_sends.is_empty(), "steered entry leaves the FIFO");
 
         // Steer accepted → the message resolves sent, exactly once.
         let rpc_id = step.outbound[0]["id"].as_u64().unwrap();
@@ -3226,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    fn send_during_start_window_buffers_then_steers_on_turn_started() {
+    fn steer_clicked_during_start_window_waits_for_turn_id() {
         let mut m = mapper();
         // First send: no active turn → turn/start, and the start window opens.
         let step = m.on_command(AgentCommand::Send {
@@ -3234,25 +3352,30 @@ mod tests {
         });
         assert_eq!(step.outbound[0]["method"], "turn/start");
         assert!(m.turn_pending);
-        // Second send arrives BEFORE turn/started: it must NOT fire a second
-        // turn/start (which the server rejects, losing the message) — it buffers,
-        // echoed queued until its flushed steer resolves.
+        // Second send arrives BEFORE turn/started: it queues without racing a
+        // second turn/start into the app-server.
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "two".into() }],
         });
         assert!(
             step.outbound.is_empty(),
-            "second send buffers, no second turn/start: {:?}",
+            "second send queues, no second turn/start: {:?}",
             step.outbound
         );
-        let buffered_id = match &step.events[0] {
+        let queued_id = match &step.events[0] {
             AgentEvent::UserMessage { id, queued, .. } => {
-                assert!(queued, "a buffered send echoes queued");
+                assert!(queued, "the follow-up echoes queued");
                 id.clone().unwrap()
             }
             other => panic!("expected UserMessage, got {other:?}"),
         };
-        // turn/started lands: the buffered send flushes as a steer into it.
+        // A Steer click in this unidentified window is remembered, not lost.
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: queued_id.clone(),
+        });
+        assert!(step.outbound.is_empty(), "no expectedTurnId exists yet");
+
+        // turn/started lands: only the explicitly promoted send steers into it.
         let step = m.on_frame(&json!({
             "method": "turn/started",
             "params": { "turn": { "id": "turn-Z" } },
@@ -3262,18 +3385,63 @@ mod tests {
             .outbound
             .iter()
             .find(|f| f["method"] == "turn/steer")
-            .expect("buffered send steered");
+            .expect("explicitly promoted send steered");
         assert_eq!(steer["params"]["expectedTurnId"], "turn-Z");
-        // …and the flushed steer's success resolves the buffered send.
+        // …and the flushed steer's success resolves the queued send.
         let rpc_id = steer["id"].as_u64().unwrap();
         let step = m.on_frame(&json!({ "id": rpc_id, "result": {} }));
         assert_eq!(
             step.events,
             vec![AgentEvent::UserMessageUpdate {
-                id: buffered_id,
+                id: queued_id,
                 state: UserMessageState::Sent,
             }]
         );
+    }
+
+    #[test]
+    fn queued_followups_open_one_fresh_turn_at_a_time() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let second = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "second".into(),
+            }],
+        }));
+        let third = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "third".into(),
+            }],
+        }));
+        assert_eq!(m.queued_sends.len(), 2);
+
+        // Finishing the current turn promotes only the oldest queue entry.
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(step.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if id == &second
+        )));
+        assert!(step.outbound.iter().any(|o| o["method"] == "turn/start"));
+        assert_eq!(m.queued_sends.len(), 1);
+        assert_eq!(m.queued_sends[0].client_msg_id, third);
+
+        // The remaining entry does NOT auto-steer into the new turn.
+        let step = m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "turn": { "id": "turn-B" } },
+        }));
+        assert!(!step.outbound.iter().any(|o| o["method"] == "turn/steer"));
     }
 
     #[test]
@@ -3371,6 +3539,11 @@ mod tests {
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "go".into() }],
         });
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage { id: Some(id), .. } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let step = m.on_command(AgentCommand::SteerQueued { id: queued_id });
         let id = step.outbound[0]["id"].as_u64().unwrap();
         // The turn ended between our send and the steer response.
         m.on_frame(&json!({
@@ -3391,6 +3564,186 @@ mod tests {
     }
 
     #[test]
+    fn turn_end_waits_for_inflight_steer_before_fifo_promotion() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let next_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "ordinary next turn".into(),
+            }],
+        }));
+        let steered_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "promote this one".into(),
+            }],
+        }));
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: steered_id.clone(),
+        });
+        let steer_rpc = step.outbound[0]["id"].as_u64().unwrap();
+
+        // The turn ends before the steer answer. The ordinary FIFO must wait:
+        // starting it now would race the steer's possible fresh-turn redrive.
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(
+            !step.outbound.iter().any(|o| o["method"] == "turn/start"),
+            "an unresolved steer gates FIFO promotion: {:?}",
+            step.outbound
+        );
+        assert_eq!(m.queued_sends[0].client_msg_id, next_id);
+
+        // A non-turn-id steer failure re-drives only the explicitly promoted
+        // message. The ordinary entry remains queued, so there is exactly one
+        // turn/start in flight and user intent stays ordered.
+        let step = m.on_frame(&json!({
+            "id": steer_rpc,
+            "error": { "message": "no active turn" },
+        }));
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1, "only the failed steer re-drives");
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], steered_id);
+        assert!(m.turn_pending);
+        assert_eq!(m.queued_sends.len(), 1);
+        assert_eq!(m.queued_sends[0].client_msg_id, next_id);
+    }
+
+    #[test]
+    fn settled_steer_releases_waiting_fifo_after_turn_end() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let next_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "next".into(),
+            }],
+        }));
+        let steered_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "steered".into(),
+            }],
+        }));
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: steered_id.clone(),
+        });
+        let steer_rpc = step.outbound[0]["id"].as_u64().unwrap();
+        let step = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        assert!(!step.outbound.iter().any(|o| o["method"] == "turn/start"));
+
+        // A successful late ack means the promoted message landed in the old
+        // turn. It releases exactly the oldest ordinary follow-up now.
+        let step = m.on_frame(&json!({ "id": steer_rpc, "result": {} }));
+        assert!(step.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent }
+                if id == &steered_id
+        )));
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], next_id);
+        assert!(m.queued_sends.is_empty());
+        assert!(m.turn_pending);
+    }
+
+    #[test]
+    fn failed_concurrent_steers_redrive_in_click_order() {
+        let mut m = mapper();
+        active_turn(&mut m);
+        let queued_id = |step: &DriverStep| match &step.events[0] {
+            AgentEvent::UserMessage {
+                id: Some(id),
+                queued: true,
+                ..
+            } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let ordinary_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "ordinary".into(),
+            }],
+        }));
+        let first_steer_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "first steer".into(),
+            }],
+        }));
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: first_steer_id.clone(),
+        });
+        let first_rpc = step.outbound[0]["id"].as_u64().unwrap();
+        let second_steer_id = queued_id(&m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "second steer".into(),
+            }],
+        }));
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: second_steer_id.clone(),
+        });
+        let second_rpc = step.outbound[0]["id"].as_u64().unwrap();
+
+        m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-A", "status": "completed" } },
+        }));
+        // Responses arrive in reverse. The second click waits because the
+        // earlier steer is unresolved; neither can race the ordinary FIFO.
+        let step = m.on_frame(&json!({
+            "id": second_rpc,
+            "error": { "message": "no active turn" },
+        }));
+        assert!(!step.outbound.iter().any(|o| o["method"] == "turn/start"));
+        let step = m.on_frame(&json!({
+            "id": first_rpc,
+            "error": { "message": "no active turn" },
+        }));
+        let starts: Vec<_> = step
+            .outbound
+            .iter()
+            .filter(|o| o["method"] == "turn/start")
+            .collect();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["params"]["clientUserMessageId"], first_steer_id);
+        assert_eq!(m.deferred_steer_redrives.len(), 1);
+        assert_eq!(
+            m.deferred_steer_redrives
+                .first_key_value()
+                .unwrap()
+                .1
+                .client_msg_id,
+            second_steer_id
+        );
+        assert_eq!(m.queued_sends[0].client_msg_id, ordinary_id);
+    }
+
+    #[test]
     fn user_interrupt_preserves_queued_steer_via_redrive() {
         // Two-driver symmetry with claude: a stop ends only the CURRENT turn
         // (maintainer decision 2026-07-11). A message whose steer was still in
@@ -3402,7 +3755,6 @@ mod tests {
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "B".into() }],
         });
-        let steer_id = step.outbound[0]["id"].as_u64().unwrap();
         let queued_id = match &step.events[0] {
             AgentEvent::UserMessage {
                 id: Some(id),
@@ -3411,6 +3763,10 @@ mod tests {
             } => id.clone(),
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
+        let step = m.on_command(AgentCommand::SteerQueued {
+            id: queued_id.clone(),
+        });
+        let steer_id = step.outbound[0]["id"].as_u64().unwrap();
         // User hits stop; the turn then ends interrupted. The in-flight steer
         // is left tracked (codex is alive and WILL answer it) — nothing drops.
         m.on_command(AgentCommand::Interrupt);
@@ -3448,19 +3804,18 @@ mod tests {
         );
     }
 
-    /// Feature 2 (codex): a send still sitting in the pre-steer buffer can be
-    /// cancelled — it resolves `Cancelled`, leaves the buffer, and never steers
-    /// into the turn once it starts.
+    /// A follow-up still held in the next-run FIFO can be cancelled — it
+    /// resolves `Cancelled`, leaves the queue, and never reaches Codex.
     #[test]
-    fn cancel_queued_drops_a_buffered_send() {
+    fn cancel_queued_removes_a_held_followup() {
         let mut m = mapper();
         // First send opens the turn (turn/start); the start window is now open.
         m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "A".into() }],
         });
         assert!(m.turn_pending);
-        // Second send buffers during the window.
-        let buffered = match &m
+        // Second send queues during the window.
+        let queued = match &m
             .on_command(AgentCommand::Send {
                 blocks: vec![ContentBlock::Text { text: "B".into() }],
             })
@@ -3471,18 +3826,16 @@ mod tests {
             } => id.clone().unwrap(),
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
-        // Cancel it: resolves Cancelled and empties the buffer.
-        let step = m.on_command(AgentCommand::CancelQueued {
-            id: buffered.clone(),
-        });
+        // Cancel it: resolves Cancelled and empties the queue.
+        let step = m.on_command(AgentCommand::CancelQueued { id: queued.clone() });
         assert_eq!(
             step.events,
             vec![AgentEvent::UserMessageUpdate {
-                id: buffered.clone(),
+                id: queued.clone(),
                 state: UserMessageState::Cancelled,
             }]
         );
-        assert!(m.buffered_sends.is_empty(), "the buffer is emptied");
+        assert!(m.queued_sends.is_empty(), "the queue is emptied");
         // turn/started now steers NOTHING — the cancelled send is gone.
         let step = m.on_frame(&json!({
             "method": "turn/started",
@@ -3490,7 +3843,7 @@ mod tests {
         }));
         assert!(
             !step.outbound.iter().any(|o| o["method"] == "turn/steer"),
-            "a cancelled buffered send never steers: {:?}",
+            "a cancelled queued send never steers: {:?}",
             step.outbound
         );
     }
@@ -3514,8 +3867,11 @@ mod tests {
             } => id.clone().unwrap(),
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
-        // It was steered (buffer is empty; the RPC is in flight, unanswered).
-        assert!(m.buffered_sends.is_empty());
+        m.on_command(AgentCommand::SteerQueued {
+            id: steered.clone(),
+        });
+        // It was explicitly steered (queue empty; RPC in flight, unanswered).
+        assert!(m.queued_sends.is_empty());
         let step = m.on_command(AgentCommand::CancelQueued { id: steered });
         assert!(matches!(
             step.events.as_slice(),
@@ -3543,19 +3899,18 @@ mod tests {
         );
     }
 
-    /// Feature 1 (codex): a buffer stranded when a turn ended under a pending
+    /// A queued follow-up stranded when a turn ended under a pending
     /// turn/start is rescued by the idle-flush — re-driven as a fresh turn
-    /// (delivered, resolves `sent`), never left faded "queued". Symmetric to
-    /// claude's idle-flush.
+    /// (delivered, resolves `sent`), never left faded "queued".
     #[test]
-    fn idle_flush_redrives_a_stranded_buffer() {
+    fn idle_flush_redrives_a_stranded_followup() {
         let mut m = mapper();
-        // A turn/start in flight, with a send buffered behind it…
+        // A turn/start in flight, with a follow-up queued behind it…
         m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "A".into() }],
         });
         assert!(m.turn_pending);
-        let buffered = match &m
+        let queued = match &m
             .on_command(AgentCommand::Send {
                 blocks: vec![ContentBlock::Text { text: "B".into() }],
             })
@@ -3567,14 +3922,14 @@ mod tests {
             other => panic!("expected a queued UserMessage, got {other:?}"),
         };
         // …then a turn ends under the pending start (no turn/started ever
-        // landed), stranding the buffer: reset_turn_state clears turn_pending
-        // but leaves buffered_sends, and turn_active was never set.
+        // landed), stranding the queue: reset_turn_state clears turn_pending
+        // but leaves queued_sends, and turn_active was never set.
         m.on_frame(&json!({
             "method": "turn/completed",
             "params": { "turn": { "id": "turn-A", "status": "completed" } },
         }));
         assert!(!m.turn_pending && !m.turn_active);
-        assert_eq!(m.buffered_sends.len(), 1, "the buffer is stranded");
+        assert_eq!(m.queued_sends.len(), 1, "the queue is stranded");
 
         // Ticks below the grace do nothing…
         for _ in 0..IDLE_FLUSH_GRACE_TICKS {
@@ -3589,9 +3944,9 @@ mod tests {
         assert!(
             step.events.iter().any(|e| matches!(
                 e,
-                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == buffered
+                AgentEvent::UserMessageUpdate { id, state: UserMessageState::Sent } if *id == queued
             )),
-            "the stranded buffer resolves sent: {:?}",
+            "the stranded follow-up resolves sent: {:?}",
             step.events
         );
         assert!(
@@ -3599,7 +3954,7 @@ mod tests {
             "and is delivered as a fresh turn: {:?}",
             step.outbound
         );
-        assert!(m.buffered_sends.is_empty(), "the buffer drained");
+        assert!(m.queued_sends.is_empty(), "the queue drained");
     }
 
     /// The interrupt watchdog (two-driver symmetry with claude): when the
@@ -3716,6 +4071,11 @@ mod tests {
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![ContentBlock::Text { text: "go".into() }],
         });
+        let queued = match &step.events[0] {
+            AgentEvent::UserMessage { id: Some(id), .. } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let step = m.on_command(AgentCommand::SteerQueued { id: queued });
         let id = step.outbound[0]["id"].as_u64().unwrap();
 
         let step = m.on_frame(&json!({
@@ -4587,6 +4947,20 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::Checkpoint { .. })),
             "steered sends must not anchor checkpoints"
         );
+        let queued_id = match &step.events[0] {
+            AgentEvent::UserMessage { id: Some(id), .. } => id.clone(),
+            other => panic!("expected queued UserMessage, got {other:?}"),
+        };
+        let step = m.on_command(AgentCommand::SteerQueued { id: queued_id });
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Checkpoint { .. })),
+            "explicit steer must not anchor a checkpoint"
+        );
+        let steer_rpc = step.outbound[0]["id"].as_u64().unwrap();
+        m.on_frame(&json!({ "id": steer_rpc, "result": {} }));
         // The next turn-opening send chains its preceding uuid.
         m.on_frame(&json!({
             "method": "turn/completed",

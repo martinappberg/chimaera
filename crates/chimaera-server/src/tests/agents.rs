@@ -932,7 +932,7 @@ async fn create_agent_validates_agent_model_and_resume() {
     preset_agent(
         &state,
         agents::AgentKind::Codex,
-        Err("codex not found via login shell (test)".to_string()),
+        Ok(PathBuf::from("/bin/echo")),
         None,
     );
     let root = test_dir("agent-validate");
@@ -962,8 +962,9 @@ async fn create_agent_validates_agent_model_and_resume() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(err["error"].as_str().unwrap().contains("unknown agent"));
 
-    // Resume is claude-only: 400 for codex, before any binary lookup.
-    let (status, err) = request(
+    // Codex resume is supported too: the launcher maps it to the native
+    // `codex resume <thread-id>` subcommand.
+    let (status, session) = request(
         &state,
         Method::POST,
         "/api/v1/sessions",
@@ -972,8 +973,22 @@ async fn create_agent_validates_agent_model_and_resume() {
         )),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    assert_eq!(session["agent_kind"], "codex");
+
+    // Agents with no native resume contract are still rejected before binary
+    // lookup, with a capability-specific explanation.
+    let (status, err) = request(
+        &state,
+        Method::POST,
+        "/api/v1/sessions",
+        Some(sessions_body(
+            serde_json::json!({"agent": "gemini", "resume": "abc"}),
+        )),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(err["error"].as_str().unwrap().contains("resume"));
+    assert!(err["error"].as_str().unwrap().contains("not supported"));
 
     // Flag-shaped model/resume values: 400, never argv.
     for field in ["model", "resume"] {
@@ -994,6 +1009,12 @@ async fn create_agent_validates_agent_model_and_resume() {
     }
 
     // A not-installed agent is a 409 with its own install hint.
+    preset_agent(
+        &state,
+        agents::AgentKind::Codex,
+        Err("codex not found via login shell (test)".to_string()),
+        None,
+    );
     let (status, err) = request(
         &state,
         Method::POST,

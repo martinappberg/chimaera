@@ -21,12 +21,13 @@ fn kill_all_chat(state: &Arc<AppState>) -> usize {
             }
         } else {
             state.chat.remove(&info.id);
-            crate::recents::retire(
+            crate::recents::retire_with_resume(
                 state,
                 &info.id,
                 None,
                 None,
                 chimaera_agent::model::SessionUi::Chat,
+                info.native_session_id,
             );
             killed += 1;
         }

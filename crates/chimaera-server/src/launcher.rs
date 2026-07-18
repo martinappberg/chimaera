@@ -534,8 +534,8 @@ pub(crate) fn safe_arg(s: &str) -> bool {
 /// (which also carries the scheme theme) plus `--model`/`--resume` when
 /// given; codex gets `-c tui.theme=<name>` when a theme should be injected
 /// (verified against codex 0.142.5 — see `runtimes`); gemini/agy spawn
-/// their TUIs plain — no hooks, `--model` when given, never `--resume`
-/// (claude-only, enforced by the create handler).
+/// their TUIs plain. This flag-shaped builder accepts `resume` only for
+/// Claude; Codex's `resume` subcommand uses [`build_agent_resume_command`].
 pub(crate) fn build_agent_command(
     kind: AgentKind,
     bin: &Path,
@@ -546,7 +546,7 @@ pub(crate) fn build_agent_command(
 ) -> Vec<String> {
     debug_assert!(
         resume.is_none() || kind == AgentKind::Claude,
-        "resume is claude-only"
+        "this builder accepts resume only for claude"
     );
     debug_assert!(
         settings.is_none() || kind == AgentKind::Claude,

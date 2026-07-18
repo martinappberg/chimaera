@@ -760,15 +760,14 @@ Emission points, per driver:
   as its own turn resolves `sent` on the idle-flush (Pass 12), never stuck
   "queued". `cancel_async_message` un-queueing is now adopted for the
   `CancelQueued` command (Pass 12).
-- **codex** — a steered send (`turn/steer`, incl. sends buffered during
-  the turn/start window and flushed on `turn/started`) echoes
-  `queued:true` and resolves `sent` when the steer RPC succeeds (steering
-  has no follow-up item we consume — the echoed `userMessage` item is
-  deliberately ignored). A steer that fails for good (after the one
-  expectedTurnId retry, while a turn is still active) resolves `dropped`
-  next to the Error notice. A steer/buffered send re-driven as a fresh
-  `turn/start` (the turn ended under it) resolves `sent` at the re-drive —
-  it has the same standing as a fresh send from there on.
+- **codex** — a mid-turn send echoes `queued:true` and joins Chimaera's FIFO;
+  app-server has no queue RPC because queuing is client policy. Each completed,
+  interrupted, or failed turn promotes exactly the oldest entry into a fresh
+  `turn/start`; later entries remain queued. `SteerQueued{id}` is the explicit
+  native-style promotion into the RUNNING turn and maps to `turn/steer`; it
+  resolves `sent` on the RPC answer. A steer that fails for good (after the one
+  expectedTurnId retry while a turn is still active) resolves `dropped` next to
+  the Error notice. See Pass 21.
 - Fresh-turn sends on both drivers echo `queued:false` (field omitted) and
   never get an update. Transcript-seeded UserMessages carry no `id`.
 
@@ -1016,8 +1015,9 @@ instant they were written — so resolve every remaining uuid `sent`.
   state anyway (an idle driver has no live turn left to abort it). The
   is_error/interrupt DROP path is unchanged — an aborted turn still drops its
   queue.
-- Both drivers, symmetric intent: claude flushes `queued_sends` → `sent` (they
-  were written to stdin already); codex RE-DRIVES a stranded `buffered_sends`
+- Historical mechanism (superseded for Claude by Pass 13 and for Codex's queue
+  policy by Pass 21): claude flushes `queued_sends` → `sent` (they
+  were written to stdin already); codex RE-DRIVES a stranded `queued_sends`
   entry as a fresh turn (a codex buffer was never sent, so it is DELIVERED, not
   declared sent unseen) — the defensive rescue for the one seam where a turn
   ends under a pending `turn/start`.
@@ -1035,9 +1035,10 @@ nothing).
   `{"subtype":"cancel_async_message","message_uuid":id}` control request, then
   emit `Cancelled`. If it is no longer queued (already popped `sent`, or
   idle-flushed), emit a `Notice` ("too late to cancel") — it can't be un-said.
-- **codex**: if `id` is still in the pre-steer `buffered_sends`, remove it and
-  emit `Cancelled`. If it was already steered into the running turn (delivered),
-  emit the same `Notice`. Symmetric intent, per-protocol capability.
+- **codex**: if `id` is still in the next-run `queued_sends` FIFO, remove it and
+  emit `Cancelled`. If an explicit Steer RPC is already in flight, emit the
+  "on its way" Notice; a resolved id gets the replay-stable tombstone described
+  in Pass 14. Symmetric intent, per-protocol capability.
 
 ### `cancel_async_message` reliability — LIVE
 
@@ -1111,7 +1112,9 @@ The `was_active` guard and the interrupt watchdog (Pass 11) are unchanged. The
 wire SHAPE is untouched (`tests/wire_contract.rs` green); only the TIMING of the
 same normalized events changed.
 
-**Codex is deliberately NOT changed.** Its native model is `turn/steer` —
+**[Superseded by Pass 21: Codex's native UX separates queue-for-next-run from
+explicit Steer; this paragraph had mistaken the RPC primitive for the whole
+client policy.]** Codex is deliberately NOT changed. Its native model is `turn/steer` —
 inject into the RUNNING turn — with a per-message RPC answer, so it already maps
 each send deterministically and never coalesces/strands. Holding would DIVERGE
 from codex-native (the maintainer's "keep native" applies per agent: claude
@@ -1179,7 +1182,8 @@ after the abort marker. The interrupt watchdog does the same on firing
 tears the driver down and the `flushing` stage drops the batch honestly).
 `drain_pending` (process death) is the only remaining `dropped` producer.
 
-**codex.** The live-abort paths (`turn/completed{interrupted}`, `turn/failed`)
+**codex. [Superseded by Pass 21 for the FIFO mechanics; the stop-preserves-queue
+decision remains.]** The live-abort paths (`turn/completed{interrupted}`, `turn/failed`)
 no longer call the drop-drain: the first buffered send re-drives as a fresh
 turn (the rest steer into it on its `turn/started`), and in-flight steer RPCs
 stay tracked — codex is alive on these paths, so a steer that landed before
@@ -1563,3 +1567,53 @@ is presentation only. The driver still sends the empty-answer skip, resolves
 the journaled ask, and emits the timeout notice. This preserves exact behavior
 through tab remount, WebSocket reconnect, daemon replay, and older journals
 that have no field.
+
+## Pass 21 (2026-07-17 — Codex native queue vs explicit Steer). ADOPTED.
+
+The official Codex manual names two distinct host actions while a run is active:
+**Queue** saves a follow-up for the next run; **Steer** adds it to the current
+run. Queued rows in the desktop app expose per-item actions, including Steer and
+delete. The app-server primitive is only the latter:
+`turn/steer {threadId, clientUserMessageId, input, expectedTurnId}` appends input
+to an in-flight turn. There is no app-server queue RPC — the client owns that
+policy and later uses `turn/start` for the queued follow-up.
+
+Chimaera previously called `turn/steer` for every mid-turn Codex send. Its
+`queued:true` bubble therefore existed only until the RPC ack (usually
+milliseconds) and then jumped into the transcript, making queue and Steer the
+same action. The corrected mapping is:
+
+- ordinary mid-turn `Send` → echo `queued:true`, hold in the driver's FIFO;
+- any real turn end (completed, interrupted, or failed) → promote exactly the
+  oldest FIFO entry into a fresh `turn/start`, resolving it `sent`; later items
+  remain queued for later turns;
+- additive `AgentCommand::SteerQueued{id}` → remove only that entry and issue
+  `turn/steer`; a click during the `turn/start`→`turn/started` window records
+  the intent until `expectedTurnId` is known;
+- a turn end with one or more Steer RPCs still unresolved gates ordinary FIFO
+  promotion. Accepted steers release the FIFO after the last acknowledgement;
+  failed steers re-drive first in click order, so no late response can race a
+  second concurrent `turn/start` or reorder the promoted messages;
+- `CancelQueued{id}` still removes a held entry; process death/watchdog still
+  resolves genuinely undeliverable held entries `dropped`; Stop never discards
+  the FIFO.
+
+A queued follow-up becomes a Codex rewind boundary only if it opens its own
+turn. The driver emits its `Checkpoint` at promotion, never at initial queue
+time (an entry explicitly steered later is not a whole-turn boundary). That
+makes the checkpoint non-adjacent to the original queued echo. Rewind truncation
+therefore keeps the completed previous turn, replaces the early echo at the
+same seq with a `Cancelled` tombstone, and cuts at the late checkpoint; replay
+has neither a phantom pending bubble nor a seq gap.
+
+Hermetic coverage: `mid_turn_send_queues_until_explicit_steer`,
+`steer_clicked_during_start_window_waits_for_turn_id`,
+`queued_followups_open_one_fresh_turn_at_a_time`,
+`turn_end_waits_for_inflight_steer_before_fifo_promotion`,
+`settled_steer_releases_waiting_fifo_after_turn_end`,
+`failed_concurrent_steers_redrive_in_click_order`, the existing steer retry / stop /
+cancel cases, the additive wire-contract test for `{type:"steer_queued",id}`,
+and server `truncate_journal_neutralizes_early_queued_echo_at_late_checkpoint`.
+Live verification against Codex 0.144.2 exercised queued-row persistence,
+one-at-a-time FIFO promotion, and explicit Steer in the isolated web UI with no
+browser warnings; the `just chat-smoke` recipe passed 17/17 afterward.

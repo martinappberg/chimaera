@@ -12,7 +12,7 @@ TUI (see [view switch](#view-switch-and-rewind)).
 `QuestionCard`, `RewindDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
 `paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
-`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 17 `AgentCommand`s),
+`ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 19 `AgentCommand`s),
 `POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
@@ -20,21 +20,22 @@ TUI (see [view switch](#view-switch-and-rewind)).
 
 ## Composing & sending
 
-- **Send / type-through.** Type, Enter to send (Shift+Enter = newline). Sends work mid-turn —
-  the placeholder becomes "type through — the agent hears you mid-run"; claude queues it
-  natively, codex steers the running turn. `socket.send` returns `false` when the socket isn't
-  OPEN, so the draft is only cleared on an accepted send — a message during a reconnect window is
-  preserved, not lost (no client-side queue; reconnect replays the gap).
+- **Send / queue / steer.** Type, Enter to send (Shift+Enter = newline). Mid-turn sends queue for
+  the next run, matching both native clients; the placeholder says so. Codex queued rows expose
+  **↪ Steer**, which promotes only that follow-up into the current run via `turn/steer`. Claude has
+  no separate steer action. `socket.send` returns `false` when the socket isn't OPEN, so the draft
+  is only cleared on an accepted send — a message during a reconnect window is preserved, not lost;
+  reconnect replays the daemon-owned queue state.
 - **Delivery honesty + pending stack.** A mid-turn send doesn't drop into history — it waits in a
   **pending stack pinned just above the composer** (the send point), faded, with a small "queued"
-  mark. When the agent actually consumes it (claude dequeues one per finished turn, codex on the
-  steer ack) the block leaves the stack and enters the transcript proper as the newest user turn,
-  solid. If the turn aborts first (claude drops its native queue on interrupt; a codex steer fails
-  for good) the message stays in the stack marked **"not delivered"** (text kept readable/copyable,
-  never auto-dumped back into a draft you may have started). Driven entirely off the single `blocks`
-  reducer — a derived `store.pendingUserBlocks` splits queued/dropped out of the inline render — and
-  journaled via `user_message` `id`/`queued` + `user_message_update`, so replay shows the same truth
-  (see PROTOCOL.md pass 8).
+  mark. After a turn ends, Claude flushes its held queue; Codex opens exactly the oldest queued item
+  as the next turn and leaves later items queued. A Codex Steer instead resolves on the steer RPC
+  acknowledgement. Once consumed, the block leaves the stack and enters the transcript proper as
+  the newest user turn, solid. A genuinely undeliverable entry stays marked **"not delivered"**
+  (text kept readable/copyable, never auto-dumped into a draft you may have started). The ✕ pulls
+  back a queued item or dismisses a dropped one. This is driven by the single `pendingSends` reducer
+  and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
+  order and delivery truth (see PROTOCOL.md passes 8 and 21).
 - **Image paste.** Paste an image → a removable chip; sent as base64 blocks. Downscaled to
   1568px max dim, 2 MiB post-encode cap (oversized silently dropped); the journal stores a
   placeholder, never the bytes.
@@ -283,8 +284,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
 ## Status: partial
 
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
-  (resuming the native conversation, carrying the pinned title), retiring the non-resumable to
-  Recents (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
+  (resuming the native conversation, carrying the pinned title). A normally finished Codex chat
+  preserves its native thread id in Recents, whose click starts `thread/resume` under a new Chimaera
+  session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
   undercount it — the rollback then leaves those turns in place).
 
