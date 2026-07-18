@@ -372,13 +372,14 @@
     color: var(--err);
   }
 
-  /* MergeView fills the pane; both editors scroll inside it. */
-  .merge-host :global(.cm-mergeView),
-  .merge-host :global(.cm-mergeViewEditors) {
+  /* MergeView is the shared scroll container. Its editors must stay
+     auto-height so their full content contributes to its scroll range. */
+  .merge-host :global(.cm-mergeView) {
     height: 100%;
+    overflow: auto;
   }
-  .merge-host :global(.cm-editor) {
-    height: 100%;
+  .merge-host :global(.cm-mergeViewEditors) {
+    min-height: 100%;
   }
   .merge-host :global(.cm-merge-a),
   .merge-host :global(.cm-merge-b) {
