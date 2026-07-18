@@ -235,6 +235,9 @@
    *  macOS, where the clamshell/lid-close keep-awake it exists for applies. */
   let caffeinated = $state(false);
   const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
+  /** macOS workbench windows put the native controls over the webview instead
+   *  of spending a separate row on the repeated window title. */
+  const nativeTitlebarOverlay = isNativeShell() && isMac;
   async function toggleCaffeinate(): Promise<void> {
     try {
       caffeinated = await setCaffeinate(!caffeinated);
@@ -1617,7 +1620,8 @@
     const base = scope ? `${scope} | chimaera` : "chimaera";
     const title = needsYou > 0 ? `(${needsYou}) ${base}` : base;
     document.title = title;
-    // The native titlebar doesn't follow document.title — push it explicitly.
+    // The native window title doesn't follow document.title — push it
+    // explicitly. Overlay windows hide the text but keep this OS metadata.
     setNativeWindowTitle(title);
   });
 
@@ -2993,7 +2997,22 @@
   }
 </script>
 
-<div class="shell">
+<div class="shell" class:native-titlebar-overlay={nativeTitlebarOverlay}>
+  {#if nativeTitlebarOverlay && (activeWsId === null || !layout.focusMode)}
+    <!-- Overlay chrome keeps the native traffic lights but needs an explicit
+         drag target. It is control-height over the rail/home's reserved blank
+         corner. Focus mode uses the context strip's own full-height drag
+         target instead, so pane tabs never collide with native chrome. Browser
+         windows never render either target. -->
+    <div
+      class="native-drag-region"
+      style:right={activeWsId !== null
+        ? `calc(100% - ${railWidth}px)`
+        : "48px"}
+      data-tauri-drag-region
+      aria-hidden="true"
+    ></div>
+  {/if}
   {#if activeWsId === null}
     <!-- Home: a real launcher, not an empty IDE. The rail and stage only
          exist once a workspace scopes this window. A Mastermind is never a
@@ -3748,6 +3767,12 @@
           </button>
         {/each}
       </div>
+      {#if nativeTitlebarOverlay}
+        <!-- Native focus mode promotes this strip to the titlebar. Keep a
+             generous, control-height empty target so dragging never competes
+             with the workspace/session buttons. -->
+        <div class="strip-drag" data-tauri-drag-region aria-hidden="true"></div>
+      {/if}
       {#if needsYou > 0}
         <span class="strip-needs">{needsYou} need{needsYou === 1 ? "s" : ""} you</span>
       {/if}
@@ -3884,6 +3909,15 @@
     overflow: hidden;
   }
 
+  .native-drag-region {
+    position: fixed;
+    top: 0;
+    left: 112px;
+    height: 32px;
+    z-index: 220;
+    user-select: none;
+  }
+
   .body {
     flex: 1;
     display: flex;
@@ -3893,6 +3927,7 @@
   .rail {
     /* Width is inline (draggable, persisted); this is only the pre-hydration
        fallback. min-width guards against a stale/hand-set value wedging it. */
+    position: relative;
     width: 230px;
     min-width: 0;
     flex: none;
@@ -3904,6 +3939,25 @@
     transition:
       width 0.12s ease,
       opacity 0.1s ease;
+  }
+
+  /* Overlay traffic lights occupy the rail's top-left corner. Reserve that
+     corner for them + the control-height drag target; browsers keep the
+     ordinary compact 16px inset above. */
+  .native-titlebar-overlay .rail {
+    padding-top: 36px;
+  }
+
+  /* In the native window the sidebar toggle belongs to the titlebar lane,
+     beside the traffic lights, rather than trailing the workspace selector
+     on the next row. Its higher stacking level keeps it clickable above the
+     otherwise draggable lane. Browser windows retain the in-row placement. */
+  .native-titlebar-overlay .rail-collapse {
+    position: absolute;
+    top: 5px;
+    left: 82px;
+    margin-left: 0;
+    z-index: 221;
   }
 
   /* Mid-drag the width changes every frame; the ease would smear the handle. */
@@ -4807,6 +4861,31 @@
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+
+  /* With the rail hidden, macOS needs a real titlebar lane for its traffic
+     lights. Promote the existing focus strip instead of inventing extra
+     chrome: the browser keeps the compact footer, while the native app gets
+     one Codex-style context row above the pane tabs. */
+  .native-titlebar-overlay .strip {
+    order: -1;
+    position: relative;
+    height: 38px;
+    padding: 0 12px 0 82px;
+    gap: 10px;
+    border-top: none;
+    border-bottom: 1px solid var(--edge);
+  }
+
+  .native-titlebar-overlay .strip .chips {
+    flex: 0 1 auto;
+  }
+
+  .strip-drag {
+    align-self: stretch;
+    flex: 1 0 80px;
+    min-width: 80px;
+    user-select: none;
   }
 
   /* Explicit "show sidebar" icon — the discoverable mouse path back, beside

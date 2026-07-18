@@ -434,9 +434,10 @@ export function closeThisWindow(): void {
 }
 
 /**
- * Set this native window's OS titlebar. The webview does NOT mirror
- * document.title to the native title, so the SPA pushes it here (workspace +
- * host) as the scope changes. No-op in a browser — the tab uses document.title.
+ * Set this native window's OS title. The webview does NOT mirror document.title
+ * to the native title, so the SPA pushes it here (workspace + host) as the scope
+ * changes. macOS overlay windows keep it as hidden system metadata; browser
+ * tabs render document.title normally.
  */
 export function setNativeWindowTitle(title: string): void {
   void tauri()?.window.getCurrentWindow().setTitle(title);
