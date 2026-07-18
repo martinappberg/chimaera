@@ -102,6 +102,10 @@ gap-replay idea as the PTY transport, realized for structured streams.
   fires for stdin `user` messages; `Stop` misses). The **protocol is
   authoritative** for the session lifecycle in chat mode — derive state from
   events, not hooks.
+- Background work is cross-turn but process-owned. Every successful driver
+  spawn journals an empty `BackgroundTasks` level-set before its first event;
+  this is the crash/restart boundary that keeps a reused journal from reviving
+  tasks that died with the previous daemon process.
 - A `--resume` forks a NEW native session id (claude); never pin `--session-id`
   with `--resume`. Codex resumes in-protocol (the id survives).
 - `DriverExit::ProtocolError` sessions are kept in the registry *dead* so the UI
