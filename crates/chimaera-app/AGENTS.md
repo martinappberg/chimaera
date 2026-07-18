@@ -68,6 +68,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
   (`app.yml`) needs no key.
 - **Caffeinate is device state, not daemon settings.** Its preferences live in
   `data_dir()/caffeinate.json`; the display may sleep/lock while idle/system sleep
-  is inhibited. Lid-close is a separate macOS sleep reason and must not be promised
-  as guaranteed. Extra SSH retry is gated by the live assertion and must disappear
-  completely when the mode is off.
+  is inhibited. Lid-close is a separate macOS sleep reason: advertise closed-lid
+  readiness only when `caffeinate.rs` detects a laptop on external power with an
+  active external display. Extra SSH retry is gated by the live assertion and must
+  disappear completely when the mode is off.

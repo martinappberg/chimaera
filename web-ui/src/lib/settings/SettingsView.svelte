@@ -26,12 +26,11 @@
   const caffeinateAvailable = isNativeShell() && isMac && getHostLabel() === "local";
   const sections = (() => {
     const out = [...CATEGORIES];
-    if (caffeinateAvailable) {
-      const appearance = out.indexOf("Appearance");
-      out.splice(appearance >= 0 ? appearance + 1 : 0, 0, "Caffeinate");
-    }
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment");
+    // This exceptional device mode is intentionally after ordinary daemon/UI
+    // preferences; the compact cup remains its everyday entry point.
+    if (caffeinateAvailable) out.push("Caffeinate");
     return out;
   })();
 
@@ -101,9 +100,6 @@
     }
     return out;
   });
-
-  /** The pinned-chords block travels with the Keyboard section. */
-  const keyboardVisible = $derived(groups.some((g) => g.category === "Keyboard"));
 
   function jumpTo(section: string): void {
     activeSection = section;
@@ -248,44 +244,44 @@
               {#each group.defs as def (def.id)}
                 <SettingRow {def} />
               {/each}
+              {#if group.category === "Keyboard"}
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">Pinned chords</h3>
+                  <p class="kbd-note">
+                    Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
+                    browser conventions too carefully to open up.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each pinnedRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">chimaera app menu</h3>
+                  <p class="kbd-note">
+                    The native app's menu bar owns the chords a browser reserves, so these fire only
+                    in the chimaera app. Several are a second way to reach a rebindable action above —
+                    {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new
+                    terminal.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each appMenuRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              {/if}
             </section>
           {/if}
         {/each}
-
-        {#if keyboardVisible}
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">Pinned chords</h3>
-            <p class="kbd-note">
-              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
-              browser conventions too carefully to open up.
-            </p>
-            <ul class="kbd-list">
-              {#each pinnedRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">chimaera app menu</h3>
-            <p class="kbd-note">
-              The native app's menu bar owns the chords a browser reserves, so these fire only in
-              the chimaera app. Several are a second way to reach a rebindable action above —
-              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
-            </p>
-            <ul class="kbd-list">
-              {#each appMenuRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {/if}
 
         {#if groups.length === 0}
           <div class="empty">no settings match “{query}”</div>

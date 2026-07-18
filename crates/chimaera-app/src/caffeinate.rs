@@ -21,6 +21,10 @@ pub const CONSENT_REQUIRED: &str = "caffeinate needs first-time approval";
 pub struct CaffeinateState {
     pub enabled: bool,
     pub consent_required: bool,
+    /// True only when this Mac has the minimum supported closed-display
+    /// shape: a built-in display, external power, and an active external
+    /// display. This is live capability, never persisted user intent.
+    pub closed_lid_ready: bool,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -72,6 +76,7 @@ impl Caffeinate {
             // Report the real assertion, never merely the persisted wish.
             enabled: self.guard.is_some(),
             consent_required: self.prefs.consent_version != CONSENT_VERSION,
+            closed_lid_ready: closed_lid_ready(),
         }
     }
 
@@ -154,6 +159,140 @@ fn create_assertion() -> Result<keepawake::KeepAwake, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+/// macOS owns closed-display mode; a public power assertion cannot override a
+/// bare lid-close sleep. Only advertise the capability when the hardware is in
+/// the conservative supported shape we can observe without asking for extra
+/// privileges. External input is not required by Chimaera because this mode
+/// performs no desktop control, but macOS may still apply its own constraints.
+#[cfg(target_os = "macos")]
+fn closed_lid_ready() -> bool {
+    let displays = macos::display_shape();
+    docked_from_signals(
+        macos::on_external_power(),
+        displays.has_builtin,
+        displays.has_active_external,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn closed_lid_ready() -> bool {
+    false
+}
+
+fn docked_from_signals(
+    on_external_power: bool,
+    has_builtin_display: bool,
+    has_active_external_display: bool,
+) -> bool {
+    on_external_power && has_builtin_display && has_active_external_display
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::{c_char, c_void};
+
+    const MAX_DISPLAYS: usize = 32;
+    const UTF8_ENCODING: u32 = 0x0800_0100;
+
+    type CfTypeRef = *const c_void;
+    type CfStringRef = *const c_void;
+    type CgDirectDisplayId = u32;
+
+    #[derive(Default)]
+    pub(super) struct DisplayShape {
+        pub has_builtin: bool,
+        pub has_active_external: bool,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetOnlineDisplayList(
+            max_displays: u32,
+            displays: *mut CgDirectDisplayId,
+            display_count: *mut u32,
+        ) -> i32;
+        fn CGGetActiveDisplayList(
+            max_displays: u32,
+            displays: *mut CgDirectDisplayId,
+            display_count: *mut u32,
+        ) -> i32;
+        fn CGDisplayIsBuiltin(display: CgDirectDisplayId) -> u32;
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPSCopyPowerSourcesInfo() -> CfTypeRef;
+        fn IOPSGetProvidingPowerSourceType(info: CfTypeRef) -> CfStringRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringGetCString(
+            string: CfStringRef,
+            buffer: *mut c_char,
+            buffer_size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(value: CfTypeRef);
+    }
+
+    pub(super) fn display_shape() -> DisplayShape {
+        DisplayShape {
+            has_builtin: displays(false)
+                .iter()
+                .any(|display| unsafe { CGDisplayIsBuiltin(*display) != 0 }),
+            has_active_external: displays(true)
+                .iter()
+                .any(|display| unsafe { CGDisplayIsBuiltin(*display) == 0 }),
+        }
+    }
+
+    fn displays(active: bool) -> Vec<CgDirectDisplayId> {
+        let mut displays = [0; MAX_DISPLAYS];
+        let mut count = 0;
+        let result = unsafe {
+            if active {
+                CGGetActiveDisplayList(MAX_DISPLAYS as u32, displays.as_mut_ptr(), &mut count)
+            } else {
+                CGGetOnlineDisplayList(MAX_DISPLAYS as u32, displays.as_mut_ptr(), &mut count)
+            }
+        };
+        if result != 0 {
+            tracing::debug!(result, active, "could not inspect displays for Caffeinate");
+            return Vec::new();
+        }
+        displays[..count.min(MAX_DISPLAYS as u32) as usize].to_vec()
+    }
+
+    pub(super) fn on_external_power() -> bool {
+        let info = unsafe { IOPSCopyPowerSourcesInfo() };
+        if info.is_null() {
+            return false;
+        }
+        let source = unsafe { IOPSGetProvidingPowerSourceType(info) };
+        let mut buffer = [0_i8; 32];
+        let copied = !source.is_null()
+            && unsafe {
+                CFStringGetCString(
+                    source,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as isize,
+                    UTF8_ENCODING,
+                ) != 0
+            };
+        unsafe { CFRelease(info) };
+        if !copied {
+            return false;
+        }
+        let bytes = buffer
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        bytes == b"AC Power"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +320,13 @@ mod tests {
         assert!(!loaded.state().enabled);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn closed_lid_requires_every_dock_signal() {
+        assert!(docked_from_signals(true, true, true));
+        assert!(!docked_from_signals(false, true, true));
+        assert!(!docked_from_signals(true, false, true));
+        assert!(!docked_from_signals(true, true, false));
     }
 }

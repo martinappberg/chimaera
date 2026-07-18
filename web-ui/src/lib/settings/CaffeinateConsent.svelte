@@ -6,6 +6,7 @@
     busy?: boolean;
     error?: string | null;
     canOpenSettings?: boolean;
+    closedLidReady?: boolean;
     onEnable(): void;
     onCancel(): void;
     onOpenSettings(): void;
@@ -15,6 +16,7 @@
     busy = false,
     error = null,
     canOpenSettings = false,
+    closedLidReady = false,
     onEnable,
     onCancel,
     onOpenSettings,
@@ -54,10 +56,14 @@
     </p>
     <ul>
       <li>The display may turn off and the Mac remains locked normally.</li>
-      <li>
-        Locking is supported. Closing the lid can still sleep the Mac; supported closed-display use
-        normally needs power and the accessories macOS requires.
-      </li>
+      {#if closedLidReady}
+        <li>
+          This Mac is docked: Caffeinate can keep working in macOS closed-display mode while power
+          and the external display remain connected.
+        </li>
+      {:else}
+        <li>Locking is supported. Closing the lid can still sleep an undocked Mac.</li>
+      {/if}
       <li>Chimaera must remain open; SSH password or 2FA prompts may still need you.</li>
     </ul>
     {#if error !== null}

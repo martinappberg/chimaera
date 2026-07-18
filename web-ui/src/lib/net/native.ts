@@ -211,14 +211,20 @@ export async function writeClipboard(text: string): Promise<boolean> {
 export interface CaffeinateState {
   enabled: boolean;
   consent_required: boolean;
+  /** External power + built-in display + active external display detected. */
+  closed_lid_ready: boolean;
 }
 
-const CAFFEINATE_OFF: CaffeinateState = { enabled: false, consent_required: false };
+const CAFFEINATE_OFF: CaffeinateState = {
+  enabled: false,
+  consent_required: false,
+  closed_lid_ready: false,
+};
 
 /**
  * Arm/disarm Caffeinate on the local app host. The display may turn off and
- * lock normally; idle/system sleep are inhibited. Closing the lid is a
- * separate macOS sleep reason and remains best-effort.
+ * lock normally; idle/system sleep are inhibited. macOS closed-display use is
+ * advertised separately only while the laptop is detectably docked.
  * `acknowledge` is sent only by the first-use confirmation.
  */
 export async function setCaffeinate(

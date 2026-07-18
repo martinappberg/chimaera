@@ -10,7 +10,11 @@
 
   // Conservative until native state arrives so a fast first click still
   // counts as the explicit acknowledgement described on this page.
-  let mode = $state<CaffeinateState>({ enabled: false, consent_required: true });
+  let mode = $state<CaffeinateState>({
+    enabled: false,
+    consent_required: true,
+    closed_lid_ready: false,
+  });
   let busy = $state(false);
   let error = $state<string | null>(null);
 
@@ -20,8 +24,15 @@
       mode = next;
       error = null;
     }).then((u) => (unlisten = u));
-    void caffeinateState().then((next) => (mode = next));
-    return () => unlisten?.();
+    const refresh = () => void caffeinateState().then((next) => (mode = next));
+    refresh();
+    // Dock readiness is live hardware state. Keep this quiet status accurate
+    // if the user plugs into or leaves a dock while Settings stays open.
+    const timer = window.setInterval(refresh, 5_000);
+    return () => {
+      unlisten?.();
+      window.clearInterval(timer);
+    };
   });
 
   async function toggle(): Promise<void> {
@@ -65,10 +76,23 @@
     try again promptly when connectivity returns. Authentication failures pause for manual action,
     so Caffeinate does not repeatedly raise password or 2FA prompts.
   </p>
+  {#if mode.closed_lid_ready}
+    <div class="closed-lid-ready">
+      <div>
+        <div class="ready-name">Closed-lid use</div>
+        <div class="ready-detail">
+          External power and an active external display are connected. With Caffeinate active,
+          Chimaera can keep working in macOS closed-display mode.
+        </div>
+      </div>
+      <span class="ready-status">docked</span>
+    </div>
+  {/if}
   <ul>
     <li>
-      Screen lock and display-off use are supported. Closed-lid use is best-effort: macOS may still
-      sleep, and supported closed-display setups normally require power and external accessories.
+      Screen lock and display-off use are supported. Closing the lid can sleep an undocked Mac;
+      closed-lid readiness appears here only when external power and an active external display are
+      detected.
     </li>
     <li>Low battery, thermal protection, shutdown, or quitting Chimaera can stop the work.</li>
     <li>Failed model requests are not replayed automatically; only connectivity is repaired.</li>
@@ -138,6 +162,38 @@
     border-color: color-mix(in srgb, var(--accent) 52%, var(--edge));
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+
+  .closed-lid-ready {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+    max-width: 76ch;
+    margin-top: 12px;
+    padding: 10px 11px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--edge));
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+
+  .ready-name {
+    color: var(--fg);
+    font-size: var(--text-sm);
+    font-weight: 600;
+  }
+
+  .ready-detail {
+    margin-top: 2px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    line-height: 1.45;
+  }
+
+  .ready-status {
+    flex: none;
+    color: var(--accent);
+    font-size: var(--text-xs);
   }
 
   p,

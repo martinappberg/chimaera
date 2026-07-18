@@ -179,6 +179,7 @@
     setCaffeinate,
     setNativeWindowTitle,
     shellBuild,
+    type CaffeinateState,
   } from "./lib/net/native";
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
@@ -229,14 +230,16 @@
   // Conservative until native state arrives: a very fast first click should
   // open the explanation, never race into an unacknowledged IPC call.
   let caffeinateConsentRequired = $state(true);
+  let caffeinateClosedLidReady = $state(false);
   let showCaffeinateConsent = $state(false);
   let caffeinateConsentBusy = $state(false);
   let caffeinateError = $state<string | null>(null);
   const canCaffeinate = isNativeShell() && isMac && getHostLabel() === "local";
 
-  function syncCaffeinate(state: { enabled: boolean; consent_required: boolean }): void {
+  function syncCaffeinate(state: CaffeinateState): void {
     caffeinated = state.enabled;
     caffeinateConsentRequired = state.consent_required;
+    caffeinateClosedLidReady = state.closed_lid_ready;
     if (!state.enabled) clearCaffeinateReconnect();
     else if (reconnectError !== null) scheduleCaffeinateReconnect(reconnectError);
   }
@@ -244,6 +247,13 @@
   async function toggleCaffeinate(): Promise<void> {
     if (!caffeinated && caffeinateConsentRequired) {
       caffeinateError = null;
+      // Read transient dock readiness when the explanation opens; the laptop
+      // may have joined or left a dock since this window mounted.
+      try {
+        syncCaffeinate(await caffeinateState());
+      } catch {
+        /* Ordinary locked-screen Caffeinate can still be explained. */
+      }
       showCaffeinateConsent = true;
       return;
     }
@@ -3780,6 +3790,7 @@
     busy={caffeinateConsentBusy}
     error={caffeinateError}
     canOpenSettings={canCaffeinate && activeWsId !== null && layoutReady}
+    closedLidReady={caffeinateClosedLidReady}
     onEnable={() => void confirmCaffeinate()}
     onCancel={() => {
       showCaffeinateConsent = false;

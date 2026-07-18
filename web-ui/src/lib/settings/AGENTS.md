@@ -53,3 +53,7 @@ so opening Settings against a remote daemon never writes a laptop power choice t
   when you touch the persist path.
 - **UI quality is an acceptance criterion.** Use the theme tokens; light and dark
   both hold.
+- **Closed-lid wording follows live native capability.** Only present the docked
+  closed-display path when `CaffeinateState.closed_lid_ready` is true; undocked
+  Caffeinate remains a screen-lock/display-off mode. Keep the exceptional
+  Caffeinate category last in Settings; the cup/tray are the everyday controls.

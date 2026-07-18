@@ -139,23 +139,27 @@ app-build` (never the root `cargo`).
   laptop's connection; Caffeinate keeps the local app/tunnels awake enough to stay attached or heal.
 - **How it's used.** The compact surfaces remain a coffee-cup button in a local window's rail and the
   tray's **Caffeinate** check item/fill state. First enable opens one versioned approval dialog; the
-  fuller explanation and control live in the local native window's **Settings → Caffeinate** bespoke
-  section (`CaffeinateConsent.svelte`, `CaffeinateSettings.svelte`). The approved enabled state persists
-  across app restarts in device-local `caffeinate.json`; it is deliberately not a daemon setting and
-  never lands in a remote host's `settings.json`.
+  fuller explanation and control live in the final category of the local native window's
+  **Settings → Caffeinate** bespoke section (`CaffeinateConsent.svelte`,
+  `CaffeinateSettings.svelte`). The approved enabled state persists across app restarts in device-local
+  `caffeinate.json`; it is deliberately not a daemon setting and never lands in a remote host's
+  `settings.json`.
 - **Where it lives.** `crates/chimaera-app/src/caffeinate.rs` owns tolerant/atomic preferences and the
   single **keepawake** IOKit guard; `shell::{apply_caffeinate,toggle_caffeinate_from_tray}` and
   `tray.rs` own the native surfaces. IPC remains `set_caffeinate(on, acknowledge?)` /
-  `caffeinate_state()` but returns `{enabled,consent_required}`; `caffeinate-changed` broadcasts that
-  state to every macOS app window and `caffeinate-consent-required` targets one window after a first
-  tray click. Client bridge: `web-ui/src/lib/net/native.ts`; rail/conditional reconnect:
-  `web-ui/src/App.svelte`.
+  `caffeinate_state()` but returns `{enabled,consent_required,closed_lid_ready}`;
+  `caffeinate-changed` broadcasts that state to every macOS app window and
+  `caffeinate-consent-required` targets one window after a first tray click. Client bridge:
+  `web-ui/src/lib/net/native.ts`; rail/conditional reconnect: `web-ui/src/App.svelte`.
 - **Power behavior.** Armed prevents idle/system sleep but deliberately **does not** hold the display
   awake: the display may dim, turn off, and lock normally. The assertion restores before windows open
-  when the persisted mode is enabled, and drops on quit. Lock/display-off use is the reliable path.
-  Closing a MacBook lid is a separate OS sleep reason: the assertion is best-effort, and a supported
-  closed-display setup normally requires power and the external accessories macOS requires. macOS may
-  also override assertions for low power or thermal protection.
+  when the persisted mode is enabled, and drops on quit. Lock/display-off use remains available on any
+  Mac. Closing a MacBook lid is a separate OS sleep reason, so Chimaera advertises closed-lid use only
+  when a conservative live check sees all three dock signals: an online built-in display (a laptop),
+  external power, and an active external display. The first-use dialog and Settings show the docked
+  path only while that check passes; Settings refreshes it every five seconds. The signal is not a
+  persisted mode or a private lid-sleep override—macOS still owns closed-display operation and may
+  override assertions for low power or thermal protection.
 - **Network behavior.** The normal remote-window reconnect still makes its existing single automatic
   attempt. Only while the real Caffeinate assertion is held, eligible transport failures continue with
   capped exponential backoff (2s→60s) and an immediate try on the browser `online` event. Auth,
@@ -206,7 +210,8 @@ _Captured 2026-07-17 (from the maintainer)._
 - **Deliberate / non-obvious.** Keep the everyday UI quiet: the existing small cup and tray state are
   enough. Put the first-use explanation and verbose operational/safety detail in the approval dialog
   and Settings, and direct the user there when explanation is needed. Retry connectivity, not failed
-  model turns; authentication remains user-mediated.
+  model turns; authentication remains user-mediated. Closed-lid use is offered only when the Mac is
+  properly docked; undocked Caffeinate remains useful for screen-lock and display-off work.
 - **Do not change.** Do not turn Caffeinate into desktop unlock/control, do not let its retry policy
   leak into the off state, and do not crowd the rail with status prose. Those are product boundaries;
   the exact backoff, persistence file, and presentation inside Settings are additions open to
