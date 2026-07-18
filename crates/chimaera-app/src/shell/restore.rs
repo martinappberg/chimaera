@@ -10,7 +10,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::connect::{do_connect, HostStatus};
-use super::{lock, Shell, WindowScope};
+use super::{authorize_daemon_origin, daemon_navigation_allowed, lock, Shell, WindowScope};
 use crate::windows::WindowRecord;
 
 static WINDOW_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -66,9 +66,18 @@ fn open_shell_window(
     record: &WindowRecord,
     scope_alias: Option<String>,
 ) -> tauri::Result<()> {
-    let url = url.parse().expect("daemon url is always valid");
+    let url: tauri::Url = url.parse().expect("daemon url is always valid");
+    let port = url
+        .port()
+        .expect("daemon URLs always carry an explicit loopback port");
     let label = format!("win-{}", WINDOW_SEQ.fetch_add(1, Ordering::Relaxed));
+    authorize_daemon_origin(app, &label, port)?;
+    let navigation_app = app.clone();
+    let navigation_label = label.clone();
     let mut builder = WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::External(url))
+        .on_navigation(move |url| {
+            daemon_navigation_allowed(&navigation_app, &navigation_label, url)
+        })
         .title(title)
         // Tauri's own drag-drop handler intercepts OS file drops and suppresses
         // the webview's DOM drop events. The workbench handles drops itself in
@@ -96,7 +105,12 @@ fn open_shell_window(
     if let (Some(x), Some(y)) = (record.x, record.y) {
         builder = builder.position(x, y);
     }
-    builder.build()?;
+    if let Err(error) = builder.build() {
+        if let Some(shell) = app.try_state::<Shell>() {
+            lock(&shell.allowed_daemon_ports).remove(&label);
+        }
+        return Err(error);
+    }
     // Track the new window's scope so focus-existing can raise it, and
     // persist it so the next launch reopens it. Startup manages Shell before
     // opening any window, so every window registers.

@@ -7,16 +7,9 @@
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
-  import TerminalView from "../terminal/Terminal.svelte";
-  import ChatView from "../chat/ChatView.svelte";
-  import FileView from "../previews/FileView.svelte";
-  import GitView from "../workspace/GitView.svelte";
-  import SessionChangesView from "../workspace/SessionChangesView.svelte";
-  import FinderView from "../previews/FinderView.svelte";
-  import DashboardView from "../dashboard/DashboardView.svelte";
+  import { loadPaneView, type PaneViewKind } from "./lazyViews";
   import Spinner from "../previews/Spinner.svelte";
   import type { DashCtx } from "../dashboard/dash";
-  import type { DiffMode } from "../workspace/git";
 
   interface Props {
     node: PaneNode;
@@ -151,34 +144,39 @@
     node.tabs.filter((t) => t === activeTab || liveKeys.includes(tabKey(t))),
   );
 
-  // CodeMirror's merge/settings editors are substantial but uncommon on the
-  // terminal/dashboard path. Load each surface only once this pane actually
-  // mounts such a tab; the view keep-alive preserves it after that.
-  let DiffView = $state<
-    Component<{ path: string; mode: DiffMode; wsId: string | null }> | null
-  >(null);
-  let SettingsView = $state<Component | null>(null);
-  let diffLoadError = $state(false);
-  let settingsLoadError = $state(false);
-  $effect(() => {
-    if (DiffView !== null || diffLoadError || !mountedTabs.some((tab) => tab.surface === "diff"))
-      return;
-    void import("../previews/DiffView.svelte").then(
-      (m) => (DiffView = m.default),
-      () => (diffLoadError = true),
+  // Every workbench surface is a feature boundary. Loading only the kinds in
+  // this pane's bounded live set keeps home/workspace startup lean; once a
+  // view arrives the existing keep-alive model preserves it across tab swaps.
+  let views = $state<Partial<Record<PaneViewKind, Component<any>>>>({});
+  let viewErrors = $state<Partial<Record<PaneViewKind, true>>>({});
+
+  function requestView(kind: PaneViewKind) {
+    void loadPaneView(kind).then(
+      (view) => (views = { ...views, [kind]: view }),
+      () => (viewErrors = { ...viewErrors, [kind]: true }),
     );
-  });
+  }
+
+  function retryView(kind: PaneViewKind) {
+    const next = { ...viewErrors };
+    delete next[kind];
+    viewErrors = next;
+    requestView(kind);
+  }
+
+  function viewKind(tab: Tab): PaneViewKind | null {
+    if (tab.surface !== "terminal") return tab.surface;
+    const session = sessions.get(tab.sessionId);
+    if (session === undefined) return null;
+    return session.ui === "chat" ? "chat" : "terminal";
+  }
+
   $effect(() => {
-    if (
-      SettingsView !== null ||
-      settingsLoadError ||
-      !mountedTabs.some((tab) => tab.surface === "settings")
-    )
-      return;
-    void import("../settings/SettingsView.svelte").then(
-      (m) => (SettingsView = m.default),
-      () => (settingsLoadError = true),
-    );
+    const needed = new Set(mountedTabs.map(viewKind).filter((kind) => kind !== null));
+    for (const kind of needed) {
+      if (views[kind] !== undefined || viewErrors[kind]) continue;
+      requestView(kind);
+    }
   });
 
   let rootEl = $state<HTMLElement | null>(null);
@@ -195,6 +193,13 @@
   });
 </script>
 
+{#snippet loadFailure(kind: PaneViewKind, label: string)}
+  <div class="hint load-failure">
+    <span>could not load {label}</span>
+    <button type="button" onclick={() => retryView(kind)}>retry</button>
+  </div>
+{/snippet}
+
 {#snippet surface(tab: Tab, active: boolean)}
   {#if tab.surface === "terminal"}
     <!-- The surface follows server truth: which process runs behind the session
@@ -206,52 +211,103 @@
            tab): render nothing, never a fresh TerminalView against a dead id. -->
       <div class="hint"><span>closing…</span></div>
     {:else if s.ui === "chat"}
-      <ChatView
-        session={s}
-        focused={focused && active}
-        terminals={[...sessions.values()]
-          .filter((t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id)
-          .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
-        onOpenFile={(p) => ctrl.openFileFrom(node.id, p, false)}
-        onOpenPath={(p, k) => ctrl.openPathFrom(node.id, p, k, false)}
-        onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
-      />
+      {@const ChatView = views.chat}
+      {#if ChatView !== undefined}
+        <ChatView
+          session={s}
+          focused={focused && active}
+          terminals={[...sessions.values()]
+            .filter((t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id)
+            .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
+          onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
+          onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
+          onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
+        />
+      {:else if viewErrors.chat}
+        {@render loadFailure("chat", "chat view")}
+      {:else}
+        <Spinner />
+      {/if}
     {:else}
-      <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
+      {@const TerminalView = views.terminal}
+      {#if TerminalView !== undefined}
+        <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
+      {:else if viewErrors.terminal}
+        {@render loadFailure("terminal", "terminal view")}
+      {:else}
+        <Spinner />
+      {/if}
     {/if}
   {:else if tab.surface === "file"}
-    <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} />
+    {@const FileView = views.file}
+    {#if FileView !== undefined}
+      <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} />
+    {:else if viewErrors.file}
+      {@render loadFailure("file", "file view")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "finder"}
-    <FinderView
-      path={tab.path}
-      {wsRoot}
-      onOpenFile={(p, split) => ctrl.openFileFrom(node.id, p, split)}
-      onNavigate={(p) => ctrl.navigateFinder(tab.id, p)}
-    />
+    {@const FinderView = views.finder}
+    {#if FinderView !== undefined}
+      <FinderView
+        path={tab.path}
+        {wsRoot}
+        onOpenFile={(p: string, split: boolean) => ctrl.openFileFrom(node.id, p, split)}
+        onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
+      />
+    {:else if viewErrors.finder}
+      {@render loadFailure("finder", "Finder")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "diff"}
-    {#if DiffView !== null}
+    {@const DiffView = views.diff}
+    {#if DiffView !== undefined}
       <DiffView path={tab.path} mode={tab.mode} {wsId} />
-    {:else if diffLoadError}
-      <div class="hint"><span>could not load diff view — reload to retry</span></div>
+    {:else if viewErrors.diff}
+      {@render loadFailure("diff", "diff view")}
     {:else}
       <Spinner />
     {/if}
   {:else if tab.surface === "git"}
-    <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
+    {@const GitView = views.git}
+    {#if GitView !== undefined}
+      <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
+    {:else if viewErrors.git}
+      {@render loadFailure("git", "git view")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "changes"}
     {@const cs = sessions.get(tab.sessionId)}
     {#if cs !== undefined}
-      <SessionChangesView session={cs} {wsRoot} paneId={node.id} {ctrl} />
+      {@const SessionChangesView = views.changes}
+      {#if SessionChangesView !== undefined}
+        <SessionChangesView session={cs} {wsRoot} paneId={node.id} {ctrl} />
+      {:else if viewErrors.changes}
+        {@render loadFailure("changes", "changes view")}
+      {:else}
+        <Spinner />
+      {/if}
     {:else}
       <div class="hint"><span>session closed</span></div>
     {/if}
   {:else if tab.surface === "dashboard"}
-    <DashboardView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} />
+    {@const DashboardView = views.dashboard}
+    {#if DashboardView !== undefined}
+      <DashboardView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} />
+    {:else if viewErrors.dashboard}
+      {@render loadFailure("dashboard", "dashboard")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "settings"}
-    {#if SettingsView !== null}
+    {@const SettingsView = views.settings}
+    {#if SettingsView !== undefined}
       <SettingsView />
-    {:else if settingsLoadError}
-      <div class="hint"><span>could not load settings — reload to retry</span></div>
+    {:else if viewErrors.settings}
+      {@render loadFailure("settings", "settings")}
     {:else}
       <Spinner />
     {/if}
@@ -448,6 +504,20 @@
 
   .hint-sep {
     opacity: 0.5;
+  }
+
+  .load-failure button {
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    padding: 0.2rem 0.55rem;
+    color: var(--text);
+    background: var(--bg);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .load-failure button:hover {
+    border-color: color-mix(in srgb, var(--accent) 60%, var(--edge));
   }
 
   /* Translucent drop-zone preview showing exactly where the drop lands. */

@@ -777,6 +777,7 @@ dependencies = [
  "libproc",
  "mime_guess",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

@@ -1,52 +1,44 @@
 name: cla
 
-# Self-hosted CLA bot (CLA Assistant Lite). No external service and no OAuth
-# app: the whole flow runs inside Actions and signatures are stored as a JSON
-# file committed to the `cla-signatures` branch of this repo. A contributor
-# signs by posting the sign phrase as a PR comment; the bot records their
-# username and blocks the PR check until they have.
+# Repository-owned CLA gate. The trusted default-branch script talks directly
+# to GitHub's API; no third-party CLA service/action receives contributor data.
+# Signatures remain in the existing cla-signatures branch and old
+# contributor-assistant records stay compatible.
 on:
-  # pull_request_target runs in the context of the base repo, so it has the
-  # write token and repo secrets even for PRs opened from forks — which is the
-  # common case a CLA needs to cover. It never runs the PR's code.
   pull_request_target:
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
 
 permissions:
-  actions: write # let the bot re-trigger its own run on a `recheck`/sign comment
-  contents: write # commit the signatures file to the cla-signatures branch
-  pull-requests: write # post and update the CLA comment on the PR
-  statuses: write
+  contents: write # update signatures/version1/cla.json on cla-signatures
+  pull-requests: write # create/update the one CLA guidance comment
+  statuses: write # update the PR head's stable `cla` status context
+
+# Two contributors can sign within seconds of each other. Serialize every CLA
+# event for a PR so an older run can never publish failure after the run that
+# recorded the final signature. Signature writes are never cancelled midway.
+concurrency:
+  group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   cla:
     runs-on: ubuntu-latest
-    # Only react to the relevant comments (the sign phrase or `recheck`) and to
-    # PR events — not to every issue comment in the repo.
     if: >-
-      (github.event_name == 'issue_comment' &&
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
         (github.event.comment.body == 'recheck' ||
          github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA')) ||
-      (github.event_name == 'pull_request_target')
+      github.event_name == 'pull_request_target'
     steps:
-      - name: CLA Assistant
-        # The upstream repository is archived; the immutable pin limits supply-chain
-        # exposure while the CLA flow is migrated to a maintained implementation.
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+      # pull_request_target is privileged. Checkout v7's default-branch
+      # protection is left on, the ref is explicit, credentials are discarded,
+      # and no fork-controlled code or dependency is ever executed.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Check contributor license agreement
+        run: node .github/scripts/cla.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          path-to-document: "https://github.com/martinappberg/chimaera/blob/main/CLA.md"
-          path-to-signatures: "signatures/version1/cla.json"
-          # Keep bot commits off main (and out of CI): signatures live on their
-          # own branch, which the action creates on first signature.
-          branch: "cla-signatures"
-          # The Maintainer owns the copyright and grants the relicensing rights,
-          # so they never need to sign. Ignore automation accounts too.
-          allowlist: "martinappberg,dependabot[bot],renovate[bot],github-actions[bot]"
-          custom-pr-sign-comment: "I have read the CLA Document and I hereby sign the CLA"
-          custom-notsigned-prcomment: "Thank you for your contribution to Chimaera. Before it can be merged, we need you to sign the [Contributor License Agreement](https://github.com/martinappberg/chimaera/blob/main/CLA.md). You keep the copyright to your contribution — the CLA only grants the relicensing rights that keep Chimaera's dual-licensing model possible. Please read it and, if you agree, reply with the line below:"
-          custom-allsigned-prcomment: "All contributors have signed the CLA. ✍️ Thank you!"
-          lock-pullrequest-aftermerge: false

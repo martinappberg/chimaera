@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod askpass;
+mod command_manifest;
 mod daemon;
 mod menu;
 mod shell;

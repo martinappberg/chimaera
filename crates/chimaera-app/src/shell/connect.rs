@@ -10,7 +10,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::restore::open_ui_window;
-use super::{lock, Shell};
+use super::{authorize_scope_origin, lock, Shell};
 use crate::windows::WindowRecord;
 
 /// Host list entry as the UI sees it (see HostState in native.ts).
@@ -278,6 +278,8 @@ async fn run_flight(
     }
     let entry = host_entry(alias);
     let host_state = state_for(&entry, "connected", Some(&tunnel));
+    authorize_scope_origin(app, Some(alias), tunnel.local_port)
+        .map_err(|e| format!("could not authorize {alias}'s daemon origin: {e}"))?;
     // Tell open windows on this host to re-home if the port or token moved
     // (daemon restart / update); a same-port+token reconnect is a no-op for
     // them — their WebSocket just reconnects.

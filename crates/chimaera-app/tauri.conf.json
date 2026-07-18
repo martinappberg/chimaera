@@ -11,7 +11,8 @@
     "withGlobalTauri": true,
     "windows": [],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": ["wsl-setup"]
     }
   },
   "bundle": {

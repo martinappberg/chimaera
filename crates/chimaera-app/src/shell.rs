@@ -10,11 +10,12 @@
 //!   reopening the persisted window set at launch.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use chimaera_remote::Tunnel;
+use tauri::ipc::CapabilityBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::daemon::LocalDaemon;
@@ -25,6 +26,18 @@ mod connect;
 mod restore;
 
 pub use restore::open_ui_window;
+
+/// Permissions exposed to a daemon-served workbench window. These grants are
+/// installed at runtime for one volatile window label and one exact loopback
+/// origin; the only static capability is the shell-local WSL wizard.
+const DAEMON_UI_CORE_PERMISSIONS: &[&str] = &[
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-title",
+];
+
+static DAEMON_CAPABILITY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A connect attempt's shared outcome: `None` while in flight, then the
 /// result. Joiners wait on this instead of racing their own ssh — see
@@ -60,6 +73,10 @@ pub struct Shell {
     /// duplicate). The SPA reports its own scope because it swaps `ws`
     /// client-side without a shell round-trip.
     windows: Mutex<HashMap<String, WindowScope>>,
+    /// The only loopback port each daemon window may navigate to right now.
+    /// Runtime ACLs are additive, so this guard also makes an origin granted
+    /// before a reconnect unusable if its port is later recycled.
+    allowed_daemon_ports: Mutex<HashMap<String, u16>>,
     /// The persisted window set (windows.json) — what the next launch reopens.
     registry: Mutex<WindowRegistry>,
     /// Set on ExitRequested: window teardown during quit must NOT remove
@@ -107,6 +124,71 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Grant one daemon window the shell bridge on one exact loopback origin and
+/// make that origin its sole navigation target. The capability identifier is
+/// always fresh because Tauri's runtime authority is additive and rejects an
+/// identifier collision.
+pub(super) fn authorize_daemon_origin(
+    app: &AppHandle,
+    window_label: &str,
+    port: u16,
+) -> tauri::Result<()> {
+    let shell = app.state::<Shell>();
+    if lock(&shell.allowed_daemon_ports).get(window_label) == Some(&port) {
+        return Ok(());
+    }
+
+    let sequence = DAEMON_CAPABILITY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut capability = CapabilityBuilder::new(format!("daemon-ui-{window_label}-{sequence}"))
+        .window(window_label)
+        .local(false)
+        .remote(format!("http://127.0.0.1:{port}/*"));
+    for permission in DAEMON_UI_CORE_PERMISSIONS {
+        capability = capability.permission(*permission);
+    }
+    for command in crate::command_manifest::DAEMON_UI_COMMANDS {
+        capability = capability.permission(format!("allow-{}", command.replace('_', "-")));
+    }
+    app.add_capability(capability)?;
+    lock(&shell.allowed_daemon_ports).insert(window_label.to_string(), port);
+    Ok(())
+}
+
+/// Authorize a moved daemon origin for every open window in the matching
+/// scope before broadcasting the event that makes those windows navigate.
+pub(super) fn authorize_scope_origin(
+    app: &AppHandle,
+    scope_alias: Option<&str>,
+    port: u16,
+) -> tauri::Result<()> {
+    let shell = app.state::<Shell>();
+    let labels: Vec<String> = lock(&shell.windows)
+        .iter()
+        .filter(|(_, scope)| scope.alias.as_deref() == scope_alias)
+        .map(|(label, _)| label.clone())
+        .collect();
+    for label in labels {
+        authorize_daemon_origin(app, &label, port)?;
+    }
+    Ok(())
+}
+
+pub(super) fn daemon_navigation_allowed(app: &AppHandle, label: &str, url: &tauri::Url) -> bool {
+    let Some(shell) = app.try_state::<Shell>() else {
+        return false;
+    };
+    let port = lock(&shell.allowed_daemon_ports).get(label).copied();
+    daemon_origin_matches(port, url)
+}
+
+fn daemon_origin_matches(port: Option<u16>, url: &tauri::Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port() == port
 }
 
 /// The open windows for the tray's window list: `(window label, display
@@ -299,6 +381,7 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             compute_connecting: Mutex::new(std::collections::HashSet::new()),
             connecting: Mutex::new(HashMap::new()),
             windows: Mutex::new(HashMap::new()),
+            allowed_daemon_ports: Mutex::new(HashMap::new()),
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
             closing: Mutex::new(HashSet::new()),
@@ -483,6 +566,7 @@ pub fn run() {
                 // defeat restore.
                 tauri::WindowEvent::Destroyed => {
                     lock(&shell.closing).remove(window.label());
+                    lock(&shell.allowed_daemon_ports).remove(window.label());
                     let scope = lock(&shell.windows).remove(window.label());
                     if !shell.quitting.load(Ordering::Relaxed) {
                         if let Some(scope) = scope {
@@ -625,4 +709,26 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::daemon_origin_matches;
+
+    #[test]
+    fn daemon_origin_requires_exact_scheme_host_and_port() {
+        let allowed: tauri::Url = "http://127.0.0.1:43123/workspace#token=x".parse().unwrap();
+        assert!(daemon_origin_matches(Some(43123), &allowed));
+
+        for rejected in [
+            "http://127.0.0.1:43124/",
+            "http://localhost:43123/",
+            "https://127.0.0.1:43123/",
+            "http://user@127.0.0.1:43123/",
+        ] {
+            let url = rejected.parse().unwrap();
+            assert!(!daemon_origin_matches(Some(43123), &url), "{rejected}");
+        }
+        assert!(!daemon_origin_matches(None, &allowed));
+    }
 }

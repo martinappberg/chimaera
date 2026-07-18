@@ -230,7 +230,8 @@ which is the survival property that matters.
   webview stack never touches the musl/HPC builds). Its binary doubles as the daemon
   (`--daemon`), spawned detached so quitting the app kills nothing. Windows load the
   daemon-served UI over `127.0.0.1` with the token in the URL fragment — the exact browser
-  mechanism, one UI codebase; a Tauri capability grants those origins the IPC bridge. A
+  mechanism, one UI codebase; a runtime Tauri capability grants each window's exact current
+  loopback origin the IPC bridge. A
   workspace-less window is a **home screen**: workspaces by recency with live session/
   needs-you badges, plus saved remote hosts (`~/.chimaera/hosts.json`) with one-click
   connect — probe, auto-install from `~/.chimaera/dist` (built by `just dist`, target

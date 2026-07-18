@@ -29,8 +29,34 @@ function devManifest(): Plugin {
   };
 }
 
+/** Keep the always-loaded application shell under Vite's 500 kB warning
+ * threshold. Feature chunks are intentionally excluded: heavyweight previews
+ * and workbench surfaces load only when the user opens them. */
+function entryBundleBudget(): Plugin {
+  const maxBytes = 500_000;
+  return {
+    name: "chimaera-entry-bundle-budget",
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== "chunk" || !output.isEntry) continue;
+        const bytes = new TextEncoder().encode(output.code).byteLength;
+        if (bytes > maxBytes) {
+          const largest = Object.entries(output.modules)
+            .sort(([, a], [, b]) => b.renderedLength - a.renderedLength)
+            .slice(0, 8)
+            .map(([id, module]) => `  ${(module.renderedLength / 1000).toFixed(1)} kB  ${id}`)
+            .join("\n");
+          this.error(
+            `${output.fileName} is ${(bytes / 1000).toFixed(1)} kB; the always-loaded entry budget is ${maxBytes / 1000} kB\nlargest entry modules:\n${largest}`,
+          );
+        }
+      }
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [svelte(), devManifest()],
+  plugins: [svelte(), devManifest(), entryBundleBudget()],
   build: {
     outDir: "dist",
   },

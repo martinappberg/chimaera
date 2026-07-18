@@ -60,6 +60,7 @@ jobs:
       - run: node scripts/check-doc-links.mjs
       - run: node scripts/check-agent-assets.mjs
       - run: node scripts/check-workflow-security.mjs
+      - run: node --test .github/scripts/*.test.mjs
 
   dependency-review:
     if: github.event_name == 'pull_request'

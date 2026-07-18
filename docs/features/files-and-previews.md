@@ -79,9 +79,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   on older daemons). Downloads ride the ticket pattern: `POST /api/v1/fs/ticket` accepts
   directories too, and the unauthenticated `GET /download/{ticket}` streams a file (with
   `Content-Disposition: attachment`, RFC 5987 unicode names) or a zip built on the fly
-  (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool; symlinks never
-  followed; 250k-entry ceiling aborts loudly). `/raw/{ticket}` stays file-only and streams byte
-  ranges from disk instead of materializing the whole file.
+  (`async_zip` through a 64 KiB duplex — bounded memory, no disk spool). The ticket target is
+  opened once without following symlinks; folder traversal stays anchored to that descriptor and
+  opens every component relative to it with symlink following disabled. A 250k-entry ceiling plus
+  separate 8 MiB ceilings for one directory's retained names and the DFS stack's full relative
+  paths abort loudly before a wide/deep tree can amplify traversal memory. `/raw/{ticket}` stays
+  file-only and streams byte ranges from disk instead of materializing the whole file.
 - **Key behaviors.** Every mutation bumps the client `fsEpoch` (tree + Finder re-list from any
   surface's change) and nudges `git::mark_path_dirty`. App subscribes to `lastFsMutation`:
   a rename/move **rewrites open tabs** (file/diff/finder, prefix-aware for folder renames —
