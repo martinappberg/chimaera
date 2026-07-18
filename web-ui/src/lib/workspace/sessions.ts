@@ -190,9 +190,15 @@ function unintegrated(s: Session): boolean {
 
 /**
  * True when a session is doing ACTIVE work right now: a shell running a
- * foreground command (OSC 133) or hosting an agent exec, or an agent mid-turn.
- * An idle shell (at the prompt) or a waiting/finished agent is NOT busy — the
- * daemon can restart around it, and the status dot should say so.
+ * foreground command (OSC 133) or hosting an agent exec, an agent mid-turn, or
+ * an agent whose turn ended while backgrounded work keeps running. An idle
+ * shell (at the prompt) or a genuinely finished agent is NOT busy — the daemon
+ * can restart around it, and the status dot should say so.
+ *
+ * Background work counts because it does NOT restore across a restart: the
+ * tasks are the CLI's children and die with the process. "Mid-turn" alone
+ * would call such a session idle and let both callers act on it silently —
+ * the × would skip its confirm, and the pre-update warning would undercount.
  */
 export function isBusy(s: Session): boolean {
   if (!s.alive) return false;
@@ -206,6 +212,7 @@ export function isBusy(s: Session): boolean {
   return (
     s.agent_state === "running" ||
     s.exec_stage === "executing" ||
+    backgrounded(s) ||
     (unintegrated(s) && s.output_active === true)
   );
 }
@@ -265,8 +272,23 @@ export function backgrounded(s: Session): boolean {
   return s.alive && s.agent_state !== "running" && (s.background_running ?? 0) > 0;
 }
 
-/** Hover tooltip naming the state behind a session dot. */
+/**
+ * Hover tooltip naming the state behind a session dot.
+ *
+ * Background work is appended rather than folded into the state words: the
+ * mark breathes for it, and a pulsing mark whose tooltip reads "finished"
+ * looks like a rendering bug. The turn state stays the headline — the two
+ * facts are independent ("finished · 2 running in the background").
+ */
 export function dotTitle(s: Session): string {
+  const base = turnDotTitle(s);
+  const running = s.background_running ?? 0;
+  if (!s.alive || running === 0) return base;
+  return `${base} · ${running} running in the background`;
+}
+
+/** The turn/phase half of {@link dotTitle}. */
+function turnDotTitle(s: Session): string {
   if (s.kind !== "agent") {
     if (!s.alive) return "exited";
     if (s.phase === "running") return "running a command";

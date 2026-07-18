@@ -1935,6 +1935,49 @@ mod tests {
         serde_json::to_string(&SeqEvent { seq: n, ts: 0, ev }).unwrap()
     }
 
+    fn chat_info(background_running: usize) -> ChatInfo {
+        ChatInfo {
+            id: "s-1".into(),
+            agent: "claude".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            created_at_ms: 0,
+            alive: true,
+            exit_status: None,
+            native_session_id: None,
+            model: None,
+            current_mode: None,
+            pending_permission: false,
+            status_detail: None,
+            status_category: None,
+            status_needs_action: false,
+            background_running,
+        }
+    }
+
+    /// `background_running` is part of the wire contract, and it is the ONE
+    /// live-work field a chat row fills rather than nulls: every other surface
+    /// derives its version from the journal, but the rail renders sessions it
+    /// has no socket for, so the count has to ride the row. A count, never the
+    /// set — the rows live on the chat socket. (PTY rows carry null; that half
+    /// is pinned in `session_view`.)
+    #[test]
+    fn background_running_rides_chat_rows() {
+        let row = chat_session_json(&chat_info(0), None, None, false);
+        assert_eq!(
+            row["background_running"],
+            json!(0),
+            "none running is 0, not null"
+        );
+        // The fields a chat row deliberately leaves to the chat client stay
+        // null right beside it — the exception must not widen by accident.
+        for key in ["stalled", "subagents", "now_line", "usage"] {
+            assert_eq!(row[key], json!(null), "{key}");
+        }
+
+        let row = chat_session_json(&chat_info(2), None, None, false);
+        assert_eq!(row["background_running"], json!(2));
+    }
+
     /// The rewind cut drops the SELECTED user message and everything after it,
     /// keeping the fork's resume point (the preceding message) and all history
     /// before it, and reports the number of dropped turns (codex's

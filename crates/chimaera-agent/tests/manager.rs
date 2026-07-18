@@ -367,9 +367,10 @@ async fn background_tasks_outlive_their_turn_and_accumulate() {
     let info = fx.manager.get("s-bg").expect("info");
     assert_eq!(info.background_running, 2);
 
-    // The tasks were the CLI's children — they die with it, and no final
-    // empty level-set follows an exit. Without the explicit zero, a dead
-    // session's row would sit there claiming work forever.
+    // The tasks were the CLI's children — they die with it, and the row must
+    // say so. (Either mechanism satisfies this: claude's teardown journals an
+    // empty level-set, and the pump zeroes on Exited for drivers that don't.
+    // The row-level guarantee is what matters here, not which one fired.)
     assert!(fx.manager.kill("s-bg"));
     wait_for(&mut rx, &mut seen, "Exited", |ev| {
         matches!(ev, AgentEvent::Exited { .. })

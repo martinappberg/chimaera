@@ -30,10 +30,12 @@
      *  Off by default so tabs / quick-open / the dashboard (which carries its
      *  own dot) stay still. */
     pulse?: boolean;
-    /** The turn is idle but background work is still running. Breathes in the
-     *  mark's own (muted) color on the same `pulse` surfaces — off-screen work
-     *  must not read as finished. Independent of `pulse`'s alive gate: this
-     *  state is by definition NOT alive. */
+    /** The turn is idle but background work is still running: breathe in the
+     *  mark's own (muted) color, since off-screen work must not read as
+     *  finished. Widens WHEN `pulse` breathes (it is not alive), but stays
+     *  under `pulse` — a surface that opted out of animation (tabs,
+     *  quick-open) must not start moving because a task went to the
+     *  background. */
     backgrounded?: boolean;
   }
 
@@ -62,7 +64,7 @@
 
 <svg
   class="sglyph {state}"
-  class:pulse={(pulse && state === "alive") || backgrounded}
+  class:pulse={pulse && (state === "alive" || backgrounded)}
   viewBox="0 0 16 16"
   width={size}
   height={size}

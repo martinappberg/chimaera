@@ -299,8 +299,12 @@ impl ChatManager {
                 AgentEvent::Exited { status } => {
                     info.alive = false;
                     info.exit_status = *status;
-                    // The tasks were the CLI's children — they died with it,
-                    // and no final empty level-set follows an exit.
+                    // Belt-and-braces, not the primary path: claude's teardown
+                    // journals an empty level-set (drain_pending), which the
+                    // arm above already folds to 0. But that is per-DRIVER
+                    // politeness, and this fold is driver-agnostic — a driver
+                    // that dies without draining must not leave a dead row
+                    // claiming live work forever.
                     info.background_running = 0;
                 }
                 _ => {}
