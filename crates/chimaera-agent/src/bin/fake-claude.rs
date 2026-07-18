@@ -277,12 +277,17 @@ fn run_canned_turn() {
     }));
 }
 
-/// A turn that backgrounds a Bash task and then ends. `task_started` with a
-/// task_type other than `local_agent` is the background lane (the subagent
-/// lane keeps `local_agent`), and background work is cross-turn — so once the
-/// result lands the session is idle with the task still in the live set. That
-/// is the exact state the "still working off-screen" cues render, and nothing
-/// clears it until the process dies.
+/// A turn that backgrounds a Bash task and then ends. Background work is
+/// cross-turn — once the result lands the session is idle with the task still
+/// in the live set. That is the exact state the "still working off-screen"
+/// cues render, and nothing clears it until the process dies.
+///
+/// The frames mirror the real spawn order (PROTOCOL.md Pass 23):
+/// `background_tasks_changed` carrying the task arrives FIRST and is what
+/// admits it to the set, then `task_started` enriches it. `task_started`
+/// alone can't mean background — the real CLI emits an identical one for a
+/// long-running FOREGROUND Bash. Since the set change is a REPLACE, each turn
+/// re-announces every task spawned so far, which is what lets them accumulate.
 fn run_background_turn(n: u32) {
     emit(json!({
         "type": "system", "subtype": "init",
@@ -297,6 +302,20 @@ fn run_background_turn(n: u32) {
         "type": "stream_event",
         "event": { "type": "content_block_delta",
                    "delta": { "type": "text_delta", "text": "running that in the background" } },
+    }));
+    // The authoritative level-set: every task spawned so far (this frame is a
+    // REPLACE, so dropping the earlier ones would retire them).
+    let tasks: Vec<Value> = (0..=n)
+        .map(|i| {
+            json!({
+                "task_id": format!("bg-{i}"),
+                "task_type": "local_bash",
+                "description": format!("npm run build ({i})"),
+            })
+        })
+        .collect();
+    emit(json!({
+        "type": "system", "subtype": "background_tasks_changed", "tasks": tasks,
     }));
     emit(json!({
         "type": "system", "subtype": "task_started",

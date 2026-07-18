@@ -41,9 +41,9 @@ use crate::model::{
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
-/// CLI version these frame shapes were verified against (2026-07-16,
-/// full chat-smoke).
-pub const TESTED_CLAUDE_VERSION: &str = "2.1.211";
+/// CLI version these frame shapes were verified against (2026-07-18,
+/// full chat-smoke 18/18).
+pub const TESTED_CLAUDE_VERSION: &str = "2.1.212";
 
 /// Arguments for a structured chat session, before server-side extras
 /// (`--settings`, `--mcp-config`, `--session-id`) and login-shell wrapping.
@@ -117,12 +117,13 @@ fn control_request_frame(id: &str, request: Value) -> Value {
     })
 }
 
-/// One construction site for a wire-adopted background task, shared by BOTH
-/// adopt paths (task_started and background_tasks_changed carry the same
-/// task_id/task_type/description fields) so caps and fallbacks can't drift
-/// between them. `now` is the driver's first sight — the wire carries no
-/// start time, and the stamp is journaled so replayed ages stay truthful.
-/// The description falls back to the lane name so a tray row is never blank.
+/// One construction site for a wire-adopted background task. There is exactly
+/// ONE adopt path — `background_tasks_changed` — because only that frame can
+/// tell a backgrounded task from a foreground one (see
+/// [`ClaudeMapper::on_background_started`]). `now` is the driver's first sight
+/// — the wire carries no start time, and the stamp is journaled so replayed
+/// ages stay truthful. The description falls back to the lane name so a tray
+/// row is never blank.
 fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
     let id = t["task_id"].as_str().filter(|id| !id.is_empty())?;
     let task_type = t["task_type"].as_str().unwrap_or("unknown");
@@ -132,9 +133,10 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
         description: truncate_label(t["description"].as_str().unwrap_or(task_type), BG_LABEL_MAX),
         status: "running".into(),
         started_at_ms: now,
-        // task_started carries these; background_tasks_changed doesn't —
-        // the started-path fold (on_background_started) patches them onto
-        // an entry the set change adopted first (live order at spawn).
+        // Always None on today's wire: only task_started carries these, and
+        // it no longer constructs. Parsed anyway because the wire is pinned,
+        // not trusted — if a set change ever starts carrying them we take
+        // them for free. Until then on_background_started folds them on.
         workflow_name: wire_workflow_name(t),
         agents: Vec::new(),
         agents_total: 0,
@@ -143,10 +145,11 @@ fn background_task_from_wire(t: &Value, now: u64) -> Option<BackgroundTask> {
     })
 }
 
-/// The two workflow-binding fields, extracted ONCE for both adopt paths
-/// (task_started and the set change) so their sanitization can't drift.
-/// A whitespace-only `meta.name` counts as absent — the UI branches on the
-/// name being present, and a blank title would beat the description fallback.
+/// The two workflow-binding fields, extracted ONCE for both frames that can
+/// carry them — the set change (adoption) and task_started (enrichment) — so
+/// their sanitization can't drift. A whitespace-only `meta.name` counts as
+/// absent: the UI branches on the name being present, and a blank title would
+/// beat the description fallback.
 fn wire_workflow_name(v: &Value) -> Option<String> {
     opt_label(&v["workflow_name"], BG_LABEL_MAX)
 }
@@ -857,9 +860,11 @@ impl ClaudeMapper {
             // otherwise a standalone agent row is synthesized.
             Some("task_started") => {
                 // Only the subagent lane renders Agent rows. Newer CLIs also
-                // route background bash/workflows through task_* with other
-                // task_type values (local_bash, local_workflow, …) — those
-                // feed the background-tasks surface instead. An ABSENT
+                // route bash/workflows through task_* with other task_type
+                // values (local_bash, local_workflow, …) — those belong to
+                // the background surface, which adopts strictly from
+                // `background_tasks_changed` (this frame only enriches; see
+                // on_background_started for why it cannot adopt). An ABSENT
                 // task_type stays a subagent (older wire shape).
                 if frame["task_type"]
                     .as_str()
@@ -1259,49 +1264,45 @@ impl ClaudeMapper {
         }
     }
 
-    /// A background task entered the set (`task_started` with a
-    /// non-`local_agent` task_type: local_bash, local_workflow, …). Insert
-    /// and re-emit the level-set; a duplicate start is a no-op.
+    /// A background lane's `task_started` (non-`local_agent` task_type:
+    /// local_bash, local_workflow, …) — **enrichment only, never adoption.**
+    ///
+    /// `background_tasks_changed` is the SOLE authority for set membership.
+    /// This frame cannot decide it, because a FOREGROUND long-running Bash
+    /// emits a `task_started` with the same field set and the same
+    /// `task_type: "local_bash"` as a backgrounded one — the values differ
+    /// (ids, description), but no field's PRESENCE or value distinguishes the
+    /// two lanes (live-probed 2.1.212). What actually separates them
+    /// is that only a genuinely backgrounded task is announced in a
+    /// `background_tasks_changed` set; a foreground command never appears in
+    /// one. Adopting from this frame therefore parked every slow foreground
+    /// command in the background tray for as long as it ran ("background
+    /// task running" over a command the user was watching run in the
+    /// foreground).
+    ///
+    /// Both real background lanes are announced BEFORE their `task_started`
+    /// (live order, 2.1.212: `background_tasks_changed` with the task →
+    /// `task_started`; verified for local_bash and local_workflow), so the
+    /// entry is already adopted by the time this runs and nothing is lost.
+    /// Only `task_started` carries `workflow_name`/`tool_use_id`, so fold
+    /// those onto it here. An id we don't know is IGNORED — if a future CLI
+    /// ever flipped that order the set change still adopts the task, just
+    /// without those two fields (a degraded row, not a phantom one).
     fn on_background_started(&mut self, frame: &Value, step: &mut DriverStep) {
         let Some(task_id) = frame["task_id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
-        if let Some(existing) = self.background_tasks.iter_mut().find(|t| t.id == task_id) {
-            // At spawn the set change PRECEDES task_started (live order), and
-            // only task_started carries workflow_name/tool_use_id — fold them
-            // onto the adopted entry instead of no-opping the duplicate.
-            if let Some(id) = wire_tool_use_id(frame) {
-                existing.tool_use_id = Some(id);
-            }
-            let name = wire_workflow_name(frame);
-            if name.is_some() && existing.workflow_name != name {
-                existing.workflow_name = name;
-                self.emit_background_tasks(Vec::new(), step);
-            }
-            return;
-        }
-        // A re-listed id that already departed REVIVES (original stamp) —
-        // one id never lives in both collections, so a later verdict folds
-        // exactly once.
-        let Some(task) = self
-            .unpark_departed(task_id)
-            .map(|mut t| {
-                t.status = "running".into();
-                t
-            })
-            .or_else(|| background_task_from_wire(frame, crate::now_ms()))
-        else {
+        let Some(existing) = self.background_tasks.iter_mut().find(|t| t.id == task_id) else {
             return;
         };
-        self.background_tasks.push(task);
-        // Set bound: drop the OLDEST beyond the cap — the tray shows recent
-        // work, and the level-set event's size is the set's size. The evictee
-        // parks in departed so its eventual verdict still folds.
-        if self.background_tasks.len() > BG_TASKS_CAP {
-            let evicted = self.background_tasks.remove(0);
-            self.park_departed(evicted);
+        if let Some(id) = wire_tool_use_id(frame) {
+            existing.tool_use_id = Some(id);
         }
-        self.emit_background_tasks(Vec::new(), step);
+        let name = wire_workflow_name(frame);
+        if name.is_some() && existing.workflow_name != name {
+            existing.workflow_name = name;
+            self.emit_background_tasks(Vec::new(), step);
+        }
     }
 
     /// A workflow lane's per-agent progress (`task_progress` with a
@@ -5212,21 +5213,27 @@ mod tests {
         found.expect("a BackgroundTasks event")
     }
 
+    /// Announce the authoritative background set — the ONLY frame that adopts
+    /// a task. Live order at spawn puts this immediately before the task's
+    /// `task_started` (which merely enriches), so every test that wants a task
+    /// in the set announces it here first, exactly as the wire does. The frame
+    /// is a REPLACE, so callers pass the WHOLE set they want to exist.
+    fn announce(m: &mut ClaudeMapper, tasks: &[(&str, &str, &str)]) -> DriverStep {
+        let wire: Vec<Value> = tasks
+            .iter()
+            .map(|(id, task_type, description)| {
+                json!({ "task_id": id, "task_type": task_type, "description": description })
+            })
+            .collect();
+        m.on_frame(&json!({
+            "type": "system", "subtype": "background_tasks_changed", "tasks": wire,
+        }))
+    }
+
     #[test]
     fn background_task_started_feeds_the_set_not_agent_rows() {
         let mut m = mapper();
-        let step = m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-1",
-            "tool_use_id": "tu-b1", "description": "sleep 30",
-        }));
-        assert!(
-            !step
-                .events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolCall { .. })),
-            "background lanes must not synthesize Agent rows"
-        );
+        let step = announce(&mut m, &[("bg-1", "local_bash", "sleep 30")]);
         let (tasks, closed) = background_event(&step);
         assert!(closed.is_empty());
         assert_eq!(tasks.len(), 1);
@@ -5236,10 +5243,44 @@ mod tests {
         assert_eq!(tasks[0].status, "running");
         assert!(tasks[0].started_at_ms > 0, "driver stamps the start");
 
-        // A duplicate start is a no-op (no second event).
+        // The `task_started` that follows only enriches: no Agent row for a
+        // background lane, and no second copy of an already-adopted task.
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-1", "description": "sleep 30",
+            "task_type": "local_bash", "task_id": "bg-1",
+            "tool_use_id": "tu-b1", "description": "sleep 30",
+        }));
+        assert!(
+            step.events.is_empty(),
+            "an already-adopted task's start is a pure no-op — no second copy, \
+             and never an Agent row for a background lane"
+        );
+    }
+
+    #[test]
+    fn foreground_bash_task_started_never_enters_the_background_set() {
+        // A long-running FOREGROUND Bash emits a `task_started` that is
+        // identical in shape to a backgrounded one — same
+        // `task_type: "local_bash"`, same fields, no discriminator
+        // (live-probed 2.1.212). The ONLY thing that separates them is the
+        // `background_tasks_changed` announcing the backgrounded one. While
+        // this frame could adopt, every slow foreground command sat in the
+        // background tray ("background task running") for as long as it ran.
+        let mut m = mapper();
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_bash", "task_id": "fg-1", "tool_use_id": "tu-f1",
+            "description": "Run compute-bound awk summation loop",
+        }));
+        assert!(
+            step.events.is_empty(),
+            "a foreground command is not background work"
+        );
+        // Its verdict is equally silent — nothing was adopted, nothing closes.
+        let step = m.on_frame(&json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "fg-1", "tool_use_id": "tu-f1", "status": "completed",
+            "summary": "done",
         }));
         assert!(step.events.is_empty());
     }
@@ -5247,11 +5288,8 @@ mod tests {
     #[test]
     fn background_description_is_capped_at_construction() {
         let mut m = mapper();
-        let step = m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_workflow", "task_id": "bg-big",
-            "description": "x".repeat(10_000),
-        }));
+        let long = "x".repeat(10_000);
+        let step = announce(&mut m, &[("bg-big", "local_workflow", &long)]);
         let (tasks, _) = background_event(&step);
         assert!(tasks[0].description.len() <= BG_LABEL_MAX + '…'.len_utf8());
     }
@@ -5259,10 +5297,7 @@ mod tests {
     #[test]
     fn task_updated_patches_status_and_terminal_status_removes() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-2", "description": "make -j",
-        }));
+        announce(&mut m, &[("bg-2", "local_bash", "make -j")]);
         // A non-terminal patch updates the row in place.
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_updated",
@@ -5307,6 +5342,10 @@ mod tests {
         // task parks in departed so the notification still folds its close —
         // this exact sequence dropped the verdict in the first live run.
         let mut m = mapper();
+        announce(
+            &mut m,
+            &[("bg-8", "local_bash", "Sleep 8 seconds then echo done")],
+        );
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_bash", "task_id": "bg-8",
@@ -5392,6 +5431,7 @@ mod tests {
     #[test]
     fn workflow_progress_folds_agents_and_emits_on_transitions_only() {
         let mut m = mapper();
+        announce(&mut m, &[("wf-2", "local_workflow", "two agents")]);
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-2",
@@ -5448,11 +5488,7 @@ mod tests {
     #[test]
     fn workflow_agents_cap_keeps_newest_and_totals_stay_honest() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_workflow", "task_id": "wf-3",
-            "description": "big fan-out",
-        }));
+        announce(&mut m, &[("wf-3", "local_workflow", "big fan-out")]);
         let wire: Vec<Value> = (1..=(WF_AGENTS_CAP as u64 + 10))
             .map(|i| wf_agent(i, if i <= 5 { "done" } else { "start" }))
             .collect();
@@ -5473,10 +5509,7 @@ mod tests {
     #[test]
     fn workflow_progress_dedupes_repeated_indexes_newest_wins() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_workflow", "task_id": "wf-6", "description": "d",
-        }));
+        announce(&mut m, &[("wf-6", "local_workflow", "d")]);
         // Index 1 appears twice — the tail (newest) occurrence wins, and the
         // dupe inflates neither the dot row nor the totals.
         let step = m.on_frame(&json!({
@@ -5500,15 +5533,12 @@ mod tests {
         // The wire OMITS the array on aggregate ticks today; an explicit []
         // (unversioned wire) must not wipe a live dot row back to 0/0.
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_workflow", "task_id": "wf-7",
-            "tool_use_id": "tu-w7", "description": "d",
-        }));
-        m.on_frame(&json!({
+        announce(&mut m, &[("wf-7", "local_workflow", "d")]);
+        let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_progress", "task_id": "wf-7",
             "workflow_progress": [wf_agent(1, "start")],
         }));
+        assert_eq!(background_event(&step).0[0].agents.len(), 1);
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_progress", "task_id": "wf-7",
             "workflow_progress": [],
@@ -5523,6 +5553,7 @@ mod tests {
         // the counts the close line prints (silently: no level-set emit, no
         // card tick for a task that already left the set).
         let mut m = mapper();
+        announce(&mut m, &[("wf-8", "local_workflow", "d")]);
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-8",
@@ -5557,12 +5588,16 @@ mod tests {
         // shedding the OLDEST tasks' dot rows (their aggregates stay).
         let mut m = mapper();
         let over = WF_AGENTS_SET_BUDGET / WF_AGENTS_CAP + 1;
+        let spawned: Vec<(String, String)> = (0..over)
+            .map(|i| (format!("wf-b{i}"), format!("wf {i}")))
+            .collect();
         for i in 0..over {
-            m.on_frame(&json!({
-                "type": "system", "subtype": "task_started",
-                "task_type": "local_workflow", "task_id": format!("wf-b{i}"),
-                "description": format!("wf {i}"),
-            }));
+            // The set change is a REPLACE — announce everything spawned so far.
+            let set: Vec<(&str, &str, &str)> = spawned[..=i]
+                .iter()
+                .map(|(id, desc)| (id.as_str(), "local_workflow", desc.as_str()))
+                .collect();
+            announce(&mut m, &set);
             let wire: Vec<Value> = (1..=(WF_AGENTS_CAP as u64))
                 .map(|n| wf_agent(n, "start"))
                 .collect();
@@ -5591,14 +5626,15 @@ mod tests {
     #[test]
     fn whitespace_workflow_name_counts_as_absent() {
         let mut m = mapper();
+        announce(&mut m, &[("wf-9", "local_workflow", "real description")]);
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-9",
             "workflow_name": "  ", "description": "real description",
         }));
-        let (tasks, _) = background_event(&step);
+        assert!(step.events.is_empty(), "a blank name is not a transition");
         assert_eq!(
-            tasks[0].workflow_name, None,
+            m.background_tasks[0].workflow_name, None,
             "blank name never beats the description fallback"
         );
     }
@@ -5613,6 +5649,7 @@ mod tests {
     #[test]
     fn workflow_close_lands_the_final_line_on_the_launching_card() {
         let mut m = mapper();
+        announce(&mut m, &[("wf-4", "local_workflow", "two agents")]);
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-4",
@@ -5655,6 +5692,7 @@ mod tests {
     #[test]
     fn workflow_failed_close_flips_the_card_and_bash_closes_leave_cards_alone() {
         let mut m = mapper();
+        announce(&mut m, &[("wf-5", "local_workflow", "d")]);
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-5",
@@ -5668,6 +5706,7 @@ mod tests {
             AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. } if id == "tu-w5")));
         // A backgrounded Bash close never touches its Bash card — the card's
         // own tool_result already told that story.
+        announce(&mut m, &[("bg-9", "local_bash", "sleep 30")]);
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_bash", "task_id": "bg-9",
@@ -5686,10 +5725,7 @@ mod tests {
     #[test]
     fn background_tasks_changed_is_the_authoritative_level_set() {
         let mut m = mapper();
-        let step = m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-3", "description": "sleep 5",
-        }));
+        let step = announce(&mut m, &[("bg-3", "local_bash", "sleep 5")]);
         let (tasks, _) = background_event(&step);
         let stamp = tasks[0].started_at_ms;
         // The level-set: bg-3 stays (keeping its stamp), bg-4 is adopted
@@ -5730,10 +5766,7 @@ mod tests {
     #[test]
     fn task_notification_closes_background_with_verdict_summary_and_output_file() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-5", "description": "sleep 30",
-        }));
+        announce(&mut m, &[("bg-5", "local_bash", "sleep 30")]);
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_notification",
             "task_id": "bg-5", "tool_use_id": "tu-b5", "status": "completed",
@@ -5759,10 +5792,7 @@ mod tests {
         // wipe on `result` must not clear it, and a notification landing in
         // a LATER turn still closes it.
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-6", "description": "sleep 60",
-        }));
+        announce(&mut m, &[("bg-6", "local_bash", "sleep 60")]);
         m.on_frame(&json!({
             "type": "assistant",
             "message": { "id": "m1", "content": [{ "type": "text", "text": "started" }] },
@@ -5789,10 +5819,7 @@ mod tests {
     #[test]
     fn stop_task_passes_background_keys_through() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-7", "description": "sleep 600",
-        }));
+        announce(&mut m, &[("bg-7", "local_bash", "sleep 600")]);
         let step = m.on_command(AgentCommand::StopTask {
             task_id: "bg-7".into(),
         });
@@ -5889,10 +5916,7 @@ mod tests {
     #[test]
     fn close_summary_echo_and_oversized_output_file_are_dropped() {
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-e", "description": "sleep 90",
-        }));
+        announce(&mut m, &[("bg-e", "local_bash", "sleep 90")]);
         // A stop's summary is the description verbatim (live-verified) —
         // an echo carries nothing; and output_file is a PATH, so an
         // oversized one is dropped whole rather than ellipsized into a
@@ -5913,12 +5937,15 @@ mod tests {
         // level-set so every journal consumer sees them end, not just a
         // client that special-cases exit events.
         let mut m = mapper();
-        m.on_frame(&json!({
-            "type": "system", "subtype": "task_started",
-            "task_type": "local_bash", "task_id": "bg-t", "description": "sleep 600",
-        }));
         // A card-bound workflow gets an honest interrupted line before its
         // identity is dropped — the card must not strand at "N/M agents done".
+        announce(
+            &mut m,
+            &[
+                ("bg-t", "local_bash", "sleep 600"),
+                ("wf-t", "local_workflow", "d"),
+            ],
+        );
         m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_workflow", "task_id": "wf-t",
@@ -6027,8 +6054,13 @@ mod tests {
                 ..
             }
         ));
-        // local_bash (a backgrounded shell) is a different surface — it
-        // feeds the background-tasks set, never an Agent row.
+        // local_bash is a different surface — it belongs to the
+        // background-tasks set (adopted by the set change that announced it),
+        // and never synthesizes an Agent row.
+        announce(
+            &mut m,
+            &[("tk-2", "local_bash", "Sleep 8 seconds then echo")],
+        );
         let step = m.on_frame(&json!({
             "type": "system", "subtype": "task_started",
             "task_type": "local_bash", "task_id": "tk-2",
@@ -6038,8 +6070,7 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::ToolCall { .. })));
-        let (tasks, _) = background_event(&step);
-        assert_eq!(tasks[0].id, "tk-2");
+        assert_eq!(m.background_tasks[0].id, "tk-2");
     }
 
     #[test]
