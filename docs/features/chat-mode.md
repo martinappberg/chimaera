@@ -112,8 +112,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
 
 - **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
   output/diff, a `↗` to open the touched file). Consecutive calls condense into a group ("6 commands
-  · 2 files"); groups auto-collapse once every tool finished cleanly, stay open while anything runs
-  or failed. Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
+  · 2 files"); a group stays open only while something is still running, then collapses — a finished
+  run is history whether it passed or not, and its badge (`failed` / `recovered`) carries the verdict
+  without springing rows open over a problem the agent's own next message usually just explained.
+  Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
   pending); `tool_output_delta` streams live output ahead of the authoritative result. **Dangling
   rows reconcile at turn end:** on `turn_completed`/`turn_aborted`/`exited` any tool still
   in_progress/pending in the just-ended turn is closed to `completed` (a pure reducer scan back to
@@ -175,6 +177,18 @@ TUI (see [view switch](#view-switch-and-rewind)).
   dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own
   present-continuous `activeForm` ("Running tests"). Older CLIs and codex, whose plans carry none of
   this, render exactly as before — the extra fields are simply absent.
+- **Three pinned strips, one shell, all minimizable.** Plan, subagents, and background work are three
+  orthogonal readings of a session — what the agent *means* to do, *who* is working, what is
+  *detached* — so they share the `WorkTray` chrome and stack above the composer, collapsed by
+  default, each a one-line glance. Only non-empty strips render, and the plan's glyph stays still
+  unless a step is actually in flight. Inside the plan, finished tasks fold into a "N done" line so a
+  long list shows what's next rather than a wall of ✓ (they unfold on click; a fully-finished plan
+  shows its rows, since nothing else remains). The workspace dashboard card follows the same rule —
+  live tasks first, finished ones as a count — so it never fills with ✓ while hiding the work in
+  flight. **A subagent's task list is its own**: its `Task*` calls never reach the parent stream, so
+  they cannot appear in the parent's plan (verified live) — the subagent surfaces as its Agent row
+  and tray entry instead. Where the two connect is `owner`: a task claimed by a teammate shows
+  `@name`, which is the same identity `TaskStop` accepts.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
   `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·

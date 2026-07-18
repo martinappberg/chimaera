@@ -6,9 +6,9 @@
   /**
    * A run of consecutive tool calls, condensed. Collapsed it is one quiet
    * summary row ("6 commands · 2 files"); expanded it is a light list of
-   * rows, each openable for its output. It auto-collapses once every tool in
-   * the run has finished cleanly — while anything is still running, or if
-   * anything failed, it stays open so progress and errors are never hidden.
+   * rows, each openable for its output. It stays open while anything is still
+   * running, then collapses — a finished run is history, whether it succeeded
+   * or not (the badge carries the verdict).
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
@@ -54,7 +54,12 @@
 
   /** null = follow the auto rule; a bool = the user's explicit choice. */
   let userOpen = $state<boolean | null>(null);
-  const open = $derived(userOpen ?? (running || failed || active));
+  /** Auto-open tracks LIVE work only. A failure deliberately does NOT force
+   *  the group open: the red badge already says it failed, the row is one
+   *  click away, and the agent's own next message almost always explains it —
+   *  so springing a wall of rows open re-litigates a problem the reader may
+   *  have already understood, and does it retroactively as history scrolls. */
+  const open = $derived(userOpen ?? (running || active));
 
   /** "6 commands · 2 files · 1 step" — only the non-zero parts, so a pure
    *  command run reads cleanly. Edits are counted by distinct file. */

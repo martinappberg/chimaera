@@ -18,10 +18,15 @@
     /** Expanded state — bindable so a tray can gate its own work (e.g. a
      *  1 Hz elapsed clock) on whether the rows are actually visible. */
     open?: boolean;
+    /** Whether the glyph breathes. The animation means "work is happening
+     *  right now", so a strip that can sit idle (the plan, once every step is
+     *  finished or merely waiting) must be able to go still — a permanent
+     *  pulse over nothing is the exact noise these strips exist to avoid. */
+    pulse?: boolean;
     /** The expanded row list (typically WorkTrayRow children). */
     children: Snippet;
   }
-  let { glyph, label, open = $bindable(false), children }: Props = $props();
+  let { glyph, label, open = $bindable(false), pulse = true, children }: Props = $props();
 </script>
 
 <div class="tray">
@@ -32,7 +37,7 @@
     title={open ? "collapse" : "expand"}
   >
     <Chevron {open} />
-    <span class="spark" aria-hidden="true">{glyph}</span>
+    <span class="spark" class:still={!pulse} aria-hidden="true">{glyph}</span>
     <!-- aria-live on the summary only: the count changing is worth
          announcing, per-row churn is not. -->
     <span class="head-label" role="status" aria-live="polite">{label}</span>
@@ -86,6 +91,10 @@
     color: var(--accent);
     /* Presence, not alarm — shared keyframe in app.css. */
     animation: tray-breathe 1.8s ease-in-out infinite;
+  }
+  .spark.still {
+    animation: none;
+    color: var(--muted);
   }
   @media (prefers-reduced-motion: reduce) {
     .tray,
