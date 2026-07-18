@@ -17,7 +17,13 @@
   import { basename } from "../previews/files";
   import { formatElapsedSeconds } from "../shared/time";
   import { relativeAge } from "../workspace/launcher";
-  import { agentKind, dotState, dotTitle, type Session } from "../workspace/sessions";
+  import {
+    agentKind,
+    backgrounded,
+    dotState,
+    dotTitle,
+    type Session,
+  } from "../workspace/sessions";
   import { isUnread } from "../workspace/unread.svelte";
   import { inlineMarkdown } from "../shared/inlineMarkdown";
   import type { BackgroundTask, ChatBlock, ChatStore } from "../chat/store.svelte";
@@ -115,18 +121,16 @@
 
   /** Background work (backgrounded Bash / workflows) — the level-set the
    *  BackgroundTray renders, promoted card-side the same way. A card that
-   *  showed only subagents would lie by omission (design decision 12). */
+   *  showed only subagents would lie by omission (design decision 12).
+   *  Warm-store only: the ROWS need the full set, which rides the chat
+   *  socket. The cue below doesn't — it reads the count off the wire. */
   const bgTasks = $derived(store?.backgroundTasks ?? []);
   /** The turn is idle but a background task is STILL running: the session
-   *  isn't "done", it's working off-screen. The glyph pulses gray for this
-   *  (vs the alive dot's green pulse for an active turn) — so a card with
-   *  ongoing background work never reads as finished. Only warm-store cards
-   *  know their background tasks (the wire row doesn't carry them). */
-  const backgrounded = $derived(
-    session.alive &&
-      session.agent_state !== "running" &&
-      bgTasks.some((t) => t.status === "running"),
-  );
+   *  isn't "done", it's working off-screen, so the state dot keeps pulsing
+   *  and the card never reads as finished. The shared session predicate, so
+   *  this card and that session's rail row always cue together — including
+   *  for a card with no warm store, which knows the count but not the rows. */
+  const isBackgrounded = $derived(backgrounded(session));
   /** Exactly one subagent source is populated (see wireAgents), so the sum
    *  is the count — the summary label reads the same either way. */
   const subCount = $derived(activeAgents.length + wireAgents.length);
@@ -223,7 +227,7 @@
   class:compact
   class:dead={!session.alive}
   class:unread={isUnread(session.id)}
-  class:backgrounded
+  class:backgrounded={isBackgrounded}
   role="button"
   tabindex="0"
   onclick={onOpen}
@@ -422,16 +426,22 @@
   .card.dead {
     opacity: 0.75;
   }
-  /* Idle turn but a background task is still running: the type glyph breathes
-     in GRAY (the alive dot's green pulse is reserved for an active turn), so
-     the card reads as "still working off-screen", not finished. `pulse` is
-     the global keyframe (app.css). */
+  /* Idle turn but a background task is still running: the STATE DOT breathes,
+     so the card reads as "still working off-screen", not finished. The dot is
+     this surface's state channel — the type glyph is identity, and animating
+     identity read as the wrong thing moving. It keeps its own state color
+     (a quiet ring for a finished turn, warn if it also wants you), and it
+     can't collide with .dot.alive: `backgrounded` requires a non-running turn.
+     The glyph only goes muted, matching the calmed-down state. `pulse` is the
+     global keyframe (app.css). */
   .card.backgrounded :global(.sglyph) {
     color: var(--muted);
+  }
+  .card.backgrounded .dot {
     animation: pulse 2.4s ease-in-out infinite;
   }
   @media (prefers-reduced-motion: reduce) {
-    .card.backgrounded :global(.sglyph) {
+    .card.backgrounded .dot {
       animation: none;
     }
   }

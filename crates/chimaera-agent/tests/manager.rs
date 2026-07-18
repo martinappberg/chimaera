@@ -307,6 +307,80 @@ async fn post_turn_summary_folds_latest_wins_session_status() {
     );
 }
 
+/// Background work is CROSS-TURN: a task started mid-turn is still in the live
+/// set after the turn ends, and a second turn adds to it rather than replacing
+/// it. That outliving is what every "still working off-screen" cue is gated on
+/// (the dashboard card's pulsing dot, the rail glyph's muted breathing) — if
+/// the set emptied at the turn boundary they would all read "finished".
+#[tokio::test]
+async fn background_tasks_outlive_their_turn_and_accumulate() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-bg", &fx.cwd, "background"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-bg", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+
+    // Each turn backgrounds one task, then ends — so after turn N the set
+    // holds N running tasks with the turn itself idle.
+    for expected in 1..=2usize {
+        send_text(&fx, "s-bg", "background this").await;
+        let ev = wait_for(
+            &mut rx,
+            &mut seen,
+            "BackgroundTasks",
+            |ev| matches!(ev, AgentEvent::BackgroundTasks { tasks, .. } if tasks.len() == expected),
+        )
+        .await;
+        match &ev.ev {
+            AgentEvent::BackgroundTasks { tasks, .. } => {
+                assert!(
+                    tasks.iter().all(|t| t.status == "running"),
+                    "the level-set carries only live work: {tasks:#?}"
+                );
+                assert_eq!(tasks[0].task_type, "local_bash", "the background lane");
+            }
+            _ => unreachable!(),
+        }
+        wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+            matches!(ev, AgentEvent::TurnCompleted { .. })
+        })
+        .await;
+    }
+
+    // The set survived BOTH turn boundaries — nothing after TurnCompleted
+    // shrank it back.
+    let last = seen
+        .iter()
+        .rev()
+        .find_map(|e| match &e.ev {
+            AgentEvent::BackgroundTasks { tasks, .. } => Some(tasks.clone()),
+            _ => None,
+        })
+        .expect("a background set");
+    assert_eq!(last.len(), 2, "turn two ADDED to the set: {last:#?}");
+
+    // And the pump folded that level-set to a COUNT on ChatInfo — the whole
+    // point of the fold: readable without attaching a socket, which is how
+    // the session row (and so the rail) learns about off-screen work at all.
+    let info = fx.manager.get("s-bg").expect("info");
+    assert_eq!(info.background_running, 2);
+
+    // The tasks were the CLI's children — they die with it, and the row must
+    // say so. (Either mechanism satisfies this: claude's teardown journals an
+    // empty level-set, and the pump zeroes on Exited for drivers that don't.
+    // The row-level guarantee is what matters here, not which one fired.)
+    assert!(fx.manager.kill("s-bg"));
+    wait_for(&mut rx, &mut seen, "Exited", |ev| {
+        matches!(ev, AgentEvent::Exited { .. })
+    })
+    .await;
+    let info = fx.manager.get("s-bg").expect("info");
+    assert_eq!(info.background_running, 0, "an exit clears the count");
+    assert!(!info.alive);
+}
+
 #[tokio::test]
 async fn permission_deny_marks_tool_failed() {
     let fx = fixture();

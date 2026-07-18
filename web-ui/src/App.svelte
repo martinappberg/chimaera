@@ -12,6 +12,7 @@
     type Health,
   } from "./lib/net/api";
   import {
+    backgrounded,
     createSession,
     deleteSession,
     deleteWorkspace,
@@ -3153,8 +3154,9 @@
             >
               <!-- Session-type glyph carrying the state color — the same
                    mark as the pane tab (surface parity, rail included). It
-                   breathes while alive (pulse): the rail's activity cue,
-                   since the row shows only the glyph, no separate dot. -->
+                   breathes while alive (pulse), and muted while background
+                   work runs past the turn: the rail's activity cue, since the
+                   row shows only the glyph, no separate dot. -->
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
@@ -3162,6 +3164,7 @@
                 size={11}
                 title={dotTitle(s)}
                 pulse
+                backgrounded={backgrounded(s)}
               />
               {#if renamingId === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
@@ -3751,7 +3754,7 @@
           >
             <!-- The type glyph replaces both the dot and the old "$ "
                  prefix — same mark as tabs and rail rows (parity), breathing
-                 while alive. -->
+                 while alive or working in the background. -->
             <SessionGlyph
               kind={s.kind}
               agentKind={s.agent_kind}
@@ -3759,6 +3762,7 @@
               size={10}
               title={dotTitle(s)}
               pulse
+              backgrounded={backgrounded(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
             {#if hintsActive() && chordDigits.has(s.id)}

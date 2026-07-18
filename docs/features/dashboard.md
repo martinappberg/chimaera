@@ -62,7 +62,10 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   kinds) — the `AgentsTray`/`BackgroundTray` derivations promoted workspace-wide. Cards
   without a warm store get the same drop-down fed by the wire `subagents` field (claude
   TUI hooks): label + relative age, read-only — hooks can't stop a TUI subagent, and the
-  wire and store rows never merge (double counting).
+  wire and store rows never merge (double counting). The "still working off-screen" CUE
+  (a pulsing state dot for an idle turn with live background work) needs no warm store at
+  all: it reads the wire `background_running` count, the same predicate the rail glyph
+  uses, so a card and its rail row always agree.
 - **Key behaviors.**
   - **Provenance is worn openly, in plain words**: the fidelity tier is `protocol`
     (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs)

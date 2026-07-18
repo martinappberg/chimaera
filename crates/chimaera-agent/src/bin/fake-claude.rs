@@ -12,7 +12,10 @@
 //! writes a frame mid-turn; the queue here only fills when the driver flushes
 //! two-or-more held sends back-to-back and the CLI queues the later ones.
 //!
-//! Modes (argv[1]): `normal` (default), `question` (the turn asks an
+//! Modes (argv[1]): `normal` (default), `background` (the turn backgrounds a
+//! Bash task and then ENDS, leaving an idle turn with live background work —
+//! the state the dashboard/rail "still working off-screen" cues render),
+//! `question` (the turn asks an
 //! AskUserQuestion instead of running a tool — ask-lifecycle tests), `hang`
 //! (opens a turn, streams content, never ends it, and acks an interrupt with NO
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
@@ -50,6 +53,9 @@ fn main() {
     // the queue with it.
     let mut turn_active = false;
     let mut queued = 0u32;
+    // Background mode gives each turn its own task id, so a second prompt
+    // adds to the live set rather than re-listing the same one.
+    let mut turn_count = 0u32;
 
     let stdin = std::io::stdin().lock();
     for line in stdin.lines() {
@@ -88,6 +94,13 @@ fn main() {
                     // Streams content, then never ends — the driver's interrupt
                     // watchdog is the only thing that can recover it.
                     "hang" => run_hang_turn(),
+                    // Ends its own turn (no permission round-trip), so the
+                    // session settles idle with the task still running.
+                    "background" => {
+                        run_background_turn(turn_count);
+                        turn_active = false;
+                        turn_count += 1;
+                    }
                     _ => run_canned_turn(),
                 }
             }
@@ -261,6 +274,41 @@ fn run_canned_turn() {
                   "behavior": "allow", "destination": "localSettings" },
             ],
         },
+    }));
+}
+
+/// A turn that backgrounds a Bash task and then ends. `task_started` with a
+/// task_type other than `local_agent` is the background lane (the subagent
+/// lane keeps `local_agent`), and background work is cross-turn — so once the
+/// result lands the session is idle with the task still in the live set. That
+/// is the exact state the "still working off-screen" cues render, and nothing
+/// clears it until the process dies.
+fn run_background_turn(n: u32) {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "message_start", "message": { "id": "mb" } },
+    }));
+    emit(json!({
+        "type": "stream_event",
+        "event": { "type": "content_block_delta",
+                   "delta": { "type": "text_delta", "text": "running that in the background" } },
+    }));
+    emit(json!({
+        "type": "system", "subtype": "task_started",
+        "task_id": format!("bg-{n}"),
+        "task_type": "local_bash",
+        "description": format!("npm run build ({n})"),
+    }));
+    emit(json!({
+        "type": "result", "subtype": "success", "is_error": false,
+        "result": "backgrounded", "session_id": "fake-native-1",
+        "total_cost_usd": 0.002, "duration_ms": 12,
+        "usage": { "input_tokens": 5, "output_tokens": 4 },
     }));
 }
 

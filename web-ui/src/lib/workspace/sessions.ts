@@ -138,6 +138,17 @@ export interface Session {
    *  folds it into agent_state ("idle_prompt"), carried raw for future
    *  surfaces. Cleared when a new turn starts. */
   status_needs_action?: boolean;
+  /**
+   * How many background tasks (backgrounded Bash / workflows) this agent has
+   * running right now — the daemon's fold of the `background_tasks` level-set.
+   * Chat sessions only; null on PTY rows (a TUI's Ctrl-B raises no hook, so
+   * null means "unknown", not "none") and absent on old daemons.
+   *
+   * A count, not the set: it rides every session-list snapshot, and the
+   * surfaces reading it only need "is work still going". A view wanting the
+   * rows themselves reads its own ChatStore, which has the full set.
+   */
+  background_running?: number | null;
   /** Whether this agent can run as a chat session (drives the toggle). */
   chat_capable?: boolean;
 }
@@ -179,9 +190,15 @@ function unintegrated(s: Session): boolean {
 
 /**
  * True when a session is doing ACTIVE work right now: a shell running a
- * foreground command (OSC 133) or hosting an agent exec, or an agent mid-turn.
- * An idle shell (at the prompt) or a waiting/finished agent is NOT busy — the
- * daemon can restart around it, and the status dot should say so.
+ * foreground command (OSC 133) or hosting an agent exec, an agent mid-turn, or
+ * an agent whose turn ended while backgrounded work keeps running. An idle
+ * shell (at the prompt) or a genuinely finished agent is NOT busy — the daemon
+ * can restart around it, and the status dot should say so.
+ *
+ * Background work counts because it does NOT restore across a restart: the
+ * tasks are the CLI's children and die with the process. "Mid-turn" alone
+ * would call such a session idle and let both callers act on it silently —
+ * the × would skip its confirm, and the pre-update warning would undercount.
  */
 export function isBusy(s: Session): boolean {
   if (!s.alive) return false;
@@ -195,6 +212,7 @@ export function isBusy(s: Session): boolean {
   return (
     s.agent_state === "running" ||
     s.exec_stage === "executing" ||
+    backgrounded(s) ||
     (unintegrated(s) && s.output_active === true)
   );
 }
@@ -240,8 +258,37 @@ export function dotState(s: Session): string {
   }
 }
 
-/** Hover tooltip naming the state behind a session dot. */
+/**
+ * The turn is idle but background work (backgrounded Bash / workflows) is
+ * still running — "working off-screen", not finished. Every surface that cues
+ * it reads THIS predicate (the rail glyph's muted breathing, the focus-strip
+ * chip, the dashboard card's pulsing dot) so they can never disagree.
+ *
+ * Wire truth, so it holds for a session no window has ever opened — the whole
+ * reason the daemon folds the count onto the row instead of leaving it to
+ * whichever client happens to be attached.
+ */
+export function backgrounded(s: Session): boolean {
+  return s.alive && s.agent_state !== "running" && (s.background_running ?? 0) > 0;
+}
+
+/**
+ * Hover tooltip naming the state behind a session dot.
+ *
+ * Background work is appended rather than folded into the state words: the
+ * mark breathes for it, and a pulsing mark whose tooltip reads "finished"
+ * looks like a rendering bug. The turn state stays the headline — the two
+ * facts are independent ("finished · 2 running in the background").
+ */
 export function dotTitle(s: Session): string {
+  const base = turnDotTitle(s);
+  const running = s.background_running ?? 0;
+  if (!s.alive || running === 0) return base;
+  return `${base} · ${running} running in the background`;
+}
+
+/** The turn/phase half of {@link dotTitle}. */
+function turnDotTitle(s: Session): string {
   if (s.kind !== "agent") {
     if (!s.alive) return "exited";
     if (s.phase === "running") return "running a command";

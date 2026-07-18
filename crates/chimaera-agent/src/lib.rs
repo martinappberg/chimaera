@@ -73,6 +73,16 @@ pub struct ChatInfo {
     /// turn starts (the user acted) so it never badges a running session.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub status_needs_action: bool,
+    /// How many background tasks (backgrounded Bash / workflows) are running
+    /// right now — the `BackgroundTasks` level-set folded to a COUNT.
+    ///
+    /// A count, not the set: this rides the session-list snapshot to every
+    /// window on every change, and the surfaces that read it (the rail glyph,
+    /// a dashboard card with no warm store) only need "is work still going".
+    /// Anything wanting the rows themselves is attached to the chat socket,
+    /// where the full level-set already lives. Cross-turn by nature — it
+    /// survives turn ends and dies with the process.
+    pub background_running: usize,
 }
 
 struct ChatSession {
@@ -152,6 +162,7 @@ impl ChatManager {
             status_detail: None,
             status_category: None,
             status_needs_action: false,
+            background_running: 0,
         };
         let session = Arc::new(ChatSession {
             info: Mutex::new(info.clone()),
@@ -277,9 +288,24 @@ impl ChatManager {
                     info.status_category = category.clone();
                     info.status_needs_action = *needs_action;
                 }
+                // LEVEL-SET: the event carries the whole set, so replace the
+                // count rather than patching it. Deliberately NOT reset on a
+                // turn boundary — background work is cross-turn, and that
+                // outliving is the entire signal ("idle turn, still working").
+                AgentEvent::BackgroundTasks { tasks, .. } => {
+                    info.background_running =
+                        tasks.iter().filter(|t| t.status == "running").count();
+                }
                 AgentEvent::Exited { status } => {
                     info.alive = false;
                     info.exit_status = *status;
+                    // Belt-and-braces, not the primary path: claude's teardown
+                    // journals an empty level-set (drain_pending), which the
+                    // arm above already folds to 0. But that is per-DRIVER
+                    // politeness, and this fold is driver-agnostic — a driver
+                    // that dies without draining must not leave a dead row
+                    // claiming live work forever.
+                    info.background_running = 0;
                 }
                 _ => {}
             }

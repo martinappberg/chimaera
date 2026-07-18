@@ -140,6 +140,10 @@ pub(crate) fn session_json(
             .and_then(|a| a.usage.as_ref())
             .map_or(serde_json::Value::Null, |u| u.to_json()),
     );
+    // Chat-tier only: background tasks are a structured-protocol concept, and
+    // a claude TUI's Ctrl-B backgrounding raises no hook. Null is the honest
+    // answer for a PTY row — "we don't know", not "none running".
+    map.insert("background_running".to_string(), serde_json::Value::Null);
     map.insert(
         "mastermind".to_string(),
         if mastermind {
@@ -358,8 +362,11 @@ mod tests {
         };
 
         // Nothing known: all three are null (shells and fresh agents alike).
+        // `background_running` is null on EVERY PTY row, populated or not — it
+        // is chat-tier truth, and a TUI's Ctrl-B raises no hook, so null means
+        // "unknown" here rather than "none running".
         let fresh = AgentRecord::new("k".into(), AgentKind::Claude);
-        for key in ["subagents", "now_line", "usage"] {
+        for key in ["subagents", "now_line", "usage", "background_running"] {
             assert_eq!(row(None)[key], json!(null), "{key}");
             assert_eq!(row(Some(&fresh))[key], json!(null), "{key}");
         }
