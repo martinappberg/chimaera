@@ -251,6 +251,7 @@ impl Driver for CodexDriver {
             mapper: CodexMapper::new(
                 hs.thread_id,
                 hs.models,
+                hs.model,
                 spec.agent_version.clone(),
                 spec.mcp_auto_approve.clone(),
                 hs.next_id,
@@ -266,6 +267,7 @@ impl Driver for CodexDriver {
 struct CodexHandshake {
     thread_id: String,
     models: Vec<crate::model::ModelInfo>,
+    model: Option<String>,
     next_id: u64,
     rollback_error: Option<String>,
 }
@@ -287,16 +289,7 @@ async fn codex_handshake(
         return Err("initialized write failed".into());
     }
 
-    let open = match &spec.pinned_native_id {
-        Some(thread_id) => json!({
-            "id": 1, "method": "thread/resume",
-            "params": { "threadId": thread_id, "cwd": spec.cwd },
-        }),
-        None => json!({
-            "id": 1, "method": "thread/start",
-            "params": { "cwd": spec.cwd },
-        }),
-    };
+    let open = thread_open_request(spec);
     if sink.send(&open).await.is_err() {
         return Err("thread open write failed".into());
     }
@@ -305,6 +298,13 @@ async fn codex_handshake(
         .as_str()
         .map(String::from)
         .ok_or_else(|| format!("thread open result missing thread.id: {result}"))?;
+    // Current app-server returns the effective model at the top level. Keep
+    // the requested value as a compatibility fallback for older binaries so
+    // Init and plan-mode settings still reflect the user's launch choice.
+    let model = result["model"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| spec.initial_model.clone());
     let mut next_id = 2u64;
 
     // Conversation rewind: drop the trailing turns right after the resume,
@@ -389,9 +389,33 @@ async fn codex_handshake(
     Ok(CodexHandshake {
         thread_id,
         models,
+        model,
         next_id,
         rollback_error,
     })
+}
+
+/// Build the thread-open request separately from I/O so the launch recipe's
+/// create-time model contract stays hermetically testable.
+fn thread_open_request(spec: &SpawnSpec) -> Value {
+    let mut open = match &spec.pinned_native_id {
+        Some(thread_id) => json!({
+            "id": 1, "method": "thread/resume",
+            "params": { "threadId": thread_id, "cwd": spec.cwd },
+        }),
+        None => json!({
+            "id": 1, "method": "thread/start",
+            "params": { "cwd": spec.cwd },
+        }),
+    };
+    // The launcher's model selection is thread configuration, not argv, for
+    // app-server. Passing it while opening the thread avoids the old seam
+    // where a Codex chat silently fell back to the user's default until they
+    // changed the model a second time in the header.
+    if let Some(model) = &spec.initial_model {
+        open["params"]["model"] = json!(model);
+    }
+    open
 }
 
 async fn await_rpc_result(stream: &mut JsonlStream, id: u64) -> std::result::Result<Value, String> {
@@ -611,6 +635,7 @@ fn codex_modes() -> Vec<crate::model::ModeInfo> {
     vec![
         mode("read-only", "Read only"),
         mode("auto", "Auto (workspace)"),
+        mode("auto-review", "Auto review"),
         mode("full-access", "Full access"),
         mode("plan", "Plan mode"),
     ]
@@ -620,6 +645,7 @@ impl CodexMapper {
     fn new(
         thread_id: String,
         models: Vec<crate::model::ModelInfo>,
+        model: Option<String>,
         agent_version: Option<String>,
         mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
         next_id: u64,
@@ -628,7 +654,7 @@ impl CodexMapper {
             thread_id,
             models,
             agent_version,
-            model: None,
+            model,
             pending_model: None,
             pending_effort: None,
             // codex's shipped default: workspace sandbox, on-request asks.
@@ -879,6 +905,23 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Notice {
                         text: "this request requires additional safety checks, which can take extra time"
                             .into(),
+                    });
+                }
+            }
+            // Approval auto-review is its own long-running app-server lane,
+            // not a normal tool item. Promote it into the existing tool-card
+            // vocabulary so the user can see what Codex is assessing and the
+            // eventual risk/verdict instead of waiting behind silent latency.
+            "item/autoApprovalReview/started" => {
+                self.on_auto_review(&frame["params"], false, &mut step)
+            }
+            "item/autoApprovalReview/completed" => {
+                self.on_auto_review(&frame["params"], true, &mut step)
+            }
+            "guardianWarning" => {
+                if let Some(message) = frame["params"]["message"].as_str() {
+                    step.events.push(AgentEvent::Notice {
+                        text: format!("auto review: {}", truncate_label(message, 240)),
                     });
                 }
             }
@@ -1616,6 +1659,57 @@ impl CodexMapper {
         }
     }
 
+    /// Render one auto-review lifecycle update through the normalized tool
+    /// surface. The upstream payload is explicitly unstable, so this reads
+    /// only the documented action discriminator and review summary; unknown
+    /// additions degrade to a generic row without changing our public wire.
+    fn on_auto_review(&mut self, params: &Value, completed: bool, step: &mut DriverStep) {
+        let review_id = params["reviewId"].as_str().unwrap_or_default();
+        if review_id.is_empty() {
+            return;
+        }
+        if let Some(flushed) = self.coalescer.flush() {
+            step.events.push(flushed);
+        }
+        let (kind, action, locations) = auto_review_action(&params["action"]);
+        let id = format!("auto-review:{review_id}");
+        step.events.push(AgentEvent::ToolCall {
+            id: id.clone(),
+            kind,
+            title: format!("auto review · {action}"),
+            locations,
+            status: ToolStatus::InProgress,
+        });
+        if !completed {
+            return;
+        }
+
+        let review = &params["review"];
+        let verdict = review["status"].as_str().unwrap_or("completed");
+        let mut summary = verdict.to_string();
+        if let Some(risk) = review["riskLevel"].as_str().filter(|s| !s.is_empty()) {
+            summary.push_str(" · risk ");
+            summary.push_str(risk);
+        }
+        if let Some(rationale) = review["rationale"].as_str().filter(|s| !s.is_empty()) {
+            summary.push('\n');
+            summary.push_str(rationale);
+        }
+        let (text, truncated) = cap_output(&summary);
+        step.events.push(AgentEvent::ToolCallUpdate {
+            id,
+            // A denial is a successful safety verdict, not a failed tool.
+            // Only a reviewer that timed out/aborted should hold the card open
+            // in the UI's failure treatment.
+            status: if matches!(verdict, "timedOut" | "aborted") {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Completed
+            },
+            content: Some(ToolContent::Output { text, truncated }),
+        });
+    }
+
     /// Apply a resolved mode locally: record it, tell the UI (ModeChanged),
     /// and — the first time the user switches INTO full-access — announce the
     /// contract. Full access maps to approvalPolicy "never", so the only other
@@ -1626,12 +1720,19 @@ impl CodexMapper {
     /// already-unsupported per-turn path) so they stay consistent.
     fn apply_mode(&mut self, mode_id: String, step: &mut DriverStep) {
         let entered_full = mode_id == "full-access" && self.current_mode != "full-access";
+        let entered_review = mode_id == "auto-review" && self.current_mode != "auto-review";
         self.current_mode = mode_id.clone();
         step.events.push(AgentEvent::ModeChanged { mode_id });
         if entered_full {
             step.events.push(AgentEvent::Notice {
                 text: "full access on — codex will no longer ask for approval; a \
                        genuinely blocked action is auto-declined rather than prompted"
+                    .into(),
+            });
+        }
+        if entered_review {
+            step.events.push(AgentEvent::Notice {
+                text: "auto review on — codex will assess approval requests and show each verdict"
                     .into(),
             });
         }
@@ -2065,14 +2166,26 @@ impl CodexMapper {
                 // autoResolutionMs: the server wants this prompt auto-skipped
                 // after the timeout (the official client's behavior) — the
                 // harness tick expires it with empty answers + a notice.
-                let deadline = params["autoResolutionMs"]
-                    .as_u64()
-                    .map(|ms| std::time::Instant::now() + Duration::from_millis(ms));
+                let auto_resolution_ms = params["autoResolutionMs"].as_u64();
+                let deadline = auto_resolution_ms.and_then(|ms| {
+                    std::time::Instant::now().checked_add(Duration::from_millis(ms))
+                });
+                let expires_at_ms = auto_resolution_ms.and_then(|ms| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|elapsed| {
+                            u64::try_from(elapsed.as_millis())
+                                .ok()
+                                .and_then(|now| now.checked_add(ms))
+                        })
+                });
                 self.pending_questions
                     .insert(request_id.clone(), PendingQuestion { rpc_id, deadline });
                 step.events.push(AgentEvent::QuestionRequest {
                     request_id,
                     questions,
+                    expires_at_ms,
                 });
             } else {
                 // Nothing to ask — answer empty rather than parking.
@@ -2893,23 +3006,37 @@ fn is_method_not_found(err: &Value, method: &str) -> bool {
             && msg.contains(&method.to_lowercase()))
 }
 
-/// Approval-mode → wire fields (the extension's exact table). `permissions`
-/// is a profile id; sandboxPolicy is implied by it, so only these two ride.
+/// Composer-mode → thread settings. Every arm is deliberately complete:
+/// switching out of auto-review must restore the human reviewer, switching
+/// out of full access must restore approvals, and switching out of plan must
+/// clear collaboration mode. Omitting those resets leaves invisible sticky
+/// state behind while the header claims a different mode.
 fn mode_wire_fields(mode_id: &str, model: Option<&str>, effort: Option<&str>) -> Value {
     match mode_id {
         "read-only" => json!({
             "permissions": ":read-only",
             "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "collaborationMode": null,
+        }),
+        "auto-review" => json!({
+            "permissions": ":workspace",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "auto_review",
             "collaborationMode": null,
         }),
         "full-access" => json!({
             "permissions": ":danger-full-access",
             "approvalPolicy": "never",
+            "approvalsReviewer": "user",
             "collaborationMode": null,
         }),
         // Plan mode is a collaboration mode, not a permission profile;
         // settings are snake_case inside (mined).
         "plan" => json!({
+            "permissions": ":workspace",
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
             "collaborationMode": {
                 "mode": "plan",
                 "settings": {
@@ -2922,6 +3049,7 @@ fn mode_wire_fields(mode_id: &str, model: Option<&str>, effort: Option<&str>) ->
         _ => json!({
             "permissions": ":workspace",
             "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
             "collaborationMode": null,
         }),
     }
@@ -2940,6 +3068,93 @@ fn elicitation_tool_name<'a>(message: &'a str, server: &str) -> Option<&'a str> 
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
     .then_some(name)
+}
+
+/// Stable, bounded presentation of an unstable auto-review action payload.
+/// Returns the normalized tool kind, a one-line action label, and any files
+/// the existing open-in-pane affordance can safely expose.
+fn auto_review_action(action: &Value) -> (ToolKind, String, Vec<String>) {
+    match action["type"].as_str().unwrap_or_default() {
+        "command" => (
+            ToolKind::Execute,
+            truncate_label(action["command"].as_str().unwrap_or("command"), 120),
+            Vec::new(),
+        ),
+        "execve" => {
+            let mut command = action["program"].as_str().unwrap_or("command").to_string();
+            if let Some(argv) = action["argv"].as_array() {
+                for arg in argv.iter().filter_map(Value::as_str).take(12) {
+                    command.push(' ');
+                    command.push_str(arg);
+                }
+            }
+            (ToolKind::Execute, truncate_label(&command, 120), Vec::new())
+        }
+        "applyPatch" => {
+            let locations: Vec<String> = action["files"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .take(32)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let label = match locations.as_slice() {
+                [] => "apply patch".to_string(),
+                [path] => format!("edit {path}"),
+                many => format!("edit {} files", many.len()),
+            };
+            (ToolKind::Edit, truncate_label(&label, 120), locations)
+        }
+        "networkAccess" => {
+            let host = action["host"].as_str().unwrap_or("network access");
+            (
+                ToolKind::Fetch,
+                truncate_label(&format!("network access to {host}"), 120),
+                Vec::new(),
+            )
+        }
+        "mcpToolCall" => {
+            let server = action["connectorName"]
+                .as_str()
+                .or(action["server"].as_str())
+                .unwrap_or("MCP");
+            let tool = action["toolTitle"]
+                .as_str()
+                .or(action["toolName"].as_str())
+                .unwrap_or("tool");
+            (
+                ToolKind::Other,
+                truncate_label(&format!("{server} · {tool}"), 120),
+                Vec::new(),
+            )
+        }
+        "requestPermissions" => (
+            ToolKind::Other,
+            truncate_label(
+                action["reason"]
+                    .as_str()
+                    .unwrap_or("additional permissions"),
+                120,
+            ),
+            Vec::new(),
+        ),
+        other => (
+            ToolKind::Other,
+            truncate_label(
+                if other.is_empty() {
+                    "approval request"
+                } else {
+                    other
+                },
+                120,
+            ),
+            Vec::new(),
+        ),
+    }
 }
 
 /// Shell-ish quoting for the execpolicy-amendment prefix label.
@@ -2964,7 +3179,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new(), None, None, 3)
+        CodexMapper::new("thr-1".into(), Vec::new(), None, None, None, 3)
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -3609,6 +3824,103 @@ mod tests {
     }
 
     #[test]
+    fn mode_fields_reset_hidden_state_and_offer_auto_review() {
+        let auto_review = mode_wire_fields("auto-review", Some("gpt-test"), Some("high"));
+        assert_eq!(auto_review["permissions"], ":workspace");
+        assert_eq!(auto_review["approvalPolicy"], "on-request");
+        assert_eq!(auto_review["approvalsReviewer"], "auto_review");
+        assert_eq!(auto_review["collaborationMode"], Value::Null);
+
+        let auto = mode_wire_fields("auto", Some("gpt-test"), Some("high"));
+        assert_eq!(auto["approvalsReviewer"], "user");
+        assert_eq!(auto["collaborationMode"], Value::Null);
+
+        let full = mode_wire_fields("full-access", Some("gpt-test"), Some("high"));
+        assert_eq!(full["permissions"], ":danger-full-access");
+        assert_eq!(full["approvalPolicy"], "never");
+        assert_eq!(full["approvalsReviewer"], "user");
+        assert_eq!(full["collaborationMode"], Value::Null);
+
+        let plan = mode_wire_fields("plan", Some("gpt-test"), Some("high"));
+        assert_eq!(plan["approvalsReviewer"], "user");
+        assert_eq!(plan["collaborationMode"]["mode"], "plan");
+        assert_eq!(plan["collaborationMode"]["settings"]["model"], "gpt-test");
+        assert_eq!(
+            plan["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+
+        assert!(codex_modes().iter().any(|mode| mode.id == "auto-review"));
+    }
+
+    #[test]
+    fn thread_open_carries_the_create_time_model_for_start_and_resume() {
+        let mut spec = SpawnSpec::new("session", Vec::new(), std::path::PathBuf::from("/work"));
+        spec.initial_model = Some("gpt-test".into());
+        let start = thread_open_request(&spec);
+        assert_eq!(start["method"], "thread/start");
+        assert_eq!(start["params"]["model"], "gpt-test");
+
+        spec.pinned_native_id = Some("thread-old".into());
+        let resume = thread_open_request(&spec);
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-old");
+        assert_eq!(resume["params"]["model"], "gpt-test");
+    }
+
+    #[test]
+    fn auto_review_lifecycle_and_warning_render_visibly() {
+        let mut m = mapper();
+        let started = m.on_frame(&json!({
+            "method": "item/autoApprovalReview/started",
+            "params": {
+                "reviewId": "review-1",
+                "action": { "type": "applyPatch", "files": ["/work/a.rs", "/work/b.rs"] },
+                "review": { "status": "inProgress" },
+            },
+        }));
+        assert!(matches!(
+            &started.events[0],
+            AgentEvent::ToolCall { id, kind: ToolKind::Edit, title, locations, status: ToolStatus::InProgress }
+                if id == "auto-review:review-1"
+                    && title == "auto review · edit 2 files"
+                    && locations == &vec!["/work/a.rs".to_string(), "/work/b.rs".to_string()]
+        ));
+
+        let completed = m.on_frame(&json!({
+            "method": "item/autoApprovalReview/completed",
+            "params": {
+                "reviewId": "review-1",
+                "action": { "type": "applyPatch", "files": ["/work/a.rs", "/work/b.rs"] },
+                "review": {
+                    "status": "denied", "riskLevel": "high",
+                    "rationale": "Touches a protected path"
+                },
+            },
+        }));
+        assert!(matches!(
+            &completed.events[1],
+            AgentEvent::ToolCallUpdate {
+                id, status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }),
+            } if id == "auto-review:review-1"
+                && text.contains("denied · risk high")
+                && text.contains("protected path")
+        ));
+
+        let warning = m.on_frame(&json!({
+            "method": "guardianWarning",
+            "params": { "threadId": "thr-1", "message": "Auto review is unavailable" },
+        }));
+        assert_eq!(
+            warning.events,
+            vec![AgentEvent::Notice {
+                text: "auto review: Auto review is unavailable".into()
+            }]
+        );
+    }
+
+    #[test]
     fn exec_approval_offers_prefix_amendment_and_answers_with_object_decision() {
         let mut m = mapper();
         let step = m.on_frame(&json!({
@@ -3755,6 +4067,7 @@ mod tests {
             "thr-1".into(),
             Vec::new(),
             None,
+            None,
             Some(allow(Some(vec!["workspace_status".into()]))),
             3,
         );
@@ -3773,7 +4086,7 @@ mod tests {
         assert!(step.outbound.is_empty());
 
         // Auto-mode shape: the whole server is silent.
-        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, Some(allow(None)), 3);
+        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, None, Some(allow(None)), 3);
         let step = m.on_frame(&elicitation_frame(82, "spawn_agent"));
         assert!(step.events.is_empty());
         assert_eq!(
@@ -3782,7 +4095,7 @@ mod tests {
         );
 
         // Another server's tool-call approval never matches the consent.
-        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, Some(allow(None)), 3);
+        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, None, Some(allow(None)), 3);
         let mut frame = elicitation_frame(83, "anything");
         frame["params"]["serverName"] = json!("other");
         let step = m.on_frame(&frame);
@@ -3797,6 +4110,7 @@ mod tests {
         let mut m = CodexMapper::new(
             "thr-1".into(),
             Vec::new(),
+            None,
             None,
             Some(allow(Some(vec!["read_session".into()]))),
             3,
@@ -3814,6 +4128,7 @@ mod tests {
         let mut m = CodexMapper::new(
             "thr-1".into(),
             Vec::new(),
+            None,
             None,
             Some(allow(Some(vec!["workspace_status".into()]))),
             3,
@@ -4075,6 +4390,7 @@ mod tests {
             AgentEvent::QuestionRequest {
                 request_id,
                 questions,
+                ..
             } => {
                 assert_eq!(request_id, "codex-91");
                 assert_eq!(questions[0].id, "q1");
@@ -4314,7 +4630,7 @@ mod tests {
     #[test]
     fn auto_resolution_deadline_skips_question_with_empty_answers() {
         let mut m = mapper();
-        m.on_frame(&json!({
+        let asked = m.on_frame(&json!({
             "id": 93,
             "method": "item/tool/requestUserInput",
             "params": {
@@ -4322,6 +4638,13 @@ mod tests {
                 "autoResolutionMs": 50,
             },
         }));
+        assert!(matches!(
+            &asked.events[0],
+            AgentEvent::QuestionRequest {
+                expires_at_ms: Some(_),
+                ..
+            }
+        ));
         // Before the deadline: nothing expires.
         let step = m.expire_questions(std::time::Instant::now());
         assert!(step.outbound.is_empty() && step.events.is_empty());
@@ -4339,11 +4662,18 @@ mod tests {
             AgentEvent::Notice { text } if text.contains("auto-resolution")
         ));
         // A question without the field never expires.
-        m.on_frame(&json!({
+        let asked = m.on_frame(&json!({
             "id": 94,
             "method": "item/tool/requestUserInput",
             "params": { "questions": [{ "id": "q2", "question": "Still there?" }] },
         }));
+        assert!(matches!(
+            &asked.events[0],
+            AgentEvent::QuestionRequest {
+                expires_at_ms: None,
+                ..
+            }
+        ));
         let far = std::time::Instant::now() + Duration::from_secs(3600);
         let step = m.expire_questions(far);
         assert!(step.outbound.is_empty(), "no deadline, no auto-skip");

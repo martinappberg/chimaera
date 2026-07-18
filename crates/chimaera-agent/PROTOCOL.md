@@ -179,6 +179,10 @@ implement all three:
   {question_id: [labels]}`, serde-defaulted — additive; empty = resolved
   without an answer: cancelled/expired/old journal). Clients fold the
   question + chosen labels into the transcript; replay rebuilds it.
+- **`QuestionRequest.expires_at_ms` is an optional absolute Unix deadline**,
+  derived from codex `autoResolutionMs`. The driver remains authoritative;
+  clients only present the countdown. Old journals omit it and replay with
+  no deadline, while new journals never restart the clock on reconnect.
 
 `option_id` vocabulary on `PermissionResolved`: driver option ids on a
 user decision, `"cancelled"` when the agent withdrew its own ask
@@ -445,7 +449,9 @@ RPC spelling is camelCase (`workspaceWrite`), config spelling kebab-case.
 Composer agent modes (UI → wire): read-only→(:read-only, on-request),
 auto→(:workspace, on-request), full-access→(:danger-full-access, never;
 confirm dialog), guardian→approvalsReviewer guardian_subagent; approvalPolicy
-may be a granular OBJECT, not just an enum.
+may be a granular OBJECT, not just an enum. Superseded for the current
+0.144.2 surface by Pass 18: Chimaera exposes `auto_review`, while retaining
+`guardian_subagent` only as accepted upstream vocabulary.
 
 ## Extension mining, pass 4 (2026-07-08 — vsix, adoption pass)
 
@@ -543,6 +549,9 @@ file list is therefore honest about exactly what will revert.
   sends an object). Plan mode = collaborationMode
   `{mode:"plan", settings:{model, reasoning_effort,
   developer_instructions}}` (snake_case INSIDE settings).
+  Pass 18 adds Auto review → `:workspace` + on-request +
+  `approvalsReviewer:"auto_review"`; every mode arm explicitly resets reviewer
+  and collaboration mode so switching cannot leave hidden sticky state.
 - `item/commandExecution/outputDelta {itemId, delta, threadId, turnId}` —
   plain string, appended live (we cap the stream at TOOL_OUTPUT_HEAD; the
   completed item's aggregatedOutput replaces it).
@@ -715,7 +724,8 @@ that can change the serving model mid-conversation:
 - **item/autoApprovalReview/{started,completed}** `{reviewId,
   targetItemId, action, review:{status: inProgress|approved|denied|
   timedOut|aborted, riskLevel?, rationale?}}` — the guardian reviewer's
-  verdicts; not yet rendered (we don't offer guardian mode).
+  verdicts. Adopted in Pass 18 as bounded normalized tool-card updates; the
+  payload is upstream-marked unstable, so unknown actions degrade generically.
 - item/mcpToolCall/progress: confirmed ignored by the official client too.
 
 ## Pass 8 (2026-07-10 — normalized-wire additions): delivery + user-stop
@@ -880,8 +890,11 @@ signal — our contextCompaction→Notice mapping already covers it).
 `item/tool/requestUserInput`'s `autoResolutionMs` is honored driver-side:
 at the deadline the driver answers `{answers:{}}` (the official client's
 empty-skip), withdraws the card (QuestionResolved), and drops a visible
-notice. Claude needs no equivalent — its `askUserQuestionTimeout` runs
-CLI-side and unanswered prompts settle via the park deadline.
+notice. The normalized request also carries an absolute `expires_at_ms` so
+the QuestionCard can present the remaining time without moving authority into
+the browser or restarting the clock on replay. Claude needs no equivalent —
+its `askUserQuestionTimeout` runs CLI-side and unanswered prompts settle via
+the park deadline.
 
 ### Codex: misc notifications seen live (tolerated silently)
 
@@ -1504,3 +1517,48 @@ chat-smoke` re-run after the driver change: 16/16.
   `model::cap_preview` (promoted from claude.rs — driver symmetry): any
   configured MCP server reaches that arm, and an uncapped `tool_params`
   would ride the journal/ring whole.
+
+## Pass 20 (2026-07-17 — codex 0.144.2 generated bindings + parity adoption). ADOPTED.
+
+Generated TypeScript bindings from the pinned binary (`codex app-server
+generate-ts --experimental`) and a direct app-server capability probe close
+three deferred seams. The schema is upstream's own source for the unstable
+auto-review payload; the ordinary driver gate remains `just chat-smoke`.
+
+### Create-time model is thread configuration
+
+Both `thread/start` and `thread/resume` accept an optional `model`. Chimaera's
+server now carries the launch recipe's selected Codex model through
+`SpawnSpec.initial_model` into that open request. The driver reads the effective
+model from the open response (with the requested value as an older-binary
+fallback), so the first `Init` and Plan settings agree with what the user chose.
+Claude remains argv-configured; this field is deliberately Codex-only.
+
+### Auto review and complete mode resets
+
+`ApprovalsReviewer` is `user | auto_review | guardian_subagent` in 0.144.2.
+The user-facing Auto review mode sends `permissions:":workspace"`,
+`approvalPolicy:"on-request"`, `approvalsReviewer:"auto_review"`, and a null
+collaboration mode. Every other mode explicitly restores reviewer `user` and
+sets or clears collaboration mode as appropriate; Full access also restores
+its exact `never` policy. These redundant-looking fields are required state
+resets — `thread/settings/update` is a patch endpoint.
+
+`item/autoApprovalReview/started|completed` carries a stable `reviewId`, an
+action union (command, execve, applyPatch, networkAccess, mcpToolCall,
+requestPermissions), and an upstream-marked **UNSTABLE** review object
+(`inProgress|approved|denied|timedOut|aborted`, optional risk/rationale).
+Chimaera maps it onto a bounded, upserted tool row. Denied is a completed
+safety verdict, not a failed tool; timeout/abort are failed. `guardianWarning
+{threadId,message}` becomes a visible Notice. Unknown future action variants
+degrade to a generic bounded row without changing Chimaera's stable wire.
+
+### Question deadline presentation remains driver-authoritative
+
+Codex's relative `autoResolutionMs` is converted once, on receipt, into both
+the driver's monotonic deadline and optional normalized
+`QuestionRequest.expires_at_ms` (absolute Unix milliseconds). The UI countdown
+is presentation only. The driver still sends the empty-answer skip, resolves
+the journaled ask, and emits the timeout notice. This preserves exact behavior
+through tab remount, WebSocket reconnect, daemon replay, and older journals
+that have no field.

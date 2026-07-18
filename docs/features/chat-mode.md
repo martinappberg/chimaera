@@ -61,6 +61,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   `/effort`, `/mode`) to switch. The agent's *live* catalog (claude `initialize.models` / codex
   `model/list`) beats the daemon's curated list. Effort is per-model (codex falls back to the
   `minimal…xhigh` ladder; **`xhigh` is never relabeled** — canonical vocabulary is sacred).
+  Codex exposes Read only / Auto / Auto review / Full access / Plan; every switch sends a complete
+  settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
+  invisibly active. The model chosen when a Codex chat is created rides `thread/start` (and resume),
+  rather than silently falling back to the CLI default until the first header change.
   Thinking (claude) and ultracode (claude, gated to an xhigh-capable model) are client-held toggles
   reconciled from `effort_state` read-backs. **Thinking defaults ON** for claude sessions (the
   reasoning pass earns its keep in a coding workbench; the chip shows it explicitly and one click
@@ -85,11 +89,16 @@ TUI (see [view switch](#view-switch-and-rewind)).
   shows a muted "stopped" notice, and the session rail reads finished — error-red `turn failed`
   and the Errored rail state are reserved for genuine failures.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
-  `prefers-reduced-motion`). Markdown goes through **marked → DOMPurify**: `<style>` tag and `style`
-  attribute are forbidden (injected CSS can't restyle the workbench to spoof a permission prompt),
-  every external anchor is forced to `target="_blank" rel="noopener noreferrer"`, and bad local
-  anchors are neutralized on click. Client-side transcript cap of 2000 blocks (oldest dropped behind
-  one "earlier history trimmed" notice; the live tail is never touched).
+  `prefers-reduced-motion`). Markdown and Codex's common LaTeX delimiters (`$…$`, `$$…$$`,
+  `\(…\)`, `\[…\]`) render through **marked + KaTeX MathML → DOMPurify**; math is excluded from
+  the streaming word wrapper so equations are never split into animated fragments. `<style>` tag
+  and `style` attribute are forbidden (injected CSS can't restyle the workbench to spoof a
+  permission prompt), KaTeX trust is off, every external anchor is forced to
+  `target="_blank" rel="noopener noreferrer"`, and bad local anchors are neutralized on click.
+  Client-side transcript cap of 2000 blocks (oldest dropped behind one "earlier history trimmed"
+  notice; the live tail is never touched). User bubbles remain verbatim plain text—not Markdown—but
+  recognized LaTeX spans use the same sanitized MathML renderer, so typed equations do not show raw
+  delimiters.
 - **Where.** `ChatView.svelte` (`renderItems`), `store.svelte.ts` (the `blocks` reducer),
   `Markdown.svelte`, `UserText.svelte`.
 - **Untrusted output.** Everything the model emits is attacker-influenced — see
@@ -183,12 +192,20 @@ TUI (see [view switch](#view-switch-and-rewind)).
   follows the allow with a `set_permission_mode acceptEdits`, so the mode chip flips with it.
   Enter (card focused) = auto-accept, Esc = keep planning; Enter inside the comment field is
   deliberately inert (a comment can accompany any of the three answers).
+- **Codex auto review.** Auto review mode keeps the workspace sandbox and on-request policy but
+  assigns Codex's `auto_review` reviewer. Its unstable `item/autoApprovalReview/started|completed`
+  lifecycle is normalized into an ordinary bounded tool card (reviewed action/files, verdict,
+  risk, rationale); a denied action is a successful safety verdict, while timeout/abort renders
+  failed. `guardianWarning` is visible as a notice instead of disappearing.
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
-  A codex question carrying `autoResolutionMs` auto-skips at the deadline (empty answers — the
-  official client's behavior) with a visible "question timed out" notice; claude's question
-  timeouts run CLI-side.
+  A codex question carrying `autoResolutionMs` shows a live "skips in Ns" countdown, then auto-skips
+  at the driver deadline (empty answers — the official client's behavior) with a visible "question
+  timed out" notice. The countdown is presentation-only and never disables an answer: browser and
+  remote-daemon wall clocks can differ, so only the driver's monotonic deadline and resulting
+  `QuestionResolved` close the card. The journal stores the absolute deadline so reconnect and replay
+  do not restart the clock; claude's question timeouts run CLI-side.
 - **Where.** `ToolGroup.svelte`, `ToolCallCard.svelte`, `PermissionCard.svelte`,
   `PlanApprovalCard.svelte`, `QuestionCard.svelte`, `AgentsTray.svelte`, `BackgroundTray.svelte`;
   commands `permission` (optional `destination`, `feedback`) / `answer` / `stop_task`; events
@@ -266,8 +283,6 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - Chat sessions survive a *disconnect* **and a daemon restart** — the ledger resurrects them live
   (resuming the native conversation, carrying the pinned title), retiring the non-resumable to
   Recents (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
-- Codex **create-time model** is dropped in chat mode (a `TODO(seam)` in `chat.rs`).
-- Codex **guardian** auto-approval reviewer is parsed but not rendered.
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
   undercount it — the rollback then leaves those turns in place).
 
@@ -395,3 +410,10 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-07-16, au
   improvement in the PR #63 intent capture, and the two-driver-symmetry rule made claude's Agent-row
   surface the natural mapping target. The thread-scoping gate is wire-correctness, not a choice —
   see PROTOCOL.md Pass 16. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### Codex parity (review · launch model · math · timed questions) — why it exists
+_Intent pending — not yet captured from the maintainer (shipped 2026-07-17, autonomous session)._
+
+- Derived context, not intent: the maintainer requested parity with the Claude chat experience while
+  preserving Codex-native behavior, including its current modes, queue/steer semantics, and protocol
+  quirks. Run **capture-feature-intent** with the maintainer to replace this stub.

@@ -59,6 +59,9 @@ export interface Question {
 export interface PendingQuestion {
   requestId: string;
   questions: Question[];
+  /** Absolute Unix-millisecond auto-skip deadline (Codex only). Absolute so
+   *  journal replay preserves the original countdown rather than restarting. */
+  expiresAtMs: number | null;
 }
 
 export interface CheckpointRef {
@@ -681,7 +684,11 @@ export class ChatStore {
         // Twice: the overlay is the answerable card, the block is the
         // transcript's memory of it (invisible while pending, an answered
         // card once resolved) — so an answered question never just vanishes.
-        this.questions.push({ requestId, questions });
+        const expiresAtMs =
+          typeof ev.expires_at_ms === "number" && Number.isFinite(ev.expires_at_ms)
+            ? ev.expires_at_ms
+            : null;
+        this.questions.push({ requestId, questions, expiresAtMs });
         this.blocks.push({ kind: "question", id: requestId, questions, answers: {}, resolved: false });
         this.questionIndex.set(requestId, this.blocks.length - 1);
         break;

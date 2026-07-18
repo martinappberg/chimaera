@@ -763,7 +763,7 @@
              card once resolved (replay rebuilds the same). -->
         {#if item.block.resolved}
           <QuestionCard
-            request={{ requestId: item.block.id, questions: item.block.questions }}
+            request={{ requestId: item.block.id, questions: item.block.questions, expiresAtMs: null }}
             answered={item.block.answers}
           />
         {/if}

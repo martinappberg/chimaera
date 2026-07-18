@@ -11,7 +11,7 @@
 
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, PermissionOption, PermissionOptionKind, UserMessageState,
+    AgentCommand, AgentEvent, PermissionOption, PermissionOptionKind, Question, UserMessageState,
 };
 use serde_json::json;
 
@@ -256,6 +256,49 @@ fn question_resolved_answers_are_additive_on_the_wire() {
             "request_id": "r1",
             "answers": { "q1": ["SQLite"] }
         })
+    );
+}
+
+/// `expires_at_ms` is an additive hint: Claude and older Codex journals omit
+/// it, while current Codex question requests may carry one absolute deadline.
+#[test]
+fn question_request_expiry_is_additive_on_the_wire() {
+    let question = Question {
+        id: "q1".into(),
+        header: String::new(),
+        question: "Continue?".into(),
+        options: vec![],
+        multi_select: false,
+    };
+    let base = AgentEvent::QuestionRequest {
+        request_id: "r1".into(),
+        questions: vec![question.clone()],
+        expires_at_ms: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&base).unwrap(),
+        json!({
+            "type": "question_request",
+            "request_id": "r1",
+            "questions": [{ "id": "q1", "question": "Continue?" }]
+        })
+    );
+    let old: AgentEvent = serde_json::from_value(json!({
+        "type": "question_request",
+        "request_id": "r1",
+        "questions": [{ "id": "q1", "question": "Continue?" }]
+    }))
+    .unwrap();
+    assert_eq!(old, base);
+
+    assert_eq!(
+        serde_json::to_value(AgentEvent::QuestionRequest {
+            request_id: "r1".into(),
+            questions: vec![question],
+            expires_at_ms: Some(1_700_000_005_000),
+        })
+        .unwrap()["expires_at_ms"],
+        json!(1_700_000_005_000_u64)
     );
 }
 
