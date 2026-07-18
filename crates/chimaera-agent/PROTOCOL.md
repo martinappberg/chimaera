@@ -393,7 +393,9 @@ tool_use_id when present (description fallback for older CLIs) and honors
 the notification verdict. The background lane (non-`local_agent`
 task_started + task_updated + background_tasks_changed + the notification
 close) feeds the normalized `background_tasks` level-set event and the
-chat UI's background tray.
+chat UI's background tray. **Correction (Pass 23): `task_started` alone
+does NOT mean background** — a foreground Bash emits an identical one.
+Only `background_tasks_changed` adopts; `task_started` enriches.
 
 **Background frame ORDER, live-verified 2.1.207** (raw `-p stream-json`
 probe, backgrounded `sleep 8`): at spawn, `background_tasks_changed`
@@ -1659,3 +1661,58 @@ is unparseable.
 - **`TaskStop` / `TaskOutput` are NOT this family.** They are background-lane
   tools keyed by `task_id` (not `taskId`) and still render as ordinary rows —
   suppressing them would blank rows the background tray depends on.
+
+## Pass 23 (2026-07-18 — live probe 2.1.212): a FOREGROUND Bash also emits `task_started`. ADOPTED.
+
+**The bug this closes**: a slow foreground command (a `micromamba run … python …`
+the user was watching run) sat in the chat background tray labelled "background
+task running" for its whole runtime. It was never background work.
+
+**The wire fact.** A long-running FOREGROUND `Bash` emits a `task_started` that
+is *identical in shape* to a backgrounded one — same `subtype`, same
+`task_type: "local_bash"`, same `{task_id, tool_use_id, description,
+session_id, uuid}` key set. Probed side by side (`-p stream-json`, one
+`run_in_background: true` sleep vs one foreground compute-bound `awk` loop):
+
+| | foreground `awk` loop | backgrounded `sleep 20` |
+|---|---|---|
+| `background_tasks_changed` with the task | **never** | yes, immediately BEFORE `task_started` |
+| `task_started {task_type:"local_bash", tool_use_id, description}` | yes | yes (byte-identical shape) |
+| tool_result | the command's real output, inline | "running in the background", immediately |
+| settle | `task_notification` | `background_tasks_changed []` → `task_updated` → `task_notification` |
+
+So **`task_type` does NOT discriminate foreground from background, and nothing
+else on `task_started` does either.** The only signal is membership in a
+`background_tasks_changed` set: a genuinely backgrounded task is always
+announced in one, a foreground command never appears in one. `task_started`
+fires for foreground bash only once it runs long enough to be worth tracking
+(a fast `echo` produces none), which is exactly why this read as "long commands
+become background tasks".
+
+**Adoption.** `background_tasks_changed` is now the SOLE authority for set
+membership; `on_background_started` was reduced to **enrichment only** — it
+folds `workflow_name`/`tool_use_id` (which only `task_started` carries) onto an
+already-adopted entry and IGNORES an unknown id. Nothing is lost, because both
+real background lanes are announced before their `task_started`: verified at
+2.1.212 for `local_bash` (backgrounded) and for `local_workflow` (a Workflow
+run: `background_tasks_changed {local_workflow}` → `task_started
+{workflow_name}` → `task_progress`× → the settle triple). If a future CLI ever
+flipped that order the set change still adopts the task, just without those two
+fields — a degraded row, never a phantom one.
+
+This supersedes the Pass 15 phrasing "the background lane (non-`local_agent`
+task_started + …) feeds the level-set": non-`local_agent` `task_started` still
+ROUTES away from the subagent Agent-row lane (a `local_bash` must never
+synthesize an "Agent:" row), it just no longer adopts.
+
+**Live gate.** Full `just chat-smoke` re-run against 2.1.212 + codex 0.144.2:
+**18/18**, with a new claude case (`claude_foreground_bash_never_enters_the_
+background_set`) pinning the counter-fact above. `TESTED_CLAUDE_VERSION`
+bumped 2.1.211 → 2.1.212.
+
+Fixed alongside: `claude_background_task_lanes_start_and_settle` collected the
+settle frames only AFTER the turn's `result`, but a 5s task can settle inside
+the turn (turn length varies with the model's thinking) — the first loop
+discarded those frames and the second waited 60s for frames already gone. Both
+loops now collect them; presence is the contract, not which side of the
+`result` they land on.

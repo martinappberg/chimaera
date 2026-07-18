@@ -278,8 +278,16 @@ async fn claude_background_task_lanes_start_and_settle() {
 
     // Drive the turn: allow the (possibly auto-allowed) Bash call, collect
     // the start-side background frames.
+    //
+    // The settle frames are collected HERE too, not only in the second loop:
+    // a 5s task can finish before the turn's `result` lands (turn length
+    // varies with the model's thinking), and frames this loop discarded were
+    // then waited for forever. Presence is the contract, not which side of
+    // the result they fall on.
     let mut started = Value::Null;
     let mut changed_with_task = false;
+    let mut notification = Value::Null;
+    let mut emptied = false;
     loop {
         let frame = chat
             .recv(TURN)
@@ -299,7 +307,12 @@ async fn claude_background_task_lanes_start_and_settle() {
         } else if frame["type"] == "system" && frame["subtype"] == "task_started" {
             started = frame;
         } else if frame["type"] == "system" && frame["subtype"] == "background_tasks_changed" {
-            changed_with_task |= frame["tasks"].as_array().is_some_and(|t| !t.is_empty());
+            let tasks = frame["tasks"].as_array();
+            changed_with_task |= tasks.is_some_and(|t| !t.is_empty());
+            // Only counts as the SETTLE emptying once the task was listed.
+            emptied |= changed_with_task && tasks.is_some_and(|t| t.is_empty());
+        } else if frame["type"] == "system" && frame["subtype"] == "task_notification" {
+            notification = frame;
         } else if frame["type"] == "result" {
             break;
         }
@@ -319,10 +332,11 @@ async fn claude_background_task_lanes_start_and_settle() {
     );
     let task_id = started["task_id"].as_str().expect("task_id").to_string();
 
-    // The settle arrives outside any turn (~5s): the verdict notification
-    // plus the set-emptying level-set.
-    let mut notification = Value::Null;
-    let mut emptied = false;
+    // Whatever the turn didn't already carry settles outside it (~5s): the
+    // verdict notification plus the set-emptying level-set.
+    if notification["task_id"].as_str() != Some(task_id.as_str()) {
+        notification = Value::Null;
+    }
     while notification.is_null() || !emptied {
         let frame = chat
             .recv(Duration::from_secs(60))
@@ -348,6 +362,74 @@ async fn claude_background_task_lanes_start_and_settle() {
     assert!(
         notification["output_file"].is_string(),
         "the close names the output file"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// The counter-case that the background tray's whole membership rule rests
+/// on: a long-running **foreground** Bash also emits `task_started
+/// {task_type:"local_bash", tool_use_id}` — identical in shape to the
+/// backgrounded one above — but is NEVER announced in a
+/// `background_tasks_changed` set. So `task_started` cannot classify a lane,
+/// and only the set change may admit a task to the tray (PROTOCOL.md Pass
+/// 23). While the driver adopted from `task_started`, every slow foreground
+/// command showed up as "background task running".
+///
+/// The command is compute-bound rather than a `sleep` so it is unambiguously
+/// foreground work, and long enough that the CLI bothers to track it (a fast
+/// command emits no `task_started` at all).
+#[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn + a ~20s foreground command"]
+async fn claude_foreground_bash_never_enters_the_background_set() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    chat.send_user_text(
+        "Run this with the Bash tool in the FOREGROUND (do NOT set run_in_background), \
+         it is compute-bound and takes ~20s: awk 'BEGIN{for(i=0;i<400000000;i++)s+=i; print s}' \
+         Then reply with just OK.",
+    )
+    .await
+    .expect("send");
+
+    let mut started = Value::Null;
+    let mut announced_any = false;
+    loop {
+        let frame = chat
+            .recv(Duration::from_secs(120))
+            .await
+            .expect("recv")
+            .expect("claude exited before result");
+        if frame["type"] == "control_request" && frame["request"]["subtype"] == "can_use_tool" {
+            let input = frame["request"]["input"].clone();
+            chat.respond_permission(
+                &frame["request_id"],
+                PermissionDecision::Allow {
+                    updated_input: input,
+                },
+            )
+            .await
+            .expect("respond allow");
+        } else if frame["type"] == "system" && frame["subtype"] == "task_started" {
+            started = frame;
+        } else if frame["type"] == "system" && frame["subtype"] == "background_tasks_changed" {
+            announced_any |= frame["tasks"].as_array().is_some_and(|t| !t.is_empty());
+        } else if frame["type"] == "result" {
+            break;
+        }
+    }
+    assert_eq!(
+        started["task_type"],
+        json!("local_bash"),
+        "a foreground bash rides the SAME task_started shape as a backgrounded one"
+    );
+    assert!(
+        !announced_any,
+        "a foreground command is never announced in a background_tasks_changed set — \
+         this absence is the only thing that distinguishes the two lanes"
     );
 
     chat.shutdown(Duration::from_secs(5))

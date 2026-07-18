@@ -134,10 +134,14 @@ TUI (see [view switch](#view-switch-and-rewind)).
   and a ■ stop. Background work is **cross-turn** — the tray persists after the turn that started it
   ends, and dies with the CLI process (cleared on `init`/`exited`). When a task settles, its verdict
   folds into the transcript as a quiet notice ("background “…” completed — … (exit code 0)"; failed
-  renders as an error). The driver ingests the CLI's task lanes — `task_started` (non-`local_agent`)
-  + `task_updated` (patch) + `background_tasks_changed` (the authoritative REPLACE-the-set signal) +
-  `task_notification` (the only frame carrying the verdict summary) — into one level-set
-  `background_tasks` event; tasks the set-change removes before their verdict park in a bounded
+  renders as an error). The driver ingests the CLI's task lanes — `background_tasks_changed` (the
+  authoritative REPLACE-the-set signal, and the **only** frame that admits a task to the tray) +
+  `task_updated` (patch) + `task_started` (non-`local_agent`; enrichment only — it adds the
+  workflow name / card binding the set change lacks) + `task_notification` (the only frame carrying
+  the verdict summary) — into one level-set `background_tasks` event. Membership hangs on the set
+  change alone because a *foreground* long-running Bash emits a `task_started` identical to a
+  backgrounded one (PROTOCOL.md Pass 23) — trusting that frame parked every slow foreground command
+  in the tray. Tasks the set-change removes before their verdict park in a bounded
   departed buffer so the notification arriving ~ms later still closes them (the live-verified settle
   order). The ■ stop sends `stop_task` with the native task key — the CLI's stop is generic over its
   task registry and acks a raced not-found as success. Codex has no background lane — the tray never
