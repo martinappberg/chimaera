@@ -63,8 +63,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   `minimal…xhigh` ladder; **`xhigh` is never relabeled** — canonical vocabulary is sacred).
   Codex exposes Read only / Auto / Auto review / Full access / Plan; every switch sends a complete
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
-  invisibly active. The model chosen when a Codex chat is created rides `thread/start` (and resume),
-  rather than silently falling back to the CLI default until the first header change.
+  invisibly active. Claude's launch-gated Bypass permissions mode is not offered: structured chat
+  sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
+  The model chosen when a Codex chat is created rides `thread/start` (and resume), rather than
+  silently falling back to the CLI default until the first header change.
   Thinking (claude) and ultracode (claude, gated to an xhigh-capable model) are client-held toggles
   reconciled from `effort_state` read-backs. **Thinking defaults ON** for claude sessions (the
   reasoning pass earns its keep in a coding workbench; the chip shows it explicitly and one click

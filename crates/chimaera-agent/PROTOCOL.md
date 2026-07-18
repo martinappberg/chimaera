@@ -30,6 +30,7 @@ The extension's embedded SDK builds argv from:
 | `--thinking adaptive` or `--thinking` + budget | thinking toggle | not yet |
 | `--include-hook-events` | hook events ride the stream itself | not yet (we ingest hooks via HTTP) |
 | `--add-dir <dir>` | extra working dirs | not yet |
+| `--dangerously-skip-permissions` | required before `set_permission_mode bypassPermissions` is accepted | no; consequently the normalized mode catalog does not offer bypass |
 | `--no-session-persistence`, `--session-mirror` | | no |
 
 Env: `DISABLE_AUTOUPDATER=1` (ours; pins the verified binary).
