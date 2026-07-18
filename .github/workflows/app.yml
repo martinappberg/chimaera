@@ -84,8 +84,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: npm ci
         working-directory: crates/chimaera-app
-      - run: cargo test
-        working-directory: crates/chimaera-app
       # tauri's beforeBuildCommand installs and builds web-ui;
       # setup-node above guarantees it sees a modern node — the UI build
       # needs >= 18 (styleText), which is why .nvmrc exists. The windows
@@ -97,6 +95,11 @@ jobs:
       # TAURI_SIGNING_PRIVATE_KEY, which is a release-only concern
       # (release.yml on main) — a PR must not require it.
       - run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        working-directory: crates/chimaera-app
+      # On Unix the app workspace pulls in chimaera-server, whose RustEmbed
+      # derive requires web-ui/dist at compile time. Run tests after Tauri's
+      # beforeBuildCommand has created that directory on a clean runner.
+      - run: cargo test
         working-directory: crates/chimaera-app
       # The bundle is the shippable artifact; the raw .app is a directory
       # with symlinks that artifact-zipping would flatten.
