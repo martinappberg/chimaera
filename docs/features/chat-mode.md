@@ -444,3 +444,17 @@ _Intent pending — not yet captured from the maintainer (shipped 2026-07-17, au
 - Derived context, not intent: the maintainer requested parity with the Claude chat experience while
   preserving Codex-native behavior, including its current modes, queue/steer semantics, and protocol
   quirks. Run **capture-feature-intent** with the maintainer to replace this stub.
+
+### The `Task*` task list (owners, blockers, folded completions) — why it exists
+_Intent pending — not yet captured from the maintainer (shipped 2026-07-18)._
+
+- Derived context, not intent: the maintainer noticed task bookkeeping rendering as anonymous
+  transcript rows and asked whether the plan panel had already been fixed — it had (#25, #48), but
+  only for `TodoWrite`, which Claude replaced. So the *restore* is a regression fix; what is a real
+  choice is how far the panel goes beyond a checklist. The maintainer chose "full richness now"
+  (owner + blockers + description) over parity-first, and separately asked that a failed tool group
+  stop auto-expanding, that finished tasks minimize, and that the panel always be minimizable —
+  stated as a standing UI bar: "make sure this is very usable and not too cluttered".
+- Known-open, not decided: the `@owner` chip is a label, not a control, though `TaskStop` accepts the
+  same agent identity — wiring it would cross into the Mastermind story and was left deliberately
+  untouched. Run **capture-feature-intent** with the maintainer to replace this stub.
