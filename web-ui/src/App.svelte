@@ -189,7 +189,7 @@
   import UpdateToast from "./lib/workspace/UpdateToast.svelte";
   import { currentOffer, updateState } from "./lib/workspace/update.svelte";
   import * as pool from "./lib/terminal/termPool";
-  import * as chatPool from "./lib/chat/chatPool";
+  import * as chatPool from "./lib/chat/chatPool.svelte";
   import {
     applyRemoteSettings,
     flushSettings,
@@ -527,6 +527,17 @@
   const chordDigits = $derived(
     new Map(railSessions.slice(0, 9).map((s, i) => [s.id, i + 1] as const)),
   );
+  /**
+   * The agent's turn is idle but it still has background work running — the
+   * glyph-only surfaces (rail rows, focus-strip chips) breathe muted for it,
+   * exactly as the dashboard card pulses its dot. Same condition and same
+   * warm-store source as the card, so the two surfaces never disagree; a
+   * session whose store isn't pooled simply doesn't cue (the wire row carries
+   * no background tasks, and guessing would be worse than staying quiet).
+   */
+  function isBackgrounded(s: Session): boolean {
+    return s.alive && s.agent_state !== "running" && chatPool.hasBackgroundWork(s.id);
+  }
   const sessionsById = $derived(new Map(sessions.map((s) => [s.id, s])));
   /** terminal session id -> agent session id (one agent per terminal). */
   const linksByTerminal = $derived(new Map(links.map((l) => [l.terminal_id, l.agent_id])));
@@ -3153,8 +3164,9 @@
             >
               <!-- Session-type glyph carrying the state color — the same
                    mark as the pane tab (surface parity, rail included). It
-                   breathes while alive (pulse): the rail's activity cue,
-                   since the row shows only the glyph, no separate dot. -->
+                   breathes while alive (pulse), and muted while background
+                   work runs past the turn: the rail's activity cue, since the
+                   row shows only the glyph, no separate dot. -->
               <SessionGlyph
                 kind={s.kind}
                 agentKind={s.agent_kind}
@@ -3162,6 +3174,7 @@
                 size={11}
                 title={dotTitle(s)}
                 pulse
+                backgrounded={isBackgrounded(s)}
               />
               {#if renamingId === s.id}
                 <!-- svelte-ignore a11y_autofocus -->
@@ -3751,7 +3764,7 @@
           >
             <!-- The type glyph replaces both the dot and the old "$ "
                  prefix — same mark as tabs and rail rows (parity), breathing
-                 while alive. -->
+                 while alive or working in the background. -->
             <SessionGlyph
               kind={s.kind}
               agentKind={s.agent_kind}
@@ -3759,6 +3772,7 @@
               size={10}
               title={dotTitle(s)}
               pulse
+              backgrounded={isBackgrounded(s)}
             />
             <span class="chip-name">{displayNames.get(s.id) ?? displayName(s)}</span>
             {#if hintsActive() && chordDigits.has(s.id)}

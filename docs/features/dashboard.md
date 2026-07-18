@@ -13,7 +13,7 @@ any time. This is the larger dashboard/Mastermind design
 key `v:dashboard`) and its branches in `Pane.svelte`/`PaneTabs.svelte`; the landing switch
 + rail row + ⌘0 in `web-ui/src/App.svelte` (`pruneAndAutoOpen`, `openDashboardSurface`,
 `dashCtx`). The surface renders from the existing `/ws/events` roster, the chat journal
-via `web-ui/src/lib/chat/chatPool.ts` (`acquireChat`/`releaseChat`, refcounted), the git status store,
+via `web-ui/src/lib/chat/chatPool.svelte.ts` (`acquireChat`/`releaseChat`, refcounted), the git status store,
 and the rail's recents; the dock additionally rides the Mastermind daemon surface
 (`PUT`/`DELETE /api/v1/workspaces/{id}/mastermind` in
 `crates/chimaera-server/src/api/workspaces.rs`, the `mastermind` fields on the

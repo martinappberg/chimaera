@@ -12,7 +12,10 @@
  * the remount then only re-renders already-in-memory state.
  *
  * Non-reactive module state (like termPool): the ChatStore's own $state fields
- * carry reactivity; the pool map itself must never be $state.
+ * carry reactivity; the pool map itself must never be $state (it holds sockets
+ * and whole transcripts — proxying it would be pure cost). `generation` below
+ * is the one reactive escape hatch, so a view can depend on MEMBERSHIP without
+ * the map itself becoming reactive.
  */
 
 import { ChatSocket, type ChatSessionInfo, type SeqEvent } from "./chatWs";
@@ -42,6 +45,10 @@ const pool = new Map<string, ChatEntry>();
 /** Monotonic clock stand-in (Date.now is unavailable in some contexts and
  *  irrelevant here — we only need ordering). */
 let tick = 0;
+/** Bumped whenever an entry is added or dropped. Reactive readers of pool
+ *  membership (hasBackgroundWork) touch this so they re-derive when a store
+ *  warms or is evicted — the map itself stays plain, deliberately. */
+let generation = $state(0);
 
 /** Wire a fresh socket to `store` for `sessionId`, moving the handler set that
  *  used to live in ChatView. The store IS the sink — every handler is a pure
@@ -83,6 +90,7 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
       lastUsed: ++tick,
     };
     pool.set(sessionId, entry);
+    generation += 1;
   } else if (!entry.socket.healthy) {
     // The socket died while parked; heal it without losing the transcript.
     entry.socket.close();
@@ -156,6 +164,24 @@ export function disposeChat(sessionId: string): void {
   if (entry === undefined) return;
   entry.socket.close();
   pool.delete(sessionId);
+  generation += 1;
+}
+
+/**
+ * Does this session have background work (backgrounded Bash / workflows)
+ * running right now? Warm-store truth ONLY — the wire session row doesn't
+ * carry background tasks, so a session with no pooled store answers false
+ * rather than guessing. That's the same tier the dashboard card reads, so the
+ * rail and the card agree by construction: both cue exactly when the store
+ * that knows is warm.
+ *
+ * Reactive: reads `generation` (membership) and the store's own `$state`, so a
+ * `$derived` over it re-runs when either changes.
+ */
+export function hasBackgroundWork(sessionId: string): boolean {
+  void generation;
+  const entry = pool.get(sessionId);
+  return entry !== undefined && entry.store.backgroundTasks.some((t) => t.status === "running");
 }
 
 /** Drop every pooled chat whose session is no longer live (mirrors termPool's

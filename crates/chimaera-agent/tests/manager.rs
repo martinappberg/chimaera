@@ -307,6 +307,61 @@ async fn post_turn_summary_folds_latest_wins_session_status() {
     );
 }
 
+/// Background work is CROSS-TURN: a task started mid-turn is still in the live
+/// set after the turn ends, and a second turn adds to it rather than replacing
+/// it. That outliving is what every "still working off-screen" cue is gated on
+/// (the dashboard card's pulsing dot, the rail glyph's muted breathing) — if
+/// the set emptied at the turn boundary they would all read "finished".
+#[tokio::test]
+async fn background_tasks_outlive_their_turn_and_accumulate() {
+    let fx = fixture();
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-bg", &fx.cwd, "background"))
+        .expect("spawn");
+    let att = fx.manager.attach("s-bg", 0).expect("attach");
+    let mut seen: Vec<Arc<SeqEvent>> = att.replay.clone();
+    let mut rx = att.live;
+
+    // Each turn backgrounds one task, then ends — so after turn N the set
+    // holds N running tasks with the turn itself idle.
+    for expected in 1..=2usize {
+        send_text(&fx, "s-bg", "background this").await;
+        let ev = wait_for(
+            &mut rx,
+            &mut seen,
+            "BackgroundTasks",
+            |ev| matches!(ev, AgentEvent::BackgroundTasks { tasks, .. } if tasks.len() == expected),
+        )
+        .await;
+        match &ev.ev {
+            AgentEvent::BackgroundTasks { tasks, .. } => {
+                assert!(
+                    tasks.iter().all(|t| t.status == "running"),
+                    "the level-set carries only live work: {tasks:#?}"
+                );
+                assert_eq!(tasks[0].task_type, "local_bash", "the background lane");
+            }
+            _ => unreachable!(),
+        }
+        wait_for(&mut rx, &mut seen, "TurnCompleted", |ev| {
+            matches!(ev, AgentEvent::TurnCompleted { .. })
+        })
+        .await;
+    }
+
+    // The set survived BOTH turn boundaries — nothing after TurnCompleted
+    // shrank it back.
+    let last = seen
+        .iter()
+        .rev()
+        .find_map(|e| match &e.ev {
+            AgentEvent::BackgroundTasks { tasks, .. } => Some(tasks.clone()),
+            _ => None,
+        })
+        .expect("a background set");
+    assert_eq!(last.len(), 2, "turn two ADDED to the set: {last:#?}");
+}
+
 #[tokio::test]
 async fn permission_deny_marks_tool_failed() {
     let fx = fixture();

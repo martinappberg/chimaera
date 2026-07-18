@@ -30,9 +30,22 @@
      *  Off by default so tabs / quick-open / the dashboard (which carries its
      *  own dot) stay still. */
     pulse?: boolean;
+    /** The turn is idle but background work is still running. Breathes in the
+     *  mark's own (muted) color on the same `pulse` surfaces — off-screen work
+     *  must not read as finished. Independent of `pulse`'s alive gate: this
+     *  state is by definition NOT alive. */
+    backgrounded?: boolean;
   }
 
-  let { kind, agentKind = null, state = "", size = 10, title, pulse = false }: Props = $props();
+  let {
+    kind,
+    agentKind = null,
+    state = "",
+    size = 10,
+    title,
+    pulse = false,
+    backgrounded = false,
+  }: Props = $props();
 
   const PATHS: Record<string, string> = {
     shell: "M3 4.5L6.5 8 3 11.5M8.5 12h4.5",
@@ -49,7 +62,7 @@
 
 <svg
   class="sglyph {state}"
-  class:pulse={pulse && state === "alive"}
+  class:pulse={(pulse && state === "alive") || backgrounded}
   viewBox="0 0 16 16"
   width={size}
   height={size}
@@ -79,15 +92,17 @@
   .sglyph.alive {
     color: var(--accent);
   }
-  /* Opt-in breathing for glyph-only surfaces (the `pulse` prop): the same
-     2.4s rhythm as the dashboard card's alive dot, so a working agent in the
-     rail reads as active without an extra icon. `pulse` is the global
-     keyframe in app.css. */
-  .sglyph.pulse.alive {
+  /* Opt-in breathing for glyph-only surfaces (the `pulse` / `backgrounded`
+     props): the same 2.4s rhythm as the dashboard card's dots, so a working
+     agent in the rail reads as active without an extra icon. The class is
+     already gated in the markup, so the color it breathes in is whatever the
+     state modifier set — accent for a live turn, muted for background work.
+     `pulse` is the global keyframe in app.css. */
+  .sglyph.pulse {
     animation: pulse 2.4s ease-in-out infinite;
   }
   @media (prefers-reduced-motion: reduce) {
-    .sglyph.pulse.alive {
+    .sglyph.pulse {
       animation: none;
     }
   }

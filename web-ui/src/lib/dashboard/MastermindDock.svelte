@@ -10,7 +10,7 @@
    */
   import BrandMark from "../shared/BrandMark.svelte";
   import ChatView from "../chat/ChatView.svelte";
-  import { acquireChat, releaseChat } from "../chat/chatPool";
+  import { acquireChat, releaseChat } from "../chat/chatPool.svelte";
   import type { ChatStore } from "../chat/store.svelte";
   import { dismiss } from "../shared/dismiss";
   import { resolvedTheme } from "../settings/store.svelte";

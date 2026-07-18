@@ -24,7 +24,7 @@ Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 - **The Mastermind is the observer, not the observed**: every roster surface
   filters through `isMastermind()` (workspace/sessions.ts) — never re-type the
   predicate inline.
-- **Warm chat detail rides the shared chat pool** (`chat/chatPool.ts`), which
+- **Warm chat detail rides the shared chat pool** (`chat/chatPool.svelte.ts`), which
   refcounts holds — acquire/release in pairs, and keep the lane acquisition
   bounded (`RICH_LANE_MAX`).
 - The dock is reactive-only: nothing in this folder ever triggers a Mastermind

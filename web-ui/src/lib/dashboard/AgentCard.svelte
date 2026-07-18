@@ -422,16 +422,22 @@
   .card.dead {
     opacity: 0.75;
   }
-  /* Idle turn but a background task is still running: the type glyph breathes
-     in GRAY (the alive dot's green pulse is reserved for an active turn), so
-     the card reads as "still working off-screen", not finished. `pulse` is
-     the global keyframe (app.css). */
+  /* Idle turn but a background task is still running: the STATE DOT breathes,
+     so the card reads as "still working off-screen", not finished. The dot is
+     this surface's state channel — the type glyph is identity, and animating
+     identity read as the wrong thing moving. It keeps its own state color
+     (a quiet ring for a finished turn, warn if it also wants you), and it
+     can't collide with .dot.alive: `backgrounded` requires a non-running turn.
+     The glyph only goes muted, matching the calmed-down state. `pulse` is the
+     global keyframe (app.css). */
   .card.backgrounded :global(.sglyph) {
     color: var(--muted);
+  }
+  .card.backgrounded .dot {
     animation: pulse 2.4s ease-in-out infinite;
   }
   @media (prefers-reduced-motion: reduce) {
-    .card.backgrounded :global(.sglyph) {
+    .card.backgrounded .dot {
       animation: none;
     }
   }
