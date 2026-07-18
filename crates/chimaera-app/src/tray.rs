@@ -32,7 +32,7 @@ pub fn install(app: &App) -> tauri::Result<()> {
             "quit" => crate::shell::request_quit(app),
             "tray-new-window" => open_new_window(app),
             "tray-caffeinate" => {
-                let _ = crate::shell::apply_caffeinate(app, !crate::shell::caffeinate_armed(app));
+                crate::shell::toggle_caffeinate_from_tray(app);
                 // On success the `caffeinate-changed` listener rebuilds the tray
                 // (harmless double); on FAILURE nothing is broadcast, so this is
                 // what stops the auto-toggled check/icon diverging from reality.
@@ -100,7 +100,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     #[cfg(target_os = "macos")]
     {
         use tauri::menu::CheckMenuItemBuilder;
-        let keep = CheckMenuItemBuilder::with_id("tray-caffeinate", "Keep Awake")
+        let keep = CheckMenuItemBuilder::with_id("tray-caffeinate", "Caffeinate")
             .checked(crate::shell::caffeinate_armed(app))
             .build(app)?;
         b = b.item(&keep).separator();
@@ -151,7 +151,7 @@ fn icon(armed: bool) -> Image<'static> {
 
 fn tooltip(armed: bool) -> &'static str {
     if armed {
-        "Chimaera — keeping this Mac awake"
+        "Chimaera — caffeinated"
     } else {
         "Chimaera"
     }

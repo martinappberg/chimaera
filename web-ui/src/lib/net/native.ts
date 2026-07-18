@@ -204,30 +204,61 @@ export async function writeClipboard(text: string): Promise<boolean> {
 }
 
 /**
- * Arm/disarm the "caffeinate" power assertion on the local app host — while on,
- * the machine won't idle/display/system-sleep (incl. lid-closed on macOS, but
- * only on AC power). Global to the app; the change broadcasts (see
- * {@link onCaffeinateChanged}). Returns the resulting armed state; a plain
- * browser (no shell) is a no-op that reports false.
+ * The device-local Caffeinate state. `enabled` is the real held assertion,
+ * never merely a persisted preference; consent is versioned in the native
+ * shell so a material explanation change can be shown once again.
  */
-export async function setCaffeinate(on: boolean): Promise<boolean> {
-  const t = tauri();
-  if (t === null) return false;
-  return t.core.invoke<boolean>("set_caffeinate", { on });
+export interface CaffeinateState {
+  enabled: boolean;
+  consent_required: boolean;
+  /** External power + built-in display + active external display detected. */
+  closed_lid_ready: boolean;
 }
 
-/** Whether the caffeinate assertion is currently held (read on mount). */
-export async function caffeinateState(): Promise<boolean> {
+const CAFFEINATE_OFF: CaffeinateState = {
+  enabled: false,
+  consent_required: false,
+  closed_lid_ready: false,
+};
+
+/**
+ * Arm/disarm Caffeinate on the local app host. The display may turn off and
+ * lock normally; idle/system sleep are inhibited. macOS closed-display use is
+ * advertised separately only while the laptop is detectably docked.
+ * `acknowledge` is sent only by the first-use confirmation.
+ */
+export async function setCaffeinate(
+  on: boolean,
+  acknowledge = false,
+): Promise<CaffeinateState> {
   const t = tauri();
-  if (t === null) return false;
-  return t.core.invoke<boolean>("caffeinate_state");
+  if (t === null) return CAFFEINATE_OFF;
+  return t.core.invoke<CaffeinateState>("set_caffeinate", { on, acknowledge });
+}
+
+/** Current assertion + first-use consent state (read on mount). */
+export async function caffeinateState(): Promise<CaffeinateState> {
+  const t = tauri();
+  if (t === null) return CAFFEINATE_OFF;
+  return t.core.invoke<CaffeinateState>("caffeinate_state");
 }
 
 /** The caffeinate state changed (from any window) — keep this window in sync. */
-export function onCaffeinateChanged(handler: (on: boolean) => void): Promise<() => void> {
+export function onCaffeinateChanged(
+  handler: (state: CaffeinateState) => void,
+): Promise<() => void> {
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
-  return t.event.listen<boolean>("caffeinate-changed", (e) => handler(e.payload));
+  return t.event.listen<CaffeinateState>("caffeinate-changed", (e) => handler(e.payload));
+}
+
+/** A first tray click needs one window to present the consent explanation. */
+export function onCaffeinateConsentRequired(handler: () => void): Promise<() => void> {
+  const t = tauri();
+  if (t === null) return Promise.resolve(() => {});
+  return t.webviewWindow
+    .getCurrentWebviewWindow()
+    .listen<void>("caffeinate-consent-required", () => handler());
 }
 
 /**

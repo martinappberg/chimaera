@@ -11,19 +11,26 @@
   import SettingRow from "./SettingRow.svelte";
   import SettingsJson from "./SettingsJson.svelte";
   import AgentsSettings from "./AgentsSettings.svelte";
+  import CaffeinateSettings from "./CaffeinateSettings.svelte";
   import EnvironmentSettings from "./EnvironmentSettings.svelte";
+  import { getHostLabel } from "../net/api";
+  import { isNativeShell } from "../net/native";
+  import { isMac } from "../shared/keys";
   import { APP_MENU, PINNED } from "../shared/keys";
   import { activeModLabel } from "../shared/keybindings";
 
   /**
-   * Nav sections: the schema categories, plus the bespoke Environment section
-   * (store-backed via /api/v1/environment — it has no schema rows) slotted
-   * after Agents.
+   * Nav sections: schema categories plus bespoke device/environment sections.
+   * Caffeinate is local-app state, never part of a remote daemon's settings.
    */
+  const caffeinateAvailable = isNativeShell() && isMac && getHostLabel() === "local";
   const sections = (() => {
     const out = [...CATEGORIES];
     const at = out.indexOf("Agents");
     out.splice(at >= 0 ? at + 1 : out.length, 0, "Environment");
+    // This exceptional device mode is intentionally after ordinary daemon/UI
+    // preferences; the compact cup remains its everyday entry point.
+    if (caffeinateAvailable) out.push("Caffeinate");
     return out;
   })();
 
@@ -61,11 +68,29 @@
    */
   const ENV_KEYWORDS = ["environment", "prelude", "module", "conda", "micromamba", "startup", "activate", "export"];
   const envVisible = $derived(q === "" || ENV_KEYWORDS.some((k) => k.includes(q)));
+  const CAFFEINATE_KEYWORDS = [
+    "caffeinate",
+    "awake",
+    "sleep",
+    "lock",
+    "lid",
+    "ssh",
+    "network",
+    "reconnect",
+    "power",
+  ];
+  const caffeinateVisible = $derived(
+    caffeinateAvailable && (q === "" || CAFFEINATE_KEYWORDS.some((k) => k.includes(q))),
+  );
 
   /** Rows grouped by category, registry order, empty groups dropped. */
   const groups = $derived.by(() => {
     const out: { category: string; defs: SettingDef[] }[] = [];
     for (const cat of sections) {
+      if (cat === "Caffeinate") {
+        if (caffeinateVisible) out.push({ category: cat, defs: [] });
+        continue;
+      }
       if (cat === "Environment") {
         if (envVisible) out.push({ category: cat, defs: [] });
         continue;
@@ -75,9 +100,6 @@
     }
     return out;
   });
-
-  /** The pinned-chords block travels with the Keyboard section. */
-  const keyboardVisible = $derived(groups.some((g) => g.category === "Keyboard"));
 
   function jumpTo(section: string): void {
     activeSection = section;
@@ -203,6 +225,12 @@
             <section data-section={group.category}>
               <AgentsSettings />
             </section>
+          {:else if group.category === "Caffeinate"}
+            <!-- Device-local native-shell state, intentionally outside the
+                 daemon settings schema and settings.json. -->
+            <section data-section={group.category}>
+              <CaffeinateSettings />
+            </section>
           {:else if group.category === "Environment"}
             <!-- Bespoke panel: edits the daemon's prelude map over
                  /api/v1/environment (env-profiles.json), not settings.json.
@@ -216,44 +244,44 @@
               {#each group.defs as def (def.id)}
                 <SettingRow {def} />
               {/each}
+              {#if group.category === "Keyboard"}
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">Pinned chords</h3>
+                  <p class="kbd-note">
+                    Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
+                    browser conventions too carefully to open up.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each pinnedRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+
+                <div class="kbd-group">
+                  <h3 class="kbd-group-title">chimaera app menu</h3>
+                  <p class="kbd-note">
+                    The native app's menu bar owns the chords a browser reserves, so these fire only
+                    in the chimaera app. Several are a second way to reach a rebindable action above —
+                    {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new
+                    terminal.
+                  </p>
+                  <ul class="kbd-list">
+                    {#each appMenuRows as row (row.label)}
+                      <li class="kbd-row">
+                        <span class="kbd-label">{row.label}</span>
+                        <kbd class="kbd-pill">{row.chord}</kbd>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              {/if}
             </section>
           {/if}
         {/each}
-
-        {#if keyboardVisible}
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">Pinned chords</h3>
-            <p class="kbd-note">
-              Not rebindable — the terminal owns bare Ctrl on every platform, and these shadow
-              browser conventions too carefully to open up.
-            </p>
-            <ul class="kbd-list">
-              {#each pinnedRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-
-          <div class="kbd-group">
-            <h3 class="kbd-group-title">chimaera app menu</h3>
-            <p class="kbd-note">
-              The native app's menu bar owns the chords a browser reserves, so these fire only in
-              the chimaera app. Several are a second way to reach a rebindable action above —
-              {APP_MENU.closeView} also closes a view, {APP_MENU.newTerminal} opens a new terminal.
-            </p>
-            <ul class="kbd-list">
-              {#each appMenuRows as row (row.label)}
-                <li class="kbd-row">
-                  <span class="kbd-label">{row.label}</span>
-                  <kbd class="kbd-pill">{row.chord}</kbd>
-                </li>
-              {/each}
-            </ul>
-          </div>
-        {/if}
 
         {#if groups.length === 0}
           <div class="empty">no settings match “{query}”</div>

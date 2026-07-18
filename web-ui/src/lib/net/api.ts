@@ -5,6 +5,8 @@ const WS_KEY = "chimaera.ws";
 const HOST_KEY = "chimaera.host";
 /** Same key viewState.windowKey() reads — the hash seeds it. */
 const WIN_KEY = "chimaera.win";
+/** Consume-once marker when a tray click had to open a window for consent. */
+const CAFFEINATE_PROMPT_KEY = "chimaera.caffeinatePrompt";
 /** Set when this window was opened onto a compute-node daemon (Mode 2). */
 const JOB_KEY = "chimaera.job";
 const NODE_KEY = "chimaera.node";
@@ -29,6 +31,7 @@ function initFromHash(): string | null {
   const winFromHash = params.get("win");
   const jobFromHash = params.get("job");
   const nodeFromHash = params.get("node");
+  const caffeinateFromHash = params.get("caffeinate");
   if (tokenFromHash !== null) {
     sessionStorage.setItem(TOKEN_KEY, tokenFromHash);
   }
@@ -47,13 +50,17 @@ function initFromHash(): string | null {
   if (nodeFromHash !== null) {
     sessionStorage.setItem(NODE_KEY, nodeFromHash);
   }
+  if (caffeinateFromHash === "consent") {
+    sessionStorage.setItem(CAFFEINATE_PROMPT_KEY, "1");
+  }
   if (
     tokenFromHash !== null ||
     wsFromHash !== null ||
     hostFromHash !== null ||
     winFromHash !== null ||
     jobFromHash !== null ||
-    nodeFromHash !== null
+    nodeFromHash !== null ||
+    caffeinateFromHash !== null
   ) {
     history.replaceState(null, "", location.pathname + location.search);
   }
@@ -101,6 +108,13 @@ export function refreshTokenFromHash(): boolean {
  */
 export function getHostLabel(): string {
   return sessionStorage.getItem(HOST_KEY) ?? "local";
+}
+
+/** True once for a local window opened by a first Caffeinate tray click. */
+export function takeCaffeinateConsentPrompt(): boolean {
+  const pending = sessionStorage.getItem(CAFFEINATE_PROMPT_KEY) === "1";
+  sessionStorage.removeItem(CAFFEINATE_PROMPT_KEY);
+  return pending;
 }
 
 /**

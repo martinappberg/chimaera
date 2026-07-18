@@ -71,10 +71,9 @@ pub struct Shell {
     /// Destroyed, so each still sees the other in `webview_windows()`) would
     /// miscount and let the app quit. Cleared on Destroyed. macOS-only path.
     closing: Mutex<HashSet<String>>,
-    /// The held power assertion for the "caffeinate" toggle — Some = armed
-    /// (this machine won't idle/display/system-sleep). Dropped to disarm; the
-    /// guard drops on quit, so the assertion never outlives the app.
-    caffeinate: Mutex<Option<keepawake::KeepAwake>>,
+    /// Device-local persisted Caffeinate intent + the held power assertion.
+    /// The guard drops on quit, so it never outlives the app.
+    caffeinate: Mutex<crate::caffeinate::Caffeinate>,
 }
 
 /// The (host, workspace) a window is showing. `alias` None = the local
@@ -181,43 +180,66 @@ pub(crate) fn focused_ws_open(app: &AppHandle) -> bool {
 /// see `Shell`'s private field) can reflect the state; false before startup.
 pub(crate) fn caffeinate_armed(app: &AppHandle) -> bool {
     app.try_state::<Shell>()
-        .map(|s| lock(&s.caffeinate).is_some())
+        .map(|s| lock(&s.caffeinate).state().enabled)
         .unwrap_or(false)
 }
 
 /// Arm/disarm the caffeinate assertion for THIS machine, the shared core behind
-/// both the UI command (`commands::set_caffeinate`) and the tray's "Keep Awake"
-/// item. While armed the app host won't idle-, display-, or system-sleep —
-/// including lid-closed on macOS, though only on AC power (Apple blocks
-/// clamshell-awake on battery; no app can override that). Idempotent: re-arming
-/// keeps the single held guard, disarming drops it. The resulting state
+/// both the UI command (`commands::set_caffeinate`) and the tray's Caffeinate
+/// item. While armed the app host won't idle- or system-sleep — the display
+/// may dim, turn off, and lock normally. Closing a MacBook lid is a distinct
+/// OS sleep reason: the assertion is best-effort there, and macOS still owns
+/// whether the machine has a supported powered closed-display setup.
+/// Idempotent: re-arming keeps the single held guard, disarming drops it. The resulting state
 /// broadcasts on `caffeinate-changed` so every window's toggle AND the tray
 /// (icon + menu check) stay in sync regardless of which surface flipped it.
-pub(crate) fn apply_caffeinate(app: &AppHandle, on: bool) -> Result<bool, String> {
+pub(crate) fn apply_caffeinate(
+    app: &AppHandle,
+    on: bool,
+    acknowledge: bool,
+) -> Result<crate::caffeinate::CaffeinateState, String> {
     let shell = app
         .try_state::<Shell>()
         .ok_or_else(|| "the app is not ready yet".to_string())?;
-    let mut guard = lock(&shell.caffeinate);
-    if on {
-        if guard.is_none() {
-            let awake = keepawake::Builder::default()
-                .display(true)
-                .idle(true)
-                .sleep(true)
-                .app_name("Chimaera")
-                .app_reverse_domain("com.chimaera.app")
-                .reason("Caffeinate")
-                .create()
-                .map_err(|e| format!("{e:#}"))?;
-            *guard = Some(awake);
+    let state = lock(&shell.caffeinate).set(on, acknowledge)?;
+    let _ = app.emit("caffeinate-changed", state.clone());
+    Ok(state)
+}
+
+/// Tray clicks share the same consent gate as the in-window control. A first
+/// click targets one window with the explanation instead of silently doing
+/// nothing or broadcasting duplicate dialogs to every open window.
+pub(crate) fn toggle_caffeinate_from_tray(app: &AppHandle) {
+    let on = !caffeinate_armed(app);
+    match apply_caffeinate(app, on, false) {
+        Ok(_) => {}
+        Err(err) if on && err == crate::caffeinate::CONSENT_REQUIRED => {
+            let windows = app.webview_windows();
+            let target = windows
+                .values()
+                .find(|window| window.is_focused().unwrap_or(false))
+                .or_else(|| windows.values().next());
+            if let Some(window) = target {
+                let _ = app.emit_to(window.label(), "caffeinate-consent-required", ());
+                let _ = window.set_focus();
+            } else {
+                let shell = app.state::<Shell>();
+                let (port, token) = {
+                    let local = lock(&shell.local);
+                    (local.port, local.token.clone())
+                };
+                if let Err(open_err) = restore::open_caffeinate_consent_window(
+                    app,
+                    port,
+                    &token,
+                    &crate::windows::WindowRecord::new(None, None),
+                ) {
+                    tracing::warn!(%open_err, "could not open Caffeinate consent window");
+                }
+            }
         }
-    } else {
-        *guard = None; // dropping the guard releases the assertion
+        Err(err) => tracing::warn!(%err, "could not change Caffeinate from the tray"),
     }
-    let armed = guard.is_some();
-    drop(guard);
-    let _ = app.emit("caffeinate-changed", armed);
-    Ok(armed)
 }
 
 /// Startup completion is a real three-state gate, NOT `try_state::<Shell>()`:
@@ -302,8 +324,15 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
             registry: Mutex::new(WindowRegistry::load_default()),
             quitting: AtomicBool::new(false),
             closing: Mutex::new(HashSet::new()),
-            caffeinate: Mutex::new(None),
+            caffeinate: Mutex::new(crate::caffeinate::Caffeinate::load_default()),
         });
+        match lock(&handle.state::<Shell>().caffeinate).restore() {
+            Ok(state) if state.enabled => {
+                tracing::info!("Caffeinate restored from device preferences")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "could not restore Caffeinate"),
+        }
     } else {
         *lock(&handle.state::<Shell>().local) = local;
     }
