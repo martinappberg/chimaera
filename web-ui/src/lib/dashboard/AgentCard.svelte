@@ -65,8 +65,10 @@
       const act = store.activity;
       if (act !== null && act.detail !== "") return act.detail;
       if (act !== null) return act.kind;
+      // `activeForm` is the agent's own present-continuous phrasing for a
+      // "what's happening now" line — exactly this one.
       const step = store.plan.find((p) => p.status === "in_progress");
-      if (step !== undefined) return step.content;
+      if (step !== undefined) return step.activeForm ?? step.content;
       const lastMsg = store.blocks.findLast((b) => b.kind === "message");
       if (lastMsg !== undefined) return lastMsg.text.slice(0, 160);
     }
@@ -276,10 +278,13 @@
 
   {#if planEntries.length > 0}
     <div class="plan">
-      {#each planEntries as p, i (i)}
-        <div class="plan-row {p.status}">
+      {#each planEntries as p, i (p.id ? `id:${p.id}` : `ix:${i}`)}
+        <div class="plan-row {p.status}" class:blocked={p.status !== "done" && p.blockedBy.length > 0}>
           <span class="plan-mark" aria-hidden="true"></span>
           <span class="plan-text">{p.content}</span>
+          <!-- Who holds it: the signal that earns its space on a workspace
+               card, where several agents can share one task list. -->
+          {#if p.owner}<span class="plan-owner">@{p.owner}</span>{/if}
         </div>
       {/each}
     </div>
@@ -605,6 +610,18 @@
   }
   .plan-row.done .plan-mark {
     border-color: var(--accent);
+  }
+  /* Blocked is still `todo` on the wire, so without this a task that CAN'T
+     start looks exactly like one that merely hasn't. */
+  .plan-row.blocked .plan-mark {
+    border-style: dashed;
+  }
+  /* Mixed toward --fg, not --muted: accent-over-muted lands near 3.5:1 on the
+     light background, too weak for an 11px chip. */
+  .plan-owner {
+    flex: none;
+    font-size: var(--text-xs);
+    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
   }
   .plan-row.done .plan-text {
     text-decoration: line-through;

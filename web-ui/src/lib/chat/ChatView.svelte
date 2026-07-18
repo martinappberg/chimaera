@@ -23,7 +23,7 @@
   import RewindDialog from "./RewindDialog.svelte";
   import Composer from "./Composer.svelte";
   import type { ImageAttachment } from "./images";
-  import type { ChatBlock } from "./store.svelte";
+  import type { ChatBlock, PlanEntry } from "./store.svelte";
 
   interface Props {
     session: Session;
@@ -604,8 +604,32 @@
 
   const planDone = $derived(store.plan.filter((p) => p.status === "done").length);
   /** The step the agent is on now — surfaced in the plan summary so the
-   *  current goal is legible without expanding the panel. */
-  const planActive = $derived(store.plan.find((p) => p.status === "in_progress")?.content ?? null);
+   *  current goal is legible without expanding the panel. `activeForm` is the
+   *  agent's own present-continuous phrasing for exactly this spot ("Running
+   *  tests"), so prefer it and fall back to the subject. */
+  const planActive = $derived.by(() => {
+    const active = store.plan.find((p) => p.status === "in_progress");
+    return active ? (active.activeForm ?? active.content) : null;
+  });
+
+  /** Blocked is orthogonal to status: a blocked task is still `todo`, so it
+   *  would otherwise render identically to one that simply hasn't started.
+   *  The server already filters `blockedBy` to blockers that are still open. */
+  const isBlocked = (entry: PlanEntry) => entry.status !== "done" && entry.blockedBy.length > 0;
+  const planMark = (entry: PlanEntry) =>
+    entry.status === "done"
+      ? "✓"
+      : entry.status === "in_progress"
+        ? "◐"
+        : isBlocked(entry)
+          ? "⊘"
+          : "○";
+  /** Agents often restate the subject as the description; showing both then is
+   *  pure noise in a panel this small. */
+  const planDetail = (entry: PlanEntry) => {
+    const detail = entry.description?.trim();
+    return detail && detail !== entry.content.trim() ? detail : null;
+  };
 
   /** Subagents in flight right now — promoted into the live tray above the
    *  composer. They also keep their in-place "Agent:" rows in the transcript
@@ -866,12 +890,25 @@
             > · ◐ {planActive}</span
           >{/if}</summary
       >
-      {#each store.plan as entry, i (i)}
-        <div class="plan-row" class:done={entry.status === "done"}>
-          <span class="plan-mark">
-            {entry.status === "done" ? "✓" : entry.status === "in_progress" ? "◐" : "○"}
+      {#each store.plan as entry, i (entry.id ? `id:${entry.id}` : `ix:${i}`)}
+        <div
+          class="plan-row"
+          class:done={entry.status === "done"}
+          class:blocked={isBlocked(entry)}
+        >
+          <span class="plan-mark">{planMark(entry)}</span>
+          <span class="plan-body">
+            <span class="plan-line">
+              <span class="plan-subject">{entry.content}</span>
+              {#if entry.owner}<span class="plan-owner">@{entry.owner}</span>{/if}
+              {#if isBlocked(entry)}<span class="plan-blocked"
+                  >blocked by {entry.blockedBy.map((id) => `#${id}`).join(", ")}</span
+                >{/if}
+            </span>
+            {#if planDetail(entry)}
+              <span class="plan-desc">{planDetail(entry)}</span>
+            {/if}
           </span>
-          <span>{entry.content}</span>
         </div>
       {/each}
     </details>
@@ -1249,7 +1286,8 @@
     border-top: 1px solid var(--edge);
     padding: 4px 14px;
     font-size: var(--text-sm);
-    max-height: 160px;
+    /* Rows can carry a detail line now, so a few are still visible at once. */
+    max-height: 200px;
     overflow-y: auto;
   }
   .plan summary {
@@ -1275,6 +1313,46 @@
   .plan-mark {
     color: var(--accent);
     flex: none;
+  }
+  /* Blocked reads as "waiting", not "active": the mark drops to muted so a
+     ⊘ can't be mistaken for progress at a glance. */
+  .plan-row.blocked .plan-mark {
+    color: var(--muted);
+  }
+  .plan-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .plan-line {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
+  /* Every text span clips rather than wraps — the panel is a glance surface,
+     and an agent subject can be arbitrarily long. */
+  .plan-subject,
+  .plan-desc {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plan-owner,
+  .plan-blocked {
+    flex: none;
+    font-size: var(--text-xs);
+    color: var(--muted);
+  }
+  /* Mixed toward --fg, not --muted: accent-over-muted lands near 3.5:1 on the
+     light background, too weak for an 11px chip. Same blend as .plan-active. */
+  .plan-owner {
+    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
+  }
+  .plan-desc {
+    color: var(--muted);
+    font-size: var(--text-xs);
   }
   .bubble-row {
     display: flex;

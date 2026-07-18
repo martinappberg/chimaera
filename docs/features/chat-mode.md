@@ -166,6 +166,15 @@ TUI (see [view switch](#view-switch-and-rewind)).
   (reconciled shut at turn end). The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
+- **The task list is the plan panel, whichever tool spells it.** Claude replaced `TodoWrite` with an
+  incremental `TaskCreate`/`TaskUpdate`/`TaskList` family; both feed the same pinned panel and
+  neither leaves bookkeeping rows in the transcript. Because the new family carries more than a
+  checklist, a row can show **who owns it** (`@name`) and **what blocks it** ("blocked by #1", with
+  its own ⊘ mark since a blocked task is still `todo`), plus a muted detail line when the task's
+  description says more than its subject. Blockers are filtered to ones still open, so finishing a
+  dependency visibly unblocks its dependents. The in-progress summary prefers the agent's own
+  present-continuous `activeForm` ("Running tests"). Older CLIs and codex, whose plans carry none of
+  this, render exactly as before — the extra fields are simply absent.
 - **Codex subagents (collab / multi-agent), same surface.** Codex 0.144.x delegation renders the
   identical way: each spawned agent is an "Agent: {name}" row (name = the model's own
   `agentPath` name) whose progress line folds the agent's live activity (thinking · a command ·

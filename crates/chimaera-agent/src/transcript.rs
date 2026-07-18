@@ -34,9 +34,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::claude::{edit_diff_content, tool_kind, tool_locations, tool_result_text, tool_title};
+use crate::claude::{
+    edit_diff_content, opt_label, plan_status, tool_kind, tool_locations, tool_result_text,
+    tool_title, TaskTracker,
+};
 use crate::model::{
-    cap_output, AgentEvent, PlanEntry, PlanStatus, ToolContent, ToolKind, ToolStatus, Usage,
+    cap_output, truncate_label, AgentEvent, PlanEntry, ToolContent, ToolKind, ToolStatus, Usage,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP,
 };
 
 /// A single transcript line longer than this is a pathological outlier (a
@@ -149,6 +153,10 @@ struct Translator {
     /// tool_use id → kind, so a tool_result renders the same way the live
     /// driver does (edit acks are suppressed, everything else shows output).
     tool_kinds: HashMap<String, ToolKind>,
+    /// The same task-list state machine the live driver runs, so imported
+    /// history rebuilds its plan panel instead of replaying the bookkeeping
+    /// as rows. Shared (not reimplemented) so the two cannot drift.
+    task_list: TaskTracker,
 }
 
 impl Translator {
@@ -277,24 +285,30 @@ impl Translator {
         let name = block["name"].as_str().unwrap_or_default();
         let input = &block["input"];
 
-        // The todo list is a plan panel, not a tool card (as in the driver).
+        // The todo list is a plan panel, not a tool card (as in the driver):
+        // `TodoWrite` on older CLIs, the `Task*` family from 2.1.207 on. The
+        // latter's snapshot lands on its tool_result, where the ids live.
         if name == "TodoWrite" {
             if let Some(todos) = input["todos"].as_array() {
                 let entries = todos
                     .iter()
                     .filter_map(|t| {
                         Some(PlanEntry {
-                            content: t["content"].as_str()?.to_string(),
-                            status: match t["status"].as_str() {
-                                Some("in_progress") => PlanStatus::InProgress,
-                                Some("completed") => PlanStatus::Done,
-                                _ => PlanStatus::Todo,
-                            },
+                            content: truncate_label(t["content"].as_str()?, PLAN_LABEL_MAX),
+                            status: plan_status(t["status"].as_str().unwrap_or_default()),
+                            active_form: opt_label(&t["activeForm"], PLAN_LABEL_MAX),
+                            ..Default::default()
                         })
                     })
+                    .take(PLAN_TASKS_CAP)
                     .collect();
                 out.push(AgentEvent::Plan { entries });
             }
+            self.tool_kinds.insert(id, ToolKind::Think);
+            return;
+        }
+        if TaskTracker::is_task_tool(name) {
+            self.task_list.on_tool_use(&id, name, input);
             self.tool_kinds.insert(id, ToolKind::Think);
             return;
         }
@@ -330,6 +344,13 @@ impl Translator {
         }
         let failed = block["is_error"].as_bool() == Some(true);
         let kind = self.tool_kinds.get(&id).copied();
+        // A task-list call carries its id/state only in the result text.
+        if let Some(entries) = self
+            .task_list
+            .on_tool_result(&id, failed, &tool_result_text(block))
+        {
+            out.push(AgentEvent::Plan { entries });
+        }
         let content = if matches!(kind, Some(ToolKind::Edit)) && !failed {
             None
         } else {
