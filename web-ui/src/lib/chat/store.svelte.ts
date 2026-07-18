@@ -674,15 +674,21 @@ export class ChatStore {
         // so replace. Mapped field-by-field (not cast) because the rich fields
         // are omitted entirely by older journals, TodoWrite, and codex — the
         // panel reads `blockedBy.length`, which must never be undefined.
-        this.plan = ((ev.entries as Record<string, unknown>[]) ?? []).map((e) => ({
-          content: (e.content as string) ?? "",
-          status: (e.status as PlanEntry["status"]) ?? "todo",
-          id: (e.id as string) ?? null,
-          activeForm: (e.active_form as string) ?? null,
-          description: (e.description as string) ?? null,
-          owner: (e.owner as string) ?? null,
-          blockedBy: (e.blocked_by as string[]) ?? [],
-        }));
+        this.plan = ((ev.entries as Record<string, unknown>[]) ?? [])
+          .map((e) => ({
+            content: (e.content as string) ?? "",
+            status: (e.status as PlanEntry["status"]) ?? "todo",
+            id: (e.id as string) ?? null,
+            activeForm: (e.active_form as string) ?? null,
+            description: (e.description as string) ?? null,
+            owner: (e.owner as string) ?? null,
+            blockedBy: (e.blocked_by as string[]) ?? [],
+          }))
+          // Same keyed-render defense as backgroundTasks: both the plan panel
+          // and the dashboard card key rows by `id`, and a duplicate (a
+          // reworded TaskList line parsed twice, a journal from another build)
+          // would throw and take the whole view down.
+          .filter((e, i, arr) => e.id === null || arr.findIndex((o) => o.id === e.id) === i);
         break;
       case "permission_request":
         this.pending.push({

@@ -344,12 +344,15 @@ impl Translator {
         }
         let failed = block["is_error"].as_bool() == Some(true);
         let kind = self.tool_kinds.get(&id).copied();
-        // A task-list call carries its id/state only in the result text.
-        if let Some(entries) = self
-            .task_list
-            .on_tool_result(&id, failed, &tool_result_text(block))
-        {
-            out.push(AgentEvent::Plan { entries });
+        // A task-list call carries its id/state only in the result text; the
+        // `tracks` gate keeps that work off every other tool's result.
+        if self.task_list.tracks(&id) {
+            if let Some(entries) =
+                self.task_list
+                    .on_tool_result(&id, failed, &tool_result_text(block))
+            {
+                out.push(AgentEvent::Plan { entries });
+            }
         }
         let content = if matches!(kind, Some(ToolKind::Edit)) && !failed {
             None

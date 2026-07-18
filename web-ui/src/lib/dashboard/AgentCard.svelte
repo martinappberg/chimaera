@@ -184,18 +184,10 @@
    *  ones: with a plain slice, a plan whose first six tasks are done showed
    *  six ✓ and hid the work in flight entirely. Finished work becomes a count;
    *  a fully-finished plan still shows its rows, since nothing else remains. */
-  const planLive = $derived(
-    hero && store !== null ? store.plan.filter((p) => p.status !== "done") : [],
-  );
-  const planEntries = $derived.by(() => {
-    if (!hero || store === null) return [];
-    return (planLive.length > 0 ? planLive : store.plan).slice(0, 6);
-  });
-  const planDoneCount = $derived(
-    hero && store !== null && planLive.length > 0
-      ? store.plan.filter((p) => p.status === "done").length
-      : 0,
-  );
+  const planAll = $derived(hero && store !== null ? store.plan : []);
+  const planLive = $derived(planAll.filter((p) => p.status !== "done"));
+  const planEntries = $derived((planLive.length > 0 ? planLive : planAll).slice(0, 6));
+  const planDoneCount = $derived(planLive.length > 0 ? planAll.length - planLive.length : 0);
   /** Context meter: the warm store's live figure first, else the claude-TUI
    *  statusline heartbeat — same meter, same thresholds, only the source
    *  differs (chat rows carry wire usage null, so the two never overlap). */
