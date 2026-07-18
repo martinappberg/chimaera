@@ -18,9 +18,10 @@ domain surfaces + their stores: files tree, git, sessions, launcher, home) · **
 `chat/`, `settings/`, and `dashboard/` subsystems keep their own folders (+ maps).
 `App.svelte` stays at `src/`.
 
-- **There are no JS tests** — only `svelte-check` (types) + the live preview. So a UI
-  change is only "verified" once you've driven it in the preview (see **verify-app** /
-  **debug-live-app**). Don't claim a UI change works off `svelte-check` alone.
+- **Component/UI behavior has no browser tests.** The chat store reducer has a
+  targeted Vitest suite, and `svelte-check` covers types; a visible UI change is
+  still only verified once you've driven it in the preview (see **verify-app** /
+  **debug-live-app**). Don't claim a UI change works from unit/type checks alone.
 - **Agent output is untrusted.** Anything the model emits (prose, tool output, echoed
   file contents) is attacker-influenced. Render it through `chat/Markdown.svelte`'s
   sanitizer; never `{@html}` raw agent text; never build a live external link without

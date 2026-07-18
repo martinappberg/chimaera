@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use chimaera_agent::claude::ClaudeAdapter;
 use chimaera_agent::driver::SpawnSpec;
 use chimaera_agent::journal::SeqEvent;
-use chimaera_agent::model::{AgentCommand, AgentEvent, ContentBlock, ToolStatus, UserMessageState};
+use chimaera_agent::model::{
+    AgentCommand, AgentEvent, BackgroundTask, ContentBlock, ToolStatus, UserMessageState,
+};
 use chimaera_agent::{ChatManager, EventHook, ExitHook};
 
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-claude");
@@ -304,6 +306,91 @@ async fn post_turn_summary_folds_latest_wins_session_status() {
         info.status_detail.as_deref(),
         Some("turn 2 reviewed, awaiting your look"),
         "the status line survives as context until superseded"
+    );
+}
+
+/// A new driver process must neutralize background state left at the journal
+/// tail by an old process that could not drain (SIGKILL / power loss).
+#[tokio::test]
+async fn spawn_neutralizes_stale_background_set_in_reused_journal() {
+    let fx = fixture();
+    fx.manager
+        .seed_journal(
+            "s-bg-restart",
+            &[AgentEvent::BackgroundTasks {
+                tasks: vec![BackgroundTask {
+                    id: "dead-bg".into(),
+                    task_type: "local_agent".into(),
+                    description: "wait for smoke test to finish".into(),
+                    status: "running".into(),
+                    started_at_ms: 1,
+                    workflow_name: None,
+                    agents: Vec::new(),
+                    agents_total: 0,
+                    agents_done: 0,
+                    tool_use_id: None,
+                }],
+                closed: Vec::new(),
+            }],
+        )
+        .expect("seed crash-tailed journal");
+
+    // A daemon crash cannot run drain_pending. Resurrecting the same session
+    // id therefore reuses the stale journal, but starts a new driver process
+    // whose honest background set is empty.
+    fx.manager
+        .spawn(&ClaudeAdapter, spec("s-bg-restart", &fx.cwd, "normal"))
+        .expect("respawn");
+    // The old client already applied seq 1 before the crash. Its reconnect
+    // asks only for the gap, which the newly-opened journal serves from its
+    // in-memory ring (the same path a real live pane takes).
+    let att = fx.manager.attach("s-bg-restart", 1).expect("attach");
+    let mut seen = att.replay.clone();
+    let mut rx = att.live;
+
+    let reset =
+        match seen.iter().find(|e| {
+            matches!(
+                e.ev,
+                AgentEvent::BackgroundTasks { ref tasks, .. } if tasks.is_empty()
+            )
+        }) {
+            Some(entry) => Arc::clone(entry),
+            None => wait_for(
+                &mut rx,
+                &mut seen,
+                "process-start background reset",
+                |ev| matches!(ev, AgentEvent::BackgroundTasks { tasks, .. } if tasks.is_empty()),
+            )
+            .await,
+        };
+    let init = match seen
+        .iter()
+        .find(|e| matches!(e.ev, AgentEvent::Init { .. }))
+    {
+        Some(entry) => Arc::clone(entry),
+        None => {
+            wait_for(&mut rx, &mut seen, "Init after reset", |ev| {
+                matches!(ev, AgentEvent::Init { .. })
+            })
+            .await
+        }
+    };
+    assert!(
+        reset.seq < init.seq,
+        "the lifecycle reset must precede every new-driver event"
+    );
+
+    let replay = fx.manager.attach("s-bg-restart", 1).expect("replay").replay;
+    let last_set = replay.iter().rev().find_map(|entry| match &entry.ev {
+        AgentEvent::BackgroundTasks { tasks, closed } => Some((tasks, closed)),
+        _ => None,
+    });
+    let (tasks, closed) = last_set.expect("background level-set in replay");
+    assert!(tasks.is_empty(), "the dead task must not survive replay");
+    assert!(
+        closed.is_empty(),
+        "a process boundary is not a fabricated task verdict"
     );
 }
 

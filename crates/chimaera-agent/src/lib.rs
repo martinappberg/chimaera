@@ -146,6 +146,21 @@ impl ChatManager {
         let (events_tx, _) = broadcast::channel(BROADCAST_QUEUE);
         let (kill_tx, kill_rx) = watch::channel(false);
 
+        // Background work survives TURNS, not driver processes. A hard daemon
+        // stop cannot run the old mapper's teardown, so the reused journal may
+        // end with a non-empty level-set even though those child tasks died
+        // with the old process. Put the empty set ahead of every event the new
+        // driver can emit: replay then converges on the new process's truth,
+        // and a resurrected pane cannot offer a stop button for a dead task.
+        // Queueing it before adapter.spawn also means a synchronous spawn
+        // failure drops the reset along with this unregistered session.
+        ev_tx
+            .try_send(AgentEvent::BackgroundTasks {
+                tasks: Vec::new(),
+                closed: Vec::new(),
+            })
+            .expect("fresh driver event queue has room for lifecycle reset");
+
         let info = ChatInfo {
             id: id.clone(),
             agent: adapter.kind().to_string(),
