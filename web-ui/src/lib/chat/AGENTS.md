@@ -70,8 +70,9 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
 - **A queued send is NOT a transcript block.** Queued/undelivered user messages
-  live in `store.pendingSends` (the stack above the composer), never in `blocks` —
-  so a mid-turn send can't splice into a running turn's output. The reducer moves
+  live in `store.pendingSends` (rendered at the scrollable transcript tail), never
+  in `blocks` — so a mid-turn send can't splice into a running turn's output or
+  crowd the fixed composer. The reducer moves
   an entry into `blocks` (appended at the end) only when `user_message_update`
   resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
   and it stays in the stack until dismissed. A **Stop never drops the queue** —

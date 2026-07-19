@@ -26,12 +26,13 @@ TUI (see [view switch](#view-switch-and-rewind)).
   no separate steer action. `socket.send` returns `false` when the socket isn't OPEN, so the draft
   is only cleared on an accepted send — a message during a reconnect window is preserved, not lost;
   reconnect replays the daemon-owned queue state.
-- **Delivery honesty + pending stack.** A mid-turn send doesn't drop into history — it waits in a
-  **pending stack pinned just above the composer** (the send point), faded, with a small "queued"
-  mark. After a turn ends, Claude flushes its held queue; Codex opens exactly the oldest queued item
-  as the next turn and leaves later items queued. A Codex Steer instead resolves on the steer RPC
-  acknowledgement. Once consumed, the block leaves the stack and enters the transcript proper as
-  the newest user turn, solid. A genuinely undeliverable entry stays marked **"not delivered"**
+- **Delivery honesty + pending stack.** A mid-turn send doesn't become a delivered history block —
+  it waits in a faded **pending stack at the scrollable transcript tail**, with a small "queued"
+  mark. It therefore stays at the live end without covering the reading area or growing fixed
+  composer chrome. After a turn ends, Claude flushes its held queue; Codex opens exactly the oldest
+  queued item as the next turn and leaves later items queued. A Codex Steer instead resolves on the
+  steer RPC acknowledgement. Once consumed, the block leaves the stack and enters the transcript proper
+  as the newest user turn, solid. A genuinely undeliverable entry stays marked **"not delivered"**
   (text kept readable/copyable, never auto-dumped into a draft you may have started). The ✕ pulls
   back a queued item or dismisses a dropped one. This is driven by the single `pendingSends` reducer
   and journaled via `user_message` `id`/`queued` + `user_message_update`, so replay rebuilds the same
@@ -43,6 +44,10 @@ TUI (see [view switch](#view-switch-and-rewind)).
   aggregate across the manager channel and driver-held send queue. A refused command raises a
   visible, nonfatal notice; the socket stays healthy. The journal stores a placeholder, never the
   bytes.
+- **Long drafts.** The composer grows upward with wrapped text to a pane-conscious cap, then scrolls
+  internally. Its subtle top-edge grip can expand or contract it manually (drag for a precise size;
+  click to toggle expanded/content-fit; Up/Down resize from the keyboard and Home returns to
+  content-fit), and a successful send resets the next draft to its natural height.
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`

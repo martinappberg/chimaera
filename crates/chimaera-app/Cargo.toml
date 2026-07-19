@@ -56,13 +56,13 @@ chimaera-remote = { path = "../chimaera-remote" }
 # the daemon is the Linux musl binary inside WSL2, so the whole server stack
 # (and its PTY/unix surface) must stay out of that build.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 chimaera-server = { path = "../chimaera-server" }
 
 # Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
 # 24H2 stub can block 60s interactively when WSL is absent).
 [target.'cfg(windows)'.dependencies]
-winreg = "0.55"
+winreg = "0.56"
 
 [profile.release]
 lto = true
