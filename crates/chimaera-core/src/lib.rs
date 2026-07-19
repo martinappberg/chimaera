@@ -219,7 +219,7 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Generate an auth token: 32 random bytes as lowercase hex (64 chars).
 pub fn generate_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
