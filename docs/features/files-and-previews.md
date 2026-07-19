@@ -29,8 +29,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   components. Respects `files.showHidden`. Re-lists **only the dirs whose direct listing could
   have changed** — not the whole tree — when the workspace's git **epoch** bumps (parents of
   paths that entered/left the git dirty set: a symmetric diff, so both a new untracked file and a
-  removal are caught) or the client **fs epoch** bumps (the exact parent of that
-  create/rename/delete — both parents for a rename; see "File management" below). **Targeted +
+  removal are caught), the client **fs epoch** bumps (the exact parent of that
+  create/rename/delete — both parents for a rename; see "File management" below), or the daemon's
+  mounted-path monitor reports that a visible directory changed on disk (covers ignored/non-Git
+  paths and Finder locations outside the workspace). **Targeted +
   debounced (~250 ms) + coalesced** into one pass, so a working agent re-lists just the folder it
   touched, not every expanded dir — sparing a remote link a storm of `fs/list` calls. A
   modified-in-place file changes no listing (its badge updates reactively via `gitIndex`); a
@@ -126,8 +128,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   `TableView` grid — so selection/resize/paging come for free. calamine loads a whole sheet into
   memory, so the SOURCE file is size-capped (`MAX_XLSX_BYTES`, 8 MB) before parsing, and ZIP-backed
   workbooks are preflighted at 64 MiB expanded / 4096 entries before calamine runs off the reactor
-  (`spawn_blocking`); over-cap files get an honest "too large" message. No live-on-disk refresh (no
-  store entry) and no editing (a spreadsheet isn't a text file). **Gotcha:** XlsxView must NOT hand
+  (`spawn_blocking`); over-cap files get an honest "too large" message. A disk change remounts the
+  workbook preview on the fresh mtime; there is no editing (a spreadsheet isn't a text file).
+  **Gotcha:** XlsxView must NOT hand
   its own `$state` page object to `TableView` — the shared deeply-reactive proxy cross-links the two
   components' reactive graphs into a freeze; `TableView` fetches its own plain page via a *stable*
   `fetchPage`.
@@ -153,16 +156,19 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Where it lives.** `layout/Pane.svelte` (the live-set — renders active + recently-visited tabs,
   inactive ones `visibility:hidden` + `inert`); `previews/fileStore.svelte.ts` (`FileEntry`,
   `retain`/`release`/`noteWrite`); every `*View.svelte`. The store subscribes to
-  `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`).
+  `workspace/fsEvents.ts` (`fsEpoch`/`lastFsMutation`) + `workspace/git.ts` (`gitStatus`) +
+  `workspace/diskWatch.ts`; the daemon half is `chimaera-server/src/fs_watch.rs` on `/ws/events`.
 - **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is **instant with
   scroll position, image decode, finder columns, and editor state all preserved** — the DOM is
   never rebuilt, and no route is re-hit (a view only mounts while active, so nothing is measured at
-  a degenerate size). Live-on-disk update is **git-dirty-gated**: on a git-status change the store
-  re-probes the mtime (a 1-byte read carries `X-Mtime`) of **only** the on-screen entries the repo
-  reports dirty (a clean file cannot have moved), never every open preview on every tick — so an
-  agent editing a file you have open still updates it live, without the per-tick mass-probe storm
-  that made the workbench feel slow over ssh. A moved mtime refreshes payloads **in place** (never
-  nulling — a null chunk would unmount a live `CodeView`). An **unsaved** `CodeView` buffer is
+  a degenerate size). Live-on-disk update is **mounted-path-scoped**, not Git-gated: each events
+  socket registers only mounted preview files and visibly-listed tree/Finder directories. The daemon
+  stats those exact paths every ~2 s and performs a capped directory-name/type hash every
+  ~12 s as an NFS/Lustre metadata-cache backstop. Exact path invalidations cover repeated writes to
+  an already-dirty file, ignored/non-repo files, and Finder paths outside the workspace; recognized
+  agent writes and in-app mutations remain the immediate event-driven fast path. A moved mtime
+  refreshes payloads **in place** (never nulling — a null chunk would unmount a live `CodeView`),
+  while PDF/spreadsheet/binary surfaces remount on the new token. An **unsaved** `CodeView` buffer is
   never clobbered: a disk change while dirty raises the "changed on disk" conflict bar instead of
   reloading. Chat artifact cards memoize their `/raw` ticket (`rawTicketUrl`) so a cached output
   image doesn't re-fetch and re-decode (the flash) on re-render.
@@ -183,6 +189,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 - Every listing/read runs under `spawn_blocking` — a slow Lustre `read_dir` must never wedge a tokio
   worker. Directory listings cap at `MAX_DIR_ENTRIES = 4000` with an honest `truncated` flag.
+- Disk monitoring is per events client and hard-capped at 64 mounted files + 64 visible directories
+  (64 KiB of retained path text); a closed window retains nothing. It never recursively walks a
+  workspace, and its slow directory hash caps at the same 4000 entries as `fs/list`.
 - Previews **stream**; a preview of a huge Parquet/HTML/CSV must never balloon memory. This is a
   review criterion, not a nice-to-have (see [rules/daemon.md](../../.claude/rules/daemon.md)).
 - Capability tickets expire after 10 minutes and the in-memory store is capped at 4096; expiry-first

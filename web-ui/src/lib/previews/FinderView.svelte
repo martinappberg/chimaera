@@ -26,6 +26,11 @@
     requestDelete,
   } from "../workspace/fsEvents";
   import {
+    clearDiskDirs,
+    lastDiskChange,
+    setDiskDirs,
+  } from "../workspace/diskWatch";
+  import {
     clearClip,
     copyFile,
     cutFile,
@@ -64,6 +69,13 @@
   }
 
   let columns = $state<Column[]>([]);
+  const diskDirOwner = {};
+
+  // A kept-alive Finder monitors exactly the columns it preserves. Returning
+  // to the tab is still instant, while directories outside the workspace and
+  // outside Git remain coherent.
+  $effect(() => setDiskDirs(diskDirOwner, columns.map((column) => column.dir)));
+  $effect(() => () => clearDiskDirs(diskDirOwner));
   /** The canonical current directory (deepest column). Set optimistically so
    *  the reconcile effect doesn't re-fire on our own navigation. */
   let location = $state("");
@@ -480,6 +492,31 @@
         target = i > 0 ? m.path.slice(0, i) : "/";
       }
       void navigateTo(target);
+    });
+  });
+
+  // Disk observations have no rename provenance, so rebuild the visible chain
+  // in place. A vanished current directory retreats to its parent; App applies
+  // the same retarget to the persisted Finder tab.
+  let lastDiskSeq = 0;
+  $effect(() => {
+    const change = $lastDiskChange;
+    untrack(() => {
+      if (change === null || change.seq === lastDiskSeq || location === "") return;
+      lastDiskSeq = change.seq;
+      const visibleDirs = new Set(columns.map((column) => column.dir));
+      const listedFileChanged = change.files.some((file) =>
+        columns.some((column) => column.entries.some((entry) => entry.path === file)),
+      );
+      let target = location;
+      for (const removed of change.removedDirs) {
+        if (target === removed || target.startsWith(`${removed}/`)) {
+          const i = removed.lastIndexOf("/");
+          target = i > 0 ? removed.slice(0, i) : "/";
+        }
+      }
+      const listingChanged = change.dirs.some((dir) => visibleDirs.has(dir));
+      if (target !== location || listingChanged || listedFileChanged) void navigateTo(target);
     });
   });
 

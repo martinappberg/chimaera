@@ -11,6 +11,7 @@
   import { gitIndex, gitStatus, type GitEntry } from "./git";
   import { decoFor, dirColor } from "./gitDeco";
   import { fsCreateOp, fsEpoch, fsRenameOp, lastFsMutation, requestDelete } from "./fsEvents";
+  import { clearDiskDirs, lastDiskChange, setDiskDirs } from "./diskWatch";
   import {
     clearClip,
     copyFile,
@@ -70,6 +71,12 @@
   }: Props = $props();
 
   let expanded = $state<Set<string>>(new Set());
+  const diskDirOwner = {};
+
+  // Only dirs whose rows are visible are worth monitoring. A collapsed subtree
+  // reloads when expanded, so recursively watching it would buy nothing.
+  $effect(() => setDiskDirs(diskDirOwner, [root, ...expanded]));
+  $effect(() => () => clearDiskDirs(diskDirOwner));
   let listings = $state<Map<string, FsEntry[]>>(new Map());
   let loading = $state<Set<string>>(new Set());
   let rootError = $state<string | null>(null);
@@ -574,8 +581,8 @@
 
   // Any fs mutation (this tree, the Finder, a tab rename) re-lists the affected
   // dir(s): the mutation names the exact path, so we relist its parent — both
-  // parents for a rename/move — rather than the whole tree. The only refresh
-  // channel for paths outside a git repo.
+  // parents for a rename/move — rather than the whole tree. Out-of-band paths
+  // outside Git arrive through the disk-watch effect below.
   let lastFsEpoch = 0;
   $effect(() => {
     const epoch = $fsEpoch;
@@ -592,6 +599,24 @@
         dirs.add(dirname(m.path));
       } else {
         dirs.add(root); // no precise path — fall back to the root listing
+      }
+      scheduleRelist(dirs);
+    });
+  });
+
+  // Out-of-band creates/deletes/renames arrive as directory invalidations from
+  // the daemon's mounted-path monitor (including ignored and non-Git paths).
+  let lastDiskSeq = 0;
+  $effect(() => {
+    const change = $lastDiskChange;
+    untrack(() => {
+      if (change === null || change.seq === lastDiskSeq) return;
+      lastDiskSeq = change.seq;
+      const dirs = new Set(change.dirs);
+      for (const path of change.removed) dirs.add(dirname(path));
+      for (const path of change.removedDirs) {
+        dirs.add(path);
+        dirs.add(dirname(path));
       }
       scheduleRelist(dirs);
     });

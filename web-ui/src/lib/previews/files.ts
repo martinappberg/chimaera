@@ -41,10 +41,9 @@ export interface FileChunk {
   /** True when the response stopped short of EOF (X-Truncated). */
   truncated: boolean;
   /**
-   * Opaque modification token (X-Mtime; nanoseconds-since-epoch as a string).
-   * Kept as a string — the value exceeds 2^53, so parsing it as a number would
-   * lose precision and break the PUT conflict check. Echoed back as
-   * `expect_mtime`. Null on an older daemon that omits the header.
+   * Opaque file-version token (`X-Mtime`; currently a decimal metadata hash).
+   * Never parse it: echo it byte-for-byte as `expect_mtime` for the PUT
+   * conflict check. Null on an older daemon that omits the header.
    */
   mtime: string | null;
 }

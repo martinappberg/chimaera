@@ -2,9 +2,9 @@
  * The client-side fs-mutation bus: any create/rename/delete (tree, Finder,
  * pane-tab rename) bumps `fsEpoch` so every listing surface re-lists, and
  * publishes the mutation on `lastFsMutation` so App can rewrite/close open
- * tabs. The client analogue of the git-epoch refresh — and the only channel
- * for non-repo paths, which the server's git nudge never reaches (an in-repo
- * mutation refreshes twice; both re-lists are idempotent and cheap).
+ * tabs. The client analogue of the git-epoch refresh. Out-of-band/non-repo
+ * disk changes arrive separately through `diskWatch`; an in-repo mutation may
+ * refresh twice, but both re-lists are idempotent and debounced.
  *
  * The *Op wrappers are what surfaces call: files.ts stays a pure API client,
  * the notify lives here.

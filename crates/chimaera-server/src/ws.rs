@@ -25,6 +25,9 @@ const MAX_TERMINAL_INPUT_MESSAGE: usize = 1024 * 1024;
 /// text block. Leave room for JSON escaping and field overhead, but reject a
 /// giant frame in tungstenite before serde allocates the command tree.
 const MAX_CHAT_COMMAND_MESSAGE: usize = 10 * 1024 * 1024;
+/// The events socket accepts only tiny watch registrations. Cap the frame
+/// before serde can allocate attacker-chosen path arrays.
+const MAX_EVENTS_INPUT_MESSAGE: usize = 128 * 1024;
 /// Queue terminal input in bounded pieces so the PTY channel's item capacity
 /// also implies a byte capacity.
 const TERMINAL_INPUT_CHUNK: usize = 64 * 1024;
@@ -57,6 +60,13 @@ enum ClientMessage {
     Watch {
         #[serde(default)]
         workspace_id: Option<String>,
+        /// Mounted file previews and visibly-listed directories. Both arrays
+        /// are additive: older clients omit them; the daemon independently
+        /// caps count, path length, and aggregate bytes before retaining them.
+        #[serde(default)]
+        files: Vec<String>,
+        #[serde(default)]
+        dirs: Vec<String>,
     },
 }
 
@@ -579,7 +589,9 @@ pub(crate) async fn events_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_events(socket, state))
+    ws.max_message_size(MAX_EVENTS_INPUT_MESSAGE)
+        .max_frame_size(MAX_EVENTS_INPUT_MESSAGE)
+        .on_upgrade(move |socket| handle_events(socket, state))
 }
 
 /// Minimum gap between snapshot frames (<= 4/s).
@@ -600,6 +612,9 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
 
     // Released on every exit path below (a leaked watcher would poll git forever).
     let mut watch = crate::git::WatchGuard::new(state.clone());
+    // Per-client, bounded mounted-path monitor. Dropping the socket drops every
+    // registration, so a closed window costs zero filesystem work.
+    let mut fs_watch = crate::fs_watch::FsWatch::new();
 
     let mut last_sent: Option<String> = None;
     let mut last_settings_gen: Option<u64> = None;
@@ -647,12 +662,21 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             _ = tokio::time::sleep(EVENTS_TICK) => {}
             msg = socket.recv() => match msg {
                 // The only client frame on this bus: which workspace this window
-                // is showing, so the git backstop knows what to poll.
+                // shows + the exact mounted paths whose disk state it renders.
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(ClientMessage::Watch { workspace_id }) =
+                    if let Ok(ClientMessage::Watch { workspace_id, files, dirs }) =
                         serde_json::from_str::<ClientMessage>(&text)
                     {
                         watch.set(workspace_id);
+                        if fs_watch.set(files, dirs) {
+                            // Establish + announce new baselines immediately.
+                            // This closes the race between a view's initial GET
+                            // and its watch registration without waiting 2s.
+                            let changes = fs_watch.poll(true).await;
+                            if send_fs_changes(&mut socket, changes).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -690,8 +714,32 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         {
             return;
         }
+        let fs_changes = fs_watch.poll(false).await;
+        if send_fs_changes(&mut socket, fs_changes).await.is_err() {
+            return;
+        }
         tokio::time::sleep(EVENTS_THROTTLE).await;
     }
+}
+
+/// Send a path-only filesystem invalidation. File contents/listings remain
+/// pull-based; this tiny frame says exactly which mounted payloads are stale.
+async fn send_fs_changes(
+    socket: &mut WebSocket,
+    changes: crate::fs_watch::FsChanges,
+) -> Result<(), axum::Error> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let frame = json!({
+        "type": "fs",
+        "files": changes.files,
+        "removed": changes.removed,
+        "dirs": changes.dirs,
+        "removed_dirs": changes.removed_dirs,
+    })
+    .to_string();
+    socket.send(Message::Text(frame.into())).await
 }
 
 /// Send a `{"type":"update", ...}` frame when the daemon's release knowledge

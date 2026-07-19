@@ -10,6 +10,7 @@ mod download;
 mod environment;
 mod exec;
 mod fs;
+mod fs_watch;
 mod git;
 mod launcher;
 mod ledger;
