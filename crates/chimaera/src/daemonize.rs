@@ -33,13 +33,17 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 
 use anyhow::Context;
 use nix::fcntl::OFlag;
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::sys::stat::{fstat, Mode, SFlag};
-use nix::unistd::{close, dup2, execv, fork, setsid, ForkResult};
+use nix::unistd::{close, dup2_stderr, dup2_stdin, dup2_stdout, execv, fork, setsid, ForkResult};
+
+fn is_regular_file(fd: impl AsFd) -> bool {
+    matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG)
+}
 
 /// Detach the current process and re-exec a fresh `chimaera serve` (without
 /// `--daemonize`) as the daemon, in its own session with SIGHUP ignored.
@@ -93,8 +97,11 @@ pub fn detach() -> anyhow::Result<()> {
     // the dup2s iff it landed above the stdio range.
     let devnull = nix::fcntl::open("/dev/null", OFlag::O_RDWR, Mode::empty())
         .context("open /dev/null for the daemon's stdio")?;
-    let is_regular_file = |fd: RawFd| matches!(fstat(fd), Ok(st) if SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG);
-    let redirect = [0, 1, 2].map(|fd| !is_regular_file(fd));
+    let redirect = [
+        !is_regular_file(std::io::stdin()),
+        !is_regular_file(std::io::stdout()),
+        !is_regular_file(std::io::stderr()),
+    ];
 
     // Fork so the survivor is NOT a process-group leader (`setsid` EPERMs for a
     // leader — what an interactive shell makes of a foreground `chimaera serve`).
@@ -116,12 +123,16 @@ pub fn detach() -> anyhow::Result<()> {
             // Drop the launcher's channel per the stdio policy above. `dup2`
             // clears close-on-exec on the copy, so the re-pointed fds survive
             // the `execv`.
-            for (fd, must_redirect) in redirect.iter().enumerate() {
-                if *must_redirect {
-                    dup2(devnull, fd as RawFd).context("point daemon stdio at /dev/null")?;
-                }
+            if redirect[0] {
+                dup2_stdin(&devnull).context("point daemon stdin at /dev/null")?;
             }
-            if devnull > 2 {
+            if redirect[1] {
+                dup2_stdout(&devnull).context("point daemon stdout at /dev/null")?;
+            }
+            if redirect[2] {
+                dup2_stderr(&devnull).context("point daemon stderr at /dev/null")?;
+            }
+            if devnull.as_raw_fd() > 2 {
                 let _ = close(devnull);
             }
             // `execv` returns only on failure; on success the fresh `serve`

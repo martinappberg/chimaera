@@ -1025,7 +1025,7 @@ fn is_zero_u64(n: &u64) -> bool {
 /// message frames (claude checkpoint keys, codex clientUserMessageId).
 /// Only transcript-uniqueness matters.
 pub fn fresh_uuid() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = [0u8; 16];
     rand::rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
