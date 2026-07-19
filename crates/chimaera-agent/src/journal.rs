@@ -585,6 +585,24 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
         .write(true)
         .open(&path)
         .with_context(|| format!("create {}", path.display()))?;
+    struct PartialSeed<'a> {
+        path: &'a Path,
+        armed: bool,
+    }
+    impl Drop for PartialSeed<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_file(self.path);
+            }
+        }
+    }
+    // Armed only after create_new succeeds, so an AlreadyExists error can
+    // never delete somebody else's journal. Any later write/serialize error
+    // (or unwind) removes the incomplete JSONL before the caller returns.
+    let mut partial = PartialSeed {
+        path: &path,
+        armed: true,
+    };
     let mut writer = std::io::BufWriter::new(file);
     let ts = now_ms();
     for (i, ev) in events.iter().enumerate() {
@@ -611,6 +629,7 @@ pub fn seed_journal(dir: &Path, session_id: &str, events: &[AgentEvent]) -> Resu
         writer.write_all(&line)?;
     }
     writer.flush()?;
+    partial.armed = false;
     Ok(())
 }
 
@@ -865,7 +884,9 @@ mod tests {
         assert_eq!(all[0].ev, seeded[0]);
 
         // Never clobbers an existing journal.
+        let before = fs::read(dir.path().join("s-seed.jsonl")).unwrap();
         assert!(seed_journal(dir.path(), "s-seed", &seeded).is_err());
+        assert_eq!(fs::read(dir.path().join("s-seed.jsonl")).unwrap(), before);
     }
 
     #[test]

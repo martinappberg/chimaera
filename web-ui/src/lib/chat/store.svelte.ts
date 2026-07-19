@@ -957,6 +957,27 @@ export class ChatStore {
             if (block.kind === "user") block.checkpoint = null;
             if (block.kind === "message") block.nativeTurnComplete = false;
           }
+          // Everything above was replayed from a DIFFERENT process (and may
+          // be a different vendor). Keep transcript blocks, but never let its
+          // model catalog, limits, context meter, controls, or error state
+          // masquerade as destination telemetry while the target initializes.
+          this.model = null;
+          this.modes = [];
+          this.currentMode = null;
+          this.slashCommands = [];
+          this.models = [];
+          this.effort = null;
+          this.ultracode = false;
+          this.contextPct = null;
+          this.contextTokens = null;
+          this.rateLimit = null;
+          this.rewind = null;
+          this.mcpServers = null;
+          this.promptSuggestion = null;
+          this.fatalError = null;
+          this.plan = [];
+          this.exited = null;
+          this.degraded = false;
         }
         const source =
           ev.source_agent === "claude"

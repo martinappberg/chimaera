@@ -110,6 +110,61 @@ describe("ChatStore pending-send ordering", () => {
     expect(partial.blocks[1]).toMatchObject({ nativeTurnComplete: false });
   });
 
+  it("clears source-process telemetry at a portable fork marker", () => {
+    const store = fold([
+      {
+        type: "init",
+        model: "claude-source",
+        current_mode: "source-mode",
+        modes: [{ id: "source-mode", label: "Source" }],
+        slash_commands: [{ name: "source-command" }],
+        models: [{ id: "source-model", label: "Source model", efforts: ["high"] }],
+      },
+      { type: "effort_state", effort: "high", ultracode: true },
+      { type: "context_usage", percentage: 72, total_tokens: 720, max_tokens: 1_000 },
+      {
+        type: "rate_limit",
+        utilization: 81,
+        label: "source weekly",
+        resets_at: "tomorrow",
+        limit_reached: false,
+      },
+      {
+        type: "rewind_result",
+        user_message_id: "u1",
+        can_rewind: true,
+        files_changed: ["source.txt"],
+        applied: false,
+      },
+      { type: "mcp_servers", servers: [{ name: "source", status: "connected", tools: 3 }] },
+      { type: "prompt_suggestion", text: "source suggestion" },
+      {
+        type: "plan",
+        entries: [{ content: "source plan", status: "in_progress", id: "1" }],
+      },
+      { type: "error", message: "source process failed", fatal: true },
+      { type: "forked", source_agent: "claude", source_seq: 9, native: false },
+    ]);
+
+    expect(store.model).toBeNull();
+    expect(store.modes).toEqual([]);
+    expect(store.currentMode).toBeNull();
+    expect(store.slashCommands).toEqual([]);
+    expect(store.models).toEqual([]);
+    expect(store.effort).toBeNull();
+    expect(store.ultracode).toBe(false);
+    expect(store.contextPct).toBeNull();
+    expect(store.contextTokens).toBeNull();
+    expect(store.rateLimit).toBeNull();
+    expect(store.rewind).toBeNull();
+    expect(store.mcpServers).toBeNull();
+    expect(store.promptSuggestion).toBeNull();
+    expect(store.fatalError).toBeNull();
+    expect(store.plan).toEqual([]);
+    expect(store.exited).toBeNull();
+    expect(store.degraded).toBe(false);
+  });
+
   it("keeps a queued send out of the transcript until it is sent", () => {
     // Fold only up to just before the turn ends (the mid-stream window).
     const store = fold(QUEUED_MID_TURN.slice(0, 5));
