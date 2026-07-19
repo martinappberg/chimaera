@@ -863,7 +863,9 @@ setup into a new session. Distinctive, deferred.
   - **Rendered-file freshness is separate from Git.** The same watch frame additively carries
     `files[]` (mounted preview paths) and `dirs[]` (visible tree/Finder listings). Each events socket
     retains at most 64 of either and polls only their metadata every ~2 s off the async reactor; a
-    capped directory-name/type hash every ~12 s catches an NFS/Lustre metadata-cache miss.
+    capped directory-name/type hash every ~12 s catches an NFS/Lustre metadata-cache miss; newly
+    mounted directories establish that baseline in batches of at most four per two seconds, so
+    opening tabs or expanding the tree cannot force an unbounded scan burst.
     Frames report exact changed/removed files and invalidated/removed directories; payloads remain
     pull-based. Disconnect drops the registrations, collapsed/unmounted views register nothing, and
     no workspace is ever walked recursively. This is what catches repeated edits to an already-M

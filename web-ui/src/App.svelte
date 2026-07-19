@@ -1374,11 +1374,16 @@
   let lastDiskChangeSeq = 0;
   $effect(() => {
     const change = $lastDiskChange;
+    const dirty = $dirtyFiles;
     untrack(() => {
       if (change === null || change.seq === lastDiskChangeSeq) return;
       lastDiskChangeSeq = change.seq;
       for (const path of [...change.removed, ...change.removedDirs]) {
-        layout = pruneDeletedPath(layout, path);
+        // Unlike a confirmed in-app delete, an external delete must not throw
+        // away an editor buffer the user has not saved. Clean tabs still close
+        // and Finders still retreat; the retained CodeView shows the missing
+        // file as a conflict and can recreate it with overwrite.
+        layout = pruneDeletedPath(layout, path, dirty);
       }
     });
   });

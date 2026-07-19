@@ -191,7 +191,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   worker. Directory listings cap at `MAX_DIR_ENTRIES = 4000` with an honest `truncated` flag.
 - Disk monitoring is per events client and hard-capped at 64 mounted files + 64 visible directories
   (64 KiB of retained path text); a closed window retains nothing. It never recursively walks a
-  workspace, and its slow directory hash caps at the same 4000 entries as `fs/list`.
+  workspace, and its slow directory hash caps at the same 4000 entries as `fs/list`. New-directory
+  baselines are limited to four per two-second poll, so registration churn cannot turn those caps
+  into a continuous shared-filesystem scan.
 - Previews **stream**; a preview of a huge Parquet/HTML/CSV must never balloon memory. This is a
   review criterion, not a nice-to-have (see [rules/daemon.md](../../.claude/rules/daemon.md)).
 - Capability tickets expire after 10 minutes and the in-memory store is capped at 4096; expiry-first

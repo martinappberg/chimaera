@@ -19,6 +19,7 @@ import {
   closePane,
   pruneSessions,
   pruneFiles,
+  pruneDeletedPath,
   serializeLayout,
   deserializeLayout,
   pinTab,
@@ -147,6 +148,14 @@ describe("pruning dead tabs", () => {
     l = openFile(l, "/b.txt");
     const pruned = pruneFiles(l, new Set(["/a.txt"]));
     expect(allFilePaths(pruned)).toEqual(["/b.txt"]);
+  });
+
+  it("external deletion can preserve dirty descendants while pruning clean tabs", () => {
+    let l = openFile(defaultLayout(), "/gone/dirty.txt");
+    l = openFile(l, "/gone/clean.txt");
+    l = openFile(l, "/stay.txt");
+    const pruned = pruneDeletedPath(l, "/gone", new Set(["/gone/dirty.txt"]));
+    expect(allFilePaths(pruned).sort()).toEqual(["/gone/dirty.txt", "/stay.txt"]);
   });
 });
 

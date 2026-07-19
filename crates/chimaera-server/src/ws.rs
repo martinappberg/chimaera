@@ -669,10 +669,10 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
                     {
                         watch.set(workspace_id);
                         if fs_watch.set(files, dirs) {
-                            // Establish + announce new baselines immediately.
-                            // This closes the race between a view's initial GET
-                            // and its watch registration without waiting 2s.
-                            let changes = fs_watch.poll(true).await;
+                            // Establish new metadata baselines immediately when
+                            // the two-second client-I/O ceiling allows it. New
+                            // directory name baselines are separately batched.
+                            let changes = fs_watch.poll(false).await;
                             if send_fs_changes(&mut socket, changes).await.is_err() {
                                 return;
                             }

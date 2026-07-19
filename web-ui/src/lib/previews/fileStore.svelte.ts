@@ -50,6 +50,8 @@ export class FileEntry {
   readonly path: string;
   /** Opaque on-disk mtime token (X-Mtime); the invalidation key. */
   mtime = $state<string | null>(null);
+  /** The mounted path was reported absent after it was loaded. */
+  missing = $state(false);
 
   chunk = $state<FileChunk | null>(null);
   chunkError = $state<string | null>(null);
@@ -87,7 +89,10 @@ export class FileEntry {
   }
 
   private adoptMtime(m: string | null): void {
-    if (m !== null) this.mtime = m;
+    if (m !== null) {
+      this.mtime = m;
+      this.missing = false;
+    }
   }
 
   /** Seed the invalidation token for preview kinds whose payload endpoint does
@@ -239,6 +244,7 @@ export class FileEntry {
       // only after refreshed payloads land, so the remount cannot reuse the old
       // still-fresh ticket in the gap between these two operations.
       this.mtime = probed;
+      this.missing = false;
     } catch {
       return; // unreachable/deleted — leave content; the tab-prune path handles death
     } finally {
@@ -253,8 +259,14 @@ export class FileEntry {
    * the saved content, so a reopen / a second pane on this path stays correct.
    */
   noteWrite(mtime: string | null): void {
+    this.missing = false;
     if (mtime !== null) this.mtime = mtime;
     void this.refreshPayloads();
+  }
+
+  /** Preserve a mounted editor entry while recording that its disk path died. */
+  noteMissing(): void {
+    this.missing = true;
   }
 }
 
@@ -450,7 +462,10 @@ function ensureWired(): void {
     // files whose metadata moved arrive here. Re-probe X-Mtime before swapping
     // cached payloads so editor conflict handling keeps one source of truth.
     scheduleRevalidate(change.files);
-    for (const path of change.removed) forget(path);
+    for (const path of change.removed) {
+      cache.get(path)?.noteMissing();
+      forget(path);
+    }
     // App will close mounted tabs for absent files. Keep their warm entries
     // stale (without probing the known-missing path) so a later recreation at
     // the same name cannot flash the deleted file's cached payload on reopen.

@@ -15,6 +15,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const FAST_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LISTING_POLL_INTERVAL: Duration = Duration::from_secs(12);
+/// Newly registered directories get a bounded initial name/type baseline. A
+/// registration burst must not turn 64 large directories into one hot scan.
+const MAX_BASELINE_DIRS_PER_POLL: usize = 4;
 pub(crate) const MAX_WATCH_FILES: usize = 64;
 pub(crate) const MAX_WATCH_DIRS: usize = 64;
 const MAX_WATCH_PATH_BYTES: usize = 4096;
@@ -72,13 +75,12 @@ struct DirFingerprint {
     listing: Option<ListingFingerprint>,
 }
 
+/// Outer `None`: not scanned. Inner `None`: scan failed transiently.
+type ListingObservation = Option<Option<ListingFingerprint>>;
+
 struct Observations {
     files: Vec<(String, Option<MetadataFingerprint>)>,
-    dirs: Vec<(
-        String,
-        Option<MetadataFingerprint>,
-        Option<ListingFingerprint>,
-    )>,
+    dirs: Vec<(String, Option<MetadataFingerprint>, ListingObservation)>,
 }
 
 /// One events socket's watched-path state. Nothing survives disconnect.
@@ -87,9 +89,10 @@ pub(crate) struct FsWatch {
     dirs: Vec<WatchPath>,
     file_state: HashMap<String, MetadataFingerprint>,
     dir_state: HashMap<String, DirFingerprint>,
+    pending_listing_dirs: HashSet<String>,
     last_fast_poll: Option<Instant>,
     last_listing_poll: Option<Instant>,
-    force_poll: bool,
+    last_baseline_poll: Option<Instant>,
 }
 
 impl FsWatch {
@@ -99,9 +102,10 @@ impl FsWatch {
             dirs: Vec::new(),
             file_state: HashMap::new(),
             dir_state: HashMap::new(),
+            pending_listing_dirs: HashSet::new(),
             last_fast_poll: None,
             last_listing_poll: None,
-            force_poll: false,
+            last_baseline_poll: None,
         }
     }
 
@@ -131,40 +135,70 @@ impl FsWatch {
             .retain(|path, _| file_names.contains(path.as_str()));
         self.dir_state
             .retain(|path, _| dir_names.contains(path.as_str()));
+        self.pending_listing_dirs
+            .retain(|path| dir_names.contains(path.as_str()));
+        for path in &next_dirs {
+            if !self.dir_state.contains_key(&path.wire) {
+                self.pending_listing_dirs.insert(path.wire.clone());
+            }
+        }
         self.files = next_files;
         self.dirs = next_dirs;
-        // The next tick establishes new baselines AND announces the new paths.
-        // That closes the registration-vs-initial-GET race: the client always
-        // revalidates once after the daemon starts observing a mounted view.
-        self.force_poll = true;
         true
     }
 
-    /// Poll when due. `force` is used after a watch registration and by tests.
-    pub(crate) async fn poll(&mut self, force: bool) -> FsChanges {
+    /// Poll when due. `force_metadata` exists for tests; production registration
+    /// updates remain on the two-second ceiling so a client cannot create a hot
+    /// stat/read_dir loop by alternating watch frames.
+    pub(crate) async fn poll(&mut self, force_metadata: bool) -> FsChanges {
         let now = Instant::now();
-        let forced = force || self.force_poll;
-        if !forced
+        if !force_metadata
             && self
                 .last_fast_poll
                 .is_some_and(|last| now.duration_since(last) < FAST_POLL_INTERVAL)
         {
             return FsChanges::default();
         }
-        self.force_poll = false;
         self.last_fast_poll = Some(now);
-        let full_listing = forced
-            || self
-                .last_listing_poll
-                .is_none_or(|last| now.duration_since(last) >= LISTING_POLL_INTERVAL);
-        if full_listing {
+
+        // Full backstop scans stay on their 12-second cadence. Newly mounted
+        // dirs are baselined in small two-second batches; file-only watch churn
+        // therefore performs no directory walk at all.
+        let periodic_listing = self
+            .last_listing_poll
+            .is_some_and(|last| now.duration_since(last) >= LISTING_POLL_INTERVAL);
+        if self.last_listing_poll.is_none() {
             self.last_listing_poll = Some(now);
         }
+        let baseline_listing = !self.pending_listing_dirs.is_empty()
+            && self
+                .last_baseline_poll
+                .is_none_or(|last| now.duration_since(last) >= FAST_POLL_INTERVAL);
+        let listing_dirs: HashSet<String> = if periodic_listing {
+            self.last_listing_poll = Some(now);
+            self.pending_listing_dirs.clear();
+            self.dirs.iter().map(|path| path.wire.clone()).collect()
+        } else if baseline_listing {
+            self.last_baseline_poll = Some(now);
+            let targets: Vec<String> = self
+                .dirs
+                .iter()
+                .filter(|path| self.pending_listing_dirs.contains(&path.wire))
+                .take(MAX_BASELINE_DIRS_PER_POLL)
+                .map(|path| path.wire.clone())
+                .collect();
+            for path in &targets {
+                self.pending_listing_dirs.remove(path);
+            }
+            targets.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
 
         let files = self.files.clone();
         let dirs = self.dirs.clone();
         let observed =
-            match tokio::task::spawn_blocking(move || observe(files, dirs, full_listing)).await {
+            match tokio::task::spawn_blocking(move || observe(files, dirs, listing_dirs)).await {
                 Ok(value) => value,
                 Err(join) => {
                     tracing::debug!(%join, "filesystem watch task failed");
@@ -172,10 +206,10 @@ impl FsWatch {
                 }
             };
 
-        self.apply(observed, full_listing)
+        self.apply(observed)
     }
 
-    fn apply(&mut self, observed: Observations, full_listing: bool) -> FsChanges {
+    fn apply(&mut self, observed: Observations) -> FsChanges {
         let mut changes = FsChanges::default();
         for (path, next) in observed.files {
             // Permission/transient I/O errors are not deletions. Preserve the
@@ -191,11 +225,11 @@ impl FsWatch {
             }
         }
 
-        for (path, metadata, listing) in observed.dirs {
+        for (path, metadata, listing_observation) in observed.dirs {
             let Some(metadata) = metadata else { continue };
             let previous = self.dir_state.get(&path).copied();
             let mut changed = previous.is_none_or(|old| old.metadata != metadata);
-            let next_listing = if full_listing {
+            let next_listing = if let Some(listing) = listing_observation {
                 if let (Some(old), Some(next)) = (previous.and_then(|p| p.listing), listing) {
                     changed |= old != next;
                 }
@@ -269,7 +303,11 @@ fn expand_tilde(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn observe(files: Vec<WatchPath>, dirs: Vec<WatchPath>, full_listing: bool) -> Observations {
+fn observe(
+    files: Vec<WatchPath>,
+    dirs: Vec<WatchPath>,
+    listing_dirs: HashSet<String>,
+) -> Observations {
     Observations {
         files: files
             .into_iter()
@@ -279,9 +317,9 @@ fn observe(files: Vec<WatchPath>, dirs: Vec<WatchPath>, full_listing: bool) -> O
             .into_iter()
             .map(|path| {
                 let metadata = metadata_fingerprint(&path.disk);
-                let listing = full_listing
-                    .then(|| listing_fingerprint(&path.disk))
-                    .flatten();
+                let listing = listing_dirs
+                    .contains(&path.wire)
+                    .then(|| listing_fingerprint(&path.disk));
                 (path.wire, metadata, listing)
             })
             .collect(),
@@ -447,5 +485,32 @@ mod tests {
         watch.set(files, dirs);
         assert_eq!(watch.files.len(), MAX_WATCH_FILES);
         assert_eq!(watch.dirs.len(), MAX_WATCH_DIRS);
+    }
+
+    #[tokio::test]
+    async fn registration_churn_does_not_rescan_every_directory() {
+        let dirs: Vec<String> = (0..10)
+            .map(|i| format!("/tmp/chimaera-watch-d{i}"))
+            .collect();
+        let mut watch = FsWatch::new();
+        watch.set(Vec::new(), dirs.clone());
+
+        // One immediate poll consumes only the bounded baseline batch.
+        let _ = watch.poll(true).await;
+        assert_eq!(
+            watch.pending_listing_dirs.len(),
+            10 - MAX_BASELINE_DIRS_PER_POLL
+        );
+        let last_full_scan = watch.last_listing_poll;
+
+        // Adding only a file within the same interval may stat metadata for the
+        // test, but it must not consume or rescan directory baselines.
+        watch.set(vec!["/tmp/chimaera-watch-file".into()], dirs);
+        let _ = watch.poll(true).await;
+        assert_eq!(
+            watch.pending_listing_dirs.len(),
+            10 - MAX_BASELINE_DIRS_PER_POLL
+        );
+        assert_eq!(watch.last_listing_poll, last_full_scan);
     }
 }
