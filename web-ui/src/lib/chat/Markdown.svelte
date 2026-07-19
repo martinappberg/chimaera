@@ -1,61 +1,9 @@
 <script module lang="ts">
   import DOMPurify from "dompurify";
-  import { marked, type MarkedExtension } from "marked";
-  import markedKatex from "marked-katex-extension";
-  import { mathOptions, renderMath } from "./math";
+  import { marked } from "marked";
+  import { markdownMath } from "./math";
 
-  // Codex commonly emits LaTeX's \(...\) / \[...\] delimiters while the
-  // Markdown ecosystem commonly emits $...$ / $$...$$. Support both. Doing
-  // this in marked tokenizers (instead of a text replacement) means fenced
-  // and inline code keep their literal backslashes and dollar signs.
-  const slashMath = {
-    extensions: [
-      {
-        name: "inlineSlashMath",
-        level: "inline" as const,
-        start(src: string) {
-          const index = src.indexOf("\\(");
-          return index >= 0 ? index : undefined;
-        },
-        tokenizer(src: string) {
-          const match = /^\\\(([^\n]*?)\\\)/.exec(src);
-          if (match === null) return undefined;
-          return {
-            type: "inlineSlashMath",
-            raw: match[0],
-            text: match[1].trim(),
-            displayMode: false,
-          };
-        },
-        renderer(token: Record<string, unknown>) {
-          return renderMath(token.text as string, false);
-        },
-      },
-      {
-        name: "blockSlashMath",
-        level: "block" as const,
-        start(src: string) {
-          const index = src.indexOf("\\[");
-          return index >= 0 ? index : undefined;
-        },
-        tokenizer(src: string) {
-          const match = /^\\\[\s*([\s\S]*?)\s*\\\](?:\n|$)/.exec(src);
-          if (match === null) return undefined;
-          return {
-            type: "blockSlashMath",
-            raw: match[0],
-            text: match[1].trim(),
-            displayMode: true,
-          };
-        },
-        renderer(token: Record<string, unknown>) {
-          return `${renderMath(token.text as string, true)}\n`;
-        },
-      },
-    ],
-  } satisfies MarkedExtension;
-
-  marked.use(markedKatex({ ...mathOptions, nonStandard: false }), slashMath);
+  marked.use(markdownMath);
 
   // Agent markdown is untrusted model output rendered into the workbench DOM.
   // External links are a phishing / navigate-the-SPA-away vector, so force

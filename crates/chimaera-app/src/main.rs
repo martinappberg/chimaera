@@ -9,6 +9,7 @@
 mod askpass;
 mod command_manifest;
 mod daemon;
+mod http;
 mod menu;
 mod shell;
 mod tray;

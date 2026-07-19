@@ -1027,7 +1027,7 @@ fn is_zero_u64(n: &u64) -> bool {
 pub fn fresh_uuid() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h =

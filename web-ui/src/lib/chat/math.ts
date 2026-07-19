@@ -1,4 +1,5 @@
 import katex from "katex";
+import type { MarkedExtension } from "marked";
 
 /** One bounded, non-trusting KaTeX policy for every chat surface. MathML
  * avoids inline geometry styles (which our sanitizer correctly strips) and
@@ -15,6 +16,107 @@ export const mathOptions = {
 export function renderMath(source: string, displayMode: boolean): string {
   return katex.renderToString(source, { ...mathOptions, displayMode });
 }
+
+const INLINE_DOLLAR =
+  /^(\${1,2})(?!\$)((?:\\.|[^\\\n$])+?)\1(?=[\s?!.,:？！。，：]|$)/;
+const BLOCK_DOLLAR = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
+
+/** Marked tokenizers for the math forms emitted by both supported agents.
+ * Keeping these beside renderMath avoids a stale adapter peer range deciding
+ * when KaTeX can move, while tokenizing before rendering keeps code literals
+ * untouched. */
+export const markdownMath = {
+  extensions: [
+    {
+      name: "inlineDollarMath",
+      level: "inline" as const,
+      start(src: string) {
+        let searchFrom = 0;
+        while (searchFrom < src.length) {
+          const index = src.indexOf("$", searchFrom);
+          if (index < 0) return undefined;
+          const startsAtBoundary = index === 0 || src[index - 1] === " ";
+          if (startsAtBoundary && INLINE_DOLLAR.test(src.slice(index))) return index;
+          searchFrom = index + 1;
+          while (src[searchFrom] === "$") searchFrom += 1;
+        }
+        return undefined;
+      },
+      tokenizer(src: string) {
+        const match = INLINE_DOLLAR.exec(src);
+        if (match === null) return undefined;
+        return {
+          type: "inlineDollarMath",
+          raw: match[0],
+          text: match[2].trim(),
+          displayMode: match[1].length === 2,
+        };
+      },
+      renderer(token: Record<string, unknown>) {
+        return renderMath(token.text as string, token.displayMode as boolean);
+      },
+    },
+    {
+      name: "blockDollarMath",
+      level: "block" as const,
+      tokenizer(src: string) {
+        const match = BLOCK_DOLLAR.exec(src);
+        if (match === null) return undefined;
+        return {
+          type: "blockDollarMath",
+          raw: match[0],
+          text: match[2].trim(),
+          displayMode: match[1].length === 2,
+        };
+      },
+      renderer(token: Record<string, unknown>) {
+        return `${renderMath(token.text as string, token.displayMode as boolean)}\n`;
+      },
+    },
+    {
+      name: "inlineSlashMath",
+      level: "inline" as const,
+      start(src: string) {
+        const index = src.indexOf("\\(");
+        return index >= 0 ? index : undefined;
+      },
+      tokenizer(src: string) {
+        const match = /^\\\(([^\n]*?)\\\)/.exec(src);
+        if (match === null) return undefined;
+        return {
+          type: "inlineSlashMath",
+          raw: match[0],
+          text: match[1].trim(),
+          displayMode: false,
+        };
+      },
+      renderer(token: Record<string, unknown>) {
+        return renderMath(token.text as string, false);
+      },
+    },
+    {
+      name: "blockSlashMath",
+      level: "block" as const,
+      start(src: string) {
+        const index = src.indexOf("\\[");
+        return index >= 0 ? index : undefined;
+      },
+      tokenizer(src: string) {
+        const match = /^\\\[\s*([\s\S]*?)\s*\\\](?:\n|$)/.exec(src);
+        if (match === null) return undefined;
+        return {
+          type: "blockSlashMath",
+          raw: match[0],
+          text: match[1].trim(),
+          displayMode: true,
+        };
+      },
+      renderer(token: Record<string, unknown>) {
+        return `${renderMath(token.text as string, true)}\n`;
+      },
+    },
+  ],
+} satisfies MarkedExtension;
 
 export type MathRun =
   | { kind: "text"; text: string }

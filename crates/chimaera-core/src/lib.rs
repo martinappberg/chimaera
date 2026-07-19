@@ -221,7 +221,7 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub fn generate_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

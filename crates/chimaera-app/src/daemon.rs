@@ -171,9 +171,12 @@ async fn probe() -> Option<Manifest> {
 /// GET /api/v1/health with the manifest token; any 200 counts. Shared with
 /// the WSL probe, where passing it also proves the NAT localhost forward.
 pub(crate) fn health_ok(port: u16, token: &str) -> bool {
-    ureq::get(&format!("http://127.0.0.1:{port}/api/v1/health"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(2))
+    crate::http::agent()
+        .get(&format!("http://127.0.0.1:{port}/api/v1/health"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .config()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
         .call()
         .is_ok()
 }
@@ -184,13 +187,15 @@ pub(crate) fn health_ok(port: u16, token: &str) -> bool {
 pub(crate) async fn live_session_count(port: u16, token: &str) -> Option<usize> {
     let token = token.to_string();
     tokio::task::spawn_blocking(move || {
-        let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(5))
+        let mut response = crate::http::agent()
+            .get(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
             .call()
-            .ok()?
-            .into_string()
             .ok()?;
+        let body = response.body_mut().read_to_string().ok()?;
         chimaera_remote::count_alive_sessions(&body)
     })
     .await

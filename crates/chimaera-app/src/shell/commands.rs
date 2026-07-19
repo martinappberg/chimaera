@@ -154,9 +154,12 @@ pub(super) async fn end_host_sessions(
         (t.local_port, t.manifest.token.clone())
     };
     let sent = tokio::task::spawn_blocking(move || {
-        ureq::delete(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(15))
+        crate::http::agent()
+            .delete(&format!("http://127.0.0.1:{port}/api/v1/sessions"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .build()
             .call()
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -181,10 +184,13 @@ pub(super) async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Res
         (t.local_port, t.manifest.token.clone())
     };
     let sent = tokio::task::spawn_blocking(move || {
-        ureq::post(&format!("http://127.0.0.1:{port}/api/v1/shutdown"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(15))
-            .call()
+        crate::http::agent()
+            .post(&format!("http://127.0.0.1:{port}/api/v1/shutdown"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .build()
+            .send_empty()
             .map(|_| ())
             .map_err(|e| e.to_string())
     })
@@ -249,12 +255,17 @@ pub(super) async fn remote_workspaces(
         (t.local_port, t.manifest.token.clone())
     };
     tokio::task::spawn_blocking(move || {
-        let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/workspaces"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(10))
+        let mut response = crate::http::agent()
+            .get(&format!("http://127.0.0.1:{port}/api/v1/workspaces"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
             .call()
-            .map_err(|e| format!("could not list workspaces: {e}"))?
-            .into_string()
+            .map_err(|e| format!("could not list workspaces: {e}"))?;
+        let body = response
+            .body_mut()
+            .read_to_string()
             .map_err(|e| format!("could not read workspaces: {e}"))?;
         serde_json::from_str(&body).map_err(|e| format!("bad workspaces payload: {e}"))
     })
@@ -293,21 +304,28 @@ fn valid_job_id(job_id: &str) -> bool {
 
 /// Surface the daemon's own `{"error": …}` body on an HTTP error — a launch
 /// rejection carries the real reason ("invalid partition …"), not just a code.
-fn compute_api_error(context: &str, e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, resp) => {
-            let msg = resp
-                .into_string()
-                .ok()
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                .and_then(|v| v.get("error").and_then(|m| m.as_str()).map(str::to_string));
-            match msg {
-                Some(m) => format!("{context}: {m}"),
-                None => format!("{context}: HTTP {code}"),
-            }
-        }
-        e => format!("{context}: {e}"),
+fn compute_response_body(
+    context: &str,
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<String, String> {
+    let status = response.status();
+    let body = response.body_mut().read_to_string();
+    if status.is_success() {
+        return body.map_err(|e| format!("{context}: could not read response: {e}"));
     }
+    let message = body
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|message| message.as_str())
+                .map(str::to_string)
+        });
+    Err(match message {
+        Some(message) => format!("{context}: {message}"),
+        None => format!("{context}: HTTP {}", status.as_u16()),
+    })
 }
 
 /// GET the login daemon's compute registry through the tunnel, cache each
@@ -323,13 +341,16 @@ async fn fetch_compute_sessions(state: &Shell, alias: &str) -> Result<serde_json
         (t.local_port, t.manifest.token.clone())
     };
     let mut payload: serde_json::Value = tokio::task::spawn_blocking(move || {
-        let body = ureq::get(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(15))
+        let response = crate::http::agent()
+            .get(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(15)))
+            .http_status_as_error(false)
+            .build()
             .call()
-            .map_err(|e| compute_api_error("could not list compute sessions", e))?
-            .into_string()
-            .map_err(|e| format!("could not read compute sessions: {e}"))?;
+            .map_err(|e| format!("could not list compute sessions: {e}"))?;
+        let body = compute_response_body("could not list compute sessions", response)?;
         serde_json::from_str(&body).map_err(|e| format!("bad compute sessions payload: {e}"))
     })
     .await
@@ -419,13 +440,16 @@ pub(super) async fn launch_compute_session(
         (t.local_port, t.manifest.token.clone())
     };
     tokio::task::spawn_blocking(move || {
-        let body = ureq::post(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .timeout(Duration::from_secs(30))
+        let response = crate::http::agent()
+            .post(&format!("http://127.0.0.1:{port}/api/v1/compute/sessions"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
             .send_json(spec)
-            .map_err(|e| compute_api_error("could not launch the compute session", e))?
-            .into_string()
-            .map_err(|e| format!("could not read the launch reply: {e}"))?;
+            .map_err(|e| format!("could not launch the compute session: {e}"))?;
+        let body = compute_response_body("could not launch the compute session", response)?;
         let v: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("bad launch payload: {e}"))?;
         v.get("job_id")
@@ -458,14 +482,18 @@ pub(super) async fn cancel_compute_session(
     };
     let job = job_id.clone();
     tokio::task::spawn_blocking(move || {
-        ureq::delete(&format!(
-            "http://127.0.0.1:{port}/api/v1/compute/sessions/{job}"
-        ))
-        .set("Authorization", &format!("Bearer {token}"))
-        .timeout(Duration::from_secs(20))
-        .call()
-        .map(|_| ())
-        .map_err(|e| compute_api_error("could not cancel the compute session", e))
+        let response = crate::http::agent()
+            .delete(&format!(
+                "http://127.0.0.1:{port}/api/v1/compute/sessions/{job}"
+            ))
+            .header("Authorization", &format!("Bearer {token}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .map_err(|e| format!("could not cancel the compute session: {e}"))?;
+        compute_response_body("could not cancel the compute session", response).map(|_| ())
     })
     .await
     .map_err(|e| format!("{e}"))??;
@@ -936,4 +964,41 @@ pub(super) async fn wsl_setup_daemon(app: AppHandle, distro: Option<String>) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_response_body;
+
+    fn response(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(status)
+            .body(ureq::Body::builder().data(body.as_bytes().to_vec()))
+            .expect("test response")
+    }
+
+    #[test]
+    fn compute_response_preserves_daemon_error_message() {
+        let error = compute_response_body(
+            "could not launch",
+            response(422, r#"{"error":"invalid partition debug"}"#),
+        )
+        .expect_err("422 must fail");
+
+        assert_eq!(error, "could not launch: invalid partition debug");
+    }
+
+    #[test]
+    fn compute_response_falls_back_to_status_and_reads_success() {
+        assert_eq!(
+            compute_response_body("could not list", response(503, "unavailable"))
+                .expect_err("503 must fail"),
+            "could not list: HTTP 503"
+        );
+        assert_eq!(
+            compute_response_body("could not list", response(200, r#"{"sessions":[]}"#))
+                .expect("200 response"),
+            r#"{"sessions":[]}"#
+        );
+    }
 }

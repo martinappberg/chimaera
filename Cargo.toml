@@ -27,7 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rust-embed = "8"
 mime_guess = "2"
-rand = "0.8"
+rand = "0.9"
 dirs = "6"
 sha2 = "0.10"
 hostname = "0.4"
