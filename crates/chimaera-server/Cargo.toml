@@ -40,7 +40,7 @@ flate2 = "1.1"
 # any AsyncWrite (no Seek), so the archive flows through a bounded duplex
 # pipe — never materialized in memory or on disk. Its read side also backs
 # the tests, so no extra dev-dependency.
-async_zip = { version = "0.0.17", default-features = false, features = ["tokio", "deflate"] }
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio", "deflate"] }
 # ReaderStream bridges plain files and the duplex's read half into an axum
 # body stream (GET /download/{ticket}); compat adapts tokio files onto
 # async_zip's futures-flavored entry writer.
