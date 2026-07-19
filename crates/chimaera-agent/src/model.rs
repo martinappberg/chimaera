@@ -347,6 +347,15 @@ pub enum AgentEvent {
     ModeSwitch {
         to: SessionUi,
     },
+    /// Boundary between a copied source-journal prefix and the destination
+    /// session's own events. A portable handoff's old native ids are display
+    /// history only; consumers use this marker to keep them from becoming
+    /// actionable rewind/fork points in the fresh agent conversation.
+    Forked {
+        source_agent: String,
+        source_seq: u64,
+        native: bool,
+    },
     Error {
         message: String,
         /// Fatal = the driver is dead; non-fatal = noted in the transcript.
@@ -506,6 +515,17 @@ pub enum AgentCommand {
     Send {
         blocks: Vec<ContentBlock>,
     },
+    /// Server-owned first turn for a transcript fork. `blocks` is the
+    /// canonical handoff the destination agent receives; `display_text` is
+    /// the compact user row journaled in its place so the copied transcript
+    /// is not duplicated into one enormous bubble. The variant cannot be
+    /// deserialized from the public WS wire — only trusted server glue may
+    /// construct it.
+    #[serde(skip_deserializing)]
+    PrimeFork {
+        blocks: Vec<ContentBlock>,
+        display_text: String,
+    },
     Permission {
         request_id: String,
         option_id: String,
@@ -645,7 +665,7 @@ impl AgentCommand {
     /// callers such as the workspace Mastermind MCP.
     pub fn validate_ingress(&self) -> Result<(), CommandValidationError> {
         match self {
-            Self::Send { blocks } => {
+            Self::Send { blocks } | Self::PrimeFork { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
                 let mut images = 0usize;
                 let mut text_total = 0usize;
@@ -679,6 +699,13 @@ impl AgentCommand {
                     image_total,
                     COMMAND_IMAGE_BASE64_TOTAL_MAX,
                 )?;
+                if let Self::PrimeFork { display_text, .. } = self {
+                    check_command_len(
+                        "fork display text",
+                        display_text.len(),
+                        COMMAND_TEXT_BLOCK_MAX,
+                    )?;
+                }
             }
             Self::Permission {
                 request_id,
@@ -760,10 +787,15 @@ impl AgentCommand {
     /// to consume it. Only sends retain bulk payloads; the other variants are
     /// independently leaf-capped and live only in the bounded command channel.
     pub fn retained_send_bytes(&self) -> Option<usize> {
-        let Self::Send { blocks } = self else {
-            return None;
+        let (blocks, display_bytes) = match self {
+            Self::Send { blocks } => (blocks, 0),
+            Self::PrimeFork {
+                blocks,
+                display_text,
+            } => (blocks, display_text.len()),
+            _ => return None,
         };
-        let mut bytes = std::mem::size_of_val(blocks.as_slice());
+        let mut bytes = std::mem::size_of_val(blocks.as_slice()) + display_bytes;
         for block in blocks {
             bytes = bytes.saturating_add(match block {
                 ContentBlock::Text { text } => text.len(),
@@ -1271,6 +1303,14 @@ mod tests {
                 destination: None,
                 feedback: Some("use rg".into()),
             }
+        );
+
+        assert!(
+            serde_json::from_str::<AgentCommand>(
+                r#"{"type":"prime_fork","blocks":[],"display_text":"hide me"}"#,
+            )
+            .is_err(),
+            "the server-owned fork primer must not be callable from the public WS wire"
         );
     }
 

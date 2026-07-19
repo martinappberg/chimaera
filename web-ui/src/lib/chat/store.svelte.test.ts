@@ -70,6 +70,46 @@ describe("ChatStore context compaction", () => {
 });
 
 describe("ChatStore pending-send ordering", () => {
+  it("tracks exact portable boundaries and completed-turn native fork points", () => {
+    const partial = fold([
+      { type: "user_message", text: "question", id: "u1", queued: false },
+      { type: "checkpoint", user_message_id: "u1", preceding_uuid: null },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "ans" },
+      { type: "message_chunk", turn_id: "t1", text: "wer" },
+    ]);
+    expect(partial.blocks[0]).toMatchObject({
+      kind: "user",
+      forkSeq: 2,
+      checkpoint: { id: "u1" },
+    });
+    expect(partial.blocks[1]).toMatchObject({
+      kind: "message",
+      text: "answer",
+      forkSeq: 5,
+      nativeTurnComplete: false,
+    });
+
+    partial.apply({
+      seq: 6,
+      ts: 6,
+      ev: { type: "turn_completed", turn_id: "t1", usage: {} },
+    } as SeqEvent);
+    expect(partial.blocks[1]).toMatchObject({
+      forkSeq: 6,
+      nativeTurnComplete: true,
+      turnId: "t1",
+    });
+
+    partial.apply({
+      seq: 7,
+      ts: 7,
+      ev: { type: "forked", source_agent: "codex", source_seq: 6, native: false },
+    } as SeqEvent);
+    expect(partial.blocks[0]).toMatchObject({ checkpoint: null });
+    expect(partial.blocks[1]).toMatchObject({ nativeTurnComplete: false });
+  });
+
   it("keeps a queued send out of the transcript until it is sent", () => {
     // Fold only up to just before the turn ends (the mid-stream window).
     const store = fold(QUEUED_MID_TURN.slice(0, 5));

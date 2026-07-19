@@ -295,6 +295,7 @@ async fn spawn_chat_ui(
                 theme: theme.to_string(),
                 prelude: body.prelude.filter(|p| !p.trim().is_empty()),
                 mastermind: None,
+                fork: None,
             },
         )
         .await

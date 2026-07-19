@@ -222,6 +222,8 @@
           onOpenFile={(p: string) => ctrl.openFileFrom(node.id, p, false)}
           onOpenPath={(p: string, k: "file" | "dir") => ctrl.openPathFrom(node.id, p, k, false)}
           onSwitchToTerminal={() => ctrl.switchView(s.id, "term")}
+          onForked={(forked: Session) =>
+            ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
         />
       {:else if viewErrors.chat}
         {@render loadFailure("chat", "chat view")}

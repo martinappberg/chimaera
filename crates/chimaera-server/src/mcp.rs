@@ -941,6 +941,7 @@ async fn spawn_agent(
             theme: spawn_theme(state),
             prelude: None,
             mastermind: None,
+            fork: None,
         },
     )
     .await
