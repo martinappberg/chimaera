@@ -1199,18 +1199,22 @@ mod e2e {
         // PTY session prove the whole stack, not just a socket accept.
         let auth = format!("Bearer {}", local.token);
         let base = format!("http://127.0.0.1:{}/api/v1", local.port);
-        let ws: serde_json::Value = ureq::post(&format!("{base}/workspaces"))
-            .set("Authorization", &auth)
+        let ws: serde_json::Value = crate::http::agent()
+            .post(&format!("{base}/workspaces"))
+            .header("Authorization", &auth)
             .send_json(serde_json::json!({"root": "/tmp"}))
             .expect("create workspace")
-            .into_json()
+            .body_mut()
+            .read_json()
             .expect("workspace json");
         let ws_id = ws["id"].as_str().expect("workspace id").to_string();
-        let session: serde_json::Value = ureq::post(&format!("{base}/sessions"))
-            .set("Authorization", &auth)
+        let session: serde_json::Value = crate::http::agent()
+            .post(&format!("{base}/sessions"))
+            .header("Authorization", &auth)
             .send_json(serde_json::json!({"workspace_id": ws_id, "kind": "shell"}))
             .expect("create session")
-            .into_json()
+            .body_mut()
+            .read_json()
             .expect("session json");
         eprintln!("[smoke] shell session {} is up", session["id"]);
 

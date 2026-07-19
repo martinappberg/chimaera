@@ -1,66 +1,50 @@
 version: 2
+
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(deps)"
+
 updates:
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      actions-non-major:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      rust-non-major:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: cargo
     directory: /crates/chimaera-app
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      native-rust-non-major:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: npm
     directory: /web-ui
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      web-ui-non-major:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
+    # TypeScript 7 publishes only a version shim at its stable package entry;
+    # svelte-check still requires the TypeScript 5 compiler API.
+    ignore:
+      - dependency-name: typescript
+        versions: [">=7 <8"]
 
   - package-ecosystem: npm
     directory: /crates/chimaera-app
-    schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(deps)"
-    groups:
-      native-js-non-major:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    cooldown:
+      default-days: 7
