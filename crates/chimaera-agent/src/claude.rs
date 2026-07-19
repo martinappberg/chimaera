@@ -756,6 +756,24 @@ impl ClaudeMapper {
         format!("t{}", self.turn_n)
     }
 
+    /// Compaction dedupe is turn-scoped. A fresh turn must not inherit a
+    /// completed/aborted predecessor's guards, or its first native lifecycle
+    /// frame can be mistaken for a duplicate.
+    fn reset_compaction_for_new_turn(&mut self) {
+        self.compaction_active = false;
+        self.compaction_completed = false;
+    }
+
+    /// A result/watchdog abort can be the only terminal signal when the CLI
+    /// never emits compact_result. Keep completed=true until the next turn so
+    /// a late compact_boundary still dedupes, while active never leaks.
+    fn settle_compaction_at_turn_end(&mut self) {
+        if self.compaction_active {
+            self.compaction_active = false;
+            self.compaction_completed = true;
+        }
+    }
+
     /// Defensive turn boundary: content/tool frames must never stream into a
     /// turn that was never opened. A wrong queue assumption (the CLI's native
     /// queue after an abort is unverified) or a parked-prompt replay can leave
@@ -764,6 +782,7 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
             // A turn opening is a clean slate for the interrupt watchdog: an
@@ -2224,6 +2243,7 @@ impl ClaudeMapper {
         // unchanged.
         let was_active = self.turn_active;
         self.turn_active = false;
+        self.settle_compaction_at_turn_end();
         self.tool_kinds.clear();
         self.streamed.clear();
         // Task maps live per turn (the extension wipes its map on result) —
@@ -2360,6 +2380,7 @@ impl ClaudeMapper {
                     // as a quiet stop, nor let its armed watchdog abort it.
                     self.interrupt_requested = false;
                     self.interrupt_grace = None;
+                    self.reset_compaction_for_new_turn();
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
@@ -2885,6 +2906,7 @@ impl ClaudeMapper {
         }
         let turn_id = self.turn_id();
         self.turn_active = false;
+        self.settle_compaction_at_turn_end();
         self.interrupt_requested = false;
         // Same per-turn cleanup a real result performs — including closing
         // still-open subagent rows as failed (the interrupt killed them).
@@ -6377,6 +6399,96 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn interrupted_compaction_does_not_suppress_the_next_lifecycle() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+
+        // A user stop can end the turn without a compact_result frame. The
+        // UI settles from TurnAborted, and the mapper guard must settle too.
+        let aborted = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(aborted
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnAborted { .. })));
+        assert!(!m.compaction_active);
+        assert!(m.compaction_completed);
+
+        let restarted = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        assert!(matches!(
+            &restarted.events[..],
+            [
+                AgentEvent::TurnStarted { .. },
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                }
+            ]
+        ));
+
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "pre_tokens": 84000 },
+        }));
+        m.on_frame(&json!({ "type": "result", "is_error": false }));
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "next turn".into(),
+            }],
+        });
+        let standalone = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "pre_tokens": 42000 },
+        }));
+        assert!(matches!(
+            &standalone.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(42000),
+            }
+        ));
+    }
+
+    #[test]
+    fn watchdog_abort_also_resets_the_compaction_guard() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..INTERRUPT_GRACE_TICKS {
+            m.tick();
+        }
+        assert!(!m.turn_active);
+        assert!(!m.compaction_active);
+        assert!(m.compaction_completed);
+
+        let restarted = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        assert!(restarted.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Started,
+                ..
+            }
+        )));
     }
 
     #[test]
