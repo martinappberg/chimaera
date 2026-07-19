@@ -45,7 +45,7 @@ tauri-plugin-updater = "2"
 # non-gesture navigator.clipboard.writeText (agent OSC 52 / copy-on-select), so
 # those writes run in the Rust process instead, where there is no gesture gate.
 tauri-plugin-clipboard-manager = "2"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
 
 chimaera-core = { path = "../chimaera-core" }
