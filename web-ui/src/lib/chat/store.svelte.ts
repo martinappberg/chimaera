@@ -249,6 +249,10 @@ export class ChatStore {
   currentMode = $state<string | null>(null);
   slashCommands = $state<SlashCommand[]>([]);
   running = $state(false);
+  /** The agent is summarizing conversation history to reclaim its context
+   *  window. Journal-derived (not an optimistic button state), so automatic
+   *  compaction and reconnect/replay behave exactly like manual /compact. */
+  compacting = $state(false);
   /** What the agent is doing RIGHT NOW, for the live status row:
    *  thinking (reasoning deltas), writing (prose deltas), a tool title,
    *  or waiting (turn open, nothing streaming yet). */
@@ -385,6 +389,7 @@ export class ChatStore {
     this.plan = [];
     this.backgroundTasks = [];
     this.running = false;
+    this.compacting = false;
     this.activity = null;
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
     // the preference is re-pushed even if this reset races ahead of it.
@@ -786,6 +791,26 @@ export class ChatStore {
         };
         break;
       }
+      case "context_compaction": {
+        const phase = ev.phase as string;
+        if (phase === "started") {
+          this.compacting = true;
+        } else {
+          this.compacting = false;
+          if (phase === "completed") {
+            const pre = ev.pre_tokens as number | undefined;
+            this.notice(
+              pre !== undefined
+                ? `context compacted · ${pre.toLocaleString()} tokens summarized`
+                : "context compacted",
+              "info",
+            );
+          }
+          // The agent's normal turn output owns failure details. The lifecycle
+          // event only settles progress, avoiding a duplicate Claude message.
+        }
+        break;
+      }
       case "usage_report":
         this.blocks.push({ kind: "usage", windows: (ev.windows as UsageWindow[]) ?? [] });
         break;
@@ -830,6 +855,7 @@ export class ChatStore {
         break;
       case "turn_completed": {
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         // Close any tool row this turn left dangling (a dropped result frame)
         // BEFORE the turn_end block lands, so the scan stops at the previous
@@ -851,6 +877,7 @@ export class ChatStore {
       }
       case "turn_aborted": {
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         this.reconcileOpenTools();
         // A deliberate stop (Esc / stop chip) is not an error state: the
@@ -885,6 +912,7 @@ export class ChatStore {
           // A dead driver is not running — don't strand the stop button and
           // the "starting…" row waiting on a turn end that can't come.
           this.running = false;
+          this.compacting = false;
           this.activity = null;
           // A fatal error is a terminal path like the others — a tool left
           // in_progress must not spin forever when no `exited` follows (a kept-
@@ -896,6 +924,7 @@ export class ChatStore {
         break;
       case "exited":
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };

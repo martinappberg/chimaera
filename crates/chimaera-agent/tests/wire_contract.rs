@@ -11,7 +11,8 @@
 
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
-    AgentCommand, AgentEvent, PermissionOption, PermissionOptionKind, Question, UserMessageState,
+    AgentCommand, AgentEvent, CompactionPhase, PermissionOption, PermissionOptionKind, Question,
+    UserMessageState,
 };
 use serde_json::json;
 
@@ -68,6 +69,26 @@ fn agent_event_wire_shapes() {
     assert_eq!(
         serde_json::to_value(AgentEvent::ThinkingTokens { tokens: 128 }).unwrap(),
         json!({ "type": "thinking_tokens", "tokens": 128 })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Started,
+            pre_tokens: None,
+        })
+        .unwrap(),
+        json!({ "type": "context_compaction", "phase": "started" })
+    );
+    assert_eq!(
+        serde_json::to_value(AgentEvent::ContextCompaction {
+            phase: CompactionPhase::Completed,
+            pre_tokens: Some(168_000),
+        })
+        .unwrap(),
+        json!({
+            "type": "context_compaction",
+            "phase": "completed",
+            "pre_tokens": 168_000,
+        })
     );
 }
 

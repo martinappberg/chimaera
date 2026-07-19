@@ -26,6 +26,49 @@ const QUEUED_MID_TURN: Record<string, unknown>[] = [
   { type: "user_message_update", id: "q1", state: "sent" },
 ];
 
+describe("ChatStore context compaction", () => {
+  it("keeps progress replay-safe and settles with the summarized token count", () => {
+    const started = fold([
+      { type: "turn_started", turn_id: "compact-1" },
+      { type: "context_compaction", phase: "started" },
+    ]);
+    expect(started.running).toBe(true);
+    expect(started.compacting).toBe(true);
+
+    const events = [
+      { type: "turn_started", turn_id: "compact-1" },
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "completed", pre_tokens: 168_000 },
+      { type: "turn_completed", turn_id: "compact-1", usage: {} },
+    ];
+    const live = fold(events);
+    const replay = fold(events);
+    expect(live.compacting).toBe(false);
+    expect(replay.blocks).toEqual(live.blocks);
+    const notice = live.blocks.find(
+      (b) => b.kind === "notice" && b.text.includes("tokens summarized"),
+    );
+    expect(notice).toMatchObject({ kind: "notice", tone: "info" });
+    expect(notice?.kind === "notice" ? notice.text : "").toContain("168");
+  });
+
+  it("clears failed or terminally-incomplete progress without duplicating agent output", () => {
+    const failed = fold([
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "failed" },
+    ]);
+    expect(failed.compacting).toBe(false);
+    expect(failed.blocks).toEqual([]);
+
+    const missingTerminalItem = fold([
+      { type: "turn_started", turn_id: "compact-2" },
+      { type: "context_compaction", phase: "started" },
+      { type: "turn_aborted", turn_id: "compact-2", reason: "interrupted", interrupted: true },
+    ]);
+    expect(missingTerminalItem.compacting).toBe(false);
+  });
+});
+
 describe("ChatStore pending-send ordering", () => {
   it("keeps a queued send out of the transcript until it is sent", () => {
     // Fold only up to just before the turn ends (the mid-stream window).

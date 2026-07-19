@@ -192,8 +192,8 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
-    PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
+    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
+    ContentBlock, PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
     UserMessageState,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
@@ -619,6 +619,11 @@ struct CodexMapper {
     pending_questions: HashMap<String, PendingQuestion>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
+    /// The deprecated thread/compacted notification may overlap the
+    /// contextCompaction item pair. Fold both sources to exactly one start
+    /// and one completion event per turn.
+    compaction_active: bool,
+    compaction_completed: bool,
     /// One auto-decline notice per turn: full-access maps to approvalPolicy
     /// "never" (the official extension's table), so a genuinely blocked
     /// action is DECLINED by codex itself with no approval card possible —
@@ -696,6 +701,8 @@ impl CodexMapper {
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
+            compaction_active: false,
+            compaction_completed: false,
             decline_notified: false,
             pending_rpcs: HashMap::new(),
             collab_agents: Vec::new(),
@@ -776,6 +783,8 @@ impl CodexMapper {
                     .to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
+                self.compaction_active = false;
+                self.compaction_completed = false;
                 // A fresh turn is a clean slate for the interrupt watchdog: an
                 // interrupt armed against a previous (or idle) state must not
                 // abort this new turn.
@@ -967,9 +976,14 @@ impl CodexMapper {
                 }
             }
             "thread/compacted" => {
-                step.events.push(AgentEvent::Notice {
-                    text: "context compacted".into(),
-                });
+                self.compaction_active = false;
+                if !self.compaction_completed {
+                    self.compaction_completed = true;
+                    step.events.push(AgentEvent::ContextCompaction {
+                        phase: CompactionPhase::Completed,
+                        pre_tokens: None,
+                    });
+                }
             }
             // Mined shape: {threadId, turnId, fromModel, toModel, reason} —
             // reasons include safety reroutes (e.g. highRiskCyberActivity).
@@ -1099,6 +1113,14 @@ impl CodexMapper {
         self.out_streamed.clear();
         self.safety_notified = false;
         self.decline_notified = false;
+        // A missing terminal item must not strand the UI's compaction lane.
+        // Turn end clears it client-side; mark this native lifecycle settled
+        // too so a late deprecated thread/compacted notification cannot emit
+        // a second completion.
+        if self.compaction_active {
+            self.compaction_active = false;
+            self.compaction_completed = true;
+        }
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
@@ -1680,10 +1702,24 @@ impl CodexMapper {
                     }
                 }
             }
-            Some("contextCompaction") if completed => {
-                step.events.push(AgentEvent::Notice {
-                    text: "context compacted".into(),
-                });
+            Some("contextCompaction") => {
+                if completed {
+                    self.compaction_active = false;
+                    if !self.compaction_completed {
+                        self.compaction_completed = true;
+                        step.events.push(AgentEvent::ContextCompaction {
+                            phase: CompactionPhase::Completed,
+                            pre_tokens: None,
+                        });
+                    }
+                } else if !self.compaction_active {
+                    self.compaction_active = true;
+                    self.compaction_completed = false;
+                    step.events.push(AgentEvent::ContextCompaction {
+                        phase: CompactionPhase::Started,
+                        pre_tokens: None,
+                    });
+                }
             }
             // enteredReviewMode / exitedReviewMode / sleep / imageGeneration
             // etc. are tolerated silently (the official client renders
@@ -5008,6 +5044,50 @@ mod tests {
             &step.events[0],
             AgentEvent::Error { fatal: false, message } if message.contains("not now")
         ));
+    }
+
+    #[test]
+    fn context_compaction_item_maps_started_and_completed_without_duplicate() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "compact-turn" } },
+        }));
+        let started = m.on_frame(&json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thr-1",
+                "item": { "type": "contextCompaction", "id": "compact-1" },
+            },
+        }));
+        assert!(matches!(
+            &started.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Started,
+                ..
+            }
+        ));
+
+        let completed = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1",
+                "item": { "type": "contextCompaction", "id": "compact-1" },
+            },
+        }));
+        assert!(matches!(
+            &completed.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                ..
+            }
+        ));
+
+        let deprecated = m.on_frame(&json!({
+            "method": "thread/compacted",
+            "params": { "threadId": "thr-1" },
+        }));
+        assert!(deprecated.events.is_empty());
     }
 
     #[test]

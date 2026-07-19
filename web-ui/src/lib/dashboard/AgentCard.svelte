@@ -68,6 +68,7 @@
     // row — "exited" must win over every activity line.
     if (!session.alive) return "exited";
     if (store !== null) {
+      if (store.compacting) return "compacting context";
       const act = store.activity;
       if (act !== null && act.detail !== "") return act.detail;
       if (act !== null) return act.kind;
