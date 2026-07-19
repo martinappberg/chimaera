@@ -84,9 +84,9 @@ export interface CheckpointRef {
   preceding: string | null;
 }
 
-/** A user message the agent has NOT consumed yet — held in the pending stack
- *  above the composer, deliberately kept OUT of the transcript `blocks` so it
- *  can never splice into a running turn's output. Rebuilt purely from journaled
+/** A user message the agent has NOT consumed yet — shown in the scrollable
+ *  transcript tail, deliberately kept OUT of transcript `blocks` so it can
+ *  never splice into a running turn's output. Rebuilt purely from journaled
  *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
  *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
  *  here marked "not delivered". */
@@ -325,8 +325,8 @@ export class ChatStore {
   }
 
   /** Queued/undelivered user messages, in order — rendered in a holding stack
-   *  pinned above the composer (the send point), NEVER inline in history: a
-   *  queued message is one you've typed and are waiting on. This is its OWN
+   *  at the scrollable transcript tail, NEVER inserted in `blocks`: a queued
+   *  message is one you've typed and are waiting on. This is its OWN
    *  list, not a slice of `blocks`, so a queued send can't splice into a
    *  running turn's output. A `user_message_update{sent}` moves the entry into
    *  `blocks` at the current end (the reducer, so replay agrees); `cancelled`

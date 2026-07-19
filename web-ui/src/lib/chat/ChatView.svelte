@@ -701,8 +701,8 @@
     let group: Extract<RenderItem, { t: "group" }> | null = null;
     store.blocks.forEach((block, i) => {
       // Every user block in `blocks` is delivered — queued/undelivered sends
-      // live in the bottom pending stack (`store.pendingSends`), never here — so
-      // they all render inline in transcript order.
+      // live in the pending transcript tail (`store.pendingSends`), never
+      // here — so they all render inline in transcript order.
       if (block.kind === "tool") {
         if (group === null) {
           group = { t: "group", key: `g-${block.id}`, tools: [] };
@@ -717,9 +717,9 @@
     return items;
   });
 
-  /** Index of the last block (the streaming reveal keys off it). Every block
-   *  renders inline now — queued sends live in the pending stack, not in
-   *  `blocks` — so this is simply the tail. */
+  /** Index of the last block (the streaming reveal keys off it). Queued sends
+   *  render from their own pending tail, not `blocks`, so this is simply the
+   *  delivered-block tail. */
   const lastInlineIndex = $derived(store.blocks.length - 1);
 </script>
 
@@ -790,7 +790,7 @@
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
-             ones live in the pending stack above the composer. -->
+             ones live in the pending tail below. -->
         <div class="msg user">
           <div class="bubble-row">
             <!-- Codex rewinds whole turns from a preceding anchor, so its
@@ -909,6 +909,60 @@
       </div>
     {/if}
 
+    <!-- Pending sends are part of the scrollable reading surface, but remain
+         OUT of `blocks`: a mid-turn send must not splice the agent's current
+         response. Keeping the stack at the transcript tail makes queued text
+         inspectable without pinning it to (and crowding) the composer. On
+         delivery it leaves this stack and enters `blocks` as the newest user
+         turn. A Stop preserves it; ✕ cancels it. Dropped sends remain visible
+         as "not delivered" until dismissed, with replay-safe state owned by
+         the daemon. -->
+    {#if store.pendingSends.length > 0}
+      <div class="pending" aria-label="queued messages" aria-live="polite">
+        {#each store.pendingSends as send (send.id)}
+          <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
+            <div class="bubble-row">
+              <div class="bubble">
+                <UserText
+                  text={send.text}
+                  onOpenPath={openProsePath}
+                  resolvePaths={resolveProsePaths}
+                />
+              </div>
+              {#if agentKind === "codex" && send.state === "queued" && store.running}
+                <button
+                  class="steer-btn"
+                  title="add this message to the current run"
+                  aria-label="steer queued message into current run"
+                  onclick={() => steerQueued(send.id)}
+                >↪ Steer</button>
+              {/if}
+              <button
+                class="cancel-btn"
+                title={send.state === "dropped"
+                  ? "dismiss (this message was never delivered)"
+                  : "cancel this queued message (remove it before the agent sees it)"}
+                aria-label={send.state === "dropped"
+                  ? "dismiss undelivered message"
+                  : "cancel queued message"}
+                onclick={() => cancelQueued(send.id)}
+              >
+                ✕
+              </button>
+            </div>
+            <span class="delivery" class:dropped={send.state === "dropped"}>
+              {send.state === "dropped" ? "not delivered" : "queued"}
+            </span>
+            {#if send.attachments > 0}
+              <span class="attach"
+                >{send.attachments} image{send.attachments > 1 ? "s" : ""}</span
+              >
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+
     {#if !atBottom && store.pending.length > 0}
       <button class="jump" onclick={scrollToBottom}>
         permission needed ↓
@@ -1007,53 +1061,6 @@
     </div>
   {/if}
 
-  <!-- Pending stack: messages typed and waiting to send, held at the send
-       point (right above the composer) rather than inline in history. On
-       delivery the entry leaves this stack and enters the transcript as the
-       newest turn. Queued survives a Stop (it delivers after the abort); the
-       ✕ is how you discard one. A dropped one (the agent died before it could
-       be delivered) stays marked "not delivered" until its ✕ dismisses it —
-       the same cancel command, tombstoned in the journal so replay agrees. -->
-  {#if store.pendingSends.length > 0}
-    <div class="pending" aria-label="queued messages">
-      {#each store.pendingSends as send (send.id)}
-        <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
-          <div class="bubble-row">
-            <div class="bubble">
-              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
-            </div>
-            {#if agentKind === "codex" && send.state === "queued" && store.running}
-              <button
-                class="steer-btn"
-                title="add this message to the current run"
-                aria-label="steer queued message into current run"
-                onclick={() => steerQueued(send.id)}
-              >↪ Steer</button>
-            {/if}
-            <button
-              class="cancel-btn"
-              title={send.state === "dropped"
-                ? "dismiss (this message was never delivered)"
-                : "cancel this queued message (remove it before the agent sees it)"}
-              aria-label={send.state === "dropped"
-                ? "dismiss undelivered message"
-                : "cancel queued message"}
-              onclick={() => cancelQueued(send.id)}
-            >
-              ✕
-            </button>
-          </div>
-          <span class="delivery" class:dropped={send.state === "dropped"}>
-            {send.state === "dropped" ? "not delivered" : "queued"}
-          </span>
-          {#if send.attachments > 0}
-            <span class="attach">{send.attachments} image{send.attachments > 1 ? "s" : ""}</span>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
-
   <Composer
     sessionId={session.id}
     running={store.running}
@@ -1118,7 +1125,6 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
-  .chat > .pending,
   /* Every pinned strip (subagents, background, plan) — they were full-bleed
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
@@ -1178,18 +1184,15 @@
     font-size: var(--text-sm);
     margin-top: 2px;
   }
-  /* The pending stack sits between the transcript and the composer, holding
-     messages typed and waiting to send. It reads as attached to the input:
-     same 18px side padding as the composer (the selector group above), a hair
-     of vertical breathing room, and a hairline top edge tying it to the
-     composer below. Collapses to nothing when empty (the {#if} guard). */
+  /* Undelivered messages occupy the transcript tail, not fixed composer
+     chrome. The transcript's own scrollbar can therefore move a large queue
+     out of the way while the pending state remains visible at the live end. */
   .pending {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    padding-top: 8px;
-    padding-bottom: 6px;
-    border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
+    margin-top: 8px;
+    padding-bottom: 10px;
   }
   /* A pending bubble is half-present — not in the conversation yet (claude's
      native mid-turn queue / a codex steer in flight). Reuses .msg.user's
