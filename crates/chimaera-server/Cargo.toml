@@ -32,7 +32,7 @@ calamine = "0.26"
 # Read only ZIP central-directory metadata to budget xlsx/xlsm/ods expansion
 # before calamine materializes a workbook. Already present through calamine;
 # this direct edge exposes the preflight API without adding another package.
-zip = { version = "2.4.2", default-features = false }
+zip = { version = "8.6.0", default-features = false }
 # Gzip tier for fs/file + fs/table (.gz/.bgz previews). BGZF is standard
 # multi-member gzip, which MultiGzDecoder decodes sequentially.
 flate2 = "1.1"
