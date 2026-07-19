@@ -88,6 +88,7 @@
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
+  let paneHeight = $state(0);
   /** Null follows content; a number is the height chosen with the top-edge
    *  grip. It resets after a successful send so the next draft starts quiet. */
   let manualHeight = $state<number | null>(null);
@@ -107,12 +108,31 @@
     if (focused) el?.focus();
   });
 
+  // Workbench splits resize without changing the browser viewport. Observe
+  // the owning chat pane so both auto and manual heights stay inside the live
+  // reading area; disconnect on remount/tab switch per the runes teardown rule.
+  $effect(() => {
+    const t = el;
+    if (t === null) return;
+    const pane = t.closest<HTMLElement>(".chat");
+    if (pane === null) return;
+    const measure = () => (paneHeight = pane.clientHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(pane);
+    return () => observer.disconnect();
+  });
+
   function maxComposerHeight(): number {
     // A composer should help with a long prompt without swallowing the chat.
     // Measure the pane rather than the window because workbench splits can be
     // much shorter than the app viewport.
-    const paneHeight = el?.closest<HTMLElement>(".chat")?.clientHeight ?? window.innerHeight;
-    return Math.max(96, Math.min(COMPOSER_MAX_HEIGHT, Math.floor(paneHeight * 0.42)));
+    const measuredHeight =
+      paneHeight || el?.closest<HTMLElement>(".chat")?.clientHeight || window.innerHeight;
+    return Math.max(
+      COMPOSER_MIN_HEIGHT,
+      Math.min(COMPOSER_MAX_HEIGHT, Math.floor(measuredHeight * 0.42)),
+    );
   }
 
   function clampComposerHeight(height: number): number {
@@ -121,6 +141,13 @@
 
   function chooseComposerHeight(height: number | null) {
     manualHeight = height === null ? null : clampComposerHeight(height);
+  }
+
+  /** Every successfully consumed draft returns the next input to content-fit,
+   *  whether it became an agent turn or a native slash-command action. */
+  function clearSubmittedDraft() {
+    draft = "";
+    chooseComposerHeight(null);
   }
 
   // Autosize from rendered height, not "\n" count — soft-wrapped pastes
@@ -335,7 +362,7 @@
     const wholeDraft =
       token !== null && token.start === 0 && draft.slice(token.text.length).trim() === "";
     if (wholeDraft && onSlash(name)) {
-      draft = "";
+      clearSubmittedDraft();
       return;
     }
     if (token === null) {
@@ -380,7 +407,7 @@
     if (text.startsWith("/")) {
       const [name, ...rest] = text.slice(1).split(/\s+/);
       if (onSlash(name, rest.join(" "))) {
-        draft = "";
+        clearSubmittedDraft();
         return;
       }
     }
@@ -388,9 +415,8 @@
     // reconnect window the socket is not OPEN and the message would otherwise
     // vanish silently.
     if (onSubmit(text, images)) {
-      draft = "";
+      clearSubmittedDraft();
       images = [];
-      chooseComposerHeight(null);
     }
   }
 
