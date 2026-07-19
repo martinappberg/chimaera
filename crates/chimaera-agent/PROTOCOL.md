@@ -656,11 +656,17 @@ that can change the serving model mid-conversation:
   earlier output (refusal retries). Driver emits MessagesSuperseded before
   the new content; the client drops trailing prose instead of appending a
   duplicate.
-- `system/status` `{status, permissionMode?}` — CLI-initiated mode changes
-  (plan exits, applied setMode suggestions) ride here; mapped to
-  ModeChanged when the mode actually changed.
+- `system/status` `{status, permissionMode?, compact_result?, compact_error?}` —
+  CLI-initiated mode changes (plan exits, applied setMode suggestions) ride
+  `permissionMode`; compaction starts with `status:"compacting"` and settles
+  with `status:null` plus `compact_result:"success"|"failed"` (a failure also
+  carries `compact_error`). The compacting/result lifecycle was live-verified
+  against 2.1.212 with manual `/compact`; it maps to the shared journaled
+  `ContextCompaction` lifecycle rather than an optimistic client state.
 - `system/compact_boundary` `{compact_metadata:{trigger, pre_tokens}}` —
-  auto-compaction marker → Notice.
+  successful auto/manual compaction marker, including the pre-summary token
+  count. It completes that same lifecycle (the overlapping success status is
+  deduped), and the UI preserves the token count in its completion notice.
 - `user_dialog_request` (dialogKinds `fable_overage_consent_prompt`,
   `refusal_fallback_prompt`) only flows when the client declares
   `supportedDialogKinds`; we don't, so the CLI resolves these itself per
@@ -909,7 +915,9 @@ ITS OWN TURN: `thread/status/changed active` → `turn/started` →
 `item/started`/`item/completed` of a `contextCompaction` item →
 `turn/completed`. **No `thread/compacted` notification fires on 0.142.5**
 (it exists in the extension's routing table, but the item is the real
-signal — our contextCompaction→Notice mapping already covers it).
+signal). The item pair maps to the shared journaled `ContextCompaction`
+started/completed lifecycle; the deprecated notification is a completion
+fallback and is deduped if a future CLI emits both.
 
 ### Codex: question auto-resolution (adopted)
 

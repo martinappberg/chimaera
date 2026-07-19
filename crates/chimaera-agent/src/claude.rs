@@ -33,11 +33,12 @@ use crate::driver::{
 };
 use crate::model::{
     cap_head_tail, cap_output, truncate_label, AgentCommand, AgentEvent, BackgroundTask,
-    BackgroundTaskClose, ChunkKind, Coalescer, ContentBlock, ModeInfo, PermissionOption,
-    PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent, ToolKind, ToolStatus,
-    Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX, BG_PATH_MAX, BG_TASKS_CAP,
-    DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX, PLAN_LABEL_MAX,
-    PLAN_TASKS_CAP, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
+    BackgroundTaskClose, ChunkKind, Coalescer, CompactionPhase, ContentBlock, ModeInfo,
+    PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent,
+    ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX,
+    BG_PATH_MAX, BG_TASKS_CAP, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
+    WF_AGENT_LABEL_MAX,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -633,6 +634,11 @@ struct ClaudeMapper {
     /// Last journaled thinking-token estimate (throttles the status frames
     /// to every ~256 tokens; reset per turn).
     thinking_emitted: u64,
+    /// `system/status` starts/settles compaction while compact_boundary also
+    /// settles successful runs. These guards turn the overlapping native
+    /// signals into one normalized start + one terminal event.
+    compaction_active: bool,
+    compaction_completed: bool,
     next_ctl: u64,
 }
 
@@ -716,6 +722,8 @@ impl ClaudeMapper {
             title_requested: false,
             last_msg_uuid: None,
             thinking_emitted: 0,
+            compaction_active: false,
+            compaction_completed: false,
             next_ctl: 0,
         }
     }
@@ -748,6 +756,24 @@ impl ClaudeMapper {
         format!("t{}", self.turn_n)
     }
 
+    /// Compaction dedupe is turn-scoped. A fresh turn must not inherit a
+    /// completed/aborted predecessor's guards, or its first native lifecycle
+    /// frame can be mistaken for a duplicate.
+    fn reset_compaction_for_new_turn(&mut self) {
+        self.compaction_active = false;
+        self.compaction_completed = false;
+    }
+
+    /// A result/watchdog abort can be the only terminal signal when the CLI
+    /// never emits compact_result. Keep completed=true until the next turn so
+    /// a late compact_boundary still dedupes, while active never leaks.
+    fn settle_compaction_at_turn_end(&mut self) {
+        if self.compaction_active {
+            self.compaction_active = false;
+            self.compaction_completed = true;
+        }
+    }
+
     /// Defensive turn boundary: content/tool frames must never stream into a
     /// turn that was never opened. A wrong queue assumption (the CLI's native
     /// queue after an abort is unverified) or a parked-prompt replay can leave
@@ -756,6 +782,7 @@ impl ClaudeMapper {
     /// phantom turn with no start event.
     fn ensure_turn(&mut self, step: &mut DriverStep) {
         if !self.turn_active {
+            self.reset_compaction_for_new_turn();
             self.turn_n += 1;
             self.turn_active = true;
             // A turn opening is a clean slate for the interrupt watchdog: an
@@ -1014,8 +1041,41 @@ impl ClaudeMapper {
                 step.events.push(self.init_event());
             }
             // Mode changes the CLI makes on its own (plan exits, applied
-            // setMode suggestions) ride system/status.
+            // setMode suggestions) ride system/status. The same frame owns
+            // compaction's real lifecycle: start is emitted before any
+            // assistant frame, so it must also open the turn boundary (manual
+            // /compact otherwise looked idle until it finished).
             Some("status") => {
+                if frame["status"] == "compacting" {
+                    if !self.compaction_active {
+                        self.ensure_turn(step);
+                        self.compaction_active = true;
+                        self.compaction_completed = false;
+                        step.events.push(AgentEvent::ContextCompaction {
+                            phase: CompactionPhase::Started,
+                            pre_tokens: None,
+                        });
+                    }
+                } else if let Some(result) = frame["compact_result"].as_str() {
+                    if result == "failed" && self.compaction_active {
+                        self.compaction_active = false;
+                        self.compaction_completed = true;
+                        step.events.push(AgentEvent::ContextCompaction {
+                            phase: CompactionPhase::Failed,
+                            pre_tokens: None,
+                        });
+                    } else if result == "success" && self.compaction_active {
+                        // Fallback for a future build that omits/reorders the
+                        // richer compact_boundary. Today's wire lands the
+                        // boundary first, so its pre_tokens win.
+                        self.compaction_active = false;
+                        self.compaction_completed = true;
+                        step.events.push(AgentEvent::ContextCompaction {
+                            phase: CompactionPhase::Completed,
+                            pre_tokens: None,
+                        });
+                    }
+                }
                 if let Some(mode) = frame["permissionMode"].as_str() {
                     if self.current_mode.as_deref() != Some(mode) {
                         self.current_mode = Some(mode.to_string());
@@ -1027,12 +1087,14 @@ impl ClaudeMapper {
             }
             Some("compact_boundary") => {
                 let pre = frame["compact_metadata"]["pre_tokens"].as_u64();
-                step.events.push(AgentEvent::Notice {
-                    text: match pre {
-                        Some(pre) => format!("context compacted ({pre} tokens summarized)"),
-                        None => "context compacted".to_string(),
-                    },
-                });
+                self.compaction_active = false;
+                if !self.compaction_completed {
+                    self.compaction_completed = true;
+                    step.events.push(AgentEvent::ContextCompaction {
+                        phase: CompactionPhase::Completed,
+                        pre_tokens: pre,
+                    });
+                }
             }
             // Thinking progress rides its own system frames — present even
             // when the display is summarized and no thought text streams,
@@ -2181,6 +2243,7 @@ impl ClaudeMapper {
         // unchanged.
         let was_active = self.turn_active;
         self.turn_active = false;
+        self.settle_compaction_at_turn_end();
         self.tool_kinds.clear();
         self.streamed.clear();
         // Task maps live per turn (the extension wipes its map on result) —
@@ -2317,6 +2380,7 @@ impl ClaudeMapper {
                     // as a quiet stop, nor let its armed watchdog abort it.
                     self.interrupt_requested = false;
                     self.interrupt_grace = None;
+                    self.reset_compaction_for_new_turn();
                     self.turn_n += 1;
                     self.turn_active = true;
                     step.events.push(AgentEvent::TurnStarted {
@@ -2842,6 +2906,7 @@ impl ClaudeMapper {
         }
         let turn_id = self.turn_id();
         self.turn_active = false;
+        self.settle_compaction_at_turn_end();
         self.interrupt_requested = false;
         // Same per-turn cleanup a real result performs — including closing
         // still-open subagent rows as failed (the interrupt killed them).
@@ -6271,8 +6336,23 @@ mod tests {
     }
 
     #[test]
-    fn compact_boundary_maps_to_notice() {
+    fn compaction_status_and_boundary_map_to_one_lifecycle() {
         let mut m = mapper();
+        let start = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        assert!(matches!(
+            &start.events[..],
+            [
+                AgentEvent::TurnStarted { .. },
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                }
+            ]
+        ));
         let step = m.on_frame(&json!({
             "type": "system",
             "subtype": "compact_boundary",
@@ -6280,8 +6360,135 @@ mod tests {
         }));
         assert!(matches!(
             &step.events[0],
-            AgentEvent::Notice { text } if text.contains("168000")
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(168000),
+                ..
+            }
         ));
+        // The overlapping compact_result success frame must not duplicate the
+        // completion notice after the richer boundary already supplied it.
+        let duplicate = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": null,
+            "compact_result": "success",
+        }));
+        assert!(duplicate.events.is_empty());
+    }
+
+    #[test]
+    fn failed_compaction_settles_the_progress_lane() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        let step = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": null,
+            "compact_result": "failed",
+            "compact_error": "Not enough messages to compact.",
+        }));
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Failed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn interrupted_compaction_does_not_suppress_the_next_lifecycle() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+
+        // A user stop can end the turn without a compact_result frame. The
+        // UI settles from TurnAborted, and the mapper guard must settle too.
+        let aborted = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(aborted
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnAborted { .. })));
+        assert!(!m.compaction_active);
+        assert!(m.compaction_completed);
+
+        let restarted = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        assert!(matches!(
+            &restarted.events[..],
+            [
+                AgentEvent::TurnStarted { .. },
+                AgentEvent::ContextCompaction {
+                    phase: CompactionPhase::Started,
+                    ..
+                }
+            ]
+        ));
+
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "pre_tokens": 84000 },
+        }));
+        m.on_frame(&json!({ "type": "result", "is_error": false }));
+        m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "next turn".into(),
+            }],
+        });
+        let standalone = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": { "pre_tokens": 42000 },
+        }));
+        assert!(matches!(
+            &standalone.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                pre_tokens: Some(42000),
+            }
+        ));
+    }
+
+    #[test]
+    fn watchdog_abort_also_resets_the_compaction_guard() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        m.on_command(AgentCommand::Interrupt);
+        for _ in 0..INTERRUPT_GRACE_TICKS {
+            m.tick();
+        }
+        assert!(!m.turn_active);
+        assert!(!m.compaction_active);
+        assert!(m.compaction_completed);
+
+        let restarted = m.on_frame(&json!({
+            "type": "system",
+            "subtype": "status",
+            "status": "compacting",
+        }));
+        assert!(restarted.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Started,
+                ..
+            }
+        )));
     }
 
     #[test]

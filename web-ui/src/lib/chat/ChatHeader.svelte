@@ -190,7 +190,7 @@
     </button>
   {/if}
   <span class="spacer"></span>
-  {#if store.running}
+  {#if store.running || store.compacting}
     <button class="stop" onclick={onInterrupt} title="interrupt the agent (Esc)">stop</button>
   {/if}
   {#if store.rateLimit !== null && (store.rateLimit.limitReached || store.rateLimit.utilization >= 80)}

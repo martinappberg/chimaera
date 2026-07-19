@@ -155,6 +155,51 @@ async fn claude_echo_turn_streams_deltas_and_reports_cost() {
 }
 
 #[tokio::test]
+#[ignore = "live: spawns real claude, needs auth, bills one tiny turn + compaction"]
+async fn claude_manual_compaction_emits_status_lifecycle() {
+    let dir = tmpdir();
+    let mut chat = spawn_claude(dir.path(), &[]);
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+
+    chat.send_user_text("Reply with exactly: ok")
+        .await
+        .expect("send seed turn");
+    let _ = run_turn_to_result(&mut chat).await;
+
+    chat.send_user_text("/compact").await.expect("send compact");
+    let mut saw_start = false;
+    let mut saw_result = false;
+    loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("claude exited during compaction");
+        if frame["type"] == "system" && frame["subtype"] == "status" {
+            if frame["status"] == "compacting" {
+                saw_start = true;
+            }
+            if frame["compact_result"].is_string() {
+                saw_result = true;
+                assert!(frame["status"].is_null());
+                if frame["compact_result"] == "failed" {
+                    assert!(frame["compact_error"].is_string());
+                }
+            }
+        }
+        if frame["type"] == "result" {
+            break;
+        }
+    }
+    assert!(saw_start, "manual compaction announces status=compacting");
+    assert!(saw_result, "manual compaction settles with compact_result");
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test]
 #[ignore = "live: spawns real claude twice, needs auth, bills two tiny turns"]
 async fn claude_permission_roundtrip_allow_then_deny() {
     // Allow: the tool must actually run (file appears on disk).

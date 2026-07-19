@@ -303,7 +303,6 @@
         // own /compact rides its catalog — fall through to the CLI send.
         if (agentKind !== "codex") return false;
         if (!sendCommand({ type: "compact" }, "compact request not sent")) return false;
-        store.notice("compacting context…", "info");
         return true;
       case "mcp":
         if (agentKind === "claude") {
@@ -584,9 +583,11 @@
   });
 
   /** Live status line under the transcript: what the agent is doing NOW.
-   *  Phases: starting → thinking / writing / {tool title} → working
+   *  Phases: starting → compacting / thinking / writing / {tool title} → working
    *  (between tools) → gone. */
+  const agentBusy = $derived(store.running || store.compacting);
   const activityLabel = $derived.by(() => {
+    if (store.compacting) return "compacting context";
     const a = store.activity;
     if (a === null) return "working";
     switch (a.kind) {
@@ -608,7 +609,7 @@
   // interval tears down when the turn ends or the component unmounts.
   let turnElapsedMs = $state(0);
   $effect(() => {
-    const start = chatTurnStart(session.id, store.running, performance.now());
+    const start = chatTurnStart(session.id, agentBusy, performance.now());
     if (start === null) {
       turnElapsedMs = 0;
       return;
@@ -886,7 +887,7 @@
       <QuestionCard {request} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
-    {#if store.running && store.pending.length === 0 && store.questions.length === 0}
+    {#if agentBusy && store.pending.length === 0 && store.questions.length === 0}
       <div class="status-row" aria-live="polite">
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
@@ -894,6 +895,11 @@
         <span class="status-label">{activityLabel}</span>
         {#if turnElapsedLabel !== null}
           <span class="status-elapsed">{turnElapsedLabel}</span>
+        {/if}
+        {#if store.compacting}
+          <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
+            <span></span>
+          </span>
         {/if}
       </div>
     {/if}
@@ -1039,7 +1045,7 @@
     />
   {/if}
 
-  {#if store.promptSuggestion !== null && !store.running}
+  {#if store.promptSuggestion !== null && !agentBusy}
     <div class="suggestion-row">
       <button
         class="suggestion"
@@ -1063,7 +1069,7 @@
 
   <Composer
     sessionId={session.id}
-    running={store.running}
+    running={agentBusy}
     disabled={store.exited !== null || store.degraded}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
@@ -1311,6 +1317,33 @@
     font-variant-numeric: tabular-nums;
     color: color-mix(in srgb, var(--muted) 80%, transparent);
   }
+  /* Compaction has no honest percentage on either agent wire. Show a bounded
+     indeterminate track instead of inventing one; start/completion still come
+     from journaled protocol events, so reconnect never resets the truth. */
+  .compaction-progress {
+    position: relative;
+    width: clamp(48px, 12vw, 112px);
+    height: 2px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--edge) 65%, transparent);
+  }
+  .compaction-progress > span {
+    position: absolute;
+    inset-block: 0;
+    width: 42%;
+    border-radius: inherit;
+    background: var(--accent);
+    animation: compact-sweep 1.35s ease-in-out infinite;
+  }
+  @keyframes compact-sweep {
+    from {
+      transform: translateX(-110%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
   @keyframes spark-pulse {
     0%,
     100% {
@@ -1333,8 +1366,12 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .status-spark,
-    .status-label {
+    .status-label,
+    .compaction-progress > span {
       animation: none;
+    }
+    .compaction-progress > span {
+      inset-inline-start: 29%;
     }
   }
   /* The strip chrome (border, padding, collapse header, bounded scroll) now

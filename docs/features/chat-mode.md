@@ -51,8 +51,14 @@ TUI (see [view switch](#view-switch-and-rewind)).
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
-  is native for codex (`thread/compact/start`; the compaction runs as its own turn and lands a
-  "context compacted" notice) — claude's `/compact` rides its own CLI catalog as prompt text.
+  is native for codex (`thread/compact/start`; the compaction runs as its own turn) — claude's
+  `/compact` rides its own CLI catalog as prompt text. Manual and automatic compaction on either
+  agent normalize to one journaled lifecycle: while history is being summarized the live status
+  reads **"compacting context"** with an indeterminate progress track (no invented percentage),
+  the dashboard carries the same now-line, and completion becomes a quiet transcript notice
+  (including Claude's pre-summary token count when reported). Reconnect/replay restores an active
+  compaction instead of falling back to a generic working spinner; turn abort, failure, or driver
+  exit always settles it.
   The slash popover triggers for a **line-leading** `/command` anywhere in the draft (a follow-up
   begun on a fresh line), not only when the slash is the first character — a mid-draft pick
   completes the token in place; only a whole-draft slash takes the command path. Ordinary path

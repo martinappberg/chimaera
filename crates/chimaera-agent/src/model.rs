@@ -255,6 +255,18 @@ pub enum AgentEvent {
         max_tokens: u64,
         percentage: f64,
     },
+    /// The agent is summarizing its conversation to reclaim context. This is
+    /// a real, sometimes-long lifecycle rather than a transcript notice:
+    /// claude reports `system/status` compacting + compact_result/boundary,
+    /// while codex reports a contextCompaction item started/completed pair.
+    /// Journal it so reconnect/replay cannot turn active compaction back into
+    /// an unexplained "working" spinner.
+    ContextCompaction {
+        phase: CompactionPhase,
+        /// Claude's compact_boundary reports how much context was summarized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+    },
     /// Account usage windows (claude get_usage; rendered by the /usage panel).
     UsageReport {
         windows: Vec<UsageWindow>,
@@ -806,6 +818,14 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
 pub enum SessionUi {
     Chat,
     Term,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    Started,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
