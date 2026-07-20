@@ -255,6 +255,18 @@ pub enum AgentEvent {
         max_tokens: u64,
         percentage: f64,
     },
+    /// The agent is summarizing its conversation to reclaim context. This is
+    /// a real, sometimes-long lifecycle rather than a transcript notice:
+    /// claude reports `system/status` compacting + compact_result/boundary,
+    /// while codex reports a contextCompaction item started/completed pair.
+    /// Journal it so reconnect/replay cannot turn active compaction back into
+    /// an unexplained "working" spinner.
+    ContextCompaction {
+        phase: CompactionPhase,
+        /// Claude's compact_boundary reports how much context was summarized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+    },
     /// Account usage windows (claude get_usage; rendered by the /usage panel).
     UsageReport {
         windows: Vec<UsageWindow>,
@@ -334,6 +346,15 @@ pub enum AgentEvent {
     /// The session moved between chat and terminal mode (the toggle).
     ModeSwitch {
         to: SessionUi,
+    },
+    /// Boundary between a copied source-journal prefix and the destination
+    /// session's own events. A portable handoff's old native ids are display
+    /// history only; consumers use this marker to keep them from becoming
+    /// actionable rewind/fork points in the fresh agent conversation.
+    Forked {
+        source_agent: String,
+        source_seq: u64,
+        native: bool,
     },
     Error {
         message: String,
@@ -494,6 +515,17 @@ pub enum AgentCommand {
     Send {
         blocks: Vec<ContentBlock>,
     },
+    /// Server-owned first turn for a transcript fork. `blocks` is the
+    /// canonical handoff the destination agent receives; `display_text` is
+    /// the compact user row journaled in its place so the copied transcript
+    /// is not duplicated into one enormous bubble. The variant cannot be
+    /// deserialized from the public WS wire — only trusted server glue may
+    /// construct it.
+    #[serde(skip_deserializing)]
+    PrimeFork {
+        blocks: Vec<ContentBlock>,
+        display_text: String,
+    },
     Permission {
         request_id: String,
         option_id: String,
@@ -633,7 +665,7 @@ impl AgentCommand {
     /// callers such as the workspace Mastermind MCP.
     pub fn validate_ingress(&self) -> Result<(), CommandValidationError> {
         match self {
-            Self::Send { blocks } => {
+            Self::Send { blocks } | Self::PrimeFork { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
                 let mut images = 0usize;
                 let mut text_total = 0usize;
@@ -667,6 +699,13 @@ impl AgentCommand {
                     image_total,
                     COMMAND_IMAGE_BASE64_TOTAL_MAX,
                 )?;
+                if let Self::PrimeFork { display_text, .. } = self {
+                    check_command_len(
+                        "fork display text",
+                        display_text.len(),
+                        COMMAND_TEXT_BLOCK_MAX,
+                    )?;
+                }
             }
             Self::Permission {
                 request_id,
@@ -748,10 +787,15 @@ impl AgentCommand {
     /// to consume it. Only sends retain bulk payloads; the other variants are
     /// independently leaf-capped and live only in the bounded command channel.
     pub fn retained_send_bytes(&self) -> Option<usize> {
-        let Self::Send { blocks } = self else {
-            return None;
+        let (blocks, display_bytes) = match self {
+            Self::Send { blocks } => (blocks, 0),
+            Self::PrimeFork {
+                blocks,
+                display_text,
+            } => (blocks, display_text.len()),
+            _ => return None,
         };
-        let mut bytes = std::mem::size_of_val(blocks.as_slice());
+        let mut bytes = std::mem::size_of_val(blocks.as_slice()) + display_bytes;
         for block in blocks {
             bytes = bytes.saturating_add(match block {
                 ContentBlock::Text { text } => text.len(),
@@ -806,6 +850,14 @@ pub fn blocks_text(blocks: &[ContentBlock]) -> String {
 pub enum SessionUi {
     Chat,
     Term,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    Started,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1025,7 +1077,7 @@ fn is_zero_u64(n: &u64) -> bool {
 /// message frames (claude checkpoint keys, codex clientUserMessageId).
 /// Only transcript-uniqueness matters.
 pub fn fresh_uuid() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut b = [0u8; 16];
     rand::rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -1251,6 +1303,14 @@ mod tests {
                 destination: None,
                 feedback: Some("use rg".into()),
             }
+        );
+
+        assert!(
+            serde_json::from_str::<AgentCommand>(
+                r#"{"type":"prime_fork","blocks":[],"display_text":"hide me"}"#,
+            )
+            .is_err(),
+            "the server-owned fork primer must not be callable from the public WS wire"
         );
     }
 

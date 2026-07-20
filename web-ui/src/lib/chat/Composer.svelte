@@ -54,6 +54,8 @@
   }: Props = $props();
 
   const uid = $props.id();
+  const COMPOSER_MIN_HEIGHT = 38;
+  const COMPOSER_MAX_HEIGHT = 352;
 
   // The parent {#key}s ChatView (and so this composer) per session — one
   // instance, one session — and remounts it on every tab switch, so the
@@ -86,6 +88,15 @@
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
+  let paneHeight = $state(0);
+  /** Null follows content; a number is the height chosen with the top-edge
+   *  grip. It resets after a successful send so the next draft starts quiet. */
+  let manualHeight = $state<number | null>(null);
+  let currentHeight = $state(COMPOSER_MIN_HEIGHT);
+  let resizing = $state(false);
+  let resizeStartY = 0;
+  let resizeStartHeight = 0;
+  let resizeMoved = false;
   let selected = $state(0);
   let fileMatches = $state<QuickOpenEntry[]>([]);
   /** The @token the current matches were computed FOR (position + text) —
@@ -97,15 +108,115 @@
     if (focused) el?.focus();
   });
 
+  // Workbench splits resize without changing the browser viewport. Observe
+  // the owning chat pane so both auto and manual heights stay inside the live
+  // reading area; disconnect on remount/tab switch per the runes teardown rule.
+  $effect(() => {
+    const t = el;
+    if (t === null) return;
+    const pane = t.closest<HTMLElement>(".chat");
+    if (pane === null) return;
+    const measure = () => (paneHeight = pane.clientHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(pane);
+    return () => observer.disconnect();
+  });
+
+  function maxComposerHeight(): number {
+    // A composer should help with a long prompt without swallowing the chat.
+    // Measure the pane rather than the window because workbench splits can be
+    // much shorter than the app viewport.
+    const measuredHeight =
+      paneHeight || el?.closest<HTMLElement>(".chat")?.clientHeight || window.innerHeight;
+    return Math.max(
+      COMPOSER_MIN_HEIGHT,
+      Math.min(COMPOSER_MAX_HEIGHT, Math.floor(measuredHeight * 0.42)),
+    );
+  }
+
+  function clampComposerHeight(height: number): number {
+    return Math.max(COMPOSER_MIN_HEIGHT, Math.min(maxComposerHeight(), height));
+  }
+
+  function chooseComposerHeight(height: number | null) {
+    manualHeight = height === null ? null : clampComposerHeight(height);
+  }
+
+  /** Every successfully consumed draft returns the next input to content-fit,
+   *  whether it became an agent turn or a native slash-command action. */
+  function clearSubmittedDraft() {
+    draft = "";
+    chooseComposerHeight(null);
+  }
+
   // Autosize from rendered height, not "\n" count — soft-wrapped pastes
-  // must grow the box too. Cap ≈ 6 lines; beyond that it scrolls.
+  // grow the box too. A manual resize takes over until send/reset; either path
+  // is capped so the transcript always retains useful reading space.
   $effect(() => {
     void draft;
     const t = el;
     if (t === null) return;
-    t.style.height = "auto";
-    t.style.height = `${t.scrollHeight + 2}px`; // +2: 1px border × 2, box-sizing is border-box
+    const chosen = manualHeight;
+    if (chosen === null) {
+      t.style.height = "auto";
+      // +2: 1px border × 2, box-sizing is border-box.
+      t.style.height = `${clampComposerHeight(t.scrollHeight + 2)}px`;
+    } else {
+      t.style.height = `${clampComposerHeight(chosen)}px`;
+    }
+    currentHeight = t.getBoundingClientRect().height;
   });
+
+  /** The grip rides the text area's top edge. Dragging upward increases the
+   *  height, matching the bottom-anchored composer; pointer capture avoids
+   *  document listeners and keeps the drag alive outside the narrow handle. */
+  function startResize(e: PointerEvent) {
+    if (e.button !== 0 || el === null) return;
+    e.preventDefault();
+    resizeStartY = e.clientY;
+    resizeStartHeight = el.getBoundingClientRect().height;
+    resizeMoved = false;
+    resizing = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function moveResize(e: PointerEvent) {
+    if (!resizing) return;
+    if (Math.abs(resizeStartY - e.clientY) > 2) resizeMoved = true;
+    chooseComposerHeight(resizeStartHeight + resizeStartY - e.clientY);
+  }
+
+  function endResize(e: PointerEvent) {
+    if (!resizing) return;
+    resizing = false;
+    const handle = e.currentTarget as HTMLElement;
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+  }
+
+  /** A click is the discoverable companion to the precision drag: expand an
+   *  auto-sized draft to the pane cap, or return a manually sized box to fit.
+   *  Pointerup also emits click after a drag, so consume that synthetic click
+   *  without undoing the height the user just chose. */
+  function toggleComposerHeight() {
+    if (resizeMoved) {
+      resizeMoved = false;
+      return;
+    }
+    chooseComposerHeight(manualHeight === null ? maxComposerHeight() : null);
+  }
+
+  function resizeWithKeyboard(e: KeyboardEvent) {
+    if (el === null) return;
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      e.preventDefault();
+      const delta = e.key === "ArrowUp" ? 24 : -24;
+      chooseComposerHeight((manualHeight ?? el.getBoundingClientRect().height) + delta);
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      chooseComposerHeight(null);
+    }
+  }
 
   // Workbench insert flows (selection references, provenance tags) land in
   // the draft exactly like they would type into a PTY's input — appended,
@@ -251,7 +362,7 @@
     const wholeDraft =
       token !== null && token.start === 0 && draft.slice(token.text.length).trim() === "";
     if (wholeDraft && onSlash(name)) {
-      draft = "";
+      clearSubmittedDraft();
       return;
     }
     if (token === null) {
@@ -296,7 +407,7 @@
     if (text.startsWith("/")) {
       const [name, ...rest] = text.slice(1).split(/\s+/);
       if (onSlash(name, rest.join(" "))) {
-        draft = "";
+        clearSubmittedDraft();
         return;
       }
     }
@@ -304,7 +415,7 @@
     // reconnect window the socket is not OPEN and the message would otherwise
     // vanish silently.
     if (onSubmit(text, images)) {
-      draft = "";
+      clearSubmittedDraft();
       images = [];
     }
   }
@@ -467,6 +578,19 @@
   {/if}
 
   <div class="input-row">
+    <button
+      type="button"
+      class="resize-handle"
+      class:resizing
+      aria-label={`resize message composer, ${Math.round(currentHeight)} pixels high`}
+      title="drag to resize · click to expand or fit content"
+      onpointerdown={startResize}
+      onpointermove={moveResize}
+      onpointerup={endResize}
+      onpointercancel={endResize}
+      onkeydown={resizeWithKeyboard}
+      onclick={toggleComposerHeight}
+    ></button>
     <textarea
       bind:this={el}
       bind:value={draft}
@@ -608,6 +732,42 @@
     position: relative;
     display: flex;
   }
+  /* A top-edge grip is the natural geometry for a bottom-anchored composer:
+     dragging up makes room, while click toggles expanded/content-fit.
+     The line only appears on approach/focus, keeping the idle input quiet. */
+  .resize-handle {
+    position: absolute;
+    z-index: 2;
+    top: -5px;
+    left: 18px;
+    right: 18px;
+    height: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: ns-resize;
+    touch-action: none;
+    padding: 0;
+    border: none;
+    background: none;
+    outline: none;
+  }
+  .resize-handle::after {
+    content: "";
+    width: 34px;
+    height: 2px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--edge) 65%, transparent);
+    transition:
+      background-color 0.12s ease,
+      width 0.12s ease;
+  }
+  .resize-handle:hover::after,
+  .resize-handle:focus-visible::after,
+  .resize-handle.resizing::after {
+    width: 42px;
+    background: color-mix(in srgb, var(--accent) 48%, var(--edge));
+  }
   textarea {
     width: 100%;
     resize: none;
@@ -619,7 +779,8 @@
     font-size: var(--text-md);
     line-height: 1.45;
     padding: 7px 38px 7px 10px; /* right clears the 26px action button */
-    max-height: 130px; /* 6 lines at 13px/1.45 + 14px padding + 2px border */
+    min-height: 38px;
+    max-height: min(42vh, 22rem);
     overflow-y: auto;
     outline: none;
     box-sizing: border-box;

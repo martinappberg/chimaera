@@ -26,7 +26,145 @@ const QUEUED_MID_TURN: Record<string, unknown>[] = [
   { type: "user_message_update", id: "q1", state: "sent" },
 ];
 
+describe("ChatStore context compaction", () => {
+  it("keeps progress replay-safe and settles with the summarized token count", () => {
+    const started = fold([
+      { type: "turn_started", turn_id: "compact-1" },
+      { type: "context_compaction", phase: "started" },
+    ]);
+    expect(started.running).toBe(true);
+    expect(started.compacting).toBe(true);
+
+    const events = [
+      { type: "turn_started", turn_id: "compact-1" },
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "completed", pre_tokens: 168_000 },
+      { type: "turn_completed", turn_id: "compact-1", usage: {} },
+    ];
+    const live = fold(events);
+    const replay = fold(events);
+    expect(live.compacting).toBe(false);
+    expect(replay.blocks).toEqual(live.blocks);
+    const notice = live.blocks.find(
+      (b) => b.kind === "notice" && b.text.includes("tokens summarized"),
+    );
+    expect(notice).toMatchObject({ kind: "notice", tone: "info" });
+    expect(notice?.kind === "notice" ? notice.text : "").toContain("168");
+  });
+
+  it("clears failed or terminally-incomplete progress without duplicating agent output", () => {
+    const failed = fold([
+      { type: "context_compaction", phase: "started" },
+      { type: "context_compaction", phase: "failed" },
+    ]);
+    expect(failed.compacting).toBe(false);
+    expect(failed.blocks).toEqual([]);
+
+    const missingTerminalItem = fold([
+      { type: "turn_started", turn_id: "compact-2" },
+      { type: "context_compaction", phase: "started" },
+      { type: "turn_aborted", turn_id: "compact-2", reason: "interrupted", interrupted: true },
+    ]);
+    expect(missingTerminalItem.compacting).toBe(false);
+  });
+});
+
 describe("ChatStore pending-send ordering", () => {
+  it("tracks exact portable boundaries and completed-turn native fork points", () => {
+    const partial = fold([
+      { type: "user_message", text: "question", id: "u1", queued: false },
+      { type: "checkpoint", user_message_id: "u1", preceding_uuid: null },
+      { type: "turn_started", turn_id: "t1" },
+      { type: "message_chunk", turn_id: "t1", text: "ans" },
+      { type: "message_chunk", turn_id: "t1", text: "wer" },
+    ]);
+    expect(partial.blocks[0]).toMatchObject({
+      kind: "user",
+      forkSeq: 2,
+      checkpoint: { id: "u1" },
+    });
+    expect(partial.blocks[1]).toMatchObject({
+      kind: "message",
+      text: "answer",
+      forkSeq: 5,
+      nativeTurnComplete: false,
+    });
+
+    partial.apply({
+      seq: 6,
+      ts: 6,
+      ev: { type: "turn_completed", turn_id: "t1", usage: {} },
+    } as SeqEvent);
+    expect(partial.blocks[1]).toMatchObject({
+      forkSeq: 6,
+      nativeTurnComplete: true,
+      turnId: "t1",
+    });
+
+    partial.apply({
+      seq: 7,
+      ts: 7,
+      ev: { type: "forked", source_agent: "codex", source_seq: 6, native: false },
+    } as SeqEvent);
+    expect(partial.blocks[0]).toMatchObject({ checkpoint: null });
+    expect(partial.blocks[1]).toMatchObject({ nativeTurnComplete: false });
+  });
+
+  it("clears source-process telemetry at a portable fork marker", () => {
+    const store = fold([
+      {
+        type: "init",
+        model: "claude-source",
+        current_mode: "source-mode",
+        modes: [{ id: "source-mode", label: "Source" }],
+        slash_commands: [{ name: "source-command" }],
+        models: [{ id: "source-model", label: "Source model", efforts: ["high"] }],
+      },
+      { type: "effort_state", effort: "high", ultracode: true },
+      { type: "context_usage", percentage: 72, total_tokens: 720, max_tokens: 1_000 },
+      {
+        type: "rate_limit",
+        utilization: 81,
+        label: "source weekly",
+        resets_at: "tomorrow",
+        limit_reached: false,
+      },
+      {
+        type: "rewind_result",
+        user_message_id: "u1",
+        can_rewind: true,
+        files_changed: ["source.txt"],
+        applied: false,
+      },
+      { type: "mcp_servers", servers: [{ name: "source", status: "connected", tools: 3 }] },
+      { type: "prompt_suggestion", text: "source suggestion" },
+      {
+        type: "plan",
+        entries: [{ content: "source plan", status: "in_progress", id: "1" }],
+      },
+      { type: "error", message: "source process failed", fatal: true },
+      { type: "forked", source_agent: "claude", source_seq: 9, native: false },
+    ]);
+
+    expect(store.model).toBeNull();
+    expect(store.modes).toEqual([]);
+    expect(store.currentMode).toBeNull();
+    expect(store.slashCommands).toEqual([]);
+    expect(store.models).toEqual([]);
+    expect(store.effort).toBeNull();
+    expect(store.ultracode).toBe(false);
+    expect(store.contextPct).toBeNull();
+    expect(store.contextTokens).toBeNull();
+    expect(store.rateLimit).toBeNull();
+    expect(store.rewind).toBeNull();
+    expect(store.mcpServers).toBeNull();
+    expect(store.promptSuggestion).toBeNull();
+    expect(store.fatalError).toBeNull();
+    expect(store.plan).toEqual([]);
+    expect(store.exited).toBeNull();
+    expect(store.degraded).toBe(false);
+  });
+
   it("keeps a queued send out of the transcript until it is sent", () => {
     // Fold only up to just before the turn ends (the mid-stream window).
     const store = fold(QUEUED_MID_TURN.slice(0, 5));

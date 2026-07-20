@@ -44,7 +44,8 @@ hard-resets and rebuilds.
 | `AgentsTray.svelte` / `BackgroundTray.svelte` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
-| `RewindDialog.svelte` | The rewind/fork-point confirmation overlay (claude fork + codex `thread/rollback`). |
+| `RewindDialog.svelte` | The destructive in-place rewind/fork-point confirmation overlay (claude rewind + codex `thread/rollback`). |
+| `ForkDialog.svelte` | The non-destructive conversation-branch picker: target agent plus native-vs-portable boundary disclosure. |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
@@ -70,8 +71,9 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   when not OPEN — respect it (the composer keeps the draft; `store.connected`
   tracks liveness). Reconnect replays the gap; don't invent a client-side queue.
 - **A queued send is NOT a transcript block.** Queued/undelivered user messages
-  live in `store.pendingSends` (the stack above the composer), never in `blocks` —
-  so a mid-turn send can't splice into a running turn's output. The reducer moves
+  live in `store.pendingSends` (rendered at the scrollable transcript tail), never
+  in `blocks` — so a mid-turn send can't splice into a running turn's output or
+  crowd the fixed composer. The reducer moves
   an entry into `blocks` (appended at the end) only when `user_message_update`
   resolves it `sent`; `cancelled` removes it; `dropped` marks it "not delivered"
   and it stays in the stack until dismissed. A **Stop never drops the queue** —
@@ -87,6 +89,14 @@ clipboard writer lifted out of the terminal pool) — see the shared/ area.
   `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
+- **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
+  latest sequence that makes that message true on replay (a queued user message
+  advances on its `sent` update; a final Codex assistant message advances on
+  `turn_completed`). Only pass `nativeAt` for the exact vendor boundary the
+  reducer proved; the server independently validates it against the journal.
+  `forked {native:false}` clears copied source-native ids and stale live work:
+  those rows are display history in the fresh destination, not actionable
+  rewind points or running prompts/tasks.
 - **Runes discipline.** Mutate `$state` only inside the store's methods; give
   every timer/listener an `$effect` teardown (a stray debounce firing after
   unmount is a bug); an `$effect` that both reads and writes the same `$state`

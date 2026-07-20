@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick } from "svelte";
-  import { rewindSession, renameSession, type Session } from "../workspace/sessions";
+  import { forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -23,6 +23,7 @@
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
+  import ForkDialog from "./ForkDialog.svelte";
   import Composer from "./Composer.svelte";
   import type { ImageAttachment } from "./images";
   import type { ChatBlock, PlanEntry } from "./store.svelte";
@@ -40,6 +41,8 @@
      *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
      *  above all — so the native auth flow runs where it belongs. */
     onSwitchToTerminal?: () => void;
+    /** Focus the newly-created session while the source remains alive. */
+    onForked?: (session: Session) => void;
   }
 
   let {
@@ -49,6 +52,7 @@
     onOpenFile,
     onOpenPath,
     onSwitchToTerminal,
+    onForked,
   }: Props = $props();
 
   // The component is {#key}ed on session id by its parent: one instance per
@@ -69,6 +73,7 @@
    *  fall back to a built-in map until it resolves (a workspace can mix agents,
    *  so the surface always says WHICH one this is). */
   let agentCatalogName = $state<string | null>(null);
+  let forkAgents = $state<{ id: string; name: string }[]>([]);
   const agentName = $derived(
     agentCatalogName ??
       (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind),
@@ -77,7 +82,13 @@
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
     agentCatalogName = info?.name ?? null;
+    forkAgents = agents
+      .filter((agent) => agent.installed && !agent.outdated && agent.chatCapable)
+      .map((agent) => ({ id: agent.id, name: agent.name }));
   });
+  const availableForkAgents = $derived(
+    forkAgents.length > 0 ? forkAgents : [{ id: agentKind, name: agentName }],
+  );
 
   let transcriptEl = $state<HTMLElement | null>(null);
   // Seed scroll intent from the pool so a remount restores the reading
@@ -159,6 +170,49 @@
       else transcriptEl.scrollTop = saved.scrollTop;
     });
   });
+
+  // --- transcript fork -------------------------------------------------------
+  // Any rendered user/assistant message is a portable journal boundary. A
+  // same-agent choice upgrades to the native protocol only when that exact
+  // row also carries a native point: Claude's user-message checkpoint uuid,
+  // or Codex's final assistant block from a completed turn.
+  let forkIntent = $state<null | {
+    throughSeq: number;
+    nativeAt: string | null;
+    applying: boolean;
+  }>(null);
+
+  function askFork(block: ChatBlock) {
+    if (block.kind === "user") {
+      forkIntent = {
+        throughSeq: block.forkSeq,
+        nativeAt: agentKind === "claude" ? (block.checkpoint?.id ?? null) : null,
+        applying: false,
+      };
+    } else if (block.kind === "message") {
+      forkIntent = {
+        throughSeq: block.forkSeq,
+        nativeAt:
+          agentKind === "codex" && block.nativeTurnComplete ? block.turnId : null,
+        applying: false,
+      };
+    }
+  }
+
+  function confirmFork(destination: string) {
+    const intent = forkIntent;
+    if (intent === null || intent.applying) return;
+    forkIntent = { ...intent, applying: true };
+    void forkSession(session.id, intent.throughSeq, destination, intent.nativeAt)
+      .then((forked) => {
+        forkIntent = null;
+        onForked?.(forked);
+      })
+      .catch((error: unknown) => {
+        forkIntent = null;
+        store.notice(`fork failed: ${String(error)}`, "error");
+      });
+  }
 
   // Stick to the bottom while new content streams, unless the user scrolled
   // up to read history. Guarded on atBottom so a background stream never forces
@@ -303,7 +357,6 @@
         // own /compact rides its catalog — fall through to the CLI send.
         if (agentKind !== "codex") return false;
         if (!sendCommand({ type: "compact" }, "compact request not sent")) return false;
-        store.notice("compacting context…", "info");
         return true;
       case "mcp":
         if (agentKind === "claude") {
@@ -584,9 +637,11 @@
   });
 
   /** Live status line under the transcript: what the agent is doing NOW.
-   *  Phases: starting → thinking / writing / {tool title} → working
+   *  Phases: starting → compacting / thinking / writing / {tool title} → working
    *  (between tools) → gone. */
+  const agentBusy = $derived(store.running || store.compacting);
   const activityLabel = $derived.by(() => {
+    if (store.compacting) return "compacting context";
     const a = store.activity;
     if (a === null) return "working";
     switch (a.kind) {
@@ -608,7 +663,7 @@
   // interval tears down when the turn ends or the component unmounts.
   let turnElapsedMs = $state(0);
   $effect(() => {
-    const start = chatTurnStart(session.id, store.running, performance.now());
+    const start = chatTurnStart(session.id, agentBusy, performance.now());
     if (start === null) {
       turnElapsedMs = 0;
       return;
@@ -701,8 +756,8 @@
     let group: Extract<RenderItem, { t: "group" }> | null = null;
     store.blocks.forEach((block, i) => {
       // Every user block in `blocks` is delivered — queued/undelivered sends
-      // live in the bottom pending stack (`store.pendingSends`), never here — so
-      // they all render inline in transcript order.
+      // live in the pending transcript tail (`store.pendingSends`), never
+      // here — so they all render inline in transcript order.
       if (block.kind === "tool") {
         if (group === null) {
           group = { t: "group", key: `g-${block.id}`, tools: [] };
@@ -717,9 +772,9 @@
     return items;
   });
 
-  /** Index of the last block (the streaming reveal keys off it). Every block
-   *  renders inline now — queued sends live in the pending stack, not in
-   *  `blocks` — so this is simply the tail. */
+  /** Index of the last block (the streaming reveal keys off it). Queued sends
+   *  render from their own pending tail, not `blocks`, so this is simply the
+   *  delivered-block tail. */
   const lastInlineIndex = $derived(store.blocks.length - 1);
 </script>
 
@@ -790,15 +845,23 @@
       {:else if item.block.kind === "user"}
         {@const block = item.block}
         <!-- Only delivered (sent) user messages render inline; queued/dropped
-             ones live in the pending stack above the composer. -->
+             ones live in the pending tail below. -->
         <div class="msg user">
           <div class="bubble-row">
+            <button
+              class="message-action fork-btn"
+              title="fork from this message into a new session (source keeps running)"
+              aria-label="fork conversation from this message"
+              onclick={() => askFork(block)}
+            >
+              ⑂
+            </button>
             <!-- Codex rewinds whole turns from a preceding anchor, so its
                  first message (nothing precedes it) offers no button; claude
                  can still restore files there. -->
             {#if block.checkpoint !== null && (agentKind === "claude" || block.checkpoint.preceding !== null)}
               <button
-                class="rewind-btn"
+                class="message-action rewind-btn"
                 title={agentKind === "claude"
                   ? "rewind to before this message (restores files; optionally forks the conversation)"
                   : "rewind the conversation to before this message"}
@@ -821,6 +884,14 @@
         </div>
       {:else if item.block.kind === "message"}
         <div class="msg agent">
+          <button
+            class="message-action fork-btn agent-fork"
+            title="fork from this message into a new session (source keeps running)"
+            aria-label="fork conversation from this message"
+            onclick={() => askFork(item.block)}
+          >
+            ⑂
+          </button>
           <Markdown
             text={item.block.text}
             streaming={store.running && item.index === lastInlineIndex}
@@ -886,7 +957,7 @@
       <QuestionCard {request} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
-    {#if store.running && store.pending.length === 0 && store.questions.length === 0}
+    {#if agentBusy && store.pending.length === 0 && store.questions.length === 0}
       <div class="status-row" aria-live="polite">
         <span class="status-spark">
           <SessionGlyph kind="agent" {agentKind} size={12} state="alive" />
@@ -894,6 +965,11 @@
         <span class="status-label">{activityLabel}</span>
         {#if turnElapsedLabel !== null}
           <span class="status-elapsed">{turnElapsedLabel}</span>
+        {/if}
+        {#if store.compacting}
+          <span class="compaction-progress" role="progressbar" aria-label="Compacting conversation">
+            <span></span>
+          </span>
         {/if}
       </div>
     {/if}
@@ -906,6 +982,60 @@
     {:else if store.exited !== null}
       <div class="notice">
         agent exited{store.exited.status !== null ? ` (status ${store.exited.status})` : ""}
+      </div>
+    {/if}
+
+    <!-- Pending sends are part of the scrollable reading surface, but remain
+         OUT of `blocks`: a mid-turn send must not splice the agent's current
+         response. Keeping the stack at the transcript tail makes queued text
+         inspectable without pinning it to (and crowding) the composer. On
+         delivery it leaves this stack and enters `blocks` as the newest user
+         turn. A Stop preserves it; ✕ cancels it. Dropped sends remain visible
+         as "not delivered" until dismissed, with replay-safe state owned by
+         the daemon. -->
+    {#if store.pendingSends.length > 0}
+      <div class="pending" aria-label="queued messages" aria-live="polite">
+        {#each store.pendingSends as send (send.id)}
+          <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
+            <div class="bubble-row">
+              <div class="bubble">
+                <UserText
+                  text={send.text}
+                  onOpenPath={openProsePath}
+                  resolvePaths={resolveProsePaths}
+                />
+              </div>
+              {#if agentKind === "codex" && send.state === "queued" && store.running}
+                <button
+                  class="steer-btn"
+                  title="add this message to the current run"
+                  aria-label="steer queued message into current run"
+                  onclick={() => steerQueued(send.id)}
+                >↪ Steer</button>
+              {/if}
+              <button
+                class="cancel-btn"
+                title={send.state === "dropped"
+                  ? "dismiss (this message was never delivered)"
+                  : "cancel this queued message (remove it before the agent sees it)"}
+                aria-label={send.state === "dropped"
+                  ? "dismiss undelivered message"
+                  : "cancel queued message"}
+                onclick={() => cancelQueued(send.id)}
+              >
+                ✕
+              </button>
+            </div>
+            <span class="delivery" class:dropped={send.state === "dropped"}>
+              {send.state === "dropped" ? "not delivered" : "queued"}
+            </span>
+            {#if send.attachments > 0}
+              <span class="attach"
+                >{send.attachments} image{send.attachments > 1 ? "s" : ""}</span
+              >
+            {/if}
+          </div>
+        {/each}
       </div>
     {/if}
 
@@ -976,6 +1106,17 @@
     />
   {/if}
 
+  {#if forkIntent !== null}
+    <ForkDialog
+      agents={availableForkAgents}
+      sourceAgent={agentKind}
+      nativeAt={forkIntent.nativeAt}
+      applying={forkIntent.applying}
+      onCancel={() => (forkIntent = null)}
+      onConfirm={confirmFork}
+    />
+  {/if}
+
   {#if menu === "mcp"}
     <McpPanel
       servers={store.mcpServers}
@@ -985,7 +1126,7 @@
     />
   {/if}
 
-  {#if store.promptSuggestion !== null && !store.running}
+  {#if store.promptSuggestion !== null && !agentBusy}
     <div class="suggestion-row">
       <button
         class="suggestion"
@@ -1007,56 +1148,9 @@
     </div>
   {/if}
 
-  <!-- Pending stack: messages typed and waiting to send, held at the send
-       point (right above the composer) rather than inline in history. On
-       delivery the entry leaves this stack and enters the transcript as the
-       newest turn. Queued survives a Stop (it delivers after the abort); the
-       ✕ is how you discard one. A dropped one (the agent died before it could
-       be delivered) stays marked "not delivered" until its ✕ dismisses it —
-       the same cancel command, tombstoned in the journal so replay agrees. -->
-  {#if store.pendingSends.length > 0}
-    <div class="pending" aria-label="queued messages">
-      {#each store.pendingSends as send (send.id)}
-        <div class="msg user pending-msg" class:dropped={send.state === "dropped"}>
-          <div class="bubble-row">
-            <div class="bubble">
-              <UserText text={send.text} onOpenPath={openProsePath} resolvePaths={resolveProsePaths} />
-            </div>
-            {#if agentKind === "codex" && send.state === "queued" && store.running}
-              <button
-                class="steer-btn"
-                title="add this message to the current run"
-                aria-label="steer queued message into current run"
-                onclick={() => steerQueued(send.id)}
-              >↪ Steer</button>
-            {/if}
-            <button
-              class="cancel-btn"
-              title={send.state === "dropped"
-                ? "dismiss (this message was never delivered)"
-                : "cancel this queued message (remove it before the agent sees it)"}
-              aria-label={send.state === "dropped"
-                ? "dismiss undelivered message"
-                : "cancel queued message"}
-              onclick={() => cancelQueued(send.id)}
-            >
-              ✕
-            </button>
-          </div>
-          <span class="delivery" class:dropped={send.state === "dropped"}>
-            {send.state === "dropped" ? "not delivered" : "queued"}
-          </span>
-          {#if send.attachments > 0}
-            <span class="attach">{send.attachments} image{send.attachments > 1 ? "s" : ""}</span>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
-
   <Composer
     sessionId={session.id}
-    running={store.running}
+    running={agentBusy}
     disabled={store.exited !== null || store.degraded}
     slashCommands={composerCommands}
     workspaceId={session.workspace_id ?? null}
@@ -1118,7 +1212,6 @@
      padding rides OUTSIDE the measure so text edges line up with it. */
   .chat > :global(.composer),
   .chat > .suggestion-row,
-  .chat > .pending,
   /* Every pinned strip (subagents, background, plan) — they were full-bleed
      while the plan alone was inset, so the group never lined up. */
   .chat > :global(.tray) {
@@ -1178,18 +1271,15 @@
     font-size: var(--text-sm);
     margin-top: 2px;
   }
-  /* The pending stack sits between the transcript and the composer, holding
-     messages typed and waiting to send. It reads as attached to the input:
-     same 18px side padding as the composer (the selector group above), a hair
-     of vertical breathing room, and a hairline top edge tying it to the
-     composer below. Collapses to nothing when empty (the {#if} guard). */
+  /* Undelivered messages occupy the transcript tail, not fixed composer
+     chrome. The transcript's own scrollbar can therefore move a large queue
+     out of the way while the pending state remains visible at the live end. */
   .pending {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    padding-top: 8px;
-    padding-bottom: 6px;
-    border-top: 1px solid color-mix(in srgb, var(--edge) 40%, transparent);
+    margin-top: 8px;
+    padding-bottom: 10px;
   }
   /* A pending bubble is half-present — not in the conversation yet (claude's
      native mid-turn queue / a codex steer in flight). Reuses .msg.user's
@@ -1240,6 +1330,7 @@
     color: var(--err);
   }
   .msg.agent {
+    position: relative;
     padding: 2px 0;
   }
   .thought {
@@ -1308,6 +1399,33 @@
     font-variant-numeric: tabular-nums;
     color: color-mix(in srgb, var(--muted) 80%, transparent);
   }
+  /* Compaction has no honest percentage on either agent wire. Show a bounded
+     indeterminate track instead of inventing one; start/completion still come
+     from journaled protocol events, so reconnect never resets the truth. */
+  .compaction-progress {
+    position: relative;
+    width: clamp(48px, 12vw, 112px);
+    height: 2px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--edge) 65%, transparent);
+  }
+  .compaction-progress > span {
+    position: absolute;
+    inset-block: 0;
+    width: 42%;
+    border-radius: inherit;
+    background: var(--accent);
+    animation: compact-sweep 1.35s ease-in-out infinite;
+  }
+  @keyframes compact-sweep {
+    from {
+      transform: translateX(-110%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
   @keyframes spark-pulse {
     0%,
     100% {
@@ -1330,8 +1448,12 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .status-spark,
-    .status-label {
+    .status-label,
+    .compaction-progress > span {
       animation: none;
+    }
+    .compaction-progress > span {
+      inset-inline-start: 29%;
     }
   }
   /* The strip chrome (border, padding, collapse header, bounded scroll) now
@@ -1408,7 +1530,7 @@
     gap: 6px;
     max-width: 100%;
   }
-  .rewind-btn {
+  .message-action {
     background: none;
     border: none;
     color: var(--muted);
@@ -1421,12 +1543,18 @@
       opacity 0.12s ease,
       color 0.12s ease;
   }
-  .msg.user:hover .rewind-btn,
-  .rewind-btn:focus-visible {
+  .msg.user:hover .message-action,
+  .msg.agent:hover .message-action,
+  .message-action:focus-visible {
     opacity: 1;
   }
-  .rewind-btn:hover {
+  .message-action:hover {
     color: var(--accent);
+  }
+  .agent-fork {
+    position: absolute;
+    left: -22px;
+    top: 3px;
   }
   /* The ✕ on a queued bubble: pull it back before the agent sees it. Quiet by
      default (mirrors .rewind-btn), reveals on hover/focus of the pending row,

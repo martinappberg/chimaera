@@ -192,8 +192,8 @@ use crate::driver::{
     SpawnSpec, IDLE_FLUSH_GRACE_TICKS, INTERRUPT_GRACE_TICKS,
 };
 use crate::model::{
-    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, ContentBlock,
-    PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
+    cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
+    ContentBlock, PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
     UserMessageState,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
@@ -398,12 +398,21 @@ async fn codex_handshake(
 /// Build the thread-open request separately from I/O so the launch recipe's
 /// create-time model contract stays hermetically testable.
 fn thread_open_request(spec: &SpawnSpec) -> Value {
-    let mut open = match &spec.pinned_native_id {
-        Some(thread_id) => json!({
+    let mut open = match (&spec.pinned_native_id, &spec.fork_at) {
+        (Some(thread_id), Some(last_turn_id)) => json!({
+            "id": 1, "method": "thread/fork",
+            "params": {
+                "threadId": thread_id,
+                "lastTurnId": last_turn_id,
+                "cwd": spec.cwd,
+                "ephemeral": false,
+            },
+        }),
+        (Some(thread_id), None) => json!({
             "id": 1, "method": "thread/resume",
             "params": { "threadId": thread_id, "cwd": spec.cwd },
         }),
-        None => json!({
+        (None, _) => json!({
             "id": 1, "method": "thread/start",
             "params": { "cwd": spec.cwd },
         }),
@@ -619,6 +628,11 @@ struct CodexMapper {
     pending_questions: HashMap<String, PendingQuestion>,
     /// One safety-buffering notice per turn (the frame repeats).
     safety_notified: bool,
+    /// The deprecated thread/compacted notification may overlap the
+    /// contextCompaction item pair. Fold both sources to exactly one start
+    /// and one completion event per turn.
+    compaction_active: bool,
+    compaction_completed: bool,
     /// One auto-decline notice per turn: full-access maps to approvalPolicy
     /// "never" (the official extension's table), so a genuinely blocked
     /// action is DECLINED by codex itself with no approval card possible —
@@ -696,6 +710,8 @@ impl CodexMapper {
             pending_approvals: HashMap::new(),
             pending_questions: HashMap::new(),
             safety_notified: false,
+            compaction_active: false,
+            compaction_completed: false,
             decline_notified: false,
             pending_rpcs: HashMap::new(),
             collab_agents: Vec::new(),
@@ -776,6 +792,8 @@ impl CodexMapper {
                     .to_string();
                 self.turn_active = true;
                 self.turn_pending = false;
+                self.compaction_active = false;
+                self.compaction_completed = false;
                 // A fresh turn is a clean slate for the interrupt watchdog: an
                 // interrupt armed against a previous (or idle) state must not
                 // abort this new turn.
@@ -967,9 +985,14 @@ impl CodexMapper {
                 }
             }
             "thread/compacted" => {
-                step.events.push(AgentEvent::Notice {
-                    text: "context compacted".into(),
-                });
+                self.compaction_active = false;
+                if !self.compaction_completed {
+                    self.compaction_completed = true;
+                    step.events.push(AgentEvent::ContextCompaction {
+                        phase: CompactionPhase::Completed,
+                        pre_tokens: None,
+                    });
+                }
             }
             // Mined shape: {threadId, turnId, fromModel, toModel, reason} —
             // reasons include safety reroutes (e.g. highRiskCyberActivity).
@@ -1099,6 +1122,14 @@ impl CodexMapper {
         self.out_streamed.clear();
         self.safety_notified = false;
         self.decline_notified = false;
+        // A missing terminal item must not strand the UI's compaction lane.
+        // Turn end clears it client-side; mark this native lifecycle settled
+        // too so a late deprecated thread/compacted notification cannot emit
+        // a second completion.
+        if self.compaction_active {
+            self.compaction_active = false;
+            self.compaction_completed = true;
+        }
         // Defensive: a turn that ends without ever emitting turn/started must
         // not leave the start-window flag stuck true.
         self.turn_pending = false;
@@ -1680,10 +1711,24 @@ impl CodexMapper {
                     }
                 }
             }
-            Some("contextCompaction") if completed => {
-                step.events.push(AgentEvent::Notice {
-                    text: "context compacted".into(),
-                });
+            Some("contextCompaction") => {
+                if completed {
+                    self.compaction_active = false;
+                    if !self.compaction_completed {
+                        self.compaction_completed = true;
+                        step.events.push(AgentEvent::ContextCompaction {
+                            phase: CompactionPhase::Completed,
+                            pre_tokens: None,
+                        });
+                    }
+                } else if !self.compaction_active {
+                    self.compaction_active = true;
+                    self.compaction_completed = false;
+                    step.events.push(AgentEvent::ContextCompaction {
+                        phase: CompactionPhase::Started,
+                        pre_tokens: None,
+                    });
+                }
             }
             // enteredReviewMode / exitedReviewMode / sleep / imageGeneration
             // etc. are tolerated silently (the official client renders
@@ -2666,59 +2711,70 @@ impl CodexMapper {
         }
     }
 
+    fn send_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        display_text: Option<String>,
+        step: &mut DriverStep,
+    ) {
+        let text = crate::model::blocks_text(&blocks);
+        // Images ride the input array as data URLs (the extension's non-local
+        // path form; local paths need a shared fs).
+        let mut input: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            input.push(json!({ "type": "text", "text": text }));
+        }
+        let mut attachments = 0u32;
+        for b in &blocks {
+            if let ContentBlock::Image { media_type, data } = b {
+                attachments += 1;
+                input.push(json!({
+                    "type": "image",
+                    "url": format!("data:{media_type};base64,{data}"),
+                }));
+            }
+        }
+        let input = json!(input);
+        let client_msg_id = crate::model::fresh_uuid();
+        // Queue and steer are separate Codex-native actions. A send during a
+        // live/pending run is held for the NEXT turn; the UI's Steer button
+        // explicitly promotes it via `turn/steer`.
+        let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
+        let priming = display_text.is_some();
+        step.events.push(AgentEvent::UserMessage {
+            text: display_text.unwrap_or_else(|| text.clone()),
+            attachments: if priming { 0 } else { attachments },
+            id: Some(client_msg_id.clone()),
+            queued,
+        });
+        if queued {
+            self.queued_sends.push_back(QueuedSend {
+                input,
+                client_msg_id,
+                steer_when_active: false,
+            });
+        } else {
+            // Only a turn-OPENING send anchors a checkpoint: rewind rolls
+            // back whole turns (thread/rollback numTurns), so a steered
+            // message — joining a running turn — is not a boundary. Emitted
+            // right after UserMessage (journal truncation relies on adjacency).
+            let preceding = self.last_checkpoint.replace(client_msg_id.clone());
+            step.events.push(AgentEvent::Checkpoint {
+                user_message_id: client_msg_id.clone(),
+                preceding_uuid: preceding,
+            });
+            self.emit_turn_start(input, client_msg_id, step);
+        }
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
-            AgentCommand::Send { blocks } => {
-                let text = crate::model::blocks_text(&blocks);
-                // Images ride the input array as data URLs (the extension's
-                // non-local-path form; local paths need a shared fs).
-                let mut input: Vec<Value> = Vec::new();
-                if !text.is_empty() {
-                    input.push(json!({ "type": "text", "text": text }));
-                }
-                let mut attachments = 0u32;
-                for b in &blocks {
-                    if let ContentBlock::Image { media_type, data } = b {
-                        attachments += 1;
-                        input.push(json!({
-                            "type": "image",
-                            "url": format!("data:{media_type};base64,{data}"),
-                        }));
-                    }
-                }
-                let input = json!(input);
-                let client_msg_id = crate::model::fresh_uuid();
-                // Queue and steer are separate Codex-native actions. A send
-                // during a live/pending run is held for the NEXT turn; the
-                // UI's Steer button explicitly promotes it via `turn/steer`.
-                let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
-                step.events.push(AgentEvent::UserMessage {
-                    text: text.clone(),
-                    attachments,
-                    id: Some(client_msg_id.clone()),
-                    queued,
-                });
-                if queued {
-                    self.queued_sends.push_back(QueuedSend {
-                        input,
-                        client_msg_id,
-                        steer_when_active: false,
-                    });
-                } else {
-                    // Only a turn-OPENING send anchors a checkpoint: rewind
-                    // rolls back whole turns (thread/rollback numTurns), so a
-                    // steered message — joining a running turn — is not a
-                    // rewindable boundary. Emitted right after UserMessage
-                    // (the journal-truncation cut relies on the adjacency).
-                    let preceding = self.last_checkpoint.replace(client_msg_id.clone());
-                    step.events.push(AgentEvent::Checkpoint {
-                        user_message_id: client_msg_id.clone(),
-                        preceding_uuid: preceding,
-                    });
-                    self.emit_turn_start(input, client_msg_id, &mut step);
-                }
-            }
+            AgentCommand::Send { blocks } => self.send_blocks(blocks, None, &mut step),
+            AgentCommand::PrimeFork {
+                blocks,
+                display_text,
+            } => self.send_blocks(blocks, Some(display_text), &mut step),
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3347,6 +3403,26 @@ mod tests {
                 id: msg_id,
                 state: UserMessageState::Sent,
             }]
+        );
+    }
+
+    #[test]
+    fn fork_prime_sends_full_context_but_journals_only_compact_row() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::PrimeFork {
+            blocks: vec![ContentBlock::Text {
+                text: "full portable transcript context".into(),
+            }],
+            display_text: "Continue from this fork point.".into(),
+        });
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { text, .. }
+                if text == "Continue from this fork point."
+        ));
+        assert_eq!(
+            step.outbound[0]["params"]["input"][0]["text"],
+            "full portable transcript context"
         );
     }
 
@@ -4233,6 +4309,14 @@ mod tests {
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "thread-old");
         assert_eq!(resume["params"]["model"], "gpt-test");
+
+        spec.fork_at = Some("turn-7".into());
+        let fork = thread_open_request(&spec);
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "thread-old");
+        assert_eq!(fork["params"]["lastTurnId"], "turn-7");
+        assert_eq!(fork["params"]["ephemeral"], false);
+        assert_eq!(fork["params"]["model"], "gpt-test");
     }
 
     #[test]
@@ -5008,6 +5092,50 @@ mod tests {
             &step.events[0],
             AgentEvent::Error { fatal: false, message } if message.contains("not now")
         ));
+    }
+
+    #[test]
+    fn context_compaction_item_maps_started_and_completed_without_duplicate() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "method": "turn/started",
+            "params": { "threadId": "thr-1", "turn": { "id": "compact-turn" } },
+        }));
+        let started = m.on_frame(&json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thr-1",
+                "item": { "type": "contextCompaction", "id": "compact-1" },
+            },
+        }));
+        assert!(matches!(
+            &started.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Started,
+                ..
+            }
+        ));
+
+        let completed = m.on_frame(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr-1",
+                "item": { "type": "contextCompaction", "id": "compact-1" },
+            },
+        }));
+        assert!(matches!(
+            &completed.events[0],
+            AgentEvent::ContextCompaction {
+                phase: CompactionPhase::Completed,
+                ..
+            }
+        ));
+
+        let deprecated = m.on_frame(&json!({
+            "method": "thread/compacted",
+            "params": { "threadId": "thr-1" },
+        }));
+        assert!(deprecated.events.is_empty());
     }
 
     #[test]

@@ -84,9 +84,9 @@ export interface CheckpointRef {
   preceding: string | null;
 }
 
-/** A user message the agent has NOT consumed yet — held in the pending stack
- *  above the composer, deliberately kept OUT of the transcript `blocks` so it
- *  can never splice into a running turn's output. Rebuilt purely from journaled
+/** A user message the agent has NOT consumed yet — shown in the scrollable
+ *  transcript tail, deliberately kept OUT of transcript `blocks` so it can
+ *  never splice into a running turn's output. Rebuilt purely from journaled
  *  events (`UserMessage{queued}` + its `UserMessageUpdate`), so replay agrees:
  *  `sent` moves it into `blocks`, `cancelled` removes it, `dropped` keeps it
  *  here marked "not delivered". */
@@ -122,8 +122,19 @@ export type ChatBlock =
       /** Delivery key (the wire's client-minted uuid); null on old journals,
        *  transcript-seeded messages, and permission-feedback echoes. */
       id: string | null;
+      /** Inclusive journal boundary for a portable fork through this row. */
+      forkSeq: number;
     }
-  | { kind: "message"; text: string; turnId: string }
+  | {
+      kind: "message";
+      text: string;
+      turnId: string;
+      /** Inclusive journal boundary for a portable fork through this row. */
+      forkSeq: number;
+      /** Codex thread/fork can use turnId only after this is the completed
+       *  turn's final assistant block. */
+      nativeTurnComplete: boolean;
+    }
   | { kind: "thought"; text: string; turnId: string }
   | {
       /** A structured question, folded into history at the position it was
@@ -249,6 +260,10 @@ export class ChatStore {
   currentMode = $state<string | null>(null);
   slashCommands = $state<SlashCommand[]>([]);
   running = $state(false);
+  /** The agent is summarizing conversation history to reclaim its context
+   *  window. Journal-derived (not an optimistic button state), so automatic
+   *  compaction and reconnect/replay behave exactly like manual /compact. */
+  compacting = $state(false);
   /** What the agent is doing RIGHT NOW, for the live status row:
    *  thinking (reasoning deltas), writing (prose deltas), a tool title,
    *  or waiting (turn open, nothing streaming yet). */
@@ -325,8 +340,8 @@ export class ChatStore {
   }
 
   /** Queued/undelivered user messages, in order — rendered in a holding stack
-   *  pinned above the composer (the send point), NEVER inline in history: a
-   *  queued message is one you've typed and are waiting on. This is its OWN
+   *  at the scrollable transcript tail, NEVER inserted in `blocks`: a queued
+   *  message is one you've typed and are waiting on. This is its OWN
    *  list, not a slice of `blocks`, so a queued send can't splice into a
    *  running turn's output. A `user_message_update{sent}` moves the entry into
    *  `blocks` at the current end (the reducer, so replay agrees); `cancelled`
@@ -385,6 +400,7 @@ export class ChatStore {
     this.plan = [];
     this.backgroundTasks = [];
     this.running = false;
+    this.compacting = false;
     this.activity = null;
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
     // the preference is re-pushed even if this reset races ahead of it.
@@ -446,7 +462,14 @@ export class ChatStore {
         } else {
           // A fresh (turn-opening) send, or a permission-feedback echo — it was
           // received, so it goes straight into history.
-          this.blocks.push({ kind: "user", text, attachments, checkpoint: null, id });
+          this.blocks.push({
+            kind: "user",
+            text,
+            attachments,
+            checkpoint: null,
+            id,
+            forkSeq: entry.seq,
+          });
           if (id !== null) this.userIndex.set(id, this.blocks.length - 1);
         }
         this.promptSuggestion = null;
@@ -524,6 +547,7 @@ export class ChatStore {
             attachments: pending.attachments,
             checkpoint: pending.checkpoint,
             id: pending.id,
+            forkSeq: entry.seq,
           });
           this.userIndex.set(pending.id, this.blocks.length - 1);
         } else if (state === "cancelled") {
@@ -557,6 +581,7 @@ export class ChatStore {
           const block = this.blocks[idx];
           if (block.kind === "user") {
             block.checkpoint = cp;
+            block.forkSeq = entry.seq;
             break;
           }
         }
@@ -566,6 +591,7 @@ export class ChatStore {
           const block = this.blocks[i];
           if (block.kind === "user") {
             block.checkpoint = cp;
+            block.forkSeq = entry.seq;
             break;
           }
         }
@@ -576,11 +602,11 @@ export class ChatStore {
         this.activity = { kind: "waiting", detail: "starting" };
         break;
       case "message_chunk":
-        this.appendText("message", ev);
+        this.appendText("message", ev, entry.seq);
         this.activity = { kind: "writing", detail: "" };
         break;
       case "thought_chunk":
-        this.appendText("thought", ev);
+        this.appendText("thought", ev, entry.seq);
         this.activity = { kind: "thinking", detail: "" };
         break;
       case "thinking_tokens": {
@@ -786,6 +812,26 @@ export class ChatStore {
         };
         break;
       }
+      case "context_compaction": {
+        const phase = ev.phase as string;
+        if (phase === "started") {
+          this.compacting = true;
+        } else {
+          this.compacting = false;
+          if (phase === "completed") {
+            const pre = ev.pre_tokens as number | undefined;
+            this.notice(
+              pre !== undefined
+                ? `context compacted · ${pre.toLocaleString()} tokens summarized`
+                : "context compacted",
+              "info",
+            );
+          }
+          // The agent's normal turn output owns failure details. The lifecycle
+          // event only settles progress, avoiding a duplicate Claude message.
+        }
+        break;
+      }
       case "usage_report":
         this.blocks.push({ kind: "usage", windows: (ev.windows as UsageWindow[]) ?? [] });
         break;
@@ -830,11 +876,24 @@ export class ChatStore {
         break;
       case "turn_completed": {
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         // Close any tool row this turn left dangling (a dropped result frame)
         // BEFORE the turn_end block lands, so the scan stops at the previous
         // boundary and the end-of-turn artifact scan sees their final state.
         this.reconcileOpenTools();
+        // Codex's native thread/fork boundary is a COMPLETED turn id. Only
+        // the final assistant block in the turn can claim that exact point;
+        // earlier prose segments separated by tools still use the portable
+        // normalized handoff.
+        for (let i = this.blocks.length - 1; i >= 0; i--) {
+          const block = this.blocks[i];
+          if (block.kind === "message" && block.turnId === (ev.turn_id as string)) {
+            block.forkSeq = entry.seq;
+            block.nativeTurnComplete = true;
+            break;
+          }
+        }
         const usage = ev.usage as {
           cost_usd?: number;
           output_tokens?: number;
@@ -851,6 +910,7 @@ export class ChatStore {
       }
       case "turn_aborted": {
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         this.reconcileOpenTools();
         // A deliberate stop (Esc / stop chip) is not an error state: the
@@ -878,6 +938,59 @@ export class ChatStore {
         this.exited = null;
         this.degraded = false;
         break;
+      case "forked": {
+        const native = ev.native === true;
+        // The copied prefix is transcript history, not live work owned by the
+        // new process. Close transient rows before its Init/first turn arrives.
+        this.running = false;
+        this.activity = null;
+        this.reconcileOpenTools();
+        this.expirePendingAsks();
+        this.pendingSends = [];
+        this.backgroundTasks = [];
+        // A portable target received the old conversation as one hidden
+        // primer. Its copied source UUIDs/turn ids do NOT exist in the fresh
+        // native session, so they must remain display-only. The server applies
+        // the same provenance floor independently.
+        if (!native) {
+          for (const block of this.blocks) {
+            if (block.kind === "user") block.checkpoint = null;
+            if (block.kind === "message") block.nativeTurnComplete = false;
+          }
+          // Everything above was replayed from a DIFFERENT process (and may
+          // be a different vendor). Keep transcript blocks, but never let its
+          // model catalog, limits, context meter, controls, or error state
+          // masquerade as destination telemetry while the target initializes.
+          this.model = null;
+          this.modes = [];
+          this.currentMode = null;
+          this.slashCommands = [];
+          this.models = [];
+          this.effort = null;
+          this.ultracode = false;
+          this.contextPct = null;
+          this.contextTokens = null;
+          this.rateLimit = null;
+          this.rewind = null;
+          this.mcpServers = null;
+          this.promptSuggestion = null;
+          this.fatalError = null;
+          this.plan = [];
+          this.exited = null;
+          this.degraded = false;
+        }
+        const source =
+          ev.source_agent === "claude"
+            ? "Claude Code"
+            : ev.source_agent === "codex"
+              ? "Codex"
+              : String(ev.source_agent ?? "agent");
+        this.notice(
+          `${native ? "native" : "portable"} fork from ${source} · source session unchanged`,
+          "info",
+        );
+        break;
+      }
       case "error":
         this.notice(ev.message as string, "error");
         if (ev.fatal === true) {
@@ -885,6 +998,7 @@ export class ChatStore {
           // A dead driver is not running — don't strand the stop button and
           // the "starting…" row waiting on a turn end that can't come.
           this.running = false;
+          this.compacting = false;
           this.activity = null;
           // A fatal error is a terminal path like the others — a tool left
           // in_progress must not spin forever when no `exited` follows (a kept-
@@ -896,6 +1010,7 @@ export class ChatStore {
         break;
       case "exited":
         this.running = false;
+        this.compacting = false;
         this.activity = null;
         this.reconcileOpenTools();
         this.exited = { status: (ev.status as number | null) ?? null };
@@ -933,15 +1048,20 @@ export class ChatStore {
     this.rebuildIndexes();
   }
 
-  private appendText(kind: "message" | "thought", ev: AgentEvent): void {
+  private appendText(kind: "message" | "thought", ev: AgentEvent, seq: number): void {
     const text = ev.text as string;
     const turnId = ev.turn_id as string;
     const last = this.blocks[this.blocks.length - 1];
     if (last !== undefined && last.kind === kind && last.turnId === turnId) {
       last.text += text;
+      if (last.kind === "message") last.forkSeq = seq;
       return;
     }
-    this.blocks.push({ kind, text, turnId });
+    if (kind === "message") {
+      this.blocks.push({ kind, text, turnId, forkSeq: seq, nativeTurnComplete: false });
+    } else {
+      this.blocks.push({ kind, text, turnId });
+    }
   }
 
   /** Also the client's own channel for local notices (usage summaries,
