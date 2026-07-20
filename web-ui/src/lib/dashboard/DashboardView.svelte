@@ -68,11 +68,13 @@
       .toSorted((a, b) => rosterWeight(a) - rosterWeight(b) || b.created_at - a.created_at),
   );
 
-  const working = $derived(agents.filter((s) => s.alive && s.agent_state === "running").length);
+  const working = $derived(agents.filter(isBusy).length);
   // Alive-guarded like `working`: a dead row already reads "exited" on its
   // card, so counting its stale "finished" state would make the vital-signs
   // strip disagree with the roster.
-  const finished = $derived(agents.filter((s) => s.alive && s.agent_state === "finished").length);
+  const finished = $derived(
+    agents.filter((s) => s.alive && s.agent_state === "finished" && !isBusy(s)).length,
+  );
   const busyShells = $derived(shells.filter(isBusy).length);
 
   const compact = $derived.by(() => {

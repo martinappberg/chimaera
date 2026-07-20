@@ -139,8 +139,8 @@ export interface Session {
    *  surfaces. Cleared when a new turn starts. */
   status_needs_action?: boolean;
   /**
-   * How many background tasks (backgrounded Bash / workflows) this agent has
-   * running right now — the daemon's fold of the `background_tasks` level-set.
+   * How many process-owned jobs are working outside the current turn:
+   * backgrounded Bash/workflows plus cross-turn delegated agents.
    * Chat sessions only; null on PTY rows (a TUI's Ctrl-B raises no hook, so
    * null means "unknown", not "none") and absent on old daemons.
    *
@@ -196,7 +196,7 @@ function unintegrated(s: Session): boolean {
  * can restart around it, and the status dot should say so.
  *
  * Background work counts because it does NOT restore across a restart: the
- * tasks are the CLI's children and die with the process. "Mid-turn" alone
+ * tasks/threads are the CLI's children and die with the process. "Mid-turn" alone
  * would call such a session idle and let both callers act on it silently —
  * the × would skip its confirm, and the pre-update warning would undercount.
  */
@@ -259,8 +259,9 @@ export function dotState(s: Session): string {
 }
 
 /**
- * The turn is idle but background work (backgrounded Bash / workflows) is
- * still running — "working off-screen", not finished. Every surface that cues
+ * The turn is idle but background work (backgrounded Bash/workflows or a
+ * delegated Codex thread) is still running — "working off-screen", not
+ * finished. Every surface that cues
  * it reads THIS predicate (the rail glyph's muted breathing, the focus-strip
  * chip, the dashboard card's pulsing dot) so they can never disagree.
  *
@@ -275,7 +276,7 @@ export function backgrounded(s: Session): boolean {
 /**
  * Hover tooltip naming the state behind a session dot.
  *
- * Background work is appended rather than folded into the state words: the
+ * Off-turn work is appended rather than folded into the state words: the
  * mark breathes for it, and a pulsing mark whose tooltip reads "finished"
  * looks like a rendering bug. The turn state stays the headline — the two
  * facts are independent ("finished · 2 running in the background").

@@ -66,8 +66,10 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
   TUI hooks): label + relative age, read-only — hooks can't stop a TUI subagent, and the
   wire and store rows never merge (double counting). The "still working off-screen" CUE
   (a pulsing state dot for an idle turn with live background work) needs no warm store at
-  all: it reads the wire `background_running` count, the same predicate the rail glyph
-  uses, so a card and its rail row always agree.
+  all: it reads the wire `background_running` count—Claude backgrounded Bash/workflows plus
+  Codex delegated threads that outlive their parent turn—the same predicate the rail glyph
+  uses, so a card and its rail row always agree. The dashboard's working total uses that
+  predicate too, rather than counting only parent turns.
 - **Key behaviors.**
   - **Provenance is worn openly, in plain words**: the fidelity tier is `protocol`
     (chat, authoritative) › `hooks` (claude TUI) › `output-only` (other TUIs)

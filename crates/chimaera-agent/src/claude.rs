@@ -947,6 +947,7 @@ impl ClaudeMapper {
                             title: format!("Agent: {description}"),
                             locations: Vec::new(),
                             status: ToolStatus::InProgress,
+                            cross_turn: false,
                         });
                     }
                 }
@@ -1738,6 +1739,7 @@ impl ClaudeMapper {
             title: tool_title(name, input),
             locations: tool_locations(input),
             status: ToolStatus::InProgress,
+            cross_turn: false,
         });
         if let Some(diff) = edit_diff_content(name, input) {
             step.events.push(AgentEvent::ToolCallUpdate {

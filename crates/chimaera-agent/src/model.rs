@@ -174,6 +174,13 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         locations: Vec<String>,
         status: ToolStatus,
+        /// This tool owns process-scoped work that may outlive the parent
+        /// turn. Codex collab agents are real child threads and keep sending
+        /// frames after the parent answers; clients must not reconcile their
+        /// rows at the parent's turn boundary. Additive/false by default so
+        /// old journals and ordinary tools keep their existing semantics.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cross_turn: bool,
     },
     ToolCallUpdate {
         id: String,
@@ -1294,13 +1301,28 @@ mod tests {
             title: "cargo test".into(),
             locations: vec![],
             status: ToolStatus::InProgress,
+            cross_turn: false,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "tool_call");
         assert_eq!(json["kind"], "execute");
         assert_eq!(json["status"], "in_progress");
+        assert!(
+            json.get("cross_turn").is_none(),
+            "the additive false default stays off old wire shapes"
+        );
         let back: AgentEvent = serde_json::from_value(json).unwrap();
         assert_eq!(back, ev);
+
+        let detached = AgentEvent::ToolCall {
+            id: "agent:child".into(),
+            kind: ToolKind::Agent,
+            title: "Agent: child".into(),
+            locations: vec![],
+            status: ToolStatus::InProgress,
+            cross_turn: true,
+        };
+        assert_eq!(serde_json::to_value(&detached).unwrap()["cross_turn"], true);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use chimaera_agent::journal::SeqEvent;
 use chimaera_agent::model::{
     AgentCommand, AgentEvent, CompactionPhase, PermissionOption, PermissionOptionKind, Question,
-    UserMessageState,
+    ToolKind, ToolStatus, UserMessageState,
 };
 use serde_json::json;
 
@@ -145,6 +145,50 @@ fn user_message_delivery_fields_are_additive() {
         .unwrap(),
         json!({ "type": "user_message_update", "id": "u1", "state": "dropped" })
     );
+}
+
+/// Cross-turn ownership is an additive tool-call flag: ordinary rows retain
+/// their exact pre-upgrade shape, while Codex child-thread rows opt in.
+#[test]
+fn tool_call_cross_turn_flag_is_additive() {
+    let call = |cross_turn| AgentEvent::ToolCall {
+        id: "agent:child".into(),
+        kind: ToolKind::Agent,
+        title: "Agent: child".into(),
+        locations: Vec::new(),
+        status: ToolStatus::InProgress,
+        cross_turn,
+    };
+    assert_eq!(
+        serde_json::to_value(call(false)).unwrap(),
+        json!({
+            "type": "tool_call",
+            "id": "agent:child",
+            "kind": "agent",
+            "title": "Agent: child",
+            "status": "in_progress",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(call(true)).unwrap(),
+        json!({
+            "type": "tool_call",
+            "id": "agent:child",
+            "kind": "agent",
+            "title": "Agent: child",
+            "status": "in_progress",
+            "cross_turn": true,
+        })
+    );
+    let old: AgentEvent = serde_json::from_value(json!({
+        "type": "tool_call",
+        "id": "agent:child",
+        "kind": "agent",
+        "title": "Agent: child",
+        "status": "in_progress",
+    }))
+    .unwrap();
+    assert_eq!(old, call(false));
 }
 
 /// `Cancelled` is APPENDED to `UserMessageState`, so the two pre-existing

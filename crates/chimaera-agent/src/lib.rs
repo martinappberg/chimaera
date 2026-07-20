@@ -24,7 +24,7 @@ pub mod model;
 pub mod ndjson;
 pub mod transcript;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -213,8 +213,8 @@ pub struct ChatInfo {
     /// turn starts (the user acted) so it never badges a running session.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub status_needs_action: bool,
-    /// How many background tasks (backgrounded Bash / workflows) are running
-    /// right now — the `BackgroundTasks` level-set folded to a COUNT.
+    /// How many process-owned jobs are still running outside the parent turn:
+    /// backgrounded Bash/workflows plus cross-turn delegated agents.
     ///
     /// A count, not the set: this rides the session-list snapshot to every
     /// window on every change, and the surfaces that read it (the rail glyph,
@@ -223,6 +223,56 @@ pub struct ChatInfo {
     /// where the full level-set already lives. Cross-turn by nature — it
     /// survives turn ends and dies with the process.
     pub background_running: usize,
+}
+
+/// Private detail behind [`ChatInfo::background_running`]. The session-list
+/// wire only needs a count, but the pump must keep the two independent sources
+/// separate so a Claude background-task level-set cannot overwrite Codex
+/// delegated agents (or vice versa), and keyed agent upserts never double
+/// count.
+#[derive(Default)]
+struct BackgroundWork {
+    tasks: usize,
+    agents: HashSet<String>,
+}
+
+impl BackgroundWork {
+    fn observe(&mut self, ev: &AgentEvent) -> usize {
+        use model::{ToolKind, ToolStatus, BG_TASKS_CAP};
+
+        match ev {
+            AgentEvent::BackgroundTasks { tasks, .. } => {
+                self.tasks = tasks.iter().filter(|task| task.status == "running").count();
+            }
+            AgentEvent::ToolCall {
+                id,
+                kind: ToolKind::Agent,
+                status: ToolStatus::Pending | ToolStatus::InProgress,
+                cross_turn: true,
+                ..
+            } => {
+                // Codex already caps its live registry, but keep this generic
+                // fold independently bounded if another driver adopts the
+                // additive flag later.
+                if self.agents.contains(id) || self.agents.len() < BG_TASKS_CAP {
+                    self.agents.insert(id.clone());
+                }
+            }
+            AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed | ToolStatus::Failed,
+                ..
+            } => {
+                self.agents.remove(id);
+            }
+            AgentEvent::Exited { .. } => {
+                self.tasks = 0;
+                self.agents.clear();
+            }
+            _ => {}
+        }
+        self.tasks.saturating_add(self.agents.len())
+    }
 }
 
 /// Fold the driver's authoritative model/mode state into the lightweight
@@ -254,6 +304,7 @@ fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
 
 struct ChatSession {
     info: Mutex<ChatInfo>,
+    background_work: Mutex<BackgroundWork>,
     journal: Arc<Journal>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     events_tx: broadcast::Sender<Arc<SeqEvent>>,
@@ -357,6 +408,7 @@ impl ChatManager {
         };
         let session = Arc::new(ChatSession {
             info: Mutex::new(info.clone()),
+            background_work: Mutex::new(BackgroundWork::default()),
             journal: Arc::clone(&journal),
             cmd_tx,
             events_tx: events_tx.clone(),
@@ -436,6 +488,11 @@ impl ChatManager {
             .lock()
             .expect("command budget lock")
             .observe(&ev);
+        let background_running = session
+            .background_work
+            .lock()
+            .expect("background work lock")
+            .observe(&ev);
         // Native id to record in the resume index, captured under the info
         // lock but recorded AFTER it drops: index.record does a blocking
         // atomic write on possibly-NFS `~/.chimaera`, and holding the info
@@ -445,6 +502,7 @@ impl ChatManager {
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
+            info.background_running = background_running;
             match &ev {
                 AgentEvent::Init {
                     native_session_id, ..
@@ -480,24 +538,9 @@ impl ChatManager {
                     info.status_category = category.clone();
                     info.status_needs_action = *needs_action;
                 }
-                // LEVEL-SET: the event carries the whole set, so replace the
-                // count rather than patching it. Deliberately NOT reset on a
-                // turn boundary — background work is cross-turn, and that
-                // outliving is the entire signal ("idle turn, still working").
-                AgentEvent::BackgroundTasks { tasks, .. } => {
-                    info.background_running =
-                        tasks.iter().filter(|t| t.status == "running").count();
-                }
                 AgentEvent::Exited { status } => {
                     info.alive = false;
                     info.exit_status = *status;
-                    // Belt-and-braces, not the primary path: claude's teardown
-                    // journals an empty level-set (drain_pending), which the
-                    // arm above already folds to 0. But that is per-DRIVER
-                    // politeness, and this fold is driver-agnostic — a driver
-                    // that dies without draining must not leave a dead row
-                    // claiming live work forever.
-                    info.background_running = 0;
                 }
                 _ => {}
             }
@@ -725,6 +768,39 @@ mod tests {
             },
         );
         assert_eq!(info.current_mode.as_deref(), Some("auto-review"));
+    }
+
+    #[test]
+    fn background_work_counts_cross_turn_agents_until_their_own_close() {
+        let mut work = BackgroundWork::default();
+        let opened = AgentEvent::ToolCall {
+            id: "agent:sub-1".into(),
+            kind: model::ToolKind::Agent,
+            title: "Agent: analyst".into(),
+            locations: Vec::new(),
+            status: model::ToolStatus::InProgress,
+            cross_turn: true,
+        };
+        assert_eq!(work.observe(&opened), 1);
+        assert_eq!(work.observe(&opened), 1, "a row upsert never double-counts");
+
+        assert_eq!(
+            work.observe(&AgentEvent::TurnCompleted {
+                turn_id: "parent".into(),
+                usage: model::Usage::default(),
+            }),
+            1,
+            "the parent turn boundary does not end its child thread"
+        );
+        assert_eq!(
+            work.observe(&AgentEvent::ToolCallUpdate {
+                id: "agent:sub-1".into(),
+                status: model::ToolStatus::Completed,
+                content: None,
+            }),
+            0,
+            "the child's own terminal update clears the count"
+        );
     }
 
     #[test]

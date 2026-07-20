@@ -167,6 +167,10 @@ export type ChatBlock =
       allowed: boolean;
       /** Live output streamed ahead of the authoritative result. */
       streaming: boolean;
+      /** Process-owned work that may outlive its parent turn (Codex collab
+       *  agents). Turn-end reconciliation must leave this row live until its
+       *  own completion event or driver exit. */
+      crossTurn: boolean;
     }
   | { kind: "notice"; text: string; tone: "info" | "error" }
   | {
@@ -680,6 +684,7 @@ export class ChatStore {
           if (row.status !== "completed" && row.status !== "failed") {
             row.status = ev.status as "pending" | "in_progress";
           }
+          if (ev.cross_turn === true) row.crossTurn = true;
         } else {
           this.blocks.push({
             kind: "tool",
@@ -692,6 +697,7 @@ export class ChatStore {
             denied: false,
             allowed: false,
             streaming: false,
+            crossTurn: ev.cross_turn === true,
           });
           this.toolIndex.set(ev.id as string, this.blocks.length - 1);
         }
@@ -929,7 +935,7 @@ export class ChatStore {
         // Close any tool row this turn left dangling (a dropped result frame)
         // BEFORE the turn_end block lands, so the scan stops at the previous
         // boundary and the end-of-turn artifact scan sees their final state.
-        this.reconcileOpenTools();
+        this.reconcileOpenTools(true);
         // Codex's native thread/fork boundary is a COMPLETED turn id. Only
         // the final assistant block in the turn can claim that exact point;
         // earlier prose segments separated by tools still use the portable
@@ -960,7 +966,7 @@ export class ChatStore {
         this.running = false;
         this.compacting = false;
         this.activity = null;
-        this.reconcileOpenTools();
+        this.reconcileOpenTools(true);
         // A deliberate stop (Esc / stop chip) is not an error state: the
         // wire's `interrupted` flag is the drivers' structural signal
         // (claude's free-text result string never reliably said so); the
@@ -1151,9 +1157,11 @@ export class ChatStore {
     this.pending = [];
   }
 
-  /** A turn (or the session) has ended, so nothing it launched is still
-   *  running — reconcile any tool row still `in_progress`/`pending` to a
-   *  terminal state. Such a row never got its completion update: most often
+  /** A turn (or the session) has ended, so reconcile any ordinary tool row
+   *  still `in_progress`/`pending` to a terminal state. Cross-turn rows are
+   *  preserved at TURN boundaries: Codex delegated threads may outlive the
+   *  parent answer and keep streaming progress. Session/process boundaries
+   *  still close them. An ordinary dangling row most often means
    *  the result frame was too large to parse and was dropped BELOW the event
    *  layer (a big image `Read` blows the transport's per-line byte cap, so its
    *  `tool_result` never reaches the driver), and nothing else ever closes it.
@@ -1164,11 +1172,20 @@ export class ChatStore {
    *  identical transcript. Marks `completed`, not `failed`: the tool most
    *  likely DID finish (we simply never captured its output), and inventing a
    *  red failure would be the louder lie. */
-  private reconcileOpenTools(): void {
+  private reconcileOpenTools(preserveCrossTurn = false): void {
     for (let i = this.blocks.length - 1; i >= 0; i--) {
       const b = this.blocks[i];
-      if (b.kind === "turn_end") break; // previous turn boundary — older turns already reconciled at their own end
-      if (b.kind === "tool" && (b.status === "in_progress" || b.status === "pending")) {
+      if (b.kind === "turn_end") {
+        // Turn reconciliation is local. Process reconciliation crosses old
+        // turn markers to find any surviving cross-turn agent rows.
+        if (preserveCrossTurn) break;
+        continue;
+      }
+      if (
+        b.kind === "tool" &&
+        (!preserveCrossTurn || !b.crossTurn) &&
+        (b.status === "in_progress" || b.status === "pending")
+      ) {
         b.status = "completed";
       }
     }

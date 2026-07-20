@@ -140,9 +140,9 @@ pub(crate) fn session_json(
             .and_then(|a| a.usage.as_ref())
             .map_or(serde_json::Value::Null, |u| u.to_json()),
     );
-    // Chat-tier only: background tasks are a structured-protocol concept, and
-    // a claude TUI's Ctrl-B backgrounding raises no hook. Null is the honest
-    // answer for a PTY row — "we don't know", not "none running".
+    // Chat-tier only: background task lanes and cross-turn delegated agents
+    // are structured-protocol concepts, and a TUI exposes no complete count.
+    // Null is the honest answer for a PTY row — "we don't know", not "none".
     map.insert("background_running".to_string(), serde_json::Value::Null);
     map.insert(
         "mastermind".to_string(),

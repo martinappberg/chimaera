@@ -10,6 +10,7 @@ fn edit_call(id: &str, path: &str, status: ToolStatus) -> AgentEvent {
         title: "edit".into(),
         locations: vec![path.to_string()],
         status,
+        cross_turn: false,
     }
 }
 
@@ -74,6 +75,7 @@ async fn chat_edit_nudges_on_write_completion_not_announcement() {
             title: "read".into(),
             locations: vec![edited.clone()],
             status: ToolStatus::Completed,
+            cross_turn: false,
         },
     )
     .await;
