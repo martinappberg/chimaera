@@ -86,6 +86,7 @@ describe("ChatStore pending-send ordering", () => {
     expect(partial.blocks[1]).toMatchObject({
       kind: "message",
       text: "answer",
+      sentAtMs: 3,
       forkSeq: 5,
       nativeTurnComplete: false,
     });

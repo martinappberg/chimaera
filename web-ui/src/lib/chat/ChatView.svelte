@@ -7,7 +7,7 @@
   import { insertIntoComposer } from "./composerBus";
   import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
-  import { formatElapsedSeconds } from "../shared/time";
+  import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";
   import Markdown from "./Markdown.svelte";
   import UserText from "./UserText.svelte";
@@ -24,6 +24,7 @@
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
   import ForkDialog from "./ForkDialog.svelte";
+  import AgentMessageMeta from "./AgentMessageMeta.svelte";
   import Composer from "./Composer.svelte";
   import { skillBlocksForText, type ComposerCommand } from "./composer";
   import type { ImageAttachment } from "./images";
@@ -827,6 +828,27 @@
    *  render from their own pending tail, not `blocks`, so this is simply the
    *  delivered-block tail. */
   const lastInlineIndex = $derived(store.blocks.length - 1);
+
+  /** One precise wall-clock timer for every assistant timestamp in this view.
+   *  Each row reports its next label boundary; scheduling the earliest avoids
+   *  a timer per message and leaves old transcripts idle between midnights. */
+  let messageTimeNowMs = $state(Date.now());
+  const messageTimestamps = $derived(
+    store.blocks.flatMap((block) => (block.kind === "message" ? [block.sentAtMs] : [])),
+  );
+  $effect(() => {
+    if (messageTimestamps.length === 0) return;
+    const refreshIn = messageTimestamps.reduce<number | null>((soonest, timestampMs) => {
+      const next = messageTimestampRefreshIn(timestampMs, messageTimeNowMs);
+      if (next === null) return soonest;
+      return soonest === null ? next : Math.min(soonest, next);
+    }, null);
+    if (refreshIn === null) return;
+    const timer = setTimeout(() => {
+      messageTimeNowMs = Date.now();
+    }, refreshIn);
+    return () => clearTimeout(timer);
+  });
 </script>
 
 <!-- The outside-dismiss action closes any open header menu / the /mcp panel on
@@ -938,14 +960,6 @@
         </div>
       {:else if item.block.kind === "message"}
         <div class="msg agent">
-          <button
-            class="message-action fork-btn agent-fork"
-            title="fork from this message into a new session (source keeps running)"
-            aria-label="fork conversation from this message"
-            onclick={() => askFork(item.block)}
-          >
-            ⑂
-          </button>
           <Markdown
             text={item.block.text}
             streaming={store.running && item.index === lastInlineIndex}
@@ -954,6 +968,12 @@
             onReveal={() => {
               if (atBottom) scrollToBottom();
             }}
+          />
+          <AgentMessageMeta
+            text={item.block.text}
+            sentAtMs={item.block.sentAtMs}
+            nowMs={messageTimeNowMs}
+            onFork={() => askFork(item.block)}
           />
         </div>
       {:else if item.block.kind === "thought"}
@@ -1388,7 +1408,6 @@
     color: var(--err);
   }
   .msg.agent {
-    position: relative;
     padding: 2px 0;
   }
   .thought {
@@ -1602,17 +1621,11 @@
       color 0.12s ease;
   }
   .msg.user:hover .message-action,
-  .msg.agent:hover .message-action,
   .message-action:focus-visible {
     opacity: 1;
   }
   .message-action:hover {
     color: var(--accent);
-  }
-  .agent-fork {
-    position: absolute;
-    left: -22px;
-    top: 3px;
   }
   /* The ✕ on a queued bubble: pull it back before the agent sees it. Quiet by
      default (mirrors .rewind-btn), reveals on hover/focus of the pending row,
