@@ -907,7 +907,7 @@
     outline: none;
     background: none;
     font-family: var(--mono);
-    font-size: 0.74rem;
+    font-size: var(--text-sm);
     color: var(--fg);
     padding: 1px 0;
   }
@@ -939,7 +939,7 @@
   .tree-error,
   .tree-empty {
     padding: 0.3rem 0.45rem;
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--muted);
     line-height: 1.4;
   }
@@ -948,7 +948,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    height: 22px;
+    height: calc(var(--text-sm) + 10px);
     padding-right: 0.45rem;
     border-radius: 4px;
     cursor: pointer;
@@ -1033,12 +1033,13 @@
 
   .node-name {
     font-family: var(--mono);
-    font-size: 0.74rem;
+    font-size: var(--text-sm);
     color: var(--muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
+    line-height: 1.3;
   }
 
   /* Inline create/rename input, sized like the name it replaces. */
@@ -1046,13 +1047,13 @@
     flex: 1;
     min-width: 0;
     font-family: var(--mono);
-    font-size: 0.74rem;
+    font-size: var(--text-sm);
     color: var(--fg);
     background: var(--bg);
     border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--edge));
     border-radius: 3px;
     padding: 0 4px;
-    height: 18px;
+    height: calc(var(--text-sm) + 5px);
     outline: none;
   }
 
@@ -1067,7 +1068,7 @@
 
   .edit-error {
     font-family: var(--mono);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--err);
     padding-top: 1px;
     padding-bottom: 2px;
@@ -1120,7 +1121,7 @@
 
   .loading-label {
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
 
@@ -1153,7 +1154,7 @@
     flex: none;
     margin-left: auto;
     font-family: var(--mono);
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     line-height: 1;

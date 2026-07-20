@@ -24,7 +24,7 @@ its scope's entry rather than persisting `{text: ""}`.
 | File | What it owns |
 |---|---|
 | `schema.ts` | The settings schema: keys, types, defaults, labels, groups. Ground truth. |
-| `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, the sparse-map semantics, and the `dirtySince` echo-guard. |
+| `store.svelte.ts` | The reactive settings store: load/patch/persist against `/api/v1/settings`, sparse-map semantics, the `dirtySince` echo-guard, and document-wide theme/interface/editor CSS variables. |
 | `themes.ts` | The curated light/dark theme definitions + `applyAppearance`. |
 | `AgentsSettings.svelte` | Per-agent binary/model settings (paths, managed installs). |
 | `EnvironmentSettings.svelte` | The Environment prelude panel (bespoke, `/api/v1/environment`-backed — see the exception above). |
@@ -38,9 +38,10 @@ its scope's entry rather than persisting `{text: ""}`.
   *removed* from the persisted map, not stored. So "reset to default" and "delete
   the key" are the same operation — don't persist defaults.
 - **Importing the store has a side effect.** `store.svelte.ts` runs
-  `applyAppearance()` at module load (first-paint theme), and it's imported widely —
+  `applyAppearance()` at module load (first-paint theme + typography), and it's imported widely —
   so importing it mutates document styles. Intentional, but be aware of import-order
-  sensitivity during any restructure.
+  sensitivity during any restructure. Interface chrome consumes the shared `--text-*`
+  scale; chat overrides it locally, while terminal/editor keep content-specific settings.
 - **The `dirtySince` echo-guard** ignores our own writes coming back over the
   `/ws/events` settings-change push, so a local edit doesn't fight itself. Keep it
   when you touch the persist path.

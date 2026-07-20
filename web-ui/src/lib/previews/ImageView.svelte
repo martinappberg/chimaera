@@ -284,7 +284,7 @@
     height: 26px;
     padding: 0 0.7rem;
     border-bottom: 1px solid var(--edge);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -312,7 +312,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     padding: 0.1rem 0.4rem;
@@ -340,7 +340,7 @@
   .zbtn.ic {
     min-width: 20px;
     text-align: center;
-    font-size: 0.85rem;
+    font-size: var(--text-lg);
     line-height: 1;
   }
 
@@ -402,7 +402,7 @@
   .file-error {
     margin: auto;
     color: var(--muted);
-    font-size: 0.8rem;
+    font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
   }

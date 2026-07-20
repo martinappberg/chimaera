@@ -27,6 +27,7 @@
   import Composer from "./Composer.svelte";
   import type { ImageAttachment } from "./images";
   import type { ChatBlock, PlanEntry } from "./store.svelte";
+  import { getSetting } from "../settings/store.svelte";
 
   interface Props {
     session: Session;
@@ -141,6 +142,17 @@
    *  offered when the live model supports xhigh (the extension's gate). */
   const hasUltracode = $derived(
     agentKind === "claude" && (currentModel?.efforts.includes("xhigh") ?? false),
+  );
+
+  // The chat scale is deliberately local: every child uses the shared
+  // --text-* tokens, so overriding them on this root covers prose, composer,
+  // tool cards, trays, dialogs, and the dashboard's embedded Mastermind chat
+  // without making terminal/editor content follow an interface preference.
+  const chatFontSize = $derived(getSetting("chat.fontSize"));
+  const chatLineHeight = $derived(getSetting("chat.lineHeight"));
+  const chatContentWidth = $derived(getSetting("chat.contentWidth"));
+  const chatFontFamily = $derived(
+    getSetting("chat.fontFamily").trim() || "var(--ui-font)",
   );
 
   function onScroll() {
@@ -784,6 +796,10 @@
 <div
   class="chat"
   class:focused
+  style:--chat-font-size={`${chatFontSize}px`}
+  style:--chat-line-height={chatLineHeight}
+  style:--chat-measure={`${chatContentWidth}px`}
+  style:--chat-font-family={chatFontFamily}
   use:dismiss={{
     enabled: menu !== null,
     onDismiss: () => (menu = null),
@@ -1172,9 +1188,13 @@
     min-height: 0;
     background: var(--term-bg);
     color: var(--fg);
+    font-family: var(--chat-font-family);
+    --text-xs: max(9px, calc(var(--chat-font-size) - 2px));
+    --text-sm: max(10px, calc(var(--chat-font-size) - 1px));
+    --text-md: var(--chat-font-size);
+    --text-lg: calc(var(--chat-font-size) + 2px);
     /* The reading measure (the Claude Desktop proportion) shared by the
        transcript column, the composer, and their satellites. */
-    --chat-measure: 52rem;
   }
   .transcript {
     flex: 1;
@@ -1239,7 +1259,7 @@
   }
   .msg {
     word-break: break-word;
-    line-height: 1.5;
+    line-height: var(--chat-line-height);
     font-size: var(--text-md);
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
   }

@@ -522,10 +522,10 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    height: 30px;
+    min-height: calc(var(--text-sm) + 17px);
     padding: 0 0.6rem;
     border-bottom: 1px solid var(--edge);
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
 
@@ -555,14 +555,14 @@
   .ab {
     flex: none;
     font-family: var(--mono);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: var(--muted);
   }
 
   .gerr {
     color: var(--warn);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
   }
 
   .spacer {
@@ -605,7 +605,7 @@
     align-items: center;
     gap: 0.4rem;
     padding: 0.3rem 0.7rem 0.2rem;
-    font-size: 0.62rem;
+    font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: var(--muted);
@@ -621,7 +621,7 @@
     align-items: center;
     gap: 0.35rem;
     width: 100%;
-    height: 22px;
+    min-height: calc(var(--text-sm) + 9px);
     padding: 0 0.7rem;
     appearance: none;
     border: none;
@@ -647,7 +647,7 @@
 
   .gname {
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -660,14 +660,14 @@
   .gfrom {
     flex: none;
     opacity: 0.6;
-    font-size: 0.7rem;
+    font-size: var(--text-sm);
   }
 
   .gbadge {
     flex: none;
     margin-left: auto;
     font-family: var(--mono);
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     font-weight: 600;
     line-height: 1;
   }
@@ -687,12 +687,12 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    height: 20px;
+    min-height: calc(var(--text-sm) + 7px);
   }
 
   .wt-branch {
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -704,7 +704,7 @@
 
   .wt-tag {
     flex: none;
-    font-size: 0.58rem;
+    font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     padding: 0.03rem 0.28rem;
@@ -721,7 +721,7 @@
     flex: none;
     margin-left: auto;
     font-family: var(--mono);
-    font-size: 0.64rem;
+    font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
     color: var(--muted);
   }
@@ -732,7 +732,7 @@
     gap: 0.35rem;
     width: 100%;
     padding: 0 0.7rem 0 0.9rem;
-    height: 18px;
+    min-height: calc(var(--text-sm) + 7px);
     appearance: none;
     border: none;
     background: none;
@@ -747,7 +747,7 @@
   }
 
   .wt-session-name {
-    font-size: 0.7rem;
+    font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -760,7 +760,7 @@
     background: none;
     color: var(--muted);
     cursor: pointer;
-    font-size: 0.9rem;
+    font-size: var(--text-lg);
     line-height: 1;
     padding: 0 0.15rem;
     border-radius: 3px;
@@ -781,7 +781,7 @@
 
   .wt-more {
     padding: 0.15rem 0.7rem 0.2rem;
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     opacity: 0.7;
   }
@@ -793,7 +793,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.64rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     padding: 0.05rem 0.35rem;
@@ -827,7 +827,7 @@
     border: none;
     background: var(--term-bg);
     font: inherit;
-    font-size: 0.62rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     padding: 0.14rem 0.4rem;
@@ -845,7 +845,7 @@
     border-radius: 5px;
     padding: 0.16rem 0.4rem;
     font-family: var(--mono);
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--fg);
   }
   .compose-input:focus {
@@ -863,7 +863,7 @@
     border: 1px solid var(--edge);
     background: var(--term-bg);
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--fg);
     cursor: pointer;
     padding: 0.14rem 0.55rem;
@@ -887,7 +887,7 @@
   .wt-error {
     margin: 0.1rem 0.7rem 0.3rem;
     padding: 0.2rem 0.4rem;
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     color: var(--git-deleted);
     background: color-mix(in srgb, var(--git-deleted) 10%, transparent);
     border-radius: 4px;
@@ -904,7 +904,7 @@
     gap: 0.5rem;
   }
   .gitenv-title {
-    font-size: 0.82rem;
+    font-size: var(--text-md);
     font-weight: 600;
     color: var(--fg);
   }
@@ -912,7 +912,7 @@
   .gitenv-where,
   .gitenv-hint {
     margin: 0;
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     line-height: 1.5;
     color: var(--muted);
   }
@@ -925,7 +925,7 @@
   }
   .gitenv .mono {
     font-family: var(--mono);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--fg);
     background: var(--row-active);
     padding: 0.03rem 0.28rem;
@@ -953,7 +953,7 @@
   .empty,
   .trunc {
     padding: 1rem 0.8rem;
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--muted);
     text-align: center;
   }

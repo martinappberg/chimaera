@@ -249,7 +249,7 @@
     align-items: center;
     justify-content: center;
     color: var(--muted);
-    font-size: 0.8rem;
+    font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
   }

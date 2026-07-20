@@ -10,7 +10,12 @@
   import { Compartment, EditorState } from "@codemirror/state";
   import { EditorView, keymap, lineNumbers, drawSelection } from "@codemirror/view";
   import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-  import { bracketMatching, syntaxHighlighting, HighlightStyle } from "@codemirror/language";
+  import {
+    bracketMatching,
+    indentUnit,
+    syntaxHighlighting,
+    HighlightStyle,
+  } from "@codemirror/language";
   import { json as jsonLanguage, jsonParseLinter } from "@codemirror/lang-json";
   import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
   import {
@@ -33,7 +38,7 @@
   let saveError = $state<string | null>(null);
   let savedFlash = $state(false);
   let flashTimer: ReturnType<typeof setTimeout> | null = null;
-  const themeCompartment = new Compartment();
+  const settingsCompartment = new Compartment();
 
   function currentText(): string {
     const map = rawUserSettings();
@@ -116,15 +121,19 @@
         height: "100%",
         fontSize: `${getSetting("editor.fontSize")}px`,
       },
-      ".cm-scroller": { fontFamily: "var(--mono)", lineHeight: "1.55", overflow: "auto" },
+      ".cm-scroller": {
+        fontFamily: "var(--editor-font)",
+        lineHeight: `${getSetting("editor.lineHeight")}`,
+        overflow: "auto",
+      },
       ".cm-content": { padding: "10px 0 14px" },
       ".cm-line": { padding: "0 14px 0 8px" },
       ".cm-gutters": {
         backgroundColor: "transparent",
         color: "var(--muted)",
         border: "none",
-        fontFamily: "var(--mono)",
-        fontSize: "11px",
+        fontFamily: "var(--editor-font)",
+        fontSize: `${Math.max(9, getSetting("editor.fontSize") - 1.5)}px`,
         opacity: "0.65",
         userSelect: "none",
       },
@@ -152,13 +161,23 @@
       },
     });
 
+  function editorSettings() {
+    const tabSize = getSetting("editor.tabSize");
+    return [
+      makeTheme(),
+      getSetting("editor.lineNumbers") ? lineNumbers() : [],
+      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      EditorState.tabSize.of(tabSize),
+      indentUnit.of(" ".repeat(tabSize)),
+    ];
+  }
+
   onMount(() => {
     const el = host;
     if (el === null) return;
     const state = EditorState.create({
       doc: currentText(),
       extensions: [
-        lineNumbers(),
         drawSelection(),
         history(),
         bracketMatching(),
@@ -168,7 +187,7 @@
         linter(schemaLint),
         lintGutter(),
         autocompletion({ override: [keyCompletions] }),
-        themeCompartment.of(makeTheme()),
+        settingsCompartment.of(editorSettings()),
         keymap.of([
           { key: "Mod-s", run: () => (save(), true), preventDefault: true },
           indentWithTab,
@@ -207,10 +226,12 @@
     });
   });
 
-  // Editor font-size setting applies to this editor too.
+  // Every Editor setting applies to this editor too — not just font size.
   $effect(() => {
-    const theme = makeTheme();
-    if (view !== null) view.dispatch({ effects: themeCompartment.reconfigure(theme) });
+    const settings = editorSettings();
+    if (view !== null) {
+      view.dispatch({ effects: settingsCompartment.reconfigure(settings) });
+    }
   });
 
   function save(): void {
@@ -278,7 +299,7 @@
     height: 26px;
     padding: 0 0.7rem;
     border-top: 1px solid var(--edge);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -299,7 +320,7 @@
     border: 1px solid var(--edge);
     background: none;
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--fg);
     cursor: pointer;
     padding: 0.05rem 0.5rem;

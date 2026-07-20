@@ -389,7 +389,7 @@
 
   .scope {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     letter-spacing: 0.06em;
     color: var(--muted);
     border: 1px solid var(--edge);
@@ -443,7 +443,7 @@
     overflow-wrap: anywhere;
     margin-top: 5px;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     opacity: 0;
     transition: opacity 0.12s ease;

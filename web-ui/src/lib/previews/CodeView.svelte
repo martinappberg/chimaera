@@ -500,7 +500,7 @@
     padding: 0 0.7rem;
     background: color-mix(in srgb, var(--warn) 12%, var(--term-bg));
     border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, var(--edge));
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
     color: var(--fg);
   }
 
@@ -514,7 +514,7 @@
     border: 1px solid var(--edge);
     background: var(--term-bg);
     font: inherit;
-    font-size: 0.7rem;
+    font-size: var(--text-sm);
     color: var(--fg);
     cursor: pointer;
     padding: 0.1rem 0.5rem;
@@ -541,7 +541,7 @@
     height: 26px;
     padding: 0 0.7rem;
     border-top: 1px solid var(--edge);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
@@ -568,7 +568,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     padding: 0.1rem 0.4rem;
