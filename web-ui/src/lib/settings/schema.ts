@@ -427,9 +427,9 @@ const DEFS = {
     title: "Markdown Preview Font Size",
     category: "Editor",
     description:
-      "Body size in pixels for rendered Markdown previews. Per-pane A−/A+ controls can still override it.",
+      "Body size in pixels for rendered Markdown previews. Defaults to the same size as Chat; per-pane A−/A+ controls can still override it.",
     type: "number",
-    default: 15,
+    default: 13.5,
     min: 10,
     max: 32,
     step: 0.5,

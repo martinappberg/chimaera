@@ -44,8 +44,9 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   the shared scale within each `ChatView` (including the dashboard's embedded Mastermind) and
   exposes font size/family, line height, and reading width. Terminal keeps its xterm-specific
   font controls. Editor typography
-  covers code, diffs, and the JSON editor; rendered Markdown has its own font-size and line-height
-  settings rather than borrowing `terminal.fontSize`. CodeMirror views reconfigure while mounted.
+  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 13.5 px as Chat
+  but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
+  CodeMirror views reconfigure while mounted.
 - **Newer surfaces are represented.** `dashboard.landing` controls the workspace landing and
   `dashboard.cardDensity` selects automatic, comfortable, or compact agent cards. Mastermind's
   agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
