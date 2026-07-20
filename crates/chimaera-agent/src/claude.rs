@@ -37,8 +37,8 @@ use crate::model::{
     PermissionOption, PermissionOptionKind, PlanEntry, PlanStatus, SlashCommand, ToolContent,
     ToolKind, ToolStatus, Usage, UsageWindow, UserMessageState, WorkflowAgent, BG_LABEL_MAX,
     BG_PATH_MAX, BG_TASKS_CAP, DIFF_FILE_BUDGET, DIFF_TURN_BUDGET, PLAN_BLOCKED_CAP, PLAN_DESC_MAX,
-    PLAN_LABEL_MAX, PLAN_TASKS_CAP, STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET,
-    WF_AGENT_LABEL_MAX,
+    PLAN_LABEL_MAX, PLAN_TASKS_CAP, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX, SLASH_NAME_MAX,
+    STATUS_DETAIL_MAX, WF_AGENTS_CAP, WF_AGENTS_SET_BUDGET, WF_AGENT_LABEL_MAX,
 };
 use crate::ndjson::{JsonlChild, JsonlSink, JsonlStream};
 
@@ -648,16 +648,29 @@ impl ClaudeMapper {
         agent_version: Option<String>,
         commands_catalog: &Value,
     ) -> Self {
+        let mut seen_commands = HashSet::new();
         let slash_commands = commands_catalog["commands"]
             .as_array()
             .map(|cmds| {
                 cmds.iter()
                     .filter_map(|c| {
+                        let name = c["name"].as_str()?;
+                        if name.is_empty()
+                            || name.len() > SLASH_NAME_MAX
+                            || !seen_commands.insert(name.to_ascii_lowercase())
+                        {
+                            return None;
+                        }
                         Some(SlashCommand {
-                            name: c["name"].as_str()?.to_string(),
-                            description: c["description"].as_str().unwrap_or_default().to_string(),
+                            name: name.to_string(),
+                            description: truncate_label(
+                                c["description"].as_str().unwrap_or_default(),
+                                SLASH_DESCRIPTION_MAX.saturating_sub('…'.len_utf8()),
+                            ),
+                            skill_path: None,
                         })
                     })
+                    .take(SLASH_COMMANDS_CAP)
                     .collect()
             })
             .unwrap_or_default();
@@ -1022,7 +1035,6 @@ impl ClaudeMapper {
                         });
                     }
                 }
-                step.events.push(self.init_event());
             }
             // Fable needed usage credits; the CLI switched to the default
             // model (choice: consent/switch_default/cancelled).
@@ -1038,7 +1050,6 @@ impl ClaudeMapper {
                     reason: Some("Fable 5 requires usage credits".into()),
                     retract_current_turn: false,
                 });
-                step.events.push(self.init_event());
             }
             // Mode changes the CLI makes on its own (plan exits, applied
             // setMode suggestions) ride system/status. The same frame owns
@@ -1620,8 +1631,13 @@ impl ClaudeMapper {
         // fallback) the moment it happens, not at the next turn's init.
         if let Some(served) = message["model"].as_str() {
             if !served.is_empty() && self.model.as_deref() != Some(served) {
-                self.model = Some(served.to_string());
-                step.events.push(self.init_event());
+                let from = self.model.replace(served.to_string());
+                step.events.push(AgentEvent::ModelSwitched {
+                    from,
+                    to: served.to_string(),
+                    reason: None,
+                    retract_current_turn: false,
+                });
             }
         }
         let msg_id = message["id"].as_str().unwrap_or_default();
@@ -2065,8 +2081,13 @@ impl ClaudeMapper {
                 step.events.push(AgentEvent::ModeChanged { mode_id: mode });
             }
             PendingControl::SetModel(model) => {
-                self.model = Some(model);
-                step.events.push(self.init_event());
+                let from = self.model.replace(model.clone());
+                step.events.push(AgentEvent::ModelSwitched {
+                    from,
+                    to: model,
+                    reason: None,
+                    retract_current_turn: false,
+                });
             }
             PendingControl::Interrupt | PendingControl::SetThinking => {}
             PendingControl::ContextUsage => {
@@ -2346,12 +2367,16 @@ impl ClaudeMapper {
             .count() as u32;
         let content: Vec<Value> = blocks
             .iter()
-            .map(|b| match b {
-                ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                ContentBlock::Image { media_type, data } => json!({
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+                ContentBlock::Image { media_type, data } => Some(json!({
                     "type": "image",
                     "source": { "type": "base64", "media_type": media_type, "data": data },
-                }),
+                })),
+                // Claude's initialize catalog has no skill paths and the UI
+                // never sends this companion block to it. A programmatic
+                // caller still keeps the visible text block authoritative.
+                ContentBlock::Skill { .. } => None,
             })
             .collect();
         let uuid = crate::model::fresh_uuid();
@@ -3561,6 +3586,37 @@ mod tests {
             modes.iter().all(|mode| mode.id != "bypassPermissions"),
             "chat sessions omit --dangerously-skip-permissions, so the CLI rejects this mode"
         );
+    }
+
+    #[test]
+    fn slash_catalog_is_bounded_at_construction() {
+        let mut commands: Vec<Value> = (0..=SLASH_COMMANDS_CAP)
+            .map(|i| {
+                json!({
+                    "name": format!("command-{i}"),
+                    "description": "x".repeat(SLASH_DESCRIPTION_MAX * 2),
+                })
+            })
+            .collect();
+        commands.insert(
+            1,
+            json!({ "name": "COMMAND-0", "description": "duplicate" }),
+        );
+        let mapper = ClaudeMapper::new(None, None, &json!({ "commands": commands }));
+
+        assert_eq!(mapper.slash_commands.len(), SLASH_COMMANDS_CAP);
+        assert_eq!(
+            mapper
+                .slash_commands
+                .iter()
+                .filter(|command| command.name.eq_ignore_ascii_case("command-0"))
+                .count(),
+            1
+        );
+        assert!(mapper
+            .slash_commands
+            .iter()
+            .all(|command| command.description.len() <= SLASH_DESCRIPTION_MAX));
     }
 
     #[test]
@@ -6293,16 +6349,12 @@ mod tests {
             &step.events[1],
             AgentEvent::Notice { text } if text.contains("retrying on Opus")
         ));
-        match &step.events[2] {
-            AgentEvent::Init { model, .. } => {
-                assert_eq!(
-                    model.as_deref(),
-                    Some("claude-opus-4-8"),
-                    "chip follows truth"
-                );
-            }
-            other => panic!("expected Init, got {other:?}"),
-        }
+        assert_eq!(
+            step.events.len(),
+            2,
+            "model changes never masquerade as a new driver"
+        );
+        assert_eq!(m.model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]

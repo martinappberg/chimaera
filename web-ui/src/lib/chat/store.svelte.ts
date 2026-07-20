@@ -246,6 +246,10 @@ export interface ModeInfo {
 export interface SlashCommand {
   name: string;
   description?: string;
+  /** Codex `skills/list` path. Present only for real skill entries, so the
+   *  composer can add the protocol-native skill block when the slash token is
+   *  used inline or as a whole message. */
+  skill_path?: string;
 }
 
 export class ChatStore {
@@ -421,33 +425,36 @@ export class ChatStore {
         // view must re-push the user's preference to it (seq-dedupe means only
         // a genuinely-new init re-applies here; a plain reconnect doesn't).
         this.thinkingPushed = false;
-        // Deliberately NOT clearing backgroundTasks here: the driver re-emits
-        // init MID-PROCESS (a model-switch ack, a safety/consent fallback),
-        // when the tasks are still very much alive. Their real lifecycle ends
-        // are `exited`/fatal `error` below — and the driver journals an empty
-        // level-set at teardown, so replay agrees without this case guessing.
+        // Deliberately NOT clearing backgroundTasks here: the manager journals
+        // an empty level-set immediately before every new driver's Init, and
+        // that event owns the process-boundary reset. Runtime model changes use
+        // ModelSwitched and leave the live set alone; exit/fatal paths below
+        // also clear it, so replay agrees without this case guessing.
         // Any ask still pending predates this driver process — its reply
         // route died with the old one, so an answer could never land. Seq
         // ordering makes this safe: a live driver's Init is journaled BEFORE
         // its asks, so only stale ones are cleared. (A still-parked claude
         // prompt is re-delivered as a fresh request right after this Init.)
         this.expirePendingAsks();
-        if (typeof ev.model === "string") this.model = ev.model;
-        if (typeof ev.current_mode === "string") this.currentMode = ev.current_mode;
-        if (Array.isArray(ev.modes)) this.modes = ev.modes as ModeInfo[];
-        if (Array.isArray(ev.slash_commands)) {
-          this.slashCommands = ev.slash_commands as SlashCommand[];
-        }
-        if (Array.isArray(ev.models)) {
-          this.models = (ev.models as Record<string, unknown>[]).map((m) => ({
+        // Init is a complete catalog snapshot. Optional/empty serde fields are
+        // omitted on the wire, so absence must CLEAR prior process state — a
+        // resumed agent with no commands/models must not inherit stale rows.
+        this.model = typeof ev.model === "string" ? ev.model : null;
+        this.currentMode = typeof ev.current_mode === "string" ? ev.current_mode : null;
+        this.modes = Array.isArray(ev.modes) ? (ev.modes as ModeInfo[]) : [];
+        this.slashCommands = Array.isArray(ev.slash_commands)
+          ? (ev.slash_commands as SlashCommand[])
+          : [];
+        this.models = Array.isArray(ev.models)
+          ? (ev.models as Record<string, unknown>[]).map((m) => ({
             id: m.id as string,
             label: (m.label as string) ?? (m.id as string),
             description: (m.description as string) ?? null,
             resolved: (m.resolved as string) ?? null,
             efforts: (m.efforts as string[]) ?? [],
             defaultEffort: (m.default_effort as string) ?? null,
-          }));
-        }
+          }))
+          : [];
         break;
       }
       case "user_message": {

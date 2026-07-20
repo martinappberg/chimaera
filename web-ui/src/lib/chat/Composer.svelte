@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
@@ -13,7 +14,12 @@
     type ImageAttachment,
   } from "./images";
   import { loadDraft, saveDraft } from "./drafts";
-  import type { SlashCommand } from "./store.svelte";
+  import {
+    slashChoices as choicesForSlash,
+    slashContextAt,
+    type ComposerCommand,
+    type SlashChoice,
+  } from "./composer";
 
   export interface TerminalOption {
     id: string;
@@ -26,7 +32,7 @@
     sessionId: string | null;
     running: boolean;
     disabled: boolean;
-    slashCommands: SlashCommand[];
+    slashCommands: ComposerCommand[];
     /** Quick-open scope for @-mentions; null disables them. */
     workspaceId: string | null;
     /** Workspace terminals offered by @term: mentions (linked-terminal
@@ -92,6 +98,7 @@
     saveDraft(sessionId, text, imgs);
   });
   let el = $state<HTMLTextAreaElement | null>(null);
+  let caret = $state(savedDraft.text.length);
   let paneHeight = $state(0);
   /** Null follows content; an object remembers the height chosen with the
    *  top-edge grip and how much content it held at that moment. */
@@ -170,6 +177,7 @@
    *  whether it became an agent turn or a native slash-command action. */
   function clearSubmittedDraft() {
     draft = "";
+    caret = 0;
     chooseComposerHeight(null);
   }
 
@@ -252,7 +260,7 @@
     if (sessionId === null) return;
     return registerComposer(sessionId, (text) => {
       draft = draft.length > 0 && !draft.endsWith(" ") ? `${draft} ${text}` : draft + text;
-      el?.focus();
+      focusAt(draft.length);
     });
   });
 
@@ -276,37 +284,36 @@
    *  scanners. Read from the PRE-focus caret (a popover click steals
    *  selectionStart), so both popovers survive a mouse pick. */
   function caretToken(re: RegExp): { start: number; text: string } | null {
-    if (el === null) return null;
-    const caret = el.selectionStart;
-    const match = re.exec(draft.slice(0, caret));
+    const at = Math.max(0, Math.min(caret, draft.length));
+    const match = re.exec(draft.slice(0, at));
     if (match === null) return null;
-    return { start: caret - match[2].length, text: match[2] };
+    return { start: at - match[2].length, text: match[2] };
   }
 
-  /** A line-leading "/command" token under the caret. Unlike the old
-   *  draft-start-only rule, a command begun on a fresh line mid-draft (a
-   *  follow-up like "/meeting-notes") completes too. Line-leading ONLY (start
-   *  of the box or right after a newline) so ordinary path text — "cd /usr" —
-   *  is never hijacked. */
-  function slashToken(): { start: number; text: string } | null {
-    return caretToken(/(^|\n)(\/[\w:-]*)$/);
-  }
-  const slashTok = $derived.by(() => {
+  /** Slash discovery follows the live caret, not just draft mutations: moving
+   *  back into an existing inline token should reopen its completion menu. */
+  const slashContext = $derived.by(() => {
     void draft;
-    return slashToken();
+    void caret;
+    return slashContextAt(draft, caret, slashCommands);
   });
   const slashMatches = $derived.by(() => {
-    const token = slashTok;
-    if (token === null || token.text === slashDismissed) return [];
-    const q = token.text.slice(1).toLowerCase();
-    return slashCommands.filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 8);
+    const context = slashContext;
+    if (context === null || slashKey(context) === slashDismissed) return [];
+    return choicesForSlash(context, slashCommands);
   });
+  function slashKey(context: NonNullable<typeof slashContext>): string {
+    return `${context.kind}:${context.start}:${context.text}`;
+  }
   // Forget an Escape-dismissal once its token is edited away (the draft cleared
   // or sent, or the token changed) — otherwise re-typing the same command later
   // stays suppressed for the rest of the session. Settles: after the reset the
   // guard is false.
   $effect(() => {
-    if (slashDismissed !== null && slashTok?.text !== slashDismissed) {
+    if (
+      slashDismissed !== null &&
+      (slashContext === null || slashKey(slashContext) !== slashDismissed)
+    ) {
       slashDismissed = null;
     }
   });
@@ -380,25 +387,38 @@
     selected = 0;
   });
 
-  function pickSlash(name: string) {
-    const token = slashTok;
+  function focusAt(position: number) {
+    caret = position;
+    void tick().then(() => {
+      el?.focus();
+      el?.setSelectionRange(position, position);
+    });
+  }
+
+  function pickSlash(choice: SlashChoice) {
+    const context = slashContext;
     // A slash that IS the whole draft takes the command path: dialog-only
-    // commands open native UI (onSlash), the rest become "/name " ready to
-    // send. A slash begun MID-draft is a typing aid — complete the token in
-    // place and leave the surrounding message intact.
+    // commands open native UI (onSlash), the rest complete in place. Argument
+    // choices execute too when the slash is the whole draft; inline choices
+    // remain prompt text and leave the surrounding message intact.
+    const end = context === null ? 0 : context.start + context.text.length;
+    const commandStart = context?.kind === "argument" ? context.commandStart : context?.start;
     const wholeDraft =
-      token !== null && token.start === 0 && draft.slice(token.text.length).trim() === "";
-    if (wholeDraft && onSlash(name)) {
+      context !== null && commandStart === 0 && draft.slice(end).trim() === "";
+    if (wholeDraft && onSlash(choice.command.name, choice.option?.value)) {
       clearSubmittedDraft();
       return;
     }
-    if (token === null) {
-      draft = `/${name} `;
+    const replacement =
+      choice.option === undefined ? `/${choice.command.name} ` : `${choice.option.value} `;
+    if (context === null) {
+      draft = replacement;
+      focusAt(replacement.length);
     } else {
-      draft = `${draft.slice(0, token.start)}/${name} ${draft.slice(token.start + token.text.length)}`;
+      draft = `${draft.slice(0, context.start)}${replacement}${draft.slice(end)}`;
+      focusAt(context.start + replacement.length);
     }
     slashDismissed = null;
-    el?.focus();
   }
 
   function pickFile(entry: QuickOpenEntry) {
@@ -422,7 +442,11 @@
     )}`;
     fileToken = null;
     fileMatches = [];
-    el?.focus();
+    focusAt(token.start + replacement.length);
+  }
+
+  function trackCaret() {
+    if (el !== null) caret = el.selectionStart;
   }
 
   function submit() {
@@ -466,7 +490,7 @@
       }
       if (e.key === "Tab" || e.key === "Enter") {
         e.preventDefault();
-        if (popover === "slash") pickSlash(slashMatches[selected].name);
+        if (popover === "slash") pickSlash(slashMatches[selected]);
         else if (popover === "term") pickTerm(termMatches[selected]);
         else pickFile(fileMatches[selected]);
         return;
@@ -476,10 +500,15 @@
         if (popover === "slash") {
           // Dismiss the popover in place (never wipe a mid-draft message); a
           // whole-draft "/cmd" still clears, matching the old quick-escape.
-          if (slashTok !== null && slashTok.start === 0 && draft.trim() === slashTok.text) {
+          if (
+            slashContext?.kind === "command" &&
+            slashContext.start === 0 &&
+            draft.trim() === slashContext.text
+          ) {
             draft = "";
+            caret = 0;
           } else {
-            slashDismissed = slashTok?.text ?? null;
+            slashDismissed = slashContext === null ? null : slashKey(slashContext);
           }
         } else {
           fileMatches = [];
@@ -524,19 +553,19 @@
 <div class="composer">
   {#if popover === "slash"}
     <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
-      {#each slashMatches as cmd, i (cmd.name)}
+      {#each slashMatches as choice, i (choice.key)}
         <button
           class="overlay-row pop-row"
           class:sel={i === selected}
           id={`${uid}-opt-${i}`}
           role="option"
           aria-selected={i === selected}
-          title={cmd.description ?? ""}
-          onclick={() => pickSlash(cmd.name)}
+          title={choice.description}
+          onclick={() => pickSlash(choice)}
         >
-          <span class="pop-name">/{cmd.name}</span>
-          {#if cmd.description}
-            <span class="pop-desc">{cmd.description}</span>
+          <span class="pop-name">{choice.label}</span>
+          {#if choice.description}
+            <span class="pop-desc">{choice.description}</span>
           {/if}
         </button>
       {/each}
@@ -622,6 +651,9 @@
       bind:this={el}
       bind:value={draft}
       onkeydown={onKeydown}
+      onkeyup={trackCaret}
+      onselect={trackCaret}
+      oninput={trackCaret}
       onpaste={onPaste}
       role="combobox"
       aria-expanded={popover !== null}

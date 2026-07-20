@@ -193,8 +193,9 @@ use crate::driver::{
 };
 use crate::model::{
     cap_output, truncate_label, AgentCommand, AgentEvent, ChunkKind, Coalescer, CompactionPhase,
-    ContentBlock, PermissionOption, PermissionOptionKind, ToolContent, ToolKind, ToolStatus, Usage,
-    UserMessageState,
+    ContentBlock, PermissionOption, PermissionOptionKind, SlashCommand, ToolContent, ToolKind,
+    ToolStatus, Usage, UserMessageState, SKILL_PATH_MAX, SLASH_COMMANDS_CAP, SLASH_DESCRIPTION_MAX,
+    SLASH_NAME_MAX,
 };
 use crate::ndjson::{JsonlSink, JsonlStream};
 
@@ -255,7 +256,7 @@ impl Driver for CodexDriver {
         Ok(Handshake {
             mapper: CodexMapper::new(
                 hs.thread_id,
-                hs.models,
+                hs.catalog,
                 hs.model,
                 hs.effort,
                 spec.agent_version.clone(),
@@ -272,11 +273,17 @@ impl Driver for CodexDriver {
 /// conversation rollback failed (surfaced as a notice, never a dead pane).
 struct CodexHandshake {
     thread_id: String,
-    models: Vec<crate::model::ModelInfo>,
+    catalog: CodexCatalog,
     model: Option<String>,
     effort: Option<String>,
     next_id: u64,
     rollback_error: Option<String>,
+}
+
+#[derive(Default)]
+struct CodexCatalog {
+    models: Vec<crate::model::ModelInfo>,
+    slash_commands: Vec<SlashCommand>,
 }
 
 async fn codex_handshake(
@@ -405,14 +412,93 @@ async fn codex_handshake(
                 .and_then(|candidate| candidate.default_effort.clone())
         });
     }
+
+    // Codex has no slash-command catalog, but its app-server exposes the
+    // enabled skill inventory for this cwd. Promote those rows into the same
+    // bounded composer vocabulary Claude's initialize response already uses.
+    let skills_id = next_id;
+    next_id += 1;
+    let mut slash_commands = Vec::new();
+    if sink
+        .send(&json!({
+            "id": skills_id, "method": "skills/list",
+            "params": { "cwds": [spec.cwd], "forceReload": false },
+        }))
+        .await
+        .is_ok()
+    {
+        let listed =
+            tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, skills_id)).await;
+        if let Ok(Ok(list)) = listed {
+            slash_commands = parse_codex_skills(&list);
+        }
+    }
     Ok(CodexHandshake {
         thread_id,
-        models,
+        catalog: CodexCatalog {
+            models,
+            slash_commands,
+        },
         model,
         effort,
         next_id,
         rollback_error,
     })
+}
+
+/// Normalize the app-server's cwd-keyed skill inventory into the shared,
+/// bounded composer catalog. Invalid names/oversized paths are dropped whole:
+/// truncating either would create an invocation that points at something else.
+fn parse_codex_skills(list: &Value) -> Vec<SlashCommand> {
+    let mut commands = Vec::new();
+    let mut seen_names = HashSet::new();
+    let Some(entry) = list["data"].as_array().and_then(|entries| entries.first()) else {
+        return commands;
+    };
+    for skill in entry["skills"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|skill| skill["enabled"] != json!(false))
+    {
+        let Some(name) = skill["name"].as_str() else {
+            continue;
+        };
+        let Some(path) = skill["path"].as_str() else {
+            continue;
+        };
+        if name.is_empty()
+            || name.len() > SLASH_NAME_MAX
+            || path.len() > SKILL_PATH_MAX
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
+            || !seen_names.insert(name.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let summary = skill["interface"]["shortDescription"]
+            .as_str()
+            .or_else(|| skill["shortDescription"].as_str())
+            .or_else(|| skill["description"].as_str())
+            .unwrap_or_default();
+        // Bound before formatting so a hostile local SKILL.md cannot make us
+        // clone its full description just to immediately truncate it.
+        const SKILL_PREFIX: &str = "skill — ";
+        let summary = truncate_label(
+            summary,
+            SLASH_DESCRIPTION_MAX.saturating_sub(SKILL_PREFIX.len() + '…'.len_utf8()),
+        );
+        commands.push(SlashCommand {
+            name: name.to_string(),
+            description: format!("{SKILL_PREFIX}{summary}"),
+            skill_path: Some(path.to_string()),
+        });
+        if commands.len() == SLASH_COMMANDS_CAP {
+            break;
+        }
+    }
+    commands
 }
 
 /// Build the thread-open request separately from I/O so the launch recipe's
@@ -444,6 +530,13 @@ fn thread_open_request(spec: &SpawnSpec) -> Value {
     if let Some(model) = &spec.initial_model {
         open["params"]["model"] = json!(model);
     }
+    // Chimaera chat defaults to the safer reviewer-assisted workspace mode:
+    // sandboxed writes and on-request escalation stay intact, while Codex
+    // reviews each approval before deciding. Every field is explicit so a
+    // user config cannot leave the header and the real thread disagreeing.
+    open["params"]["sandbox"] = json!("workspace-write");
+    open["params"]["approvalPolicy"] = json!("on-request");
+    open["params"]["approvalsReviewer"] = json!("auto_review");
     open
 }
 
@@ -603,7 +696,7 @@ impl CollabAgent {
 /// state machine (no I/O), mirroring claude's `Mapper`.
 struct CodexMapper {
     thread_id: String,
-    models: Vec<crate::model::ModelInfo>,
+    catalog: CodexCatalog,
     /// Launcher-probed `--version` line, echoed on every Init (journal truth).
     agent_version: Option<String>,
     model: Option<String>,
@@ -715,7 +808,7 @@ fn codex_modes() -> Vec<crate::model::ModeInfo> {
 impl CodexMapper {
     fn new(
         thread_id: String,
-        models: Vec<crate::model::ModelInfo>,
+        catalog: CodexCatalog,
         model: Option<String>,
         effort: Option<String>,
         agent_version: Option<String>,
@@ -724,15 +817,16 @@ impl CodexMapper {
     ) -> Self {
         Self {
             thread_id,
-            models,
+            catalog,
             agent_version,
             model,
             pending_model: None,
             pending_effort: effort.clone(),
             // The handshake queues this exact state immediately after Init.
             reported_effort: Some(effort),
-            // codex's shipped default: workspace sandbox, on-request asks.
-            current_mode: "auto".to_string(),
+            // Chimaera's chat default: the same workspace/on-request tuple,
+            // with Codex's reviewer assessing approvals before they surface.
+            current_mode: "auto-review".to_string(),
             pending_mode: None,
             mode_per_turn: None,
             settings_update_unsupported: false,
@@ -760,7 +854,7 @@ impl CodexMapper {
             last_checkpoint: None,
             mcp_auto_approve,
             // The handshake minted 0..next_id (init, thread open, optional
-            // rollback, model/list) and hands over the next free id.
+            // rollback, model/list, skills/list) and hands over the next id.
             next_id,
         }
     }
@@ -771,8 +865,8 @@ impl CodexMapper {
             model: self.model.clone(),
             modes: codex_modes(),
             current_mode: Some(self.current_mode.clone()),
-            slash_commands: Vec::new(),
-            models: self.models.clone(),
+            slash_commands: self.catalog.slash_commands.clone(),
+            models: self.catalog.models.clone(),
             agent_version: self.agent_version.clone(),
         }
     }
@@ -1115,7 +1209,6 @@ impl CodexMapper {
                     step.events.push(AgentEvent::Notice {
                         text: format!("Your request was routed to {to}."),
                     });
-                    step.events.push(self.init_event());
                 }
             }
             // Turn-level error notification: retried errors are transient.
@@ -2890,12 +2983,30 @@ impl CodexMapper {
         }
         let mut attachments = 0u32;
         for b in &blocks {
-            if let ContentBlock::Image { media_type, data } = b {
-                attachments += 1;
-                input.push(json!({
-                    "type": "image",
-                    "url": format!("data:{media_type};base64,{data}"),
-                }));
+            match b {
+                ContentBlock::Image { media_type, data } => {
+                    attachments += 1;
+                    input.push(json!({
+                        "type": "image",
+                        "url": format!("data:{media_type};base64,{data}"),
+                    }));
+                }
+                ContentBlock::Skill { name, path } => {
+                    // ContentBlock is also accepted over the public WS, so do
+                    // not trust the browser to have built this companion from
+                    // our catalog. Codex receives only the exact enabled
+                    // name/path pair advertised for this session cwd.
+                    let advertised = self.catalog.slash_commands.iter().any(|command| {
+                        command.name == *name
+                            && command.skill_path.as_deref() == Some(path.as_str())
+                    });
+                    if advertised {
+                        input.push(json!({
+                            "type": "skill", "name": name, "path": path,
+                        }));
+                    }
+                }
+                ContentBlock::Text { .. } => {}
             }
         }
         let input = json!(input);
@@ -3009,8 +3120,13 @@ impl CodexMapper {
             }
             AgentCommand::SetModel { model_id } => {
                 self.pending_model = Some(model_id.clone());
-                self.model = Some(model_id);
-                step.events.push(self.init_event());
+                let from = self.model.replace(model_id.clone());
+                step.events.push(AgentEvent::ModelSwitched {
+                    from,
+                    to: model_id,
+                    reason: None,
+                    retract_current_turn: false,
+                });
             }
             AgentCommand::SetEffort { effort_id } => {
                 if self.pending_effort.as_deref() == Some(&effort_id) {
@@ -3561,7 +3677,34 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new(), None, None, None, None, 3)
+        CodexMapper::new(
+            "thr-1".into(),
+            CodexCatalog::default(),
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+    }
+
+    fn mapper_with_skill(name: &str, path: &str) -> CodexMapper {
+        CodexMapper::new(
+            "thr-1".into(),
+            CodexCatalog {
+                models: Vec::new(),
+                slash_commands: vec![SlashCommand {
+                    name: name.into(),
+                    description: "Test skill".into(),
+                    skill_path: Some(path.into()),
+                }],
+            },
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -4401,14 +4544,26 @@ mod tests {
     }
 
     #[test]
-    fn idle_send_starts_turn_with_images_as_data_urls() {
-        let mut m = mapper();
+    fn idle_send_starts_turn_with_images_and_native_skills() {
+        let mut m = mapper_with_skill("review", "/skills/review/SKILL.md");
         let step = m.on_command(AgentCommand::Send {
             blocks: vec![
                 ContentBlock::Text { text: "see".into() },
                 ContentBlock::Image {
                     media_type: "image/png".into(),
                     data: "QUJD".into(),
+                },
+                ContentBlock::Skill {
+                    name: "review".into(),
+                    path: "/skills/review/SKILL.md".into(),
+                },
+                ContentBlock::Skill {
+                    name: "review".into(),
+                    path: "/forged/review/SKILL.md".into(),
+                },
+                ContentBlock::Skill {
+                    name: "forged".into(),
+                    path: "/skills/review/SKILL.md".into(),
                 },
             ],
         });
@@ -4430,6 +4585,14 @@ mod tests {
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[1]["type"], "image");
         assert_eq!(input[1]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(input[2]["type"], "skill");
+        assert_eq!(input[2]["name"], "review");
+        assert_eq!(input[2]["path"], "/skills/review/SKILL.md");
+        assert_eq!(
+            input.as_array().unwrap().len(),
+            3,
+            "unadvertised skill name/path pairs never reach Codex"
+        );
     }
 
     #[test]
@@ -4518,7 +4681,7 @@ mod tests {
         let mode = m.on_command(AgentCommand::SetMode {
             mode_id: "plan".into(),
         });
-        assert_eq!(m.current_mode, "auto");
+        assert_eq!(m.current_mode, "auto-review");
         assert_eq!(
             m.pending_mode.as_ref().map(|(_, mode)| mode.as_str()),
             Some("plan")
@@ -4558,7 +4721,7 @@ mod tests {
             "result": {},
         }));
         assert!(step.events.is_empty());
-        assert_eq!(m.current_mode, "auto");
+        assert_eq!(m.current_mode, "auto-review");
         assert_eq!(
             m.pending_mode.as_ref().map(|(_, mode)| mode.as_str()),
             Some("auto")
@@ -4646,12 +4809,16 @@ mod tests {
         let start = thread_open_request(&spec);
         assert_eq!(start["method"], "thread/start");
         assert_eq!(start["params"]["model"], "gpt-test");
+        assert_eq!(start["params"]["sandbox"], "workspace-write");
+        assert_eq!(start["params"]["approvalPolicy"], "on-request");
+        assert_eq!(start["params"]["approvalsReviewer"], "auto_review");
 
         spec.pinned_native_id = Some("thread-old".into());
         let resume = thread_open_request(&spec);
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "thread-old");
         assert_eq!(resume["params"]["model"], "gpt-test");
+        assert_eq!(resume["params"]["approvalsReviewer"], "auto_review");
 
         spec.fork_at = Some("turn-7".into());
         let fork = thread_open_request(&spec);
@@ -4660,6 +4827,57 @@ mod tests {
         assert_eq!(fork["params"]["lastTurnId"], "turn-7");
         assert_eq!(fork["params"]["ephemeral"], false);
         assert_eq!(fork["params"]["model"], "gpt-test");
+        assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+    }
+
+    #[test]
+    fn skills_list_becomes_a_bounded_composer_catalog() {
+        let listed = json!({
+            "data": [{
+                "cwd": "/work",
+                "skills": [
+                    {
+                        "name": "chat-mode",
+                        "description": "long fallback",
+                        "interface": { "shortDescription": "Work on structured chat" },
+                        "path": "/work/.agents/skills/chat-mode/SKILL.md",
+                        "enabled": true,
+                    },
+                    {
+                        "name": "disabled",
+                        "description": "do not show",
+                        "path": "/skills/disabled.md",
+                        "enabled": false,
+                    },
+                    {
+                        "name": "CHAT-MODE",
+                        "description": "lower-priority duplicate",
+                        "path": "/skills/duplicate.md",
+                        "enabled": true,
+                    },
+                    {
+                        "name": "not composer compatible",
+                        "description": "bad name",
+                        "path": "/skills/bad.md",
+                        "enabled": true,
+                    }
+                ],
+                "errors": [],
+            }]
+        });
+        assert_eq!(
+            parse_codex_skills(&listed),
+            vec![SlashCommand {
+                name: "chat-mode".into(),
+                description: "skill — Work on structured chat".into(),
+                skill_path: Some("/work/.agents/skills/chat-mode/SKILL.md".into()),
+            }]
+        );
+
+        let mut oversized = listed;
+        oversized["data"][0]["skills"][0]["interface"]["shortDescription"] =
+            json!("x".repeat(SLASH_DESCRIPTION_MAX * 2));
+        assert!(parse_codex_skills(&oversized)[0].description.len() <= SLASH_DESCRIPTION_MAX);
     }
 
     #[test]
@@ -4885,7 +5103,7 @@ mod tests {
         // Ask-mode shape: only the read list is silent.
         let mut m = CodexMapper::new(
             "thr-1".into(),
-            Vec::new(),
+            CodexCatalog::default(),
             None,
             None,
             None,
@@ -4909,7 +5127,7 @@ mod tests {
         // Auto-mode shape: the whole server is silent.
         let mut m = CodexMapper::new(
             "thr-1".into(),
-            Vec::new(),
+            CodexCatalog::default(),
             None,
             None,
             None,
@@ -4926,7 +5144,7 @@ mod tests {
         // Another server's tool-call approval never matches the consent.
         let mut m = CodexMapper::new(
             "thr-1".into(),
-            Vec::new(),
+            CodexCatalog::default(),
             None,
             None,
             None,
@@ -4946,7 +5164,7 @@ mod tests {
         // pinned shape and rejects quote/space-carrying names.
         let mut m = CodexMapper::new(
             "thr-1".into(),
-            Vec::new(),
+            CodexCatalog::default(),
             None,
             None,
             None,
@@ -4965,7 +5183,7 @@ mod tests {
         // approves.
         let mut m = CodexMapper::new(
             "thr-1".into(),
-            Vec::new(),
+            CodexCatalog::default(),
             None,
             None,
             None,
@@ -5636,12 +5854,12 @@ mod tests {
             &step.events[1],
             AgentEvent::Notice { text } if text.contains("routed to gpt-5.4-mini")
         ));
-        match &step.events[2] {
-            AgentEvent::Init { model, .. } => {
-                assert_eq!(model.as_deref(), Some("gpt-5.4-mini"));
-            }
-            other => panic!("expected Init, got {other:?}"),
-        }
+        assert_eq!(
+            step.events.len(),
+            2,
+            "model changes never masquerade as a new driver"
+        );
+        assert_eq!(m.model.as_deref(), Some("gpt-5.4-mini"));
     }
 
     #[test]

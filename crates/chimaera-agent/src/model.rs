@@ -71,12 +71,22 @@ pub const WF_AGENT_LABEL_MAX: usize = 120;
 /// stuck with no way to approve or deny. Kept well under 256 KiB so the
 /// event stays admissible even beside its sibling fields.
 pub const PREVIEW_TOTAL_BUDGET: usize = 64 * 1024;
+/// Agent-provided composer catalog bound. Codex skills and Claude commands
+/// are filesystem/plugin influenced and the complete Init event is journaled.
+/// These maxima keep even a fully saturated catalog comfortably below the
+/// journal's 256 KiB line cap.
+pub const SLASH_COMMANDS_CAP: usize = 64;
+pub const SLASH_NAME_MAX: usize = 128;
+pub const SLASH_DESCRIPTION_MAX: usize = 320;
+pub const SKILL_PATH_MAX: usize = 1024;
 
 // AgentCommand ingress budgets. These are enforced again by ChatManager
 // immediately before enqueue, so non-WebSocket callers cannot bypass them.
-// The browser's current legitimate maximum is one text block plus four images.
-pub const COMMAND_BLOCKS_MAX: usize = 5;
+// The browser's current legitimate maximum is one text block, eight selected
+// skills, and four images.
+pub const COMMAND_BLOCKS_MAX: usize = 13;
 pub const COMMAND_IMAGES_MAX: usize = 4;
+pub const COMMAND_SKILLS_MAX: usize = 8;
 pub const COMMAND_TEXT_BLOCK_MAX: usize = 256 * 1024;
 pub const COMMAND_TEXT_TOTAL_MAX: usize = 256 * 1024;
 pub const COMMAND_IMAGE_BASE64_MAX: usize = 2 * 1024 * 1024;
@@ -669,6 +679,7 @@ impl AgentCommand {
             Self::Send { blocks } | Self::PrimeFork { blocks, .. } => {
                 check_command_len("send blocks", blocks.len(), COMMAND_BLOCKS_MAX)?;
                 let mut images = 0usize;
+                let mut skills = 0usize;
                 let mut text_total = 0usize;
                 let mut image_total = 0usize;
                 for block in blocks {
@@ -691,9 +702,15 @@ impl AgentCommand {
                             )?;
                             image_total = image_total.saturating_add(data.len());
                         }
+                        ContentBlock::Skill { name, path } => {
+                            skills = skills.saturating_add(1);
+                            check_command_len("skill name", name.len(), SLASH_NAME_MAX)?;
+                            check_command_len("skill path", path.len(), SKILL_PATH_MAX)?;
+                        }
                     }
                 }
                 check_command_len("send images", images, COMMAND_IMAGES_MAX)?;
+                check_command_len("send skills", skills, COMMAND_SKILLS_MAX)?;
                 check_command_len("send text", text_total, COMMAND_TEXT_TOTAL_MAX)?;
                 check_command_len(
                     "send image base64",
@@ -803,6 +820,7 @@ impl AgentCommand {
                 ContentBlock::Image { media_type, data } => {
                     media_type.len().saturating_add(data.len())
                 }
+                ContentBlock::Skill { name, path } => name.len().saturating_add(path.len()),
             });
         }
         Some(bytes)
@@ -830,9 +848,16 @@ pub enum ContentBlock {
         media_type: String,
         data: String,
     },
+    /// Codex `skills/list` selection. The text block retains the user's
+    /// visible `/skill-name` token; this companion block is the app-server's
+    /// native invocation signal.
+    Skill {
+        name: String,
+        path: String,
+    },
 }
 
-/// The text of a user message: its text blocks joined, image blocks dropped —
+/// The text of a user message: its text blocks joined, non-text blocks dropped —
 /// the prompt string both drivers hand their child. Shared so the two `Send`
 /// handlers can't drift.
 pub fn blocks_text(blocks: &[ContentBlock]) -> String {
@@ -945,6 +970,10 @@ pub struct SlashCommand {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Present for Codex `skills/list` rows. Additive on the daemon↔UI wire;
+    /// Claude's own slash catalog leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_path: Option<String>,
 }
 
 /// ACP tool-kind taxonomy; drivers map their native tool names into this so
@@ -1324,6 +1353,10 @@ mod tests {
             media_type: "image/png".to_string(),
             data: "x".repeat(COMMAND_IMAGE_BASE64_MAX),
         }));
+        blocks.extend((0..COMMAND_SKILLS_MAX).map(|i| ContentBlock::Skill {
+            name: format!("skill-{i}"),
+            path: format!("/skills/{i}/SKILL.md"),
+        }));
         assert!(AgentCommand::Send { blocks }.validate_ingress().is_ok());
     }
 
@@ -1357,6 +1390,24 @@ mod tests {
             ],
         };
         assert!(aggregate_text.validate_ingress().is_err());
+
+        let too_many_skills = AgentCommand::Send {
+            blocks: (0..COMMAND_SKILLS_MAX + 1)
+                .map(|i| ContentBlock::Skill {
+                    name: format!("skill-{i}"),
+                    path: format!("/skills/{i}/SKILL.md"),
+                })
+                .collect(),
+        };
+        assert!(too_many_skills.validate_ingress().is_err());
+
+        let oversized_skill_path = AgentCommand::Send {
+            blocks: vec![ContentBlock::Skill {
+                name: "skill".to_string(),
+                path: "x".repeat(SKILL_PATH_MAX + 1),
+            }],
+        };
+        assert!(oversized_skill_path.validate_ingress().is_err());
     }
 
     #[test]
@@ -1387,9 +1438,13 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data: "base64".to_string(),
                 },
+                ContentBlock::Skill {
+                    name: "review".to_string(),
+                    path: "/skills/review.md".to_string(),
+                },
             ],
         };
-        assert!(command.retained_send_bytes().unwrap() >= 5 + 9 + 6);
+        assert!(command.retained_send_bytes().unwrap() >= 5 + 9 + 6 + 6 + 17);
         assert_eq!(AgentCommand::Interrupt.retained_send_bytes(), None);
     }
 

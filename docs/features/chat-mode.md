@@ -52,7 +52,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   the available room, the composer keeps growing to the cap. A successful send resets the next draft
   to its natural height.
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
-  own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
+  own commands and Codex's enabled skills); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`
   is native for codex (`thread/compact/start`; the compaction runs as its own turn) — claude's
   `/compact` rides its own CLI catalog as prompt text. Manual and automatic compaction on either
@@ -62,16 +62,22 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   (including Claude's pre-summary token count when reported). Reconnect/replay restores an active
   compaction instead of falling back to a generic working spinner; turn abort, failure, or driver
   exit always settles it.
-  The slash popover triggers for a **line-leading** `/command` anywhere in the draft (a follow-up
-  begun on a fresh line), not only when the slash is the first character — a mid-draft pick
-  completes the token in place; only a whole-draft slash takes the command path. Ordinary path
-  text ("cd /usr") is never hijacked.
+  The slash popover triggers after any whitespace boundary, so prose such as
+  `please use /skill` remains fully editable while the matching command menu opens. A mid-draft
+  pick completes the token in place; only a whole-draft slash takes the command path. Native
+  command arguments are completable too (`/model`, `/mode`, `/effort`, `/ultracode`). Path
+  fragments such as `src/skill` are not command boundaries, and an unmatched slash token remains
+  ordinary text.
+  Codex's cwd-scoped `skills/list` inventory becomes bounded `/skill-name` rows. Sending prose
+  containing an exact skill token preserves the visible text and adds Codex's native
+  `{type:"skill", name, path}` input block; Claude continues to execute its advertised commands as
+  text. Skill invocations are de-duplicated and capped at eight per send.
 - **`/login` recovery (claude).** An expired-auth chat session dead-ends — the `-p stream-json`
   CLI answers "/login isn't available in this environment". `/login` (palette + intercepted on
   send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
   where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
   never touches the credentials. Sign in there, toggle back to chat.
-- **Where.** `Composer.svelte`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
+- **Where.** `Composer.svelte`, `composer.ts`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
   `composerBus.ts` (other surfaces drop references into the draft). Uses `fsValidate`/`fsQuickOpen`.
 
 ## Header controls
@@ -84,6 +90,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   settings tuple so a prior reviewer, sandbox, approval policy, or collaboration mode cannot stay
   invisibly active. Claude's launch-gated Bypass permissions mode is not offered: structured chat
   sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
+  New and resumed Codex chats default to **Auto review** at thread open — workspace writes remain
+  sandboxed and escalation remains on-request, while `auto_review` assesses approval requests.
+  The header reflects that state from the first `Init`; `/mode auto-review` switches it explicitly,
+  and the common `/model auto-review` slip is recovered as a mode switch with a corrective notice.
   The model chosen when a Codex chat is created rides `thread/start` (and resume), rather than
   silently falling back to the CLI default until the first header change.
   Codex's effort chip is seeded from the effective thread setting and each selection is applied
@@ -246,7 +256,7 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   follows the allow with a `set_permission_mode acceptEdits`, so the mode chip flips with it.
   Enter (card focused) = auto-accept, Esc = keep planning; Enter inside the comment field is
   deliberately inert (a comment can accompany any of the three answers).
-- **Codex auto review.** Auto review mode keeps the workspace sandbox and on-request policy but
+- **Codex auto review.** Auto review is the Codex chat default. It keeps the workspace sandbox and on-request policy but
   assigns Codex's `auto_review` reviewer. Its unstable `item/autoApprovalReview/started|completed`
   lifecycle is normalized into an ordinary bounded tool card (reviewed action/files, verdict,
   risk, rationale); a denied action is a successful safety verdict, while timeout/abort renders
