@@ -97,14 +97,18 @@ just app-build          # bundle the .app/.dmg
 released app) share `~/.chimaera` — a dev build would fight your real app over
 the manifest, port, saved hosts, and window registry. `app-dev-isolated` runs
 [`run-app-isolated.sh`](run-app-isolated.sh), which sets `CHIMAERA_HOME=
-~/.chimaera-dev-app/<worktree>` before launching the built binary. Because the
+~/.chimaera-dev-app/<worktree-key>` before launching the built binary. The key
+includes a stable checksum of the absolute worktree path because linked
+worktrees commonly all end in `chimaera`. Because the
 app, the `--daemon` it spawns (a free port, THIS worktree's build), and the
 shells that daemon spawns all inherit `CHIMAERA_HOME`, the whole stack is isolated
 — nothing lands in the shared `~/.chimaera` — yet still per-worktree.
 
 The launcher also runs a generated `chimaera-dev` identity rather than
 `chimaera` (on macOS, a small `target/debug/chimaera-dev.app` wrapper with its
-own bundle id; elsewhere, a `target/debug/chimaera-dev` hard link). This keeps
+own bundle id; elsewhere, a `target/debug/chimaera-dev` hard link). It also
+builds with a per-worktree Tauri identifier: the single-instance plugin keys
+its socket/service from compiled configuration, not wrapper metadata. This keeps
 the isolated GUI process distinct in Activity Monitor and Computer Use while
 the released app is open; for live automation, target **`chimaera-dev`**, never
 the user's `chimaera`.
@@ -187,15 +191,14 @@ connect Just Works. This is the flow to walk them through.
 
 **1. Launch the isolated native app** (a real window, isolated state, won't touch
 their real `~/.chimaera` app). `just app-dev-isolated`, or when `just` is absent,
-its three steps — the last one **in the background** (it's a long-running GUI):
+its two steps — the last one **in the background** (it's a long-running GUI):
 
 ```sh
 nvm use 22 && npm --prefix web-ui run build          # UI is embedded/served from dist
-cargo build --manifest-path crates/chimaera-app/Cargo.toml
-bash .claude/skills/develop/run-app-isolated.sh      # run in background — opens the window
+bash .claude/skills/develop/run-app-isolated.sh      # builds + runs in background — opens the window
 ```
 
-State lives under `CHIMAERA_HOME=~/.chimaera-dev-app/<worktree>`; the script
+State lives under `CHIMAERA_HOME=~/.chimaera-dev-app/<worktree-key>`; the script
 scrubs `CLAUDE*`/`ANTHROPIC*` env (else the app's spawned agents die on start)
 and launches the generated `chimaera-dev` app identity. Computer Use must
 target `chimaera-dev`, which prevents it from driving the user's released app.
@@ -211,7 +214,7 @@ branch must exist where THIS app looks. The trap: the in-app hint says
 ```sh
 # needs zig + cargo-zigbuild; arch = the host's (Sherlock = x86_64)
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p chimaera
-HOME_DIR=~/.chimaera-dev-app/$(basename "$PWD")
+HOME_DIR="$(bash .claude/skills/develop/run-app-isolated.sh --print-home)"
 mkdir -p "$HOME_DIR/data/dist"
 cp target/x86_64-unknown-linux-musl/release/chimaera \
    "$HOME_DIR/data/dist/chimaera-x86_64-linux-musl"

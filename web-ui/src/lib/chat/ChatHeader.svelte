@@ -254,7 +254,7 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    height: 18px;
+    height: calc(var(--text-xs) + 6px);
     /* Fixed-height pill: the label must clip, never wrap out of it. */
     white-space: nowrap;
     min-width: 0;
@@ -342,7 +342,7 @@
     background: none;
     border-radius: 5px;
     padding: 0 10px;
-    line-height: 16px;
+    line-height: 1.35;
     cursor: pointer;
     transition: background-color 0.12s ease;
   }
@@ -362,7 +362,7 @@
     border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--edge));
     border-radius: 999px;
     padding: 0 8px;
-    height: 18px;
+    height: calc(var(--text-xs) + 6px);
     display: inline-flex;
     align-items: center;
     animation: rise 0.18s ease; /* @keyframes rise lives in app.css */

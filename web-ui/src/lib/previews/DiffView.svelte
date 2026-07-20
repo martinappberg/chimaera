@@ -13,7 +13,7 @@
    * side is the index, whose line numbers need not match the file on disk).
    */
   import { untrack } from "svelte";
-  import { EditorState, StateEffect } from "@codemirror/state";
+  import { Compartment, EditorState, StateEffect } from "@codemirror/state";
   import { EditorView, lineNumbers, highlightSpecialChars } from "@codemirror/view";
   import { MergeView } from "@codemirror/merge";
   import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
@@ -52,6 +52,7 @@
   let chipPos = $state<{ x: number; y: number } | null>(null);
 
   let merge: MergeView | null = null;
+  const settingsCompartment = new Compartment();
   let loadSeq = 0;
   // Plain (non-reactive) so writing it inside the epoch effect cannot loop.
   let lastEpoch = -1;
@@ -71,13 +72,24 @@
   }
 
   function baseExtensions() {
+    const tabSize = getSetting("editor.tabSize");
     return [
-      lineNumbers(),
       highlightSpecialChars(),
       syntaxHighlighting(codeHighlight, { fallback: true }),
-      makeCodeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
+      settingsCompartment.of(
+        editorSettings(tabSize),
+      ),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
+    ];
+  }
+
+  function editorSettings(tabSize = getSetting("editor.tabSize")) {
+    return [
+      makeCodeTheme(getSetting("editor.fontSize"), getSetting("editor.lineHeight")),
+      getSetting("editor.lineNumbers") ? lineNumbers() : [],
+      getSetting("editor.wordWrap") ? EditorView.lineWrapping : [],
+      EditorState.tabSize.of(tabSize),
     ];
   }
 
@@ -196,6 +208,17 @@
     untrack(() => void load(id, p, m));
   });
 
+  // Every Editor setting must reach an already-mounted merge view; rebuilding
+  // only when git changed made the rows look saved while an open diff stayed
+  // stale. Font family rides the live CSS variable inside the theme.
+  $effect(() => {
+    const settings = editorSettings();
+    const view = merge;
+    if (view === null) return;
+    view.a.dispatch({ effects: settingsCompartment.reconfigure(settings) });
+    view.b.dispatch({ effects: settingsCompartment.reconfigure(settings) });
+  });
+
   // Keep the diff live: an agent write, a save, or a terminal `git` command
   // bumps the workspace epoch, and the view refetches.
   $effect(() => {
@@ -281,7 +304,7 @@
     height: 28px;
     padding: 0 0.6rem;
     border-bottom: 1px solid var(--edge);
-    font-size: 0.7rem;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
 
@@ -300,7 +323,7 @@
   }
 
   .dtag {
-    font-size: 0.62rem;
+    font-size: var(--text-xs);
     padding: 0.05rem 0.32rem;
     border-radius: 3px;
     font-weight: 600;
@@ -334,7 +357,7 @@
     border: none;
     background: var(--term-bg);
     font: inherit;
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     padding: 0.16rem 0.5rem;
@@ -365,7 +388,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.74rem;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
   .msg .err {
@@ -403,6 +426,6 @@
     color: var(--muted);
     background: color-mix(in srgb, var(--fg) 3%, transparent);
     font-family: var(--mono);
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
   }
 </style>

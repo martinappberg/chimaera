@@ -36,6 +36,7 @@
   } from "../workspace/sessions";
   import type { LayoutCtrl } from "../layout/dnd";
   import { rosterWeight, type DashCtx , relPath as sharedRelPath} from "./dash";
+  import { getSetting } from "../settings/store.svelte";
 
   interface Props {
     dash: DashCtx;
@@ -74,8 +75,11 @@
   const finished = $derived(agents.filter((s) => s.alive && s.agent_state === "finished").length);
   const busyShells = $derived(shells.filter(isBusy).length);
 
-  const hero = $derived(lane.length === 0 && roster.length === 1);
-  const compact = $derived(roster.length >= 7);
+  const compact = $derived.by(() => {
+    const density = getSetting("dashboard.cardDensity");
+    return density === "compact" || (density === "auto" && roster.length >= 7);
+  });
+  const hero = $derived(lane.length === 0 && roster.length === 1 && !compact);
 
   /** Roster cards glide instead of teleporting when they REORDER within
    *  their list (the live-before-dead resort, a new sibling pushing the
@@ -675,7 +679,7 @@
   }
   .blank h2 {
     margin: 0;
-    font-size: 17px;
+    font-size: var(--text-lg);
     font-weight: 600;
     color: var(--fg);
     letter-spacing: 0.01em;
@@ -724,7 +728,7 @@
   }
   kbd {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     border: 1px solid var(--edge);
     border-radius: 3px;
@@ -1148,7 +1152,7 @@
   .fby {
     flex: none;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     border: 1px solid var(--edge);
     border-radius: 999px;

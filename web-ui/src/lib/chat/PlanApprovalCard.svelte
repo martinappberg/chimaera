@@ -197,7 +197,7 @@
     color: rgba(0, 0, 0, 0.8);
     display: grid;
     place-items: center;
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 700;
   }
   .label {

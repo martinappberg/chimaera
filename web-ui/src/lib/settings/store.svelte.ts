@@ -6,9 +6,10 @@
  * the sparse map on the daemon, which broadcasts it back to every window
  * over /ws/events (`applyRemote`).
  *
- * Appearance (theme + accent) is applied to the document HERE, synchronously
- * with every change, so CSS variables are already correct when subscribers
- * (e.g. the terminal theme rebuild) read them.
+ * Appearance (theme, accent, interface typography, and the editor font) is
+ * applied to the document HERE, synchronously with every change, so CSS
+ * variables are already correct when subscribers (e.g. the terminal theme
+ * rebuild) read them.
  */
 
 import { api } from "../net/api";
@@ -161,7 +162,7 @@ function notify(): void {
   for (const cb of listeners) cb();
 }
 
-// --- appearance: theme + accent applied at the document root ---------------
+// --- appearance: theme + typography applied at the document root -----------
 
 const systemDark =
   typeof matchMedia !== "undefined" ? matchMedia("(prefers-color-scheme: dark)") : null;
@@ -203,6 +204,25 @@ function applyAppearance(): void {
   }
   const accent = getSetting("appearance.accentColor");
   if (accent !== "") root.style.setProperty("--accent", accent);
+
+  // One application-wide interface scale. Components consume only the four
+  // --text-* tokens; updating them here makes a settings edit apply to every
+  // mounted surface (including lazy views) without a reload. The deliberately
+  // small two-pixel spread keeps labels subordinate without returning to the
+  // 9–11px chrome that prompted this setting.
+  const ui = getSetting("appearance.interfaceFontSize");
+  root.style.setProperty("--text-xs", `${Math.max(9, ui - 2)}px`);
+  root.style.setProperty("--text-sm", `${Math.max(10, ui - 1)}px`);
+  root.style.setProperty("--text-md", `${ui}px`);
+  root.style.setProperty("--text-lg", `${ui + 2}px`);
+
+  const uiFont = getSetting("appearance.interfaceFontFamily").trim();
+  if (uiFont === "") root.style.removeProperty("--ui-font-custom");
+  else root.style.setProperty("--ui-font-custom", uiFont);
+
+  const editorFont = getSetting("editor.fontFamily").trim();
+  if (editorFont === "") root.style.removeProperty("--editor-font-custom");
+  else root.style.setProperty("--editor-font-custom", editorFont);
 }
 
 // Apply defaults immediately on module load so the first paint has a theme

@@ -403,7 +403,7 @@
      "daemon" scope tag, tinted by state (accent = resolvable, warn = not). */
   .badge {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--muted);
@@ -454,7 +454,7 @@
     overflow-wrap: anywhere;
     margin-top: 5px;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     opacity: 0;
     transition: opacity 0.12s ease;

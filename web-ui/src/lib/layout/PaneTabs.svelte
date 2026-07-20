@@ -1337,7 +1337,7 @@
 
   /* Per-pane text size (parity with the chords); text glyphs, same cluster. */
   .ctl-font {
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-family: var(--mono);
     letter-spacing: -0.02em;
     width: 24px;

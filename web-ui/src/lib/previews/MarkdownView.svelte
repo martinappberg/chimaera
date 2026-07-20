@@ -30,9 +30,11 @@
 
   let { path, fontSize = undefined }: Props = $props();
 
-  // Preview base size: the pane override, else the app's base text size (the
-  // same value the A−/A+ steps start from, so the first step never jumps).
-  const bodyFont = $derived(fontSize ?? getSetting("terminal.fontSize"));
+  // Preview base size: the pane override, else the Markdown preference. This
+  // used to fall through to terminal.fontSize, coupling two unrelated content
+  // surfaces and making the Editor settings appear only partly enforced.
+  const bodyFont = $derived(fontSize ?? getSetting("editor.markdownFontSize"));
+  const bodyLineHeight = $derived(getSetting("editor.markdownLineHeight"));
 
   type Mode = "preview" | "split" | "edit";
   let mode = $state<Mode>("preview");
@@ -168,7 +170,7 @@
   }
 </script>
 
-<div class="md-view">
+<div class="md-view" style:--markdown-line-height={bodyLineHeight}>
   <div class="md-bar">
     <div class="toggle" role="tablist" aria-label="markdown mode">
       <button
@@ -334,7 +336,7 @@
   .file-error {
     padding: 2rem;
     color: var(--muted);
-    font-size: 0.8rem;
+    font-size: var(--text-md);
     text-align: center;
   }
 
@@ -344,8 +346,8 @@
     max-width: 70ch;
     margin: 0 auto;
     padding: 2.2rem 2rem 3.5rem;
-    font-size: 0.92rem;
-    line-height: 1.65;
+    font-size: var(--text-lg);
+    line-height: var(--markdown-line-height);
     color: var(--fg);
     overflow-wrap: break-word;
   }
