@@ -2333,79 +2333,91 @@ impl ClaudeMapper {
         }
     }
 
+    fn send_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        display_text: Option<String>,
+        step: &mut DriverStep,
+    ) {
+        let text = crate::model::blocks_text(&blocks);
+        let attachments = blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count() as u32;
+        let content: Vec<Value> = blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
+                ContentBlock::Image { media_type, data } => json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": data },
+                }),
+            })
+            .collect();
+        let uuid = crate::model::fresh_uuid();
+        let preceding = self.last_msg_uuid.replace(uuid.clone());
+        let priming = display_text.is_some();
+        step.events.push(AgentEvent::UserMessage {
+            text: display_text.unwrap_or_else(|| text.clone()),
+            attachments: if priming { 0 } else { attachments },
+            id: Some(uuid.clone()),
+            queued: self.turn_active,
+        });
+        step.events.push(AgentEvent::Checkpoint {
+            user_message_id: uuid.clone(),
+            preceding_uuid: preceding,
+        });
+        if self.turn_active {
+            // A turn is running: HOLD this message (do NOT write it to the CLI
+            // now). It flushes to stdin when the running turn's result lands,
+            // which also resolves it `sent`. Holding — vs the official
+            // client's own mid-turn queue — keeps the CLI from coalescing rapid
+            // sends into fewer results and stranding one, and keeps the
+            // delivered bubble out of the still-streaming turn.
+            self.queued_sends.push_back((uuid.clone(), json!(content)));
+        } else {
+            // Idle: this send opens a fresh turn and goes to the CLI
+            // immediately. An interrupt sent while idle (benign no-op on the
+            // CLI) must not relabel this fresh turn's genuine failure as a
+            // quiet stop, nor let its armed watchdog abort it.
+            self.interrupt_requested = false;
+            self.interrupt_grace = None;
+            self.reset_compaction_for_new_turn();
+            self.turn_n += 1;
+            self.turn_active = true;
+            step.events.push(AgentEvent::TurnStarted {
+                turn_id: self.turn_id(),
+            });
+            step.outbound
+                .push(user_message_frame(&uuid, json!(content)));
+        }
+        // Name an ordinary new conversation off its first message. A fork is
+        // already named by the server; generating a title from the large
+        // hidden handoff would waste context and produce a misleading label.
+        if !priming && !self.title_requested && !text.trim().is_empty() {
+            self.title_requested = true;
+            let id = self.ctl_id();
+            self.pending_controls
+                .insert(id.clone(), PendingControl::Title);
+            step.outbound.push(control_request_frame(
+                &id,
+                json!({
+                    "subtype": "generate_session_title",
+                    "description": text,
+                    "persist": false,
+                }),
+            ));
+        }
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
-            AgentCommand::Send { blocks } => {
-                let text = crate::model::blocks_text(&blocks);
-                let attachments = blocks
-                    .iter()
-                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
-                    .count() as u32;
-                let content: Vec<Value> = blocks
-                    .iter()
-                    .map(|b| match b {
-                        ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                        ContentBlock::Image { media_type, data } => json!({
-                            "type": "image",
-                            "source": { "type": "base64", "media_type": media_type, "data": data },
-                        }),
-                    })
-                    .collect();
-                let uuid = crate::model::fresh_uuid();
-                let preceding = self.last_msg_uuid.replace(uuid.clone());
-                step.events.push(AgentEvent::UserMessage {
-                    text: text.clone(),
-                    attachments,
-                    id: Some(uuid.clone()),
-                    queued: self.turn_active,
-                });
-                step.events.push(AgentEvent::Checkpoint {
-                    user_message_id: uuid.clone(),
-                    preceding_uuid: preceding,
-                });
-                if self.turn_active {
-                    // A turn is running: HOLD this message (do NOT write it to
-                    // the CLI now). It flushes to stdin when the running turn's
-                    // result lands, which also resolves it `sent`. Holding — vs
-                    // the official client's own mid-turn queue — is what keeps
-                    // the CLI from coalescing rapid sends into fewer results and
-                    // stranding one, and it keeps the delivered bubble from
-                    // splicing into the still-streaming turn.
-                    self.queued_sends.push_back((uuid.clone(), json!(content)));
-                } else {
-                    // Idle: this send opens a fresh turn and goes to the CLI
-                    // immediately. An interrupt sent while idle (benign no-op on
-                    // the CLI) must not relabel this fresh turn's genuine failure
-                    // as a quiet stop, nor let its armed watchdog abort it.
-                    self.interrupt_requested = false;
-                    self.interrupt_grace = None;
-                    self.reset_compaction_for_new_turn();
-                    self.turn_n += 1;
-                    self.turn_active = true;
-                    step.events.push(AgentEvent::TurnStarted {
-                        turn_id: self.turn_id(),
-                    });
-                    step.outbound
-                        .push(user_message_frame(&uuid, json!(content)));
-                }
-                // Name the conversation off the first message (the
-                // extension's moment and shape: description = message text).
-                if !self.title_requested && !text.trim().is_empty() {
-                    self.title_requested = true;
-                    let id = self.ctl_id();
-                    self.pending_controls
-                        .insert(id.clone(), PendingControl::Title);
-                    step.outbound.push(control_request_frame(
-                        &id,
-                        json!({
-                            "subtype": "generate_session_title",
-                            "description": text,
-                            "persist": false,
-                        }),
-                    ));
-                }
-            }
+            AgentCommand::Send { blocks } => self.send_blocks(blocks, None, &mut step),
+            AgentCommand::PrimeFork {
+                blocks,
+                display_text,
+            } => self.send_blocks(blocks, Some(display_text), &mut step),
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3659,6 +3671,31 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
             "the queued turn opens lazily on its first real frame: {:?}",
             step.events
+        );
+    }
+
+    #[test]
+    fn fork_prime_sends_full_context_but_journals_only_compact_row() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::PrimeFork {
+            blocks: vec![ContentBlock::Text {
+                text: "full portable transcript context".into(),
+            }],
+            display_text: "Continue from this fork point.".into(),
+        });
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { text, .. }
+                if text == "Continue from this fork point."
+        ));
+        assert_eq!(
+            step.outbound[0]["message"]["content"][0]["text"],
+            "full portable transcript context"
+        );
+        assert_eq!(
+            step.outbound.len(),
+            1,
+            "server already names forks; hidden context must not request a title"
         );
     }
 

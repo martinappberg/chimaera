@@ -145,8 +145,9 @@ decides **which** driver runs and **what happens around** its lifecycle.
 - **`apply_chat_event`** folds protocol events into the `AgentRecord` state
   machine. In chat mode the **protocol is authoritative** for the whole
   lifecycle (hooks are unreliable under `-p stream-json`).
-- **`spawn_chat_session`** is the one spawn recipe (create, view-switch, rewind
-  all route through it). It assembles argv via `launcher`, seeds the journal
+- **`spawn_chat_session`** is the one spawn recipe (create, view-switch, rewind,
+  and non-destructive branch all route through it). It assembles argv via
+  `launcher`, seeds the journal
   from a previous life on resume, and hands a `SpawnSpec` to `state.chat.spawn`.
 - **`handle_chat_exit`** degrades a failed handshake to a PTY TUI (marking the
   in-flight degrade in `chat_switching` so attached chat sockets report
@@ -157,6 +158,10 @@ decides **which** driver runs and **what happens around** its lifecycle.
   failures are already journaled by the driver harness before this runs.
 - **`switch_view` / `rewind_session`** stop the current process and respawn the
   SAME chimaera session id in the other surface / at a fork point.
+- **`fork_session`** snapshots a source journal prefix without stopping it and
+  creates a distinct session. Same-agent exact boundaries use native history;
+  cross-agent and unrepresentable boundaries seed the normalized prefix and
+  prime a fresh driver with a bounded portable transcript.
 
 ### The state maps you must keep coherent
 
@@ -177,7 +182,8 @@ the lifecycle, keep them consistent:
   (`chat_authenticate`), same token as the rest. Don't add an unauthenticated
   endpoint.
 - **Kill-then-respawn is not atomic.** Resolve every respawn precondition
-  (binary, settings files) *before* killing the old process — a post-kill
+  (binary and regenerable runtime settings/MCP files) *before* killing the old
+  process — a post-kill
   failure leaves the session in no registry and the watcher retires it. Serialize
   concurrent switches on `chat_switching`.
 - **Chat sessions survive disconnect AND a daemon restart.** They are

@@ -398,12 +398,21 @@ async fn codex_handshake(
 /// Build the thread-open request separately from I/O so the launch recipe's
 /// create-time model contract stays hermetically testable.
 fn thread_open_request(spec: &SpawnSpec) -> Value {
-    let mut open = match &spec.pinned_native_id {
-        Some(thread_id) => json!({
+    let mut open = match (&spec.pinned_native_id, &spec.fork_at) {
+        (Some(thread_id), Some(last_turn_id)) => json!({
+            "id": 1, "method": "thread/fork",
+            "params": {
+                "threadId": thread_id,
+                "lastTurnId": last_turn_id,
+                "cwd": spec.cwd,
+                "ephemeral": false,
+            },
+        }),
+        (Some(thread_id), None) => json!({
             "id": 1, "method": "thread/resume",
             "params": { "threadId": thread_id, "cwd": spec.cwd },
         }),
-        None => json!({
+        (None, _) => json!({
             "id": 1, "method": "thread/start",
             "params": { "cwd": spec.cwd },
         }),
@@ -2702,59 +2711,70 @@ impl CodexMapper {
         }
     }
 
+    fn send_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+        display_text: Option<String>,
+        step: &mut DriverStep,
+    ) {
+        let text = crate::model::blocks_text(&blocks);
+        // Images ride the input array as data URLs (the extension's non-local
+        // path form; local paths need a shared fs).
+        let mut input: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            input.push(json!({ "type": "text", "text": text }));
+        }
+        let mut attachments = 0u32;
+        for b in &blocks {
+            if let ContentBlock::Image { media_type, data } = b {
+                attachments += 1;
+                input.push(json!({
+                    "type": "image",
+                    "url": format!("data:{media_type};base64,{data}"),
+                }));
+            }
+        }
+        let input = json!(input);
+        let client_msg_id = crate::model::fresh_uuid();
+        // Queue and steer are separate Codex-native actions. A send during a
+        // live/pending run is held for the NEXT turn; the UI's Steer button
+        // explicitly promotes it via `turn/steer`.
+        let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
+        let priming = display_text.is_some();
+        step.events.push(AgentEvent::UserMessage {
+            text: display_text.unwrap_or_else(|| text.clone()),
+            attachments: if priming { 0 } else { attachments },
+            id: Some(client_msg_id.clone()),
+            queued,
+        });
+        if queued {
+            self.queued_sends.push_back(QueuedSend {
+                input,
+                client_msg_id,
+                steer_when_active: false,
+            });
+        } else {
+            // Only a turn-OPENING send anchors a checkpoint: rewind rolls
+            // back whole turns (thread/rollback numTurns), so a steered
+            // message — joining a running turn — is not a boundary. Emitted
+            // right after UserMessage (journal truncation relies on adjacency).
+            let preceding = self.last_checkpoint.replace(client_msg_id.clone());
+            step.events.push(AgentEvent::Checkpoint {
+                user_message_id: client_msg_id.clone(),
+                preceding_uuid: preceding,
+            });
+            self.emit_turn_start(input, client_msg_id, step);
+        }
+    }
+
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
-            AgentCommand::Send { blocks } => {
-                let text = crate::model::blocks_text(&blocks);
-                // Images ride the input array as data URLs (the extension's
-                // non-local-path form; local paths need a shared fs).
-                let mut input: Vec<Value> = Vec::new();
-                if !text.is_empty() {
-                    input.push(json!({ "type": "text", "text": text }));
-                }
-                let mut attachments = 0u32;
-                for b in &blocks {
-                    if let ContentBlock::Image { media_type, data } = b {
-                        attachments += 1;
-                        input.push(json!({
-                            "type": "image",
-                            "url": format!("data:{media_type};base64,{data}"),
-                        }));
-                    }
-                }
-                let input = json!(input);
-                let client_msg_id = crate::model::fresh_uuid();
-                // Queue and steer are separate Codex-native actions. A send
-                // during a live/pending run is held for the NEXT turn; the
-                // UI's Steer button explicitly promotes it via `turn/steer`.
-                let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
-                step.events.push(AgentEvent::UserMessage {
-                    text: text.clone(),
-                    attachments,
-                    id: Some(client_msg_id.clone()),
-                    queued,
-                });
-                if queued {
-                    self.queued_sends.push_back(QueuedSend {
-                        input,
-                        client_msg_id,
-                        steer_when_active: false,
-                    });
-                } else {
-                    // Only a turn-OPENING send anchors a checkpoint: rewind
-                    // rolls back whole turns (thread/rollback numTurns), so a
-                    // steered message — joining a running turn — is not a
-                    // rewindable boundary. Emitted right after UserMessage
-                    // (the journal-truncation cut relies on the adjacency).
-                    let preceding = self.last_checkpoint.replace(client_msg_id.clone());
-                    step.events.push(AgentEvent::Checkpoint {
-                        user_message_id: client_msg_id.clone(),
-                        preceding_uuid: preceding,
-                    });
-                    self.emit_turn_start(input, client_msg_id, &mut step);
-                }
-            }
+            AgentCommand::Send { blocks } => self.send_blocks(blocks, None, &mut step),
+            AgentCommand::PrimeFork {
+                blocks,
+                display_text,
+            } => self.send_blocks(blocks, Some(display_text), &mut step),
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3383,6 +3403,26 @@ mod tests {
                 id: msg_id,
                 state: UserMessageState::Sent,
             }]
+        );
+    }
+
+    #[test]
+    fn fork_prime_sends_full_context_but_journals_only_compact_row() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::PrimeFork {
+            blocks: vec![ContentBlock::Text {
+                text: "full portable transcript context".into(),
+            }],
+            display_text: "Continue from this fork point.".into(),
+        });
+        assert!(matches!(
+            &step.events[0],
+            AgentEvent::UserMessage { text, .. }
+                if text == "Continue from this fork point."
+        ));
+        assert_eq!(
+            step.outbound[0]["params"]["input"][0]["text"],
+            "full portable transcript context"
         );
     }
 
@@ -4269,6 +4309,14 @@ mod tests {
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "thread-old");
         assert_eq!(resume["params"]["model"], "gpt-test");
+
+        spec.fork_at = Some("turn-7".into());
+        let fork = thread_open_request(&spec);
+        assert_eq!(fork["method"], "thread/fork");
+        assert_eq!(fork["params"]["threadId"], "thread-old");
+        assert_eq!(fork["params"]["lastTurnId"], "turn-7");
+        assert_eq!(fork["params"]["ephemeral"], false);
+        assert_eq!(fork["params"]["model"], "gpt-test");
     }
 
     #[test]

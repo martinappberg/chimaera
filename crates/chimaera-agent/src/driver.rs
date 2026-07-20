@@ -76,6 +76,10 @@ pub struct SpawnSpec {
     /// `thread/rollback` right after `thread/resume`. Claude ignores it — its
     /// fork rides argv (`--fork-session --resume-session-at`).
     pub rollback_turns: Option<u32>,
+    /// Native conversation fork point. Claude consumes this through launcher
+    /// argv (`--fork-session --resume-session-at`); Codex opens with
+    /// `thread/fork {threadId,lastTurnId}` instead of `thread/resume`.
+    pub fork_at: Option<String>,
     /// MCP tool calls the embedder has already consented to: the driver
     /// answers their approval prompts accept itself instead of surfacing a
     /// PermissionRequest. Codex-only today — its app-server elicits EVERY
@@ -114,6 +118,7 @@ impl SpawnSpec {
             initial_model: None,
             agent_version: None,
             rollback_turns: None,
+            fork_at: None,
             mcp_auto_approve: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,

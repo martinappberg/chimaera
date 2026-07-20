@@ -578,6 +578,29 @@ export async function rewindSession(id: string, resumeAt: string): Promise<void>
   );
 }
 
+/** Branch a chat transcript through one rendered message into a fresh session.
+ * Same-agent exact boundaries use the agent's native fork protocol; otherwise
+ * the daemon transfers Chimaera's normalized transcript into the destination. */
+export async function forkSession(
+  id: string,
+  throughSeq: number,
+  agent: string,
+  nativeAt: string | null,
+): Promise<Session> {
+  return json(
+    await api(`/sessions/${id}/fork`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        through_seq: throughSeq,
+        agent,
+        native_at: nativeAt,
+        theme: resolvedTheme(),
+      }),
+    }),
+  );
+}
+
 /** Pin a user-chosen display name on a session (any kind — the app owns
  *  renaming; only claude has an in-TUI /rename, and it shouldn't be the
  *  only way). The pin outranks every derived name on every surface. */

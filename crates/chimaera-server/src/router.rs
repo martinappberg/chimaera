@@ -56,6 +56,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/journal", get(api::session_journal))
         .route("/sessions/{id}/view", post(chat::switch_view))
         .route("/sessions/{id}/rewind", post(chat::rewind_session))
+        .route("/sessions/{id}/fork", post(chat::fork_session))
         .route("/links", get(links::list_links).put(links::put_link))
         .route("/links/{terminal_id}", delete(links::delete_link))
         .route("/agents", get(launcher::list_agents))

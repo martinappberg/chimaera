@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy, tick } from "svelte";
-  import { rewindSession, renameSession, type Session } from "../workspace/sessions";
+  import { forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
@@ -23,6 +23,7 @@
   import UsagePanel from "./UsagePanel.svelte";
   import McpPanel from "./McpPanel.svelte";
   import RewindDialog from "./RewindDialog.svelte";
+  import ForkDialog from "./ForkDialog.svelte";
   import Composer from "./Composer.svelte";
   import type { ImageAttachment } from "./images";
   import type { ChatBlock, PlanEntry } from "./store.svelte";
@@ -40,6 +41,8 @@
      *  interactive CLI flows the `-p` stream-json mode can't run — `/login`
      *  above all — so the native auth flow runs where it belongs. */
     onSwitchToTerminal?: () => void;
+    /** Focus the newly-created session while the source remains alive. */
+    onForked?: (session: Session) => void;
   }
 
   let {
@@ -49,6 +52,7 @@
     onOpenFile,
     onOpenPath,
     onSwitchToTerminal,
+    onForked,
   }: Props = $props();
 
   // The component is {#key}ed on session id by its parent: one instance per
@@ -69,6 +73,7 @@
    *  fall back to a built-in map until it resolves (a workspace can mix agents,
    *  so the surface always says WHICH one this is). */
   let agentCatalogName = $state<string | null>(null);
+  let forkAgents = $state<{ id: string; name: string }[]>([]);
   const agentName = $derived(
     agentCatalogName ??
       (agentKind === "claude" ? "Claude Code" : agentKind === "codex" ? "Codex" : agentKind),
@@ -77,7 +82,13 @@
     const info = agents.find((a) => a.id === agentKind);
     models = info?.models ?? [];
     agentCatalogName = info?.name ?? null;
+    forkAgents = agents
+      .filter((agent) => agent.installed && !agent.outdated && agent.chatCapable)
+      .map((agent) => ({ id: agent.id, name: agent.name }));
   });
+  const availableForkAgents = $derived(
+    forkAgents.length > 0 ? forkAgents : [{ id: agentKind, name: agentName }],
+  );
 
   let transcriptEl = $state<HTMLElement | null>(null);
   // Seed scroll intent from the pool so a remount restores the reading
@@ -159,6 +170,49 @@
       else transcriptEl.scrollTop = saved.scrollTop;
     });
   });
+
+  // --- transcript fork -------------------------------------------------------
+  // Any rendered user/assistant message is a portable journal boundary. A
+  // same-agent choice upgrades to the native protocol only when that exact
+  // row also carries a native point: Claude's user-message checkpoint uuid,
+  // or Codex's final assistant block from a completed turn.
+  let forkIntent = $state<null | {
+    throughSeq: number;
+    nativeAt: string | null;
+    applying: boolean;
+  }>(null);
+
+  function askFork(block: ChatBlock) {
+    if (block.kind === "user") {
+      forkIntent = {
+        throughSeq: block.forkSeq,
+        nativeAt: agentKind === "claude" ? (block.checkpoint?.id ?? null) : null,
+        applying: false,
+      };
+    } else if (block.kind === "message") {
+      forkIntent = {
+        throughSeq: block.forkSeq,
+        nativeAt:
+          agentKind === "codex" && block.nativeTurnComplete ? block.turnId : null,
+        applying: false,
+      };
+    }
+  }
+
+  function confirmFork(destination: string) {
+    const intent = forkIntent;
+    if (intent === null || intent.applying) return;
+    forkIntent = { ...intent, applying: true };
+    void forkSession(session.id, intent.throughSeq, destination, intent.nativeAt)
+      .then((forked) => {
+        forkIntent = null;
+        onForked?.(forked);
+      })
+      .catch((error: unknown) => {
+        forkIntent = null;
+        store.notice(`fork failed: ${String(error)}`, "error");
+      });
+  }
 
   // Stick to the bottom while new content streams, unless the user scrolled
   // up to read history. Guarded on atBottom so a background stream never forces
@@ -794,12 +848,20 @@
              ones live in the pending tail below. -->
         <div class="msg user">
           <div class="bubble-row">
+            <button
+              class="message-action fork-btn"
+              title="fork from this message into a new session (source keeps running)"
+              aria-label="fork conversation from this message"
+              onclick={() => askFork(block)}
+            >
+              ⑂
+            </button>
             <!-- Codex rewinds whole turns from a preceding anchor, so its
                  first message (nothing precedes it) offers no button; claude
                  can still restore files there. -->
             {#if block.checkpoint !== null && (agentKind === "claude" || block.checkpoint.preceding !== null)}
               <button
-                class="rewind-btn"
+                class="message-action rewind-btn"
                 title={agentKind === "claude"
                   ? "rewind to before this message (restores files; optionally forks the conversation)"
                   : "rewind the conversation to before this message"}
@@ -822,6 +884,14 @@
         </div>
       {:else if item.block.kind === "message"}
         <div class="msg agent">
+          <button
+            class="message-action fork-btn agent-fork"
+            title="fork from this message into a new session (source keeps running)"
+            aria-label="fork conversation from this message"
+            onclick={() => askFork(item.block)}
+          >
+            ⑂
+          </button>
           <Markdown
             text={item.block.text}
             streaming={store.running && item.index === lastInlineIndex}
@@ -1033,6 +1103,17 @@
       onCancel={() => (rewindIntent = null)}
       onConfirm={confirmRewind}
       {onOpenFile}
+    />
+  {/if}
+
+  {#if forkIntent !== null}
+    <ForkDialog
+      agents={availableForkAgents}
+      sourceAgent={agentKind}
+      nativeAt={forkIntent.nativeAt}
+      applying={forkIntent.applying}
+      onCancel={() => (forkIntent = null)}
+      onConfirm={confirmFork}
     />
   {/if}
 
@@ -1249,6 +1330,7 @@
     color: var(--err);
   }
   .msg.agent {
+    position: relative;
     padding: 2px 0;
   }
   .thought {
@@ -1448,7 +1530,7 @@
     gap: 6px;
     max-width: 100%;
   }
-  .rewind-btn {
+  .message-action {
     background: none;
     border: none;
     color: var(--muted);
@@ -1461,12 +1543,18 @@
       opacity 0.12s ease,
       color 0.12s ease;
   }
-  .msg.user:hover .rewind-btn,
-  .rewind-btn:focus-visible {
+  .msg.user:hover .message-action,
+  .msg.agent:hover .message-action,
+  .message-action:focus-visible {
     opacity: 1;
   }
-  .rewind-btn:hover {
+  .message-action:hover {
     color: var(--accent);
+  }
+  .agent-fork {
+    position: absolute;
+    left: -22px;
+    top: 3px;
   }
   /* The ✕ on a queued bubble: pull it back before the agent sees it. Quiet by
      default (mirrors .rewind-btn), reveals on hover/focus of the pending row,

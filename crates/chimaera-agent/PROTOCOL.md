@@ -1761,3 +1761,70 @@ the turn (turn length varies with the model's thinking) — the first loop
 discarded those frames and the second waited 60s for frames already gone. Both
 loops now collect them; presence is the contract, not which side of the
 `result` they land on.
+
+## Pass 24 (2026-07-19 — non-destructive conversation branches). ADOPTED.
+
+Chimaera's old rewind endpoint mutates one live session: it stops the process,
+truncates that session's journal, and resumes the native conversation at an
+earlier point. A branch is a different operation. `POST /api/v1/sessions/{id}/fork`
+snapshots the normalized journal through a selected sequence, creates a distinct
+Chimaera session, and never stops or rewrites the source.
+
+### Native same-agent boundaries
+
+- **Claude:** the existing native path remains
+  `--resume <source> --fork-session --resume-session-at <checkpoint_uuid>`.
+  Claude exposes exact checkpoint UUIDs on delivered user messages, so only
+  those messages qualify for native branching. The target journal is still
+  seeded with the visible normalized prefix, but no transcript is resent to the
+  model — native context is authoritative.
+- **Codex:** generated bindings from the pinned 0.144.2 binary define
+  `thread/fork {threadId, lastTurnId?, cwd?, model?, modelProvider?,
+  approvalPolicy?, sandbox?, config?, baseInstructions?, developerInstructions?,
+  personality?, ephemeral?}`. `threadId` is required; `lastTurnId` is inclusive
+  and must name a completed turn (an in-progress turn is rejected). The response
+  carries a distinct `result.thread.id`. Chimaera sends the selected model,
+  cwd, and `ephemeral:false`, then treats the returned thread exactly like a
+  normal opened thread. A final assistant message becomes native-forkable only
+  after its parent `turn/completed` supplies that exact turn id.
+
+The UI therefore offers the action at every user and assistant message but calls
+it **native** only at those exact points. Claude assistant messages and Codex
+user messages are not mislabeled as native boundaries; they use the portable
+path below.
+
+### Portable cross-agent/fallback handoff
+
+Cross-agent branches, source sessions without a reusable native id, and
+same-agent points the vendor cannot represent use one vendor-neutral handoff:
+copy the normalized journal prefix for replay, render a bounded transcript from
+user/assistant/tool/question/notice events, and send it to a fresh target. The
+render drops internal thinking, configuration, init, and lifecycle bookkeeping;
+an early `queued` echo is included only if a later update says it was sent. The
+full copied journal remains visible in the branch while the model-facing prompt
+is capped to a 32 KiB head plus a 184 KiB recent tail, below the shared 256 KiB
+command text budget.
+
+An additive `Forked {source_agent, source_seq, native}` event separates the
+copied prefix from the destination's own events. It is provenance, not merely a
+notice: after a portable import, copied checkpoint UUIDs and turn ids belong to
+the old vendor conversation and must never be offered back to the new native
+session. The UI clears their native affordances and stale transient work; the
+server independently refuses any native boundary at or below the latest
+portable marker. Native forks preserve prior native boundaries. This floor
+survives branch-of-a-branch chains.
+
+`AgentCommand::PrimeFork` is an internal-only driver command
+(`skip_deserializing`, so browsers cannot invoke it). Both drivers send its rich
+blocks natively but journal only its compact `display_text`, preventing the
+portable transcript from being duplicated in the visible branch and avoiding
+Claude's ordinary first-prompt title generation. It shares `Send`'s validation
+and retained-byte accounting.
+
+The Codex live contract is pinned by
+`codex_fork_rollback_and_compact_surface`; hermetic coverage pins native boundary
+selection, portable journal seeding, command-ingress rejection, and both
+drivers' compact-journal/rich-native-send behavior. The adoption gate ran the
+full `just chat-smoke` matrix against the installed Claude Code and Codex CLIs:
+18/18 passed, including a real Codex `thread/fork` that returned a distinct
+thread while the source remained usable for rollback and compaction.

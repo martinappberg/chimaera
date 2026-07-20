@@ -5,15 +5,16 @@ CLI over its **structured JSON protocol** (Claude Code over bidirectional `strea
 Codex over `codex app-server` JSON-RPC) and renders a first-class chat UI — streamed prose
 and thinking, tool cards, permission and question prompts, inline artifacts, model/effort
 controls, and lossless reconnect. The same session identity can toggle between chat and the
-TUI (see [view switch](#view-switch-and-rewind)).
+TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 **Where it lives (shared):** UI `web-ui/src/lib/chat/` (`ChatView.svelte`, `Composer.svelte`,
 `ChatHeader.svelte`, `Markdown.svelte`, `ToolGroup`/`ToolCallCard`, `PermissionCard`,
-`QuestionCard`, `RewindDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
+`QuestionCard`, `RewindDialog`, `ForkDialog`, `McpPanel`, `UsagePanel`, `store.svelte.ts`, `chatWs.ts`,
 `paths.ts`). Engine `crates/chimaera-agent/src/` (`driver.rs`, `claude.rs`, `codex.rs`,
 `model.rs`, `journal.rs`). Daemon glue `crates/chimaera-server/src/chat.rs`, WS
 `ws.rs::chat_ws`. Wire: `GET /ws/chat/{id}` (events + the 19 `AgentCommand`s),
-`POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`. Deep protocol facts:
+`POST /api/v1/sessions/{id}/view`, `POST /api/v1/sessions/{id}/rewind`,
+`POST /api/v1/sessions/{id}/fork`. Deep protocol facts:
 [PROTOCOL.md](../../crates/chimaera-agent/PROTOCOL.md); rules:
 [rules/agent-protocol.md](../../.claude/rules/agent-protocol.md); working skill:
 [chat-mode](../../.claude/skills/chat-mode/SKILL.md).
@@ -65,7 +66,7 @@ TUI (see [view switch](#view-switch-and-rewind)).
   text ("cd /usr") is never hijacked.
 - **`/login` recovery (claude).** An expired-auth chat session dead-ends — the `-p stream-json`
   CLI answers "/login isn't available in this environment". `/login` (palette + intercepted on
-  send) instead flips the session to its real TUI (the [view switch](#view-switch-and-rewind)),
+  send) instead flips the session to its real TUI (the [view switch](#view-switch-rewind-and-branch)),
   where claude's own `/login` runs the native auth flow (OAuth / setup-token / SSO); chimaera
   never touches the credentials. Sign in there, toggle back to chat.
 - **Where.** `Composer.svelte`, `ChatView.svelte` (`sendNow`, `onSlash`, `composerCommands`),
@@ -303,7 +304,7 @@ TUI (see [view switch](#view-switch-and-rewind)).
   its protocol in 20s fails fast and respawns as the real TUI on the same session id (one attempt),
   so a pane never hangs.
 
-## View switch and rewind
+## View switch, rewind, and branch
 
 - **View switch.** `POST /api/v1/sessions/{id}/view {ui:"chat"|"term", force?}` flips a session
   between chat and TUI on the same id (same AgentRecord, resume target). Kill-then-respawn is **not
@@ -312,6 +313,16 @@ TUI (see [view switch](#view-switch-and-rewind)).
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
   is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
+- **Branch at any message, without stopping the source.** Hover any user or assistant message and
+  choose **⑂** to create a new chat session through that journal sequence. The picker can target any
+  installed chat-capable agent. An exact same-agent boundary uses the vendor's native history:
+  Claude forks at a delivered user checkpoint; Codex uses `thread/fork` through a completed turn.
+  Every other combination — cross-agent, a same-agent assistant/user boundary the native API cannot
+  represent exactly, or a source with no reusable native id — copies the normalized Chimaera journal
+  prefix and primes a fresh agent with a bounded vendor-neutral transcript handoff. The new journal
+  retains the full copied visible prefix; only the model-facing handoff is head/tail capped. The
+  dialog names native vs portable behavior before creating the branch. Neither path rolls files back,
+  kills the source process, nor truncates its journal.
 - **Rewind + fork (claude).** Hover a user message → "↺" → a dry-run report → a dialog listing the
   files that will revert → "restore files" or "restore + rewind conversation". File-restore rides the
   chat socket (`rewind`); the conversation fork is `POST /api/v1/sessions/{id}/rewind {resume_at}`,
@@ -333,6 +344,9 @@ TUI (see [view switch](#view-switch-and-rewind)).
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
   undercount it — the rollback then leaves those turns in place).
+- Native same-agent branches are available only at boundaries the vendor exposes: delivered user
+  checkpoints for Claude and completed turns for Codex. The branch action remains available at every
+  message, but labels and uses the portable handoff elsewhere.
 
 ---
 
@@ -342,6 +356,24 @@ TUI (see [view switch](#view-switch-and-rewind)).
 > skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
 > this line is derived and may be regenerated; everything below is deliberate and must not
 > be "helpfully" changed without asking.
+
+### Conversation branching — why it exists
+_Captured 2026-07-19 (from the maintainer, in-session)._
+
+- **Problem it solves:** the maintainer wants to "fork a conversation (and keep the current one
+  running) at any message in the conversation" and send that branch to Codex, Claude, or another
+  agent. A failed rewind after moving conversations exposed that the old destructive-respawn path
+  was not a general branching primitive.
+- **Settled behavior:** the source conversation keeps running; the branch may start at any rendered
+  user or assistant message; and when source and target are the same agent, Chimaera should use that
+  agent's native fork rather than translating through the standardized format whenever the native
+  protocol can represent the selected boundary.
+- **Deliberately open:** the visual chrome, icon, labels, and the normalized portable transcript
+  presentation are implementation details and may improve. Native APIs do not expose every rendered
+  boundary, so the portable fallback at those points is an explicit compatibility choice, not a claim
+  of native identity.
+- **Grade — addition:** the branching surface is improvable. Do not casually turn it into an in-place
+  rewind, stop the source, or prefer a portable handoff over an available exact native fork.
 
 ### Rich workflow rows — why they exist
 _Captured 2026-07-16 (from the maintainer, PR #69)._

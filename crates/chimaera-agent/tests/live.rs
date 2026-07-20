@@ -1327,14 +1327,16 @@ async fn codex_steer_settings_and_account_surface() {
         .expect("shutdown");
 }
 
-/// The codex rewind/compact surface (PROTOCOL.md pass 8): thread/rollback
-/// drops trailing turns in place (result = the updated thread), works right
-/// after thread/resume (the rewind-respawn path), and thread/compact/start
-/// acks then runs the compaction as its own turn with a contextCompaction
-/// item (no thread/compacted notification on the pinned version).
+/// The codex fork/rewind/compact surface (PROTOCOL.md passes 8 and 24):
+/// thread/fork copies through an inclusive completed turn without mutating the
+/// source; thread/rollback drops trailing turns in place (result = the updated
+/// thread), works right after thread/resume (the rewind-respawn path), and
+/// thread/compact/start acks then runs the compaction as its own turn with a
+/// contextCompaction item (no thread/compacted notification on the pinned
+/// version).
 #[tokio::test]
 #[ignore = "live: spawns real codex twice, needs auth, bills two tiny turns"]
-async fn codex_rollback_and_compact_surface() {
+async fn codex_fork_rollback_and_compact_surface() {
     let dir = tmpdir();
     let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
     chat.initialize(HANDSHAKE).await.expect("initialize");
@@ -1344,6 +1346,7 @@ async fn codex_rollback_and_compact_surface() {
         .expect("thread/start");
 
     // Two turns of history to roll back / compact.
+    let mut completed_turns = Vec::new();
     for word in ["one", "two"] {
         chat.turn_start(&thread_id, &format!("Reply with exactly: {word}"))
             .await
@@ -1355,10 +1358,37 @@ async fn codex_rollback_and_compact_surface() {
                 .expect("recv")
                 .expect("codex exited mid-turn");
             if frame["method"] == "turn/completed" {
+                completed_turns.push(
+                    frame["params"]["turn"]["id"]
+                        .as_str()
+                        .expect("completed turn carries id")
+                        .to_string(),
+                );
                 break;
             }
         }
     }
+
+    // Fork at the first completed turn. The source still has both turns; the
+    // response names a distinct native thread for the branch.
+    let forked = chat
+        .request_raw(
+            "thread/fork",
+            json!({
+                "threadId": thread_id,
+                "lastTurnId": completed_turns[0],
+                "cwd": dir.path(),
+                "ephemeral": false,
+            }),
+            HANDSHAKE,
+        )
+        .await
+        .expect("thread/fork answered");
+    assert!(forked.get("error").is_none(), "fork failed: {forked}");
+    let forked_id = forked["result"]["thread"]["id"]
+        .as_str()
+        .expect("fork returns a thread id");
+    assert_ne!(forked_id, thread_id, "fork creates a distinct thread");
 
     // Rollback drops the last turn in place; the result is the thread object.
     let rollback = chat

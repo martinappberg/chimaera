@@ -226,6 +226,7 @@ pub(crate) async fn put_mastermind(
             theme,
             prelude: None,
             mastermind: Some(mode),
+            fork: None,
         },
     )
     .await
