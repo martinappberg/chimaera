@@ -132,10 +132,9 @@
     if (currentModel !== undefined) return currentModel.efforts;
     return agentKind === "codex" ? FALLBACK_EFFORTS : [];
   });
-  /** codex holds the pick client-side (rides the next turn); claude's truth
-   *  arrives via effort_state read-backs. */
-  let effort = $state<string | null>(null);
-  const effortShown = $derived(store.effort ?? effort);
+  /** Agent read-back is the only displayed truth. Both drivers emit an
+   *  effort_state after applying a selection. */
+  const effortShown = $derived(store.effort);
   const hasEffort = $derived(effortChoices.length > 0);
   /** Ultracode: session-scoped xhigh + standing workflow orchestration —
    *  offered when the live model supports xhigh (the extension's gate). */
@@ -573,14 +572,13 @@
 
   function pickEffort(id: string): boolean {
     if (!sendCommand({ type: "set_effort", effort_id: id }, "effort change not sent")) return false;
-    effort = id;
     menu = null;
     return true;
   }
 
   const EFFORT_HINT: Record<string, string> = {
     claude: "reasoning effort — applies immediately, this session only",
-    codex: "reasoning effort — applies from the next message",
+    codex: "reasoning effort — saved to this thread for the next message",
   };
 
   /** Extended-thinking toggle (claude). ON by default — chimaera's chat is a

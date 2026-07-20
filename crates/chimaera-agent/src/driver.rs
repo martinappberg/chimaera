@@ -198,7 +198,8 @@ pub struct DriverStep {
 
 /// What a concrete driver hands back from its handshake: the built mapper and
 /// any steps to deliver right after the `Init` event (claude seeds effort
-/// settings and replays parked permission prompts; codex has none).
+/// settings and replays parked permission prompts; codex seeds its effective
+/// thread effort).
 pub struct Handshake<M> {
     pub mapper: M,
     pub initial: Vec<DriverStep>,

@@ -308,6 +308,14 @@ back to per-turn fields on method-not-found. Efforts: `minimal|low|medium|
 high|xhigh` (+gated `max`/`none`/`ultra`); default model `gpt-5.5`, default
 effort `medium`. Wire param is `effort` (webview calls it reasoningEffort;
 collaborationMode.settings uses snake_case reasoning_effort).
+Thread start/resume/fork responses return the effective top-level
+`reasoningEffort`; `thread/settings/updated {threadId, threadSettings:{effort,
+...}}` is the authoritative read-back after a settings change. Chimaera seeds
+the effort chip from the open response, applies selections through
+`thread/settings/update`, and journals the read-back. The explicit
+`turn/start.effort` remains the compatibility path when settings/update is
+absent. Plan mode must update both the top-level `effort` and its nested
+`collaborationMode.settings.reasoning_effort` or the stale nested value can win.
 **`model/list` `{includeHidden, cursor, limit}` → `{data:[{model,
 defaultReasoningEffort}]}` — adopt for the model picker instead of a curated
 list.** `collaborationMode/list` → plan/default modes
@@ -568,6 +576,9 @@ file list is therefore honest about exactly what will revert.
   (model, effort, collaborationMode, permissions, personality,
   multiAgentMode); feature-detect fallback on -32601 / "method not found" /
   "unknown method|variant" → the fields ride each `turn/start` instead.
+  `thread/settings/updated` returns the full effective `threadSettings`; use
+  its nullable `effort` as the selector read-back rather than trusting only
+  client-held state.
 - Approval-mode table (adopted): read-only → permissions ":read-only" +
   approvalPolicy on-request; auto → ":workspace" + on-request; full-access →
   ":danger-full-access" + never. `permissions` (profile id) and

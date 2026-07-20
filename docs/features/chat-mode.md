@@ -86,6 +86,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   sessions do not start with `--dangerously-skip-permissions`, so Claude would reject the switch.
   The model chosen when a Codex chat is created rides `thread/start` (and resume), rather than
   silently falling back to the CLI default until the first header change.
+  Codex's effort chip is seeded from the effective thread setting and each selection is applied
+  immediately through `thread/settings/update`, then reconciled from the agent's settings
+  notification so it survives remount/reconnect. Older app-servers fall back to carrying the
+  selected effort on the next `turn/start`; Plan mode keeps its nested reasoning effort aligned.
   Thinking (claude) and ultracode (claude, gated to an xhigh-capable model) are client-held toggles
   reconciled from `effort_state` read-backs. **Thinking defaults ON** for claude sessions (the
   reasoning pass earns its keep in a coding workbench; the chip shows it explicitly and one click

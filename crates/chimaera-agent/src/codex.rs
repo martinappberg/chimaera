@@ -233,25 +233,31 @@ impl Driver for CodexDriver {
         spec: &'a SpawnSpec,
     ) -> std::result::Result<Handshake<CodexMapper>, String> {
         let hs = codex_handshake(sink, stream, spec).await?;
+        let mut initial = vec![DriverStep {
+            events: vec![AgentEvent::EffortState {
+                effort: hs.effort.clone(),
+                ultracode: false,
+            }],
+            outbound: Vec::new(),
+        }];
         // A failed conversation rewind degrades to a notice, not a dead pane:
         // the thread resumed whole, only the rollback was refused/ignored.
-        let initial = hs
-            .rollback_error
-            .into_iter()
-            .map(|err| DriverStep {
+        if let Some(err) = hs.rollback_error {
+            initial.push(DriverStep {
                 events: vec![AgentEvent::Notice {
                     text: format!(
                         "conversation rewind failed: {err} (the agent may still see the rewound turns)"
                     ),
                 }],
                 outbound: Vec::new(),
-            })
-            .collect();
+            });
+        }
         Ok(Handshake {
             mapper: CodexMapper::new(
                 hs.thread_id,
                 hs.models,
                 hs.model,
+                hs.effort,
                 spec.agent_version.clone(),
                 spec.mcp_auto_approve.clone(),
                 hs.next_id,
@@ -268,6 +274,7 @@ struct CodexHandshake {
     thread_id: String,
     models: Vec<crate::model::ModelInfo>,
     model: Option<String>,
+    effort: Option<String>,
     next_id: u64,
     rollback_error: Option<String>,
 }
@@ -305,6 +312,7 @@ async fn codex_handshake(
         .as_str()
         .map(String::from)
         .or_else(|| spec.initial_model.clone());
+    let mut effort = result["reasoningEffort"].as_str().map(String::from);
     let mut next_id = 2u64;
 
     // Conversation rewind: drop the trailing turns right after the resume,
@@ -386,10 +394,22 @@ async fn codex_handshake(
             }
         }
     }
+    // Current binaries report the effective thread effort directly. Older
+    // ones may omit it, in which case the active model's advertised default
+    // is the best available truth for the header until the user changes it.
+    if effort.is_none() {
+        effort = model.as_deref().and_then(|active| {
+            models
+                .iter()
+                .find(|candidate| candidate.id == active)
+                .and_then(|candidate| candidate.default_effort.clone())
+        });
+    }
     Ok(CodexHandshake {
         thread_id,
         models,
         model,
+        effort,
         next_id,
         rollback_error,
     })
@@ -463,6 +483,13 @@ enum PendingRpc {
     SettingsUpdate {
         mode_id: String,
         per_turn: Value,
+    },
+    /// Effort is applied eagerly to the thread when supported, with the
+    /// guaranteed `turn/start.effort` path retained as the compatibility
+    /// fallback. `previous` lets a rejected value restore honest UI state.
+    EffortUpdate {
+        effort_id: String,
+        previous: Option<String>,
     },
     /// account/read — rate-limit telemetry; `report` also renders /usage.
     AccountRead {
@@ -582,9 +609,13 @@ struct CodexMapper {
     model: Option<String>,
     /// Model override for subsequent turns (set_model).
     pending_model: Option<String>,
-    /// Reasoning effort for subsequent turns (live-verified: turn/start
-    /// accepts an "effort" param).
+    /// Effective/selected reasoning effort for subsequent turns. Current
+    /// app-servers persist it through thread/settings/update; older ones use
+    /// the guaranteed turn/start override.
     pending_effort: Option<String>,
+    /// Last effort value journaled to the UI. The nested option distinguishes
+    /// "no event emitted yet" from an authoritative `None` read-back.
+    reported_effort: Option<Option<String>>,
     /// Composer agent mode (read-only/auto/full-access/plan): the wire
     /// fields ride each turn/start once settings/update proves unsupported.
     current_mode: String,
@@ -683,6 +714,7 @@ impl CodexMapper {
         thread_id: String,
         models: Vec<crate::model::ModelInfo>,
         model: Option<String>,
+        effort: Option<String>,
         agent_version: Option<String>,
         mcp_auto_approve: Option<crate::driver::McpAutoApprove>,
         next_id: u64,
@@ -693,7 +725,9 @@ impl CodexMapper {
             agent_version,
             model,
             pending_model: None,
-            pending_effort: None,
+            pending_effort: effort.clone(),
+            // The handshake queues this exact state immediately after Init.
+            reported_effort: Some(effort),
             // codex's shipped default: workspace sandbox, on-request asks.
             current_mode: "auto".to_string(),
             mode_per_turn: None,
@@ -736,6 +770,42 @@ impl CodexMapper {
             slash_commands: Vec::new(),
             models: self.models.clone(),
             agent_version: self.agent_version.clone(),
+        }
+    }
+
+    fn emit_effort_state(&mut self, effort: Option<String>, step: &mut DriverStep) {
+        if self.reported_effort.as_ref() == Some(&effort) {
+            return;
+        }
+        self.reported_effort = Some(effort.clone());
+        step.events.push(AgentEvent::EffortState {
+            effort,
+            ultracode: false,
+        });
+    }
+
+    /// Top-level effort is the normal setting. Plan collaboration mode also
+    /// embeds it, so update both copies or the stale nested value can win.
+    fn effort_wire_fields(&self, effort: &str) -> Value {
+        let mut fields = json!({ "effort": effort });
+        if self.current_mode == "plan" {
+            fields["collaborationMode"] = mode_wire_fields(
+                &self.current_mode,
+                self.pending_model.as_deref().or(self.model.as_deref()),
+                Some(effort),
+            )["collaborationMode"]
+                .clone();
+        }
+        fields
+    }
+
+    fn refresh_per_turn_mode_effort(&mut self) {
+        if self.mode_per_turn.is_some() {
+            self.mode_per_turn = Some(mode_wire_fields(
+                &self.current_mode,
+                self.pending_model.as_deref().or(self.model.as_deref()),
+                self.pending_effort.as_deref(),
+            ));
         }
     }
 
@@ -785,6 +855,24 @@ impl CodexMapper {
         }
 
         match method {
+            "thread/settings/updated" => {
+                let settings = &frame["params"]["threadSettings"];
+                if let Some(value) = settings.get("effort") {
+                    let effort = value.as_str().map(String::from);
+                    let effort_update_pending = self
+                        .pending_rpcs
+                        .values()
+                        .any(|pending| matches!(pending, PendingRpc::EffortUpdate { .. }));
+                    // A rapid second click may already be in flight when the
+                    // first update's notification arrives. Ignore that stale
+                    // read-back; the latest selection will reconcile itself.
+                    if !effort_update_pending || effort == self.pending_effort {
+                        self.pending_effort = effort.clone();
+                        self.refresh_per_turn_mode_effort();
+                        self.emit_effort_state(effort, &mut step);
+                    }
+                }
+            }
             "turn/started" => {
                 self.turn_id = frame["params"]["turn"]["id"]
                     .as_str()
@@ -1279,6 +1367,35 @@ impl CodexMapper {
                     });
                 }
             }
+            (
+                PendingRpc::EffortUpdate {
+                    effort_id,
+                    previous,
+                },
+                Some(err),
+            ) => {
+                if is_method_not_found(err, "thread/settings/update") {
+                    // The selected value still has a guaranteed path: every
+                    // subsequent turn/start carries it explicitly.
+                    self.settings_update_unsupported = true;
+                    self.refresh_per_turn_mode_effort();
+                    if self.pending_effort.as_deref() == Some(&effort_id) {
+                        self.emit_effort_state(Some(effort_id), step);
+                    }
+                } else {
+                    // Do not roll back a newer click whose request is still in
+                    // flight; this response owns only its exact selection.
+                    if self.pending_effort.as_deref() == Some(&effort_id) {
+                        self.pending_effort = previous.clone();
+                        self.refresh_per_turn_mode_effort();
+                        self.emit_effort_state(previous, step);
+                    }
+                    step.events.push(AgentEvent::Error {
+                        message: format!("effort change failed: {}", err["message"]),
+                        fatal: false,
+                    });
+                }
+            }
             (PendingRpc::AccountRead { .. }, Some(_)) => {
                 // Absent on older binaries; the chip just stays empty.
             }
@@ -1290,6 +1407,11 @@ impl CodexMapper {
             }
             (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
                 self.apply_mode(mode_id, step);
+            }
+            (PendingRpc::EffortUpdate { effort_id, .. }, None) => {
+                if self.pending_effort.as_deref() == Some(&effort_id) {
+                    self.emit_effort_state(Some(effort_id), step);
+                }
             }
             (PendingRpc::AccountRead { report }, None) => {
                 self.on_account(&frame["result"], report, step);
@@ -2849,7 +2971,38 @@ impl CodexMapper {
                 step.events.push(self.init_event());
             }
             AgentCommand::SetEffort { effort_id } => {
-                self.pending_effort = Some(effort_id);
+                if self.pending_effort.as_deref() == Some(&effort_id) {
+                    self.emit_effort_state(Some(effort_id), &mut step);
+                } else {
+                    let previous = self.pending_effort.replace(effort_id.clone());
+                    self.refresh_per_turn_mode_effort();
+                    if self.settings_update_unsupported {
+                        // Older app-server: the value is still real and rides
+                        // the next turn/start, so journal it immediately.
+                        self.emit_effort_state(Some(effort_id), &mut step);
+                    } else {
+                        let id = self.rpc_id();
+                        let fields = self.effort_wire_fields(&effort_id);
+                        let mut params = json!({ "threadId": self.thread_id });
+                        if let Some(obj) = fields.as_object() {
+                            for (key, value) in obj {
+                                params[key] = value.clone();
+                            }
+                        }
+                        self.pending_rpcs.insert(
+                            id,
+                            PendingRpc::EffortUpdate {
+                                effort_id,
+                                previous,
+                            },
+                        );
+                        step.outbound.push(json!({
+                            "id": id,
+                            "method": "thread/settings/update",
+                            "params": params,
+                        }));
+                    }
+                }
             }
             AgentCommand::SetMode { mode_id } => {
                 let fields = mode_wire_fields(
@@ -3354,7 +3507,7 @@ mod tests {
     use super::*;
 
     fn mapper() -> CodexMapper {
-        CodexMapper::new("thr-1".into(), Vec::new(), None, None, None, 3)
+        CodexMapper::new("thr-1".into(), Vec::new(), None, None, None, None, 3)
     }
 
     fn active_turn(m: &mut CodexMapper) {
@@ -4267,6 +4420,75 @@ mod tests {
     }
 
     #[test]
+    fn effort_updates_thread_and_reconciles_the_server_read_back() {
+        let mut m = mapper();
+        let step = m.on_command(AgentCommand::SetEffort {
+            effort_id: "high".into(),
+        });
+        assert!(step.events.is_empty(), "the RPC read-back owns truth");
+        assert_eq!(step.outbound[0]["method"], "thread/settings/update");
+        assert_eq!(step.outbound[0]["params"]["effort"], "high");
+        let id = step.outbound[0]["id"].as_u64().unwrap();
+
+        // Current app-servers announce the effective settings. That event is
+        // journaled once, survives reconnect, and the RPC ack does not repeat
+        // it when the notification arrived first.
+        let step = m.on_frame(&json!({
+            "method": "thread/settings/updated",
+            "params": {
+                "threadId": "thr-1",
+                "threadSettings": { "effort": "high" },
+            },
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("high".into()),
+                ultracode: false,
+            }]
+        );
+        let step = m.on_frame(&json!({ "id": id, "result": {} }));
+        assert!(step.events.is_empty(), "the matching ack is deduplicated");
+
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text { text: "hi".into() }],
+        });
+        assert_eq!(step.outbound[0]["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn effort_fallback_keeps_plan_mode_and_turn_start_in_sync() {
+        let mut m = mapper();
+        m.current_mode = "plan".into();
+        m.settings_update_unsupported = true;
+        m.mode_per_turn = Some(mode_wire_fields("plan", Some("gpt-5.5"), Some("medium")));
+
+        let step = m.on_command(AgentCommand::SetEffort {
+            effort_id: "xhigh".into(),
+        });
+        assert!(step.outbound.is_empty());
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::EffortState {
+                effort: Some("xhigh".into()),
+                ultracode: false,
+            }]
+        );
+
+        let step = m.on_command(AgentCommand::Send {
+            blocks: vec![ContentBlock::Text {
+                text: "plan".into(),
+            }],
+        });
+        let params = &step.outbound[0]["params"];
+        assert_eq!(params["effort"], "xhigh");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "xhigh"
+        );
+    }
+
+    #[test]
     fn mode_fields_reset_hidden_state_and_offer_auto_review() {
         let auto_review = mode_wire_fields("auto-review", Some("gpt-test"), Some("high"));
         assert_eq!(auto_review["permissions"], ":workspace");
@@ -4519,6 +4741,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
             Some(allow(Some(vec!["workspace_status".into()]))),
             3,
         );
@@ -4537,7 +4760,15 @@ mod tests {
         assert!(step.outbound.is_empty());
 
         // Auto-mode shape: the whole server is silent.
-        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, None, Some(allow(None)), 3);
+        let mut m = CodexMapper::new(
+            "thr-1".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(allow(None)),
+            3,
+        );
         let step = m.on_frame(&elicitation_frame(82, "spawn_agent"));
         assert!(step.events.is_empty());
         assert_eq!(
@@ -4546,7 +4777,15 @@ mod tests {
         );
 
         // Another server's tool-call approval never matches the consent.
-        let mut m = CodexMapper::new("thr-1".into(), Vec::new(), None, None, Some(allow(None)), 3);
+        let mut m = CodexMapper::new(
+            "thr-1".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(allow(None)),
+            3,
+        );
         let mut frame = elicitation_frame(83, "anything");
         frame["params"]["serverName"] = json!("other");
         let step = m.on_frame(&frame);
@@ -4561,6 +4800,7 @@ mod tests {
         let mut m = CodexMapper::new(
             "thr-1".into(),
             Vec::new(),
+            None,
             None,
             None,
             Some(allow(Some(vec!["read_session".into()]))),
@@ -4579,6 +4819,7 @@ mod tests {
         let mut m = CodexMapper::new(
             "thr-1".into(),
             Vec::new(),
+            None,
             None,
             None,
             Some(allow(Some(vec!["workspace_status".into()]))),

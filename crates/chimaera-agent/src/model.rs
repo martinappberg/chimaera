@@ -226,7 +226,7 @@ pub enum AgentEvent {
         mode_id: String,
     },
     /// Effort/ultracode truth read back from the agent (claude get_settings
-    /// applied.{effort,ultracode}; re-read after every apply).
+    /// applied.{effort,ultracode}; codex thread open/settings read-backs).
     EffortState {
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
@@ -549,8 +549,9 @@ pub enum AgentCommand {
     SetModel {
         model_id: String,
     },
-    /// Reasoning-effort selection (codex: rides the next `turn/start`;
-    /// drivers without an effort concept ignore it).
+    /// Reasoning-effort selection (codex: updates thread settings, with the
+    /// next `turn/start` as a compatibility fallback; drivers without an
+    /// effort concept ignore it).
     SetEffort {
         effort_id: String,
     },
