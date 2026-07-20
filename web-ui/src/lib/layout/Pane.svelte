@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tabKey, type PaneNode, type Tab } from "./layout";
+  import { keepsPaneViewAlive, tabKey, type PaneNode, type Tab } from "./layout";
   import { untrack, type Component } from "svelte";
   import type { Session } from "../workspace/sessions";
   import type { DropSpot, LayoutCtrl } from "./dnd";
@@ -101,21 +101,26 @@
 
   // --- view keep-alive (the "keep tabs in RAM" model) -----------------------
   //
-  // A pane renders EVERY tab in its live set, the active one visible and the
-  // rest hidden (never destroyed), so switching back is instant with scroll,
-  // image decode, and listings all intact. The live set is a per-pane MRU
-  // capped at LIVE_CAP: the active tab is always in it (and at the front), a
-  // revisited tab is promoted, and the tail unmounts past the cap (re-mounting
-  // fresh on return). This is the file/finder/chat/diff analogue of what the
-  // terminal already gets from termPool — a tab's view never mounts while
-  // hidden (it enters the set as the active tab), so nothing is measured at a
-  // degenerate size. Bounded RAM, no daemon cost (client-only DOM).
+  // A pane retains recently-used view trees whose DOM is itself valuable, so
+  // switching files/Finders/diffs and long chats preserves scroll, decode,
+  // editor state, and rendered transcript DOM. PTYs deliberately remount:
+  // termPool can re-parent the xterm element into its hidden stash, avoiding
+  // duplicate invisible WebGL renderers while preserving scrollback/socket
+  // state. The live set is a per-pane MRU capped at LIVE_CAP; views enter only
+  // after being active, so nothing is first measured at a degenerate size.
   const LIVE_CAP = 8;
   let liveKeys = $state<string[]>([]);
 
+  function retainView(tab: Tab): boolean {
+    return keepsPaneViewAlive(
+      tab,
+      tab.surface === "terminal" ? sessions.get(tab.sessionId)?.ui : undefined,
+    );
+  }
+
   $effect(() => {
     const active = activeTab;
-    if (active === null) return;
+    if (active === null || !retainView(active)) return;
     const key = tabKey(active);
     untrack(() => {
       const i = liveKeys.indexOf(key);
@@ -128,9 +133,9 @@
   });
 
   // Drop live keys whose tab has closed (or moved to another pane), so the cap
-  // counts only tabs this pane still holds.
+  // counts only retained views this pane still holds.
   $effect(() => {
-    const present = new Set(node.tabs.map(tabKey));
+    const present = new Set(node.tabs.filter(retainView).map(tabKey));
     untrack(() => {
       if (liveKeys.some((k) => !present.has(k))) {
         liveKeys = liveKeys.filter((k) => present.has(k));
@@ -139,9 +144,9 @@
   });
 
   // The tabs whose views are mounted right now: the active tab (always) plus
-  // the rest of the live set, in tab-bar order.
+  // retained DOM-backed views, in tab-bar order.
   const mountedTabs = $derived(
-    node.tabs.filter((t) => t === activeTab || liveKeys.includes(tabKey(t))),
+    node.tabs.filter((t) => t === activeTab || (retainView(t) && liveKeys.includes(tabKey(t)))),
   );
 
   // Every workbench surface is a feature boundary. Loading only the kinds in
@@ -216,6 +221,7 @@
         <ChatView
           session={s}
           focused={focused && active}
+          visible={active}
           terminals={[...sessions.values()]
             .filter((t) => t.kind === "shell" && t.alive && t.workspace_id === s.workspace_id)
             .map((t) => ({ id: t.id, name: names.get(t.id) ?? t.name }))}
@@ -342,10 +348,9 @@
     bind:el={tabbarEl}
   />
   <div class="content" bind:this={contentEl}>
-    <!-- Every mounted tab keeps its live view — the active one visible, the rest
-         hidden (not destroyed), so a switch-back is instant with scroll, image
-         decode, and listings all preserved. Terminals layer their pooled xterm
-         on top of this via termPool the same way. -->
+    <!-- Retained file/workbench/chat views stay mounted with the active one
+         visible. PTY components remount against termPool, so inactive xterm
+         elements park without making long chat transcripts reconstruct. -->
     {#each mountedTabs as tab (tabKey(tab))}
       {@const active = tab === activeTab}
       <div class="layer" class:active inert={!active}>

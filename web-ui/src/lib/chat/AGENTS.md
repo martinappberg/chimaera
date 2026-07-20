@@ -33,9 +33,11 @@ hard-resets and rebuilds.
 
 | File | What it owns |
 |---|---|
-| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected). **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
+| `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
-| `ChatView.svelte` | The host: wires the socket + store, renders the transcript, and hangs the header/composer/overlays/panels off itself. Still the big one — keep new chrome in child components, not inline. |
+| `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted. |
+| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; it pages in either direction), and hangs the header/composer/overlays/panels off itself. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
+| `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window; tests cover both paging directions and stale cursor repair after reducer compaction. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
@@ -48,7 +50,7 @@ hard-resets and rebuilds.
 | `ForkDialog.svelte` | The non-destructive conversation-branch picker: target agent plus native-vs-portable boundary disclosure. |
 | `AgentMessageMeta.svelte` | The hover/focus rail below assistant prose: localized journal-backed timestamp, full-message copy, and the conversation-fork affordance. Its pure time ladder lives in `../shared/time.ts`. |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
-| `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
+| `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript; expensive tickets/table reads/image/PDF loads are intersection-gated near the viewport. |
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
 | `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |

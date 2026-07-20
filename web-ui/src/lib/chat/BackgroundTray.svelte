@@ -21,8 +21,10 @@
     /** Stop one (claude stop_task, generic over its task registry).
      *  Omitted when unsupported. */
     onStop?: (id: string) => void;
+    /** False while the owning retained chat tab is hidden. */
+    visible?: boolean;
   }
-  let { tasks, onStop }: Props = $props();
+  let { tasks, onStop, visible = true }: Props = $props();
 
   /** Bound to the shell's expanded state — the clock below gates on it. */
   let open = $state(false);
@@ -34,7 +36,7 @@
    *  tray (it unmounts on an empty set). */
   let now = $state(Date.now());
   $effect(() => {
-    if (!open) return;
+    if (!visible || !open) return;
     now = Date.now();
     const timer = setInterval(() => (now = Date.now()), 1000);
     return () => clearInterval(timer);

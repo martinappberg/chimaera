@@ -1,11 +1,19 @@
 <script lang="ts">
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { forkSession, rewindSession, renameSession, type Session } from "../workspace/sessions";
   import { fsValidate } from "../previews/files";
   import { listAgents } from "../workspace/launcher";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
   import { insertIntoComposer } from "./composerBus";
-  import { acquireChat, releaseChat, saveChatScroll, chatScroll, chatTurnStart } from "./chatPool";
+  import {
+    acquireChat,
+    releaseChat,
+    saveChatScroll,
+    chatScroll,
+    chatTurnStart,
+    chatRenderWindow,
+    saveChatRenderWindow,
+  } from "./chatPool";
   import { dismiss } from "../shared/dismiss";
   import { formatElapsedSeconds, messageTimestampRefreshIn } from "../shared/time";
   import ChatHeader from "./ChatHeader.svelte";
@@ -29,11 +37,20 @@
   import { skillBlocksForText, type ComposerCommand } from "./composer";
   import type { ImageAttachment } from "./images";
   import type { ChatBlock, PlanEntry } from "./store.svelte";
+  import {
+    pageEarlier,
+    pageLater,
+    restoreWindow,
+    tailWindow,
+  } from "./transcriptWindow";
   import { getSetting } from "../settings/store.svelte";
 
   interface Props {
     session: Session;
     focused: boolean;
+    /** Whether this retained view is the pane's visible tab. Distinct from
+     *  focus: an unfocused split is still visible and should keep animating. */
+    visible?: boolean;
     /** Workspace terminals for @term: mention grants. */
     terminals?: { id: string; name: string }[];
     /** Open a file path in an adjacent pane (the workbench path-click flow). */
@@ -51,6 +68,7 @@
   let {
     session,
     focused,
+    visible = true,
     terminals = [],
     onOpenFile,
     onOpenPath,
@@ -58,11 +76,12 @@
     onForked,
   }: Props = $props();
 
-  // The component is {#key}ed on session id by its parent: one instance per
-  // session. The store + socket come from the session-keyed chat pool, so a
-  // tab switch (which remounts this component) reuses the warm store and the
-  // open socket instead of re-fetching the whole journal. Release keeps them
-  // warm; the pool disposes them when the session ends or toggles to a PTY.
+  // The component is keyed on session id by its parent: one instance per
+  // retained pane layer. Ordinary tab switches keep that tree (and its bounded
+  // transcript window) mounted; if the pane live set evicts it or a pane
+  // move remounts it, the session-keyed pool still reuses the warm store and
+  // open socket instead of re-fetching the journal. Release keeps them warm;
+  // the pool disposes them when the session ends or toggles to a PTY.
   // svelte-ignore state_referenced_locally
   const { store, socket } = acquireChat(session.id);
   // svelte-ignore state_referenced_locally
@@ -94,11 +113,67 @@
   );
 
   let transcriptEl = $state<HTMLElement | null>(null);
+  let columnEl = $state<HTMLElement | null>(null);
   // Seed scroll intent from the pool so a remount restores the reading
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
   let atBottom = $state(chatScroll(session.id).atBottom);
   let menu = $state<"model" | "mode" | "effort" | "mcp" | null>(null);
+
+  // --- bounded transcript DOM ------------------------------------------------
+  // The reducer/socket always fold the complete bounded journal so background
+  // work and dashboard truth remain live. The expensive DOM is a separate,
+  // bottom-anchored window: historical Markdown/artifacts mount only when the
+  // reader asks for older context. A hidden retained chat freezes this plain
+  // snapshot, so incoming work updates the store without re-rendering a tab no
+  // one can see; activation reconciles one bounded page in a single paint.
+  // svelte-ignore state_referenced_locally
+  const savedRenderWindow = chatRenderWindow(session.id);
+  let renderBlocks = $state<ChatBlock[]>([]);
+  let renderStart = $state(0);
+  let renderEnd = $state(0);
+  let renderReady = $state(false);
+  let pagingTranscript = false;
+
+  function captureRange(start: number, end: number) {
+    const total = store.blocks.length;
+    const safeEnd = Math.max(0, Math.min(end, total));
+    const safeStart = Math.max(0, Math.min(start, safeEnd));
+    renderStart = safeStart;
+    renderEnd = safeEnd;
+    renderBlocks = $state.snapshot(store.blocks.slice(safeStart, safeEnd));
+    renderReady = true;
+    saveChatRenderWindow(session.id, safeStart, safeEnd);
+  }
+
+  function captureTail() {
+    const range = tailWindow(store.blocks.length);
+    captureRange(range.start, range.end);
+  }
+
+  // Reconcile the rendered page only while visible. `lastSeq` catches in-place
+  // message/tool updates that don't change blocks.length; local notices are
+  // caught by the length dependency. While scrolled into history, keep the
+  // absolute window stable and surface a "new activity" jump instead.
+  $effect(() => {
+    if (!visible || store.hydrating) return;
+    const total = store.blocks.length;
+    void store.lastSeq;
+    untrack(() => {
+      if (!renderReady) {
+        if (!atBottom && savedRenderWindow !== null) {
+          const restored = restoreWindow(savedRenderWindow, total);
+          captureRange(restored.start, restored.end);
+        } else {
+          captureTail();
+        }
+      } else if (atBottom) {
+        captureTail();
+      } else {
+        captureRange(renderStart, Math.min(renderEnd, total));
+      }
+    });
+  });
 
   /** Model picker: the agent's own catalog (claude initialize.models /
    *  codex model/list) beats the daemon's curated list. */
@@ -159,13 +234,92 @@
   function onScroll() {
     const el = transcriptEl;
     if (el === null) return;
-    atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    atBottom =
+      renderEnd >= store.blocks.length && el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     // Persist into the pool so the next remount restores this position.
     saveChatScroll(session.id, el.scrollTop, atBottom);
+    if (store.hydrating || pagingTranscript) return;
+    if (el.scrollTop < 140 && renderStart > 0) {
+      revealEarlier();
+    } else if (
+      renderEnd < store.blocks.length &&
+      el.scrollHeight - el.scrollTop - el.clientHeight < 140
+    ) {
+      revealLater();
+    }
   }
 
   function scrollToBottom() {
-    transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight });
+    if (!store.hydrating && renderEnd < store.blocks.length) captureTail();
+    atBottom = true;
+    void tick().then(() => transcriptEl?.scrollTo({ top: transcriptEl.scrollHeight }));
+  }
+
+  function revealEarlier() {
+    const el = transcriptEl;
+    if (el === null || pagingTranscript || renderStart === 0 || store.hydrating) return;
+    pagingTranscript = true;
+    const beforeHeight = el.scrollHeight;
+    const beforeTop = el.scrollTop;
+    const plan = pageEarlier({ start: renderStart, end: renderEnd }, store.blocks.length);
+    captureRange(plan.expanded.start, plan.expanded.end);
+    void tick().then(async () => {
+      let current = transcriptEl;
+      if (current === null) {
+        pagingTranscript = false;
+        return;
+      }
+      // Measure the newly prepended page before trimming far-away DOM below
+      // the viewport; only the prepended height belongs in the anchor offset.
+      const anchoredTop = beforeTop + (current.scrollHeight - beforeHeight);
+      if (
+        plan.settled.start !== plan.expanded.start ||
+        plan.settled.end !== plan.expanded.end
+      ) {
+        captureRange(plan.settled.start, plan.settled.end);
+        await tick();
+        current = transcriptEl;
+      }
+      if (current !== null) {
+        current.scrollTop = anchoredTop;
+        saveChatScroll(session.id, current.scrollTop, false);
+      }
+      pagingTranscript = false;
+    });
+  }
+
+  function revealLater() {
+    const el = transcriptEl;
+    const total = store.blocks.length;
+    if (el === null || pagingTranscript || renderEnd >= total || store.hydrating) return;
+    pagingTranscript = true;
+    const beforeTop = el.scrollTop;
+    const plan = pageLater({ start: renderStart, end: renderEnd }, total);
+    captureRange(plan.expanded.start, plan.expanded.end);
+    void tick().then(async () => {
+      let current = transcriptEl;
+      if (current === null) {
+        pagingTranscript = false;
+        return;
+      }
+      const expandedHeight = current.scrollHeight;
+      if (
+        plan.settled.start !== plan.expanded.start ||
+        plan.settled.end !== plan.expanded.end
+      ) {
+        captureRange(plan.settled.start, plan.settled.end);
+        await tick();
+        current = transcriptEl;
+      }
+      if (current !== null) {
+        // Appending changes nothing above the reader. If the bounded window
+        // then drops its oldest page, subtract exactly that removed height.
+        const removedHeight = expandedHeight - current.scrollHeight;
+        current.scrollTop = Math.max(0, beforeTop - removedHeight);
+        saveChatScroll(session.id, current.scrollTop, false);
+      }
+      pagingTranscript = false;
+    });
   }
 
   // On (re)mount, restore the saved reading position ONCE: bottom-pinned
@@ -174,7 +328,7 @@
   let didRestore = false;
   $effect(() => {
     const el = transcriptEl;
-    if (el === null || didRestore) return;
+    if (el === null || didRestore || store.hydrating || !renderReady) return;
     didRestore = true;
     const saved = chatScroll(session.id);
     void tick().then(() => {
@@ -236,8 +390,22 @@
     void store.blocks.length;
     void store.pending.length;
     void store.lastSeq;
-    if (!atBottom) return;
-    void tick().then(scrollToBottom);
+    if (!visible || store.hydrating || !renderReady || !atBottom) return;
+    scrollToBottom();
+  });
+
+  // Artifact images/tables can resolve after the transcript page mounted.
+  // Keep the correct end anchored through those late size changes; a reader
+  // who scrolled up is deliberately left untouched (native scroll anchoring
+  // handles changes around their viewport).
+  $effect(() => {
+    const column = columnEl;
+    if (!visible || column === null || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (atBottom) scrollToBottom();
+    });
+    observer.observe(column);
+    return () => observer.disconnect();
   });
 
   function sendNow(text: string, images: ImageAttachment[]): boolean {
@@ -721,6 +889,10 @@
       return;
     }
     turnElapsedMs = performance.now() - start;
+    // Retained background chats keep their transcript DOM, but a counter the
+    // user cannot see must not wake the main thread every second. Re-entering
+    // the tab recomputes from the pool's original turn start before painting.
+    if (!visible) return;
     const iv = setInterval(() => {
       turnElapsedMs = performance.now() - start;
     }, 1000);
@@ -796,17 +968,18 @@
     ),
   );
 
-  /** Render list: consecutive tool blocks coalesce into one ToolGroup so a
-   *  long run reads as a single condensed line, not a wall of cards. Every
-   *  other block passes through as a "single" carrying its ORIGINAL index (the
-   *  streaming reveal keys off store.blocks positions). */
+  /** Render list for the bounded plain-data snapshot: consecutive tool blocks
+   *  coalesce into one ToolGroup so a long run reads as a single condensed
+   *  line, not a wall of cards. Every other block carries its ORIGINAL store
+   *  index (the streaming reveal keys off store.blocks positions). */
   type RenderItem =
     | { t: "group"; key: string; tools: Extract<ChatBlock, { kind: "tool" }>[] }
     | { t: "single"; key: string; index: number; block: ChatBlock };
   const renderItems = $derived.by(() => {
     const items: RenderItem[] = [];
     let group: Extract<RenderItem, { t: "group" }> | null = null;
-    store.blocks.forEach((block, i) => {
+    renderBlocks.forEach((block, i) => {
+      const originalIndex = renderStart + i;
       // Every user block in `blocks` is delivered — queued/undelivered sends
       // live in the pending transcript tail (`store.pendingSends`), never
       // here — so they all render inline in transcript order.
@@ -818,7 +991,7 @@
         group.tools.push(block);
       } else {
         group = null;
-        items.push({ t: "single", key: `b-${i}`, index: i, block });
+        items.push({ t: "single", key: `b-${originalIndex}`, index: originalIndex, block });
       }
     });
     return items;
@@ -903,17 +1076,29 @@
   >
     <!-- One real reading column (the Claude Desktop measure): agent prose
          fills it from the left, user bubbles right-align inside it. -->
-    <div class="column">
+    <div class="column" bind:this={columnEl}>
+    {#if store.hydrating}
+      <div class="empty hydrate" aria-live="polite">
+        <SessionGlyph kind="agent" {agentKind} size={18} state="alive" />
+        <span>loading recent conversation…</span>
+      </div>
+    {:else}
     {#if store.blocks.length === 0 && store.exited === null}
       <div class="empty">
         <SessionGlyph kind="agent" {agentKind} size={18} />
         <span>{store.connected ? `${agentName} is ready` : `connecting to ${agentName}…`}</span>
       </div>
     {/if}
+    {#if renderStart > 0}
+      <button class="history-more" onclick={revealEarlier}>
+        ↑ show earlier conversation · {renderStart} block{renderStart === 1 ? "" : "s"}
+      </button>
+    {/if}
     {#each renderItems as item (item.key)}
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
+          {visible}
           {onOpenFile}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
@@ -966,7 +1151,7 @@
             onOpenPath={openProsePath}
             resolvePaths={resolveProsePaths}
             onReveal={() => {
-              if (atBottom) scrollToBottom();
+              if (visible && atBottom) scrollToBottom();
             }}
           />
           <AgentMessageMeta
@@ -989,6 +1174,7 @@
           <QuestionCard
             request={{ requestId: item.block.id, questions: item.block.questions, expiresAtMs: null }}
             answered={item.block.answers}
+            {visible}
           />
         {/if}
       {:else if item.block.kind === "notice"}
@@ -1028,7 +1214,7 @@
     {/each}
 
     {#each store.questions as request (request.requestId)}
-      <QuestionCard {request} onAnswer={(answers) => answer(request.requestId, answers)} />
+      <QuestionCard {request} {visible} onAnswer={(answers) => answer(request.requestId, answers)} />
     {/each}
 
     {#if agentBusy && store.pending.length === 0 && store.questions.length === 0}
@@ -1113,10 +1299,15 @@
       </div>
     {/if}
 
-    {#if !atBottom && store.pending.length > 0}
+    {#if renderEnd < store.blocks.length}
+      <button class="jump" onclick={scrollToBottom}>
+        jump to newest ↓
+      </button>
+    {:else if !atBottom && store.pending.length > 0}
       <button class="jump" onclick={scrollToBottom}>
         permission needed ↓
       </button>
+    {/if}
     {/if}
     </div>
   </div>
@@ -1130,6 +1321,7 @@
          native task key the wire gave us; the driver passes it through. -->
     <BackgroundTray
       tasks={store.backgroundTasks}
+      {visible}
       onStop={agentKind === "claude" ? stopTask : undefined}
     />
   {/if}
@@ -1314,6 +1506,22 @@
     flex-direction: column;
     align-items: center;
     gap: 8px;
+  }
+  .history-more {
+    align-self: center;
+    margin: 2px 0 10px;
+    padding: 3px 10px;
+    border: 1px solid color-mix(in srgb, var(--edge) 72%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--fg) 3%, transparent);
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .history-more:hover {
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--accent) 48%, var(--edge));
   }
   .msg {
     word-break: break-word;

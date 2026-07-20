@@ -55,9 +55,12 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
 ## Warm terminal pool (client)
 
 - **What & when.** Each session keeps one long-lived xterm instance + open socket that survive
-  tab switches and pane moves, so switching away and back is instant with nothing reflowed.
-- **Where it lives.** `web-ui/src/lib/terminal/termPool.ts` (`pool`, `attach`/`show`/`release`,
-  hidden `stash`, `POOL_CAP = 12`, `evictLru`), `Terminal.svelte`.
+  tab switches and pane moves, so switching back reuses warm scrollback without reconnecting or
+  rebuilding the terminal buffer (the newly attached pane may still need a fit).
+- **Where it lives.** `web-ui/src/lib/terminal/termPool.ts` (lazy facade) and
+  `termPoolRuntime.ts` (`pool`, `attach`/`show`/`release`, hidden `stash`, `POOL_CAP = 12`,
+  `evictLru`), plus `Terminal.svelte` and `layout/Pane.svelte` (only an active PTY component stays
+  mounted, so inactive instances actually park; structured-chat tabs retain their separate DOM).
 - **Key behaviors.** Up to 12 terminals stay warm; the LRU *parked* one is disposed past the cap.
   A visible terminal outlives its dead session on purpose (an agent's last words stay on screen
   until you close the tab). WebGL renderer with DOM fallback on context loss; fonts are awaited

@@ -359,6 +359,12 @@ export class ChatStore {
    *  Reactive so views can track "any event applied" (in-place chunk appends
    *  and tool patches change no collection lengths). */
   lastSeq = $state(0);
+  /** True only while a fresh/reset store is folding its initial journal gap.
+   *  The reducer stays authoritative, but the view waits for the advertised
+   *  head before mounting transcript DOM so replay cannot visibly paint from
+   *  the oldest message down or eagerly load every historical artifact. */
+  hydrating = $state(true);
+  private replayHead = 0;
   /** tool_call id -> index into blocks, for in-place status/content patches. */
   private toolIndex = new Map<string, number>();
   /** user-message delivery id -> index into blocks (user_message_update). */
@@ -374,6 +380,17 @@ export class ChatStore {
     if (head !== undefined && head < this.lastSeq) {
       this.resetTranscript();
     }
+    if (head !== undefined) {
+      // Preserve an interrupted initial hydration across reconnects. An
+      // ordinary reconnect with an already-rendered store never hides it.
+      const initial = this.hydrating || this.lastSeq === 0;
+      this.replayHead = head;
+      this.hydrating = initial && this.lastSeq < head;
+    } else {
+      // Compatibility with a server that predates the additive head field:
+      // it cannot give us a hydration boundary, so preserve the old live fold.
+      this.hydrating = false;
+    }
     if (session.model !== null) this.model = session.model;
     if (session.current_mode !== null) this.currentMode = session.current_mode;
     if (!session.alive && this.exited === null) {
@@ -384,6 +401,24 @@ export class ChatStore {
   /** The socket dropped; we are no longer live until the next `ready`. */
   onDisconnected(): void {
     this.connected = false;
+  }
+
+  /** The structured driver fell back to its terminal surface. */
+  onDegraded(): void {
+    this.hydrating = false;
+    this.degraded = true;
+  }
+
+  /** The driver closed before (or after) an initial journal replay. */
+  onExited(status: number | null): void {
+    this.hydrating = false;
+    this.exited = { status };
+  }
+
+  /** A socket/handshake failure can precede `ready`; reveal it immediately. */
+  onFatalError(message: string): void {
+    this.hydrating = false;
+    this.fatalError = message;
   }
 
   /** Drop the rendered transcript and seq cursor so a fresh replay rebuilds it
@@ -399,6 +434,8 @@ export class ChatStore {
     this.pendingSends = [];
     this.questions = [];
     this.lastSeq = 0;
+    this.hydrating = false;
+    this.replayHead = 0;
     this.exited = null;
     this.degraded = false;
     // Turn state and the plan belong to the dead journal too — a stale plan
@@ -417,6 +454,7 @@ export class ChatStore {
   apply(entry: SeqEvent): void {
     if (entry.seq <= this.lastSeq) return;
     this.lastSeq = entry.seq;
+    if (this.hydrating && this.lastSeq >= this.replayHead) this.hydrating = false;
     const ev = entry.ev;
     switch (ev.type) {
       case "init": {
@@ -1038,12 +1076,12 @@ export class ChatStore {
     this.trimBlocks();
   }
 
-  /** Client-side transcript cap. The daemon journal compacts its own history;
-   *  the rendered `blocks` array has no such bound, so a very long session
-   *  would grow it (and the DOM) without limit. Beyond a generous cap we drop
-   *  the oldest blocks behind a single "earlier history trimmed" notice,
-   *  mirroring the server's compaction. The cap is far above the live tail, so
-   *  the streaming message and its tool cards are never touched. */
+  /** Client-side reducer cap. The daemon journal compacts its own history;
+   *  this in-memory `blocks` array needs its own bound even though ChatView now
+   *  mounts only a paged DOM window. Beyond a generous cap we drop the oldest
+   *  blocks behind one "earlier history trimmed" notice, mirroring server
+   *  compaction. The cap is far above the live tail, so the streaming message
+   *  and its tool cards are never touched. */
   private static readonly BLOCK_CAP = 2000;
   private trimBlocks(): void {
     const cap = ChatStore.BLOCK_CAP;

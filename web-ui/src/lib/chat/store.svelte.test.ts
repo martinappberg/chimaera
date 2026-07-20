@@ -483,6 +483,32 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.activity).toBeNull();
   });
 
+  it("holds initial rendering until replay reaches the advertised journal head", () => {
+    const store = new ChatStore();
+    const session = {
+      id: "s1",
+      agent: "claude",
+      alive: true,
+      exit_status: null,
+      native_session_id: null,
+      model: null,
+      current_mode: null,
+      pending_permission: false,
+    };
+    store.onReady(session, 0, 3);
+    expect(store.hydrating).toBe(true);
+
+    store.apply({ seq: 1, ts: 1, ev: { type: "user_message", text: "oldest" } } as SeqEvent);
+    store.apply({ seq: 2, ts: 2, ev: { type: "message_chunk", turn_id: "t1", text: "middle" } } as SeqEvent);
+    expect(store.hydrating).toBe(true);
+
+    // A reconnect partway through keeps the partial transcript gated.
+    store.onReady(session, 2, 3);
+    expect(store.hydrating).toBe(true);
+    store.apply({ seq: 3, ts: 3, ev: { type: "turn_completed", turn_id: "t1", usage: {} } } as SeqEvent);
+    expect(store.hydrating).toBe(false);
+  });
+
   it("preserves Codex question auto-resolution deadlines across replay", () => {
     const events = [
       {

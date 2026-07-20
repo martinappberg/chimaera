@@ -1,8 +1,8 @@
 /**
- * Per-session composer drafts. The layout mounts exactly one surface per pane
- * and deliberately remounts ChatView (Composer included) per session, so a
- * component-local draft dies on every tab switch — this module keys the draft
- * to the SESSION instead, like composerBus keys its insert registry.
+ * Per-session composer drafts. A recent chat view remains mounted across an
+ * ordinary tab switch, but pane live-set eviction, moves, and page reloads can
+ * still remount it. This module keys the draft to the SESSION instead, like
+ * composerBus keys its insert registry.
  *
  * Text also layers into sessionStorage (the auth token's precedent) so a
  * page reload keeps it; image attachments stay in-memory only — each is

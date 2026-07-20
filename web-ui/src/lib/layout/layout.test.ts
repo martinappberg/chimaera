@@ -3,6 +3,8 @@ import {
   type Layout,
   type Tab,
   defaultLayout,
+  activateTab,
+  keepsPaneViewAlive,
   tabKey,
   panes,
   tabCount,
@@ -63,6 +65,16 @@ describe("tabKey", () => {
   });
 });
 
+describe("pane view retention", () => {
+  it("parks PTYs but retains rendered chat and file views", () => {
+    const terminal = { surface: "terminal", sessionId: "s1" } as const;
+    expect(keepsPaneViewAlive(terminal)).toBe(false);
+    expect(keepsPaneViewAlive(terminal, "term")).toBe(false);
+    expect(keepsPaneViewAlive(terminal, "chat")).toBe(true);
+    expect(keepsPaneViewAlive({ surface: "file", path: "/a.txt" })).toBe(true);
+  });
+});
+
 describe("opening surfaces", () => {
   it("openSession adds a terminal tab and focuses it", () => {
     const l = openSession(defaultLayout(), "s1");
@@ -76,6 +88,11 @@ describe("opening surfaces", () => {
     l = openSession(l, "s1");
     expect(allSessionIds(l)).toEqual(["s1"]);
     expect(tabCount(l)).toBe(1);
+  });
+
+  it("activating the already-active tab preserves layout identity", () => {
+    const l = openSession(defaultLayout(), "s1");
+    expect(activateTab(l, l.focusedPaneId, 0)).toBe(l);
   });
 
   it("openFile adds a file tab, focusedFile reflects the active tab", () => {

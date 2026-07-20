@@ -103,6 +103,17 @@ export function tabKey(t: Tab): string {
   return "v:settings";
 }
 
+/**
+ * Whether Pane should retain this tab's rendered component tree while it is
+ * inactive. A terminal tab can host either a PTY or structured chat: PTYs park
+ * their re-parentable xterm DOM in termPool, while chat keeps its bounded
+ * rendered page so it never has to be rebuilt on every switch.
+ * `sessionUi` is ignored for every non-terminal surface.
+ */
+export function keepsPaneViewAlive(t: Tab, sessionUi?: "chat" | "term"): boolean {
+  return t.surface !== "terminal" || sessionUi === "chat";
+}
+
 export interface PaneNode {
   type: "pane";
   id: string;
@@ -330,6 +341,7 @@ export function setRatio(l: Layout, splitId: string, ratio: number): Layout {
 export function activateTab(l: Layout, paneId: string, index: number): Layout {
   const p = findPane(l.root, paneId);
   if (p === null || index < 0 || index >= p.tabs.length) return l;
+  if (p.active === index && l.focusedPaneId === paneId) return l;
   const root = withPane(l.root, paneId, (x) => ({ ...x, active: index }));
   return normalize({ ...l, root, focusedPaneId: paneId });
 }

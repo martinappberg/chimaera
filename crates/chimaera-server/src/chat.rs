@@ -1076,8 +1076,12 @@ pub(crate) async fn switch_view(
     };
 
     // The resume handle: chat side knows its native id from Init; TUI side
-    // from the transcript path hooks report. Missing handle = fresh start in
-    // the other mode (still the same chimaera session identity).
+    // prefers the transcript path hooks report, then falls back to the durable
+    // handle it was itself resumed from. The fallback matters immediately
+    // after daemon resurrection: no new hook may have fired yet, but the
+    // ledger-backed `resumed_from` is still the conversation's exact tip.
+    // Missing handle = fresh start in the other mode (still the same chimaera
+    // session identity).
     //
     // A *resumed* claude chat is spawned with no pinned native id — its
     // `native_session_id` stays None until the first turn emits `system/init`.
@@ -1095,7 +1099,7 @@ pub(crate) async fn switch_view(
                     .and_then(|r| r.resume.clone())
             })
     } else {
-        record.resume_id()
+        terminal_resume_handle(&record)
     };
     // A handle is only resumable once a turn has landed a transcript on disk.
     // A fresh chat PINS its uuid at spawn (`--session-id`), so the handle
@@ -1143,6 +1147,12 @@ pub(crate) async fn switch_view(
         }
         Err(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
     }
+}
+
+/// Resume identity for a TUI→chat switch. A live hook-derived transcript is
+/// newest; `resumed_from` is the durable ledger fallback before hooks fire.
+fn terminal_resume_handle(record: &crate::agent_state::AgentRecord) -> Option<String> {
+    record.resume_id().or_else(|| record.resumed_from.clone())
 }
 
 #[allow(clippy::too_many_arguments)] // internal helper of switch_view only
@@ -1202,8 +1212,35 @@ async fn perform_switch(
     // recipe) is the source of truth, resolved at respawn time.
     let mastermind = crate::workspaces::workspace_mastermind_mode(state, &workspace_id, id);
 
+    // Build the successor recipe before stopping the current process. Besides
+    // keeping the kill→respawn interval small, the chat target needs this
+    // complete identity to seed a TUI-originated native transcript below.
+    let recipe = ChatRecipe {
+        workspace_root,
+        workspace_id,
+        kind: record.kind,
+        bin,
+        version,
+        settings,
+        mcp_config,
+        model: None,
+        resume,
+        fork_at: None,
+        rollback_turns: None,
+        theme,
+        prelude: launch_prelude,
+        mastermind,
+        // A view switch respawns in place; age isn't preserved across it
+        // today (the ledger path is what fixes resurrection).
+        created_at_ms: None,
+    };
+
     // Stop the current process and wait for its slot to free.
     stop_for_respawn(state, id, currently_chat).await?;
+
+    if target_chat {
+        seed_view_switch_history(state, id, &recipe).await;
+    }
 
     // Stamp the transition in the journal while no live Journal owns the
     // file: replayers then read "continued in terminal/chat" instead of a
@@ -1238,47 +1275,114 @@ async fn perform_switch(
     }
 
     if target_chat {
-        let recipe = ChatRecipe {
-            workspace_root: workspace_root.clone(),
-            workspace_id: workspace_id.clone(),
-            kind: record.kind,
-            bin: bin.clone(),
-            version: version.clone(),
-            settings: settings.clone(),
-            mcp_config: mcp_config.clone(),
-            model: None,
-            resume: resume.clone(),
-            fork_at: None,
-            rollback_turns: None,
-            theme: theme.clone(),
-            prelude: launch_prelude.clone(),
-            mastermind,
-            // A view switch respawns in place; age isn't preserved across it
-            // today (the ledger path is what fixes resurrection).
-            created_at_ms: None,
-        };
         spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
     } else {
-        let recipe = ChatRecipe {
-            workspace_root,
-            workspace_id,
-            kind: record.kind,
-            bin,
-            version,
-            settings,
-            mcp_config,
-            model: None,
-            resume,
-            fork_at: None,
-            rollback_turns: None,
-            theme,
-            prelude: launch_prelude,
-            mastermind,
-            created_at_ms: None,
-        };
         degrade_to_pty(state, id, recipe, pinned_name).await;
     }
     Ok(())
+}
+
+/// A term→chat switch must seed native/previous Chimaera history before its
+/// ModeSwitch marker creates the target journal. Otherwise the marker-only
+/// file trips `seed_resumed_journal`'s never-clobber guard and the chat opens
+/// with only "continued in chat" while the real conversation stays invisible.
+async fn seed_view_switch_history(state: &Arc<AppState>, id: &str, recipe: &ChatRecipe) {
+    if recipe.resume.is_none() {
+        return;
+    }
+    let state = Arc::clone(state);
+    let seed_id = id.to_string();
+    let log_id = seed_id.clone();
+    let recipe = recipe.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let _ = seed_or_repair_view_switch_journal(&state, &seed_id, &recipe);
+    })
+    .await
+    {
+        // Seeding is deliberately best-effort (same contract as chat spawn):
+        // a failed import must not strand the session after its TUI stopped.
+        tracing::warn!(id = %log_id, %error, "view-switch history seed task failed");
+    }
+}
+
+/// Seed an ordinary term→chat switch, or repair the exact marker-only shape
+/// produced by the old append-before-seed ordering. The caller has already
+/// stopped the target process, so the target journal has no live writer.
+fn seed_or_repair_view_switch_journal(
+    state: &Arc<AppState>,
+    id: &str,
+    recipe: &ChatRecipe,
+) -> bool {
+    let path = state.chat.journal_dir().join(format!("{id}.jsonl"));
+    if !control_only_switch_journal(&path) {
+        return seed_resumed_journal(state, id, recipe);
+    }
+
+    // Keep the old diagnostic tail recoverable until a complete seed lands.
+    // The timestamp makes this collision-free across a crash/retry; successful
+    // repair removes it, while any failure restores it byte-for-byte.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = path.with_extension(format!("jsonl.pre-seed-{}-{nonce}", std::process::id()));
+    if let Err(error) = std::fs::rename(&path, &backup) {
+        tracing::warn!(%id, %error, "could not stage marker-only journal for history repair");
+        return false;
+    }
+
+    if seed_resumed_journal(state, id, recipe) {
+        if let Err(error) = std::fs::remove_file(&backup) {
+            tracing::warn!(%id, %error, "could not remove repaired journal backup");
+        }
+        tracing::info!(%id, "repaired marker-only chat journal from resumed history");
+        return true;
+    }
+
+    // A failed copy can leave a partial destination. Remove only this exact
+    // session file, then put the known-good lifecycle journal back in place.
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Err(error) = std::fs::rename(&backup, &path) {
+        tracing::error!(%id, %error, "could not restore marker-only journal after failed history repair");
+    }
+    false
+}
+
+/// Recognize only the lifecycle-only journal shape the historical switch bug
+/// produced. Parse errors and any transcript-bearing event make this false:
+/// ambiguous or genuine history is never moved or replaced.
+fn control_only_switch_journal(path: &std::path::Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut saw_chat_switch = false;
+    let mut saw_event = false;
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<SeqEvent>(line) else {
+            return false;
+        };
+        saw_event = true;
+        match entry.ev {
+            AgentEvent::ModeSwitch {
+                to: chimaera_agent::model::SessionUi::Chat,
+            } => saw_chat_switch = true,
+            AgentEvent::ModeSwitch { .. }
+            | AgentEvent::Init { .. }
+            | AgentEvent::ModeChanged { .. }
+            | AgentEvent::EffortState { .. }
+            | AgentEvent::ContextUsage { .. }
+            | AgentEvent::UsageReport { .. }
+            | AgentEvent::RateLimit { .. }
+            | AgentEvent::BackgroundTasks { .. }
+            | AgentEvent::PromptSuggestion { .. }
+            | AgentEvent::SessionStatus { .. }
+            | AgentEvent::Exited { .. } => {}
+            _ => return false,
+        }
+    }
+    saw_event && saw_chat_switch
 }
 
 #[derive(Deserialize)]
@@ -3151,6 +3255,153 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn view_switch_repairs_marker_only_journal_before_new_marker() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-view-switch-seed-{}-{nonce}",
+            std::process::id()
+        ));
+        let data_dir = dir.join("data");
+        let config_dir = dir.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let state = Arc::new(AppState::new(
+            "test-token".into(),
+            "test-host".into(),
+            std::process::id(),
+            0,
+            data_dir,
+            config_dir,
+        ));
+
+        let native_id = "native-view-switch";
+        let source_id = "s-source-history";
+        let target_id = "s-marker-only";
+        let history = vec![
+            AgentEvent::UserMessage {
+                text: "preserved question".into(),
+                attachments: 0,
+                id: None,
+                queued: false,
+            },
+            AgentEvent::TurnStarted {
+                turn_id: "turn-1".into(),
+            },
+            AgentEvent::MessageChunk {
+                turn_id: "turn-1".into(),
+                text: "preserved answer".into(),
+            },
+            AgentEvent::TurnCompleted {
+                turn_id: "turn-1".into(),
+                usage: Default::default(),
+            },
+        ];
+        state.chat.seed_journal(source_id, &history).unwrap();
+        state.chat.index().record(native_id, source_id);
+
+        // This is the exact broken ordering: the marker creates the journal,
+        // then driver lifecycle events land, but no transcript can seed it.
+        state
+            .chat
+            .seed_journal(
+                target_id,
+                &[
+                    AgentEvent::ModeSwitch {
+                        to: chimaera_agent::model::SessionUi::Chat,
+                    },
+                    AgentEvent::Init {
+                        native_session_id: native_id.into(),
+                        model: None,
+                        modes: Vec::new(),
+                        current_mode: None,
+                        slash_commands: Vec::new(),
+                        models: Vec::new(),
+                        agent_version: None,
+                    },
+                    AgentEvent::Exited { status: Some(0) },
+                ],
+            )
+            .unwrap();
+
+        let recipe = ChatRecipe {
+            workspace_root: dir.clone(),
+            workspace_id: "w-test".into(),
+            kind: AgentKind::Claude,
+            bin: PathBuf::from("/bin/true"),
+            version: None,
+            settings: None,
+            mcp_config: None,
+            model: None,
+            resume: Some(native_id.into()),
+            fork_at: None,
+            rollback_turns: None,
+            theme: "dark".into(),
+            prelude: None,
+            mastermind: None,
+            created_at_ms: None,
+        };
+
+        seed_view_switch_history(&state, target_id, &recipe).await;
+        chimaera_agent::journal::append_marker(
+            state.chat.journal_dir(),
+            target_id,
+            AgentEvent::ModeSwitch {
+                to: chimaera_agent::model::SessionUi::Chat,
+            },
+        )
+        .await
+        .unwrap();
+
+        let target = state.chat.journal_dir().join(format!("{target_id}.jsonl"));
+        let entries: Vec<SeqEvent> = std::fs::read_to_string(target)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), history.len() + 1);
+        assert!(matches!(
+            &entries[0].ev,
+            AgentEvent::UserMessage { text, .. } if text == "preserved question"
+        ));
+        assert!(matches!(
+            &entries[2].ev,
+            AgentEvent::MessageChunk { text, .. } if text == "preserved answer"
+        ));
+        assert!(matches!(
+            &entries.last().unwrap().ev,
+            AgentEvent::ModeSwitch {
+                to: chimaera_agent::model::SessionUi::Chat,
+            }
+        ));
+        assert_eq!(
+            entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            (1..=entries.len() as u64).collect::<Vec<_>>()
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn terminal_view_switch_keeps_durable_resume_until_a_new_hook_arrives() {
+        let mut record = crate::agent_state::AgentRecord::new("test-key".into(), AgentKind::Claude);
+        record.resumed_from = Some("ledger-native-id".into());
+        assert_eq!(
+            terminal_resume_handle(&record).as_deref(),
+            Some("ledger-native-id")
+        );
+
+        record.transcript_path = Some(PathBuf::from("/tmp/live-hook-native-id.jsonl"));
+        assert_eq!(
+            terminal_resume_handle(&record).as_deref(),
+            Some("live-hook-native-id"),
+            "a later hook-derived tip must outrank the ancestor"
+        );
     }
 
     #[test]

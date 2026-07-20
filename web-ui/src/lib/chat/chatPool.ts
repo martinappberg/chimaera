@@ -1,15 +1,14 @@
 /**
  * The chat-session pool: one warm ChatStore + ChatSocket per session id,
- * kept alive across ChatView remounts (a tab switch, a pane move) so the
+ * kept alive across ChatView remounts (live-set eviction, a pane move) so the
  * transcript never re-fetches the whole journal and the socket never drops.
  * The DOM analogue of termPool for the xterm surface — but here the state is
  * plain JS (a reducer + a socket), so we keep the objects, not the DOM.
  *
- * Why a pool and not keep-alive DOM: a Svelte component tree can't be parked
- * and re-parented the way an xterm element can, and rendering every chat tab
- * hidden would hold a full transcript DOM (up to BLOCK_CAP blocks of markdown
- * + tool cards) per tab. Keeping the bounded store + one socket is far cheaper;
- * the remount then only re-renders already-in-memory state.
+ * The pane also retains a bounded MRU of bottom-windowed chat DOM for seamless
+ * normal tab switches. The pool is the cheaper fallback beyond that cap: a
+ * Svelte tree cannot be parked/re-parented like xterm, so an evicted view
+ * releases its rendered page while this bounded store + socket remain warm.
  *
  * Non-reactive module state (like termPool): the ChatStore's own $state fields
  * carry reactivity; the pool map itself must never be $state.
@@ -24,6 +23,10 @@ interface ChatEntry {
   /** Saved transcript scroll position, restored on the next mount. */
   scrollTop: number;
   atBottom: boolean;
+  /** Absolute block range last rendered by ChatView. Keeping this tiny view
+   *  cursor separate from the reducer lets an evicted view restore the same
+   *  reading window without remounting the entire transcript. */
+  renderWindow: { start: number; end: number } | null;
   /** performance.now() when the current turn started (null when idle). Kept
    *  here, NOT in the reducer, so the elapsed-turn counter survives a remount
    *  (a tab switch mid-turn) without ever leaking a clock into journal replay. */
@@ -51,9 +54,9 @@ function makeSocket(sessionId: string, store: ChatStore): ChatSocket {
     onReady: (info: ChatSessionInfo, replayFrom: number, head: number | undefined) =>
       store.onReady(info, replayFrom, head),
     onEvent: (entry: SeqEvent) => store.apply(entry),
-    onDegraded: () => (store.degraded = true),
-    onExited: (status: number | null) => (store.exited = { status }),
-    onError: (message: string) => (store.fatalError = message),
+    onDegraded: () => store.onDegraded(),
+    onExited: (status: number | null) => store.onExited(status),
+    onError: (message: string) => store.onFatalError(message),
     // A refused command is a notice, not a dead pane — the socket keeps
     // reconnecting and the user keeps their transcript.
     onCommandFailed: (message: string) => store.notice(message, "error"),
@@ -78,6 +81,7 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
       socket: makeSocket(sessionId, store),
       scrollTop: 0,
       atBottom: true,
+      renderWindow: null,
       turnStart: null,
       refs: 0,
       lastUsed: ++tick,
@@ -130,6 +134,18 @@ export function chatScroll(sessionId: string): { scrollTop: number; atBottom: bo
   return entry !== undefined
     ? { scrollTop: entry.scrollTop, atBottom: entry.atBottom }
     : { scrollTop: 0, atBottom: true };
+}
+
+/** Save the bounded block window currently mounted by a ChatView. */
+export function saveChatRenderWindow(sessionId: string, start: number, end: number): void {
+  const entry = pool.get(sessionId);
+  if (entry !== undefined) entry.renderWindow = { start, end };
+}
+
+/** Last mounted block window, if this session had a rendered view before. */
+export function chatRenderWindow(sessionId: string): { start: number; end: number } | null {
+  const saved = pool.get(sessionId)?.renderWindow;
+  return saved === undefined || saved === null ? null : { ...saved };
 }
 
 /**
