@@ -619,6 +619,9 @@ struct CodexMapper {
     /// Composer agent mode (read-only/auto/full-access/plan): the wire
     /// fields ride each turn/start once settings/update proves unsupported.
     current_mode: String,
+    /// Latest mode selection awaiting thread/settings/update. Effort changes
+    /// must compose with this selection, not the last acknowledged mode.
+    pending_mode: Option<(u64, String)>,
     mode_per_turn: Option<Value>,
     settings_update_unsupported: bool,
     turn_id: String,
@@ -730,6 +733,7 @@ impl CodexMapper {
             reported_effort: Some(effort),
             // codex's shipped default: workspace sandbox, on-request asks.
             current_mode: "auto".to_string(),
+            pending_mode: None,
             mode_per_turn: None,
             settings_update_unsupported: false,
             turn_id: String::new(),
@@ -788,9 +792,14 @@ impl CodexMapper {
     /// embeds it, so update both copies or the stale nested value can win.
     fn effort_wire_fields(&self, effort: &str) -> Value {
         let mut fields = json!({ "effort": effort });
-        if self.current_mode == "plan" {
+        let mode = self
+            .pending_mode
+            .as_ref()
+            .map(|(_, mode)| mode.as_str())
+            .unwrap_or(&self.current_mode);
+        if mode == "plan" {
             fields["collaborationMode"] = mode_wire_fields(
-                &self.current_mode,
+                mode,
                 self.pending_model.as_deref().or(self.model.as_deref()),
                 Some(effort),
             )["collaborationMode"]
@@ -1366,9 +1375,23 @@ impl CodexMapper {
                     // Older app-server: the fields ride every turn/start
                     // instead (the extension's own fallback path).
                     self.settings_update_unsupported = true;
-                    self.mode_per_turn = Some(per_turn);
-                    self.apply_mode(mode_id, step);
+                    if self
+                        .pending_mode
+                        .as_ref()
+                        .is_some_and(|(pending_id, _)| *pending_id == id)
+                    {
+                        self.pending_mode = None;
+                        self.mode_per_turn = Some(per_turn);
+                        self.apply_mode(mode_id, step);
+                    }
                 } else {
+                    if self
+                        .pending_mode
+                        .as_ref()
+                        .is_some_and(|(pending_id, _)| *pending_id == id)
+                    {
+                        self.pending_mode = None;
+                    }
                     step.events.push(AgentEvent::Error {
                         message: format!("mode change failed: {}", err["message"]),
                         fatal: false,
@@ -1414,7 +1437,18 @@ impl CodexMapper {
                 });
             }
             (PendingRpc::SettingsUpdate { mode_id, .. }, None) => {
-                self.apply_mode(mode_id, step);
+                // A later selection supersedes this response. Applying stale
+                // acknowledgements would make the UI flicker back to an old
+                // mode and break effort composition while the latest request
+                // is still in flight.
+                if self
+                    .pending_mode
+                    .as_ref()
+                    .is_some_and(|(pending_id, _)| *pending_id == id)
+                {
+                    self.pending_mode = None;
+                    self.apply_mode(mode_id, step);
+                }
             }
             (PendingRpc::EffortUpdate { effort_id, .. }, None) => {
                 if self.pending_effort.as_deref() == Some(&effort_id) {
@@ -3019,6 +3053,7 @@ impl CodexMapper {
                     self.pending_effort.as_deref(),
                 );
                 if self.settings_update_unsupported {
+                    self.pending_mode = None;
                     self.mode_per_turn = Some(fields);
                     self.apply_mode(mode_id, &mut step);
                 } else {
@@ -3031,6 +3066,7 @@ impl CodexMapper {
                             params[k] = v.clone();
                         }
                     }
+                    self.pending_mode = Some((id, mode_id.clone()));
                     self.pending_rpcs.insert(
                         id,
                         PendingRpc::SettingsUpdate {
@@ -4472,6 +4508,73 @@ mod tests {
             blocks: vec![ContentBlock::Text { text: "hi".into() }],
         });
         assert_eq!(step.outbound[0]["params"]["effort"], "high");
+    }
+
+    #[test]
+    fn effort_uses_pending_plan_mode_before_mode_ack() {
+        let mut m = mapper();
+        m.pending_effort = Some("medium".into());
+
+        let mode = m.on_command(AgentCommand::SetMode {
+            mode_id: "plan".into(),
+        });
+        assert_eq!(m.current_mode, "auto");
+        assert_eq!(
+            m.pending_mode.as_ref().map(|(_, mode)| mode.as_str()),
+            Some("plan")
+        );
+        assert_eq!(
+            mode.outbound[0]["params"]["collaborationMode"]["settings"]["reasoning_effort"],
+            "medium"
+        );
+
+        // The user can change effort before the mode response arrives. The
+        // second update must refresh Plan's nested copy as well as the
+        // top-level effort, or the stale nested value can win server-side.
+        let effort = m.on_command(AgentCommand::SetEffort {
+            effort_id: "high".into(),
+        });
+        let params = &effort.outbound[0]["params"];
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn stale_mode_ack_does_not_override_latest_selection() {
+        let mut m = mapper();
+        let plan = m.on_command(AgentCommand::SetMode {
+            mode_id: "plan".into(),
+        });
+        let auto = m.on_command(AgentCommand::SetMode {
+            mode_id: "auto".into(),
+        });
+
+        let step = m.on_frame(&json!({
+            "id": plan.outbound[0]["id"],
+            "result": {},
+        }));
+        assert!(step.events.is_empty());
+        assert_eq!(m.current_mode, "auto");
+        assert_eq!(
+            m.pending_mode.as_ref().map(|(_, mode)| mode.as_str()),
+            Some("auto")
+        );
+
+        let step = m.on_frame(&json!({
+            "id": auto.outbound[0]["id"],
+            "result": {},
+        }));
+        assert_eq!(
+            step.events,
+            vec![AgentEvent::ModeChanged {
+                mode_id: "auto".into(),
+            }]
+        );
+        assert_eq!(m.pending_mode, None);
     }
 
     #[test]
