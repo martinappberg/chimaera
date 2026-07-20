@@ -2,6 +2,10 @@
   import { fsQuickOpen, parentName, type QuickOpenEntry } from "../previews/files";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
+  import {
+    composerHeightForContent,
+    type ManualComposerHeight,
+  } from "./composerHeight";
   import { registerComposer, registerComposerAttach } from "./composerBus";
   import {
     imageToAttachment,
@@ -89,13 +93,14 @@
   });
   let el = $state<HTMLTextAreaElement | null>(null);
   let paneHeight = $state(0);
-  /** Null follows content; a number is the height chosen with the top-edge
-   *  grip. It resets after a successful send so the next draft starts quiet. */
-  let manualHeight = $state<number | null>(null);
+  /** Null follows content; an object remembers the height chosen with the
+   *  top-edge grip and how much content it held at that moment. */
+  let manualHeight = $state<ManualComposerHeight | null>(null);
   let currentHeight = $state(COMPOSER_MIN_HEIGHT);
   let resizing = $state(false);
   let resizeStartY = 0;
   let resizeStartHeight = 0;
+  let resizeStartContentHeight = 0;
   let resizeMoved = false;
   let selected = $state(0);
   let fileMatches = $state<QuickOpenEntry[]>([]);
@@ -139,8 +144,26 @@
     return Math.max(COMPOSER_MIN_HEIGHT, Math.min(maxComposerHeight(), height));
   }
 
-  function chooseComposerHeight(height: number | null) {
-    manualHeight = height === null ? null : clampComposerHeight(height);
+  /** Measure the content independently of the current inline height. */
+  function naturalComposerHeight(t: HTMLTextAreaElement): number {
+    const previousHeight = t.style.height;
+    t.style.height = "auto";
+    // +2: 1px border × 2, box-sizing is border-box.
+    const height = t.scrollHeight + 2;
+    t.style.height = previousHeight;
+    return height;
+  }
+
+  function chooseComposerHeight(height: number | null, contentHeight?: number) {
+    manualHeight =
+      height === null
+        ? null
+        : {
+            height: clampComposerHeight(height),
+            contentHeight:
+              contentHeight ??
+              (el === null ? COMPOSER_MIN_HEIGHT : naturalComposerHeight(el)),
+          };
   }
 
   /** Every successfully consumed draft returns the next input to content-fit,
@@ -151,20 +174,20 @@
   }
 
   // Autosize from rendered height, not "\n" count — soft-wrapped pastes
-  // grow the box too. A manual resize takes over until send/reset; either path
-  // is capped so the transcript always retains useful reading space.
+  // grow the box too. A manual resize reserves (or contracts) space without
+  // locking the box: further content growth still expands it to the pane cap.
   $effect(() => {
     void draft;
     const t = el;
     if (t === null) return;
     const chosen = manualHeight;
-    if (chosen === null) {
-      t.style.height = "auto";
-      // +2: 1px border × 2, box-sizing is border-box.
-      t.style.height = `${clampComposerHeight(t.scrollHeight + 2)}px`;
-    } else {
-      t.style.height = `${clampComposerHeight(chosen)}px`;
-    }
+    const contentHeight = naturalComposerHeight(t);
+    t.style.height = `${composerHeightForContent(
+      contentHeight,
+      chosen,
+      COMPOSER_MIN_HEIGHT,
+      maxComposerHeight(),
+    )}px`;
     currentHeight = t.getBoundingClientRect().height;
   });
 
@@ -176,6 +199,7 @@
     e.preventDefault();
     resizeStartY = e.clientY;
     resizeStartHeight = el.getBoundingClientRect().height;
+    resizeStartContentHeight = naturalComposerHeight(el);
     resizeMoved = false;
     resizing = true;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -184,7 +208,10 @@
   function moveResize(e: PointerEvent) {
     if (!resizing) return;
     if (Math.abs(resizeStartY - e.clientY) > 2) resizeMoved = true;
-    chooseComposerHeight(resizeStartHeight + resizeStartY - e.clientY);
+    chooseComposerHeight(
+      resizeStartHeight + resizeStartY - e.clientY,
+      resizeStartContentHeight,
+    );
   }
 
   function endResize(e: PointerEvent) {
@@ -211,7 +238,7 @@
     if (e.key === "ArrowUp" || e.key === "ArrowDown") {
       e.preventDefault();
       const delta = e.key === "ArrowUp" ? 24 : -24;
-      chooseComposerHeight((manualHeight ?? el.getBoundingClientRect().height) + delta);
+      chooseComposerHeight(el.getBoundingClientRect().height + delta);
     } else if (e.key === "Home") {
       e.preventDefault();
       chooseComposerHeight(null);
