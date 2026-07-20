@@ -66,4 +66,10 @@ describe("messageTimestampRefreshIn", () => {
     expect(messageTimestampRefreshIn(sent, sent + 61_000)).toBe(59_025);
     expect(messageTimestampRefreshIn(sent, sent + 90 * 60_000)).toBe(30 * 60_000 + 25);
   });
+
+  it("caps the first refresh when a new message is ahead of the view clock", () => {
+    const sent = at(2026, 7, 20, 16);
+    const staleViewClock = at(2026, 7, 20, 12);
+    expect(messageTimestampRefreshIn(sent, staleViewClock)).toBe(60_025);
+  });
 });

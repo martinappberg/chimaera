@@ -96,6 +96,11 @@ export function formatFullTimestamp(timestampMs: number, locale?: string): strin
  */
 export function messageTimestampRefreshIn(timestampMs: number, nowMs: number): number | null {
   if (!Number.isFinite(timestampMs)) return null;
+  // ChatView's clock advances only when a timestamp label is due to change. A
+  // newly appended message can therefore be newer than that cached value;
+  // cap this first wake-up to one real minute instead of extending "now" by
+  // however long the view clock has been idle.
+  if (timestampMs > nowMs) return MINUTE_MS + 25;
   const ageMs = Math.max(0, nowMs - timestampMs);
   let refreshAt: number;
   if (ageMs < MINUTE_MS) {
