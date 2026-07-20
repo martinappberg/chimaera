@@ -244,7 +244,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   assigns Codex's `auto_review` reviewer. Its unstable `item/autoApprovalReview/started|completed`
   lifecycle is normalized into an ordinary bounded tool card (reviewed action/files, verdict,
   risk, rationale); a denied action is a successful safety verdict, while timeout/abort renders
-  failed. `guardianWarning` is visible as a notice instead of disappearing.
+  failed. Codex also repeats routine successful reviews through `guardianWarning`; those duplicates
+  stay inside the compact tool history, while genuine or unrecognized guardian warnings remain
+  visible as transcript notices.
 - **Structured questions.** The agent's multiple-choice/free-text questions (claude
   `AskUserQuestion` / codex `requestUserInput`) render as a card. Selections are keyed by
   question/option **index**, not by model-authored id/label (those are untrusted and can collide).
