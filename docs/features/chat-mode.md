@@ -144,9 +144,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 
 - **Tool cards + grouping.** Each tool call is a collapsible card (title, glyph, status dot,
   output/diff, a `↗` to open the touched file). Consecutive calls condense into a group ("6 commands
-  · 2 files"); a group stays open only while something is still running, then collapses — a finished
-  run is history whether it passed or not, and its badge (`failed` / `recovered`) carries the verdict
-  without springing rows open over a problem the agent's own next message usually just explained.
+  · 2 files"). Groups are collapsed by default, including while work is running, and remain
+  expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
+  without turning live activity or history into a wall of command rows.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
   pending); `tool_output_delta` streams live output ahead of the authoritative result. **Dangling
   rows reconcile at turn end:** on `turn_completed`/`turn_aborted`/`exited` any tool still
