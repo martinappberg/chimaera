@@ -134,8 +134,16 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   notice; the live tail is never touched). User bubbles remain verbatim plain text—not Markdown—but
   recognized LaTeX spans use the same sanitized MathML renderer, so typed equations do not show raw
   delimiters.
+- **Assistant message metadata + actions.** Hover an assistant message (or focus one of its actions)
+  to reveal a slim rail directly below the prose: the journal-backed send time, copy-full-message,
+  and conversation-fork actions. The timestamp starts at `now`, advances through minute labels and
+  `1h ago`, then switches to the user's local hour cycle and calendar (`today`, `yesterday`, nearby
+  weekday, dated time, and a year-bearing date for older calendar years). One view-level timer wakes
+  only at the next label boundary rather than leaving an interval on every transcript row. Touch
+  devices keep the rail visible; a successful copy briefly swaps its icon to a checkmark.
 - **Where.** `ChatView.svelte` (`renderItems`), `store.svelte.ts` (the `blocks` reducer),
-  `Markdown.svelte`, `UserText.svelte`.
+  `AgentMessageMeta.svelte`, `Markdown.svelte`, `UserText.svelte`; timestamp formatting and refresh
+  boundaries live in `../shared/time.ts`, and clipboard writes use `../shared/clipboard.ts`.
 - **Untrusted output.** Everything the model emits is attacker-influenced — see
   [rules/web-ui.md](../../.claude/rules/web-ui.md). Tool-card bodies/diffs render as plain `<pre>`
   (no `{@html}`).
@@ -332,7 +340,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
 - **Branch at any message, without stopping the source.** Hover any user or assistant message and
-  choose **⑂** to create a new chat session through that journal sequence. The picker can target any
+  choose the fork action (below assistant prose; beside user bubbles) to create a new chat session
+  through that journal sequence. The picker can target any
   installed chat-capable agent. An exact same-agent boundary uses the vendor's native history:
   Claude forks at a delivered user checkpoint; Codex uses `thread/fork` through a completed turn.
   Every other combination — cross-agent, a same-agent assistant/user boundary the native API cannot

@@ -129,6 +129,9 @@ export type ChatBlock =
       kind: "message";
       text: string;
       turnId: string;
+      /** Wall-clock timestamp of the first text chunk in this assistant block.
+       *  Journal-backed so replay and reconnect preserve the original time. */
+      sentAtMs: number;
       /** Inclusive journal boundary for a portable fork through this row. */
       forkSeq: number;
       /** Codex thread/fork can use turnId only after this is the completed
@@ -609,11 +612,11 @@ export class ChatStore {
         this.activity = { kind: "waiting", detail: "starting" };
         break;
       case "message_chunk":
-        this.appendText("message", ev, entry.seq);
+        this.appendText("message", ev, entry.seq, entry.ts);
         this.activity = { kind: "writing", detail: "" };
         break;
       case "thought_chunk":
-        this.appendText("thought", ev, entry.seq);
+        this.appendText("thought", ev, entry.seq, entry.ts);
         this.activity = { kind: "thinking", detail: "" };
         break;
       case "thinking_tokens": {
@@ -1055,7 +1058,12 @@ export class ChatStore {
     this.rebuildIndexes();
   }
 
-  private appendText(kind: "message" | "thought", ev: AgentEvent, seq: number): void {
+  private appendText(
+    kind: "message" | "thought",
+    ev: AgentEvent,
+    seq: number,
+    timestampMs: number,
+  ): void {
     const text = ev.text as string;
     const turnId = ev.turn_id as string;
     const last = this.blocks[this.blocks.length - 1];
@@ -1065,7 +1073,14 @@ export class ChatStore {
       return;
     }
     if (kind === "message") {
-      this.blocks.push({ kind, text, turnId, forkSeq: seq, nativeTurnComplete: false });
+      this.blocks.push({
+        kind,
+        text,
+        turnId,
+        sentAtMs: timestampMs,
+        forkSeq: seq,
+        nativeTurnComplete: false,
+      });
     } else {
       this.blocks.push({ kind, text, turnId });
     }

@@ -46,6 +46,7 @@ hard-resets and rebuilds.
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
 | `RewindDialog.svelte` | The destructive in-place rewind/fork-point confirmation overlay (claude rewind + codex `thread/rollback`). |
 | `ForkDialog.svelte` | The non-destructive conversation-branch picker: target agent plus native-vs-portable boundary disclosure. |
+| `AgentMessageMeta.svelte` | The hover/focus rail below assistant prose: localized journal-backed timestamp, full-message copy, and the conversation-fork affordance. Its pure time ladder lives in `../shared/time.ts`. |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript. |
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
@@ -55,8 +56,9 @@ hard-resets and rebuilds.
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type); size-bounded. |
 
-The transcript's copy affordances reuse `../shared/clipboard.ts` (the native-first
-clipboard writer lifted out of the terminal pool) — see the shared/ area.
+The transcript's copy affordances — fenced code blocks and whole assistant
+messages — reuse `../shared/clipboard.ts` (the native-first clipboard writer
+lifted out of the terminal pool) — see the shared/ area.
 
 ## Invariants / gotchas
 
