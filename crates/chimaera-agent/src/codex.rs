@@ -970,9 +970,17 @@ impl CodexMapper {
             }
             "guardianWarning" => {
                 if let Some(message) = frame["params"]["message"].as_str() {
-                    step.events.push(AgentEvent::Notice {
-                        text: format!("auto review: {}", truncate_label(message, 240)),
-                    });
+                    // Codex repeats every successful structured review as a
+                    // prose "warning". The ToolCallUpdate above already owns
+                    // that verdict; journaling the duplicate splits compact
+                    // tool groups with a wall of success notices. Keep real
+                    // warnings visible and filter only the host-authored
+                    // approved prefix observed live from app-server.
+                    if !is_routine_auto_review_approval(message) {
+                        step.events.push(AgentEvent::Notice {
+                            text: format!("auto review: {}", truncate_label(message, 240)),
+                        });
+                    }
                 }
             }
             "thread/name/updated" => {
@@ -3332,6 +3340,16 @@ fn auto_review_action(action: &Value) -> (ToolKind, String, Vec<String>) {
     }
 }
 
+/// The app-server emits this prose notification alongside the structured
+/// `item/autoApprovalReview/completed` event. Match a token boundary so an
+/// unexpected warning that merely shares the leading words stays visible.
+fn is_routine_auto_review_approval(message: &str) -> bool {
+    const PREFIX: &str = "Automatic approval review approved";
+    message
+        .strip_prefix(PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':'))
+}
+
 /// Shell-ish quoting for the execpolicy-amendment prefix label.
 fn quote_tokens(tokens: &[String]) -> String {
     tokens
@@ -4320,7 +4338,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_review_lifecycle_and_warning_render_visibly() {
+    fn auto_review_lifecycle_and_guardian_messages_render_once() {
         let mut m = mapper();
         let started = m.on_frame(&json!({
             "method": "item/autoApprovalReview/started",
@@ -4359,6 +4377,18 @@ mod tests {
                 && text.contains("protected path")
         ));
 
+        let routine_approval = m.on_frame(&json!({
+            "method": "guardianWarning",
+            "params": {
+                "threadId": "thr-1",
+                "message": "Automatic approval review approved (risk: low, authorization: high): routine read-only validation"
+            },
+        }));
+        assert!(
+            routine_approval.events.is_empty(),
+            "the structured review row already carries successful verdicts"
+        );
+
         let warning = m.on_frame(&json!({
             "method": "guardianWarning",
             "params": { "threadId": "thr-1", "message": "Auto review is unavailable" },
@@ -4367,6 +4397,20 @@ mod tests {
             warning.events,
             vec![AgentEvent::Notice {
                 text: "auto review: Auto review is unavailable".into()
+            }]
+        );
+
+        let similar_warning = m.on_frame(&json!({
+            "method": "guardianWarning",
+            "params": {
+                "threadId": "thr-1",
+                "message": "Automatic approval review approvedButNotExecuted"
+            },
+        }));
+        assert_eq!(
+            similar_warning.events,
+            vec![AgentEvent::Notice {
+                text: "auto review: Automatic approval review approvedButNotExecuted".into()
             }]
         );
     }
