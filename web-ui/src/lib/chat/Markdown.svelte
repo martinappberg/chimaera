@@ -441,7 +441,7 @@
 
 <style>
   .md {
-    line-height: 1.55;
+    line-height: var(--chat-line-height, 1.55);
     font-size: var(--text-md);
     word-break: break-word;
   }

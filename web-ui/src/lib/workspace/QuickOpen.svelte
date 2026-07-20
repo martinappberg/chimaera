@@ -374,7 +374,7 @@
 
   .foot kbd {
     font-family: var(--mono);
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
     padding: 0 0.25rem;
     border: 1px solid var(--edge);
     border-radius: 4px;

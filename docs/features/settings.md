@@ -11,8 +11,9 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
 
 ## The settings model
 
-- **What & when.** The single store for user preferences — terminal appearance, the git binary path,
-  scrollback, quick-open ignore dirs, agent paths, update behavior, and the theme.
+- **What & when.** The single store for user preferences — interface/chat/editor/terminal
+  typography, themes, dashboard behavior, file and quick-open behavior, keybindings, runtime paths,
+  daemon persistence, and update behavior.
 - **How it's used.** The Settings pane (a singleton tab) edits keys through typed rows; a raw-JSON
   editor (`SettingsJson.svelte`) is available for anything the schema doesn't surface. `GET
   /api/v1/settings` returns the map; `PUT /api/v1/settings` replaces it whole (≤256 KB, 204). Changes
@@ -26,6 +27,30 @@ a `settings` frame on `/ws/events`. Map: [settings/AGENTS.md](../../web-ui/src/l
   UI's keys survive an older daemon). A corrupt/oversized/non-object file degrades to an empty map with
   a warning — settings must never brick the daemon. A changed `agents.*.path` triggers shim regeneration
   + a detection-cache drop.
+
+## Settings surface and typography domains
+
+- **The schema is the contract.** Every typed row, default, range, category, JSON completion, and
+  validation message derives from `schema.ts`; default values remain sparse (choosing a default
+  deletes that key). The UI covers Appearance, Agents, Environment, Dashboard, Chat, Terminal,
+  Editor, Files, Quick Open, Git, Daemon, Updates, and Keyboard. Environment is the deliberate
+  exception: its multiline preludes use `/api/v1/environment` and `env-profiles.json`.
+- **Interface typography applies app-wide.** `appearance.interfaceFontSize` (13 px by default)
+  rebuilds the shared `--text-xs`/`--text-sm`/`--text-md`/`--text-lg` scale live, so the rail,
+  file tree, pane tabs, dashboard, settings, dialogs, Git, and preview chrome move together.
+  `appearance.interfaceFontFamily` supplies the shared UI font stack. Small chrome uses those
+  tokens rather than fixed rem/px sizes.
+- **Content surfaces stay independently legible.** Chat defaults to a 13.5 px base and overrides
+  the shared scale within each `ChatView` (including the dashboard's embedded Mastermind) and
+  exposes font size/family, line height, and reading width. Terminal keeps its xterm-specific
+  font controls. Editor typography
+  covers code, diffs, and the JSON editor; rendered Markdown defaults to the same 13.5 px as Chat
+  but has its own font-size and line-height settings rather than borrowing `terminal.fontSize`.
+  CodeMirror views reconfigure while mounted.
+- **Newer surfaces are represented.** `dashboard.landing` controls the workspace landing and
+  `dashboard.cardDensity` selects automatic, comfortable, or compact agent cards. Mastermind's
+  agent/mode are workspace state edited in its setup card, while Environment preludes remain scoped
+  records rather than being flattened into global preferences.
 
 ## Agents settings & themes
 

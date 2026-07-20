@@ -35,12 +35,11 @@ app-dev: ui
     cd crates/chimaera-app && cargo run
 
 # The full app on an ISOLATED state dir (its own daemon of this build + a free
-# port, all under ~/.chimaera-dev-app/<worktree> — a short $HOME base so its
+# port, all under ~/.chimaera-dev-app/<worktree-key> — a short $HOME base so its
 # unix sockets fit sun_path) so a dev build never touches your real ~/.chimaera
 # — windows, saved hosts, sessions. Worktree-safe; runs alongside your real
 # app. See the develop skill.
 app-dev-isolated: ui
-    cd crates/chimaera-app && cargo build
     bash .claude/skills/develop/run-app-isolated.sh
 
 app-check:

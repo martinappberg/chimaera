@@ -90,7 +90,7 @@
 
   .name {
     font-family: var(--mono);
-    font-size: 0.82rem;
+    font-size: var(--text-md);
     color: var(--fg);
     max-width: 100%;
     overflow: hidden;
@@ -103,7 +103,7 @@
     grid-template-columns: auto auto;
     gap: 0.15rem 0.7rem;
     margin: 0;
-    font-size: 0.72rem;
+    font-size: var(--text-sm);
   }
 
   dt {
@@ -119,7 +119,7 @@
 
   .note {
     margin-top: 0.35rem;
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     opacity: 0.75;
   }
 </style>

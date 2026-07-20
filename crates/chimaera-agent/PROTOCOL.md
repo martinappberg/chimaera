@@ -1600,8 +1600,9 @@ requestPermissions), and an upstream-marked **UNSTABLE** review object
 (`inProgress|approved|denied|timedOut|aborted`, optional risk/rationale).
 Chimaera maps it onto a bounded, upserted tool row. Denied is a completed
 safety verdict, not a failed tool; timeout/abort are failed. `guardianWarning
-{threadId,message}` becomes a visible Notice. Unknown future action variants
-degrade to a generic bounded row without changing Chimaera's stable wire.
+{threadId,message}` becomes a visible Notice, except for the routine approval
+duplicates documented in Pass 25. Unknown future action variants degrade to a
+generic bounded row without changing Chimaera's stable wire.
 
 ### Question deadline presentation remains driver-authoritative
 
@@ -1839,3 +1840,27 @@ drivers' compact-journal/rich-native-send behavior. The adoption gate ran the
 full `just chat-smoke` matrix against the installed Claude Code and Codex CLIs:
 18/18 passed, including a real Codex `thread/fork` that returned a distinct
 thread while the source remained usable for rollback and compaction.
+
+## Pass 25 (2026-07-19 — codex auto-review duplicate verdicts). ADOPTED.
+
+A real Auto review turn exposed a second notification for every approved tool:
+after the structured `item/autoApprovalReview/completed` verdict, app-server
+also emits `guardianWarning {threadId,message}` whose message begins
+`Automatic approval review approved …`. The structured event already produces
+the bounded tool row with action, risk, and rationale. Promoting the prose copy
+to `AgentEvent::Notice` duplicated that information, interrupted consecutive
+tool groups, and left a paragraph between each compact command row.
+
+`GuardianWarningNotification` has only `threadId` and an unstructured `message`
+— no review id to correlate safely. Chimaera therefore filters only that exact
+host-authored successful-review prefix at a token boundary. Unknown wording,
+near-prefixes, unavailable-review messages, and adverse guardian warnings still
+become bounded visible notices. The structured lifecycle remains the single
+transcript representation of routine approvals.
+
+The isolated verification binary's top-level `codex --version` reported
+0.144.2, while its initialized app-server advertised `codex-cli 0.144.4` and
+triggered Chimaera's existing non-fatal version-drift notice. All five Codex
+live smoke cases still passed against that installation; this pass records the
+observed notification behavior without treating the wrapper/version mismatch
+as resolved.

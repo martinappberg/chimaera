@@ -265,7 +265,7 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    font-size: 11px;
+    font-size: var(--text-xs);
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -290,7 +290,7 @@
     gap: 6px;
     min-width: 0;
     font-family: var(--mono);
-    font-size: 12.5px;
+    font-size: var(--text-sm);
     color: var(--muted);
     white-space: nowrap;
     overflow: hidden;
@@ -308,7 +308,7 @@
 
   .res {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--text-sm);
     color: var(--muted);
   }
 
@@ -319,7 +319,7 @@
 
   .countdown {
     font-family: var(--mono);
-    font-size: 21px;
+    font-size: calc(var(--text-lg) + 5px);
     font-weight: 600;
     color: var(--fg);
     font-variant-numeric: tabular-nums;
@@ -331,7 +331,7 @@
   }
 
   .sub {
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -341,7 +341,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 11px;
+    font-size: var(--text-xs);
     color: var(--muted);
     cursor: pointer;
     margin: 5px -7px 0 0;
@@ -372,7 +372,7 @@
 
   .confirm-copy {
     min-width: 0;
-    font-size: 12.5px;
+    font-size: var(--text-sm);
     line-height: 1.45;
     color: var(--fg);
   }
@@ -380,7 +380,7 @@
   /* A definitive cancel failure (the daemon answered an error): the job is
      still running, so the confirm stays armed and says why. */
   .confirm-err {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     line-height: 1.4;
     color: var(--err);
   }
@@ -395,7 +395,7 @@
   .confirm-end {
     appearance: none;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--text-sm);
     white-space: nowrap;
     cursor: pointer;
     padding: 4px 10px;
@@ -419,7 +419,7 @@
     border: none;
     background: none;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--text-sm);
     color: var(--muted);
     cursor: pointer;
     padding: 4px 8px;
@@ -433,7 +433,7 @@
 
   .ending-msg {
     font-family: var(--mono);
-    font-size: 15px;
+    font-size: var(--text-lg);
     font-weight: 600;
     color: var(--warn);
     line-height: 1.3;
@@ -442,7 +442,7 @@
   .close-win {
     appearance: none;
     font: inherit;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     margin-top: 7px;
     padding: 3px 10px;
     border: 1px solid var(--edge);

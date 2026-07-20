@@ -480,7 +480,7 @@
   .chip {
     flex: none;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     border: 1px solid var(--edge);
     border-radius: 999px;
@@ -493,7 +493,7 @@
   .prov {
     flex: none;
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     cursor: help;
     opacity: 0.85;
   }
