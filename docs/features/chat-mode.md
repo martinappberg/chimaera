@@ -48,7 +48,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Long drafts.** The composer grows upward with wrapped text to a pane-conscious cap, then scrolls
   internally. Its subtle top-edge grip can expand or contract it manually (drag for a precise size;
   click to toggle expanded/content-fit; Up/Down resize from the keyboard and Home returns to
-  content-fit), and a successful send resets the next draft to its natural height.
+  content-fit). A manual size remains the baseline rather than locking the input: once new text uses
+  the available room, the composer keeps growing to the cap. A successful send resets the next draft
+  to its natural height.
 - **Autocomplete.** `/` → slash-command popover (native chimaera pickers first, then the CLI's
   own commands); `@name` → fuzzy file/dir quick-open; `@term:` → workspace-terminal grants (see
   [linked-terminals.md](linked-terminals.md)). `/rename <name>` pins a session name. `/compact`

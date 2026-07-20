@@ -51,6 +51,7 @@ hard-resets and rebuilds.
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
 | `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |
+| `composerHeight.ts` | Pure height policy for content-fit growth plus manual resize baselines; covered by `composerHeight.test.ts`. |
 | `drafts.ts` | Per-session composer draft persistence (survives the per-session ChatView remount + a page reload) — text layers into sessionStorage, images stay in-memory; both bounded. |
 | `images.ts` | Pasted/dropped image → downscale + base64 encode into an `ImageAttachment` (the canonical home of that type); size-bounded. |
 
