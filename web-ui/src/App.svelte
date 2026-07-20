@@ -220,6 +220,13 @@
   import { contextMenu } from "./lib/shared/contextMenu.svelte";
   import ConfirmDialog from "./lib/shared/ConfirmDialog.svelte";
   import { fsDeleteOp, lastFsMutation, notifyCreated, pendingDelete } from "./lib/workspace/fsEvents";
+  import {
+    currentDiskWatches,
+    diskWatchDirs,
+    diskWatchFiles,
+    lastDiskChange,
+    notifyDiskChange,
+  } from "./lib/workspace/diskWatch";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
@@ -508,6 +515,15 @@
     eventsSocket?.watch(wsId);
   });
 
+  // Mounted file views + visible listing directories are the complete scope of
+  // the daemon's bounded disk monitor. Registrations follow keep-alive mounts,
+  // not every tab ever opened, and are re-sent after reconnect by EventsSocket.
+  $effect(() => {
+    const files = $diskWatchFiles;
+    const dirs = $diskWatchDirs;
+    eventsSocket?.watchFs(files, dirs);
+  });
+
   // A worktree create/remove changed the daemon's workspace registry: re-fetch
   // the list so the home screen and switcher stay honest (a removed worktree's
   // workspace disappears; a created one appears).
@@ -771,6 +787,7 @@
           refreshRecents();
         }
       },
+      onFs: notifyDiskChange,
       onStatus: (up) => (eventsUp = up),
       onFatal: (message) => {
         if (message === "unauthorized") notifyUnauthorized();
@@ -779,6 +796,8 @@
     eventsSocket = events;
     // Register this window's workspace so the daemon's git backstop polls it.
     events.watch(activeWsId);
+    const diskWatches = currentDiskWatches();
+    events.watchFs(diskWatches.files, diskWatches.dirs);
     refreshWorkspaces();
     void bootViewState();
     // Re-run the landing one-shot once settings settle: the sessions
@@ -1347,6 +1366,26 @@
     const id = active.id;
     if (finderMru[0] === id) return;
     finderMru = [id, ...finderMru.filter((x) => x !== id)].slice(0, 16);
+  });
+
+  // An out-of-band deletion has no trustworthy rename destination, but it does
+  // have exact absence. Close file/diff tabs under it and retarget Finders just
+  // like an in-app delete; recreation can be opened as a fresh view later.
+  let lastDiskChangeSeq = 0;
+  $effect(() => {
+    const change = $lastDiskChange;
+    const dirty = $dirtyFiles;
+    untrack(() => {
+      if (change === null || change.seq === lastDiskChangeSeq) return;
+      lastDiskChangeSeq = change.seq;
+      for (const path of [...change.removed, ...change.removedDirs]) {
+        // Unlike a confirmed in-app delete, an external delete must not throw
+        // away an editor buffer the user has not saved. Clean tabs still close
+        // and Finders still retreat; the retained CodeView shows the missing
+        // file as a conflict and can recreate it with overwrite.
+        layout = pruneDeletedPath(layout, path, dirty);
+      }
+    });
   });
 
   /** Every open Finder instance's id, in tree order. */

@@ -913,9 +913,14 @@ export function rewriteTabPaths(l: Layout, from: string, to: string): Layout {
  * After an fs delete: file and diff tabs at/under `path` close; a Finder
  * browsing at/under it retargets to the deleted path's parent instead of
  * closing — a Miller-columns browser shouldn't vanish because the folder it
- * was showing did.
+ * was showing did. External deletion may pass dirty file paths to preserve:
+ * unlike a confirmed in-app delete, it must not discard unsaved buffers.
  */
-export function pruneDeletedPath(l: Layout, path: string): Layout {
+export function pruneDeletedPath(
+  l: Layout,
+  path: string,
+  preserveDirtyFiles?: ReadonlySet<string>,
+): Layout {
   const parent = parentPath(path);
   const retarget = (node: LayoutNode): LayoutNode => {
     if (node.type === "pane") {
@@ -932,7 +937,10 @@ export function pruneDeletedPath(l: Layout, path: string): Layout {
   const retargeted = root === l.root ? l : { ...l, root };
   return pruneTabs(
     retargeted,
-    (t) => (t.surface !== "file" && t.surface !== "diff") || !underPath(t.path, path),
+    (t) =>
+      (t.surface !== "file" && t.surface !== "diff") ||
+      !underPath(t.path, path) ||
+      (t.surface === "file" && preserveDirtyFiles?.has(t.path) === true),
   );
 }
 
@@ -1402,6 +1410,15 @@ if (import.meta.env.DEV) {
   dl = pruneDeletedPath(dl, "/w/gone");
   ok(allFilePaths(dl).join() === "/w/stay.txt", "delete closes file tabs under the path");
   ok(findFinder(dl, dlf.id)?.tab.path === "/w", "delete retargets finders to the parent");
+
+  let dd = defaultLayout();
+  dd = openFile(dd, "/w/gone/dirty.txt");
+  dd = openFile(dd, "/w/gone/clean.txt");
+  dd = pruneDeletedPath(dd, "/w/gone", new Set(["/w/gone/dirty.txt"]));
+  ok(
+    allFilePaths(dd).join() === "/w/gone/dirty.txt",
+    "external delete preserves dirty file tabs while pruning clean siblings",
+  );
 
   // shift+cmd+arrow auto-split: with no neighbor in `dir`, a single-tab pane
   // splits into a fresh empty pane on that side and focuses it.

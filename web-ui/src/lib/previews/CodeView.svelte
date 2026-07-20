@@ -214,11 +214,21 @@
   $effect(() => {
     const e = entry;
     if (e === null || savedMtime === null) return; // not yet initialized
+    if (e.missing) {
+      // App preserves dirty tabs when an external actor deletes the path. Keep
+      // the buffer mounted and let overwrite recreate the file; a clean tab is
+      // pruned before this transient state matters.
+      conflict = true;
+      return;
+    }
     const diskMtime = e.mtime;
     if (diskMtime === null || diskMtime === savedMtime) return; // our version, or unknown
     if (dirty || saving) conflict = true;
     else void reloadFromDisk();
   });
+  const conflictMessage = $derived(
+    entry?.missing === true ? "deleted on disk" : "changed on disk",
+  );
 
   onMount(() => {
     const el = host;
@@ -431,7 +441,7 @@
   {#if conflict}
     <!-- Quiet concurrent-modification bar: the file changed on disk under us. -->
     <div class="conflict" role="alert">
-      <span class="conflict-msg">changed on disk</span>
+      <span class="conflict-msg">{conflictMessage}</span>
       <button class="conflict-btn" onclick={() => void reloadFromDisk(true)}>reload</button>
       <button class="conflict-btn danger" onclick={() => void save(true)}>overwrite</button>
     </div>

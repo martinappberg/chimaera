@@ -10,13 +10,12 @@
  *      cached here (CACHE_CAP > the view live-set), so re-mounting re-renders
  *      warm instead of re-hitting the network. The complement to view
  *      keep-alive in the Chrome-tabs model.
- *   2. Live-on-disk update: an agent editing a file you have open updates the
- *      view in place. This is now PRECISE — the store re-probes only entries the
- *      repo reports DIRTY (see scheduleRevalidate / retain), never every
- *      on-screen preview on every git tick. A clean file cannot have moved, so
- *      it is never probed; that removed the per-tick mass-probe storm that made
- *      the workbench feel slow while an agent wrote. The editor guards its own
- *      unsaved buffer (see CodeView); the store carries last-known-on-disk only.
+ *   2. Live-on-disk update: the daemon monitors only mounted paths and tells the
+ *      store exactly which file metadata moved — including repeated edits to an
+ *      already-dirty file, ignored/non-repo files, and paths outside the
+ *      workspace. Agent/in-app git nudges remain the zero-latency fast path.
+ *      The editor guards its own unsaved buffer (see CodeView); the store carries
+ *      last-known-on-disk only.
  *
  * Memory lives in the browser tab, not the daemon: each entry holds at most the
  * first 256KB chunk (+ small rendered payloads), and the LRU caps the count.
@@ -27,6 +26,11 @@
 import { get } from "svelte/store";
 import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
+import {
+  lastDiskChange,
+  releaseDiskFile,
+  retainDiskFile,
+} from "../workspace/diskWatch";
 import { gitStatus, type GitStatus } from "../workspace/git";
 import { getSetting } from "../settings/store.svelte";
 
@@ -46,6 +50,8 @@ export class FileEntry {
   readonly path: string;
   /** Opaque on-disk mtime token (X-Mtime); the invalidation key. */
   mtime = $state<string | null>(null);
+  /** The mounted path was reported absent after it was loaded. */
+  missing = $state(false);
 
   chunk = $state<FileChunk | null>(null);
   chunkError = $state<string | null>(null);
@@ -76,14 +82,31 @@ export class FileEntry {
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
   /** In-flight guards so concurrent readers don't double-fetch. */
-  private loading = { chunk: false, md: false, table: false, raw: false };
+  private loading = { mtime: false, chunk: false, md: false, table: false, raw: false };
 
   constructor(path: string) {
     this.path = path;
   }
 
   private adoptMtime(m: string | null): void {
-    if (m !== null) this.mtime = m;
+    if (m !== null) {
+      this.mtime = m;
+      this.missing = false;
+    }
+  }
+
+  /** Seed the invalidation token for preview kinds whose payload endpoint does
+   *  not carry X-Mtime (rendered markdown/tables, tickets, spreadsheets). */
+  async ensureMtime(): Promise<void> {
+    if (this.mtime !== null || this.loading.mtime) return;
+    this.loading.mtime = true;
+    try {
+      this.adoptMtime((await fsFile(this.path, 0, 1)).mtime);
+    } catch {
+      // The payload request owns the visible error; metadata is best-effort.
+    } finally {
+      this.loading.mtime = false;
+    }
   }
 
   /** Fetch the first 256KB chunk (text/binary sniff) if not already present. */
@@ -216,8 +239,12 @@ export class FileEntry {
     try {
       const probed = (await fsFile(this.path, 0, 1)).mtime;
       if (probed === null || probed === this.mtime) return;
-      this.mtime = probed;
       await this.refreshPayloads();
+      // Raw-ticket consumers such as PdfView remount on this token. Publish it
+      // only after refreshed payloads land, so the remount cannot reuse the old
+      // still-fresh ticket in the gap between these two operations.
+      this.mtime = probed;
+      this.missing = false;
     } catch {
       return; // unreachable/deleted — leave content; the tab-prune path handles death
     } finally {
@@ -232,8 +259,14 @@ export class FileEntry {
    * the saved content, so a reopen / a second pane on this path stays correct.
    */
   noteWrite(mtime: string | null): void {
+    this.missing = false;
     if (mtime !== null) this.mtime = mtime;
     void this.refreshPayloads();
+  }
+
+  /** Preserve a mounted editor entry while recording that its disk path died. */
+  noteMissing(): void {
+    this.missing = true;
   }
 }
 
@@ -273,6 +306,7 @@ function evict(): void {
 export function retain(path: string): FileEntry {
   const e = entryFor(path);
   e.refs += 1;
+  retainDiskFile(path);
   evict();
   // A warm entry reclaimed after time off-screen (the keep-alive live set
   // evicted its view, but the bytes are still cached) may have missed a change.
@@ -286,6 +320,7 @@ export function retain(path: string): FileEntry {
 export function release(path: string): void {
   const e = cache.get(path);
   if (e !== undefined) e.refs = Math.max(0, e.refs - 1);
+  releaseDiskFile(path);
 }
 
 /** Tell the store an in-app save changed `path` on disk (see FileEntry.noteWrite). */
@@ -377,7 +412,8 @@ let lastMutationSeq = 0;
 let fsMutationPendingEpoch = false;
 let lastGitPaths = new Set<string>();
 /**
- * Absolute paths the repo currently reports dirty — the gate for revalidation.
+ * Absolute paths the repo currently reports dirty — the gate for git-nudge
+ * revalidation (mounted-path fs frames already carry exact changed paths).
  * Captured straight from each git-status snapshot's entries (the same source the
  * file tree's badges read), so only files an agent/tool ACTUALLY changed are
  * ever re-probed; a clean file cannot have moved and is never touched. This is
@@ -419,6 +455,21 @@ function ensureWired(): void {
     lastMutationSeq = m.seq;
     fsMutationPendingEpoch = true;
     applyMutation(m);
+  });
+  lastDiskChange.subscribe((change) => {
+    if (change === null) return;
+    // The daemon already did the expensive discrimination: only exact mounted
+    // files whose metadata moved arrive here. Re-probe X-Mtime before swapping
+    // cached payloads so editor conflict handling keeps one source of truth.
+    scheduleRevalidate(change.files);
+    for (const path of change.removed) {
+      cache.get(path)?.noteMissing();
+      forget(path);
+    }
+    // App will close mounted tabs for absent files. Keep their warm entries
+    // stale (without probing the known-missing path) so a later recreation at
+    // the same name cannot flash the deleted file's cached payload on reopen.
+    markStale(change.removed);
   });
   gitStatus.subscribe((s) => {
     // Refresh the dirty set on every status (even a same-epoch replay), so the

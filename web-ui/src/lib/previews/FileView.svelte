@@ -98,6 +98,7 @@
     const e = retain(p);
     entry = e;
     if (viewKindFor(p) === "text") void e.ensureChunk();
+    else void e.ensureMtime();
     return () => release(p);
   });
 
@@ -156,7 +157,9 @@
         <TableView {path} />
       {:else if kind === "xlsx"}
         {#if XlsxView !== null}
-          <XlsxView {path} />
+          {#key entry?.mtime ?? path}
+            <XlsxView {path} />
+          {/key}
         {:else if lazyError !== null}
           <div class="file-error">{lazyError}</div>
         {:else}
@@ -164,14 +167,18 @@
         {/if}
       {:else if kind === "pdf"}
         {#if PdfView !== null}
-          <PdfView {path} />
+          {#key entry?.mtime ?? path}
+            <PdfView {path} />
+          {/key}
         {:else if lazyError !== null}
           <div class="file-error">{lazyError}</div>
         {:else}
           <Spinner />
         {/if}
       {:else if kind === "binary"}
-        <BinaryView {path} />
+        {#key entry?.mtime ?? path}
+          <BinaryView {path} />
+        {/key}
       {:else if probe.state === "text"}
         {#if CodeView !== null}
           <CodeView {path} first={probe.chunk} />
@@ -181,7 +188,9 @@
           <Spinner />
         {/if}
       {:else if probe.state === "binary"}
-        <BinaryView {path} knownSize={probe.size} />
+        {#key entry?.mtime ?? path}
+          <BinaryView {path} knownSize={probe.size} />
+        {/key}
       {:else if probe.state === "error"}
         <div class="file-error">{probe.message}</div>
       {:else if probe.state === "loading"}

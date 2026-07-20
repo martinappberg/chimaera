@@ -848,9 +848,9 @@ setup into a new session. Distinctive, deferred.
     entry-count cap (truncate to "N+ changes", never materialize a 50k-file list); one
     in-flight status per repo, concurrent asks coalesce. **Git state is never persisted** — it
     is reconstructible, so nothing new lands under `~/.chimaera`.
-  - **Refresh is event-driven, not polled** (a 2 s `git status` loop is exactly the steady-state
-    cost the budget forbids, and NFS/Lustre inotify is unreliable where Chimaera runs, so no
-    file-watcher either). Recompute on signals the daemon already has: a daemon file save
+  - **Git refresh is event-driven, not rapidly polled** (a 2 s `git status` loop is exactly the
+    steady-state cost the budget forbids, and NFS/Lustre inotify is unreliable where Chimaera runs,
+    so there is no recursive/native workspace watcher). Recompute on signals the daemon already has: a daemon file save
     (`PUT /fs/file`), an **agent PostToolUse write** (`files_touched` is already ingested — the
     signature integration: agent writes → tree lights up, zero polling), and explicit UI refresh.
     A 12 s backstop poll catches out-of-band edits (an external editor, a `git` command in a
@@ -860,6 +860,17 @@ setup into a new session. Distinctive, deferred.
     is a trap — pulls only happen when something *changed*, so a recency window decays to zero on
     a quiet repo and the backstop stops watching exactly when it is needed (found in live
     verification, not in tests). With no window open, nothing is polled.
+  - **Rendered-file freshness is separate from Git.** The same watch frame additively carries
+    `files[]` (mounted preview paths) and `dirs[]` (visible tree/Finder listings). Each events socket
+    retains at most 64 of either and polls only their metadata every ~2 s off the async reactor; a
+    capped directory-name/type hash every ~12 s catches an NFS/Lustre metadata-cache miss; newly
+    mounted directories establish that baseline in batches of at most four per two seconds, so
+    opening tabs or expanding the tree cannot force an unbounded scan burst.
+    Frames report exact changed/removed files and invalidated/removed directories; payloads remain
+    pull-based. Disconnect drops the registrations, collapsed/unmounted views register nothing, and
+    no workspace is ever walked recursively. This is what catches repeated edits to an already-M
+    file plus ignored, non-repo, and out-of-workspace paths without turning Git status or the shared
+    filesystem into a hot loop.
   - **Wire = invalidate-and-pull**, not push-the-payload. `/ws/events` gains only a tiny
     `{type:"git", epochs:{workspace_id: epoch}}` nudge (the settings-generation trick); the
     client, if it is showing that workspace, pulls `GET /api/v1/git/status?workspace_id=`. Big

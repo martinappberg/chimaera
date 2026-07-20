@@ -1399,9 +1399,11 @@ async fn fs_put_file_conflict_is_409_and_leaves_disk_untouched() {
     let (_, headers, _) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
     let stale = header_str(&headers, "x-mtime").to_string();
 
-    // Another writer touches the file (mtime moves past the token).
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    std::fs::write(&path, "external edit").unwrap();
+    // Another writer replaces the bytes without changing their length. The
+    // opaque token still advances even on a filesystem with coarse mtimes.
+    std::fs::write(&path, "external").unwrap();
+    let (_, headers, _) = request_bytes(&state, Method::GET, &uri, Some("test-token")).await;
+    assert_ne!(header_str(&headers, "x-mtime"), stale);
 
     let (status, _, body) = put_raw(
         &state,
@@ -1413,7 +1415,7 @@ async fn fs_put_file_conflict_is_409_and_leaves_disk_untouched() {
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(err, serde_json::json!({"error": "file changed on disk"}));
     // The refused write changed nothing on disk.
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
 
     // A file deleted since the editor loaded it is a conflict too.
     let gone = root.join("gone.txt");

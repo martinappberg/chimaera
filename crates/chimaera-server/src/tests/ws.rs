@@ -274,6 +274,112 @@ async fn ws_events_pushes_files_touched_changes() {
     state.sessions.kill(&id).ok();
 }
 
+/// `/ws/events` watches only mounted file/listing paths, but those watches are
+/// independent of Git: repeated writes to an already-dirty file and new output
+/// in a non-repository directory both produce exact fs invalidations.
+#[tokio::test]
+async fn ws_events_pushes_mounted_disk_changes_outside_git() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let state = test_state();
+    let root = test_dir("ws-fs-watch");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("already-dirty.txt");
+    std::fs::write(&file, b"first").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/events");
+    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({"type": "auth", "token": "test-token"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // Drain the deterministic initial snapshots through recents, then register
+    // a mounted file + visible directory (no workspace/Git required).
+    loop {
+        let frame = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            _ => continue,
+        };
+        if frame["type"] == "recents" {
+            break;
+        }
+    }
+    socket
+        .send(WsMessage::text(
+            serde_json::json!({
+                "type": "watch",
+                "workspace_id": null,
+                "files": [file.to_string_lossy()],
+                "dirs": [root.to_string_lossy()],
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let initial = loop {
+        let frame = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            _ => continue,
+        };
+        if frame["type"] == "fs" {
+            break frame;
+        }
+    };
+    assert_eq!(initial["files"], serde_json::json!([file]));
+    assert_eq!(initial["dirs"], serde_json::json!([root]));
+
+    // A second content change does not alter porcelain's M status; the mounted
+    // metadata watch must still see it. A sibling create changes the listing.
+    std::fs::write(&file, b"second-and-longer").unwrap();
+    let child = root.join("ignored-output.bin");
+    std::fs::write(&child, b"x").unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    let changed = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no fs frame for external changes"
+        );
+        let frame = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            _ => continue,
+        };
+        if frame["type"] == "fs" {
+            break frame;
+        }
+    };
+    assert_eq!(changed["files"], serde_json::json!([file]));
+    assert_eq!(changed["dirs"], serde_json::json!([root]));
+
+    std::fs::remove_file(&file).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no fs frame for external deletion"
+        );
+        let frame = match next_ws_frame(&mut socket).await {
+            WsMessage::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            _ => continue,
+        };
+        if frame["type"] == "fs" {
+            assert_eq!(frame["removed"], serde_json::json!([file]));
+            break;
+        }
+    }
+}
+
 #[tokio::test]
 async fn ws_events_auth_snapshot_and_change_push() {
     use futures::SinkExt;

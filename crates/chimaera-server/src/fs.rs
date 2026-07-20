@@ -7,6 +7,7 @@
 //! without a bearer header.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -168,15 +169,29 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
         .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM)
 }
 
-/// Modification time as an opaque token for the `X-Mtime` header and the PUT
-/// `expect_mtime` conflict check: nanoseconds since the unix epoch, so two
-/// saves within the same second still compare as different on filesystems
-/// with sub-second timestamps.
+/// File-version fingerprint as an opaque decimal token for the `X-Mtime`
+/// header and PUT `expect_mtime` conflict check. mtime remains the primary
+/// signal, but length plus Unix inode/ctime identity catch a same-size rewrite
+/// whose timestamp was preserved or rounded by a coarse shared filesystem.
 fn mtime_token(meta: &std::fs::Metadata) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or_else(|| "0".to_string(), |d| d.as_nanos().to_string())
+        .map_or(0, |d| d.as_nanos())
+        .hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    meta.is_file().hash(&mut hasher);
+    meta.is_dir().hash(&mut hasher);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.dev().hash(&mut hasher);
+        meta.ino().hash(&mut hasher);
+        meta.ctime().hash(&mut hasher);
+        meta.ctime_nsec().hash(&mut hasher);
+    }
+    hasher.finish().max(1).to_string()
 }
 
 /// 400 with a JSON error body.
