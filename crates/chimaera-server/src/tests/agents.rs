@@ -43,6 +43,7 @@ async fn chat_handshake_failure_degrades_to_pty_on_same_id() {
             theme: "dark".into(),
             prelude: None,
             mastermind: None,
+            portable_context: None,
             created_at_ms: None,
         },
     );

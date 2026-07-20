@@ -57,7 +57,19 @@ async fn run_turn_to_result(chat: &mut ClaudeChat) -> (Value, Value, bool) {
 #[ignore = "live: spawns real claude, needs auth"]
 async fn claude_handshake_answers_before_any_turn() {
     let dir = tmpdir();
-    let mut chat = spawn_claude(dir.path(), &[]);
+    // Portable branches use this file-backed system initialization so opening
+    // one cannot manufacture a user message. Pin the real CLI's acceptance of
+    // the flag on the no-turn handshake test (no billing).
+    let context = dir.path().join("fork-context.txt");
+    std::fs::write(&context, "Historical branch context; wait for the user.")
+        .expect("write fork context");
+    let mut chat = spawn_claude(
+        dir.path(),
+        &[
+            "--append-system-prompt-file".into(),
+            context.to_string_lossy().into_owned(),
+        ],
+    );
 
     let init = chat.initialize(HANDSHAKE).await.expect("initialize");
     let commands = init["commands"]
@@ -1380,6 +1392,9 @@ async fn codex_fork_rollback_and_compact_surface() {
                 "threadId": thread_id,
                 "lastTurnId": completed_turns[0],
                 "cwd": dir.path(),
+                // Quiet portable context rides thread open, not turn/start.
+                // Pin the generated schema's top-level field on a real fork.
+                "developerInstructions": "Historical branch context; wait for the user.",
                 "ephemeral": false,
             }),
             HANDSHAKE,

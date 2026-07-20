@@ -1791,8 +1791,11 @@ Chimaera session, and never stops or rewrites the source.
 
 - **Claude:** the existing native path remains
   `--resume <source> --fork-session --resume-session-at <checkpoint_uuid>`.
-  Claude exposes exact checkpoint UUIDs on delivered user messages, so only
-  those messages qualify for native branching. The target journal is still
+  A delivered user message's checkpoint carries both its own UUID and the
+  preceding message UUID. Branching from the user's message means editing it,
+  so Chimaera excludes that message and resumes at `preceding_uuid`; branching
+  after a Claude assistant response remains portable because the normalized
+  assistant block does not expose its native UUID. The target journal is still
   seeded with the visible normalized prefix, but no transcript is resent to the
   model — native context is authoritative.
 - **Codex:** generated bindings from the pinned 0.144.2 binary define
@@ -1805,22 +1808,22 @@ Chimaera session, and never stops or rewrites the source.
   normal opened thread. A final assistant message becomes native-forkable only
   after its parent `turn/completed` supplies that exact turn id.
 
-The UI therefore offers the action at every user and assistant message but calls
-it **native** only at those exact points. Claude assistant messages and Codex
-user messages are not mislabeled as native boundaries; they use the portable
-path below.
+The UI therefore gives the two message roles distinct semantics: an assistant
+action branches after the response with an empty composer; a user action
+branches before that prompt and restores its text as an unsent draft. It calls
+the path **native** only when the exact preceding boundary above is available.
 
 ### Portable cross-agent/fallback handoff
 
 Cross-agent branches, source sessions without a reusable native id, and
 same-agent points the vendor cannot represent use one vendor-neutral handoff:
-copy the normalized journal prefix for replay, render a bounded transcript from
-user/assistant/tool/question/notice events, and send it to a fresh target. The
+copy the normalized visible journal prefix for replay, render a bounded transcript from
+user/assistant/tool/question/notice events, and install it on a fresh target. The
 render drops internal thinking, configuration, init, and lifecycle bookkeeping;
-an early `queued` echo is included only if a later update says it was sent. The
-full copied journal remains visible in the branch while the model-facing prompt
-is capped to a 32 KiB head plus a 184 KiB recent tail, below the shared 256 KiB
-command text budget.
+an early `queued` echo is included only if a later update inside the selected
+cut says it was sent (otherwise both it and its checkpoint are removed from the
+copied branch). The copied visible prefix remains visible in the branch while
+the model-facing prompt is capped to a 32 KiB head plus a 184 KiB recent tail.
 
 An additive `Forked {source_agent, source_seq, native}` event separates the
 copied prefix from the destination's own events. It is provenance, not merely a
@@ -1831,20 +1834,29 @@ server independently refuses any native boundary at or below the latest
 portable marker. Native forks preserve prior native boundaries. This floor
 survives branch-of-a-branch chains.
 
-`AgentCommand::PrimeFork` is an internal-only driver command
-(`skip_deserializing`, so browsers cannot invoke it). Both drivers send its rich
-blocks natively but journal only its compact `display_text`, preventing the
-portable transcript from being duplicated in the visible branch and avoiding
-Claude's ordinary first-prompt title generation. It shares `Send`'s validation
-and retained-byte accounting.
+Portable initialization is deliberately not an `AgentCommand` and creates no
+user event. Claude receives the bounded prompt from a mode-0600 runtime file via
+`--append-system-prompt-file`; Codex puts it in the thread start/resume/fork
+request's top-level `developerInstructions`. Both mechanisms initialize the
+destination before its first real user send, so opening a branch neither starts
+a billed turn nor manufactures the old “Continue from this fork point” row.
+The `Forked` marker lets resurrection reconstruct the same standing context
+after a daemon restart; native descendants inherit it as well.
 
 The Codex live contract is pinned by
 `codex_fork_rollback_and_compact_surface`; hermetic coverage pins native boundary
-selection, portable journal seeding, command-ingress rejection, and both
-drivers' compact-journal/rich-native-send behavior. The adoption gate ran the
+selection, portable journal seeding, quiet thread initialization, and removal
+of unresolved queued echoes. The adoption gate ran the
 full `just chat-smoke` matrix against the installed Claude Code and Codex CLIs:
 18/18 passed, including a real Codex `thread/fork` that returned a distinct
 thread while the source remained usable for rollback and compaction.
+
+The 2026-07-20 verification after rebasing this work over the chat-tab/history
+performance pass completed 11/19 cases successfully, including every Codex
+case. The other eight exercise Claude paths and could not complete under the
+account's weekly Claude limit (the end-to-end driver reported the limit and its
+reset time). This is an environment gate, not a replacement for the original
+18/18 adoption result above.
 
 ## Pass 25 (2026-07-19 — codex auto-review duplicate verdicts). ADOPTED.
 
