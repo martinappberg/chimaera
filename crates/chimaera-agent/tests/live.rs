@@ -1275,7 +1275,8 @@ async fn codex_steer_settings_and_account_surface() {
         "turn/steer must exist on this binary: {msg}"
     );
 
-    // thread/settings/update: supported, or -32601 (per-turn fallback path).
+    // thread/settings/update: mode and effort settings are supported together,
+    // or -32601 selects the driver's per-turn fallback path for both.
     let settings = chat
         .request_raw(
             "thread/settings/update",
@@ -1283,6 +1284,7 @@ async fn codex_steer_settings_and_account_surface() {
                 "threadId": thread_id,
                 "permissions": ":workspace",
                 "approvalPolicy": "on-request",
+                "effort": "low",
             }),
             HANDSHAKE,
         )
