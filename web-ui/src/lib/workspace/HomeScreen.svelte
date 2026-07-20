@@ -1404,7 +1404,7 @@
 
   h1 {
     margin: 0;
-    font-size: 20px;
+    font-size: calc(var(--text-lg) + 4px);
     font-weight: 600;
     letter-spacing: 0.01em;
   }
@@ -1482,7 +1482,7 @@
 
   kbd {
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     color: var(--muted);
     border: 1px solid var(--edge);
     border-radius: 3px;
@@ -1895,7 +1895,7 @@
     align-items: center;
     gap: 7px;
     padding: 2px 10px 0;
-    font-size: 12px;
+    font-size: var(--text-sm);
     color: var(--muted);
     animation: dotpulse 1.4s ease-in-out infinite;
   }

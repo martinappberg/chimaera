@@ -26,7 +26,9 @@ workspace/session wire, helpers in `web-ui/src/lib/workspace/sessions.ts`).
 - **How it's used.** Automatic (setting `dashboard.landing`, default `auto`; `never`
   restores the old first-session behavior). Manual: the fixed `dashboard` rail row above
   the terminals section, or Mod+0 (the same pinned-chord family as Mod+1–9; the digit `0`
-  ride-along lives in `web-ui/src/lib/shared/keys.ts::chordDigit`).
+  ride-along lives in `web-ui/src/lib/shared/keys.ts::chordDigit`). The
+  `dashboard.cardDensity` setting keeps roster cards comfortable, forces compact rows, or
+  retains the automatic seven-agent threshold.
 - **Key behaviors.** Singleton tab (re-opening focuses it); serialized additively in the
   layout blob (`{v:"dashboard"}` — older builds skip it without resetting the layout).
   When **nothing is running** (no agents, no terminals, no Mastermind) the surface shows

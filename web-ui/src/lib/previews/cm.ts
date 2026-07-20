@@ -38,7 +38,7 @@ export const makeCodeTheme = (fontSize: number, lineHeight: number) =>
       fontSize: `${fontSize}px`,
     },
     ".cm-scroller": {
-      fontFamily: "var(--mono)",
+      fontFamily: "var(--editor-font)",
       lineHeight: `${lineHeight}`,
       overflow: "auto",
     },
@@ -52,7 +52,7 @@ export const makeCodeTheme = (fontSize: number, lineHeight: number) =>
       backgroundColor: "transparent",
       color: "var(--muted)",
       border: "none",
-      fontFamily: "var(--mono)",
+      fontFamily: "var(--editor-font)",
       fontSize: `${Math.max(9, Math.round(fontSize - 1.5))}px`,
       opacity: "0.65",
       userSelect: "none",

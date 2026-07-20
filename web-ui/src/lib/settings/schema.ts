@@ -81,8 +81,15 @@ export type SettingsMap = {
   "appearance.lightTheme": string;
   "appearance.darkTheme": string;
   "appearance.accentColor": string;
+  "appearance.interfaceFontSize": number;
+  "appearance.interfaceFontFamily": string;
   "agents.defaultView": "chat" | "terminal";
   "dashboard.landing": "auto" | "never";
+  "dashboard.cardDensity": "auto" | "comfortable" | "compact";
+  "chat.fontSize": number;
+  "chat.fontFamily": string;
+  "chat.lineHeight": number;
+  "chat.contentWidth": number;
   "terminal.fontSize": number;
   "terminal.fontFamily": string;
   "terminal.lineHeight": number;
@@ -93,7 +100,10 @@ export type SettingsMap = {
   "terminal.copyOnSelect": boolean;
   "terminal.macOptionIsMeta": boolean;
   "editor.fontSize": number;
+  "editor.fontFamily": string;
   "editor.lineHeight": number;
+  "editor.markdownFontSize": number;
+  "editor.markdownLineHeight": number;
   "editor.lineNumbers": boolean;
   "editor.wordWrap": boolean;
   "editor.tabSize": number;
@@ -168,6 +178,28 @@ const DEFS = {
     default: "",
     scope: "client",
   },
+  "appearance.interfaceFontSize": {
+    title: "Interface Font Size",
+    category: "Appearance",
+    description:
+      "Base size in pixels for application chrome: the workspace rail, file tree, tabs, dashboard, settings, dialogs, and preview controls. Content surfaces keep their own Terminal, Chat, and Editor sizes below.",
+    type: "number",
+    default: 13,
+    min: 11,
+    max: 18,
+    step: 0.5,
+    scope: "client",
+  },
+  "appearance.interfaceFontFamily": {
+    title: "Interface Font Family",
+    category: "Appearance",
+    description:
+      "Font stack for application chrome. Empty uses the operating system's interface font. Custom fonts must be installed on the machine running the browser.",
+    type: "string",
+    default: "",
+    placeholder: "system interface font",
+    scope: "client",
+  },
 
   // --- Agents ----------------------------------------------------------------
   "agents.defaultView": {
@@ -196,6 +228,67 @@ const DEFS = {
       { value: "auto", label: "Dashboard" },
       { value: "never", label: "First session" },
     ],
+    scope: "client",
+  },
+  "dashboard.cardDensity": {
+    title: "Agent Card Density",
+    category: "Dashboard",
+    description:
+      "Card detail in the dashboard roster. Auto uses comfortable cards for smaller rosters and compact rows once seven or more agents are present.",
+    type: "enum",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Auto" },
+      { value: "comfortable", label: "Comfortable" },
+      { value: "compact", label: "Compact" },
+    ],
+    scope: "client",
+  },
+
+  // --- Chat ------------------------------------------------------------------
+  "chat.fontSize": {
+    title: "Font Size",
+    category: "Chat",
+    description:
+      "Base size in pixels for the complete structured-chat surface, including transcript prose, the composer, tool cards, trays, and the embedded Mastermind chat.",
+    type: "number",
+    default: 13.5,
+    min: 11,
+    max: 24,
+    step: 0.5,
+    scope: "client",
+  },
+  "chat.fontFamily": {
+    title: "Font Family",
+    category: "Chat",
+    description:
+      "Font stack for chat prose and controls. Empty follows the Interface Font Family; code remains in the bundled monospace face.",
+    type: "string",
+    default: "",
+    placeholder: "follow interface font",
+    scope: "client",
+  },
+  "chat.lineHeight": {
+    title: "Line Height",
+    category: "Chat",
+    description: "Line height multiplier for messages and the composer.",
+    type: "number",
+    default: 1.55,
+    min: 1.2,
+    max: 2.2,
+    step: 0.05,
+    scope: "client",
+  },
+  "chat.contentWidth": {
+    title: "Content Width",
+    category: "Chat",
+    description:
+      "Maximum width in pixels of the transcript, composer, and live work trays. Narrower panes still fit their available space.",
+    type: "integer",
+    default: 832,
+    min: 480,
+    max: 1400,
+    step: 16,
     scope: "client",
   },
 
@@ -309,6 +402,16 @@ const DEFS = {
     step: 0.5,
     scope: "client",
   },
+  "editor.fontFamily": {
+    title: "Font Family",
+    category: "Editor",
+    description:
+      "Font stack for code, text, diffs, and the raw settings editor. Empty uses the bundled JetBrains Mono.",
+    type: "string",
+    default: "",
+    placeholder: "JetBrains Mono",
+    scope: "client",
+  },
   "editor.lineHeight": {
     title: "Line Height",
     category: "Editor",
@@ -316,6 +419,29 @@ const DEFS = {
     type: "number",
     default: 1.55,
     min: 1,
+    max: 2.4,
+    step: 0.05,
+    scope: "client",
+  },
+  "editor.markdownFontSize": {
+    title: "Markdown Preview Font Size",
+    category: "Editor",
+    description:
+      "Body size in pixels for rendered Markdown previews. Per-pane A−/A+ controls can still override it.",
+    type: "number",
+    default: 15,
+    min: 10,
+    max: 32,
+    step: 0.5,
+    scope: "client",
+  },
+  "editor.markdownLineHeight": {
+    title: "Markdown Preview Line Height",
+    category: "Editor",
+    description: "Line height multiplier for rendered Markdown previews.",
+    type: "number",
+    default: 1.65,
+    min: 1.2,
     max: 2.4,
     step: 0.05,
     scope: "client",

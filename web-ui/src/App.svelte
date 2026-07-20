@@ -4360,7 +4360,7 @@
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: var(--text-xs);
     line-height: 1;
     color: var(--fg);
     animation: hintfade 0.14s ease-out;
@@ -5053,7 +5053,7 @@
     background: color-mix(in srgb, var(--accent) 24%, var(--rail-bg));
     border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
     font-family: var(--mono);
-    font-size: 9px;
+    font-size: var(--text-xs);
     line-height: 1;
     color: var(--fg);
     pointer-events: none;

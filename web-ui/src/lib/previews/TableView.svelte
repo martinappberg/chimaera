@@ -237,7 +237,7 @@
     if (el === null) return;
     const measure = document.createElement("span");
     measure.style.cssText =
-      "position:absolute;visibility:hidden;white-space:pre;font-family:var(--mono);font-size:0.74rem;";
+      "position:absolute;visibility:hidden;white-space:pre;font-family:var(--mono);font-size:var(--text-sm);";
     el.appendChild(measure);
     let max = 0;
     measure.textContent = columns[col] ?? "";
@@ -447,7 +447,7 @@
     border-collapse: separate;
     border-spacing: 0;
     font-family: var(--mono);
-    font-size: 0.74rem;
+    font-size: var(--text-sm);
     line-height: 1.4;
     min-width: 100%;
   }
@@ -549,7 +549,7 @@
     text-align: right;
     padding-left: 0.9rem;
     user-select: none;
-    font-size: 0.66rem;
+    font-size: var(--text-xs);
   }
 
   .ln.selrow {
@@ -569,7 +569,7 @@
     padding: 0.5rem;
     text-align: center;
     color: var(--muted);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     font-family: var(--mono);
   }
 
@@ -581,7 +581,7 @@
     height: 28px;
     padding: 0 0.7rem;
     border-top: 1px solid var(--edge);
-    font-size: 0.68rem;
+    font-size: var(--text-xs);
     color: var(--muted);
   }
 
@@ -605,7 +605,7 @@
   .file-error {
     margin: auto;
     color: var(--muted);
-    font-size: 0.8rem;
+    font-size: var(--text-md);
     padding: 1rem;
     text-align: center;
   }

@@ -11,27 +11,55 @@
 # The app's shell state, its daemon's state, and (over ssh) the spawned shells
 # all inherit CHIMAERA_HOME, so nothing lands in the shared ~/.chimaera. The real
 # $HOME is untouched, so ~/.claude auth still works. State lives under
-# ~/.chimaera-dev-app/<worktree> (a short $HOME base — see below). Mirrors
+# ~/.chimaera-dev-app/<worktree-key> (a short $HOME base — see below). Mirrors
 # serve-isolated.sh, for the app instead of the bare daemon. See the develop
 # skill.
 set -euo pipefail
 
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+# Worktrees conventionally share the same final directory name (`chimaera`), so
+# basename alone is not an identity. A stable checksum of the absolute root
+# keeps both the state directory and Tauri identifier short and collision-free.
+ROOT_CHECKSUM="$(printf '%s' "$ROOT" | cksum)"
+WORKTREE_ID="${ROOT_CHECKSUM%% *}"
+WORKTREE_KEY="$(basename "$ROOT")-$WORKTREE_ID"
+DEV_IDENTIFIER="dev.chimaera.app.dev.w$WORKTREE_ID"
 # The state dir MUST stay short: it holds unix sockets (the askpass relay, the
 # ssh ControlMaster) whose full path has to fit the ~104-byte `sun_path` limit.
 # A CHIMAERA_HOME *inside* the deep worktree path overshoots and the socket binds
 # fail (askpass can't reach the app → ssh auth dies; ssh mux fails). So anchor it
 # in $HOME under a per-worktree subdir: short base, still isolated per worktree.
-export CHIMAERA_HOME="$HOME/.chimaera-dev-app/$(basename "$ROOT")"
+export CHIMAERA_HOME="$HOME/.chimaera-dev-app/$WORKTREE_KEY"
+
+if [ "${1:-}" = "--print-home" ]; then
+  printf '%s\n' "$CHIMAERA_HOME"
+  exit 0
+fi
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0 [--print-home]" >&2
+  exit 2
+fi
+
 mkdir -p "$CHIMAERA_HOME"
 
 BUILD_BIN="$ROOT/crates/chimaera-app/target/debug/chimaera"
-if [ ! -x "$BUILD_BIN" ]; then
-  echo "app not built — run first:  cargo build --manifest-path crates/chimaera-app/Cargo.toml" >&2
-  exit 1
-fi
 if [ ! -f "$ROOT/web-ui/dist/index.html" ]; then
   echo "web-ui not built — run first (Node 22):  npm --prefix web-ui ci && npm --prefix web-ui run build" >&2
+  exit 1
+fi
+
+# The single-instance plugin keys its socket/service from Tauri's COMPILED
+# identifier, not the generated macOS wrapper's Info.plist. Build with a unique
+# development identity so chimaera-dev can coexist with the released app and
+# with isolated apps from other worktrees. tauri-build tracks TAURI_CONFIG, so
+# switching back to a normal app build automatically restores the base config.
+DEV_TAURI_CONFIG="{\"productName\":\"chimaera-dev\",\"identifier\":\"$DEV_IDENTIFIER\"}"
+echo "building isolated chimaera-dev app ($DEV_IDENTIFIER)" >&2
+TAURI_CONFIG="$DEV_TAURI_CONFIG" \
+  cargo build --manifest-path "$ROOT/crates/chimaera-app/Cargo.toml"
+
+if [ ! -x "$BUILD_BIN" ]; then
+  echo "isolated app build did not produce $BUILD_BIN" >&2
   exit 1
 fi
 
@@ -50,7 +78,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   plutil -create xml1 "$DEV_PLIST"
   plutil -insert CFBundleDisplayName -string "chimaera-dev" "$DEV_PLIST"
   plutil -insert CFBundleExecutable -string "chimaera-dev" "$DEV_PLIST"
-  plutil -insert CFBundleIdentifier -string "dev.chimaera.app.dev" "$DEV_PLIST"
+  plutil -insert CFBundleIdentifier -string "$DEV_IDENTIFIER" "$DEV_PLIST"
   plutil -insert CFBundleInfoDictionaryVersion -string "6.0" "$DEV_PLIST"
   plutil -insert CFBundleName -string "chimaera-dev" "$DEV_PLIST"
   plutil -insert CFBundlePackageType -string "APPL" "$DEV_PLIST"
@@ -64,6 +92,7 @@ fi
 
 echo "launching isolated chimaera-dev app" >&2
 echo "  CHIMAERA_HOME = $CHIMAERA_HOME" >&2
+echo "  app identifier = $DEV_IDENTIFIER" >&2
 echo "  daemon log    = $CHIMAERA_HOME/data/logs/serve.log" >&2
 echo "  (a debug daemon reads web-ui/dist from disk — after a UI change, rebuild the UI and reload the window; no app restart)" >&2
 

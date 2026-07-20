@@ -777,7 +777,7 @@
     color: var(--fg);
     font: inherit;
     font-size: var(--text-md);
-    line-height: 1.45;
+    line-height: var(--chat-line-height, 1.45);
     padding: 7px 38px 7px 10px; /* right clears the 26px action button */
     min-height: 38px;
     max-height: min(42vh, 22rem);
