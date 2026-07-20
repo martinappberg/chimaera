@@ -372,6 +372,27 @@ describe("ChatStore pending-send ordering", () => {
     expect(store.thinkingPushed).toBe(false);
   });
 
+  it("treats init as a complete catalog snapshot", () => {
+    const store = fold([
+      {
+        type: "init",
+        model: "old-model",
+        current_mode: "old-mode",
+        modes: [{ id: "old-mode", label: "Old" }],
+        slash_commands: [{ name: "old-command" }],
+        models: [{ id: "old-model", label: "Old model" }],
+      },
+      // Empty vectors/options are omitted by serde. They still mean the new
+      // driver has no catalog/state, not "keep the previous process's".
+      { type: "init", native_session_id: "new-driver" },
+    ]);
+    expect(store.model).toBeNull();
+    expect(store.currentMode).toBeNull();
+    expect(store.modes).toEqual([]);
+    expect(store.slashCommands).toEqual([]);
+    expect(store.models).toEqual([]);
+  });
+
   it("keeps client-side notices under the transcript cap", () => {
     const store = new ChatStore();
     for (let i = 0; i < 2_100; i++) store.notice(`offline ${i}`, "error");
@@ -673,18 +694,23 @@ describe("ChatStore background tasks", () => {
     expect(notices[0]).toMatchObject({ tone: "error" });
   });
 
-  it("survives a turn end AND a mid-process init, dies with the process", () => {
+  it("survives a turn end and model switch, dies with the process", () => {
     // Cross-turn: the turn ending does not clear the set (that's the point
-    // of background work). Neither does an init — the driver re-emits init
-    // MID-PROCESS (model-switch ack, safety fallback) while the tasks still
-    // run; the model-switch wipe was a real bug. The lifecycle ends are a
-    // driver exit / fatal error (the tasks were the CLI's children) — and
-    // the driver journals an empty level-set at teardown, so replay agrees.
+    // of background work). Neither does a ModelSwitched event while the tasks
+    // still run; the old fake-Init model refresh could expire unrelated state.
+    // The lifecycle ends are a driver exit / fatal error (the tasks were the
+    // CLI's children), and the manager journals an empty level-set before a
+    // replacement driver's Init so replay agrees.
     const store = fold([
       { type: "turn_started", turn_id: "t1" },
       { type: "background_tasks", tasks: [BG()] },
       { type: "turn_completed", turn_id: "t1", usage: {} },
-      { type: "init", native_session_id: "n1" },
+      {
+        type: "model_switched",
+        from: "claude-old",
+        to: "claude-new",
+        retract_current_turn: false,
+      },
     ]);
     expect(store.backgroundTasks).toHaveLength(1);
     store.apply({ seq: 5, ts: 5, ev: { type: "exited", status: 0 } } as SeqEvent);

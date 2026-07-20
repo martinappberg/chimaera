@@ -563,6 +563,11 @@ file list is therefore honest about exactly what will revert.
 - Images ride `input`: `{type:"image", url:<data URL>}` (or
   `{type:"localImage", path}` when a shared fs exists — we use data URLs).
   `turn/start` also carries `clientUserMessageId` (client-minted uuid).
+- `skills/list {cwds:[cwd], forceReload:false}` returns cwd-keyed entries with
+  `skills:[{name,description,shortDescription?,interface?,path,scope,enabled}]`.
+  Enabled rows become a bounded composer catalog; selecting an exact skill
+  token adds the native `UserInput` variant `{type:"skill",name,path}` beside
+  the preserved text input. See Pass 26.
 - `turn/steer {threadId, clientUserMessageId, input, expectedTurnId}`; on
   mismatch the live turn id is parsed from the error text
   (``expected active turn id `x` but found `y` ``) and retried ONCE. Used
@@ -1864,3 +1869,39 @@ triggered Chimaera's existing non-fatal version-drift notice. All five Codex
 live smoke cases still passed against that installation; this pass records the
 observed notification behavior without treating the wrapper/version mismatch
 as resolved.
+
+## Pass 26 (2026-07-19 — generated schema + live probe codex 0.144.2): skills and review defaults. ADOPTED.
+
+The pinned app-server's generated TypeScript schema and a direct initialized
+process probe agree on the missing composer surface:
+
+- `skills/list` accepts optional `cwds: string[]` and `forceReload: boolean`.
+  The live response is `{data:[{cwd,skills,errors}]}`; each `SkillMetadata`
+  carries `name`, descriptions, absolute `path`, `scope`, and `enabled`.
+- `UserInput` has a first-class `{type:"skill",name,path}` variant. Sending only
+  the visible `/skill-name` text does not express the same protocol intent.
+- `thread/start` and `thread/resume` both accept `approvalPolicy`,
+  `approvalsReviewer`, and the legacy-compatible `sandbox` mode at open time.
+
+**Adoption.** The handshake requests the enabled inventory for the session cwd
+after `model/list`. Failure or the two-second timeout is non-fatal; the chat
+still opens without Codex skill rows. Names, descriptions, paths, entry count,
+and per-send skill blocks are independently bounded; at most 64 catalog rows
+fit in the journaled `Init`, and at most eight de-duplicated native skill blocks
+ride one command. Before dispatch, the driver requires each native companion's
+exact name/path pair to match that session's advertised catalog, so non-browser
+clients cannot inject an unadvertised skill. The browser preserves the user's
+complete prose while adding those companion inputs.
+
+Codex threads now open in the product's reviewer-assisted default:
+`sandbox:"workspace-write"`, `approvalPolicy:"on-request"`, and
+`approvalsReviewer:"auto_review"`. The mapper's first `Init` therefore reports
+`auto-review`, rather than claiming plain Auto until the user manually switches.
+Explicit mode changes remain complete state resets as established in Pass 20.
+
+Model switches and server reroutes now emit only `ModelSwitched`; they no longer
+forge a second process `Init`. `Init` is a complete driver-process snapshot and
+expires stale asks, so using it as a generic model-refresh event could silently
+withdraw a live question or approval and retain omitted catalog state. The UI
+reducer correspondingly treats every real `Init` as authoritative: absent
+optional model/mode/catalog fields clear the prior process snapshot.

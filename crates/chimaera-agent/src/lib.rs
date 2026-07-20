@@ -225,6 +225,33 @@ pub struct ChatInfo {
     pub background_running: usize,
 }
 
+/// Fold the driver's authoritative model/mode state into the lightweight
+/// session-list snapshot. The attached chat store consumes the same events;
+/// keeping this fold beside `ChatInfo` prevents dashboard rows and fresh WS
+/// ready metadata from lagging behind a live model reroute.
+fn fold_session_metadata(info: &mut ChatInfo, ev: &AgentEvent) {
+    match ev {
+        AgentEvent::Init {
+            model,
+            current_mode,
+            ..
+        } => {
+            // Init is a complete process snapshot. Clear values that a fresh
+            // driver no longer advertises instead of retaining stale state
+            // from a resumed/restarted process.
+            info.model = model.clone();
+            info.current_mode = current_mode.clone();
+        }
+        AgentEvent::ModelSwitched { to, .. } => {
+            info.model = Some(to.clone());
+        }
+        AgentEvent::ModeChanged { mode_id } => {
+            info.current_mode = Some(mode_id.clone());
+        }
+        _ => {}
+    }
+}
+
 struct ChatSession {
     info: Mutex<ChatInfo>,
     journal: Arc<Journal>,
@@ -417,26 +444,15 @@ impl ChatManager {
         let mut native_to_index: Option<String> = None;
         {
             let mut info = session.info.lock().expect("info lock");
+            fold_session_metadata(&mut info, &ev);
             match &ev {
                 AgentEvent::Init {
-                    native_session_id,
-                    model,
-                    current_mode,
-                    ..
+                    native_session_id, ..
                 } => {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
                         native_to_index = Some(native_session_id.clone());
                     }
-                    if model.is_some() {
-                        info.model = model.clone();
-                    }
-                    if current_mode.is_some() {
-                        info.current_mode = current_mode.clone();
-                    }
-                }
-                AgentEvent::ModeChanged { mode_id } => {
-                    info.current_mode = Some(mode_id.clone());
                 }
                 // "Pending permission" really means "waiting on a human
                 // decision" — structured questions block the turn exactly
@@ -650,6 +666,66 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_info_with_metadata(model: Option<&str>, mode: Option<&str>) -> ChatInfo {
+        ChatInfo {
+            id: "chat-1".into(),
+            agent: "codex".into(),
+            cwd: PathBuf::from("/workspace"),
+            created_at_ms: 0,
+            alive: true,
+            exit_status: None,
+            native_session_id: None,
+            model: model.map(str::to_string),
+            current_mode: mode.map(str::to_string),
+            pending_permission: false,
+            status_detail: None,
+            status_category: None,
+            status_needs_action: false,
+            background_running: 0,
+        }
+    }
+
+    #[test]
+    fn session_metadata_tracks_authoritative_init_and_model_switches() {
+        let mut info = chat_info_with_metadata(Some("old-model"), Some("old-mode"));
+        fold_session_metadata(
+            &mut info,
+            &AgentEvent::Init {
+                native_session_id: "thread-1".into(),
+                model: None,
+                modes: Vec::new(),
+                current_mode: None,
+                slash_commands: Vec::new(),
+                models: Vec::new(),
+                agent_version: None,
+            },
+        );
+        assert_eq!(info.model, None, "a complete Init clears stale model state");
+        assert_eq!(
+            info.current_mode, None,
+            "a complete Init clears stale mode state"
+        );
+
+        fold_session_metadata(
+            &mut info,
+            &AgentEvent::ModelSwitched {
+                from: None,
+                to: "rerouted-model".into(),
+                reason: Some("server reroute".into()),
+                retract_current_turn: false,
+            },
+        );
+        assert_eq!(info.model.as_deref(), Some("rerouted-model"));
+
+        fold_session_metadata(
+            &mut info,
+            &AgentEvent::ModeChanged {
+                mode_id: "auto-review".into(),
+            },
+        );
+        assert_eq!(info.current_mode.as_deref(), Some("auto-review"));
+    }
 
     #[test]
     fn command_budget_bounds_bytes_and_releases_on_delivery() {

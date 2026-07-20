@@ -25,6 +25,7 @@
   import RewindDialog from "./RewindDialog.svelte";
   import ForkDialog from "./ForkDialog.svelte";
   import Composer from "./Composer.svelte";
+  import { skillBlocksForText, type ComposerCommand } from "./composer";
   import type { ImageAttachment } from "./images";
   import type { ChatBlock, PlanEntry } from "./store.svelte";
   import { getSetting } from "../settings/store.svelte";
@@ -241,6 +242,11 @@
   function sendNow(text: string, images: ImageAttachment[]): boolean {
     const blocks: Record<string, unknown>[] = [];
     if (text.length > 0) blocks.push({ type: "text", text });
+    // Codex exposes skills through `skills/list`; an exact `/skill-name`
+    // token keeps the user's original prose AND adds the app-server's native
+    // skill input block. Claude catalog entries have no skill_path and keep
+    // riding its own slash-command text path.
+    blocks.push(...skillBlocksForText(text, composerCommands));
     for (const img of images) {
       blocks.push({ type: "image", media_type: img.media_type, data: img.data });
     }
@@ -338,9 +344,18 @@
         );
         if (arg.length > 0 && hit !== undefined) {
           return pickModel(hit.id);
-        } else {
-          menu = "model";
         }
+        // "Auto review" reads like a model to humans but is a Codex approval
+        // mode. Accept the common slip without silently opening the wrong
+        // menu, while teaching the canonical command for next time.
+        const modeHit = store.modes.find(
+          (m) => m.id.toLowerCase() === arg || m.label.toLowerCase() === arg,
+        );
+        if (arg.length > 0 && modeHit !== undefined) {
+          store.notice(`“${args.trim()}” is a mode — switching it (use /mode next time)`, "info");
+          return pickMode(modeHit.id);
+        }
+        menu = "model";
         return true;
       }
       case "mode": {
@@ -443,21 +458,44 @@
 
   /** The composer's palette: chimaera-native pickers first (they don't
    *  exist in the CLI's -p catalog), then the CLI's own commands. */
-  const composerCommands = $derived.by(() => {
-    const native: { name: string; description: string }[] = [];
+  const composerCommands = $derived.by((): ComposerCommand[] => {
+    const native: ComposerCommand[] = [];
     native.push({ name: "rename", description: "rename this session — chimaera" });
-    native.push({ name: "model", description: `switch model — chimaera picker` });
+    native.push({
+      name: "model",
+      description: `switch model — chimaera picker`,
+      options: modelChoices.map((model) => ({
+        value: model.id,
+        label: model.label,
+        description:
+          "description" in model && typeof model.description === "string"
+            ? model.description
+            : model.id,
+      })),
+    });
     if (store.modes.length > 0) {
-      native.push({ name: "mode", description: "permission mode — chimaera picker" });
+      native.push({
+        name: "mode",
+        description: "permission mode — chimaera picker",
+        options: store.modes.map((mode) => ({ value: mode.id, label: mode.label })),
+      });
     }
     if (hasEffort) {
       native.push({
         name: "effort",
         description: `reasoning effort (${effortChoices.join("/")}) — chimaera picker`,
+        options: effortChoices.map((choice) => ({ value: choice, label: choice })),
       });
     }
     if (hasUltracode) {
-      native.push({ name: "ultracode", description: "toggle ultracode (on/off) — session only" });
+      native.push({
+        name: "ultracode",
+        description: "toggle ultracode (on/off) — session only",
+        options: [
+          { value: "on", label: "On" },
+          { value: "off", label: "Off" },
+        ],
+      });
     }
     native.push({ name: "usage", description: "plan usage limits — chimaera panel" });
     if (agentKind === "claude") {
@@ -467,8 +505,11 @@
     if (agentKind === "codex") {
       native.push({ name: "compact", description: "compact conversation context" });
     }
-    const nativeNames = new Set(native.map((n) => n.name));
-    return [...native, ...store.slashCommands.filter((c) => !nativeNames.has(c.name))];
+    const nativeNames = new Set(native.map((n) => n.name.toLowerCase()));
+    return [
+      ...native,
+      ...store.slashCommands.filter((c) => !nativeNames.has(c.name.toLowerCase())),
+    ];
   });
 
   // --- checkpoint rewind ------------------------------------------------------
