@@ -2083,8 +2083,10 @@
   }
 
   /**
-   * Step (or reset, delta 0) a pane's terminal font size — the chords and
+   * Step (or reset, delta 0) a pane's content font size — the chords and
    * the pane-bar A−/A+ controls both land here; persisted with the layout.
+   * An unset override starts from the active surface's own preference, so a
+   * Markdown increase never jumps to the unrelated terminal baseline.
    */
   function adjustFont(paneId: string, delta: 1 | -1 | 0): void {
     const p = findPane(layout.root, paneId);
@@ -2093,7 +2095,12 @@
       layout = setPaneFont(layout, paneId, undefined);
       return;
     }
-    layout = setPaneFont(layout, paneId, (p.fontSize ?? pool.baseFontSize()) + delta);
+    const active = p.tabs[p.active];
+    const base =
+      active?.surface === "file" && viewKindFor(active.path) === "markdown"
+        ? getSetting("editor.markdownFontSize")
+        : pool.baseFontSize();
+    layout = setPaneFont(layout, paneId, (p.fontSize ?? base) + delta);
   }
 
   /** The focused pane's fitted size, for spawning sessions at the right grid. */
