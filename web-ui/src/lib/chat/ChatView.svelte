@@ -892,7 +892,6 @@
       {#if item.t === "group"}
         <ToolGroup
           tools={item.tools}
-          active={store.running && item === renderItems[renderItems.length - 1]}
           {onOpenFile}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
