@@ -67,9 +67,9 @@
   const COMPOSER_MIN_HEIGHT = 38;
   const COMPOSER_MAX_HEIGHT = 352;
 
-  // The parent {#key}s ChatView (and so this composer) per session — one
-  // instance, one session — and remounts it on every tab switch, so the
-  // draft must live in the session-keyed module store, not the component.
+  // The parent keys ChatView (and so this composer) per session — one
+  // instance, one session. The bounded pane live-set can still evict/remount
+  // it, so the draft must live in the session-keyed module store, not here.
   // svelte-ignore state_referenced_locally
   const savedDraft = sessionId !== null ? loadDraft(sessionId) : { text: "", images: [] };
   let draft = $state(savedDraft.text);
@@ -122,7 +122,7 @@
 
   // Workbench splits resize without changing the browser viewport. Observe
   // the owning chat pane so both auto and manual heights stay inside the live
-  // reading area; disconnect on remount/tab switch per the runes teardown rule.
+  // reading area; disconnect on remount/unmount per the runes teardown rule.
   $effect(() => {
     const t = el;
     if (t === null) return;

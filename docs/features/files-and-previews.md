@@ -148,9 +148,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Preview keep-alive & live-update
 
-- **What & when.** A pane keeps every recently-viewed tab's **rendered view alive** (hidden, not
-  destroyed) across a tab switch — the same keep-alive model the terminal (`termPool`) and chat
-  (`chatPool`) surfaces use, bounded by a per-pane LRU (cap 8). A shared, LRU-capped content store
+- **What & when.** A pane keeps recently-viewed rendered views alive (hidden, not destroyed) across
+  a tab switch, bounded by a per-pane LRU (cap 8). This includes structured chat, which retains a
+  bottom-anchored DOM window (64 blocks initially, 192 maximum) rather than a whole long transcript.
+  PTY components remount instead: `termPool` re-parents their xterm element into a hidden stash while
+  preserving its socket and scrollback. A shared, LRU-capped content store
   (`previews/fileStore.svelte.ts`, keyed by path) additionally caches the *bytes* so re-opening a
   view the live-set evicted re-renders warm rather than re-fetching.
 - **Where it lives.** `layout/Pane.svelte` (the live-set — renders active + recently-visited tabs,
@@ -161,7 +163,13 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 - **Key behaviors.** Switching pane-tabs (or panes) to a recently-viewed file is **instant with
   scroll position, image decode, finder columns, and editor state all preserved** — the DOM is
   never rebuilt, and no route is re-hit (a view only mounts while active, so nothing is measured at
-  a degenerate size). Live-on-disk update is **mounted-path-scoped**, not Git-gated: each events
+  a degenerate size). Inactive PTY tabs park in the pool's hidden stash instead of leaving invisible
+  WebGL renderers attached. Inactive chat tabs freeze their bounded transcript snapshot while the
+  pooled reducer/socket continues; historical artifact previews load only near the viewport, and
+  initial journal hydration mounts from the newest end once instead of painting oldest-to-newest.
+  `chatPool` keeps the reducer/socket and view cursor warm if a view is eventually evicted or moved.
+  Live-on-disk update is **mounted-path-scoped**, not Git-gated:
+  each events
   socket registers only mounted preview files and visibly-listed tree/Finder directories. The daemon
   stats those exact paths every ~2 s and performs a capped directory-name/type hash every
   ~12 s as an NFS/Lustre metadata-cache backstop. Exact path invalidations cover repeated writes to

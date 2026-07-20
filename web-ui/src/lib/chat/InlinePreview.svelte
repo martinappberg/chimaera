@@ -30,10 +30,37 @@
 
   let rawUrl = $state<string | null>(null);
   let table = $state<TablePage | null>(null);
+  let host = $state<HTMLDivElement | null>(null);
+  let nearby = $state(false);
+
+  // Historical artifacts should not mint tickets, query tables, instantiate
+  // PDFs, or decode images merely because their transcript page exists. Load
+  // once they approach the conversation viewport; old WebViews fall back to
+  // eager behavior rather than leaving a permanently blank artifact.
+  $effect(() => {
+    const el = host;
+    if (el === null || nearby) return;
+    if (typeof IntersectionObserver === "undefined") {
+      nearby = true;
+      return;
+    }
+    const root = el.closest(".transcript");
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        nearby = true;
+        observer.disconnect();
+      },
+      { root, rootMargin: "360px 0px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
 
   $effect(() => {
     rawUrl = null;
     table = null;
+    if (!nearby) return;
     let stale = false;
     if (kind === "image" || kind === "pdf") {
       void rawTicketUrl(path)
@@ -57,60 +84,65 @@
   const shownCols = $derived(table?.columns.slice(0, TABLE_PEEK_COLS) ?? []);
 </script>
 
-{#if kind === "image" && rawUrl !== null}
-  <button class="img-preview" title="open in a pane" onclick={() => onOpen?.(path)}>
-    <img src={rawUrl} alt={basename(path)} />
-  </button>
-{:else if kind === "table" && table !== null}
-  <div class="artifact">
-    <button class="artifact-head" title="open the full table in a pane" onclick={() => onOpen?.(path)}>
-      <FileIcon {path} size={13} />
-      <span class="artifact-name">{basename(path)}</span>
-      <span class="artifact-hint">
-        {table.truncated ? `first ${table.rows.length} rows — open full table` : `${table.rows.length} rows`}
-      </span>
+<div class="lazy-preview" bind:this={host}>
+  {#if kind === "image" && rawUrl !== null}
+    <button class="img-preview" title="open in a pane" onclick={() => onOpen?.(path)}>
+      <img src={rawUrl} alt={basename(path)} loading="lazy" decoding="async" />
     </button>
-    <div class="tbl-scroll">
-      <table>
-        <thead>
-          <tr>
-            {#each shownCols as col (col)}
-              <th>{col}</th>
-            {/each}
-            {#if colsElided}
-              <th class="elide">… {table.columns.length - TABLE_PEEK_COLS} more</th>
-            {/if}
-          </tr>
-        </thead>
-        <tbody>
-          {#each table.rows as row, r (r)}
+  {:else if kind === "table" && table !== null}
+    <div class="artifact">
+      <button class="artifact-head" title="open the full table in a pane" onclick={() => onOpen?.(path)}>
+        <FileIcon {path} size={13} />
+        <span class="artifact-name">{basename(path)}</span>
+        <span class="artifact-hint">
+          {table.truncated ? `first ${table.rows.length} rows — open full table` : `${table.rows.length} rows`}
+        </span>
+      </button>
+      <div class="tbl-scroll">
+        <table>
+          <thead>
             <tr>
-              {#each shownCols as _, c (c)}
-                <td>{row[c] ?? ""}</td>
+              {#each shownCols as col (col)}
+                <th>{col}</th>
               {/each}
               {#if colsElided}
-                <td class="elide">…</td>
+                <th class="elide">… {table.columns.length - TABLE_PEEK_COLS} more</th>
               {/if}
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each table.rows as row, r (r)}
+              <tr>
+                {#each shownCols as _, c (c)}
+                  <td>{row[c] ?? ""}</td>
+                {/each}
+                {#if colsElided}
+                  <td class="elide">…</td>
+                {/if}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     </div>
-  </div>
-{:else if kind === "pdf" && rawUrl !== null}
-  <div class="artifact">
-    <button class="artifact-head" title="open in a pane" onclick={() => onOpen?.(path)}>
-      <FileIcon {path} size={13} />
-      <span class="artifact-name">{basename(path)}</span>
-      <span class="artifact-hint">open in a pane</span>
-    </button>
-    <object class="pdf" data={rawUrl} type="application/pdf" aria-label={basename(path)}>
-      <span class="pdf-fallback">PDF preview unavailable here — open it in a pane</span>
-    </object>
-  </div>
-{/if}
+  {:else if kind === "pdf" && rawUrl !== null}
+    <div class="artifact">
+      <button class="artifact-head" title="open in a pane" onclick={() => onOpen?.(path)}>
+        <FileIcon {path} size={13} />
+        <span class="artifact-name">{basename(path)}</span>
+        <span class="artifact-hint">open in a pane</span>
+      </button>
+      <object class="pdf" data={rawUrl} type="application/pdf" aria-label={basename(path)}>
+        <span class="pdf-fallback">PDF preview unavailable here — open it in a pane</span>
+      </object>
+    </div>
+  {/if}
+</div>
 
 <style>
+  .lazy-preview {
+    min-height: 1px;
+  }
   .img-preview {
     display: block;
     width: 100%;

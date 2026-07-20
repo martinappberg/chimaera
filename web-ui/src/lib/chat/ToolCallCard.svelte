@@ -11,9 +11,11 @@
     onBackground?: () => void;
     /** Stop this running subagent (claude stop_task). */
     onStop?: () => void;
+    /** False while the owning retained chat tab is hidden. */
+    visible?: boolean;
   }
 
-  let { block, onOpenFile, onBackground, onStop }: Props = $props();
+  let { block, onOpenFile, onBackground, onStop, visible = true }: Props = $props();
 
   const running = $derived(block.status === "in_progress" || block.status === "pending");
 
@@ -62,7 +64,7 @@
   // Live output follows its own tail (terminal-style) while streaming.
   let bodyEl = $state<HTMLElement | null>(null);
   $effect(() => {
-    if (!block.streaming || block.content === null) return;
+    if (!visible || !block.streaming || block.content === null) return;
     void block.content.text;
     bodyEl?.scrollTo({ top: bodyEl.scrollHeight });
   });

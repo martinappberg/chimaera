@@ -158,7 +158,12 @@ decides **which** driver runs and **what happens around** its lifecycle.
   switch (`chat_switching`), which it leaves intact for the respawn. Startup
   failures are already journaled by the driver harness before this runs.
 - **`switch_view` / `rewind_session`** stop the current process and respawn the
-  SAME chimaera session id in the other surface / at a fork point.
+  SAME chimaera session id in the other surface / at a fork point. A term→chat
+  switch seeds native or previous-Chimaera history **before** appending its
+  `ModeSwitch` marker: the journal seeder is create-new/never-clobber, so
+  reversing that order produces a marker-only transcript. A resurrected TUI
+  may not have emitted a fresh transcript hook yet, so its durable
+  `AgentRecord.resumed_from` is the resume-handle fallback.
 - **`fork_session`** snapshots a source journal prefix without stopping it and
   creates a distinct session. Same-agent exact boundaries use native history;
   cross-agent and unrepresentable boundaries seed the normalized prefix and

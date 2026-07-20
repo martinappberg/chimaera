@@ -17,9 +17,18 @@
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
     onStopTask?: (id: string) => void;
+    /** False while a retained chat tab is hidden; suppresses layout work in
+     *  streaming child rows without destroying their expanded state. */
+    visible?: boolean;
   }
 
-  let { tools, onOpenFile, onBackground, onStopTask }: Props = $props();
+  let {
+    tools,
+    onOpenFile,
+    onBackground,
+    onStopTask,
+    visible = true,
+  }: Props = $props();
 
   const running = $derived(
     tools.some((t) => t.status === "in_progress" || t.status === "pending"),
@@ -99,6 +108,7 @@
       {#each tools as tool (tool.id)}
         <ToolCallCard
           block={tool}
+          {visible}
           {onOpenFile}
           onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}

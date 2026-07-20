@@ -141,9 +141,25 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   weekday, dated time, and a year-bearing date for older calendar years). One view-level timer wakes
   only at the next label boundary rather than leaving an interval on every transcript row. Touch
   devices keep the rail visible; a successful copy briefly swaps its icon to a checkmark.
+- **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
+  "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
+  the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
+  message. Reaching a window edge pages 64 blocks in either direction while preserving the paragraph
+  under the reader; the DOM window stays capped at 192 blocks and a jump returns directly to the live
+  tail. Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
+  preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
+  reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
+- **Tab lifecycle.** Recently viewed chat tabs retain only that bounded rendered page in the pane's
+  live set. While hidden, its plain-data transcript snapshot freezes and scroll-following, elapsed
+  clocks, question countdown painting, and streaming tool-body scrolling pause; the pooled
+  store/socket continues folding authoritative events. Activation reconciles one page at the right
+  end in a single paint. If the live set evicts or moves the view, `chatPool` preserves the reducer,
+  socket, scroll intent, and rendered-range cursor for a bounded warm remount. Dashboard reporting
+  remains independent on the daemon's session event bus, so none of this pauses the agent.
 - **Where.** `ChatView.svelte` (`renderItems`), `store.svelte.ts` (the `blocks` reducer),
-  `AgentMessageMeta.svelte`, `Markdown.svelte`, `UserText.svelte`; timestamp formatting and refresh
-  boundaries live in `../shared/time.ts`, and clipboard writes use `../shared/clipboard.ts`.
+  `AgentMessageMeta.svelte`, `Markdown.svelte`, `UserText.svelte`, `chatPool.ts`, and
+  `layout/Pane.svelte`; timestamp formatting and refresh boundaries live in `../shared/time.ts`, and
+  clipboard writes use `../shared/clipboard.ts`.
 - **Untrusted output.** Everything the model emits is attacker-influenced — see
   [rules/web-ui.md](../../.claude/rules/web-ui.md). Tool-card bodies/diffs render as plain `<pre>`
   (no `{@html}`).
@@ -335,7 +351,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **View switch.** `POST /api/v1/sessions/{id}/view {ui:"chat"|"term", force?}` flips a session
   between chat and TUI on the same id (same AgentRecord, resume target). Kill-then-respawn is **not
   atomic** — every respawn precondition is resolved before the kill; concurrent toggles serialize on
-  `chat_switching` (double-click → 409). A busy `Running` agent needs `force` (409). **Billing note:**
+  `chat_switching` (double-click → 409). On term→chat, native or earlier Chimaera history is imported
+  before the transition marker, so the chat reopens with its transcript rather than only “continued
+  in chat”; a terminal resurrected after daemon restart uses its durable resume handle even before a
+  fresh transcript hook arrives. A busy `Running` agent needs `force` (409). **Billing note:**
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
   is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
@@ -466,9 +485,9 @@ _Captured 2026-07-10 (from the maintainer, PR #43)._
 _Captured 2026-07-11 (from the maintainer)._
 
 - **Problem it solves.** Switching chat tabs must not refetch the journal or drop the socket. A
-  session-keyed chat pool holds a warm store + open socket per session, so transcript, scroll, and the
-  live stream survive the remount (mirrors the terminal `termPool`; the turn timer's start lives in
-  the pool so it survives a mid-turn switch).
+  session-keyed chat pool holds a warm store + open socket per session, so transcript state, the
+  bounded render cursor, scroll, and the live stream survive a remount (mirrors the terminal
+  `termPool`; the turn timer's start lives in the pool so it survives a mid-turn switch).
 - **The promise (the load-bearing bit).** **Chat tabs are as durable as terminal tabs** — a view
   switch is a view switch, never a reload. Keep that parity.
 - **Grade — addition** otherwise: the pool mechanics are implementation, free to improve.

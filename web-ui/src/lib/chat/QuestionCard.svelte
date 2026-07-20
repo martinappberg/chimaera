@@ -18,9 +18,11 @@
     /** Chosen labels per question id; non-null renders the read-only
      *  answered card. Empty object = resolved without an answer. */
     answered?: Record<string, string[]> | null;
+    /** False while the owning retained chat tab is hidden. */
+    visible?: boolean;
   }
 
-  let { request, onAnswer, answered = null }: Props = $props();
+  let { request, onAnswer, answered = null, visible = true }: Props = $props();
 
   const readOnly = $derived(answered !== null);
   let remainingMs = $state<number | null>(null);
@@ -39,6 +41,9 @@
       remainingMs = null;
       return;
     }
+    // The absolute deadline remains authoritative; recompute immediately when
+    // the tab becomes visible instead of ticking hidden cards four times/sec.
+    if (!visible) return;
     const update = () => {
       remainingMs = Math.max(0, deadline - Date.now());
     };
