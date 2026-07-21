@@ -15,19 +15,30 @@
     agents: AgentChoice[];
     sourceAgent: string;
     nativeAt: string | null;
+    restoreDraft: boolean;
     applying: boolean;
     onCancel: () => void;
     onConfirm: (agent: string) => void;
   }
 
-  let { agents, sourceAgent, nativeAt, applying, onCancel, onConfirm }: Props = $props();
+  let {
+    agents,
+    sourceAgent,
+    nativeAt,
+    restoreDraft,
+    applying,
+    onCancel,
+    onConfirm,
+  }: Props = $props();
 </script>
 
 <div class="dialog-veil">
   <div class="dialog" role="dialog" aria-label="fork conversation">
     <div class="dialog-title">fork the conversation from here</div>
     <div class="dialog-note">
-      copies the transcript into a new session; this session keeps running
+      {restoreDraft
+        ? "opens before this message and restores it as an unsent draft; this session keeps running"
+        : "opens after this response without sending anything; this session keeps running"}
     </div>
 
     <div class="agent-list">

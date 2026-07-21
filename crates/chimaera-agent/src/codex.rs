@@ -530,6 +530,12 @@ fn thread_open_request(spec: &SpawnSpec) -> Value {
     if let Some(model) = &spec.initial_model {
         open["params"]["model"] = json!(model);
     }
+    // Portable forks must open quietly: developerInstructions initializes the
+    // fresh/resumed thread with the normalized source transcript without
+    // manufacturing a user message or starting a billed turn.
+    if let Some(context) = &spec.portable_context {
+        open["params"]["developerInstructions"] = json!(context);
+    }
     // Chimaera chat defaults to the safer reviewer-assisted workspace mode:
     // sandboxed writes and on-request escalation stay intact, while Codex
     // reviews each approval before deciding. Every field is explicit so a
@@ -2968,12 +2974,7 @@ impl CodexMapper {
         }
     }
 
-    fn send_blocks(
-        &mut self,
-        blocks: Vec<ContentBlock>,
-        display_text: Option<String>,
-        step: &mut DriverStep,
-    ) {
+    fn send_blocks(&mut self, blocks: Vec<ContentBlock>, step: &mut DriverStep) {
         let text = crate::model::blocks_text(&blocks);
         // Images ride the input array as data URLs (the extension's non-local
         // path form; local paths need a shared fs).
@@ -3015,10 +3016,9 @@ impl CodexMapper {
         // live/pending run is held for the NEXT turn; the UI's Steer button
         // explicitly promotes it via `turn/steer`.
         let queued = (self.turn_active && !self.turn_id.is_empty()) || self.turn_pending;
-        let priming = display_text.is_some();
         step.events.push(AgentEvent::UserMessage {
-            text: display_text.unwrap_or_else(|| text.clone()),
-            attachments: if priming { 0 } else { attachments },
+            text,
+            attachments,
             id: Some(client_msg_id.clone()),
             queued,
         });
@@ -3045,11 +3045,7 @@ impl CodexMapper {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
-            AgentCommand::Send { blocks } => self.send_blocks(blocks, None, &mut step),
-            AgentCommand::PrimeFork {
-                blocks,
-                display_text,
-            } => self.send_blocks(blocks, Some(display_text), &mut step),
+            AgentCommand::Send { blocks } => self.send_blocks(blocks, &mut step),
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3753,26 +3749,6 @@ mod tests {
                 id: msg_id,
                 state: UserMessageState::Sent,
             }]
-        );
-    }
-
-    #[test]
-    fn fork_prime_sends_full_context_but_journals_only_compact_row() {
-        let mut m = mapper();
-        let step = m.on_command(AgentCommand::PrimeFork {
-            blocks: vec![ContentBlock::Text {
-                text: "full portable transcript context".into(),
-            }],
-            display_text: "Continue from this fork point.".into(),
-        });
-        assert!(matches!(
-            &step.events[0],
-            AgentEvent::UserMessage { text, .. }
-                if text == "Continue from this fork point."
-        ));
-        assert_eq!(
-            step.outbound[0]["params"]["input"][0]["text"],
-            "full portable transcript context"
         );
     }
 
@@ -4828,6 +4804,13 @@ mod tests {
         assert_eq!(fork["params"]["ephemeral"], false);
         assert_eq!(fork["params"]["model"], "gpt-test");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
+
+        spec.portable_context = Some("quiet imported transcript".into());
+        let contextual = thread_open_request(&spec);
+        assert_eq!(
+            contextual["params"]["developerInstructions"],
+            "quiet imported transcript"
+        );
     }
 
     #[test]

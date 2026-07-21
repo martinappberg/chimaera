@@ -34,8 +34,8 @@ hard-resets and rebuilds.
 | File | What it owns |
 |---|---|
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
-| `chatWs.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, decode frames, dispatch to handlers. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
-| `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted. |
+| `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
+| `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
 | `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; it pages in either direction), and hangs the header/composer/overlays/panels off itself. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
 | `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window; tests cover both paging directions and stale cursor repair after reducer compaction. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
@@ -94,11 +94,24 @@ lifted out of the terminal pool) — see the shared/ area.
   `store.svelte.test.ts`.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
+- **Inactive UI is not an inactive agent.** A hidden retained chat freezes its
+  bounded plain-data DOM snapshot, while `chatPool` keeps its reducer and socket
+  warm and the daemon-owned process continues working. Live-set or client-pool
+  eviction may unmount a view or close a parked *client socket*, never the
+  agent; the next acquire gap-replays the journal.
+- **Scroll restoration is window-aware.** Save both `scrollTop` and the bounded
+  absolute block range. Paging in either direction compensates inserted or
+  removed height so the paragraph under the reader stays fixed; replay never
+  remounts the entire retained transcript.
 - **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
   latest sequence that makes that message true on replay (a queued user message
   advances on its `sent` update; a final Codex assistant message advances on
-  `turn_completed`). Only pass `nativeAt` for the exact vendor boundary the
-  reducer proved; the server independently validates it against the journal.
+  `turn_completed`). An assistant action includes that block and opens with an
+  empty composer; a user action passes its own id/seq so the daemon can derive
+  the exact cut before delivery, then restores the selected text through
+  `composerBus` as an unsent destination draft. Only pass `nativeAt` for the
+  exact vendor boundary the reducer proved; the server independently validates
+  it against the journal.
   `forked {native:false}` clears copied source-native ids and stale live work:
   those rows are display history in the fresh destination, not actionable
   rewind points or running prompts/tasks.

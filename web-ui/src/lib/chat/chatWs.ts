@@ -1,5 +1,6 @@
 import { getToken } from "../net/api";
 import { Reconnector, UNKNOWN_SESSION_RETRIES } from "../net/reconnect";
+import { CooperativeQueue } from "./cooperativeQueue";
 
 /**
  * Normalized agent events from the daemon (chimaera-agent's AgentEvent,
@@ -49,6 +50,20 @@ export interface ChatSocketHandlers {
   lastSeq(): number;
 }
 
+type ChatDelivery =
+  | {
+      kind: "ready";
+      session: ChatSessionInfo;
+      replayFrom: number;
+      head: number | undefined;
+    }
+  | { kind: "event"; entry: SeqEvent }
+  | { kind: "degraded" }
+  | { kind: "exited"; status: number | null }
+  | { kind: "error"; message: string }
+  | { kind: "command_failed"; message: string }
+  | { kind: "disconnected" };
+
 /**
  * One WebSocket per attached chat session, per the /ws/chat/{id} contract:
  * auth (with last_seq) -> ready -> batched journal replay -> live seq-tagged
@@ -62,12 +77,48 @@ export class ChatSocket {
   private ended = false;
   private unknownRetries = 0;
   private readonly recon = new Reconnector(() => this.connect());
+  /** Replay, live events, and terminal frames share one cooperative FIFO.
+   *  Keeping the control frames in the same queue preserves wire ordering —
+   *  an `exited` frame cannot overtake the final replay slice. */
+  private readonly deliveries: CooperativeQueue<ChatDelivery>;
 
   constructor(
     private readonly sessionId: string,
     private readonly handlers: ChatSocketHandlers,
   ) {
+    this.deliveries = new CooperativeQueue((delivery) => this.deliver(delivery));
     this.connect();
+  }
+
+  private deliver(delivery: ChatDelivery): void {
+    try {
+      switch (delivery.kind) {
+        case "ready":
+          this.handlers.onReady(delivery.session, delivery.replayFrom, delivery.head);
+          break;
+        case "event":
+          this.handlers.onEvent(delivery.entry);
+          break;
+        case "degraded":
+          this.handlers.onDegraded();
+          break;
+        case "exited":
+          this.handlers.onExited(delivery.status);
+          break;
+        case "error":
+          this.handlers.onError(delivery.message);
+          break;
+        case "command_failed":
+          this.handlers.onCommandFailed(delivery.message);
+          break;
+        case "disconnected":
+          this.handlers.onDisconnected();
+          break;
+      }
+    } catch (error) {
+      const suffix = delivery.kind === "event" ? ` seq=${delivery.entry.seq}` : "";
+      console.warn(`chat: dropping unapplyable ${delivery.kind}${suffix}`, error);
+    }
   }
 
   private connect(): void {
@@ -98,34 +149,41 @@ export class ChatSocket {
         case "ready":
           this.recon.succeeded();
           this.unknownRetries = 0;
-          this.handlers.onReady(
-            msg.session as ChatSessionInfo,
-            (msg.replay_from as number) ?? 0,
-            msg.head as number | undefined,
-          );
+          this.deliveries.push({
+            kind: "ready",
+            session: msg.session as ChatSessionInfo,
+            replayFrom: (msg.replay_from as number) ?? 0,
+            head: msg.head as number | undefined,
+          });
           break;
         case "batch":
-          // One malformed event (unversioned wire / old journal) must cost one
-          // event, not the rest of the batch: lastSeq already advanced, so an
-          // uncaught throw here would strand the tail forever.
-          for (const entry of (msg.events as SeqEvent[]) ?? []) {
-            this.safeEvent(entry);
-          }
+          this.deliveries.pushMany(
+            ((msg.events as SeqEvent[]) ?? []).map((entry) => ({
+              kind: "event" as const,
+              entry,
+            })),
+          );
           break;
         case "ev":
-          this.safeEvent({
-            seq: msg.seq as number,
-            ts: msg.ts as number,
-            ev: msg.ev as AgentEvent,
+          this.deliveries.push({
+            kind: "event",
+            entry: {
+              seq: msg.seq as number,
+              ts: msg.ts as number,
+              ev: msg.ev as AgentEvent,
+            },
           });
           break;
         case "degraded":
           this.ended = true;
-          this.handlers.onDegraded();
+          this.deliveries.push({ kind: "degraded" });
           break;
         case "exited":
           this.ended = true;
-          this.handlers.onExited((msg.status as number | null) ?? null);
+          this.deliveries.push({
+            kind: "exited",
+            status: (msg.status as number | null) ?? null,
+          });
           break;
         case "error":
           // Mid view-switch the driver may not be registered yet — the
@@ -142,11 +200,17 @@ export class ChatSocket {
           // fatal here permanently stopped reconnects after a single answer
           // sent into a dead driver.
           if (msg.code === "command_failed" || msg.code === "invalid_command") {
-            this.handlers.onCommandFailed((msg.message as string) ?? "command failed");
+            this.deliveries.push({
+              kind: "command_failed",
+              message: (msg.message as string) ?? "command failed",
+            });
             break;
           }
           this.fatal = true;
-          this.handlers.onError((msg.message as string) ?? "unknown error");
+          this.deliveries.push({
+            kind: "error",
+            message: (msg.message as string) ?? "unknown error",
+          });
           break;
         default:
           break;
@@ -161,18 +225,9 @@ export class ChatSocket {
       }
       // Live no longer: the composer must stop claiming the agent hears us and
       // stop clearing drafts into a closed socket until we reconnect.
-      this.handlers.onDisconnected();
+      this.deliveries.push({ kind: "disconnected" });
       this.recon.schedule();
     };
-  }
-
-  /** Apply one event, isolating a reducer throw so it can't strand the batch. */
-  private safeEvent(entry: SeqEvent): void {
-    try {
-      this.handlers.onEvent(entry);
-    } catch (err) {
-      console.warn(`chat: dropping unapplyable event seq=${entry.seq}`, err);
-    }
   }
 
   /**
@@ -196,6 +251,7 @@ export class ChatSocket {
     this.closed = true;
     this.recon.cancel();
     this.recon.clear();
+    this.deliveries.clear();
     this.ws?.close();
     this.ws = null;
   }

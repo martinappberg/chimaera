@@ -80,6 +80,11 @@ pub struct SpawnSpec {
     /// argv (`--fork-session --resume-session-at`); Codex opens with
     /// `thread/fork {threadId,lastTurnId}` instead of `thread/resume`.
     pub fork_at: Option<String>,
+    /// Quiet portable-fork context. Codex passes it as thread-open developer
+    /// instructions; Claude receives the same text through the launcher's
+    /// `--append-system-prompt-file`. It initializes context without creating
+    /// a synthetic user turn or triggering an agent response.
+    pub portable_context: Option<String>,
     /// MCP tool calls the embedder has already consented to: the driver
     /// answers their approval prompts accept itself instead of surfacing a
     /// PermissionRequest. Codex-only today — its app-server elicits EVERY
@@ -119,6 +124,7 @@ impl SpawnSpec {
             agent_version: None,
             rollback_turns: None,
             fork_at: None,
+            portable_context: None,
             mcp_auto_approve: None,
             created_at_ms: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
