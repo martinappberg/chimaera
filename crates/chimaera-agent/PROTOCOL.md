@@ -1940,3 +1940,19 @@ rail and dashboard, while the attached chat shows the child's live progress in
 the pinned Agents tray. Hermetic mapper/reducer/count tests pin replay and
 upsert behavior; `codex_collab_subagent_can_outlive_parent_turn` pins the live
 ordering.
+
+## Pass 28 (2026-07-20 — codex auto-review effort isolation). ADOPTED.
+
+The generated 0.144.2 app-server schema defines `thread/settings/updated` with
+a required `threadId`. Auto-review runs its guardian as a separate thread, so a
+guardian's effective `low` effort belongs only to that thread and must never
+replace the parent chat's selector. Chimaera's existing foreign-thread gate
+already discards correctly scoped guardian settings; it now also rejects a
+malformed settings notification with no thread id instead of treating it as a
+parent update.
+
+An isolated live run held the parent at `xhigh` while an escalated command went
+through auto-review, then remained `xhigh` after `/compact` and a browser
+reconnect. The journal contained only parent `EffortState(xhigh)` entries and no
+guardian effort event. Hermetic coverage pins both the correctly scoped foreign
+case and the unscoped defensive case.
