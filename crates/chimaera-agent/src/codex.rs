@@ -957,11 +957,17 @@ impl CodexMapper {
         // are connection-scoped, and a subagent-thread ask must still
         // withdraw its card.
         if method != "serverRequest/resolved" {
-            if let Some(thread) = frame["params"]["threadId"].as_str() {
-                if thread != self.thread_id {
+            match frame["params"]["threadId"].as_str() {
+                Some(thread) if thread != self.thread_id => {
                     self.on_foreign_frame(thread, method, frame, &mut step);
                     return step;
                 }
+                // Current app-server schemas require threadId on settings
+                // notifications. Refuse an unscoped update rather than let a
+                // malformed auto-review/guardian frame replace the parent's
+                // effort selector.
+                None if method == "thread/settings/updated" => return step,
+                _ => {}
             }
         }
 
@@ -6080,9 +6086,12 @@ mod tests {
     fn foreign_thread_frames_never_touch_the_parent_transcript() {
         let mut m = mapper();
         active_turn(&mut m);
+        m.pending_effort = Some("xhigh".into());
+        m.reported_effort = Some(Some("xhigh".into()));
 
-        // A subagent's prose, turn end, name, and reroute frames — all tagged
-        // with its own threadId — must not leak into the parent's stream.
+        // A subagent's prose, turn end, name, usage, and settings frames — all
+        // tagged with its own threadId — must not leak into the parent's
+        // stream or controls.
         let mut events = Vec::new();
         for frame in [
             json!({ "method": "item/agentMessage/delta",
@@ -6100,12 +6109,33 @@ mod tests {
                                 "tokenUsage": { "total": { "totalTokens": 9 },
                                                  "last": { "totalTokens": 9 },
                                                  "modelContextWindow": 100 } } }),
+            json!({ "method": "thread/settings/updated",
+                    "params": { "threadId": "sub-9",
+                                "threadSettings": { "effort": "low" } } }),
         ] {
             events.extend(m.on_frame(&frame).events);
             events.extend(m.flush());
         }
         assert_eq!(events, Vec::new(), "foreign frames leaked: {events:?}");
         assert!(m.turn_active, "parent turn survives foreign turn ends");
+        assert_eq!(m.pending_effort.as_deref(), Some("xhigh"));
+        assert_eq!(m.reported_effort, Some(Some("xhigh".into())));
+    }
+
+    #[test]
+    fn unscoped_settings_cannot_replace_the_parent_effort() {
+        let mut m = mapper();
+        m.pending_effort = Some("xhigh".into());
+        m.reported_effort = Some(Some("xhigh".into()));
+
+        let step = m.on_frame(&json!({
+            "method": "thread/settings/updated",
+            "params": { "threadSettings": { "effort": "low" } },
+        }));
+
+        assert!(step.events.is_empty());
+        assert_eq!(m.pending_effort.as_deref(), Some("xhigh"));
+        assert_eq!(m.reported_effort, Some(Some("xhigh".into())));
     }
 
     #[test]
