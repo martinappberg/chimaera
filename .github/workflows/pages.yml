@@ -6,7 +6,7 @@ name: pages
 #
 # ONE-TIME SETUP: repo Settings → Pages → Build and deployment → Source:
 # "GitHub Actions". After that every push to main that touches `site/`
-# (re)deploys to https://martinappberg.github.io/chimaera/.
+# (re)deploys to the configured custom domain, https://chimaera.sh/.
 #
 # `[skip release]` note doesn't apply here — this workflow never cuts a
 # release; it's independent of release.yml.
