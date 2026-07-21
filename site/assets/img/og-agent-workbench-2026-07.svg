@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
+  <title id="title">Chimaera — your agent workbench</title>
+  <desc id="description">A social preview card showing Chimaera's persistent coding-agent workbench.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111114"/>
+      <stop offset="0.62" stop-color="#151519"/>
+      <stop offset="1" stop-color="#101814"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(1015 115) rotate(132) scale(430 430)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3fbf85" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#3fbf85" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="54" y1="84" x2="186" y2="156" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#68686f"/>
+      <stop offset="0.5" stop-color="#b5b5bb"/>
+      <stop offset="1" stop-color="#f2f2f4"/>
+    </linearGradient>
+    <linearGradient id="cardEdge" x1="720" y1="76" x2="1138" y2="552" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#44444c"/>
+      <stop offset="0.6" stop-color="#2b2b32"/>
+      <stop offset="1" stop-color="#3fbf85" stop-opacity="0.52"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.025"/>
+    </pattern>
+    <filter id="shadow" x="650" y="25" width="560" height="610" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#000000" flood-opacity="0.46"/>
+    </filter>
+    <clipPath id="workbenchClip">
+      <rect x="724" y="80" width="410" height="468" rx="13"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#background)"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+  <path d="M0 0H1200V6H0z" fill="#3fbf85"/>
+
+  <!-- Brand -->
+  <polygon points="98.6,68.8 117.1,79.4 117.1,98.2 98.6,108.8 80.1,98.2 80.1,79.4" fill="#b5b5bb"/>
+  <polygon points="98.6,73.7 112.8,81.9 112.8,95.7 98.6,103.9 84.4,95.7 84.4,81.9" fill="#111114"/>
+  <circle cx="98.6" cy="88.8" r="11.8" fill="#b5b5bb"/>
+  <circle cx="98.6" cy="88.8" r="7.5" fill="#111114"/>
+  <rect x="98.6" y="75" width="15" height="28" fill="#111114"/>
+  <text x="142" y="105" fill="#f0f0f2" font-family="Menlo, Monaco, monospace" font-size="30" font-weight="700">chimaera</text>
+  <text x="72" y="159" fill="#93939d" font-family="Menlo, Monaco, monospace" font-size="15" font-weight="700">OPEN SOURCE  ·  ONE STATIC RUST BINARY</text>
+
+  <!-- Message -->
+  <text x="68" y="252" fill="#f1f1f3" font-family="Helvetica Neue, Arial, sans-serif" font-size="67" font-weight="700">Your agent</text>
+  <text x="68" y="325" fill="#f1f1f3" font-family="Helvetica Neue, Arial, sans-serif" font-size="67" font-weight="700">workbench.</text>
+  <text x="72" y="382" fill="#a9a9b2" font-family="Helvetica Neue, Arial, sans-serif" font-size="24" font-weight="500">Run coding agents in parallel — in rich chat</text>
+  <text x="72" y="416" fill="#a9a9b2" font-family="Helvetica Neue, Arial, sans-serif" font-size="24" font-weight="500">or their real terminals, with files beside them.</text>
+
+  <!-- Capability chips -->
+  <g font-family="Menlo, Monaco, monospace" font-size="14" font-weight="700">
+    <g transform="translate(72 466)">
+      <rect width="171" height="38" rx="8" fill="#1c1c21" stroke="#34343b"/>
+      <circle cx="20" cy="19" r="4" fill="#3fbf85"/>
+      <text x="34" y="24" fill="#b7b7c0">persistent sessions</text>
+    </g>
+    <g transform="translate(255 466)">
+      <rect width="206" height="38" rx="8" fill="#1c1c21" stroke="#34343b"/>
+      <circle cx="20" cy="19" r="4" fill="#3fbf85"/>
+      <text x="34" y="24" fill="#b7b7c0">local · remote · HPC</text>
+    </g>
+    <g transform="translate(72 516)">
+      <rect width="192" height="38" rx="8" fill="#1c1c21" stroke="#34343b"/>
+      <circle cx="20" cy="19" r="4" fill="#3fbf85"/>
+      <text x="34" y="24" fill="#b7b7c0">survives disconnect</text>
+    </g>
+  </g>
+  <text x="72" y="592" fill="#3fbf85" font-family="Menlo, Monaco, monospace" font-size="17" font-weight="700">chimaera.sh</text>
+
+  <!-- Product workbench -->
+  <g filter="url(#shadow)">
+    <rect x="720" y="76" width="418" height="476" rx="17" fill="#111115" stroke="url(#cardEdge)" stroke-width="2"/>
+    <g clip-path="url(#workbenchClip)">
+      <rect x="724" y="80" width="410" height="468" fill="#151519"/>
+      <rect x="724" y="80" width="410" height="43" fill="#1d1d22"/>
+      <circle cx="744" cy="101.5" r="4" fill="#5c5c64"/>
+      <circle cx="758" cy="101.5" r="4" fill="#5c5c64"/>
+      <circle cx="772" cy="101.5" r="4" fill="#5c5c64"/>
+      <polygon points="797.2,92.8 802.3,95.8 802.3,101.3 797.2,104.2 792.1,101.3 792.1,95.8" fill="#b5b5bb"/>
+      <polygon points="797.2,94.8 800.5,96.7 800.5,100.3 797.2,102.2 793.9,100.3 793.9,96.7" fill="#1d1d22"/>
+      <text x="810" y="106" fill="#9e9ea7" font-family="Menlo, Monaco, monospace" font-size="10">rnaseq-pipeline · gpu-node</text>
+
+      <!-- Session rail -->
+      <rect x="724" y="123" width="116" height="425" fill="#18181c"/>
+      <path d="M840 123V548" stroke="#2b2b32"/>
+      <text x="739" y="149" fill="#6f6f79" font-family="Menlo, Monaco, monospace" font-size="9" font-weight="700">AGENTS</text>
+      <rect x="734" y="162" width="96" height="49" rx="7" fill="#24242a" stroke="#3fbf85" stroke-opacity="0.65"/>
+      <circle cx="748" cy="178" r="4" fill="#3fbf85"/>
+      <text x="759" y="181" fill="#d7d7dc" font-family="Menlo, Monaco, monospace" font-size="9">Claude Code</text>
+      <rect x="746" y="192" width="62" height="4" rx="2" fill="#696972"/>
+      <rect x="734" y="219" width="96" height="49" rx="7" fill="#1d1d22"/>
+      <circle cx="748" cy="235" r="4" fill="#a58fd6"/>
+      <text x="759" y="238" fill="#b9b9c1" font-family="Menlo, Monaco, monospace" font-size="9">Codex</text>
+      <rect x="746" y="249" width="48" height="4" rx="2" fill="#55555e"/>
+      <text x="739" y="298" fill="#6f6f79" font-family="Menlo, Monaco, monospace" font-size="9" font-weight="700">TERMINALS</text>
+      <rect x="734" y="311" width="96" height="43" rx="7" fill="#1d1d22"/>
+      <path d="M746 325L752 331L746 337M757 337H769" fill="none" stroke="#85858f" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <rect x="777" y="328" width="36" height="4" rx="2" fill="#55555e"/>
+
+      <!-- Agent chat -->
+      <rect x="840" y="123" width="294" height="264" fill="#131317"/>
+      <text x="859" y="151" fill="#74747e" font-family="Menlo, Monaco, monospace" font-size="9" font-weight="700">AGENT CHAT</text>
+      <circle cx="1112" cy="147" r="4" fill="#3fbf85"/>
+      <rect x="855" y="168" width="259" height="64" rx="8" fill="#1d1d22" stroke="#2d2d34"/>
+      <rect x="870" y="183" width="183" height="6" rx="3" fill="#b0b0b8"/>
+      <rect x="870" y="197" width="219" height="5" rx="2.5" fill="#595962"/>
+      <rect x="870" y="210" width="144" height="5" rx="2.5" fill="#595962"/>
+      <rect x="855" y="244" width="259" height="95" rx="8" fill="#19191e" stroke="#2d2d34"/>
+      <rect x="870" y="260" width="96" height="6" rx="3" fill="#3fbf85" fill-opacity="0.85"/>
+      <rect x="870" y="277" width="219" height="5" rx="2.5" fill="#696972"/>
+      <rect x="870" y="290" width="202" height="5" rx="2.5" fill="#696972"/>
+      <rect x="870" y="303" width="230" height="5" rx="2.5" fill="#696972"/>
+      <rect x="870" y="316" width="159" height="5" rx="2.5" fill="#696972"/>
+      <rect x="855" y="352" width="259" height="22" rx="6" fill="#1d1d22"/>
+      <rect x="868" y="360" width="117" height="5" rx="2.5" fill="#505059"/>
+      <circle cx="1099" cy="363" r="5" fill="#3fbf85"/>
+
+      <!-- File preview -->
+      <rect x="840" y="387" width="294" height="161" fill="#18181d"/>
+      <path d="M840 387H1134" stroke="#2b2b32"/>
+      <text x="859" y="412" fill="#74747e" font-family="Menlo, Monaco, monospace" font-size="9" font-weight="700">FILE PREVIEW  ·  results.png</text>
+      <path d="M868 509V435M868 509H1110" fill="none" stroke="#45454d"/>
+      <path d="M880 498L901 485L923 490L946 460L969 477L992 448L1016 454L1039 431L1062 446L1098 423" fill="none" stroke="#3fbf85" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="946" cy="460" r="4" fill="#3fbf85"/>
+      <circle cx="1039" cy="431" r="4" fill="#3fbf85"/>
+      <rect x="886" y="522" width="54" height="4" rx="2" fill="#56565f"/>
+      <rect x="951" y="522" width="74" height="4" rx="2" fill="#56565f"/>
+    </g>
+  </g>
+</svg>
