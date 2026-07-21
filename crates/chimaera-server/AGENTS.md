@@ -149,8 +149,9 @@ decides **which** driver runs and **what happens around** its lifecycle.
   lifecycle (hooks are unreliable under `-p stream-json`).
 - **`spawn_chat_session`** is the one spawn recipe (create, view-switch, rewind,
   and non-destructive branch all route through it). It assembles argv via
-  `launcher`, seeds the journal
-  from a previous life on resume, and hands a `SpawnSpec` to `state.chat.spawn`.
+  `launcher`, materializes Claude's quiet portable-context file, seeds the
+  journal from a previous life on resume, and hands a `SpawnSpec` to
+  `state.chat.spawn` (Codex consumes that context during thread open).
 - **`handle_chat_exit`** degrades a failed handshake to a PTY TUI (marking the
   in-flight degrade in `chat_switching` so attached chat sockets report
   `degraded`, not `exited`, and stamping a `ModeSwitch` in the journal on
@@ -167,8 +168,10 @@ decides **which** driver runs and **what happens around** its lifecycle.
   `AgentRecord.resumed_from` is the resume-handle fallback.
 - **`fork_session`** snapshots a source journal prefix without stopping it and
   creates a distinct session. Same-agent exact boundaries use native history;
-  cross-agent and unrepresentable boundaries seed the normalized prefix and
-  prime a fresh driver with a bounded portable transcript.
+  cross-agent and unrepresentable boundaries seed the normalized visible prefix
+  and initialize a fresh driver with bounded system/developer context. An
+  assistant fork ends after the response and stays idle; a user fork ends before
+  the prompt so the browser can restore that prompt as an unsent draft.
 
 ### The state maps you must keep coherent
 
@@ -179,7 +182,7 @@ the lifecycle, keep them consistent:
 |---|---|---|
 | `state.chat` (the `ChatManager`) | the live driver registry | dead `ProtocolError` entries are kept visible — presence ≠ alive. |
 | `state.agents` | `AgentRecord` (state, title, files, `custom_title`) | survives a view switch; the identity that both surfaces share. |
-| `state.chat_recipes` | respawn recipe per id | must be removed when the session ends or toggles (else it leaks). |
+| `state.chat_recipes` | respawn recipe per id | retained by a PTY successor when launch/portable context must survive a round trip; always remove when the session ends. |
 | `state.chat_switching` | ids mid view-switch (or mid auto-degrade) | serialize entry (one switch per id); the exit path keys on it; the degrade inserts "term" around its respawn window. |
 | `state.session_workspaces` | id → workspace | resolve the workspace root from here. |
 

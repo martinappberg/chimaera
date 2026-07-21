@@ -2356,12 +2356,7 @@ impl ClaudeMapper {
         }
     }
 
-    fn send_blocks(
-        &mut self,
-        blocks: Vec<ContentBlock>,
-        display_text: Option<String>,
-        step: &mut DriverStep,
-    ) {
+    fn send_blocks(&mut self, blocks: Vec<ContentBlock>, step: &mut DriverStep) {
         let text = crate::model::blocks_text(&blocks);
         let attachments = blocks
             .iter()
@@ -2383,10 +2378,9 @@ impl ClaudeMapper {
             .collect();
         let uuid = crate::model::fresh_uuid();
         let preceding = self.last_msg_uuid.replace(uuid.clone());
-        let priming = display_text.is_some();
         step.events.push(AgentEvent::UserMessage {
-            text: display_text.unwrap_or_else(|| text.clone()),
-            attachments: if priming { 0 } else { attachments },
+            text: text.clone(),
+            attachments,
             id: Some(uuid.clone()),
             queued: self.turn_active,
         });
@@ -2418,10 +2412,9 @@ impl ClaudeMapper {
             step.outbound
                 .push(user_message_frame(&uuid, json!(content)));
         }
-        // Name an ordinary new conversation off its first message. A fork is
-        // already named by the server; generating a title from the large
-        // hidden handoff would waste context and produce a misleading label.
-        if !priming && !self.title_requested && !text.trim().is_empty() {
+        // Name an ordinary new conversation off its first real user message.
+        // Portable fork context rides the system prompt, not this input path.
+        if !self.title_requested && !text.trim().is_empty() {
             self.title_requested = true;
             let id = self.ctl_id();
             self.pending_controls
@@ -2440,11 +2433,7 @@ impl ClaudeMapper {
     fn on_command(&mut self, cmd: AgentCommand) -> DriverStep {
         let mut step = DriverStep::default();
         match cmd {
-            AgentCommand::Send { blocks } => self.send_blocks(blocks, None, &mut step),
-            AgentCommand::PrimeFork {
-                blocks,
-                display_text,
-            } => self.send_blocks(blocks, Some(display_text), &mut step),
+            AgentCommand::Send { blocks } => self.send_blocks(blocks, &mut step),
             AgentCommand::Permission {
                 request_id,
                 option_id,
@@ -3729,31 +3718,6 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::TurnStarted { turn_id } if turn_id == "t2")),
             "the queued turn opens lazily on its first real frame: {:?}",
             step.events
-        );
-    }
-
-    #[test]
-    fn fork_prime_sends_full_context_but_journals_only_compact_row() {
-        let mut m = mapper();
-        let step = m.on_command(AgentCommand::PrimeFork {
-            blocks: vec![ContentBlock::Text {
-                text: "full portable transcript context".into(),
-            }],
-            display_text: "Continue from this fork point.".into(),
-        });
-        assert!(matches!(
-            &step.events[0],
-            AgentEvent::UserMessage { text, .. }
-                if text == "Continue from this fork point."
-        ));
-        assert_eq!(
-            step.outbound[0]["message"]["content"][0]["text"],
-            "full portable transcript context"
-        );
-        assert_eq!(
-            step.outbound.len(),
-            1,
-            "server already names forks; hidden context must not request a title"
         );
     }
 

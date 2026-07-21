@@ -194,6 +194,7 @@ pub(crate) async fn spawn_session(
                     None,
                     None,
                     codex_theme,
+                    None,
                 )
             } else {
                 crate::launcher::build_agent_command(

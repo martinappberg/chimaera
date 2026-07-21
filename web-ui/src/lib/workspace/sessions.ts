@@ -579,14 +579,15 @@ export async function rewindSession(id: string, resumeAt: string): Promise<void>
   );
 }
 
-/** Branch a chat transcript through one rendered message into a fresh session.
- * Same-agent exact boundaries use the agent's native fork protocol; otherwise
- * the daemon transfers Chimaera's normalized transcript into the destination. */
+/** Branch into a fresh session: agent rows cut after the response; user rows
+ * pass their preceding boundary and id so the caller can restore the prompt as
+ * an unsent draft. Exact same-agent points use the native fork protocol. */
 export async function forkSession(
   id: string,
   throughSeq: number,
   agent: string,
   nativeAt: string | null,
+  beforeUserId: string | null,
 ): Promise<Session> {
   return json(
     await api(`/sessions/${id}/fork`, {
@@ -596,6 +597,7 @@ export async function forkSession(
         through_seq: throughSeq,
         agent,
         native_at: nativeAt,
+        before_user_id: beforeUserId,
         theme: resolvedTheme(),
       }),
     }),

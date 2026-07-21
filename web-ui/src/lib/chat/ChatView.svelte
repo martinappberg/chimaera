@@ -339,21 +339,51 @@
   });
 
   // --- transcript fork -------------------------------------------------------
-  // Any rendered user/assistant message is a portable journal boundary. A
-  // same-agent choice upgrades to the native protocol only when that exact
-  // row also carries a native point: Claude's user-message checkpoint uuid,
-  // or Codex's final assistant block from a completed turn.
+  // An assistant action branches AFTER its row. A user action edits by
+  // branching BEFORE its row and restoring the prompt as an unsent draft.
+  // Same-agent choices upgrade to native only when that exact preceding
+  // boundary is representable by the vendor.
   let forkIntent = $state<null | {
     throughSeq: number;
     nativeAt: string | null;
+    beforeUserId: string | null;
+    draft: string | null;
     applying: boolean;
   }>(null);
 
-  function askFork(block: ChatBlock) {
+  type ConversationBlock = Extract<ChatBlock, { kind: "user" | "message" }>;
+
+  function previousConversationBlock(blockIndex: number): ConversationBlock | null {
+    // #105 renders immutable snapshots of a bounded window, so object identity
+    // does not match the reducer's source array. The render item retains the
+    // absolute source index specifically for boundary-sensitive actions.
+    for (let i = blockIndex - 1; i >= 0; i--) {
+      const previous = store.blocks[i];
+      if (previous.kind === "user" || previous.kind === "message") return previous;
+    }
+    return null;
+  }
+
+  function askFork(block: ChatBlock, blockIndex: number) {
     if (block.kind === "user") {
+      // Editing a sent prompt is a branch BEFORE that prompt: preserve the
+      // source, copy only its preceding history, and restore the text as an
+      // unsent draft in the destination composer.
+      const previous = previousConversationBlock(blockIndex);
+      const beforeUserId = block.checkpoint?.id ?? block.id;
       forkIntent = {
-        throughSeq: block.forkSeq,
-        nativeAt: agentKind === "claude" ? (block.checkpoint?.id ?? null) : null,
+        // Old/imported journals can lack a user id entirely. They cannot use
+        // the daemon's exact before-user resolver, so fall back to the latest
+        // preceding conversation row rather than duplicating the prompt.
+        throughSeq: beforeUserId === null ? (previous?.forkSeq ?? 0) : block.forkSeq,
+        nativeAt:
+          agentKind === "claude"
+            ? (block.checkpoint?.preceding ?? null)
+            : previous?.kind === "message" && previous.nativeTurnComplete
+              ? previous.turnId
+              : null,
+        beforeUserId,
+        draft: block.text,
         applying: false,
       };
     } else if (block.kind === "message") {
@@ -361,6 +391,8 @@
         throughSeq: block.forkSeq,
         nativeAt:
           agentKind === "codex" && block.nativeTurnComplete ? block.turnId : null,
+        beforeUserId: null,
+        draft: null,
         applying: false,
       };
     }
@@ -370,9 +402,16 @@
     const intent = forkIntent;
     if (intent === null || intent.applying) return;
     forkIntent = { ...intent, applying: true };
-    void forkSession(session.id, intent.throughSeq, destination, intent.nativeAt)
+    void forkSession(
+      session.id,
+      intent.throughSeq,
+      destination,
+      intent.nativeAt,
+      intent.beforeUserId,
+    )
       .then((forked) => {
         forkIntent = null;
+        if (intent.draft !== null) insertIntoComposer(forked.id, intent.draft);
         onForked?.(forked);
       })
       .catch((error: unknown) => {
@@ -1113,7 +1152,7 @@
               class="message-action fork-btn"
               title="fork from this message into a new session (source keeps running)"
               aria-label="fork conversation from this message"
-              onclick={() => askFork(block)}
+              onclick={() => askFork(block, item.index)}
             >
               ⑂
             </button>
@@ -1158,7 +1197,7 @@
             text={item.block.text}
             sentAtMs={item.block.sentAtMs}
             nowMs={messageTimeNowMs}
-            onFork={() => askFork(item.block)}
+            onFork={() => askFork(item.block, item.index)}
           />
         </div>
       {:else if item.block.kind === "thought"}
@@ -1377,6 +1416,7 @@
       agents={availableForkAgents}
       sourceAgent={agentKind}
       nativeAt={forkIntent.nativeAt}
+      restoreDraft={forkIntent.draft !== null}
       applying={forkIntent.applying}
       onCancel={() => (forkIntent = null)}
       onConfirm={confirmFork}

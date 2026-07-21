@@ -63,6 +63,46 @@ pub(crate) fn mcp_config_path(session_id: &str) -> PathBuf {
     agents_runtime_dir().join(format!("{session_id}-mcp.json"))
 }
 
+/// Path to the quiet portable-fork context Claude reads as an appended system
+/// prompt. The bounded transcript belongs in a mode-0600 file rather than argv
+/// (which is both world-readable on shared hosts and close to process argument
+/// ceilings).
+pub(crate) fn fork_context_path(session_id: &str) -> PathBuf {
+    agents_runtime_dir().join(format!("{session_id}-fork-context.txt"))
+}
+
+pub(crate) fn write_fork_context(session_id: &str, context: &str) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = fork_context_path(session_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    file.write_all(context.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+pub(crate) fn remove_fork_context(session_id: &str) {
+    let path = fork_context_path(session_id);
+    if let Err(error) = std::fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, path = %path.display(), "failed to remove fork context");
+        }
+    }
+}
+
 /// Hook events wired into the generated settings file. Everything the state
 /// machine consumes, plus PostToolUse so long tool-free stretches still
 /// refresh "running", plus SubagentStart/Stop for the live-subagent roster

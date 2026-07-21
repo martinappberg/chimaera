@@ -149,6 +149,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   tail. Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
   preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
   reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
+  Replay/live/control frames are reduced through one order-preserving cooperative queue, yielding
+  between bounded slices so a large remote journal cannot monopolize navigation clicks.
 - **Tab lifecycle.** Recently viewed chat tabs retain only that bounded rendered page in the pane's
   live set. While hidden, its plain-data transcript snapshot freezes and scroll-following, elapsed
   clocks, question countdown painting, and streaming tool-body scrolling pause; the pooled
@@ -362,17 +364,18 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   the TUI side bills like an interactive session; the chat side drives the structured protocol. This
   is also the **`/login` recovery** path (see [Composing & sending](#composing-sending)): an
   expired-auth session flips to its TUI so claude's native auth flow can run.
-- **Branch at any message, without stopping the source.** Hover any user or assistant message and
-  choose the fork action (below assistant prose; beside user bubbles) to create a new chat session
-  through that journal sequence. The picker can target any
-  installed chat-capable agent. An exact same-agent boundary uses the vendor's native history:
-  Claude forks at a delivered user checkpoint; Codex uses `thread/fork` through a completed turn.
-  Every other combination — cross-agent, a same-agent assistant/user boundary the native API cannot
-  represent exactly, or a source with no reusable native id — copies the normalized Chimaera journal
-  prefix and primes a fresh agent with a bounded vendor-neutral transcript handoff. The new journal
-  retains the full copied visible prefix; only the model-facing handoff is head/tail capped. The
-  dialog names native vs portable behavior before creating the branch. Neither path rolls files back,
-  kills the source process, nor truncates its journal.
+- **Branch at any message, without stopping the source.** Hover an assistant response and choose its
+  fork action to create a new idle chat immediately after that response. The composer is empty and no
+  synthetic prompt or agent turn is sent. Forking from your own message instead branches immediately
+  **before** that message and restores its text into the new composer as an unsent draft, ready to
+  edit. The picker can target any installed chat-capable agent. An exact same-agent boundary uses the
+  vendor's native history: Claude can use the selected user checkpoint's preceding message; Codex
+  uses `thread/fork` through a completed turn. Every other combination — cross-agent, a same-agent
+  boundary the native API cannot represent exactly, or a source with no reusable native id — copies
+  the normalized visible Chimaera prefix and installs a bounded vendor-neutral transcript as quiet
+  system/developer context. The new journal retains the full copied visible prefix; only the
+  model-facing handoff is head/tail capped. Neither path rolls files back, kills the source process,
+  truncates its journal, or asks the destination agent to speak before the user sends something.
 - **Rewind + fork (claude).** Hover a user message → "↺" → a dry-run report → a dialog listing the
   files that will revert → "restore files" or "restore + rewind conversation". File-restore rides the
   chat socket (`rewind`); the conversation fork is `POST /api/v1/sessions/{id}/rewind {resume_at}`,
@@ -394,9 +397,10 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   session id (see [lifecycle-and-persistence.md](lifecycle-and-persistence.md)).
 - Codex rewind's rollback count only sees turns the chat journal saw (TUI-interleaved turns
   undercount it — the rollback then leaves those turns in place).
-- Native same-agent branches are available only at boundaries the vendor exposes: delivered user
-  checkpoints for Claude and completed turns for Codex. The branch action remains available at every
-  message, but labels and uses the portable handoff elsewhere.
+- Native same-agent branches are available only at boundaries the vendor exposes: a Claude user
+  checkpoint can authenticate the message immediately before that prompt, while Codex exposes
+  completed turns. The branch action remains available at every message, but uses the portable
+  handoff elsewhere.
 
 ---
 
@@ -491,7 +495,11 @@ _Captured 2026-07-11 (from the maintainer)._
 - **Problem it solves.** Switching chat tabs must not refetch the journal or drop the socket. A
   session-keyed chat pool holds a warm store + open socket per session, so transcript state, the
   bounded render cursor, scroll, and the live stream survive a remount (mirrors the terminal
-  `termPool`; the turn timer's start lives in the pool so it survives a mid-turn switch).
+  `termPool`; the turn timer's start lives in the pool so it survives a mid-turn switch). Hidden
+  views freeze only their bounded rendered snapshot: the pooled reducer/socket and daemon-owned agent
+  continue working, and returning to the chat can send the next message normally. Even an LRU client
+  eviction closes only that browser socket; it never stops the agent, and the next open gap-replays
+  the journal.
 - **The promise (the load-bearing bit).** **Chat tabs are as durable as terminal tabs** — a view
   switch is a view switch, never a reload. Keep that parity.
 - **Grade — addition** otherwise: the pool mechanics are implementation, free to improve.
