@@ -76,6 +76,11 @@
       // "what's happening now" line — exactly this one.
       const step = store.plan.find((p) => p.status === "in_progress");
       if (step !== undefined) return step.activeForm ?? step.content;
+      const delegated = store.blocks.findLast(
+        (b): b is Extract<ChatBlock, { kind: "tool" }> =>
+          b.kind === "tool" && b.tool === "agent" && b.status === "in_progress",
+      );
+      if (delegated !== undefined) return `${subName(delegated.title)} working in background`;
       const lastMsg = store.blocks.findLast((b) => b.kind === "message");
       if (lastMsg !== undefined) return lastMsg.text.slice(0, 160);
     }
@@ -126,7 +131,7 @@
    *  Warm-store only: the ROWS need the full set, which rides the chat
    *  socket. The cue below doesn't — it reads the count off the wire. */
   const bgTasks = $derived(store?.backgroundTasks ?? []);
-  /** The turn is idle but a background task is STILL running: the session
+  /** The turn is idle but process-owned work is STILL running: the session
    *  isn't "done", it's working off-screen, so the state dot keeps pulsing
    *  and the card never reads as finished. The shared session predicate, so
    *  this card and that session's rail row always cue together — including
@@ -427,7 +432,7 @@
   .card.dead {
     opacity: 0.75;
   }
-  /* Idle turn but a background task is still running: the STATE DOT breathes,
+  /* Idle turn but background work is still running: the STATE DOT breathes,
      so the card reads as "still working off-screen", not finished. The dot is
      this surface's state channel — the type glyph is identity, and animating
      identity read as the wrong thing moving. It keeps its own state color

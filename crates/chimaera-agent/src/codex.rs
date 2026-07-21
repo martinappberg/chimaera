@@ -774,7 +774,9 @@ struct CodexMapper {
     decline_notified: bool,
     pending_rpcs: HashMap<u64, PendingRpc>,
     /// Collab subagents by their thread id, insertion-ordered (see
-    /// [`CollabAgent`]). Lives per parent turn, like claude's task map.
+    /// [`CollabAgent`]). These are process-scoped child threads: they may keep
+    /// working after the parent turn completes and remain tracked until their
+    /// own turn closes or this driver process dies.
     collab_agents: Vec<CollabAgent>,
     /// One over-cap notice per turn (only a >32-live-agent turn ever sees it).
     collab_cap_notified: bool,
@@ -1248,11 +1250,6 @@ impl CodexMapper {
                     usage.duration_ms = turn["durationMs"].as_u64().unwrap_or(0);
                     let turn_id = turn["id"].as_str().unwrap_or(&self.turn_id).to_string();
                     if turn["status"] == "interrupted" {
-                        // The turn died with its subagents still open: close
-                        // their rows as failed BEFORE the abort marker, so
-                        // the UI's turn-end reconcile can't flip them green
-                        // (claude parity).
-                        self.fail_dangling_collab_agents(&mut step);
                         // status "interrupted" only follows a turn/interrupt RPC
                         // — codex's wire carries the user-stop fact structurally.
                         step.events.push(AgentEvent::TurnAborted {
@@ -1292,9 +1289,6 @@ impl CodexMapper {
                 let was_active = self.turn_active;
                 self.turn_active = false;
                 if was_active {
-                    // Subagent rows die with the failed turn (claude parity —
-                    // never reconciled green by the UI's turn-end sweep).
-                    self.fail_dangling_collab_agents(&mut step);
                     step.events.push(AgentEvent::TurnAborted {
                         turn_id: self.turn_id.clone(),
                         reason: frame["params"]["error"]["message"]
@@ -1343,12 +1337,11 @@ impl CodexMapper {
         // Approvals only ever reference items of the current turn; keeping
         // these forever is unbounded growth over a long session.
         self.item_locations.clear();
-        // Collab subagents live per parent turn, like claude's task map
-        // (wiped on result). Rows still open on a NORMAL end were left
-        // running deliberately — the UI's turn-end reconcile closes them
-        // (green), exactly as it does claude's; the abort paths fail them
-        // explicitly before this runs.
-        self.collab_agents.clear();
+        // Collab agents are real child THREADS, not items owned by this turn.
+        // Live 0.144.2 proves they can finish after the parent has answered;
+        // keep the registry so their foreign-thread frames continue updating
+        // the pinned agent row. Only their own close or driver teardown ends
+        // them. The cap notice remains per parent turn.
         self.collab_cap_notified = false;
     }
 
@@ -1642,6 +1635,7 @@ impl CodexMapper {
             },
             locations,
             status: ToolStatus::InProgress,
+            cross_turn: false,
         });
     }
 
@@ -1675,6 +1669,7 @@ impl CodexMapper {
                         title: command_title(item),
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
+                        cross_turn: false,
                     });
                 } else {
                     let failed =
@@ -1776,6 +1771,7 @@ impl CodexMapper {
                         title,
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
+                        cross_turn: false,
                     });
                 } else {
                     let failed = item["error"].is_object()
@@ -1824,6 +1820,7 @@ impl CodexMapper {
                         title: format!("search: {}", item["query"].as_str().unwrap_or("the web")),
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
+                        cross_turn: false,
                     });
                 } else {
                     // Honor the item status like every other item type — a
@@ -1856,6 +1853,7 @@ impl CodexMapper {
                         title: "generating image".into(),
                         locations: Vec::new(),
                         status: ToolStatus::InProgress,
+                        cross_turn: false,
                     });
                 } else {
                     // Re-emit with the saved path so the open affordance
@@ -1875,6 +1873,7 @@ impl CodexMapper {
                             vec![saved.to_string()]
                         },
                         status: ToolStatus::InProgress,
+                        cross_turn: false,
                     });
                     step.events.push(AgentEvent::ToolCallUpdate {
                         id,
@@ -1919,6 +1918,7 @@ impl CodexMapper {
                     title,
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
+                    cross_turn: false,
                 });
                 if completed {
                     let failed =
@@ -2020,6 +2020,7 @@ impl CodexMapper {
             title: format!("auto review · {action}"),
             locations,
             status: ToolStatus::InProgress,
+            cross_turn: false,
         });
         if !completed {
             return;
@@ -2133,6 +2134,7 @@ impl CodexMapper {
                     title: format!("Agent: {}", self.collab_agents[idx].name),
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
+                    cross_turn: true,
                 });
             }
             let agent = &mut self.collab_agents[idx];
@@ -2176,6 +2178,7 @@ impl CodexMapper {
             title: format!("Agent: {name}"),
             locations: Vec::new(),
             status: ToolStatus::InProgress,
+            cross_turn: true,
         });
         let mut agent = CollabAgent {
             thread_id: thread.to_string(),
@@ -2231,11 +2234,10 @@ impl CodexMapper {
         }
     }
 
-    /// The parent turn died (interrupt, failure, watchdog): close every
-    /// still-open subagent row as failed — their own turn ends will never
-    /// render, and the UI's turn-end reconcile would otherwise flip them to a
-    /// green "completed". Same wording and semantics as claude's
-    /// `fail_dangling_tasks`. Clears the set it drains.
+    /// The DRIVER PROCESS is ending: close every still-open subagent row as
+    /// failed, because their multiplexed thread frames cannot arrive after
+    /// this point. Parent turn boundaries deliberately do not call this.
+    /// Clears the set it drains.
     fn fail_dangling_collab_agents(&mut self, step: &mut DriverStep) {
         for agent in std::mem::take(&mut self.collab_agents) {
             if !agent.open {
@@ -2245,7 +2247,7 @@ impl CodexMapper {
                 id: agent.row_id,
                 status: ToolStatus::Failed,
                 content: Some(ToolContent::Output {
-                    text: "subagent stopped with the turn".into(),
+                    text: "subagent stopped with the agent process".into(),
                     truncated: false,
                 }),
             });
@@ -3376,8 +3378,9 @@ impl CodexMapper {
             return step;
         }
         self.turn_active = false;
-        // The synthesized abort closes subagent rows exactly like a real one.
-        self.fail_dangling_collab_agents(&mut step);
+        // This only proves the PARENT turn stopped answering. Child threads
+        // are process-scoped and may continue streaming independently; their
+        // own terminal frames (or driver teardown) close them.
         step.events.push(AgentEvent::TurnAborted {
             turn_id: self.turn_id.clone(),
             reason: "interrupted".into(),
@@ -4876,7 +4879,7 @@ mod tests {
         }));
         assert!(matches!(
             &started.events[0],
-            AgentEvent::ToolCall { id, kind: ToolKind::Edit, title, locations, status: ToolStatus::InProgress }
+            AgentEvent::ToolCall { id, kind: ToolKind::Edit, title, locations, status: ToolStatus::InProgress, .. }
                 if id == "auto-review:review-1"
                     && title == "auto review · edit 2 files"
                     && locations == &vec!["/work/a.rs".to_string(), "/work/b.rs".to_string()]
@@ -5921,6 +5924,7 @@ mod tests {
                 title: "Agent: agent_a".into(),
                 locations: Vec::new(),
                 status: ToolStatus::InProgress,
+                cross_turn: true,
             }]
         );
 
@@ -6008,6 +6012,7 @@ mod tests {
                     title: "Agent: agent_a".into(),
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
+                    cross_turn: true,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "agent:sub-1#2".into(),
@@ -6104,7 +6109,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_abort_fails_dangling_agent_rows_before_the_abort_marker() {
+    fn parent_abort_keeps_cross_turn_agent_rows_live() {
         let mut m = mapper();
         active_turn(&mut m);
         m.on_frame(&sub_agent_activity("started", "sub-1"));
@@ -6115,24 +6120,44 @@ mod tests {
                         "turn": { "id": "turn-A", "status": "interrupted",
                                    "durationMs": 10 } },
         }));
-        let close = step
-            .events
-            .iter()
-            .position(|e| {
-                matches!(e, AgentEvent::ToolCallUpdate { id, status: ToolStatus::Failed, .. }
-                             if id == "agent:sub-1")
-            })
-            .expect("dangling row closes failed");
-        let abort = step
-            .events
-            .iter()
-            .position(|e| matches!(e, AgentEvent::TurnAborted { .. }))
-            .expect("abort marker");
         assert!(
-            close < abort,
-            "row must close before the abort so the UI reconcile can't flip it green"
+            step.events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnAborted { .. })),
+            "the parent turn still aborts"
         );
-        assert!(m.collab_agents.is_empty(), "the set clears with the turn");
+        assert!(
+            !step.events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallUpdate {
+                    id,
+                    status: ToolStatus::Completed | ToolStatus::Failed,
+                    ..
+                } if id == "agent:sub-1"
+            )),
+            "a parent boundary must not invent a child-thread close"
+        );
+        assert_eq!(m.collab_agents.len(), 1, "the child remains tracked");
+        assert!(m.collab_agents[0].open, "the child row remains live");
+
+        // Its own foreign-thread completion remains observable after the
+        // parent turn is gone — the ordering pinned by the live probe.
+        let close = m.on_frame(&json!({
+            "method": "turn/completed",
+            "params": { "threadId": "sub-1",
+                        "turn": { "id": "t-s1", "status": "completed" } },
+        }));
+        assert!(
+            close.events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallUpdate {
+                    id,
+                    status: ToolStatus::Completed,
+                    ..
+                } if id == "agent:sub-1"
+            )),
+            "the child closes on its own turn boundary"
+        );
     }
 
     #[test]
@@ -6156,6 +6181,7 @@ mod tests {
                     title: "waiting for subagents".into(),
                     locations: Vec::new(),
                     status: ToolStatus::InProgress,
+                    cross_turn: false,
                 },
                 AgentEvent::ToolCallUpdate {
                     id: "call_w1".into(),

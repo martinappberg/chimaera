@@ -61,16 +61,17 @@ explicit nulls: the chat client derives richer versions from its journal):
   preserving any user statusline command byte-for-byte.
 
 Plus one field that runs the OTHER way — **`background_running`**, a count of
-the agent's live backgrounded Bash/workflows. **Chat rows carry it; PTY rows
-carry null** (a TUI's Ctrl-B raises no hook, so null means "unknown"). It is
-the deliberate exception to "the chat client derives it from its journal":
-that only holds for a client attached to *that* session's socket, and the rail
-renders every session while attached to none, so warm-store-only truth left an
-agent working off-screen looking idle. `ChatManager`'s pump folds the
-`BackgroundTasks` level-set (a count, not the set — this rides every
-session-list snapshot; anything wanting the rows is on the chat socket) onto
-`ChatInfo`, and `chat_session_json` emits it. Cross-turn by nature: it survives
-turn ends and is zeroed on `Exited`.
+the agent's live process-owned work outside the parent turn: Claude
+backgrounded Bash/workflows plus Codex delegated threads. **Chat rows carry it;
+PTY rows carry null** (a TUI's Ctrl-B raises no hook, so null means "unknown").
+It is the deliberate exception to "the chat client derives it from its
+journal": that only holds for a client attached to *that* session's socket,
+and the rail renders every session while attached to none, so warm-store-only
+truth left an agent working off-screen looking idle. `ChatManager`'s pump folds
+the bounded `BackgroundTasks` level-set and cross-turn Agent tool-row lifecycle
+to a count (the rows themselves stay on the chat socket) onto `ChatInfo`, and
+`chat_session_json` emits it. Cross-turn by nature: it survives parent turn
+ends and is zeroed on `Exited`.
 
 The wire shapes are pinned in `session_view.rs` tests — extend additively.
 

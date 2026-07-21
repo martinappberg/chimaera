@@ -707,7 +707,8 @@ pub(crate) fn chat_session_json(
         // "derive it from the journal" only holds for a client attached to
         // THIS session's socket; the rail renders every session and is
         // attached to none of them, so warm-store-only truth left an agent
-        // working off-screen looking idle. The count rides the row instead.
+        // working off-screen looking idle. It covers both background task
+        // lanes and cross-turn delegated agents; the count rides the row.
         "stalled": null,
         "subagents": null,
         "now_line": null,
@@ -3569,7 +3570,7 @@ mod tests {
     /// live-work field a chat row fills rather than nulls: every other surface
     /// derives its version from the journal, but the rail renders sessions it
     /// has no socket for, so the count has to ride the row. A count, never the
-    /// set — the rows live on the chat socket. (PTY rows carry null; that half
+    /// set — task/subagent rows live on the chat socket. (PTY rows carry null; that half
     /// is pinned in `session_view`.)
     #[test]
     fn background_running_rides_chat_rows() {

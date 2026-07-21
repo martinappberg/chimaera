@@ -1247,6 +1247,72 @@ async fn codex_collab_subagent_surface() {
         .expect("shutdown");
 }
 
+/// A delegated Codex agent may keep working after the parent has answered.
+/// Pin that cross-turn ordering: clearing the driver's subagent registry at
+/// the parent's turn/completed would make the remaining work invisible.
+#[tokio::test]
+#[ignore = "live: spawns real codex, needs auth, bills a small multi-agent turn"]
+async fn codex_collab_subagent_can_outlive_parent_turn() {
+    let dir = tmpdir();
+    let mut chat = CodexChat::spawn("codex", dir.path()).expect("spawn codex");
+    chat.initialize(HANDSHAKE).await.expect("initialize");
+    let thread_id = chat
+        .thread_start(dir.path(), HANDSHAKE)
+        .await
+        .expect("thread/start");
+    chat.turn_start(
+        &thread_id,
+        "Spawn exactly ONE subagent. Its task is to run `sleep 12`, then reply \
+         with exactly DONE. Do not wait for that subagent and do not call the \
+         wait tool: immediately after spawn succeeds, give your own final reply \
+         of exactly LAUNCHED.",
+    )
+    .await
+    .expect("turn/start");
+
+    let mut agent_thread = String::new();
+    let mut parent_completed = false;
+    let foreign_completed_after_parent = loop {
+        let frame = chat
+            .recv(TURN)
+            .await
+            .expect("recv")
+            .expect("codex exited before subagent completed");
+        let frame_thread = frame["params"]["threadId"].as_str().unwrap_or_default();
+        let item = &frame["params"]["item"];
+        match frame["method"].as_str() {
+            Some("item/completed")
+                if frame_thread == thread_id
+                    && item["type"] == "subAgentActivity"
+                    && item["kind"] == "started" =>
+            {
+                agent_thread = item["agentThreadId"]
+                    .as_str()
+                    .expect("spawn marker carries agentThreadId")
+                    .to_string();
+            }
+            Some("turn/completed") if frame_thread == thread_id => {
+                parent_completed = true;
+            }
+            Some("turn/completed") if !agent_thread.is_empty() && frame_thread == agent_thread => {
+                break parent_completed;
+            }
+            _ => {}
+        }
+    };
+
+    assert!(!agent_thread.is_empty(), "the model spawned a subagent");
+    assert!(parent_completed, "the parent turn completed");
+    assert!(
+        foreign_completed_after_parent,
+        "the subagent turn completed after the parent turn"
+    );
+
+    chat.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 /// Feature-detects the codex control surface the driver leans on: turn/steer
 /// (exists; errors sanely without an active turn), thread/settings/update
 /// (supported or -32601 → the driver's per-turn fallback), account/read

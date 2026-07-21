@@ -1419,11 +1419,12 @@ variant must not leave a subagent invisible). A subagent's `fileChange`
 items also record `item_locations`, so its approval card still names the
 touched files; its `error` notifications fold into the progress line.
 Subagent transcripts are hidden from the parent's (claude hides
-parent_tool_use_id frames the same way). The set lives per parent turn like
-claude's task map: an aborted/failed/watchdogged parent turn — and driver
-teardown (`drain_pending`), where the subagents die with the process —
-first fails still-open rows ("subagent stopped with the turn"); a normal
-end just clears the set. Over the 32-row cap, closed rows are evicted
+parent_tool_use_id frames the same way). The registry is process-scoped, not
+parent-turn-scoped: a delegated thread can keep working after the parent
+answers, and parent completion/abort is not a child close signal. Its own
+`turn/completed|failed` closes the row; driver teardown (`drain_pending`),
+where every subagent dies with the process, fails any still-open rows. Over
+the 32-row cap, closed rows are evicted
 first; when every slot is live the newest agents are NOT tracked (a
 synthetic close would lie) and a once-per-turn Notice says so. `wait`
 renders as an ordinary tool row ("waiting for subagents"),
@@ -1917,3 +1918,25 @@ expires stale asks, so using it as a generic model-refresh event could silently
 withdraw a live question or approval and retain omitted catalog state. The UI
 reducer correspondingly treats every real `Init` as authoritative: absent
 optional model/mode/catalog fields clear the prior process snapshot.
+
+## Pass 27 (2026-07-20 — live probe codex 0.144.2): delegated agents outlive the parent turn. ADOPTED.
+
+A direct app-server probe spawned one subagent whose task intentionally ran
+past the parent's answer. The parent `turn/completed` arrived first; the child
+thread continued emitting its own multiplexed frames and its
+`turn/completed` arrived later. Parent turn boundaries therefore cannot clear
+Codex's collab registry. The old mapper did exactly that, so it discarded every
+later child frame, the pinned Agents tray vanished, and rail/dashboard state
+claimed the session was finished while work was still running.
+
+Codex collab `ToolCall` rows now carry additive `cross_turn:true`. The mapper
+keeps them until the child thread's own terminal frame (or driver teardown),
+and the UI's dropped-result reconciliation preserves those rows across parent
+turn completion/abort while retaining its ordinary dangling-tool cleanup. The
+manager folds live cross-turn agent ids together with Claude's background-task
+level-set into the existing bounded `background_running` count. Thus an idle
+parent with a working Codex child keeps the same off-screen-work cue in the
+rail and dashboard, while the attached chat shows the child's live progress in
+the pinned Agents tray. Hermetic mapper/reducer/count tests pin replay and
+upsert behavior; `codex_collab_subagent_can_outlive_parent_turn` pins the live
+ordering.

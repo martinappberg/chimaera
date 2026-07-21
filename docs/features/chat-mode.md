@@ -204,8 +204,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   set-change removes before their verdict park in a bounded
   departed buffer so the notification arriving ~ms later still closes them (the live-verified settle
   order). The ■ stop sends `stop_task` with the native task key — the CLI's stop is generic over its
-  task registry and acks a raced not-found as success. Codex has no background lane — the tray never
-  renders there.
+  task registry and acks a raced not-found as success. Codex has no Bash/workflow background-task
+  lane — that tray never renders there; long-lived Codex subagents stay in the sibling Agents tray.
 - **Rich workflow rows + card verdicts (claude).** A `local_workflow` lane renders richer than a
   bare bash row: the tray row leads with the workflow's `meta.name` (from `task_started
   .workflow_name`; lane + description stay in the tooltip) and carries a per-agent **dot row**
@@ -259,10 +259,14 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   N tools · M tokens), so the tray works unchanged. A subagent is a real thread multiplexed onto
   the same connection — the driver scopes every frame by `threadId`, hides the agent's transcript
   from the parent's (claude symmetry), and closes the row when the agent answers ("answered"), is
-  shut down ("closed"), or dies with an aborted parent turn or the process itself. A follow-up to a
+  shut down ("closed"), or the process itself dies. A parent answer/abort does not close the child:
+  delegated threads may keep working after the parent turn, so their cross-turn rows remain in the
+  pinned Agents tray and keep the rail/dashboard's off-screen-work cue live until the child's own
+  turn ends. A follow-up to a
   closed agent opens a fresh row (a finished card never walks back to running). The
   model's `wait` renders as a "waiting for subagents" tool row. No per-agent stop for codex (no
-  such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Pass 16.
+  such client RPC on the wire) — the tray's ■ stays claude-only. Wire facts: PROTOCOL.md Passes 16
+  and 27.
 - **Permission prompts.** A warning card ("<tool> wants to run") with a JSON-input preview and
   allow-once / always / reject options, plus a destination cycler for "always" rules (this project
   just-you / all projects / this project shared / this session, persisted in localStorage). The card
