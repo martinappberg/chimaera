@@ -470,6 +470,12 @@ export class ChatStore {
         // view must re-push the user's preference to it (seq-dedupe means only
         // a genuinely-new init re-applies here; a plain reconnect doesn't).
         this.thinkingPushed = false;
+        // A new driver process cannot own work launched by the previous one.
+        // Turn-end reconciliation deliberately preserves cross-turn Codex
+        // agent rows, so close any that survived in the reused journal before
+        // this process starts contributing events. Scan across turn markers:
+        // the stale row may precede its parent's completed-turn boundary.
+        this.reconcileOpenTools();
         // Deliberately NOT clearing backgroundTasks here: the manager journals
         // an empty level-set immediately before every new driver's Init, and
         // that event owns the process-boundary reset. Runtime model changes use

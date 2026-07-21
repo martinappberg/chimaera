@@ -378,6 +378,29 @@ describe("ChatStore pending-send ordering", () => {
     expect(live).toMatchObject({ status: "completed" });
   });
 
+  it("closes a cross-turn Codex agent when a new driver process starts", () => {
+    const store = fold([
+      { type: "init", native_session_id: "old-process" },
+      { type: "turn_started", turn_id: "parent" },
+      {
+        type: "tool_call",
+        id: "agent:sub-1",
+        kind: "agent",
+        title: "Agent: analyst",
+        status: "in_progress",
+        cross_turn: true,
+      },
+      { type: "turn_completed", turn_id: "parent", usage: {} },
+      // Every spawn emits this reset before Init, but it only owns the
+      // background-task lane. The fresh Init owns stale tool-row cleanup.
+      { type: "background_tasks", tasks: [] },
+      { type: "init", native_session_id: "new-process" },
+    ]);
+
+    const stale = store.blocks.find((b) => b.kind === "tool" && b.id === "agent:sub-1");
+    expect(stale).toMatchObject({ status: "completed", crossTurn: true });
+  });
+
   it("reconciles a dangling tool when the driver dies with a fatal error", () => {
     // A fatal error is a terminal path like turn end: a kept-visible
     // ProtocolError session emits no `exited`, so a tool left in_progress must
