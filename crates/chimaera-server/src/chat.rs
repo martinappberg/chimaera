@@ -2270,13 +2270,40 @@ fn native_fork_point(
                         AgentEvent::TurnStarted { turn_id } if turn_id == requested
                     )
             });
-            let completed = entries.iter().any(|entry| {
-                entry.seq > portable_floor
-                    && entry.seq == through_seq
+            let completed_seq = entries.iter().find_map(|entry| {
+                (entry.seq > portable_floor
+                    && entry.seq <= through_seq
                     && matches!(
                         &entry.ev,
                         AgentEvent::TurnCompleted { turn_id, .. } if turn_id == requested
-                    )
+                    ))
+                .then_some(entry.seq)
+            });
+            let completed = completed_seq.is_some_and(|completed_seq| {
+                if before_user_id.is_none() {
+                    return completed_seq == through_seq;
+                }
+                // Editing a user prompt branches at the preceding completed
+                // turn, while the raw cut lands immediately before that
+                // prompt. Codex's post-turn account/read response commonly
+                // journals RateLimit between those points; lifecycle notices
+                // and telemetry do not make the native turn boundary stale.
+                // A later conversational turn or delivered prompt does.
+                entries.iter().all(|entry| {
+                    entry.seq <= completed_seq
+                        || entry.seq > through_seq
+                        || !matches!(
+                            &entry.ev,
+                            AgentEvent::TurnStarted { .. }
+                                | AgentEvent::TurnCompleted { .. }
+                                | AgentEvent::TurnAborted { .. }
+                                | AgentEvent::UserMessage { queued: false, .. }
+                                | AgentEvent::UserMessageUpdate {
+                                    state: chimaera_agent::model::UserMessageState::Sent,
+                                    ..
+                                }
+                        )
+                })
             });
             started && completed
         }
@@ -3426,6 +3453,58 @@ mod tests {
             "assistant-native-1",
             Some("u2"),
         ));
+
+        let mut codex_before_user = entries.clone();
+        codex_before_user.extend([
+            seq_event(
+                6,
+                AgentEvent::RateLimit {
+                    utilization: 42.0,
+                    resets_at: None,
+                    label: Some("session limit".into()),
+                    limit_reached: false,
+                },
+            ),
+            seq_event(
+                7,
+                AgentEvent::UserMessage {
+                    text: "edit this too".into(),
+                    attachments: 0,
+                    id: Some("u2".into()),
+                    queued: false,
+                },
+            ),
+            seq_event(
+                8,
+                AgentEvent::Checkpoint {
+                    user_message_id: "u2".into(),
+                    preceding_uuid: Some("t1".into()),
+                },
+            ),
+        ]);
+        let codex_cut = before_user_cut(&codex_before_user, 8, "u2").unwrap();
+        assert_eq!(codex_cut, 6);
+        assert!(
+            native_fork_point(
+                &codex_before_user,
+                codex_cut,
+                AgentKind::Codex,
+                "t1",
+                Some("u2"),
+            ),
+            "post-turn telemetry must not downgrade an exact before-user native fork"
+        );
+        let mut codex_later_turn = entries.clone();
+        codex_later_turn.push(seq_event(
+            6,
+            AgentEvent::TurnStarted {
+                turn_id: "t2".into(),
+            },
+        ));
+        assert!(
+            !native_fork_point(&codex_later_turn, 6, AgentKind::Codex, "t1", Some("u2"),),
+            "a later conversational turn still invalidates the older native boundary"
+        );
 
         let mut later = entries.clone();
         later.push(seq_event(
