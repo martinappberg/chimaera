@@ -66,6 +66,12 @@ pub struct SpawnSpec {
     /// `thread/start` / `thread/resume`; Claude already receives its initial
     /// model through launcher argv and ignores this protocol-side copy.
     pub initial_model: Option<String>,
+    /// Reasoning effort to apply while opening a Codex thread. For resumes,
+    /// this is that thread's last user-selected value. When absent (including
+    /// every fresh thread), the driver reads Codex's own
+    /// `model_reasoning_effort` config before falling back to the model
+    /// default. Claude ignores this protocol-side copy.
+    pub initial_effort: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version
     /// handshake (see PROTOCOL.md), so the server-side probe is the source:
@@ -121,6 +127,7 @@ impl SpawnSpec {
             env_remove: Vec::new(),
             pinned_native_id: None,
             initial_model: None,
+            initial_effort: None,
             agent_version: None,
             rollback_turns: None,
             fork_at: None,

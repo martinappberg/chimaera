@@ -1301,15 +1301,17 @@ async fn perform_switch(
     // process. That record is the identity a view switch CARRIES across the
     // respawn, so its absence here means the session was retired mid-switch —
     // do NOT resurrect the id (that would leave a live, billing process with
-    // no workspace row). Checked immediately before the respawn, which is the
-    // last await-free point, so no retire can slip between here and the spawn.
+    // no workspace row). The spawn helper repeats this check after its optional
+    // blocking legacy-effort recovery, immediately before the await-free spawn.
     if crate::lock(&state.agents).get(id).is_none() {
         tracing::info!(%id, "view switch aborted — session retired mid-switch");
         return Ok(());
     }
 
     if target_chat {
-        spawn_chat_session(state, id.to_string(), recipe, None).map_err(|e| e.to_string())?;
+        spawn_chat_session(state, id.to_string(), recipe, None)
+            .await
+            .map_err(|e| e.to_string())?;
     } else {
         degrade_to_pty(state, id, recipe, pinned_name).await;
     }
@@ -1638,7 +1640,9 @@ pub(crate) async fn rewind_session(
             portable_context,
             created_at_ms: None,
         };
-        spawn_chat_session(&state, id.clone(), recipe, None).map_err(|e| e.to_string())?;
+        spawn_chat_session(&state, id.clone(), recipe, None)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     .await;
@@ -2741,7 +2745,7 @@ pub(crate) async fn spawn_fresh_chat(
     // failure therefore cannot strand an AgentRecord/workspace association.
     crate::lock(&state.agents).insert(id.clone(), record.clone());
     crate::lock(&state.session_workspaces).insert(id.clone(), workspace.id.clone());
-    match spawn_chat_session(state, id.clone(), recipe, None) {
+    match spawn_chat_session(state, id.clone(), recipe, None).await {
         Ok(info) => {
             crate::agents::spawn_agent_watch(state.clone(), id.clone());
             state.changes.notify_waiters();
@@ -2760,12 +2764,40 @@ pub(crate) async fn spawn_fresh_chat(
     }
 }
 
-pub(crate) fn spawn_chat_session(
+async fn codex_initial_effort(state: &Arc<AppState>, recipe: &ChatRecipe) -> Option<String> {
+    if recipe.kind != AgentKind::Codex {
+        return None;
+    }
+    let native_id = recipe.resume.clone()?;
+    if let Some(effort) = state.chat.index().effort(&native_id) {
+        return Some(effort);
+    }
+
+    // Pre-Pass-29 rows need one bounded journal read. Journals can live on
+    // NFS/Lustre, so never perform this recovery on Tokio's reactor.
+    let manager = Arc::clone(&state.chat);
+    match tokio::task::spawn_blocking(move || manager.index().effort_or_recover(&native_id)).await {
+        Ok(effort) => effort,
+        Err(error) => {
+            tracing::warn!(%error, "Codex effort recovery worker failed");
+            None
+        }
+    }
+}
+
+pub(crate) async fn spawn_chat_session(
     state: &Arc<AppState>,
     id: String,
     recipe: ChatRecipe,
     pinned_override: Option<String>,
 ) -> anyhow::Result<ChatInfo> {
+    let initial_effort = codex_initial_effort(state, &recipe).await;
+    // Legacy recovery can yield while a concurrent retire removes the shared
+    // identity. From here through ChatManager::spawn there are no awaits, so
+    // this closes that race without resurrecting an untracked billing process.
+    if crate::lock(&state.agents).get(&id).is_none() {
+        anyhow::bail!("chat session retired before spawn");
+    }
     // Re-enforce the journal-dir budget as sessions are created: the
     // construction-time prune alone lets a weeks-long daemon accumulate one
     // capped journal per session past the documented ceiling.
@@ -2896,6 +2928,13 @@ pub(crate) fn spawn_chat_session(
     // already received the same recipe value through build_chat_command.
     if recipe.kind == AgentKind::Codex {
         spec.initial_model = recipe.model.clone();
+        // Codex's rollout survives app-server restarts, but its selected
+        // effort does not: thread/resume otherwise falls back to the model's
+        // default. Prefer that conversation's value. A brand-new conversation
+        // leaves this empty so the driver reads Codex's global configuration.
+        // The index is updated only from authoritative parent EffortState
+        // events (foreign auto-review threads are filtered in the driver).
+        spec.initial_effort = initial_effort;
     }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
@@ -3068,7 +3107,7 @@ pub(crate) async fn resurrect_chat(
         // no stamp → let the spawn stamp now, as before).
         created_at_ms: (entry.created_at > 0).then(|| entry.created_at * 1000),
     };
-    match spawn_chat_session(state, entry.id.clone(), recipe, None) {
+    match spawn_chat_session(state, entry.id.clone(), recipe, None).await {
         Ok(_) => {
             // Same lifetime watcher every freshly-created chat gets (see
             // create_session): it tails the transcript for title records and is
