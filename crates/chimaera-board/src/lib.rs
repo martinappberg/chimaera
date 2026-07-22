@@ -22,6 +22,12 @@
 
 pub mod arrange;
 pub mod chart;
+/// The `chimaera board` CLI verbs (`cli` cargo feature — pulls clap). Mounted
+/// by the standalone `chimaera` binary AND the native app binary, so the
+/// daemon-written `chimaera` shim (an exec of `current_exe()`) resolves to a
+/// working board CLI in both deployments.
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod colormap;
 pub mod composites;
 pub mod cvd;

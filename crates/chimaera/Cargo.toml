@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
@@ -20,15 +19,13 @@ tracing-subscriber.workspace = true
 nix.workspace = true
 open.workspace = true
 mimalloc.workspace = true
-chimaera-board.workspace = true
+# `cli` mounts chimaera_board::cli::BoardCmd as the `board` subcommand (the
+# verb layer lives in the engine crate so the native app binary can mount the
+# identical set).
+chimaera-board = { workspace = true, features = ["cli"] }
 chimaera-core.workspace = true
 chimaera-remote.workspace = true
 chimaera-server.workspace = true
-
-[dev-dependencies]
-# The PDF-import tests build their fixture in-test instead of committing a
-# binary one; same pin as chimaera-board's export dependency.
-pdf-writer = "0.12"
 
 [features]
 # `board import fig.pdf` (hayro rasterization). Off by default — and off in

@@ -1,9 +1,16 @@
-//! `chimaera board` — the CLI half of the bidirectional loop.
+//! `chimaera board` — the CLI half of the bidirectional loop (`cli` feature).
 //!
-//! Everything here is a thin shell over `chimaera-board` crate functions; the
+//! Everything here is a thin shell over this crate's engine functions; the
 //! daemon routes wrap the same functions, which is what keeps the pane and the
 //! CLI showing the same pixels. All verbs are synchronous and touch only the
 //! filesystem — no daemon needs to be running.
+//!
+//! The module lives in the engine crate (not the `chimaera` binary) so BOTH
+//! binaries that can end up behind the `chimaera` shim answer `board`: the
+//! standalone `chimaera` CLI mounts [`BoardCmd`] as its `board` subcommand,
+//! and the native app binary (whose GUI exe IS the daemon there, so
+//! `current_exe()` resolves to it) dispatches `board` argv to [`run`] before
+//! any Tauri init.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,11 +18,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
-use chimaera_board::export::pdf::export_pdf;
-use chimaera_board::export::svg::{export_svg, SvgVariant};
-use chimaera_board::layout::FontStack;
-use chimaera_board::render::{render_page, RasterParams};
-use chimaera_board::theme::Theme;
+use crate::export::pdf::export_pdf;
+use crate::export::svg::{export_svg, SvgVariant};
+use crate::layout::FontStack;
+use crate::render::{render_page, RasterParams};
+use crate::theme::Theme;
 
 #[derive(Subcommand)]
 pub enum BoardCmd {
@@ -315,10 +322,10 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
         BoardCmd::Rescheme { path, theme, out } => rescheme(&path, &theme, out),
         BoardCmd::Describe { path } => {
             let board = load_normalized(&path)?.0;
-            let summary = chimaera_board::journal::summary(&journal_path_for(&path));
+            let summary = crate::journal::summary(&journal_path_for(&path));
             print!(
                 "{}",
-                chimaera_board::describe::describe_with_journal(&board, summary)
+                crate::describe::describe_with_journal(&board, summary)
             );
             Ok(())
         }
@@ -350,11 +357,9 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
 }
 
 /// Load, normalize, and report — the shared front half of every verb.
-fn load_normalized(
-    path: &Path,
-) -> Result<(chimaera_board::Board, Vec<chimaera_board::Diagnostic>)> {
-    let mut board = chimaera_board::load(path)?;
-    let diags = chimaera_board::normalize(&mut board);
+fn load_normalized(path: &Path) -> Result<(crate::Board, Vec<crate::Diagnostic>)> {
+    let mut board = crate::load(path)?;
+    let diags = crate::normalize(&mut board);
     Ok((board, diags))
 }
 
@@ -364,18 +369,18 @@ fn load_normalized(
 /// second key for the same board.
 fn journal_path_for(path: &Path) -> PathBuf {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let ws = chimaera_board::workspace_root(&abs);
-    chimaera_board::journal::journal_path(&ws, &abs)
+    let ws = crate::workspace_root(&abs);
+    crate::journal::journal_path(&ws, &abs)
 }
 
 fn journal(path: &Path, since: Option<u64>) -> Result<()> {
-    if !chimaera_board::is_board_path(path) {
+    if !crate::is_board_path(path) {
         bail!(
             "not a board: {} does not end in .board.json",
             path.display()
         );
     }
-    let events = chimaera_board::journal::read_since(&journal_path_for(path), since.unwrap_or(0))?;
+    let events = crate::journal::read_since(&journal_path_for(path), since.unwrap_or(0))?;
     if events.is_empty() {
         println!("no journal events");
         return Ok(());
@@ -386,11 +391,7 @@ fn journal(path: &Path, since: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-fn resolve_theme(
-    reference: Option<&str>,
-    board: &chimaera_board::Board,
-    ws: &Path,
-) -> Result<Theme> {
+fn resolve_theme(reference: Option<&str>, board: &crate::Board, ws: &Path) -> Result<Theme> {
     let name = reference
         .map(String::from)
         .or_else(|| board.theme.clone())
@@ -430,8 +431,8 @@ fn show(
 
     // --mermaid wraps the raw input as the spec's fourth body kind; the JSON
     // path stays exactly what it was.
-    let mut spec: chimaera_board::show::ShowSpec = if mermaid {
-        chimaera_board::show::ShowSpec {
+    let mut spec: crate::show::ShowSpec = if mermaid {
+        crate::show::ShowSpec {
             title: None,
             note: None,
             chart: None,
@@ -451,40 +452,40 @@ fn show(
 
     let size = match size {
         Some(s) => parse_size(&s)?,
-        None => chimaera_board::show::preset_size(preset)
+        None => crate::show::preset_size(preset)
             .with_context(|| format!("unknown preset {preset:?}; use default|wide|square|tall"))?,
     };
 
     let cwd = std::env::current_dir().context("resolving the working directory")?;
-    let ws = chimaera_board::workspace_root(&cwd);
+    let ws = crate::workspace_root(&cwd);
     let theme_id = theme_ref.unwrap_or_else(|| "talk-dark".to_string());
     let theme = Theme::resolve(&theme_id, Some(&ws))?;
 
-    let board = chimaera_board::show::build_board(&spec, size, &theme_id)?;
+    let board = crate::show::build_board(&spec, size, &theme_id)?;
     if emit_board {
-        print!("{}", chimaera_board::to_string(&board)?);
+        print!("{}", crate::to_string(&board)?);
     }
 
     let fonts = FontStack::for_workspace(&ws);
     let rendered = render_page(&board, 0, &theme, &fonts, RasterParams::default())?;
 
     // Content-derived id unless the caller supplied an update handle.
-    let card_id = id.unwrap_or_else(|| chimaera_board::show::spec_id(&raw));
+    let card_id = id.unwrap_or_else(|| crate::show::spec_id(&raw));
     let (board_path, png_path) = match out {
         Some(p) => {
             let board_path = p.with_extension("board.json");
             (board_path, p)
         }
         None => {
-            let shown = chimaera_board::ensure_shown_dir(&ws)?;
+            let shown = crate::ensure_shown_dir(&ws)?;
             (
                 shown.join(format!("{card_id}.board.json")),
                 shown.join(format!("{card_id}.png")),
             )
         }
     };
-    chimaera_board::save(&board_path, &board)?;
-    chimaera_board::write_atomic(&png_path, &rendered.png)?;
+    crate::save(&board_path, &board)?;
+    crate::write_atomic(&png_path, &rendered.png)?;
     append_shown_event(&board_path);
 
     if !quiet {
@@ -495,13 +496,13 @@ fn show(
         };
         println!(
             "{} → {}",
-            chimaera_board::show::summary(&board, &theme_id),
+            crate::show::summary(&board, &theme_id),
             rel(&board_path)
         );
         for d in rendered
             .diagnostics
             .iter()
-            .filter(|d| d.severity != chimaera_board::Severity::Info)
+            .filter(|d| d.severity != crate::Severity::Info)
         {
             eprintln!("{}", d.render());
         }
@@ -515,7 +516,7 @@ fn show(
 /// already on disk and the one-line stdout is the contract, so a journal
 /// failure warns rather than failing a show that succeeded.
 fn append_shown_event(board_path: &Path) {
-    use chimaera_board::journal::{Actor, Event, EventKind, Journal};
+    use crate::journal::{Actor, Event, EventKind, Journal};
     let appended = Journal::open(&journal_path_for(board_path))
         .and_then(|mut journal| journal.append(Event::new(Actor::Agent, EventKind::Shown)));
     if let Err(err) = appended {
@@ -541,7 +542,7 @@ fn new(path: &Path, title: Option<String>, theme: &str) -> Result<()> {
     if path.exists() {
         bail!("{} already exists", path.display());
     }
-    if !chimaera_board::is_board_path(path) {
+    if !crate::is_board_path(path) {
         bail!(
             "a board path ends in .board.json — try {}",
             path.with_extension("board.json").display()
@@ -553,12 +554,12 @@ fn new(path: &Path, title: Option<String>, theme: &str) -> Result<()> {
             .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
             .unwrap_or_else(|| "Untitled".to_string())
     });
-    let mut board = chimaera_board::Board::new(title, chimaera_board::Canvas::default());
+    let mut board = crate::Board::new(title, crate::Canvas::default());
     board.theme = Some(theme.to_string());
-    chimaera_board::save(path, &board)?;
+    crate::save(path, &board)?;
     // The workspace surround comes into being with the first board.
     let cwd = std::env::current_dir()?;
-    chimaera_board::ensure_board_dir(&chimaera_board::workspace_root(&cwd))?;
+    crate::ensure_board_dir(&crate::workspace_root(&cwd))?;
     println!("created {}", path.display());
     Ok(())
 }
@@ -571,7 +572,7 @@ fn render(
     theme_ref: Option<String>,
 ) -> Result<()> {
     let (board, diags) = load_normalized(path)?;
-    let ws = chimaera_board::workspace_root(path);
+    let ws = crate::workspace_root(path);
     let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
     let fonts = FontStack::for_workspace(&ws);
     let params = RasterParams {
@@ -579,10 +580,7 @@ fn render(
         workspace: Some(ws.clone()),
     };
 
-    for d in diags
-        .iter()
-        .filter(|d| d.severity != chimaera_board::Severity::Info)
-    {
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
         eprintln!("{}", d.render());
     }
 
@@ -591,7 +589,7 @@ fn render(
         None => (0..board.pages.len()).collect(),
     };
     let single = pages.len() == 1;
-    let canonical = chimaera_board::to_string(&board)?;
+    let canonical = crate::to_string(&board)?;
 
     for p in pages {
         let rendered = render_page(&board, p, &theme, &fonts, params.clone())?;
@@ -599,18 +597,18 @@ fn render(
             (Some(o), true) => o.clone(),
             (Some(o), false) => o.join(format!("{}.png", board.pages[p].id)),
             (None, _) => {
-                let dir = chimaera_board::ensure_board_dir(&ws)?.join("renders");
+                let dir = crate::ensure_board_dir(&ws)?.join("renders");
                 std::fs::create_dir_all(&dir)?;
-                let key = chimaera_board::render::render_key(&canonical, &theme, p, params.clone());
+                let key = crate::render::render_key(&canonical, &theme, p, params.clone());
                 dir.join(format!("{key}.png"))
             }
         };
-        chimaera_board::write_atomic(&dest, &rendered.png)?;
+        crate::write_atomic(&dest, &rendered.png)?;
         // The default destination is the shared content-addressed cache; an
         // explicit -o is the user's own path and never pruned.
         if out.is_none() {
             if let Some(dir) = dest.parent() {
-                chimaera_board::prune_renders(dir, chimaera_board::RENDER_CACHE_CAP);
+                crate::prune_renders(dir, crate::RENDER_CACHE_CAP);
             }
         }
         println!(
@@ -624,7 +622,7 @@ fn render(
         for d in rendered
             .diagnostics
             .iter()
-            .filter(|d| d.severity != chimaera_board::Severity::Info)
+            .filter(|d| d.severity != crate::Severity::Info)
         {
             eprintln!("{}", d.render());
         }
@@ -644,21 +642,18 @@ fn export(
     // --charts is a pptx knob; validate up front so a typo is loud and a
     // stray `--charts native` on an SVG export never silently no-ops.
     let chart_fidelity = match charts {
-        "grouped" => chimaera_board::export::ChartFidelity::Grouped,
-        "native" => chimaera_board::export::ChartFidelity::Native,
+        "grouped" => crate::export::ChartFidelity::Grouped,
+        "native" => crate::export::ChartFidelity::Native,
         other => bail!("unknown --charts {other:?}: use grouped | native"),
     };
-    if chart_fidelity != chimaera_board::export::ChartFidelity::Grouped && format != "pptx" {
+    if chart_fidelity != crate::export::ChartFidelity::Grouped && format != "pptx" {
         bail!("--charts applies to pptx only");
     }
     let (board, diags) = load_normalized(path)?;
-    for d in diags
-        .iter()
-        .filter(|d| d.severity != chimaera_board::Severity::Info)
-    {
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
         eprintln!("{}", d.render());
     }
-    let ws = chimaera_board::workspace_root(path);
+    let ws = crate::workspace_root(path);
     let theme = resolve_theme(None, &board, &ws)?;
     let fonts = FontStack::for_workspace(&ws);
 
@@ -669,8 +664,7 @@ fn export(
         .and_then(|n| n.to_str())
         .map(|n| n.trim_end_matches(".board.json").to_string())
         .unwrap_or_else(|| "board".to_string());
-    let exports_dir =
-        || -> Result<PathBuf> { Ok(chimaera_board::ensure_board_dir(&ws)?.join("exports")) };
+    let exports_dir = || -> Result<PathBuf> { Ok(crate::ensure_board_dir(&ws)?.join("exports")) };
 
     match format {
         "svg" | "svg-outlined" => {
@@ -697,7 +691,7 @@ fn export(
                         exports_dir()?.join(format!("{base}-{}.svg", board.pages[p].id))
                     }
                 };
-                chimaera_board::write_atomic(&dest, svg.as_bytes())?;
+                crate::write_atomic(&dest, svg.as_bytes())?;
                 println!(
                     "page {} ({}) → {}",
                     p + 1,
@@ -716,7 +710,7 @@ fn export(
                 Some(o) => o,
                 None => exports_dir()?.join(format!("{stem}.pdf")),
             };
-            chimaera_board::write_atomic(&dest, &pdf)?;
+            crate::write_atomic(&dest, &pdf)?;
             let n = board.pages.len();
             println!(
                 "{n} page{} → {}",
@@ -729,8 +723,8 @@ fn export(
                 bail!("--page does not apply to pptx: the whole deck exports as one file");
             }
             let mut bytes = Vec::new();
-            let opts = chimaera_board::export::PptxOptions { chart_fidelity };
-            let report = chimaera_board::export::write_pptx_with(
+            let opts = crate::export::PptxOptions { chart_fidelity };
+            let report = crate::export::write_pptx_with(
                 &board,
                 &theme,
                 &fonts,
@@ -742,7 +736,7 @@ fn export(
                 Some(o) => o,
                 None => exports_dir()?.join(format!("{stem}.pptx")),
             };
-            chimaera_board::write_atomic(&dest, &bytes)?;
+            crate::write_atomic(&dest, &bytes)?;
             // The degradation contract, stated per object rather than
             // discovered after the deck is opened.
             for fate in &report.objects {
@@ -781,7 +775,7 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
     if src.trim().is_empty() {
         bail!("no mermaid source: pass a file, or `-` with the source on stdin");
     }
-    let (mut diagram, notes) = chimaera_board::diagram::from_mermaid_with_notes(&src)?;
+    let (mut diagram, notes) = crate::diagram::from_mermaid_with_notes(&src)?;
     for n in &notes {
         eprintln!("note: {n}");
     }
@@ -817,22 +811,19 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
     let (obj_id, n_nodes, n_edges) = (diagram.id.clone(), diagram.nodes.len(), diagram.edges.len());
     board.pages[page_index]
         .objects
-        .push(chimaera_board::Object::Diagram(diagram));
-    let diags = chimaera_board::normalize(&mut board);
+        .push(crate::Object::Diagram(diagram));
+    let diags = crate::normalize(&mut board);
     let mut errors = 0;
-    for d in diags
-        .iter()
-        .filter(|d| d.severity != chimaera_board::Severity::Info)
-    {
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
         eprintln!("{}", d.render());
-        if d.severity == chimaera_board::Severity::Error {
+        if d.severity == crate::Severity::Error {
             errors += 1;
         }
     }
     if errors > 0 {
         bail!("{errors} error(s); nothing written");
     }
-    chimaera_board::save(to, &board)?;
+    crate::save(to, &board)?;
     println!(
         "imported {obj_id:?} · {n_nodes} nodes · {n_edges} edges → {} (page {})",
         to.display(),
@@ -843,33 +834,26 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
 
 /// Load `to`, or start a fresh one-page board when it does not exist yet —
 /// the shared front half of every import.
-fn load_or_create_board(to: &Path) -> Result<chimaera_board::Board> {
-    if !chimaera_board::is_board_path(to) {
+fn load_or_create_board(to: &Path) -> Result<crate::Board> {
+    if !crate::is_board_path(to) {
         bail!(
             "a board path ends in .board.json — try {}",
             to.with_extension("board.json").display()
         );
     }
     if to.exists() {
-        chimaera_board::load(to)
+        crate::load(to)
     } else {
         let title = to
             .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
             .unwrap_or_else(|| "Untitled".to_string());
-        Ok(chimaera_board::Board::new(
-            title,
-            chimaera_board::Canvas::default(),
-        ))
+        Ok(crate::Board::new(title, crate::Canvas::default()))
     }
 }
 
-fn resolve_page_index(
-    board: &mut chimaera_board::Board,
-    page: Option<&str>,
-    to: &Path,
-) -> Result<usize> {
+fn resolve_page_index(board: &mut crate::Board, page: Option<&str>, to: &Path) -> Result<usize> {
     match page {
         Some(pid) => board
             .pages
@@ -878,7 +862,7 @@ fn resolve_page_index(
             .with_context(|| format!("no page {pid:?} in {}", to.display())),
         None => {
             if board.pages.is_empty() {
-                board.pages.push(chimaera_board::Page::new("page-1"));
+                board.pages.push(crate::Page::new("page-1"));
             }
             Ok(0)
         }
@@ -926,13 +910,13 @@ fn import(
         _ => {
             let bytes =
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            if chimaera_board::pdfimport::sniff_pdf(&bytes) {
+            if crate::pdfimport::sniff_pdf(&bytes) {
                 import_pdf(path, to, page, id, regen, pdf_page, dpi)
             } else if looks_like_mermaid(&bytes) {
                 pdf_only_note();
                 import_mermaid(path, to, page, id)
-            } else if chimaera_board::imginfo::sniff_image(&bytes, &path.to_string_lossy())
-                != chimaera_board::imginfo::ImgKind::Unknown
+            } else if crate::imginfo::sniff_image(&bytes, &path.to_string_lossy())
+                != crate::imginfo::ImgKind::Unknown
             {
                 pdf_only_note();
                 import_figure(path, to, page, id, regen)
@@ -990,18 +974,18 @@ fn import_figure(
     id: Option<String>,
     regen: Option<String>,
 ) -> Result<()> {
-    use chimaera_board::imginfo::ImgKind;
+    use crate::imginfo::ImgKind;
 
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("{} has no usable file name", path.display()))?;
-    let kind = chimaera_board::imginfo::sniff_image(&bytes, name);
+    let kind = crate::imginfo::sniff_image(&bytes, name);
     if kind == ImgKind::Unknown {
         bail!("{} is not a recognizable PNG, JPEG, or SVG", path.display());
     }
-    if !chimaera_board::is_board_path(to) {
+    if !crate::is_board_path(to) {
         bail!(
             "a board path ends in .board.json — try {}",
             to.with_extension("board.json").display()
@@ -1013,9 +997,9 @@ fn import_figure(
     } else {
         cwd.join(to)
     };
-    let ws = chimaera_board::workspace_root(&to_abs);
-    chimaera_board::ensure_board_dir(&ws)?;
-    let assets = chimaera_board::board_dir(&ws).join("assets");
+    let ws = crate::workspace_root(&to_abs);
+    crate::ensure_board_dir(&ws)?;
+    let assets = crate::board_dir(&ws).join("assets");
     std::fs::create_dir_all(&assets).with_context(|| format!("creating {}", assets.display()))?;
 
     // Land the asset: an identical name+bytes is reused, a name collision
@@ -1033,15 +1017,15 @@ fn import_figure(
     }
     let dest = assets.join(&asset_name);
     if !dest.exists() {
-        chimaera_board::write_atomic(&dest, &bytes)?;
+        crate::write_atomic(&dest, &bytes)?;
     }
-    let src_rel = format!("{}/assets/{asset_name}", chimaera_board::BOARD_DIR);
+    let src_rel = format!("{}/assets/{asset_name}", crate::BOARD_DIR);
 
     // Natural size: sniffed pixels for rasters, document units for SVG; both
     // place at 96 dpi (unit × 0.75 pt), the convention the renderer shares.
     let (pixel_size, natural_pt) = match kind {
         ImgKind::Png | ImgKind::Jpeg => {
-            let (w, h) = chimaera_board::imginfo::raster_dimensions(kind, &bytes)
+            let (w, h) = crate::imginfo::raster_dimensions(kind, &bytes)
                 .with_context(|| format!("could not read the pixel size of {}", path.display()))?;
             (
                 Some([w as f64, h as f64]),
@@ -1051,8 +1035,8 @@ fn import_figure(
         ImgKind::Svg => {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
-            let fonts = chimaera_board::layout::FontStack::for_workspace(&ws);
-            match chimaera_board::imginfo::sanitize_svg(text, fonts.db(), "probe-") {
+            let fonts = crate::layout::FontStack::for_workspace(&ws);
+            match crate::imginfo::sanitize_svg(text, fonts.db(), "probe-") {
                 Ok(san) => (None, Some([san.width * 0.75, san.height * 0.75])),
                 Err(e) => {
                     eprintln!("note: svg did not parse ({e}); imported, but it will render as a placeholder");
@@ -1102,15 +1086,15 @@ fn import_figure(
     }
     let page_index = resolve_page_index(&mut board, page.as_deref(), to)?;
 
-    let image = chimaera_board::schema::ImageObject {
+    let image = crate::schema::ImageObject {
         id: obj_id.clone(),
-        kind: chimaera_board::schema::ImageKind,
+        kind: crate::schema::ImageKind,
         src: src_rel.clone(),
         slot: None,
         at: Some([m, m]),
         size: Some(size),
         src_rect: None,
-        provenance: Some(chimaera_board::schema::Provenance {
+        provenance: Some(crate::schema::Provenance {
             script: None,
             regen,
             sha256: Some(digest),
@@ -1126,22 +1110,19 @@ fn import_figure(
     };
     board.pages[page_index]
         .objects
-        .push(chimaera_board::Object::Image(image));
-    let diags = chimaera_board::normalize(&mut board);
+        .push(crate::Object::Image(image));
+    let diags = crate::normalize(&mut board);
     let mut errors = 0;
-    for d in diags
-        .iter()
-        .filter(|d| d.severity != chimaera_board::Severity::Info)
-    {
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
         eprintln!("{}", d.render());
-        if d.severity == chimaera_board::Severity::Error {
+        if d.severity == crate::Severity::Error {
             errors += 1;
         }
     }
     if errors > 0 {
         bail!("{errors} error(s); nothing written");
     }
-    chimaera_board::save(to, &board)?;
+    crate::save(to, &board)?;
     let px_note = pixel_size
         .map(|[w, h]| format!(" · {w}×{h} px"))
         .unwrap_or_default();
@@ -1168,7 +1149,7 @@ fn import_pdf(
     pdf_page: Option<usize>,
     dpi: Option<f64>,
 ) -> Result<()> {
-    use chimaera_board::pdfimport;
+    use crate::pdfimport;
 
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let src_digest = sha256_hex(&bytes);
@@ -1180,7 +1161,7 @@ fn import_pdf(
     let raster = pdfimport::rasterize_pdf_page(bytes, pdf_page, dpi_req)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if !chimaera_board::is_board_path(to) {
+    if !crate::is_board_path(to) {
         bail!(
             "a board path ends in .board.json — try {}",
             to.with_extension("board.json").display()
@@ -1192,9 +1173,9 @@ fn import_pdf(
     } else {
         cwd.join(to)
     };
-    let ws = chimaera_board::workspace_root(&to_abs);
-    chimaera_board::ensure_board_dir(&ws)?;
-    let assets = chimaera_board::board_dir(&ws).join("assets");
+    let ws = crate::workspace_root(&to_abs);
+    crate::ensure_board_dir(&ws)?;
+    let assets = crate::board_dir(&ws).join("assets");
     std::fs::create_dir_all(&assets).with_context(|| format!("creating {}", assets.display()))?;
 
     // Land the PNG under the figure convention: stem + source page names it,
@@ -1216,9 +1197,9 @@ fn import_pdf(
     }
     let dest = assets.join(&asset_name);
     if !dest.exists() {
-        chimaera_board::write_atomic(&dest, &raster.png)?;
+        crate::write_atomic(&dest, &raster.png)?;
     }
-    let src_rel = format!("{}/assets/{asset_name}", chimaera_board::BOARD_DIR);
+    let src_rel = format!("{}/assets/{asset_name}", crate::BOARD_DIR);
 
     let mut board = load_or_create_board(to)?;
     // Fit into the canvas minus a margin, preserving aspect, never upscaling
@@ -1252,21 +1233,21 @@ fn import_pdf(
     }
     let page_index = resolve_page_index(&mut board, page.as_deref(), to)?;
 
-    let mut extra = chimaera_board::schema::Extra::default();
+    let mut extra = crate::schema::Extra::default();
     extra.insert(
         "source".to_string(),
         serde_json::Value::String(format!("{}#page={pdf_page}", path.display())),
     );
     let [px_w, px_h] = raster.pixel_size;
-    let image = chimaera_board::schema::ImageObject {
+    let image = crate::schema::ImageObject {
         id: obj_id.clone(),
-        kind: chimaera_board::schema::ImageKind,
+        kind: crate::schema::ImageKind,
         src: src_rel.clone(),
         slot: None,
         at: Some([m, m]),
         size: Some(size),
         src_rect: None,
-        provenance: Some(chimaera_board::schema::Provenance {
+        provenance: Some(crate::schema::Provenance {
             script: None,
             regen,
             sha256: Some(src_digest),
@@ -1282,22 +1263,19 @@ fn import_pdf(
     };
     board.pages[page_index]
         .objects
-        .push(chimaera_board::Object::Image(image));
-    let diags = chimaera_board::normalize(&mut board);
+        .push(crate::Object::Image(image));
+    let diags = crate::normalize(&mut board);
     let mut errors = 0;
-    for d in diags
-        .iter()
-        .filter(|d| d.severity != chimaera_board::Severity::Info)
-    {
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
         eprintln!("{}", d.render());
-        if d.severity == chimaera_board::Severity::Error {
+        if d.severity == crate::Severity::Error {
             errors += 1;
         }
     }
     if errors > 0 {
         bail!("{errors} error(s); nothing written");
     }
-    chimaera_board::save(to, &board)?;
+    crate::save(to, &board)?;
     println!(
         "imported image {obj_id:?} · {px_w}×{px_h} px · pdf page {pdf_page}/{} → {} (page {}) · asset {src_rel}",
         raster.page_count,
@@ -1313,12 +1291,12 @@ fn import_pdf(
 /// collisions with a numeric suffix and saying so.
 fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
-    let ws = chimaera_board::workspace_root(&cwd);
+    let ws = crate::workspace_root(&cwd);
     let direct = PathBuf::from(shown);
-    let shown_candidate = chimaera_board::board_dir(&ws)
+    let shown_candidate = crate::board_dir(&ws)
         .join("shown")
         .join(format!("{shown}.board.json"));
-    let src = if direct.exists() && chimaera_board::is_board_path(&direct) {
+    let src = if direct.exists() && crate::is_board_path(&direct) {
         direct
     } else if shown_candidate.exists() {
         shown_candidate.clone()
@@ -1329,11 +1307,11 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
             shown_candidate.display()
         );
     };
-    let src_board = chimaera_board::load(&src)?;
+    let src_board = crate::load(&src)?;
 
     match to {
         Some(target) => {
-            if !chimaera_board::is_board_path(&target) {
+            if !crate::is_board_path(&target) {
                 bail!(
                     "a board path ends in .board.json — got {}",
                     target.display()
@@ -1345,33 +1323,30 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
                     target.display()
                 );
             }
-            let mut board = chimaera_board::load(&target)?;
+            let mut board = crate::load(&target)?;
             let (adopted, notes) = merge_pages(&mut board, src_board);
-            let diags = chimaera_board::normalize(&mut board);
+            let diags = crate::normalize(&mut board);
             let mut errors = 0;
-            for d in diags
-                .iter()
-                .filter(|d| d.severity != chimaera_board::Severity::Info)
-            {
+            for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
                 eprintln!("{}", d.render());
-                if d.severity == chimaera_board::Severity::Error {
+                if d.severity == crate::Severity::Error {
                     errors += 1;
                 }
             }
             if errors > 0 {
                 bail!("{errors} error(s); nothing written");
             }
-            chimaera_board::save(&target, &board)?;
+            crate::save(&target, &board)?;
             for n in &notes {
                 println!("note: {n}");
             }
             // The semantic trace: one page-added per adopted page. The human
             // asked for the adoption, so the human is the actor.
-            let mut journal = chimaera_board::journal::Journal::open(&journal_path_for(&target))?;
+            let mut journal = crate::journal::Journal::open(&journal_path_for(&target))?;
             for page in &adopted {
-                journal.append(chimaera_board::journal::Event::new(
-                    chimaera_board::journal::Actor::Human,
-                    chimaera_board::journal::EventKind::PageAdded { page: page.clone() },
+                journal.append(crate::journal::Event::new(
+                    crate::journal::Actor::Human,
+                    crate::journal::EventKind::PageAdded { page: page.clone() },
                 ))?;
             }
             println!(
@@ -1398,14 +1373,14 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
             }
             let bytes =
                 std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
-            chimaera_board::write_atomic(&dest, &bytes)?;
+            crate::write_atomic(&dest, &bytes)?;
             std::fs::remove_file(&src)
                 .with_context(|| format!("removing the shown copy {}", src.display()))?;
-            let mut journal = chimaera_board::journal::Journal::open(&journal_path_for(&dest))?;
+            let mut journal = crate::journal::Journal::open(&journal_path_for(&dest))?;
             for page in &src_board.pages {
-                journal.append(chimaera_board::journal::Event::new(
-                    chimaera_board::journal::Actor::Human,
-                    chimaera_board::journal::EventKind::PageAdded {
+                journal.append(crate::journal::Event::new(
+                    crate::journal::Actor::Human,
+                    crate::journal::EventKind::PageAdded {
                         page: page.id.clone(),
                     },
                 ))?;
@@ -1423,10 +1398,7 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
 /// Append `src`'s pages to `target`, re-id'ing page and object collisions
 /// with a numeric suffix. Returns the adopted page ids (post-rename) and the
 /// human-readable notes for every rename.
-fn merge_pages(
-    target: &mut chimaera_board::Board,
-    src: chimaera_board::Board,
-) -> (Vec<String>, Vec<String>) {
+fn merge_pages(target: &mut crate::Board, src: crate::Board) -> (Vec<String>, Vec<String>) {
     use std::collections::{BTreeMap, BTreeSet};
 
     fn free_id(id: &str, taken: &BTreeSet<String>) -> String {
@@ -1444,7 +1416,7 @@ fn merge_pages(
     }
 
     fn collect_renames(
-        objects: &[chimaera_board::Object],
+        objects: &[crate::Object],
         taken: &mut BTreeSet<String>,
         renames: &mut BTreeMap<String, String>,
     ) {
@@ -1453,7 +1425,7 @@ fn merge_pages(
             if !id.is_empty() {
                 // An Unknown object's id lives inside preserved raw JSON, so
                 // it cannot be renamed — it only occupies its id.
-                if matches!(o, chimaera_board::Object::Unknown(_)) {
+                if matches!(o, crate::Object::Unknown(_)) {
                     taken.insert(id);
                 } else {
                     let new = free_id(&id, taken);
@@ -1463,13 +1435,13 @@ fn merge_pages(
                     taken.insert(new);
                 }
             }
-            if let chimaera_board::Object::Group(g) = o {
+            if let crate::Object::Group(g) = o {
                 collect_renames(&g.objects, taken, renames);
             }
         }
     }
 
-    fn fix_endpoint(ep: &mut chimaera_board::schema::EndPoint, renames: &BTreeMap<String, String>) {
+    fn fix_endpoint(ep: &mut crate::schema::EndPoint, renames: &BTreeMap<String, String>) {
         if let Some(obj) = &mut ep.object {
             if let Some(n) = renames.get(obj) {
                 *obj = n.clone();
@@ -1477,10 +1449,7 @@ fn merge_pages(
         }
     }
 
-    fn fix_anchor(
-        anchor: &mut Option<chimaera_board::schema::Anchor>,
-        renames: &BTreeMap<String, String>,
-    ) {
+    fn fix_anchor(anchor: &mut Option<crate::schema::Anchor>, renames: &BTreeMap<String, String>) {
         if let Some(a) = anchor {
             if let Some(obj) = &mut a.object {
                 if let Some(n) = renames.get(obj) {
@@ -1490,8 +1459,8 @@ fn merge_pages(
         }
     }
 
-    fn apply_renames(objects: &mut [chimaera_board::Object], renames: &BTreeMap<String, String>) {
-        use chimaera_board::Object as O;
+    fn apply_renames(objects: &mut [crate::Object], renames: &BTreeMap<String, String>) {
+        use crate::Object as O;
         let fix = |s: &mut String| {
             if let Some(n) = renames.get(s) {
                 *s = n.clone();
@@ -1590,15 +1559,15 @@ fn merge_pages(
 /// `board theme-export` — the theme's numbers for external plotting code.
 fn theme_export(theme_id: &str, format: &str, out: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
-    let ws = chimaera_board::workspace_root(&cwd);
+    let ws = crate::workspace_root(&cwd);
     let theme = Theme::resolve(theme_id, Some(&ws))?;
     let body = match format {
         // The bundled ids export their exact source bytes; anything else is
         // the parsed theme, pretty-printed deterministically (BTreeMaps).
         "json" => match theme_id {
-            "talk-dark" => chimaera_board::theme::TALK_DARK.to_string(),
-            "talk-light" => chimaera_board::theme::TALK_LIGHT.to_string(),
-            "figure-light" => chimaera_board::theme::FIGURE_LIGHT.to_string(),
+            "talk-dark" => crate::theme::TALK_DARK.to_string(),
+            "talk-light" => crate::theme::TALK_LIGHT.to_string(),
+            "figure-light" => crate::theme::FIGURE_LIGHT.to_string(),
             _ => {
                 let mut s =
                     serde_json::to_string_pretty(&theme).context("serializing the theme")?;
@@ -1611,7 +1580,7 @@ fn theme_export(theme_id: &str, format: &str, out: Option<PathBuf>) -> Result<()
     };
     match out {
         Some(p) => {
-            chimaera_board::write_atomic(&p, body.as_bytes())?;
+            crate::write_atomic(&p, body.as_bytes())?;
             println!("{} ({format}) → {}", theme.id, p.display());
         }
         None => print!("{body}"),
@@ -1624,7 +1593,7 @@ fn theme_export(theme_id: &str, format: &str, out: Option<PathBuf>) -> Result<()
 /// theme always exports the same bytes.
 fn mplstyle_for(theme: &Theme) -> String {
     use std::fmt::Write as _;
-    let hex = |rgb: chimaera_board::theme::Rgb| rgb.hex()[1..].to_string();
+    let hex = |rgb: crate::theme::Rgb| rgb.hex()[1..].to_string();
     let bg = hex(theme.bg());
     let body_c = hex(theme.color_or_fg(Some("@body")));
     let muted = theme
@@ -1685,7 +1654,7 @@ struct ReschemeRow {
 struct ColorHit {
     start: usize,
     end: usize,
-    rgb: chimaera_board::theme::Rgb,
+    rgb: crate::theme::Rgb,
 }
 
 /// Find every color literal in `fill`/`stroke`/`stop-color` positions — both
@@ -1728,8 +1697,8 @@ fn scan_svg_colors(src: &str) -> Vec<ColorHit> {
     hits
 }
 
-fn parse_css_color(v: &str) -> Option<chimaera_board::theme::Rgb> {
-    if let Some(rgb) = chimaera_board::theme::parse_hex(v) {
+fn parse_css_color(v: &str) -> Option<crate::theme::Rgb> {
+    if let Some(rgb) = crate::theme::parse_hex(v) {
         return Some(rgb);
     }
     let named = match v.to_ascii_lowercase().as_str() {
@@ -1749,7 +1718,7 @@ fn parse_css_color(v: &str) -> Option<chimaera_board::theme::Rgb> {
         "teal" => "#008080",
         _ => return None,
     };
-    chimaera_board::theme::parse_hex(named)
+    crate::theme::parse_hex(named)
 }
 
 /// The mechanical recolor: map the SVG's own colors onto the theme.
@@ -1761,23 +1730,22 @@ fn rescheme_svg(src: &str, theme: &Theme) -> (String, Vec<ReschemeRow>) {
     let hits = scan_svg_colors(src);
 
     // Frequency in first-seen order, so ties break deterministically.
-    let mut order: Vec<(chimaera_board::theme::Rgb, usize)> = Vec::new();
+    let mut order: Vec<(crate::theme::Rgb, usize)> = Vec::new();
     for h in &hits {
         match order.iter_mut().find(|(c, _)| *c == h.rgb) {
             Some((_, n)) => *n += 1,
             None => order.push((h.rgb, 1)),
         }
     }
-    let mut ranked: Vec<(usize, chimaera_board::theme::Rgb, usize)> = order
+    let mut ranked: Vec<(usize, crate::theme::Rgb, usize)> = order
         .iter()
         .enumerate()
         .map(|(i, (c, n))| (i, *c, *n))
         .collect();
     ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
-    let saturated = |c: &chimaera_board::theme::Rgb| {
-        (c.r.max(c.g).max(c.b) as i32 - c.r.min(c.g).min(c.b) as i32) >= 25
-    };
+    let saturated =
+        |c: &crate::theme::Rgb| (c.r.max(c.g).max(c.b) as i32 - c.r.min(c.g).min(c.b) as i32) >= 25;
 
     enum Target {
         Bg,
@@ -1786,7 +1754,7 @@ fn rescheme_svg(src: &str, theme: &Theme) -> (String, Vec<ReschemeRow>) {
         Kept,
     }
 
-    let mut decisions: Vec<(chimaera_board::theme::Rgb, usize, Target)> = Vec::new();
+    let mut decisions: Vec<(crate::theme::Rgb, usize, Target)> = Vec::new();
     let mut extremes = Vec::new();
     let mut mids = Vec::new();
     for (_, c, n) in ranked {
@@ -1833,7 +1801,7 @@ fn rescheme_svg(src: &str, theme: &Theme) -> (String, Vec<ReschemeRow>) {
     }
 
     let mut rows = Vec::new();
-    let mut map: Vec<(chimaera_board::theme::Rgb, chimaera_board::theme::Rgb)> = Vec::new();
+    let mut map: Vec<(crate::theme::Rgb, crate::theme::Rgb)> = Vec::new();
     for (c, n, t) in &decisions {
         let (label, to) = match t {
             Target::Bg => ("@bg".to_string(), theme.color("@bg")),
@@ -1883,7 +1851,7 @@ fn rescheme_svg(src: &str, theme: &Theme) -> (String, Vec<ReschemeRow>) {
 fn rescheme(path: &Path, theme_ref: &str, out: Option<PathBuf>) -> Result<()> {
     let src =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let ws = chimaera_board::workspace_root(path);
+    let ws = crate::workspace_root(path);
     let theme = Theme::resolve(theme_ref, Some(&ws))?;
     let (recolored, rows) = rescheme_svg(&src, &theme);
     if rows.is_empty() {
@@ -1905,7 +1873,7 @@ fn rescheme(path: &Path, theme_ref: &str, out: Option<PathBuf>) -> Result<()> {
             .unwrap_or("figure");
         path.with_file_name(format!("{stem}-{}.svg", theme.id))
     });
-    chimaera_board::write_atomic(&dest, recolored.as_bytes())?;
+    crate::write_atomic(&dest, recolored.as_bytes())?;
     println!("→ {}", dest.display());
     Ok(())
 }
@@ -1918,20 +1886,20 @@ fn lint(
     strict: bool,
     fix: bool,
 ) -> Result<()> {
-    let ws = chimaera_board::workspace_root(path);
+    let ws = crate::workspace_root(path);
 
     // --fix runs first, on the file exactly as it stands — normalizing before
     // the fix would pre-snap the grid and hide the very classes it repairs.
     // The repaired board saves through the canonical writer; an untouched
     // board is not re-saved (no mtime churn for a no-op).
     if fix {
-        let mut board = chimaera_board::load(path)?;
+        let mut board = crate::load(path)?;
         let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
-        let fixes = chimaera_board::lint::lint_fix(&mut board, &theme);
+        let fixes = crate::lint::lint_fix(&mut board, &theme);
         if fixes.is_empty() {
             println!("nothing to fix");
         } else {
-            chimaera_board::save(path, &board)?;
+            crate::save(path, &board)?;
             for f in &fixes {
                 println!("fixed: {f}");
             }
@@ -1948,28 +1916,26 @@ fn lint(
     // stack; the plain legality profile stays scan-free.
     let fonts = (style || target_id.is_some()).then(|| FontStack::for_workspace(&ws));
     match target_id.as_deref() {
-        None => diags.extend(chimaera_board::lint::lint(&board, &theme)),
+        None => diags.extend(crate::lint::lint(&board, &theme)),
         Some(id) => {
-            let preset = chimaera_board::presets::get(id).with_context(|| {
+            let preset = crate::presets::get(id).with_context(|| {
                 format!(
                     "unknown target {id:?}; presets are {}",
-                    chimaera_board::presets::ids().join(", ")
+                    crate::presets::ids().join(", ")
                 )
             })?;
             let fonts = fonts.as_ref().expect("built for any target");
-            diags.extend(chimaera_board::lint::lint_target(
-                &board, &theme, preset, fonts,
-            ));
+            diags.extend(crate::lint::lint_target(&board, &theme, preset, fonts));
             // The census: every top-level object's computed export fate, so
             // degradation is stated before an export, never discovered after.
             let (mut native, mut grouped, mut vector, mut raster) = (0u32, 0u32, 0u32, 0u32);
             for page in &board.pages {
                 for obj in &page.objects {
-                    match chimaera_board::presets::tier_of(obj).0 {
-                        chimaera_board::export::ExportTier::Native => native += 1,
-                        chimaera_board::export::ExportTier::Grouped => grouped += 1,
-                        chimaera_board::export::ExportTier::Vector => vector += 1,
-                        chimaera_board::export::ExportTier::Raster => raster += 1,
+                    match crate::presets::tier_of(obj).0 {
+                        crate::export::ExportTier::Native => native += 1,
+                        crate::export::ExportTier::Grouped => grouped += 1,
+                        crate::export::ExportTier::Vector => vector += 1,
+                        crate::export::ExportTier::Raster => raster += 1,
                     }
                 }
             }
@@ -1981,7 +1947,7 @@ fn lint(
     }
 
     if style {
-        diags.extend(chimaera_board::lint::lint_style(
+        diags.extend(crate::lint::lint_style(
             &board,
             &theme,
             fonts.as_ref().expect("built for --style"),
@@ -1997,7 +1963,7 @@ fn lint(
     let mut errors = 0;
     for d in &diags {
         println!("{}", d.render());
-        if d.severity == chimaera_board::Severity::Error {
+        if d.severity == crate::Severity::Error {
             errors += 1;
         }
     }
@@ -2007,7 +1973,7 @@ fn lint(
     Ok(())
 }
 
-/// Apply an [`chimaera_board::arrange`] op and save through the same
+/// Apply an [`crate::arrange`] op and save through the same
 /// pipeline a pane gesture takes: mutate → normalize (grid snap) → canonical
 /// save → journal. Run from the CLI this is the *agent's* hand, so the moves
 /// journal with actor `agent` — the mirror of the daemon edit route's
@@ -2027,12 +1993,12 @@ fn arrange(
     if ids.is_empty() {
         bail!("--ids wants a comma-separated list of object ids");
     }
-    let mut board = chimaera_board::load(path)?;
-    let ws = chimaera_board::workspace_root(path);
+    let mut board = crate::load(path)?;
+    let ws = crate::workspace_root(path);
     let theme = resolve_theme(None, &board, &ws)?;
 
     // Prior geometry, for the journal's from/to.
-    let prior: Vec<(String, Option<chimaera_board::schema::Frame>)> = ids
+    let prior: Vec<(String, Option<crate::schema::Frame>)> = ids
         .iter()
         .map(|id| {
             let f = board
@@ -2043,19 +2009,14 @@ fn arrange(
         })
         .collect();
 
-    let moves = chimaera_board::arrange::arrange(
-        &mut board,
-        op,
-        &ids,
-        gap.or(Some(theme.spacing.gap)),
-        cols,
-    )?;
+    let moves =
+        crate::arrange::arrange(&mut board, op, &ids, gap.or(Some(theme.spacing.gap)), cols)?;
     if moves.is_empty() {
         println!("nothing to move — already arranged");
         return Ok(());
     }
-    chimaera_board::normalize(&mut board);
-    chimaera_board::save(path, &board)?;
+    crate::normalize(&mut board);
+    crate::save(path, &board)?;
     for m in &moves {
         println!("{m}");
     }
@@ -2063,7 +2024,7 @@ fn arrange(
     // The journal narrates the *saved* (post-normalize) geometry. Best-effort
     // by design, like the daemon's edit route: the board file is truth and
     // the journal is the audit trail.
-    use chimaera_board::journal::{Actor, Event, EventKind};
+    use crate::journal::{Actor, Event, EventKind};
     let mut events = Vec::new();
     for (id, before) in prior {
         let after = board
@@ -2084,8 +2045,8 @@ fn arrange(
         }
     }
     if !events.is_empty() {
-        let appended = chimaera_board::ensure_board_dir(&ws)
-            .and_then(|_| chimaera_board::journal::Journal::open(&journal_path_for(path)))
+        let appended = crate::ensure_board_dir(&ws)
+            .and_then(|_| crate::journal::Journal::open(&journal_path_for(path)))
             .and_then(|mut journal| journal.append_batch(events));
         if let Err(err) = appended {
             eprintln!("warning: journal append failed: {err:#}");
@@ -2099,23 +2060,23 @@ fn arrange(
 /// plus the computed safe series cap the chart lint holds series against.
 fn validate_theme(theme_id: &str) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
-    let ws = chimaera_board::workspace_root(&cwd);
+    let ws = crate::workspace_root(&cwd);
     let theme = Theme::resolve(theme_id, Some(&ws))?;
 
-    let ramp: Vec<chimaera_board::theme::Rgb> = theme
+    let ramp: Vec<crate::theme::Rgb> = theme
         .chart
         .categorical
         .iter()
         .filter_map(|r| theme.color(r))
         .collect();
-    let cap = chimaera_board::cvd::safe_series_cap(&ramp);
+    let cap = crate::cvd::safe_series_cap(&ramp);
     println!(
         "{}: safe series cap {cap} of {} ramp colors (all-pairs ΔE ≥ 8 under Machado 2009)",
         theme.id,
         ramp.len()
     );
 
-    let findings = chimaera_board::cvd::validate_theme(&theme);
+    let findings = crate::cvd::validate_theme(&theme);
     if findings.is_empty() {
         println!("clean");
         return Ok(());
@@ -2140,7 +2101,7 @@ fn merge(base: &Path, ours: &Path, theirs: &Path, out: Option<PathBuf>, check: b
     let read = |p: &Path| -> Result<String> {
         std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))
     };
-    let outcome = chimaera_board::merge::merge(&read(base)?, &read(ours)?, &read(theirs)?)?;
+    let outcome = crate::merge::merge(&read(base)?, &read(ours)?, &read(theirs)?)?;
     // The report goes to stderr — git shows a driver's stderr to the user,
     // and stdout stays clean for scripting.
     for c in &outcome.conflicts {
@@ -2154,7 +2115,7 @@ fn merge(base: &Path, ours: &Path, theirs: &Path, out: Option<PathBuf>, check: b
         bail!("{} conflict(s)", outcome.conflicts.len());
     }
     let dest = out.unwrap_or_else(|| ours.to_path_buf());
-    chimaera_board::save(&dest, &outcome.board)?;
+    crate::save(&dest, &outcome.board)?;
     if outcome.conflicts.is_empty() {
         println!("merged → {}", dest.display());
         return Ok(());
@@ -2170,8 +2131,8 @@ fn merge(base: &Path, ours: &Path, theirs: &Path, out: Option<PathBuf>, check: b
 mod tests {
     use super::*;
 
-    fn board_json(json: &str) -> chimaera_board::Board {
-        chimaera_board::parse(json).unwrap()
+    fn board_json(json: &str) -> crate::Board {
+        crate::parse(json).unwrap()
     }
 
     #[test]
@@ -2201,8 +2162,7 @@ mod tests {
         let ids: Vec<&str> = merged.objects.iter().map(|o| o.id()).collect();
         assert_eq!(ids, ["title-2", "box", "arrow"], "{notes:?}");
         // The connector followed its renamed endpoint.
-        let Some(chimaera_board::Object::Connector(c)) =
-            merged.objects.iter().find(|o| o.id() == "arrow")
+        let Some(crate::Object::Connector(c)) = merged.objects.iter().find(|o| o.id() == "arrow")
         else {
             panic!("connector survived the merge");
         };
@@ -2219,7 +2179,7 @@ mod tests {
 
     #[test]
     fn mplstyle_export_is_deterministic_and_carries_the_ramp() {
-        let theme = chimaera_board::theme::default_for(true);
+        let theme = crate::theme::default_for(true);
         let a = mplstyle_for(&theme);
         let b = mplstyle_for(&theme);
         assert_eq!(a, b, "same theme, same bytes");
@@ -2253,7 +2213,7 @@ mod tests {
             <rect width="2" height="6" fill="#00cc44"/>
             <path d="M 0 0 L 1 1" stroke="#2244ff" fill="none"/>
         </svg>"##;
-        let theme = chimaera_board::theme::default_for(true);
+        let theme = crate::theme::default_for(true);
         let (out, rows) = rescheme_svg(svg, &theme);
         let row = |from: &str| rows.iter().find(|r| r.from == from).unwrap();
         assert_eq!(row("#ffffff").target, "@bg");
@@ -2311,8 +2271,7 @@ mod tests {
         append_shown_event(&board_path);
         append_shown_event(&board_path);
 
-        let events =
-            chimaera_board::journal::read_since(&journal_path_for(&board_path), 0).unwrap();
+        let events = crate::journal::read_since(&journal_path_for(&board_path), 0).unwrap();
         let lines: Vec<String> = events.iter().map(|e| e.render()).collect();
         assert_eq!(
             lines,
@@ -2416,14 +2375,11 @@ mod tests {
         let asset = dir.join(".chimaera/board/assets/fig-p1.png");
         let png = std::fs::read(&asset).unwrap();
         // 200×100 pt at the default 300 dpi.
-        assert_eq!(
-            chimaera_board::imginfo::png_dimensions(&png),
-            Some((833, 416))
-        );
+        assert_eq!(crate::imginfo::png_dimensions(&png), Some((833, 416)));
 
         // The image object carries the source PDF's digest + origin.
-        let board = chimaera_board::load(&board_path).unwrap();
-        let Some(chimaera_board::Object::Image(img)) =
+        let board = crate::load(&board_path).unwrap();
+        let Some(crate::Object::Image(img)) =
             board.pages[0].objects.iter().find(|o| o.id() == "fig")
         else {
             panic!("no image object landed");

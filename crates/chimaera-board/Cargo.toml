@@ -7,6 +7,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The `chimaera board` verb layer (src/cli.rs, `cli` feature): both the
+# standalone binary and the native app mount it, so the two never drift.
+clap = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -63,6 +66,10 @@ default = ["math"]
 # spare the engine + bundled STIX Two Math font (~2.4 MB of binary). The
 # schema, ceilings and the missing-feature refusal compile in every build.
 math = ["dep:mathtex"]
+# The `chimaera board` CLI layer (src/cli.rs): the clap Subcommand + verb
+# implementations both binaries mount. A library consumer (the daemon's
+# routes) never needs it, so clap stays out of default builds.
+cli = ["dep:clap"]
 # `board import fig.pdf`: rasterize one PDF page into an image asset
 # (src/pdfimport.rs). Off by default — hayro's interpreter stack is real
 # weight on the static musl binary, and most figure flows export SVG/PNG.

@@ -21,7 +21,9 @@ Depth: [chimaera-app/AGENTS.md](../../crates/chimaera-app/AGENTS.md).
   `tauri.conf.json` + both `Cargo.toml`s. A pre-bumped value makes the sed silently
   no-op and ship the wrong version.
 - **`--askpass` must stay lightweight** — it's the `SSH_ASKPASS` relay and must never
-  spawn a daemon or window. The three-role argv dispatch order in `main.rs` is
-  load-bearing.
+  spawn a daemon or window. The four-role argv dispatch order in `main.rs` is
+  load-bearing; the `board` arm (the shim's `current_exe()` target here is this GUI
+  binary) must exit before any Tauri init, or the single-instance plugin fronts the
+  running window and swallows the CLI.
 - Signing is release-only (`TAURI_SIGNING_PRIVATE_KEY*`); the `app.yml` PR build needs
   no key.

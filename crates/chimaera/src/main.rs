@@ -1,4 +1,3 @@
-mod board;
 mod compute;
 mod connect;
 mod daemonize;
@@ -8,6 +7,10 @@ mod status;
 
 use std::path::PathBuf;
 
+// The board CLI lives in the engine crate (`cli` feature) so the native app
+// binary can mount the identical verb set; this alias keeps the command tree
+// (and its parse tests) reading as before.
+use chimaera_board::cli as board;
 use clap::{Parser, Subcommand};
 
 #[global_allocator]

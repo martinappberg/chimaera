@@ -17,7 +17,8 @@ exists but only behind the non-default `pdf-import` cargo feature — see CLI).
 (schema, pretty, normalize, slots, theme, chart, colormap, diagram,
 composites, layout, render, show, describe, lint, arrange, cvd, presets,
 journal, imginfo, export/{pptx,svg,pdf}). CLI verbs:
-`crates/chimaera/src/board.rs`. Daemon routes:
+`crates/chimaera-board/src/cli.rs` (the `cli` cargo feature; mounted by the
+`chimaera` binary and, pre-Tauri, by the native app binary). Daemon routes:
 `crates/chimaera-server/src/board.rs`. Pane:
 `web-ui/src/lib/previews/BoardView.svelte` (+ `boardInteract.ts`,
 `BoardRail`, `BoardPresentChrome`), registered as the `board` `FileViewKind`
@@ -178,10 +179,15 @@ edits arrive via the 2 s disk watch and re-render in place. Chat renders a
 `board show` signature line (client-detected v1; the daemon `shown` event can
 replace the detection later). Discovery is wired, not hoped for: chat spawns
 with a workspace get an injected board note (`launcher::BOARD_SYSTEM_PROMPT`
-— claude `--append-system-prompt`, codex `developer_instructions`) pointing
-at `chimaera board show`, and the daemon writes a `chimaera` shim (its own
-binary) into the shims dir on every session's PATH, so agents in arbitrary
-workspaces can run it without a user install.
+— claude `--append-system-prompt`, codex `developer_instructions`) that is
+zero-shot: it carries a complete runnable example, so the agent's first board
+action is the `chimaera board show` pipe itself, with no `--help` or source
+exploration. The daemon writes a `chimaera` shim (an exec of its own binary)
+into the shims dir on every session's PATH, so agents in arbitrary workspaces
+can run it without a user install — and that holds in the native app too,
+where the daemon IS the GUI binary: it answers `board` argv before any Tauri
+init (`crates/chimaera-app/src/main.rs`), so the shim never silently launches
+a window instead of the CLI.
 
 ## The journal
 

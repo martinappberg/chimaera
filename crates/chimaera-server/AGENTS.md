@@ -138,8 +138,10 @@ verified codex 0.144.2) — the same key-in-URL endpoint claude's
 `--mcp-config` points at.
 
 Every chat spawn with a workspace also carries the **board capability note**
-(`launcher::BOARD_SYSTEM_PROMPT`, pointing at `chimaera board show` — the
-`chimaera` shim in `runtimes` is what makes it resolvable): claude
+(`launcher::BOARD_SYSTEM_PROMPT` — zero-shot: a complete runnable `board show`
+example plus "run it directly, narrate outcomes not CLI mechanics"; the
+`chimaera` shim in `runtimes` is what makes it resolvable, in the native app
+via the GUI binary's pre-Tauri `board` dispatch): claude
 concatenates it with the Mastermind role prompt into the single
 `--append-system-prompt` (the flag is accepted once), codex rides the same
 `-c developer_instructions` the role prompt uses. TUI spawns get no note —

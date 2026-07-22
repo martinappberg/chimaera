@@ -1,17 +1,22 @@
 # chimaera-board — map
 
 The board engine: the `.board.json` format and everything that turns one into
-pixels. Pure library — no daemon, no async, no network. The CLI
-(`crates/chimaera/src/board.rs`) and the daemon routes
-(`crates/chimaera-server/src/board.rs`) are both thin wrappers over these
-functions; that single-engine property is what keeps the pane, the CLI and
-(later) the exporter agreeing pixel-for-pixel. Design source of truth:
+pixels. Pure library — no daemon, no async, no network. The CLI verb layer
+lives in-crate (`src/cli.rs`, behind the `cli` cargo feature, which is what
+pulls clap) and the daemon routes (`crates/chimaera-server/src/board.rs`) are
+thin wrappers over the same functions; that single-engine property is what
+keeps the pane, the CLI and (later) the exporter agreeing pixel-for-pixel.
+Both binaries mount the CLI — `crates/chimaera` as its `board` subcommand,
+and the native app (`crates/chimaera-app/src/main.rs`) via a pre-Tauri argv
+dispatch, because the daemon's `chimaera` shim execs `current_exe()`, which
+in the app deployment is the GUI binary. Design source of truth:
 [docs/board-plan.md](../../docs/board-plan.md); current-state feature page:
 [docs/features/board.md](../../docs/features/board.md).
 
 | File | What it is |
 |---|---|
 | `src/lib.rs` | parse/save, `is_board_path`, the workspace surround (`.chimaera/board/`, the self-ignoring `shown/`) |
+| `src/cli.rs` | the `chimaera board` verbs (`cli` feature): the clap `BoardCmd` Subcommand + `run` both binaries mount — help text and behavior are shared, never duplicated |
 | `src/schema.rs` | the format: 5 primitives + `table` + `chart` + `diagram` + `equation` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`); table cells reuse the `Paragraph` text model; `equation` requires `alt` (the C6 carve-out) so an alt-less one parse-fails into `Unknown` |
 | `src/pretty.rs` | the canonical byte-stable JSON layout — the exact bytes are part of the format |
 | `src/normalize.rs` | sugar expansion + the constraints that make ugly unrepresentable; pure and idempotent |

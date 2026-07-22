@@ -45,6 +45,11 @@
 //! carries a `chimaera` shim exec'ing the daemon's own binary
 //! (`current_exe()` at write time), so `chimaera board show` resolves inside
 //! every session — any workspace, local or remote — without a user install.
+//! That holds in BOTH deployments: standalone, current_exe IS the full CLI;
+//! in the native app it is the GUI binary, which dispatches `board` argv
+//! before any Tauri init (crates/chimaera-app/src/main.rs) — board is the
+//! one CLI surface the note promises, so the shim never silently launches
+//! (or fronts) a window for it.
 //! Agent spawns
 //! are guaranteed to resolve them (the login-shell wrap re-prepends the dir
 //! via `$CHIMAERA_SHIMS` after profile init); plain kind-"shell" panes are
@@ -821,7 +826,10 @@ pub(crate) fn write_shims(
 /// The `chimaera` shim: a plain exec of the daemon's own binary, putting the
 /// `chimaera` CLI (`board show`, most importantly) on every session's PATH.
 /// It deliberately outranks any user install: the daemon that owns the
-/// session is the version whose CLI matches what its UI renders.
+/// session is the version whose CLI matches what its UI renders. In the
+/// native app the daemon IS the GUI binary — it answers `board` via a
+/// pre-Tauri argv dispatch, so this exec is a working board CLI there too
+/// (other subcommands remain the standalone binary's).
 fn chimaera_shim_script(daemon_bin: &Path) -> String {
     format!(
         r#"#!/bin/sh
