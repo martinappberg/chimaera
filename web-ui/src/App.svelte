@@ -118,6 +118,11 @@
     findFinder,
     freshFinderTab,
     setFinderPath,
+    openBrowser,
+    openTab,
+    freshBrowserTab,
+    setBrowserPath,
+    setBrowserTarget,
     openDashboard,
     openGit,
     openSession,
@@ -142,6 +147,8 @@
     type Tab,
   } from "./lib/layout/layout";
   import type { PathKind } from "./lib/terminal/links";
+  import type { UrlTarget } from "./lib/terminal/urlLinks";
+  import { sweepProxies } from "./lib/browser/proxy";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
   import { dirtyFiles } from "./lib/shared/editing";
   import {
@@ -855,6 +862,19 @@
     chatPool.syncChatSessions(new Set(ids));
   });
 
+  // Revoke proxy sessions whose last browser tab closed (hygiene — the
+  // daemon's idle TTL is the backstop, and other windows self-heal by
+  // re-minting).
+  $effect(() => {
+    const active = new Set<string>();
+    for (const p of panesOf(layout.root)) {
+      for (const t of p.tabs) {
+        if (t.surface === "browser" && t.host !== "") active.add(`${t.host}:${t.port}`);
+      }
+    }
+    sweepProxies(active);
+  });
+
   onMount(() => {
     pool.initPool({
       onTitle,
@@ -864,6 +884,7 @@
       onPaste: onTermPaste,
       linkContext,
       onOpenPath,
+      onOpenUrl,
     });
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
@@ -1377,6 +1398,31 @@
     };
   }
 
+  /**
+   * A proxyable URL link was activated (the browser pane's front door). An
+   * existing pane on the same host:port target is focused — clicking
+   * Jupyter's printed URL twice lands where you already are — while Cmd/Ctrl
+   * forces a fresh split beside the terminal.
+   */
+  function onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void {
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    const fromPane = loc?.paneId ?? layout.focusedPaneId;
+    if (newSplit) {
+      layout = splitPane(layout, fromPane, "row");
+      layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
+    } else {
+      layout = openBrowser(focusPane(layout, fromPane), target.host, target.port, target.path);
+    }
+    // The browser surface took focus: pull DOM focus off the terminal so
+    // plain keys stop reaching a PTY that is no longer the focused view.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */
+  function newBrowserSurface(): void {
+    layout = openTab(layout, freshBrowserTab("", 0, "/"));
+  }
+
   /** A confirmed terminal path link was activated. */
   function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
@@ -1711,6 +1757,10 @@
         // persisted default agent, or install it when it's missing.
         intercept();
         newAgentPrimary();
+        return;
+      case "newBrowser":
+        intercept();
+        newBrowserSurface();
         return;
       case "splitRight":
         intercept();
@@ -2628,6 +2678,12 @@
     },
     navigateFinder(id, path) {
       layout = setFinderPath(layout, id, path);
+    },
+    navigateBrowser(id, path) {
+      layout = setBrowserPath(layout, id, path);
+    },
+    retargetBrowser(id, host, port, path) {
+      layout = setBrowserTarget(layout, id, host, port, path);
     },
     openDiffFrom(paneId, path, mode, newSplit) {
       openDiffFromPane(paneId, path, mode, newSplit);

@@ -17,6 +17,12 @@ import {
   openGit,
   openDashboard,
   openChanges,
+  openBrowser,
+  freshBrowserTab,
+  findBrowser,
+  setBrowserPath,
+  setBrowserTarget,
+  openTab,
   splitPane,
   closePane,
   pruneSessions,
@@ -195,6 +201,45 @@ describe("serialize / deserialize round-trip", () => {
     expect(deserializeLayout(42)).toBeNull();
     expect(deserializeLayout({ nope: true })).toBeNull();
     expect(deserializeLayout("not a layout")).toBeNull();
+  });
+});
+
+describe("browser tabs (the reverse-proxied web-app pane)", () => {
+  it("openBrowser dedupes on host:port, not on path", () => {
+    let l = openBrowser(defaultLayout(), "localhost", 8888, "/lab?token=a");
+    l = openBrowser(l, "localhost", 8888, "/tree?token=b");
+    expect(tabCount(l)).toBe(1);
+    l = openBrowser(l, "localhost", 8501, "/");
+    expect(tabCount(l)).toBe(2);
+  });
+
+  it("persists target + navigation path across serialize round-trips, never a ticket", () => {
+    const tab = freshBrowserTab("sh03-09n14", 8888, "/lab?token=x");
+    let l = openTab(defaultLayout(), tab);
+    l = setBrowserPath(l, tab.id, "/lab/tree/results");
+    const blob = JSON.parse(JSON.stringify(serializeLayout(l))) as unknown;
+    expect(JSON.stringify(blob)).not.toContain("/proxy/");
+    const restored = deserializeLayout(blob);
+    expect(restored).not.toBeNull();
+    const loc = findBrowser(restored!, tab.id);
+    expect(loc).not.toBeNull();
+    expect(loc!.tab.host).toBe("sh03-09n14");
+    expect(loc!.tab.port).toBe(8888);
+    expect(loc!.tab.path).toBe("/lab/tree/results");
+  });
+
+  it("retargeting keeps the instance identity (the pane keeps its place)", () => {
+    const tab = freshBrowserTab("", 0, "/");
+    let l = openTab(defaultLayout(), tab);
+    l = setBrowserTarget(l, tab.id, "localhost", 8888, "/lab");
+    const loc = findBrowser(l, tab.id);
+    expect(loc?.tab.host).toBe("localhost");
+    expect(loc?.tab.port).toBe(8888);
+    expect(tabCount(l)).toBe(1);
+  });
+
+  it("keeps its rendered view alive across tab switches (a live app must not reload)", () => {
+    expect(keepsPaneViewAlive(freshBrowserTab("localhost", 8888, "/"))).toBe(true);
   });
 });
 

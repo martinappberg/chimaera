@@ -6,6 +6,7 @@
  */
 
 import type { LinkContext, PathKind } from "./links";
+import type { UrlTarget } from "./urlLinks";
 import { baseFontSize, estimateSize } from "./terminalMetrics";
 
 export { baseFontSize, estimateSize };
@@ -18,6 +19,8 @@ export interface PoolHandlers {
   onPaste(id: string, text: string): void;
   linkContext(id: string): LinkContext;
   onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void;
+  /** A proxyable URL link was activated: open it in a browser pane. */
+  onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void;
 }
 
 type Runtime = typeof import("./termPoolRuntime");

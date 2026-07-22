@@ -79,6 +79,22 @@ export interface ChangesTab {
   surface: "changes";
   sessionId: string;
 }
+/**
+ * A browser pane: a live web app (Jupyter, marimo, Streamlit…) served through
+ * the daemon's reverse proxy. Keyed by a stable `id` like the Finder (several
+ * browsers coexist); `host`/`port` name the TARGET the daemon dials — the
+ * proxy ticket itself is transport state the view re-mints on demand, never
+ * persisted. `path` is the app-internal path+query (mutable navigation state,
+ * persisted so a reload lands where you were browsing). An empty host is the
+ * blank "enter an address" state.
+ */
+export interface BrowserTab {
+  surface: "browser";
+  id: string;
+  host: string;
+  port: number;
+  path: string;
+}
 export type Tab =
   | TerminalTab
   | FileTab
@@ -87,7 +103,8 @@ export type Tab =
   | DiffTab
   | GitTab
   | ChangesTab
-  | DashboardTab;
+  | DashboardTab
+  | BrowserTab;
 
 /** Identity key for the no-duplicates invariant (one tab per surface). */
 export function tabKey(t: Tab): string {
@@ -100,6 +117,8 @@ export function tabKey(t: Tab): string {
   if (t.surface === "git") return "v:git";
   if (t.surface === "dashboard") return "v:dashboard";
   if (t.surface === "changes") return `changes:${t.sessionId}`;
+  // `w:` (web) — its own namespace beside the Finder's `d:` and diff's `g:`.
+  if (t.surface === "browser") return `w:${t.id}`;
   return "v:settings";
 }
 
@@ -543,6 +562,69 @@ export function findFinder(
     if (index >= 0) return { paneId: p.id, index, tab: p.tabs[index] as FinderTab };
   }
   return null;
+}
+
+/**
+ * Open a browser pane. An existing tab for the same host:port target is
+ * focused instead of duplicated (clicking Jupyter's printed URL twice should
+ * land on the pane you already have); a fresh target mints a new instance.
+ */
+export function openBrowser(l: Layout, host: string, port: number, path: string): Layout {
+  for (const p of panes(l.root)) {
+    const index = p.tabs.findIndex(
+      (t) => t.surface === "browser" && t.host === host && t.port === port,
+    );
+    if (index >= 0) return activateTab(l, p.id, index);
+  }
+  return openTab(l, freshBrowserTab(host, port, path));
+}
+
+/** A browser tab NOT yet in any layout (fresh instance id per call). */
+export function freshBrowserTab(host: string, port: number, path: string): BrowserTab {
+  return { surface: "browser", id: uid(), host, port, path };
+}
+
+/** The browser instance with `id`, and where it lives, if open. */
+export function findBrowser(
+  l: Layout,
+  id: string,
+): { paneId: string; index: number; tab: BrowserTab } | null {
+  for (const p of panes(l.root)) {
+    const index = p.tabs.findIndex((t) => t.surface === "browser" && t.id === id);
+    if (index >= 0) return { paneId: p.id, index, tab: p.tabs[index] as BrowserTab };
+  }
+  return null;
+}
+
+/** Update a browser instance's current in-app path (its navigation state). */
+export function setBrowserPath(l: Layout, id: string, path: string): Layout {
+  const loc = findBrowser(l, id);
+  if (loc === null || loc.tab.path === path) return l;
+  const root = withPane(l.root, loc.paneId, (p) => ({
+    ...p,
+    tabs: p.tabs.map((t, i) => (i === loc.index && t.surface === "browser" ? { ...t, path } : t)),
+  }));
+  return root === l.root ? l : { ...l, root };
+}
+
+/** Re-point a browser instance at a different target (the address bar's
+ *  full-URL entry, and the blank tab's first address). */
+export function setBrowserTarget(
+  l: Layout,
+  id: string,
+  host: string,
+  port: number,
+  path: string,
+): Layout {
+  const loc = findBrowser(l, id);
+  if (loc === null) return l;
+  const root = withPane(l.root, loc.paneId, (p) => ({
+    ...p,
+    tabs: p.tabs.map((t, i) =>
+      i === loc.index && t.surface === "browser" ? { ...t, host, port, path } : t,
+    ),
+  }));
+  return root === l.root ? l : { ...l, root };
 }
 
 /** Update a specific Finder's current directory (its navigation state). */
@@ -1041,7 +1123,8 @@ type STab =
   | { v: string }
   | { d: string; di: string }
   | { gd: string; dm?: string }
-  | { cs: string };
+  | { cs: string }
+  | { w: string; wo: number; wi: string; wp: string };
 
 /** Coerce a persisted diff mode, defaulting to unstaged. */
 function diffModeOf(x: unknown): DiffMode {
@@ -1078,6 +1161,7 @@ function serNode(node: LayoutNode): SNode {
         if (t.surface === "git") return { v: "git" };
         if (t.surface === "dashboard") return { v: "dashboard" };
         if (t.surface === "changes") return { cs: t.sessionId };
+        if (t.surface === "browser") return { w: t.host, wo: t.port, wi: t.id, wp: t.path };
         return { v: "settings" };
       }),
       active: node.active,
@@ -1137,6 +1221,18 @@ function deserNode(
         tab = { surface: "dashboard" };
       } else if (typeof t.cs === "string" && t.cs.length > 0) {
         tab = { surface: "changes", sessionId: t.cs };
+      } else if (
+        typeof t.w === "string" &&
+        t.w.length <= 253 &&
+        typeof t.wo === "number" &&
+        Number.isInteger(t.wo) &&
+        t.wo >= 0 &&
+        t.wo <= 65535
+      ) {
+        // Browser: `wi` is the instance id, `wp` the app-internal path+query.
+        const id = typeof t.wi === "string" && t.wi.length > 0 ? t.wi : uid();
+        const path = typeof t.wp === "string" && t.wp.length <= 4096 ? t.wp : "/";
+        tab = { surface: "browser", id, host: t.w, port: t.wo, path };
       } else if (t.v === "settings") {
         tab = { surface: "settings" };
       } else {

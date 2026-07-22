@@ -87,6 +87,12 @@ export const ACTIONS = [
     def: "Mod2+e",
   },
   {
+    id: "newBrowser",
+    label: "New Browser Pane",
+    description: "Open a live web app (Jupyter, Streamlit, …) through the daemon's proxy.",
+    def: "Mod2+b",
+  },
+  {
     id: "splitRight",
     label: "Split Right",
     description: "Split the focused pane horizontally.",

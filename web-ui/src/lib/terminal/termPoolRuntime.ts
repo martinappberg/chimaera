@@ -15,6 +15,13 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { registerPathLinks } from "./links";
+import { registerUrlLinks } from "./urlLinks";
+
+function composeDispose(...disposers: Array<() => void>): () => void {
+  return () => {
+    for (const d of disposers) d();
+  };
+}
 import type { PoolHandlers } from "./termPool";
 import { BASE_FONT_SIZE, baseFontSize, fontFamily } from "./terminalMetrics";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
@@ -250,12 +257,19 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
     fitTimer: null,
     pendingFit: false,
     fontOverride,
-    // Clickable paths work in EVERY session — agents and shells alike.
-    disposeLinks: registerPathLinks(term, id, {
-      context: (sid) =>
-        handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
-      open: (sid, path, kind, newSplit) => handlers?.onOpenPath(sid, path, kind, newSplit),
-    }),
+    // Clickable paths work in EVERY session — agents and shells alike. So do
+    // proxyable URLs (the browser pane's front door); both providers share
+    // one dispose.
+    disposeLinks: composeDispose(
+      registerPathLinks(term, id, {
+        context: (sid) =>
+          handlers?.linkContext(sid) ?? { cwd: null, root: null, workspaceId: null },
+        open: (sid, path, kind, newSplit) => handlers?.onOpenPath(sid, path, kind, newSplit),
+      }),
+      registerUrlLinks(term, id, {
+        open: (sid, target, newSplit) => handlers?.onOpenUrl(sid, target, newSplit),
+      }),
+    ),
   };
   fitEntry(entry);
 

@@ -349,6 +349,25 @@
     {:else}
       <Spinner />
     {/if}
+  {:else if tab.surface === "browser"}
+    {@const BrowserView = views.browser}
+    {#if BrowserView !== undefined}
+      <BrowserView
+        tabId={tab.id}
+        host={tab.host}
+        port={tab.port}
+        path={tab.path}
+        visible={active}
+        onNavigate={(p: string) => ctrl.navigateBrowser(tab.id, p)}
+        onRetarget={(h: string, p: number, pth: string) =>
+          ctrl.retargetBrowser(tab.id, h, p, pth)}
+        onFocusRequest={() => ctrl.focusPane(node.id)}
+      />
+    {:else if viewErrors.browser}
+      {@render loadFailure("browser", "browser pane")}
+    {:else}
+      <Spinner />
+    {/if}
   {:else if tab.surface === "settings"}
     {@const SettingsView = views.settings}
     {#if SettingsView !== undefined}
