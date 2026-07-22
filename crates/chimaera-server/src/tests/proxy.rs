@@ -375,6 +375,34 @@ async fn workbench_surface_is_never_rescued() {
     assert_ne!(body_json(&bytes)["marker"], "echo-target");
     let (_, _, bytes) = get_with_headers(&state, "/ws/nope", &[("cookie", &cookie)]).await;
     assert_ne!(body_json(&bytes)["marker"], "echo-target");
+
+    // A STALE chimaera chunk (missing /assets/*, workbench Referer) must 404,
+    // NOT get cookie-rescued to the app — else a redeploy silently breaks the
+    // SPA for anyone with a browser pane open. `/assets/` is chimaera's own
+    // namespace; only a proxied app's asset (which carries a /proxy Referer)
+    // is rescued there.
+    let (status, _, bytes) =
+        get_with_headers(&state, "/assets/index-OLD.js", &[("cookie", &cookie)]).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "stale workbench chunk must 404"
+    );
+    assert_ne!(body_json(&bytes)["marker"], "echo-target");
+    // …but a proxied app's own /assets bundle (with a /proxy/{id} Referer, the
+    // shape marimo's subresource requests have) is still rescued.
+    let (status, _, bytes) = get_with_headers(
+        &state,
+        "/assets/app.js",
+        &[("referer", &format!("http://x/proxy/{id}/"))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body_json(&bytes)["marker"],
+        "echo-target",
+        "a proxied app's /assets bundle still rescues via its Referer"
+    );
 }
 
 #[tokio::test]

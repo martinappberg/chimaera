@@ -237,7 +237,9 @@ fn expand_nodelist(list: &str, cap: usize) -> Vec<String> {
                     if let Some((a, b)) = part.split_once('-') {
                         let width = a.len();
                         if let (Ok(lo), Ok(hi)) = (a.parse::<u64>(), b.parse::<u64>()) {
-                            for n in lo..=hi.min(lo + cap as u64) {
+                            // saturating: a pathological node number must not
+                            // overflow (debug panic) before the out.len() cap.
+                            for n in lo..=hi.min(lo.saturating_add(cap as u64)) {
                                 if out.len() >= cap {
                                     break;
                                 }
@@ -264,9 +266,12 @@ async fn classify_host(state: &AppState, host: &str) -> HostClass {
         return HostClass::SelfHost;
     }
     // A node one of the user's own Slurm jobs runs on is theirs to reach.
+    // Only RUNNING jobs have a real nodelist in `nodes`; for a pending job
+    // that field is Slurm's pending-reason text, not a nodelist (matches the
+    // UI's nodeCandidates filter).
     let snapshot = state.compute.snapshot(false).await;
     if snapshot.scheduler == "slurm" {
-        for job in &snapshot.jobs {
+        for job in snapshot.jobs.iter().filter(|j| j.state == "RUNNING") {
             for node in expand_nodelist(&job.nodes, 512) {
                 if short == node.to_ascii_lowercase() {
                     return HostClass::ComputeNode;
@@ -925,10 +930,24 @@ pub(crate) async fn fallback(State(state): State<Arc<AppState>>, req: Request) -
     if !reserved && path != "/" && !top_level_doc && req.headers().get(LOOP_GUARD).is_none() {
         // The requesting page's Referer names the exact app; the cookie
         // covers what carries no Referer (WebSocket handshakes, redirected
-        // navigations).
+        // navigations). But `/assets/` is chimaera's OWN chunk namespace too:
+        // a proxied app's asset carries a `/proxy/{id}` Referer (rescued by
+        // the first branch), while a STALE workbench chunk after a redeploy
+        // carries the workbench's own Referer and must fall through to the
+        // `/assets/` 404 below — never be cookie-rescued to the app (which
+        // would hand it 200 HTML, silently breaking the SPA). So skip the
+        // bare-cookie fallback under `/assets/`; referer rescue still serves
+        // a proxied app's bundles.
+        let cookie_ok = !path.starts_with("/assets/");
         let id = referer_rescue_id(req.headers())
             .filter(|id| plan(&state, id).is_some())
-            .or_else(|| cookie_rescue_id(req.headers()).filter(|id| plan(&state, id).is_some()));
+            .or_else(|| {
+                if cookie_ok {
+                    cookie_rescue_id(req.headers()).filter(|id| plan(&state, id).is_some())
+                } else {
+                    None
+                }
+            });
         if let Some(id) = id {
             let pq = req
                 .uri()

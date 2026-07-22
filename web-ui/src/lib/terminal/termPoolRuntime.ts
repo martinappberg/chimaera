@@ -16,12 +16,6 @@ import "@xterm/xterm/css/xterm.css";
 import { SessionSocket } from "./ws";
 import { registerPathLinks } from "./links";
 import { registerUrlLinks } from "./urlLinks";
-
-function composeDispose(...disposers: Array<() => void>): () => void {
-  return () => {
-    for (const d of disposers) d();
-  };
-}
 import type { PoolHandlers } from "./termPool";
 import { BASE_FONT_SIZE, baseFontSize, fontFamily } from "./terminalMetrics";
 import { activeTheme, getSetting, onSettingsChange } from "../settings/store.svelte";
@@ -30,6 +24,14 @@ import { copyText } from "../shared/clipboard";
 
 const POOL_CAP = 12;
 const REFIT_DEBOUNCE_MS = 80;
+
+/** Fold several dispose callbacks into one (the path- and URL-link providers
+ *  a pooled terminal registers share a single `disposeLinks`). */
+function composeDispose(...disposers: Array<() => void>): () => void {
+  return () => {
+    for (const d of disposers) d();
+  };
+}
 /** A PTY controls OSC 52 payloads. Bound decode + clipboard IPC memory so a
  * hostile process cannot turn one escape sequence into an unbounded client
  * allocation (roughly 1 MiB decoded text after base64 overhead). */
