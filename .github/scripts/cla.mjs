@@ -10,7 +10,7 @@ const SIGNATURE_PATH = "signatures/version1/cla.json";
 const COMMENT_MARKER = "<!-- chimaera-cla -->";
 const STATUS_CONTEXT = "cla";
 const ALLOWLIST = new Set(
-  ["martinappberg", "dependabot[bot]", "renovate[bot]", "github-actions[bot]"].map((name) =>
+  ["martinappberg", "dependabot[bot]", "renovate[bot]", "github-actions[bot]", "claude", "codex"].map((name) =>
     name.toLowerCase(),
   ),
 );
