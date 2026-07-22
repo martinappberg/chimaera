@@ -1,0 +1,754 @@
+# Boards — the visual composition surface: design & plan
+
+Status: **design draft for discussion** (2026-07-21). Nothing here is built.
+This document synthesizes eight grounding passes (four over this codebase, four
+over verified July 2026 research — OOXML/PPTX internals, scene-graph format
+prior art, the pure-Rust render stack, and journal-figure/presentation ground
+truth) plus a three-lens design panel (format-first / interaction-first /
+workflow-first) with a judge that scored and merged them. Decisions marked
+**[decide]** are the maintainer's call. Everything else is decided — where a
+design was contested, the resolution and its one-line rationale are stated
+rather than left as options.
+
+Companion plan: [skills-manager-plan.md](skills-manager-plan.md) (the "Loadout"
+tab). The board skill is the natural first-party pack that dogfoods Loadout's
+install path, and both features share the "files are the database, the daemon
+only scans/serves" posture.
+
+## 0. The one-paragraph version
+
+A **board** is an ordinary git-tracked `.board.json` file — a small, strict
+scene graph of pages and named objects (text with real runs, shapes, images,
+plot panels, arrows, groups) in **points**, whose every construct is a clean
+subset of PPTX semantics, so export to *natively editable* PowerPoint is a
+mechanical projection rather than a lossy afterthought. A **theme-token layer**
+(`@accent1`, `role: "title"`) sits between the board and its literal styling, so
+"strict system by default, fully customizable" is literal: agents author against
+a constrained schema, humans restyle by swapping tokens. A pure-Rust engine in
+the daemon binary rasterizes a page — or one region, or one object — to
+PNG/JPEG in tens of milliseconds, which is how **the agent sees the board**; a
+prose `describe` dump is how it **reads positions**; and an append-only
+**semantic journal** turns every human gesture (moved `panel-a`, selected
+`callout`, pinned "make this stand out") into compact structured events the
+agent reads back — which is how it **knows what you meant**. The editor pane
+displays the engine's own pixels with a vector overlay for handles, so what you
+see *is* what exports, by construction. It is deliberately not a drawing tool:
+no pen, no bezier, no blend modes — text, shapes, images, arrows, groups. The
+defensible core is **the bidirectional loop over a plain file on whatever host
+owns the work** — Claude artifacts and claude-canvas can generate a picture;
+nothing lets you drag a panel on a login node and have `codex` read what you did
+and why.
+
+## 1. The name **[decide]**
+
+The panel called this "composer" throughout. **That name is taken:** the chat
+message input is the composer (`web-ui/src/lib/chat/Composer.svelte`,
+`composerBus.ts`, `attachImageToComposer`, `registerComposerAttach`). Shipping a
+second "composer" would make every future grep ambiguous in the one area — chat
+— where the two features actually meet.
+
+**Recommendation: Board.** Files are `.board.json`, the pane is `BoardView`, the
+crate is `chimaera-board`, the CLI is `chimaera board render …`, the feature is
+"boards" in prose. Self-describing, collision-free, and it survives the feature
+growing from decks into figures and posters. Alternatives if you want more
+character: *Easel* (evocative, unique, `chimaera easel` reads nicely, files stay
+`.board.json`), or *Plate* (the scientific term for an assembled figure — sharp
+for the wedge use case, opaque for decks). This document uses **board**
+throughout; a rename is a find-and-replace before slice 1.
+
+## 2. What already exists to build on
+
+The feature needs almost no new *idioms* — every mechanism it depends on is
+shipped and load-bearing somewhere else. That is the argument for building it
+natively rather than as a plugin.
+
+| Primitive | Where | Reused for |
+|---|---|---|
+| Extension-routed file views (`viewKindFor` → `FileView` branch, lazy subview) | `web-ui/src/lib/previews/files.ts:560-575` | `board` view kind — inherits tab identity `f:<path>`, dedupe, preview/pin, rename-follow, delete-prune, quick-open, git decoration, keep-alive, and unknown-kind text fallback **for free** |
+| Ticketed binary serving (`POST /fs/ticket` → `GET /raw/{ticket}`, 10-min, range-aware) | `fs.rs:1738-1975` | serving rendered rasters to `<img>` tags that can't send a bearer token |
+| Atomic writes with mtime conflict (`PUT /fs/file?expect_mtime=`, 409, `X-Mtime` chaining) | `fs.rs:610-752` | board saves; the 409 path is the conflict-merge trigger |
+| Per-workspace epoch invalidation on `/ws/events` (git epoch, `mark_path_dirty`) | `git/service.rs:445-482` | board-changed invalidation — pull-based, never a firehose |
+| Registration-scoped fs polling (≤64 mounted files, 2s stat) | `fs_watch.rs` | agent-edit → UI live update for the open board |
+| Seq-first append-only JSONL journal (bounded mpsc writer, cap → compaction, torn-tail truncation) | `chimaera-agent/src/journal.rs` | the semantic edit journal, verbatim discipline |
+| Nested CLI subcommand enum (the `Compute { cmd }` shape) | `crates/chimaera/src/main.rs:83-90` | `chimaera board <cmd>` — delegation-only entrypoint |
+| Leaf engine crate depended on by both binary and server (`chimaera-pty`, `chimaera-agent`) | `Cargo.toml` workspace members | `chimaera-board` — one engine, CLI and daemon, laptop and login node |
+| Inline chat artifacts (`turn_end` collection → `ArtifactGallery`/`InlinePreview`, ticket-backed, capped at 8) | `chat/store.svelte.ts:1300-1319` | board artifact cards in chat |
+| `composerBus` text + image attachment into the chat input | `chat/composerBus.ts:75` | selection-as-deixis and region snapshots into a message |
+| Curated theme system with a 31-token contract and WCAG ≥4.5:1 gate | `settings/themes.ts` | precedent (and quality bar) for board document themes |
+| Rebindable action registry + one capture-phase dispatcher | `shared/keys.ts`, `App.svelte` | the board keymap, including extending the `sizable` predicate for ⌘±/⌘0 |
+| Boards in product code | — | **zero** |
+
+## 3. The board format
+
+The schema *is* the product. Four constraints drive every decision: it must (a)
+project faithfully onto PPTX, (b) read like prose under `git diff`, (c) be
+authorable by an agent from a ~300-line spec excerpt, and (d) be constrained
+enough that a naive agent cannot produce something ugly.
+
+### 3.1 Units: points, only points
+
+**pt (72/inch), never px, never EMU, never affine matrices.** A 16:9 slide *is*
+960 × 540 pt. PPTX export is exact integer arithmetic (1 pt = 12,700 EMU).
+Physical figure sizes convert with one multiply (Nature single column 89 mm =
+252.28 pt) — and the **mm intent lives in the preset**, not the file, so the
+board never carries a DPI assumption. Origin top-left, y down. Each object
+carries `at: [x, y]` (top-left of the unrotated box), `size: [w, h]`, optional
+`rotation` (degrees clockwise about center, matching PPTX `ST_Angle/60000`) and
+`flipH`/`flipV`. This is a 1:1 shadow of `spPr/xfrm` decoded into human numbers.
+
+One unit everywhere also kills a whole class of agent arithmetic errors, which
+is worth more here than in a human-only tool.
+
+### 3.2 Text: explicit sparse runs, not markdown
+
+Runs, not a markdown blob. The fidelity target is `a:p → a:r → a:rPr`, where a
+run independently carries family, size, color, and weight — exactly what a slide
+callout or a figure caption needs and what markdown emphasis cannot express.
+Markdown is offered as **skill-side authoring sugar** that normalizes to runs on
+write, never as a stored representation (two stored styling representations
+create normalization ambiguity and diff churn).
+
+Verbosity is bounded by sugar: a paragraph that is one unstyled run may be
+written as a bare string, and `normalize()` expands it. Runs carry **only
+overrides**; everything unset inherits from the object's `role` → the theme.
+Sizes are plain pt in the file (export multiplies by 100). Paragraph spacing is
+exact pt (`spcPts`, never `spcPct`) for cross-app determinism.
+
+### 3.3 Theme tokens: the `@` sigil
+
+Every color is either a token reference `"@accent1"` or a literal `"#1a1a1a"`.
+The sigil makes indirection obvious to both reader and agent, and maps directly
+onto the PPTX color model: **`@`-refs export as `<a:schemeClr>`** (so a slide
+pasted into a themed deck re-themes natively) **and literals as `<a:srgbClr>`**.
+Fonts and sizes are referenced *through roles* — `role: "heading"` resolves
+family/size/weight/color from the theme's type scale — with sparse instance
+overrides winning. **Resolved styles are never baked into the file**, and the
+theme is referenced by path, never snapshot-inlined (the theme file is
+git-tracked in the same repo, so determinism is already guaranteed; inlining
+would churn every board diff).
+
+### 3.4 Ids, order, versioning, lenient parsing
+
+Ids are short human slugs (`panel-a`, `deck-title`), unique per board — they are
+simultaneously the diff anchor, the agent's `Edit` anchor, the journal's
+subject, and the merge key. Z-order is array order within a page.
+`formatVersion` is an integer with explicit migrations. **No churn fields ever**
+— no nonces, no `updated` timestamps, no selection or zoom state (Excalidraw's
+dirty-on-open is the anti-pattern that makes a format unmergeable).
+
+Serialization is **byte-stable**: fixed key order, 2-space indent, one property
+per line, trailing newline — a semantically identical save is byte-identical, so
+`git status` stays honest.
+
+Parsing is **lenient and never bricks**: unknown fields are preserved verbatim
+(forward compatibility across daemon versions, the settings-store discipline),
+an unknown object `type` is preserved-but-skipped-in-render (never dropped from
+the array), and a genuinely malformed board falls back to the existing text/Code
+view with a repair banner — the file is human-readable JSON, so that fallback is
+actually useful over ssh.
+
+### 3.5 Anti-ugly is a format property, not a guideline
+
+The format *prevents* bad output rather than merely permitting good output:
+
+- **Per-role `minPt` lint errors** — Nature 5 pt, PLOS 8 pt, slides 18 pt. Below
+  the target's minimum is an error, not a warning.
+- **Autofit is unrepresentable.** There is no autofit field. Text is always
+  explicit-size and the exporter measures it (cosmic-text) and sizes boxes with
+  ~10% headroom, always emitting `noAutofit`. This closes PPTX's `normAutofit`
+  round-tripping trap at the schema level.
+- **Colors default to `@`-tokens** drawn from validated palettes.
+- **Off-canvas objects** and **unresolved fonts** lint as warnings/errors.
+- `chimaera board lint --target nature-single` **gates export** — a
+  non-compliant figure is caught before it reaches a submission portal.
+
+### 3.6 A concrete board
+
+```json
+{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "title": "Kinase screen — lab meeting",
+  "theme": ".chimaera/board/themes/talk-dark.theme.json",
+  "canvas": { "preset": "talk-16x9", "size": [960, 540] },
+  "pages": [
+    {
+      "id": "cover",
+      "background": { "fill": "@bg" },
+      "objects": [
+        { "id": "deck-title", "type": "text", "role": "title",
+          "at": [80, 210], "size": [800, 90],
+          "text": ["Kinase inhibitor screen"] },
+        { "id": "subtitle", "type": "text", "role": "subtitle",
+          "at": [80, 310], "size": [800, 50],
+          "text": [{ "runs": [
+            { "t": "Hits from a " },
+            { "t": "1,280-compound", "b": true, "color": "@accent1" },
+            { "t": " library" }
+          ] }] }
+      ]
+    },
+    {
+      "id": "results",
+      "objects": [
+        { "id": "heading", "type": "text", "role": "heading",
+          "at": [80, 48], "size": [800, 56], "text": ["Dose–response"] },
+        { "id": "panel-a", "type": "plot",
+          "at": [80, 130], "size": [420, 320],
+          "src": ".chimaera/board/assets/dose_response.svg",
+          "provenance": {
+            "tool": "matplotlib",
+            "script": "scripts/fig2.py",
+            "regen": "python scripts/fig2.py",
+            "themeExport": "talk-dark.mplstyle",
+            "generated": "2026-07-20T09:14:00Z"
+          } },
+        { "id": "callout", "type": "shape", "geo": "roundRect",
+          "at": [520, 150], "size": [360, 120],
+          "fill": "@surface", "stroke": { "color": "@accent1", "width": 1.5 },
+          "text": [{ "runs": [{ "t": "IC50 = 42 nM", "b": true }] }] },
+        { "id": "arrow-1", "type": "connector", "geo": "straight",
+          "from": { "object": "callout", "side": "left" },
+          "to": { "object": "panel-a", "side": "right" },
+          "stroke": { "color": "@fg", "width": 1.5 }, "tailEnd": "arrow" }
+      ],
+      "notes": "Emphasize the sub-100 nM potency."
+    }
+  ]
+}
+```
+
+Object taxonomy (union on `type`): `text`, `shape` (`geo` from the PPTX-safe
+preset list, optional bound child text), `image`, `plot` (an image carrying
+provenance), `connector`/`line` (point- or object-bound with sides), `group`
+(one nesting level preferred — deeper nesting degrades in Keynote and Google
+Slides). Deferred behind a version bump: `table`, `embed`. Never: freehand,
+bezier, boolean path ops, blend modes, animation.
+
+The **PPTX-safe subset** the schema targets — verified against OOXML docs — is:
+rect/roundRect/ellipse/triangle/diamond/hexagon/chevron/block-arrows/star5,
+straight and bent connectors with arrowheads; solid and 2–3-stop linear fills;
+solid strokes with dash/cap/join; at most one soft outer shadow; explicit runs;
+`buChar`/`buAutoNum` bullets with explicit `buFont`; PNG/JPEG images at ~2× placed
+size with `srcRect` crop; SVG only as `svgBlip`-over-PNG progressive enhancement;
+a generated `clrScheme`/`fontScheme`; plain-text notes slides. Everything in that
+list maps to a first-class editable object in PowerPoint 2016+, Keynote,
+LibreOffice 7.x+, and Google Slides import.
+
+## 4. Where things live
+
+Boards are **ordinary files anywhere in the workspace** — `figures/fig2.board.json`
+next to the manuscript, `talks/lab-meeting.board.json`. This is a deliberate
+refinement of the original "everything in a dotdir" instinct: files-as-truth
+means the figure belongs next to the paper it illustrates, git-diffability is a
+hard requirement, and the `FileTab` pipeline routes any path for free. What
+belongs in a managed home is everything *around* the board:
+
+```
+.chimaera/board/
+  themes/      tracked   *.theme.json      — curated + user themes
+  fonts/       tracked   Inter/, …         — vendored fonts (determinism on HPC)
+  assets/      tracked   dose_response.svg — imported figure panels
+  .gitignore   tracked   — written on first use; ignores the three below
+  renders/     IGNORED   <hash>.png        — content-addressed raster cache
+  exports/     IGNORED   deck.pptx, fig2.pdf
+  journal/     IGNORED   <board-id>.jsonl  — the semantic edit stream
+```
+
+The split is exactly your "renders don't clutter but stay accessible": **tracked**
+= anything that is truth and must travel with the repo (boards, themes, vendored
+fonts, imported assets — an imported matplotlib SVG *is* source; losing it loses
+the figure). **Gitignored + reconstructible** = renders (a pure function of
+board + theme + fonts), exports (regenerable final artifacts), and the journal
+(hot state; git holds the durable audit). All three stay on disk, in the file
+tree, one click away — they simply never appear in `git status` or a PR.
+
+**Naming note [decide]:** `~/.chimaera` is the *daemon's* home. A workspace-level
+`.chimaera/` is a different thing in a different place, and establishes a
+namespace future workspace-scoped features (Loadout's ack snapshot, for one) can
+share — but the echo is a real readability hazard. The alternative is a distinct
+name like `.board/` or `.chimaera-board/`. Recommendation: `.chimaera/board/`,
+documented once, because one workspace namespace beats N sibling dotdirs.
+
+## 5. The pane
+
+A `board` `FileViewKind`: register the extension in `viewKindFor`, add a
+`BoardView` branch in `FileView.svelte`. Everything in §2's first row comes free,
+including rollback safety — an older daemon renders a v2 board as text rather
+than dropping the tab.
+
+**Regions.** A **theme bar** across the top (theme picker, canvas preset, target
+preset: Talk-16:9 / Nature-single / Nature-double / Cell / PLOS / Poster-A0). A
+left **outline rail** (collapsible): pages as a thumbnail navigator, and under
+the active page an object outline — indented, z-order top-to-bottom, click to
+select, drag to restack, eye/lock toggles. The center is the **stage** (the page
+on a neutral pasteboard, page bounds drawn, optional rulers). The right is the
+**inspector**. The bottom is a **status strip**: zoom %, cursor position in
+physical units, a live **font-availability indicator** (green all-present, amber
+with the missing family *named*), and a "rendered N ms ago" chip.
+
+**Selection, move, resize, snap.** Click selects, shift-click extends, marquee
+multi-selects, click-empty deselects. Eight handles plus a rotation handle.
+Corner resize is proportional with shift, edge resize is one axis. Snapping to
+page center/edges/margins, an 8 pt grid, and sibling edges/centers with live
+alignment guides and equal-spacing hints; `alt` suppresses. Arrows nudge 1 pt,
+shift-arrow 10 pt.
+
+**Text resize changes the box, never the font size.** This is the single most
+important interaction decision in the editor: it is what keeps a figure inside
+its journal's font bounds through every resize, and it is exactly what
+Illustrator gets wrong. Font size changes only via the role dropdown or an
+explicit numeric override in the inspector.
+
+**Alignment tools.** A floating toolbar at ≥2 selected: align left/center/right/
+top/middle/bottom, distribute horizontal/vertical, match size, tidy into grid.
+These write the *same journal events* as the agent's align ops — the human's
+button and the agent's command are the same operation, which is what makes the
+two actors' histories comparable.
+
+**Inspector**, contextual: numeric transform (authoritative — you can type
+`x = 80`, because the file is numeric and the UI never hides the coordinate
+system), fill/stroke with theme swatches first and custom hex behind a
+disclosure, text (role dropdown, size shown as *resolved-from-theme* with an
+override affordance that displays "= theme (overridden)"), and for `plot` nodes
+a **provenance card** with Regenerate and Re-export-theme buttons.
+
+**Present mode** (decks; `P`): full-screen from the pane — page-at-a-time,
+arrow/space advance, `Esc` exits, a presenter view on a second window showing
+speaker notes, next-slide thumbnail, and elapsed time. It renders the same
+engine rasters at display resolution, pre-warming the next page. This is the one
+region all three designs under-specified despite "presentations first."
+
+**Empty states.** A new board opens a centered card — Slide deck / Figure panel /
+Poster — with a theme picker, plus **"Ask an agent to draft it"** which opens a
+chat session with a staged prompt naming the board path. An empty figure page
+shows ghost drop-zones sized to the active journal preset. Target: first board
+on screen in under 60 seconds, from the file tree or from chat.
+
+**Keymap** (pane-local, through the existing rebindable registry): `V` select,
+`T` text, `R`/`O`/`L` rect/ellipse/line, `⌘G`/`⌘⇧G` group/ungroup, `⌘D`
+duplicate, `⌘]`/`⌘[` raise/lower, `⌫` delete, `[`/`]` prev/next page, `⌘K`
+command palette (align, distribute, retarget, export), `P` present, `⌘±`/`⌘0`
+zoom (extending the `sizable` pane predicate), space-drag or trackpad to pan.
+
+**Deliberately absent, and this is a feature:** no pen or freehand, no bezier
+node editing, no boolean path ops, no gradient mesh, no blend modes beyond one
+soft shadow, no animation timeline, no infinite whiteboard. It beats PowerPoint
+and desktop artifacts *for figures and decks* by refusing to become Figma.
+
+## 6. The bidirectional loop
+
+This is the requirement that justifies the feature. Four channels, all over
+plain files, all agent-agnostic — a `codex` TUI on a login node uses exactly the
+same interface as a structured chat session.
+
+### 6.1 The agent reads positions — `describe`
+
+```
+$ chimaera board describe figures/fig2.board.json --page results
+page results (slide, 960×540 pt, theme talk-dark)
+  heading   text  "Dose–response"          at  80,48   size 800×56   role heading (28pt/@fg)
+  panel-a   plot  assets/dose_response.svg at  80,130  size 420×320  from scripts/fig2.py
+  callout   shape roundRect                at 520,150  size 360×120  fill @surface stroke @accent1
+  arrow-1   connector  callout.left → panel-a.right
+  ⚠ caption-1 text 4.5pt — below nature-single minimum (5pt)
+```
+
+Prose, named objects, integer pt, resolved styles, lint inline. The agent never
+parses raw JSON to *understand* a board — it reads this. It edits the JSON
+directly, anchored on ids.
+
+### 6.2 The agent sees the board — raster
+
+```
+chimaera board render fig2.board.json --page results --object callout --scale 2 -o /tmp/x.png
+chimaera board render fig2.board.json --region 500,140,400,140 --format jpeg -o /tmp/x.jpg
+```
+
+Whole page, an arbitrary region, or a single object — your "select which part
+should be rendered for the agent to see." Warm renders are tens of milliseconds
+(§7), which is what makes "render and look" affordable *every turn* rather than
+a special occasion. In chat, the same render arrives as an image attachment; in
+a TUI session, the agent runs the CLI itself.
+
+### 6.3 The human's gestures become structured data — the journal
+
+One append-only JSONL per board under `.chimaera/board/journal/`, written with
+`journal.rs` discipline (seq-first and gap-free, dedicated writer over a bounded
+mpsc, cap → compaction at a `board.opened` boundary, oversize entry replaced
+with an error record, crash-torn tail truncated on open). Gestures are
+**coalesced**: a 900 ms drag is one `object.moved` with from/to, not 60 frames.
+
+```jsonl
+{"seq":41,"ts":"2026-07-21T10:00:01Z","actor":"human","op":"select","page":"results","objects":["panel-a"]}
+{"seq":42,"ts":"2026-07-21T10:00:09Z","actor":"human","op":"move","page":"results","object":"panel-a","from":[80,130],"to":[96,130]}
+{"seq":43,"ts":"2026-07-21T10:00:14Z","actor":"human","op":"resize","page":"results","object":"panel-a","from":[420,320],"to":[460,350]}
+{"seq":44,"ts":"2026-07-21T10:00:21Z","actor":"human","op":"comment","page":"results","object":"callout","pin":"c1","text":"make this the same blue as panel A's points"}
+{"seq":45,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"restyle","page":"results","object":"callout","changed":{"stroke.color":"@accent2"},"note":"matched panel-a series color"}
+{"seq":46,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"render","page":"results","hash":"9c1a…"}
+```
+
+`chimaera board journal <board> --since 40` is the agent's cheap read of *what
+the human just did* — no full-file diff, no guessing. Because every mutation
+from either actor writes both the file and an event, the journal is a complete
+semantic causal trace across both, in human-readable named-object terms
+(requirement 3a satisfied twice over: `describe` for state, journal for change).
+
+**Three details that are easy to get wrong and must be in slice 1:**
+1. **Multi-writer.** The daemon UI and a separately-invoked `chimaera board`
+   CLI process can both want to append. The CLI **routes its append through the
+   running daemon** when one owns the workspace (a local route call), and only
+   falls back to a direct advisory-locked append when no daemon does. One writer
+   per file, always.
+2. **Rename-follow.** Journals are keyed by board path; a rename must re-key the
+   journal on the same event that already rewrites tab paths, or a renamed board
+   silently orphans its history.
+3. **Compaction must preserve** unresolved `comment` pins and the latest
+   `select` entry — otherwise deixis and pins vanish at a cap boundary, which
+   would be a spooky, hard-to-reproduce bug.
+
+### 6.4 Selection is pointing
+
+When objects are selected in the pane and you type "make **this** bigger" into a
+chat session, the board resolves `this` → object ids and injects, via the
+existing `composerBus`, a compact context line (`[board: figures/fig2.board.json
+› results › callout, arrow-1]`) **plus an object-scoped region snapshot as an
+image attachment**. The agent knows which objects and sees them, without you
+describing either. In a TUI session — where Chimaera never types into a PTY —
+the same action instead offers "copy snapshot path", dropping the render into
+the session upload dir and giving you an `@`-path to send yourself.
+
+Comment **pins** are the lower-bandwidth version of the same thing: drop a
+numbered dot on the canvas, optionally bound to an object, with text. Pins live
+in the journal only — never in the board file, whose diffability must not be
+polluted by conversation. Resolving appends `comment.resolved`.
+
+### 6.5 The agent's edits land legibly
+
+The agent edits the board with its ordinary `Edit`/`Write` tools (id-anchored,
+sparse). The write bumps the workspace epoch; the board is a registered mounted
+path so `fs_watch` picks it up; `fileStore` revalidates **in place** (never
+null-then-refetch). `BoardView` then diffs old vs new **by id** and animates the
+delta: moved and resized objects tween ~180 ms to their new box, created objects
+fade and scale in, deleted objects fade out, restyled objects flash a 1.2 s
+**attribution glow in the acting agent's hue**, and a transient chip narrates it
+("claude moved panel-a, restyled callout") with click-to-focus.
+
+This is the anti-poltergeist mechanism and it is not decoration: an agent that
+silently rearranges your figure is unnerving and untrustworthy, and the fix is
+that every remote edit is *narrated, attributed, and animated* so you can see
+what changed and undo precisely.
+
+### 6.6 Conflict: you are dragging while the agent writes
+
+Because the file is structured JSON with stable ids and zero churn fields,
+conflict resolution is a **per-object three-way merge**, not textual:
+
+- On drag start the UI snapshots the on-disk board + `X-Mtime` as base, holds an
+  optimistic local overlay, and does not write.
+- If the agent writes mid-drag, revalidation applies the agent's changes to
+  **every object except the one under your pointer**, tweening them in with
+  attribution, and silently advances the base mtime. Your drag is never yanked.
+- On pointer-up the UI writes with `expect_mtime`. A 409 re-reads, re-applies
+  your single-object delta by id, and rewrites.
+- **Same-object collision:** your in-flight delta re-applies on top of the
+  agent's write for that object — you win where you are actively touching, the
+  agent wins everywhere else — with an attributed toast and one-click undo. No
+  modal conflict bar; the human is present and undo is cheap, so a combative
+  dialog is the wrong instinct.
+
+The common case (agent restyles `callout` while you move `panel-a`) merges
+cleanly with zero loss, which is only true because ids are the merge key.
+
+### 6.7 Undo across two actors
+
+Undo is journal-driven and **actor-aware**. Every committed mutation is an
+invertible event. `⌘Z` walks back *your own* entries by default, stepping over
+the agent's — you should not undo the agent's work by reflex while cleaning up
+your own. An explicit menu item ("Undo claude's restyle of callout?") steps over
+agent edits with attribution shown. Git remains the coarse time-travel backstop.
+
+### 6.8 Latency budget
+
+| Segment | Budget |
+|---|---|
+| gesture → optimistic UI | < 16 ms (local overlay, no round trip) |
+| gesture → journal append | async, backpressure-bounded, never blocks a gesture |
+| save → disk (atomic PUT) | < 5 ms local, + RTT remote |
+| agent edit → UI animation starts | ~0 ms same-window (client bus); ≤ 2 s cross-process (fs poll) |
+| selection → snapshot attached in chat | < 100 ms (warm render + attach) |
+| warm page render | 20–60 ms; promise < 100 ms, target < 50 ms |
+
+The only segment above 100 ms is cross-process file-watch detection on the 2 s
+poll — acceptable for the human-perceptible "the agent is working" beat, and
+invisible for same-window edits.
+
+## 7. Rendering, and why the pane shows the engine's pixels
+
+A new **`chimaera-board`** leaf crate (depends only on `chimaera-core`; both the
+binary and `chimaera-server` depend on it — the `chimaera-pty` pattern). Stack,
+all pure Rust with zero C dependencies so it cross-compiles to musl exactly like
+the daemon: **usvg + resvg + tiny-skia** (SVG panels, shapes, compositing),
+**cosmic-text** (our text layout — shares `fontdb` with usvg, so one font world),
+**fontdb** (discovery), **krilla + krilla-svg** (PDF with real selectable text
+and font subsetting), **png** (image-rs, fast profile for previews) and
+**jpeg-encoder**. Roughly 8–14 MB of binary; RSS impact is mmap'd fonts plus one
+~8.3 MB framebuffer per concurrent render, so renders run under the existing
+8-permit `spawn_blocking` semaphore with a size gate before parse.
+
+**The parity decision.** The stage displays **server-rendered rasters** with a
+thin client-side vector overlay for selection handles, guides, snap lines, and
+drag ghosts. The page raster is the truth layer; when you grab an object, the
+daemon mints a two-part render (page-without-object, object-alone) so the drag
+translates a crisp sprite over a static backdrop, and a fresh render lands on
+release.
+
+This is the same instinct as *terminal state lives server-side*: it means **what
+you see is what exports, by construction, on day one** — no DOM-vs-cosmic-text
+metric drift, no "it looked right in the editor and wrapped differently in the
+PPTX", and imported matplotlib SVGs render through the identical pipeline in
+both places. The cost is that in-place *text editing* wants a local layout
+engine; that arrives in a later slice by compiling cosmic-text to wasm, and
+until then text editing happens in an overlaid field that commits to a re-render.
+**DOM `measureText` must never become layout truth at any point** — that is the
+door through which drift permanently enters.
+
+**CLI** (a nested `Board { cmd }` enum, the `Compute` shape):
+
+```
+chimaera board new      <path> [--kind slide|figure|poster] [--preset ID] [--theme ID]
+chimaera board render   <board> [--page ID] [--object ID | --region X,Y,W,H]
+                                [--scale N] [--format png|jpeg] [-o FILE]
+chimaera board describe <board> [--page ID]
+chimaera board journal  <board> [--since SEQ] [--limit N]
+chimaera board lint     <board> [--target nature-single|cell|plos|talk|poster-a0]
+chimaera board export   <board> --to pptx|pdf|svg|png [--target ID] [-o FILE]
+chimaera board rescheme <asset.svg> --theme ID [-o FILE]
+chimaera board fonts    [--board <board>]
+chimaera board theme-export <theme> --as mplstyle|ggtheme [-o FILE]
+```
+
+**Daemon routes** (bearer-authed, versioned envelopes, additive to the stable
+wire): `POST /api/v1/board/render` → mints a `/raw` ticket; `GET
+/api/v1/board/describe`; `GET|POST /api/v1/board/journal`; `POST
+/api/v1/board/export` → a download ticket. Board mutations bump a per-workspace
+**board epoch** on `/ws/events` — invalidate-and-pull, never payload on the
+firehose.
+
+**Render cache** in `renders/`, content-addressed on
+`hash(page subtree + resolved theme + font-set fingerprint + region + scale)`,
+LRU-capped by directory byte budget. An agent's `render` journal entry records
+the hash, so the UI reuses the exact bytes the agent saw. This is what makes
+render-every-turn cheap.
+
+## 8. Fonts
+
+First-class, because on a login node this is where naive tools fall over. Order:
+**vendored** `.chimaera/board/fonts/` (git-tracked, so a figure renders
+byte-identically on your laptop and on a fontless compute node) → **bundled**
+OFL defaults baked into the binary via `include_bytes!` (Inter, Source Sans, a
+Noto subset) → **system** scan via `fontdb` (pure-Rust fontconfig parsing, no C
+linkage, works headless).
+
+A missing font **never fails and is never silent**: the nearest family
+substitutes, and the substitution is surfaced in the status strip (naming the
+missing family), in `describe`, as a `lint` error, on the render response, and
+as a faint corner watermark on the raster — so a wrong-font export cannot be
+mistaken for a correct one. Vendoring carries OFL attribution and redistribution
+obligations; the bundled set ships its licenses and `board fonts` prints them.
+
+## 9. Themes and the curated defaults
+
+A `.theme.json` carries `palette` (named colors), `type` (roles → family/size/
+weight/color, each with `minPt`), `fonts` (family → vendored path), `spacing`
+(the 8 pt grid, margins), and `presets`. Defaults are an acceptance criterion,
+not a nicety — the whole promise of "better than PowerPoint out of the box"
+lives here. Ship:
+
+- **talk-dark** and **talk-light** — the Butterick fixes: off-neutral background
+  (never pure white or black), body text at ~88% gray, exactly one accent, a
+  modular ~1.25 type scale on the 960×540 pt / 8 pt grid, at most two families.
+- **figure-okabe-ito** and **figure-tol-bright** — categorical palettes that are
+  colorblind-safe and grayscale-robust (`#E69F00 #56B4E9 #009E73 #F0E442
+  #0072B2 #D55E00 #CC79A7`; Tol Bright as the alternative), **Viridis** for
+  continuous. No red-green encoding, no jet, ever. Minimal chrome: top/right
+  spines off, thin axes, direct labels over heavy legends.
+- **journal-nature / journal-cell / plos** — correct column widths, font-size
+  bounds, and panel-label style (Nature 8 pt bold lowercase `a b c`; Cell/PLOS
+  capitals), with **Arial and not Helvetica for PLOS** — the specific trap that
+  bounces submissions.
+- **poster-a0**.
+
+Themes validate for WCAG text contrast, reusing the app-theme legibility
+contract. **Target presets are first-class**: switching Nature-single → Cell
+atomically remaps canvas width, font-size bounds, panel-label style, and export
+format — resubmission becomes one click instead of a manual redo.
+
+## 10. Figures: matplotlib, ggplot, and rescheming
+
+**Import.** Drop an `.svg`/`.pdf`/`.png` from `results/` onto the stage (or from
+the file tree); it is copied into `assets/` (tracked) and becomes a `plot` node
+with `provenance {tool, script, regen, themeExport, generated}`. matplotlib SVGs
+exported with the default `svg.fonttype:'path'` render pixel-faithfully with no
+fonts required, which is the easy and common case.
+
+**Rescheming, two paths, in this order of preference:**
+
+1. **Regenerate on-theme (lossless, preferred).** `chimaera board theme-export`
+   emits the theme as a `.mplstyle` or a ggplot `theme()` snippet — palette as
+   `axes.prop_cycle`, family and per-role sizes, spines off, `svg.fonttype:'none'`
+   (real text!), `pdf.fonttype:42`, transparent background, exact figsize in mm,
+   and never `bbox_inches='tight'` (which silently breaks exact sizing). The
+   provenance `regen` command re-runs the script; the agent or the Regenerate
+   button reproduces the panel natively on-theme.
+2. **In-place SVG recolor (for what you cannot regenerate).** `board rescheme`
+   remaps colors **by element id/group and role — never a global hex
+   find-replace**, because the same hex means a data series in one place and a
+   gridline in another. Text re-fonting works only where the SVG carries real
+   `<text>`, which is precisely why path 1 pushes `fonttype:'none'` upstream
+   rather than trying to reverse-engineer outlines.
+
+A `plot` whose script is newer than its asset shows a **stale badge** with a
+one-click regenerate. PDF-panel import (via `hayro`) is feature-gated to a late
+slice; v1 honestly says "export SVG or PNG from your plotting code."
+
+## 11. Exports
+
+- **PPTX — a pure-Rust OOXML writer** (`zip` + `quick-xml`) inside
+  `chimaera-board`, targeting §3.6's safe subset. This is a deliberate deviation
+  from the research's python-pptx recommendation, and the argument is a Chimaera
+  invariant: the daemon is one static musl binary deployed to login nodes with no
+  Python and no system dependencies, so shelling out breaks remote-transparency.
+  The subset is a small fixed vocabulary — tractable to emit directly. **python-pptx
+  becomes a CI-only fidelity oracle**: tests open our output and assert object
+  counts, text, and positions round-trip. A PowerPoint / Keynote / LibreOffice /
+  Google Slides fidelity matrix is a release gate, not a hope. Always `noAutofit`;
+  `@`-tokens become `schemeClr` refs against a generated `clrScheme`.
+- **PDF** via krilla — real selectable text, subsetted fonts.
+- **SVG** in two variants: text-as-paths by default (renders identically
+  anywhere) and a real-`<text>` + `@font-face` toggle (editable in Illustrator
+  and Inkscape). This is matplotlib's own tradeoff, surfaced as a choice.
+- **PNG/JPEG** at export DPI (≥300 for journals, 600 for line art).
+
+Exports land in `.chimaera/board/exports/` and are offered as a download ticket.
+`lint --target` runs first and blocks on min-font-size, off-canvas, and
+unresolved-font errors.
+
+## 12. Skills and chat
+
+Canonical `.claude/skills/board/SKILL.md` + a `.agents/skills/board/` Codex
+bridge — the interface is **files + CLI, zero MCP**, which is what makes it work
+for any agent, in a TUI or in chat, locally or over ssh. The skill is the
+format's `llms.txt`: the coordinate system, the object taxonomy, the run and
+token model, the id-anchored sparse-edit contract, the CLI, and the loop
+("after editing, `render` and look; before asking, `describe`; to know what the
+human did, `journal --since`"). A versioned spec is fetchable, because models
+confidently emit stale formats otherwise.
+
+**Chat.** `.board.json` joins `viewKindFor` and `INLINE_PREVIEW_KINDS`, so a
+board an agent writes surfaces as an **inline artifact card** — rendered through
+the render route and backed by `fileStore` (the *live* pattern, not the
+write-once memo, so the card updates as the agent iterates). A per-tile "Open in
+board" action threads through `ArtifactGallery` → `InlinePreview`. Outgoing
+snapshots and selection deixis use `composerBus` (§6.4). And `board new` plus a
+staged prompt means an agent can bootstrap a board from inside a chat turn with
+no CLI round-trip — the empty-state button and the skill both go through it.
+
+## 13. Edge cases and failure honesty
+
+- **Missing fonts** — substitute, name it in five places, watermark the raster.
+- **Huge assets** — size-gate before parse; rasters downscaled to ~2× placed
+  size; an oversized SVG is refused with an explanation, never an OOM on a
+  150 MB-budget daemon.
+- **Malformed board** — lenient parse; true corruption falls back to the text
+  view with a repair banner and an "ask an agent to fix it" affordance.
+- **A future formatVersion** — text fallback, never a dropped tab.
+- **Remote hosts** — every step (render, export, describe, journal) runs on the
+  daemon that owns the files; the same binary is already deployed there, so the
+  whole loop is remote-transparent with no new transport. Only ticketed rasters
+  cross the tunnel.
+- **Journal loss** — hot and reconstructible; the agent loses recent context,
+  nothing durable. Git holds truth.
+- **Two windows on one board** — the same per-object merge as §6.6.
+
+## 14. Phasing
+
+1. **Slice 1 — the spine, dogfoodable in a week.** `chimaera-board` crate:
+   schema, `normalize`, lenient parse, the raster path (usvg/resvg/cosmic-text/
+   png), bundled fonts. CLI `new`, `render`, `describe`, `lint`, `journal`.
+   `BoardView` with the stage, select/move/resize/snap, outline rail, numeric
+   inspector, page navigator. One theme (`talk-dark`) + PNG export. The journal
+   writer **and gesture emission**. The board skill (claude + codex bridge).
+   **The day-one dogfood, which is the whole point of the feature:** an agent
+   authors a two-slide deck from the skill, renders it, you drag a box, the agent
+   reads `describe` + `journal --since` and adjusts. Rust unit tests on the
+   schema, normalize, and lint (the web UI has no component tests — the isolated
+   preview is its net).
+2. **Slice 2 — the loop's polish.** Daemon routes + board epoch; live
+   agent-edit animation with attribution and narration; selection-as-deixis and
+   region snapshots into chat; comments and pins; per-object conflict merge;
+   actor-aware undo.
+3. **Slice 3 — exports.** Pure-Rust PPTX + krilla PDF + SVG (both variants) +
+   JPEG; the python-pptx CI oracle and the cross-app fidelity matrix; target
+   presets; `lint --target` gating.
+4. **Slice 4 — figures.** matplotlib/ggplot import, provenance, stale badges,
+   `theme-export` to `.mplstyle`/ggtheme, `rescheme`; Okabe-Ito/Tol/Viridis
+   themes; journal width presets; poster preset.
+5. **Slice 5 — decks and parity.** Present mode with presenter view; inline
+   board artifacts and snapshot attachments fully wired; cosmic-text-wasm for
+   in-place text editing; `svgBlip` progressive enhancement; `hayro` PDF-panel
+   import behind a feature flag.
+
+Every slice is independently shippable and live-verified per **verify-app**;
+anything touching chat is gated by `just chat-smoke`. A `feat:` carries its
+feature-catalog page ([document-feature](../.claude/skills/document-feature/SKILL.md))
+and an intent capture.
+
+## 15. Open questions **[decide]**
+
+- **The name** (§1) — Board, Easel, Plate, or keep "composer" and rename the
+  chat one. Recommendation: Board.
+- **The workspace dotdir** (§4) — `.chimaera/board/` (one namespace, echoes the
+  daemon home) vs `.chimaera-board/` (unambiguous, proliferates).
+- **Figures vs decks first.** Slice 1 ships a deck because 16:9 is one fixed
+  canvas and the schema is simplest there, but the *wedge* — the thing nobody
+  else does — is figure assembly. Flipping slices 3 and 4 would put the
+  differentiated use case in your hands two slices earlier at the cost of
+  shipping PPTX later.
+- **How much of the plugin story to honor now.** Recommendation in the earlier
+  brainstorm stands: ship this as an optional built-in surface (a setting hides
+  it), publish the *format* spec in an outside repo if you want an ecosystem,
+  and defer a general UI-plugin system until three things need it. Worth an
+  explicit yes/no, since it was your original framing.
+- **`table` objects.** Deferred behind a version bump here. Scientific decks use
+  them constantly and PPTX `a:tbl` is safe everywhere — is that a slice-4 item
+  rather than "later"?
+- **User-scope themes** (`~/.chimaera/board/themes/`) so a lab's house style
+  follows you across projects on a shared HPC home — powerful, but it weakens
+  the "the repo contains everything needed to rebuild the figure" story.
+
+## Appendix: what we deliberately do NOT build
+
+- **A drawing tool.** No pen, bezier, boolean ops, gradient mesh, blend modes,
+  or animation. The object set is text, shape, image/plot, connector, group.
+- **DOM `measureText` as layout truth.** The stage shows the engine's pixels
+  (§7); a browser-measured shortcut would permanently split editor and export.
+- **Autofit.** Unrepresentable in the schema by design (§3.5).
+- **Markdown as the stored text model.** Authoring sugar only — a second stored
+  styling representation makes normalization ambiguous and diffs churn.
+- **Inlined theme snapshots in boards.** The theme is a tracked file in the same
+  repo; snapshotting buys nothing and churns every diff.
+- **Comments and pins in the board file.** Journal-only; conversation must not
+  pollute the document's diff.
+- **A daemon-side board database.** Files are truth. On a shared NFS home a
+  per-host daemon store would show different truth per daemon and none at all to
+  a teammate's clone.
+- **Shelling out to Python (python-pptx, Inkscape, LibreOffice) at runtime.**
+  Breaks the static-binary and remote-transparency invariants; python-pptx is a
+  CI oracle only.
+- **pdfium or mutool for PDF import.** AGPL contagion and system dependencies;
+  `hayro` behind a feature flag is the honest path, and v1 says "export SVG."
+- **Global hex find-replace rescheming.** The same hex means different things in
+  different parts of a matplotlib SVG; id/role-scoped remap or regenerate.
+- **An infinite canvas.** Boards are pages with real physical sizes, because the
+  output is a slide or a journal figure with a column width.
