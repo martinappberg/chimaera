@@ -13,7 +13,8 @@ errors). Depth: [chat/AGENTS.md](../../web-ui/src/lib/chat/AGENTS.md),
 `src/lib/` is grouped by concern, not flat: **`net/`** (api, ws-adjacent transport,
 reconnect, native bridge, the `/ws/events` socket) · **`layout/`** (the split/pane/tab
 tree + view-state) · **`previews/`** (the file-preview surfaces + their loaders) ·
-**`terminal/`** (the PTY stack: xterm, pool, socket, links) · **`workspace/`** (workbench
+**`terminal/`** (the PTY stack: xterm, pool, socket, links) · **`browser/`** (the
+reverse-proxied web-app pane + its proxy client) · **`workspace/`** (workbench
 domain surfaces + their stores: files tree, git, sessions, launcher, home) · **`shared/`**
 (cross-cutting leaf primitives: icons + glyphs, keys/keybindings, reference/provenance). The
 `chat/`, `settings/`, and `dashboard/` subsystems keep their own folders (+ maps).
