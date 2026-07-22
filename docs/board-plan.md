@@ -35,8 +35,10 @@ are the database, the daemon only scans and serves.
 A **board** is an ordinary git-tracked `.board.json` file — a small, strict
 scene graph of pages and named objects (text with real runs, shapes, images,
 plot panels, arrows, groups) in **points**, whose every construct is a clean
-subset of PPTX semantics, so export to *natively editable* PowerPoint is a
-mechanical projection rather than a lossy afterthought. A **theme-token layer**
+constructs project onto PPTX at a **declared fidelity tier per object** — most
+land as natively editable PowerPoint objects by mechanical projection, and the
+rest degrade to a stated tier the preflight tells you *before* you export, never
+after. A **theme-token layer**
 (`@accent1`, `role: "title"`) sits between the board and its literal styling, so
 "strict system by default, fully customizable" is literal: agents author against
 a constrained schema, humans restyle by swapping tokens. A pure-Rust engine in
@@ -92,7 +94,8 @@ natively rather than as a plugin.
 ## 3. The board format
 
 The schema *is* the product. Four constraints drive every decision: it must (a)
-project faithfully onto PPTX, (b) read like prose under `git diff`, (c) be
+project onto PPTX at a fidelity that is **computable before export**, not
+discovered after, (b) read like prose under `git diff`, (c) be
 authorable by an agent from a ~300-line spec excerpt, and (d) be constrained
 enough that a naive agent cannot produce something ugly.
 
@@ -252,7 +255,7 @@ vocabulary is a composite that expands into them (§3.8):
 | Type | Purpose | PPTX |
 |---|---|---|
 | `text` | A box of paragraphs of explicit runs. The only thing that owns glyph layout. | `p:sp` + `a:txBody`; `role: title/heading` → real `p:ph` |
-| `shape` | A preset geometry with fill/stroke and optional bound child text. Absorbs `line`. | `p:sp` + `a:prstGeom` |
+| `shape` | A geometry — named preset **or** arbitrary path — with fill/stroke and optional bound child text. Absorbs `line`. | `p:sp` + `a:prstGeom`, or `a:custGeom` where `geo` is a path |
 | `connector` | A stroked two-endpoint geometry binding to other objects by box edge. | `p:cxnSp` with its own resolved `a:xfrm` |
 | `image` | Placed pixels or SVG, with optional `srcRect`, `provenance`, `pixelSize`, `frame`, `tint`. Absorbs `plot`. | `p:pic` (+ `svgBlip`) |
 | `group` | A z-order and selection envelope over page-absolute children. | `p:grpSp`, identity child space |
@@ -271,27 +274,76 @@ the which-type-do-I-emit ambiguity agents get wrong in every tool carrying both.
 Groups prefer one nesting level (deeper degrades in Keynote and Google Slides).
 Never: freehand, bezier, boolean path ops, blend modes, animation.
 
+**`geo` is a named preset *or* a path.** Named geometries stay the authored
+default — they read beautifully under `git diff`, they carry a real `a:avLst`
+adjust value so PowerPoint's yellow handle still works, and they are what the
+skill points agents at. `{"geo": "path", "d": "M …"}` is the fallback for
+geometry that has no name: composite outlines, `sigBracket` and `callout` tails,
+`scalebar` caps, violin and KM shapes, and anything `detach-on-drag`
+materializes. **Board never infers a preset from a path** — inference produces
+near-misses that ship as visibly wrong corner radii.
+
+A path exports as `a:custGeom`, which is a **first-class editable PowerPoint
+shape**: the same `spPr` fill and stroke, the same theme colors, the same bound
+`a:txBody` with real editable text, and Edit Points works. The relation actually
+runs the other way — when a user hits Edit Points on a *preset* shape, PowerPoint
+converts it *to* custGeom, so custGeom is the native representation of "a shape a
+human has edited." Two writer rules are non-negotiable, both verified to fail
+otherwise against a shipping OOXML consumer:
+
+- **Never emit `a:arcTo`.** Its parameterization is unlike SVG's and consumers
+  disagree; three separate `arcTo` test shapes drew *literally nothing*, and
+  LibreOffice has a long-standing custGeom `arcTo` bug. Flatten every arc to
+  cubics (≤4 segments, ~1e-4 relative error). Costs nothing.
+- **Always emit `a:path` coordinates in shape-local EMU with `w`/`h` equal to the
+  shape's `ext`.** A normalized path space rendered at ~4% of intended size in a
+  real consumer — a one-line convention that would otherwise ship microscopic
+  shapes in some apps and pass every unit test.
+
+This also makes `detach-on-drag` (§3.8) **lossless**: a detached composite becomes
+literal editable shapes with no approximation, which it could not be while `geo`
+was a fixed enum.
+
 **Four fields every object carries, none of which is a type:** `anchor` (§3.7),
 `alt` (exports as `p:cNvPr/@descr` — ~5 lines of writer, and it completes the
 accessibility story), `link` (run- or shape-level `a:hlinkClick`, so a DOI
 survives export instead of dying inside a flattened picture), and image-only
 `tint` (recolors a monochrome SVG to a theme token).
 
-The **PPTX-safe subset** the schema targets — verified against OOXML docs — is:
+**Tier 1 for the pptx target** — the vocabulary that lands as a first-class
+editable object in PowerPoint 2016+, Keynote, LibreOffice 7.x+, and Google Slides
+import. Note the reframing: this is a *property of an export target*, not an
+admission test for the schema (§3.7).
+
+*Geometry — wide.* Any path, as `a:custGeom`; the named presets
 rect/roundRect/ellipse/triangle/diamond/hexagon/chevron/block-arrows/star5,
-straight and bent connectors with arrowheads; solid and 2–3-stop linear fills;
-solid strokes with dash/cap/join; at most one soft outer shadow; explicit runs;
-`buChar`/`buAutoNum` bullets with explicit `buFont`; **fill alpha** (`<a:alpha>` —
-there is no Venn overlap, highlight band, or legend swatch without it); the extra
-geo presets `flowChartDocument`/`flowChartDecision`/`flowChartMagneticDisk`/
-`flowChartPreparation`/`parallelogram`/`stadium` and `leftBrace`/`rightBrace`/
-`bracketPair` (constant in figures — "these three lanes are the treatment group");
-PNG/JPEG images at ~2× placed size with `srcRect` crop; SVG only as
-`svgBlip`-over-PNG progressive enhancement;
-a generated `clrScheme`/`fontScheme` plus **title/body placeholders on a generated
-master and a minimal layout set** (title, title+body, blank, picture); plain-text
-notes slides. Everything in that list maps to a first-class editable object in
-PowerPoint 2016+, Keynote, LibreOffice 7.x+, and Google Slides import.
+`flowChartDocument`/`flowChartDecision`/`flowChartMagneticDisk`/
+`flowChartPreparation`/`parallelogram`/`stadium`, and `leftBrace`/`rightBrace`/
+`bracketPair` (constant in figures — "these three lanes are the treatment
+group"); straight and bent connectors with arrowheads.
+
+*Paint — narrow, and deliberately narrower than DrawingML permits.* Solid and
+2–3-stop **linear** fills; **fill alpha** (`<a:alpha>` — there is no Venn overlap,
+highlight band, or legend swatch without it); **stroke alpha**
+(`<a:ln><a:solidFill><a:alpha>`, valid and honored — its omission earlier was an
+oversight); solid strokes with dash/cap/join; at most one soft outer shadow.
+
+*The named silent-failure list, which is why paint stays narrow.* **Radial
+gradients, `a:pattFill`, `a:softEdge`, and `a:path/@fill="none"` all failed
+silently in a shipping OOXML consumer** — the pattern fill rendered as *nothing at
+all*, and `a:outerShdw` did not render either. A figure that arrives with its
+hatched overlap as white space is worse than one that refused to export. These are
+`vector` tier at best and must be named in the degradation table, never quietly
+emitted. **Holes are the least portable construct in the vocabulary**: DrawingML
+has no `fill-rule` switch, a hole exists only by subpath-winding convention, and
+three donut strategies all rendered as a solid disc. A path with a hole is a
+degradation row, not a safe primitive.
+
+*Also tier 1:* explicit runs; `buChar`/`buAutoNum` bullets with explicit
+`buFont`; PNG/JPEG at ~2× placed size with `srcRect` crop; `svgBlip`-over-PNG
+(**a picture-quality feature, never an editability feature — §11**); a generated
+`clrScheme`/`fontScheme` plus **title/body placeholders on a generated master and
+a minimal layout set** (title, title+body, blank, picture); plain-text notes.
 
 Two coordinate spaces the schema must pin down explicitly, because leaving them
 implicit yields a board that renders correctly in the pane and wrong in
@@ -332,19 +384,56 @@ clauses; one failure and it is an imported panel.
 > layout, and typography, never an estimator, fit, smoother, binner, clusterer,
 > projection, or solver.
 >
-> **C3 — Bounded.** It expands to fewer than 2,000 primitives, and the bound is
-> computable *before* expansion.
+> **C3 — Bounded.** It expands to fewer than 2,000 **drawn** primitives for the
+> render path, and its **emitted export-object count** is computable before
+> expansion and stays under the target's ceiling. These are two different numbers,
+> and an earlier draft conflated them: §3.8's data cap already permits ≤5,000
+> drawn marks. The export bound is what actually bites — file size is a non-issue
+> in every direction (5,000 custGeom circles zip to 138 KB; a 40,000-segment path
+> to 362 KB), but ~200–500 emitted shapes is a comfortable slide, ~1,000 is the
+> "are you sure" line, and ~5,000 stops being a document.
 >
-> **C4 — Projectable.** Every primitive it emits is already in §3.6's PPTX-safe
-> subset and lands on a first-class *editable* object at the destination. If the
-> destination application has to compute where things go, Board does not know what
-> it exported.
+> **C4 — Closed-form at the destination.** Board resolves all geometry to explicit
+> coordinates before writing, and nothing in the output may depend on the
+> consumer's text metrics, layout engine, or version. If the destination
+> application has to compute where things go, Board does not know what it exported.
+>
+> **C5 — Declared fate.** Every primitive it emits has a **computable export tier
+> at every target**, derived per instance *before* export and surfaced in the
+> preflight and in `describe`. An element may land below native at a target; it may
+> never land there **silently**.
+>
+> **C6 — Text integrity.** Every glyph Board draws originates from a `text` run in
+> the file, and every such run reaches an editability-claiming target as **one real
+> text run** — `a:r` inside a single `a:txBody` on PPTX, a tagged run in PDF,
+> `<text>`/`<tspan>` in the SVG real-text variant. Run and paragraph boundaries in
+> the file are exactly the boundaries in the output. Text is **never outlined,
+> never rasterized, never split per word or per glyph to make it fit.** No element
+> that owns text may fall below `grouped` tier.
 
 The one-line form, which goes verbatim into the skill: **Board computes scales,
 layout, and typography. Board never computes statistics.** Colloquially: *you
 could place it correctly with a ruler and the caption, without opening the
-dataset.* C4 alone decides SmartArt, autofit, live layout containers, and
-Microsoft's `cx:` chartex extension in one stroke.
+dataset.*
+
+**C4 is stronger than the clause it replaces, not weaker.** It still decides
+SmartArt, autofit, live layout containers, and Microsoft's `cx:` chartex in one
+stroke — and it now independently forbids the tempting "just embed an SVG and let
+PowerPoint convert it to shapes" trick, because that conversion demonstrably
+re-lays-out text differently per build and per installed font. What C4 no longer
+does is decide *what the schema may express*, which was never its job: **PowerPoint's
+feature set is not a dependency of a scientific figure's file format.** The old
+clause was in fact already false — `equation` and `colorbar` are native composites
+that ship as pictures, so it was documenting a rule shipped elements broke.
+
+**C6 is the load-bearing addition, and it is the maintainer's own caveat —
+*"as long as the general text isn't like one text box for every word"* — promoted
+from a preference to an invariant.** It is what makes widening the geometry
+vocabulary safe. Its live threat comes from upstream rather than from PowerPoint:
+**matplotlib mathtext emits one `<tspan>` per glyph with absolute x positions**, so
+`-\log_{10}(p)` arrives as 16 separately-positioned single-character runs. Plain
+axis and tick labels are one run each and are fine; math labels are not, and lint
+must say so rather than let a panel claim verified text.
 
 **The corollary that makes this generous rather than restrictive**, and the single
 most useful finding of the whole design pass: *most of the bioinformatics long
@@ -647,13 +736,46 @@ containers, because a container owning its siblings' positions would break
 `at`), and PPTX has no container, so a live one would reintroduce exactly the
 consumer-side layout drift C4 forbids.
 
-**The fidelity preflight.** A tier glyph per object in the outline rail (solid =
-native primitive, hollow = composite, square = picture), a running "N objects
-export editable, M as pictures" in the status strip, and `⌘K → Export` opening a
-preflight that lists per-target degradations, unverified-panel warnings, stale
-data digests, missing `pixelSize`, and every blocking lint. `describe` prints the
-same tier per object, so the agent reads the identical contract. Nothing about
-export fidelity should be discovered by opening the file in PowerPoint.
+**The fidelity preflight.** Every object has an **export tier** at the active
+target, computed by a pure function over the same normalized, expanded tree the
+renderer, lint, and the writer already run on:
+
+| tier | meaning | pptx | pdf | svg |
+|---|---|---|---|---|
+| `native` | first-class editable object of the right kind | `p:sp`/`p:cxnSp`/`a:tbl`/`p:pic` | tagged text + vector | `<text>` + primitives |
+| `grouped` | group of native primitives; visual identity exact, composite identity lost | `p:grpSp` | vector | group |
+| `vector` | one embedded vector picture; recoverable only by a manual, build-dependent, recipient-side conversion | `svgBlip`-over-PNG | vector XObject | `<image>` |
+| `raster` | PNG at declared DPI; terminal | `p:pic` | image | `<image>` |
+
+Three properties are invariants, not niceties. **Demotion is per-element, never
+per-page** — one rich object must never drag its page to a picture, which is the
+failure mode of every existing export-to-pptx tool and the single thing that
+would make this feature untrustworthy. **The exporter may not make a tier
+decision the preflight did not already compute**, with a debug assertion on
+violation; otherwise you get the classic "preflight said clean, output disagrees"
+bug, invisible until a collaborator complains. And **every demotion carries a
+reason string naming the field** — `"radial gradient (5 stops) → pptx supports
+≤3-stop linear: vector picture"`. The reason string is the entire UX: it is the
+difference between a rule and a lecture, and it lets a human decide "fine" or
+"I'll use a flat fill" in two seconds.
+
+**The preset carries an `exportFloor`, and that is what keeps the model quiet.**
+Talk presets default to `grouped` — you are shipping a deck, so a picture-tier
+chart is a real problem and lints as an error. Journal presets default to
+`raster`, i.e. don't care, because the output is a PDF and pptx editability is
+irrelevant. **Nobody assembling a Nature figure is ever nagged about PowerPoint.**
+A "strict editable deck" profile is just `exportFloor: "native"` — a lint profile,
+not a schema variant.
+
+Surfaced as: a tier glyph per object in the outline rail **shown only below the
+board's floor** (a badge on everything is noise within a day), a running "N export
+editable, M as pictures" in the status strip, `lint --target` printing a census
+(`38 native · 4 grouped · 1 vector (fig2a: radial gradient) · 0 raster`), and
+`⌘K → Export` opening a sheet grouped by tier — each row naming object, tier, and
+reason, with reveal-in-stage — alongside unverified-panel warnings, stale digests,
+missing `pixelSize`, and every blocking lint. **`describe` prints the tier and the
+reason too, and that is a requirement rather than polish:** the preflight is UI,
+and the primary author is an agent that never sees it.
 
 Because charts are now native, the export preflight also carries a **CVD and
 grayscale check** — deuteranope/protanope/tritanope matrices plus a luminance
@@ -892,7 +1014,10 @@ translates a crisp sprite over a static backdrop, and a fresh render lands on
 release.
 
 This is the same instinct as *terminal state lives server-side*: it means **what
-you see is what exports, by construction, on day one** — no DOM-vs-cosmic-text
+you see is what exports, visually, by construction, on day one** (a demoted object
+is pixel-identical — that is the entire point of a tier; what you get
+*structurally* is the per-object contract of §5, printed before you export) — no
+DOM-vs-cosmic-text
 metric drift, no "it looked right in the editor and wrapped differently in the
 PPTX", and imported matplotlib SVGs render through the identical pipeline in
 both places. The cost is that in-place *text editing* wants a local layout
@@ -1014,7 +1139,8 @@ slice; v1 honestly says "export SVG or PNG from your plotting code."
 ## 11. Exports
 
 - **PPTX — a pure-Rust OOXML writer** (`zip` + `quick-xml`) inside
-  `chimaera-board`, targeting §3.6's safe subset. This is a deliberate deviation
+  `chimaera-board`, emitting §3.6's tier-1 vocabulary natively and everything
+  else at its declared tier. This is a deliberate deviation
   from the research's python-pptx recommendation, and the argument is a Chimaera
   invariant: the daemon is one static musl binary deployed to login nodes with no
   Python and no system dependencies, so shelling out breaks remote-transparency.
@@ -1076,7 +1202,42 @@ gated on a hand-verified "double-click → Edit Data opens" pass.
 
 Composite identity is lost at the destination and that is *correct* — the identity
 lives in the `.board.json`, which stays yours. Keynote's handling of grouped
-composites goes on the fidelity matrix as **unverified and hand-checked**.
+composites goes on the fidelity matrix as **unverified and hand-checked**. This
+table is *generated* from the same `tier()` the preflight calls, so it cannot
+drift from the exporter.
+
+Four corrections that fall out of the tier model:
+
+- **`svgBlip` is a picture-quality feature, and the docs must say so plainly so
+  nobody re-litigates it.** Everything already landing at `raster` — `equation`,
+  the `colorbar` ramp, imported panels — costs nothing to *also* carry as
+  `svgBlip` beside the PNG: modern PowerPoint and LibreOffice ≥24.2 get
+  resolution-independent vector, everyone else gets today's PNG, nobody gets
+  worse. It is **not** an editability mechanism (§11 note below).
+- **`colorbar` splits.** The ramp is a continuous field and rasterizes, but its
+  **tick labels must not go down with it** — they export as separate `native` text
+  objects positioned over the raster. C6 forbids taking real text into a picture.
+- **`equation` is the one named C6 exception**, carved explicitly so it cannot
+  generalize: an equation is *notation*, not prose. It must carry `alt` with the
+  LaTeX source, and lint must not count it as verified text. The SVG
+  text-as-paths variant is likewise not a C6 violation — it is a deliberately
+  chosen rendering output, and the preflight names it as such.
+- **The python-pptx oracle is structurally blind to `svgBlip`** — it reports such
+  a picture's content type as `image/png`, seeing only the fallback. Any assertion
+  about SVG content must go through raw XML. (It is also not an authoring
+  reference: its `FreeformBuilder` supports only `moveTo`/`lnTo`/`close` — no
+  béziers at all — and is O(n²), taking 163 s for 40,000 segments against 0.11 s
+  for a direct-XML writer. The pure-Rust-writer decision is vindicated.)
+
+**Why we do not embed SVG to get editability**, recorded once because it is the
+obvious idea and it does not survive contact with evidence: PowerPoint's *Convert
+to Shape* is a manual, per-graphic, recipient-side ritual; it is **Windows-M365
+only and absent on PowerPoint for Mac**; Google Slides ignores the SVG entirely
+and renders the PNG forever; and its text outcome is build-dependent, with three
+credibly-reported results — retained, silently dropped, and exploded per letter.
+Board authoring the content means Board can emit real shapes and real text
+instead, and `a:custGeom` (§3.6) delivers exactly the "shapes and boxes, all
+editable" outcome with zero recipient action and no risk to text.
 
 Exports land in `.chimaera/board/exports/` and are offered as a download ticket.
 `lint --target` runs first and blocks on min-font-size (board text *and* scaled
@@ -1194,7 +1355,16 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    the **anchor union in the schema** (`at` + `rel` resolving), the `alt`/`link`
    fields carried through, `page.layout` + named slots, `page.caption`, and the
    `Composite` trait shipped with exactly one implementation (`table`, rendered
-   but not yet exported) so the mechanism cannot be retrofitted badly.
+   but not yet exported) so the mechanism cannot be retrofitted badly. And the
+   **export-tier machinery** (`tier()`, the reason strings, `exportFloor` on
+   presets, the census in `lint --target` and `describe`) — **with the §3.6/§3.8
+   vocabulary completely unchanged.** *Ship the door, not the rooms:* the
+   machinery is cheap now and expensive to retrofit (it re-keys the preflight,
+   `describe`, lint output, and the skill — the same argument that lands anchors
+   in slice 1), while rich elements are the reverse: cheap to add, impossible to
+   remove once boards in the wild use them. The first rich element is admitted
+   when a concrete figure is demonstrably blocked, not when expressiveness is
+   argued in the abstract.
 2. **Slice 2 — the loop's polish.** The remaining daemon routes (`describe`,
    `export`) + board epoch; live agent-edit animation with attribution and
    narration; selection-as-deixis and region snapshots into chat; comments and
@@ -1245,6 +1415,17 @@ and an intent capture.
   it), publish the *format* spec in an outside repo if you want an ecosystem,
   and defer a general UI-plugin system until three things need it. Worth an
   explicit yes/no, since it was your original framing.
+- **One 60-second hand-check, if you want it.** The SVG-editability question was
+  settled on the Mac gap, the manual ritual, and Google Slides — none of which
+  depend on the text outcome — so nothing in the plan hinges on this. But if
+  you're curious: on a Windows M365 box, insert a matplotlib figure saved with
+  `svg.fonttype:'none'`, right-click → Graphics Format → Convert to Shape →
+  ungroup twice, and click an axis label. Editable text, per-letter shapes, or
+  nothing? The negative control is the same figure at matplotlib's *default*
+  `svg.fonttype:'path'`, which contains **zero `<text>` elements** (measured: 0
+  `<text>`, 53 `<use>` glyph refs) and should yield ~53 letter-shaped freeforms —
+  confirming that "text vanished" reports are the input SVG's fault, not
+  PowerPoint's. On your Mac the button should simply be absent.
 - **Mermaid, decided but worth your eye.** `board import mermaid` converts once
   into a `diagram` spec (mermaid text kept in provenance only) rather than storing
   mermaid or rendering it client-side — a second stored representation is the
@@ -1284,9 +1465,14 @@ says *not natively, and here is where it lives instead.*
   recently supported by LibreOffice. Box-and-whisker is exactly where an imported
   seaborn panel is better anyway. Likewise `c:stockChart` and `c:surfaceChart`,
   standardized since 2006 and implemented by essentially nobody.
-- **`a:custGeom` projection of imported SVG** — path-count explosion, arc
-  re-derivation, and it defeats the panel lint that reads the SVG rather than the
-  exported geometry.
+- **`a:custGeom` projection of *imported* SVG** — but not for the reason first
+  assumed. Path-count explosion is the wrong model: a 40,000-segment path is
+  362 KB and renders fine, and what actually explodes is *object* count (a
+  5,000-point scatter becomes 5,000 shapes), which C3's export bound already
+  governs. The real reason is that projecting an imported panel to geometry
+  **defeats the panel lint that reads the SVG's own `<text>` and `stroke-width`**
+  — the mechanism that makes §3.5's lint-through-panels honest. Board's *own*
+  shapes emit custGeom freely (§3.6).
 - **Force-directed layout** — iterative and seeded, so it fails C1 and fights
   byte-stable serialization.
 - **Axis breaks, and any redrawing or annotating over an imported panel's axes.**
