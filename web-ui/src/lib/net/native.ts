@@ -330,6 +330,9 @@ export interface HostStatusEvent {
    *  observed the attempt (startup restore) can surface it instead of
    *  showing "connecting" forever. */
   error?: string;
+  /** Why a live connection transitioned down. This is context for the
+   *  automatic reconnect, not a failed reconnect attempt. */
+  reason?: string;
 }
 
 /**

@@ -16,7 +16,9 @@
 //! Bash task and then ENDS, leaving an idle turn with live background work —
 //! the state the dashboard/rail "still working off-screen" cues render),
 //! `question` (the turn asks an
-//! AskUserQuestion instead of running a tool — ask-lifecycle tests), `hang`
+//! AskUserQuestion instead of running a tool — ask-lifecycle tests), `plan`
+//! (publishes a TodoWrite level-set and parks on ExitPlanMode approval),
+//! `subagent` (parks a turn with one live Task row and progress), `hang`
 //! (opens a turn, streams content, never ends it, and acks an interrupt with NO
 //! result — the interrupt-watchdog recovery tests), `silent` (never answers —
 //! handshake watchdog tests), `die` (exit 3 immediately — spawn-crash tests),
@@ -91,6 +93,8 @@ fn main() {
                 turn_active = true;
                 match mode.as_str() {
                     "question" => run_question_turn(),
+                    "plan" => run_plan_turn(),
+                    "subagent" => run_subagent_turn(),
                     // Streams content, then never ends — the driver's interrupt
                     // watchdog is the only thing that can recover it.
                     "hang" => run_hang_turn(),
@@ -148,6 +152,14 @@ fn main() {
                     "result": "noted", "session_id": "fake-native-1",
                     "total_cost_usd": 0.001, "duration_ms": 7,
                     "usage": { "input_tokens": 3, "output_tokens": 2 },
+                }));
+            } else if frame["response"]["request_id"] == "req-plan" {
+                turn_active = false;
+                emit(json!({
+                    "type": "result", "subtype": "success", "is_error": false,
+                    "result": "plan approved", "session_id": "fake-native-1",
+                    "total_cost_usd": 0.001, "duration_ms": 9,
+                    "usage": { "input_tokens": 5, "output_tokens": 3 },
                 }));
             }
         } else if frame["type"] == "control_request" && frame["request"]["subtype"] == "interrupt" {
@@ -357,6 +369,69 @@ fn run_question_turn() {
                 "multiSelect": false,
             }]},
         },
+    }));
+}
+
+/// Publish the plan level-set and park on the dedicated ExitPlanMode prompt.
+/// This gives UI/live tests both plan surfaces in one deterministic turn: the
+/// pinned progress tray and the markdown approval card with its three official
+/// choices. Any response settles the fake turn; response-shape correctness is
+/// covered by the driver's focused mapper tests.
+fn run_plan_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "plan", "slash_commands": ["compact"],
+    }));
+    emit(json!({
+        "type": "assistant",
+        "message": { "id": "m-plan", "content": [{
+            "type": "tool_use", "id": "tu-todos", "name": "TodoWrite",
+            "input": { "todos": [
+                { "content": "Audit the current behavior", "status": "completed" },
+                { "content": "Implement the robust path", "status": "in_progress",
+                  "activeForm": "Implementing the robust path" },
+                { "content": "Verify every lifecycle", "status": "pending" }
+            ]}
+        }]}
+    }));
+    emit(json!({
+        "type": "control_request",
+        "request_id": "req-plan",
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "ExitPlanMode",
+            "tool_use_id": "tu-plan",
+            "input": { "plan": "## Plan\n\n1. Audit the current behavior.\n2. Implement the robust path.\n3. Verify every lifecycle." }
+        }
+    }));
+}
+
+/// Park a turn with one live subagent and a representative progress update.
+/// The ordinary interrupt branch settles it, exercising the tray's complete
+/// running → reconciled lifecycle without a real child process.
+fn run_subagent_turn() {
+    emit(json!({
+        "type": "system", "subtype": "init",
+        "session_id": "fake-native-1", "model": "fake-model",
+        "permissionMode": "default", "slash_commands": ["compact"],
+    }));
+    emit(json!({
+        "type": "assistant",
+        "message": { "id": "m-agent", "content": [{
+            "type": "tool_use", "id": "tu-agent", "name": "Task",
+            "input": { "description": "audit helper", "prompt": "inspect the lifecycle" }
+        }]}
+    }));
+    emit(json!({
+        "type": "system", "subtype": "task_started",
+        "task_type": "local_agent", "task_id": "task-agent",
+        "tool_use_id": "tu-agent", "description": "audit helper",
+    }));
+    emit(json!({
+        "type": "system", "subtype": "task_progress", "task_id": "task-agent",
+        "summary": "checking lifecycle edges",
+        "usage": { "tool_uses": 3, "total_tokens": 1200, "duration_ms": 7000 },
     }));
 }
 

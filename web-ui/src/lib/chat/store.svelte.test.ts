@@ -26,6 +26,27 @@ const QUEUED_MID_TURN: Record<string, unknown>[] = [
   { type: "user_message_update", id: "q1", state: "sent" },
 ];
 
+describe("ChatStore transcript activity", () => {
+  it("separates visible conversation changes from control telemetry", () => {
+    const store = new ChatStore();
+    store.apply({ seq: 1, ts: 1, ev: { type: "rate_limit", utilization: 12 } } as SeqEvent);
+    store.apply({ seq: 2, ts: 2, ev: { type: "mode_changed", mode_id: "ask" } } as SeqEvent);
+    expect(store.lastSeq).toBe(2);
+    expect(store.transcriptVersion).toBe(0);
+
+    store.apply({
+      seq: 3,
+      ts: 3,
+      ev: { type: "message_chunk", turn_id: "t1", text: "visible" },
+    } as SeqEvent);
+    expect(store.transcriptVersion).toBe(1);
+
+    const afterChunk = store.transcriptVersion;
+    store.notice("local feedback", "info");
+    expect(store.transcriptVersion).toBe(afterChunk + 1);
+  });
+});
+
 describe("ChatStore context compaction", () => {
   it("keeps progress replay-safe and settles with the summarized token count", () => {
     const started = fold([
@@ -326,6 +347,48 @@ describe("ChatStore pending-send ordering", () => {
     expect(tool).toMatchObject({ kind: "tool", denied: true, allowed: false });
   });
 
+  it("upserts repeated permission/question identities without duplicate keyed cards", () => {
+    const store = fold([
+      {
+        type: "permission_request",
+        request_id: "perm-1",
+        title: "old title",
+        options: [{ id: "allow", label: "Allow", kind: "allow_once" }],
+      },
+      {
+        type: "permission_request",
+        request_id: "perm-1",
+        title: "current title",
+        options: [
+          { id: "allow", label: "Allow", kind: "allow_once" },
+          { id: "allow", label: "Duplicate", kind: "allow_once" },
+          { id: "deny", label: "Deny", kind: "reject_once" },
+        ],
+      },
+      {
+        type: "question_request",
+        request_id: "ask-1",
+        questions: [{ id: "scope", question: "Old?", options: [] }],
+      },
+      {
+        type: "question_request",
+        request_id: "ask-1",
+        questions: [
+          { id: "scope", question: "Current?", options: [] },
+          { id: "scope", question: "Duplicate?", options: [] },
+        ],
+      },
+    ]);
+
+    expect(store.pending).toHaveLength(1);
+    expect(store.pending[0]).toMatchObject({ requestId: "perm-1", title: "current title" });
+    expect(store.pending[0].options.map((option) => option.id)).toEqual(["allow", "deny"]);
+    expect(store.questions).toHaveLength(1);
+    expect(store.questions[0].questions).toHaveLength(1);
+    expect(store.questions[0].questions[0]).toMatchObject({ id: "scope", question: "Current?" });
+    expect(store.blocks.filter((block) => block.kind === "question")).toHaveLength(1);
+  });
+
   it("reconciles a tool whose completion update never arrived at turn end", () => {
     // The stuck-"running" bug: a big image Read's result frame blows the
     // transport's per-line cap and is dropped below the event layer, so the
@@ -341,7 +404,12 @@ describe("ChatStore pending-send ordering", () => {
     ];
     const store = fold(events);
     const tool = store.blocks.find((b) => b.kind === "tool");
-    expect(tool).toMatchObject({ kind: "tool", id: "r1", status: "completed" });
+    expect(tool).toMatchObject({
+      kind: "tool",
+      id: "r1",
+      status: "completed",
+      streaming: false,
+    });
     // Replay agrees — the reconciliation is a pure reducer over the journal.
     expect(fold(events).blocks).toEqual(store.blocks);
   });
@@ -508,6 +576,21 @@ describe("ChatStore pending-send ordering", () => {
     // Status holds; the straggler's content still lands.
     expect(a1).toMatchObject({ status: "completed" });
     expect(a1).toMatchObject({ content: { kind: "output", text: "straggler line" } });
+  });
+
+  it("a late output delta enriches a finished tool without reviving its cursor", () => {
+    const store = fold([
+      { type: "tool_call", id: "a1", kind: "execute", title: "build", status: "in_progress" },
+      { type: "tool_output_delta", id: "a1", text: "first\n" },
+      { type: "tool_call_update", id: "a1", status: "completed" },
+      { type: "tool_output_delta", id: "a1", text: "late\n" },
+    ]);
+    const tool = store.blocks.find((b) => b.kind === "tool" && b.id === "a1");
+    expect(tool).toMatchObject({
+      status: "completed",
+      streaming: false,
+      content: { kind: "output", text: "first\nlate\n" },
+    });
   });
 
   it("a journal reset clears the plan and turn state with the transcript", () => {
@@ -718,6 +801,24 @@ describe("ChatStore background tasks", () => {
     ]);
     const indexes = store.backgroundTasks[0].agents.map((a) => a.index);
     expect(indexes).toEqual([...new Set(indexes)]);
+  });
+
+  it("keeps the newest duplicate task id so the keyed tray cannot throw", () => {
+    const store = fold([
+      {
+        type: "background_tasks",
+        tasks: [
+          BG({ id: "same", description: "stale", status: "running" }),
+          BG({ id: "same", description: "current", status: "waiting" }),
+        ],
+      },
+    ]);
+    expect(store.backgroundTasks).toHaveLength(1);
+    expect(store.backgroundTasks[0]).toMatchObject({
+      id: "same",
+      description: "current",
+      status: "waiting",
+    });
   });
 
   it("folds a close verdict into history as a notice and empties the set", () => {

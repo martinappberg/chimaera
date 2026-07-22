@@ -692,16 +692,22 @@ pub fn run() {
                 if let Some(state) = app.try_state::<Shell>() {
                     lock(&state.registry).save_if_dirty();
                     tauri::async_runtime::block_on(async {
-                        let mut tunnels = state.tunnels.lock().await;
-                        for (_, tunnel) in tunnels.drain() {
+                        let tunnels: Vec<_> =
+                            state.tunnels.lock().await.drain().map(|(_, t)| t).collect();
+                        for tunnel in tunnels {
                             tunnel.close().await;
                         }
-                        drop(tunnels);
                         // Compute-node tunnels too: closing a job's window
                         // does not tear its forward down (a reconnect to the
                         // same job reuses it), so quit is their cleanup.
-                        let mut compute = state.compute_tunnels.lock().await;
-                        for (_, tunnel) in compute.drain() {
+                        let compute: Vec<_> = state
+                            .compute_tunnels
+                            .lock()
+                            .await
+                            .drain()
+                            .map(|(_, t)| t)
+                            .collect();
+                        for tunnel in compute {
                             tunnel.close().await;
                         }
                     });

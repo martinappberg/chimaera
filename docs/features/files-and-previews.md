@@ -39,6 +39,11 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   change under a collapsed dir needs no relist (its rollup dot is reactive too). Changed files show
   a right-aligned letter badge (M/A/D/R/C/T/U/!) and a recolored name; a collapsed dir containing
   changes shows a rollup dot.
+- **Large-directory safety.** `fs/list` returns at most 1000 entries and carries an honest
+  `truncated` flag. The tree and Finder surface that partial-listing state instead of silently
+  looking complete, and offscreen Finder rows use browser layout containment. Filesystem preview
+  requests share an eight-operation blocking-work ceiling, so a burst against a slow NFS/Lustre
+  mount queues without consuming the daemon's async workers or an unbounded blocking-thread pool.
 
 ## File management (create / rename / copy / paste / delete / download)
 
@@ -94,7 +99,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   Finders to the parent (`pruneDeletedPath`). A slow (remote) listing shows a delayed spinner —
   a per-node "listing…" row in the tree, an incoming-column spinner in the Finder. A file tab's
   Rename is disabled while the file has unsaved edits. Escape cancels any inline input; blur
-  commits a non-empty valid name.
+  commits a non-empty valid name. Finder descents reveal the new column with the smallest possible
+  horizontal movement; refreshes preserve the user's horizontal position and re-list only affected
+  visible columns, coalescing mutation and disk-watch bursts.
 
 ## Raw reads & lightweight editing
 
@@ -142,7 +149,9 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
   preview, so that mode stays the fidelity reference.
   PDF metadata arrives progressively so the first pages paint before a long document is scanned;
-  rasters cap at 12M pixels and inactive canvases use an 8-page LRU.
+  rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Closing or evicting a PDF
+  cancels its active pdf.js raster tasks, text layers, delayed rerenders, and restoration frame
+  before destroying the document worker, so invisible work cannot keep a pane or webview busy.
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
 
@@ -195,11 +204,12 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
 
 ## Key constraints
 
-- Every listing/read runs under `spawn_blocking` — a slow Lustre `read_dir` must never wedge a tokio
-  worker. Directory listings cap at `MAX_DIR_ENTRIES = 4000` with an honest `truncated` flag.
+- Every listing/read runs under `spawn_blocking` behind one eight-permit semaphore — a slow Lustre
+  `read_dir` must never wedge a Tokio worker or cause unbounded blocking-pool growth. Directory
+  listings cap at `MAX_DIR_ENTRIES = 1000` with an honest `truncated` flag.
 - Disk monitoring is per events client and hard-capped at 64 mounted files + 64 visible directories
   (64 KiB of retained path text); a closed window retains nothing. It never recursively walks a
-  workspace, and its slow directory hash caps at the same 4000 entries as `fs/list`. New-directory
+  workspace, and its slow directory hash caps at the same 1000 entries as `fs/list`. New-directory
   baselines are limited to four per two-second poll, so registration churn cannot turn those caps
   into a continuous shared-filesystem scan.
 - Previews **stream**; a preview of a huge Parquet/HTML/CSV must never balloon memory. This is a

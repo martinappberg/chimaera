@@ -34,10 +34,22 @@
     expanded: boolean;
     /** Toggle between the sidebar width and the full surface. */
     onToggleExpand: () => void;
+    /** False while the retained dashboard pane is hidden. */
+    visible?: boolean;
   }
 
-  let { cfg, session, wsId, paneId, ctrl, refresh, onCollapse, expanded, onToggleExpand }: Props =
-    $props();
+  let {
+    cfg,
+    session,
+    wsId,
+    paneId,
+    ctrl,
+    refresh,
+    onCollapse,
+    expanded,
+    onToggleExpand,
+    visible = true,
+  }: Props = $props();
 
   /** Setup-card mode choice; ask-first is the default (plan §6). */
   let mode = $state<"ask" | "auto">("ask");
@@ -372,6 +384,7 @@
         <ChatView
           session={live}
           focused={focusWithin}
+          {visible}
           onOpenFile={(p) => ctrl.openFileFrom(paneId, p, false)}
           onOpenPath={(p, k) => ctrl.openPathFrom(paneId, p, k, false)}
         />

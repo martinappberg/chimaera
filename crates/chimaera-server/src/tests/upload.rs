@@ -36,9 +36,9 @@ async fn post_upload(
 /// A body that arrives as many separate chunks — exercises the streaming
 /// path rather than a single buffered frame.
 fn chunked_body(chunk: Vec<u8>, count: usize) -> Body {
-    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..count)
-        .map(|_| Ok(bytes::Bytes::from(chunk.clone())))
-        .collect();
+    let chunk = bytes::Bytes::from(chunk);
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+        (0..count).map(|_| Ok(chunk.clone())).collect();
     Body::from_stream(futures::stream::iter(chunks))
 }
 
@@ -106,12 +106,29 @@ async fn upload_streams_multi_chunk_bodies_into_the_session_dir() {
 }
 
 #[tokio::test]
+async fn folder_upload_streams_files_past_the_old_32mb_limit() {
+    let state = test_state();
+    let dir = test_dir("folder-upload-large");
+    let uri = format!(
+        "/api/v1/fs/upload?dir={}&name=dataset.bin",
+        dir.to_string_lossy()
+    );
+    let (status, body) = post_upload(&state, &uri, chunked_body(vec![9u8; 1024 * 1024], 33)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["size"], 33 * 1024 * 1024);
+    assert_eq!(
+        std::fs::metadata(dir.join("dataset.bin")).unwrap().len(),
+        33 * 1024 * 1024
+    );
+}
+
+#[tokio::test]
 async fn upload_enforces_the_per_file_cap_and_leaves_nothing_behind() {
     let state = test_state();
     let id = plant_session(&state);
-    // One chunk past the 32MB cap, streamed so no oversized buffer exists
+    // One chunk past the session-file cap, streamed so no oversized buffer exists
     // client-side either.
-    let chunks = (upload::MAX_UPLOAD_BYTES / (1024 * 1024)) as usize + 1;
+    let chunks = (upload::MAX_SESSION_UPLOAD_FILE_BYTES / (1024 * 1024)) as usize + 1;
     let (status, body) = post_upload(
         &state,
         &format!("/api/v1/sessions/{id}/upload?name=big.bin"),

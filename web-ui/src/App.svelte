@@ -297,6 +297,8 @@
   let reconnecting = $state(false);
   /** Last reconnect failure, surfaced with a Retry. */
   let reconnectError = $state<string | null>(null);
+  /** Context from the shell's liveness monitor for the current drop. */
+  let reconnectReason = $state<string | null>(null);
   /** The user dismissed the overlay; don't auto-reshow until state changes. */
   let reconnectDismissed = $state(false);
   let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
@@ -327,8 +329,11 @@
     }
   }
 
-  function beginReconnect(): void {
-    if (!canReconnect || eventsUp) return;
+  function beginReconnect(reason: string | null = null): void {
+    // A shell liveness event is authoritative and skips the socket grace even
+    // if Svelte has not observed the corresponding events-socket close yet.
+    if (!canReconnect || (reason === null && eventsUp)) return;
+    if (reason !== null) reconnectReason = reason;
     reconnectDismissed = false;
     showReconnect = true;
     void attemptReconnect();
@@ -355,6 +360,7 @@
       }
       showReconnect = false;
       reconnectError = null;
+      reconnectReason = null;
       reconnectDismissed = false;
       return;
     }
@@ -879,7 +885,7 @@
         onHostStatus((e) => {
           if (!canReconnect || e.alias !== statusAlias) return;
           if (e.status === "down") {
-            beginReconnect();
+            beginReconnect(e.reason ?? "The remote connection stopped responding.");
             return;
           }
           const port = e.local_port;
@@ -1205,8 +1211,8 @@
         continue;
       }
       accepted += 1;
-      const result = await trackFileOp(`Uploading ${file.name}…`, () =>
-        uploadToDir(dir, file, file.name),
+      const result = await trackFileOp(`Uploading ${file.name}…`, (progress) =>
+        uploadToDir(dir, file, file.name, progress),
       );
       // Re-list the destination so the new file appears without a manual refresh.
       if (result !== null) notifyCreated(result.path);
@@ -3917,8 +3923,20 @@
     {#each $uploadJobs as job (job.id)}
       <div class="upload-job" class:err={job.error !== null}>
         {#if job.error === null}
-          <span class="upload-spinner" aria-hidden="true"></span>
-          <span class="upload-name">uploading {job.name}…</span>
+          {#if job.progress === null}
+            <span class="upload-spinner" aria-hidden="true"></span>
+          {:else}
+            <span class="upload-progress" aria-hidden="true">
+              <span style:width={`${Math.round(job.progress * 100)}%`}></span>
+            </span>
+          {/if}
+          <span class="upload-name">{job.name}</span>
+          {#if job.progress !== null}
+            <span class="upload-percent">{Math.round(job.progress * 100)}%</span>
+          {/if}
+          {#if job.cancel !== null}
+            <button class="upload-cancel" aria-label={`cancel ${job.name}`} onclick={job.cancel}>×</button>
+          {/if}
         {:else}
           <span class="upload-name">{job.error}</span>
         {/if}
@@ -3953,6 +3971,7 @@
       </div>
       <p class="reconnect-body">
         {reconnectError ??
+          reconnectReason ??
           "re-establishing the SSH tunnel — this window resumes where it left off."}
       </p>
       <div class="reconnect-actions">
@@ -5229,6 +5248,7 @@
     font-size: var(--text-xs);
     color: var(--muted);
     animation: upload-in 0.16s ease-out;
+    pointer-events: auto;
   }
 
   @keyframes upload-in {
@@ -5261,6 +5281,48 @@
     border: 1.5px solid color-mix(in srgb, var(--accent) 35%, transparent);
     border-top-color: var(--accent);
     animation: upload-spin 0.8s linear infinite;
+  }
+
+  .upload-progress {
+    flex: none;
+    width: 44px;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .upload-progress > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transition: width 0.12s linear;
+  }
+
+  .upload-percent {
+    flex: none;
+    min-width: 3ch;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  .upload-cancel {
+    appearance: none;
+    border: none;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: var(--text-md);
+    line-height: 1;
+    padding: 0 1px;
+    cursor: pointer;
+  }
+
+  .upload-cancel:hover,
+  .upload-cancel:focus-visible {
+    color: var(--fg);
   }
 
   @keyframes upload-spin {

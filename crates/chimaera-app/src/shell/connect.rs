@@ -50,6 +50,10 @@ pub(super) struct HostStatus {
     pub(super) token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
+    /// Human-facing context for a liveness transition. Unlike `error`, this
+    /// does not mean a reconnect attempt failed; it explains why one began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 pub(super) fn state_for(
@@ -224,6 +228,7 @@ pub(super) async fn do_connect(
                     local_port: None,
                     token: None,
                     error: Some(e.clone()),
+                    reason: None,
                 },
             );
         }
@@ -240,16 +245,17 @@ async fn run_flight(
     update_daemon: bool,
 ) -> Result<HostState, String> {
     let state = app.state::<Shell>();
-    let reuse_port = {
-        let mut tunnels = state.tunnels.lock().await;
-        match tunnels.remove(alias) {
-            Some(old) => {
-                let port = old.local_port;
-                old.close().await;
-                (!update_daemon).then_some(port)
-            }
-            None => None,
+    // Remove under the map lock, then do process/network teardown without it.
+    // `Tunnel::close` is bounded but still asynchronous; holding this lock made
+    // one dead host freeze health checks and commands for every other host.
+    let old = state.tunnels.lock().await.remove(alias);
+    let reuse_port = match old {
+        Some(old) => {
+            let port = old.local_port;
+            old.close().await;
+            (!update_daemon).then_some(port)
         }
+        None => None,
     };
     let entry = HostsStore::load_default()
         .add(alias, None)
@@ -291,6 +297,7 @@ async fn run_flight(
             local_port: Some(tunnel.local_port),
             token: Some(tunnel.manifest.token.clone()),
             error: None,
+            reason: None,
         },
     );
     let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());

@@ -24,7 +24,7 @@ const MAX_WATCH_PATH_BYTES: usize = 4096;
 const MAX_WATCH_TOTAL_BYTES: usize = 64 * 1024;
 /// Mirrors `fs::MAX_DIR_ENTRIES`: the monitor must never walk farther than the
 /// listing surface it invalidates.
-const MAX_LISTING_ENTRIES: usize = 4000;
+const MAX_LISTING_ENTRIES: usize = crate::fs::MAX_DIR_ENTRIES;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FsChanges {

@@ -17,17 +17,22 @@
    * BackgroundTray).
    */
   interface Props {
-    /** Subagent tool rows still in flight (kind "agent", in_progress). */
+    /** Subagent tool rows still in flight (kind "agent", pending/running). */
     agents: Extract<ChatBlock, { kind: "tool" }>[];
     /** Stop a subagent (claude stop_task). Omitted when unsupported. */
     onStop?: (id: string) => void;
+    /** False while the owning retained chat tab is hidden. */
+    visible?: boolean;
   }
-  let { agents, onStop }: Props = $props();
+  let { agents, onStop, visible = true }: Props = $props();
 
   /** The driver titles these "Agent: {description}" — the prefix is the tray's
    *  own label, so drop it from each row. */
   function name(title: string): string {
-    return title.startsWith("Agent: ") ? title.slice(7) : title;
+    for (const prefix of ["Agent: ", "Task: "]) {
+      if (title.startsWith(prefix)) return title.slice(prefix.length);
+    }
+    return title;
   }
   function progress(b: Extract<ChatBlock, { kind: "tool" }>): string {
     return b.content?.kind === "output" ? (b.content.text ?? "").trim() : "";
@@ -36,6 +41,7 @@
 
 <WorkTray
   glyph="✳"
+  {visible}
   label={agents.length === 1 ? "subagent working" : `${agents.length} subagents working`}
 >
   {#each agents as agent (agent.id)}

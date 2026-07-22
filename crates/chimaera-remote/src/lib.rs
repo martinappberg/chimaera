@@ -541,7 +541,8 @@ impl Tunnel {
     /// is cancelled — the ControlMaster stays (ControlPersist), so reconnects
     /// and other windows on this host keep their authenticated connection.
     pub async fn close(mut self) {
-        self.child.kill().await.ok();
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         cancel_master_forward(
             &self.host,
             &format!("{}:127.0.0.1:{}", self.local_port, self.manifest.port),
@@ -556,12 +557,17 @@ impl Tunnel {
 /// bound until the master expires, so every path that abandons such a
 /// forward must cancel it by the exact spec it was opened with.
 async fn cancel_master_forward(host: &str, spec: &str) {
-    let _ = output_bounded(
-        ssh_base().args(["-O", "cancel", "-L"]).arg(spec).arg(host),
-        30,
-        "ssh -O cancel",
-    )
-    .await;
+    // OpenSSH uses the first value it sees for most options. Put the tighter
+    // teardown timeout before the shared ConnectTimeout=15 rather than
+    // appending an option that looks effective but is silently ignored.
+    let mut command = transport_command("ssh");
+    command
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        .args(ssh_opts())
+        .args(["-O", "cancel", "-L"])
+        .arg(spec)
+        .arg(host);
+    let _ = output_bounded(&mut command, 10, "ssh -O cancel").await;
 }
 
 /// Whether an HTTP server answers on `127.0.0.1:port` within 2s. A bare TCP
@@ -1656,7 +1662,8 @@ impl ComputeTunnel {
     /// Kill the tunnel; a master-held forward is also cancelled so local
     /// ports don't leak past the window that opened them.
     pub async fn close(mut self) {
-        self.child.kill().await.ok();
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
         if let Some(spec) = &self.master_forward {
             cancel_master_forward(&self.host, spec).await;
         }

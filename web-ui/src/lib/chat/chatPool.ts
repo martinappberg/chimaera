@@ -26,7 +26,12 @@ interface ChatEntry {
   /** Absolute block range last rendered by ChatView. Keeping this tiny view
    *  cursor separate from the reducer lets an evicted view restore the same
    *  reading window without remounting the entire transcript. */
-  renderWindow: { start: number; end: number } | null;
+  renderWindow: { start: number; end: number; tail: boolean } | null;
+  /** Transcript revision the reader has actually followed. This is separate
+   *  from the socket sequence: model/rate-limit/control events should not
+   *  manufacture a "new activity" badge, and an MRU eviction must not forget
+   *  that background output is still unread. */
+  followedVersion: number | null;
   /** performance.now() when the current turn started (null when idle). Kept
    *  here, NOT in the reducer, so the elapsed-turn counter survives a remount
    *  (a tab switch mid-turn) without ever leaking a clock into journal replay. */
@@ -82,6 +87,7 @@ export function acquireChat(sessionId: string): { store: ChatStore; socket: Chat
       scrollTop: 0,
       atBottom: true,
       renderWindow: null,
+      followedVersion: null,
       turnStart: null,
       refs: 0,
       lastUsed: ++tick,
@@ -137,15 +143,32 @@ export function chatScroll(sessionId: string): { scrollTop: number; atBottom: bo
 }
 
 /** Save the bounded block window currently mounted by a ChatView. */
-export function saveChatRenderWindow(sessionId: string, start: number, end: number): void {
+export function saveChatRenderWindow(
+  sessionId: string,
+  start: number,
+  end: number,
+  tail: boolean,
+): void {
   const entry = pool.get(sessionId);
-  if (entry !== undefined) entry.renderWindow = { start, end };
+  if (entry !== undefined) entry.renderWindow = { start, end, tail };
 }
 
 /** Last mounted block window, if this session had a rendered view before. */
-export function chatRenderWindow(sessionId: string): { start: number; end: number } | null {
+export function chatRenderWindow(
+  sessionId: string,
+): { start: number; end: number; tail: boolean } | null {
   const saved = pool.get(sessionId)?.renderWindow;
   return saved === undefined || saved === null ? null : { ...saved };
+}
+
+/** Save/read the transcript revision whose live edge the reader reached. */
+export function saveChatFollowedVersion(sessionId: string, version: number): void {
+  const entry = pool.get(sessionId);
+  if (entry !== undefined) entry.followedVersion = version;
+}
+
+export function chatFollowedVersion(sessionId: string): number | null {
+  return pool.get(sessionId)?.followedVersion ?? null;
 }
 
 /**

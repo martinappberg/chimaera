@@ -11,6 +11,34 @@ import type { AgentEvent, ChatSessionInfo, SeqEvent } from "./chatWs";
 /** The single leading notice a client-side transcript trim leaves behind. */
 const TRIM_NOTICE = "earlier history trimmed";
 
+/** Events that materially change the scrollable conversation. The socket seq
+ * also advances for header/control telemetry (models, rate limits, context),
+ * which must not read as unread chat activity. */
+const TRANSCRIPT_EVENTS = new Set([
+  "init",
+  "user_message",
+  "user_message_update",
+  "message_chunk",
+  "thought_chunk",
+  "tool_call",
+  "tool_call_update",
+  "tool_output_delta",
+  "permission_request",
+  "permission_resolved",
+  "question_request",
+  "question_resolved",
+  "usage_report",
+  "messages_superseded",
+  "notice",
+  "turn_completed",
+  "turn_aborted",
+  "truncated",
+  "mode_switch",
+  "forked",
+  "error",
+  "exited",
+]);
+
 export interface ToolContent {
   kind: "output" | "diff" | "batch";
   text?: string;
@@ -363,6 +391,10 @@ export class ChatStore {
    *  Reactive so views can track "any event applied" (in-place chunk appends
    *  and tool patches change no collection lengths). */
   lastSeq = $state(0);
+  /** Monotonic UI-only revision for transcript content. Unlike `lastSeq`, it
+   *  ignores control-only frames and also covers local notices, so viewport
+   *  follow/unread state describes what the reader can actually see. */
+  transcriptVersion = $state(0);
   /** True only while a fresh/reset store is folding its initial journal gap.
    *  The reducer stays authoritative, but the view waits for the advertised
    *  head before mounting transcript DOM so replay cannot visibly paint from
@@ -411,18 +443,21 @@ export class ChatStore {
   onDegraded(): void {
     this.hydrating = false;
     this.degraded = true;
+    this.touchTranscript();
   }
 
   /** The driver closed before (or after) an initial journal replay. */
   onExited(status: number | null): void {
     this.hydrating = false;
     this.exited = { status };
+    this.touchTranscript();
   }
 
   /** A socket/handshake failure can precede `ready`; reveal it immediately. */
   onFatalError(message: string): void {
     this.hydrating = false;
     this.fatalError = message;
+    this.touchTranscript();
   }
 
   /** Drop the rendered transcript and seq cursor so a fresh replay rebuilds it
@@ -453,6 +488,7 @@ export class ChatStore {
     // The rebuilt replay re-drives the driver's `init`, but reset here too so
     // the preference is re-pushed even if this reset races ahead of it.
     this.thinkingPushed = false;
+    this.touchTranscript();
   }
 
   apply(entry: SeqEvent): void {
@@ -560,7 +596,13 @@ export class ChatStore {
             agentsTotal: (t.agents_total as number) ?? 0,
             agentsDone: (t.agents_done as number) ?? 0,
           }))
-          .filter((t) => t.id !== "");
+          // Keep the newest duplicate. Level-set producers should never emit
+          // one, but an older/corrupt journal must not crash Svelte's keyed
+          // task rows or show two contradictory states for one task.
+          .filter(
+            (t, i, arr) =>
+              t.id !== "" && arr.findIndex((later, j) => j > i && later.id === t.id) === -1,
+          );
         // Tasks that left the set WITH a verdict fold into history as quiet
         // notices — completion is transcript-worthy; a set change alone is
         // not. A summary that names the verdict is the CLI's own full
@@ -753,12 +795,15 @@ export class ChatStore {
         const block = this.blocks[idx];
         if (block.kind !== "tool") break;
         const text = ev.text as string;
-        if (block.content !== null && block.content.kind === "output" && block.streaming) {
+        const terminal = block.status === "completed" || block.status === "failed";
+        if (block.content !== null && block.content.kind === "output") {
           block.content.text = (block.content.text ?? "") + text;
         } else {
           block.content = { kind: "output", text };
-          block.streaming = true;
         }
+        // A delayed output frame may enrich a settled row, but it can never
+        // resurrect the live cursor after completion/reconciliation.
+        block.streaming = !terminal;
         break;
       }
       case "plan":
@@ -782,28 +827,51 @@ export class ChatStore {
           // would throw and take the whole view down.
           .filter((e, i, arr) => e.id === null || arr.findIndex((o) => o.id === e.id) === i);
         break;
-      case "permission_request":
-        this.pending.push({
-          requestId: ev.request_id as string,
+      case "permission_request": {
+        const requestId = (ev.request_id as string) ?? "";
+        if (requestId === "") break;
+        const options = ((ev.options as PermissionOption[]) ?? []).filter(
+          (option, i, all) =>
+            typeof option.id === "string" &&
+            option.id.length > 0 &&
+            all.findIndex((other) => other.id === option.id) === i,
+        );
+        const request: PendingPermission = {
+          requestId,
           toolCallId: (ev.tool_call_id as string) ?? null,
           title: ev.title as string,
-          options: (ev.options as PermissionOption[]) ?? [],
+          options,
           inputPreview: ev.input_preview,
           plan: (ev.plan as string) ?? null,
-        });
+        };
+        // A parked prompt may be described again with a newer seq during a
+        // reconnect. Upsert by its wire identity so keyed cards cannot throw,
+        // and so the existing component keeps any typed feedback/comment.
+        const existing = this.pending.findIndex((p) => p.requestId === requestId);
+        if (existing === -1) this.pending.push(request);
+        else this.pending[existing] = request;
         break;
+      }
       case "question_request": {
-        const requestId = ev.request_id as string;
-        const questions = ((ev.questions as Record<string, unknown>[]) ?? []).map((q) => ({
-          id: q.id as string,
-          header: (q.header as string) ?? "",
-          question: (q.question as string) ?? "",
-          options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
-            label: o.label as string,
-            description: (o.description as string) ?? "",
-          })),
-          multiSelect: q.multi_select === true,
-        }));
+        const requestId = (ev.request_id as string) ?? "";
+        if (requestId === "") break;
+        const questions = ((ev.questions as Record<string, unknown>[]) ?? [])
+          .map((q) => ({
+            id: (q.id as string) ?? "",
+            header: (q.header as string) ?? "",
+            question: (q.question as string) ?? "",
+            options: ((q.options as Record<string, unknown>[]) ?? []).map((o) => ({
+              label: o.label as string,
+              description: (o.description as string) ?? "",
+            })),
+            multiSelect: q.multi_select === true,
+          }))
+          // Answers are keyed by question id. Duplicate/empty ids would make
+          // one visible answer overwrite another at submit time.
+          .filter(
+            (question, i, all) =>
+              question.id !== "" && all.findIndex((other) => other.id === question.id) === i,
+          );
         // Twice: the overlay is the answerable card, the block is the
         // transcript's memory of it (invisible while pending, an answered
         // card once resolved) — so an answered question never just vanishes.
@@ -811,9 +879,25 @@ export class ChatStore {
           typeof ev.expires_at_ms === "number" && Number.isFinite(ev.expires_at_ms)
             ? ev.expires_at_ms
             : null;
-        this.questions.push({ requestId, questions, expiresAtMs });
-        this.blocks.push({ kind: "question", id: requestId, questions, answers: {}, resolved: false });
-        this.questionIndex.set(requestId, this.blocks.length - 1);
+        const liveQuestion: PendingQuestion = { requestId, questions, expiresAtMs };
+        const pendingIndex = this.questions.findIndex((q) => q.requestId === requestId);
+        if (pendingIndex === -1) this.questions.push(liveQuestion);
+        else this.questions[pendingIndex] = liveQuestion;
+
+        const blockIndex = this.questionIndex.get(requestId);
+        const existing = blockIndex !== undefined ? this.blocks[blockIndex] : undefined;
+        if (existing !== undefined && existing.kind === "question" && !existing.resolved) {
+          existing.questions = questions;
+        } else {
+          this.blocks.push({
+            kind: "question",
+            id: requestId,
+            questions,
+            answers: {},
+            resolved: false,
+          });
+          this.questionIndex.set(requestId, this.blocks.length - 1);
+        }
         break;
       }
       case "question_resolved": {
@@ -908,7 +992,10 @@ export class ChatStore {
         // fallback): the chip follows the truth, and a retracting switch
         // withdraws the current turn's trailing prose before the retry.
         this.model = ev.to as string;
-        if (ev.retract_current_turn === true) this.dropTrailingProse();
+        if (ev.retract_current_turn === true) {
+          this.dropTrailingProse();
+          this.touchTranscript();
+        }
         break;
       }
       case "messages_superseded":
@@ -1086,6 +1173,7 @@ export class ChatStore {
         break;
     }
     this.trimBlocks();
+    if (TRANSCRIPT_EVENTS.has(ev.type)) this.touchTranscript();
   }
 
   /** Client-side reducer cap. The daemon journal compacts its own history;
@@ -1144,6 +1232,11 @@ export class ChatStore {
     // enforces the transcript cap. Repeated disconnected-action feedback must
     // not become an unbounded side channel around that cap.
     this.trimBlocks();
+    this.touchTranscript();
+  }
+
+  private touchTranscript(): void {
+    this.transcriptVersion += 1;
   }
 
   /** Withdraw every pending ask whose reply route is gone (driver exit or a
@@ -1193,6 +1286,7 @@ export class ChatStore {
         (b.status === "in_progress" || b.status === "pending")
       ) {
         b.status = "completed";
+        b.streaming = false;
       }
     }
   }

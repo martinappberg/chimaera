@@ -20,6 +20,10 @@
     /** False while a retained chat tab is hidden; suppresses layout work in
      *  streaming child rows without destroying their expanded state. */
     visible?: boolean;
+    /** Absolute transcript index used by ChatView's scroll-anchor policy. */
+    sourceIndex?: number;
+    /** Inclusive source end; a prepended page can merge adjacent tool runs. */
+    sourceEnd?: number;
   }
 
   let {
@@ -28,6 +32,8 @@
     onBackground,
     onStopTask,
     visible = true,
+    sourceIndex,
+    sourceEnd,
   }: Props = $props();
 
   const running = $derived(
@@ -86,7 +92,14 @@
   });
 </script>
 
-<div class="group" class:failed class:running>
+<div
+  class="group"
+  class:failed
+  class:running
+  class:visible
+  data-block-index={sourceIndex}
+  data-block-end={sourceEnd}
+>
   <button
     class="summary"
     aria-expanded={open}
@@ -126,6 +139,9 @@
     background: color-mix(in srgb, var(--fg) 2%, transparent);
     overflow: hidden;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
+  }
+  .group:not(.visible) {
+    animation: none;
   }
   @media (prefers-reduced-motion: reduce) {
     .group {

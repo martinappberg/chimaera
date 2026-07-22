@@ -52,7 +52,7 @@ selection references (see [terminals.md](terminals.md)).
   The folder target wins over the session pane it may sit inside. The daemon that owns the
   session/window receives the bytes, so an agent (or a shell) on a remote host can read a file
   you dragged from your laptop. Folder uploads go through `POST /api/v1/fs/upload?dir=&name=`
-  (`upload::upload_to_dir`), stream the same way, cap per-file at 32 MB, then bump the fs epoch
+  (`upload::upload_to_dir`), stream the same way, cap one user-chosen file at 2 GB, then bump the fs epoch
   so the tree/Finder re-list. In-app **move between folders** is done via copy/cut/paste (a
   pointer-drag folder-move is a follow-up); dragging files **out to the desktop** is punted —
   the pointer-drag stack plus remote-over-tunnel bytes make it not worth it in two of three
@@ -63,7 +63,9 @@ selection references (see [terminals.md](terminals.md)).
 - **How it's used.** Drag a file over the app; a whole live-session pane lights as the
   **"@ drop to upload & reference"** target (HTML5 dnd has no competing tile gesture, so the whole
   pane is the zone, not a bottom band). Release to upload each file and type its returned path. An
-  in-flight (or briefly failed) upload shows a quiet chip toast bottom-center. Dropping an **image**
+  in-flight upload shows byte progress plus a cancel action in a quiet chip bottom-center; failures
+  briefly explain what happened. A two-minute no-progress watchdog turns a dead SSH tunnel or stuck
+  destination filesystem into an actionable error instead of an endless spinner. Dropping an **image**
   onto a *chat* pane additionally attaches its pixels to the composer (the model sees it now); the
   uploaded path stays the durable, host-side artifact the agent can re-read later.
 - **Where it lives.** `App.svelte` registers **window-level** `dragenter/dragover/dragleave/drop`
@@ -76,7 +78,7 @@ selection references (see [terminals.md](terminals.md)).
   default).
 - **Key behaviors.** The route **streams** the body chunk-by-chunk to a hidden tmp sibling then
   renames (a partial upload is never visible under its final name) — the whole file **never sits in
-  RAM** (the daemon lives on shared login nodes). Hard caps: **32 MB per file, 256 MB and 256 files
+  RAM** (the daemon lives on shared login nodes). Hard caps: **64 MB per session file, 256 MB and 256 files
   per session dir**; completion rechecks those aggregate quotas including in-flight temp files,
   and overflow aborts, deletes the tmp, and answers `413`. Filenames sanitize to a strict
   basename (no separators, no control bytes, no dot-dirs, ≤200 chars) before becoming a path on a
@@ -86,7 +88,11 @@ selection references (see [terminals.md](terminals.md)).
   sessions that died unwatched (`spawn_boot_prune`). Temp names use exclusive creation and
   exhausted collision retries fail instead of falling back to a known name. Bearer-authed like every REST route; an unknown
   session id `404`s and never mints a directory. A drop caps at **8 files**; **folders** dropped
-  from the OS are rejected with a toast (recursive upload is a follow-up).
+  from the OS are rejected with a toast (recursive upload is a follow-up). User-chosen Finder/tree
+  uploads are distinct: they land outside daemon-owned state, stay constant-memory and atomic, and
+  accept up to **2 GB per file**. The browser/webview Blob stream is deliberately the common
+  transport rather than `rsync`: it works without extra host tools and is remote-correct in both the
+  native app and an ordinary browser, where the source file's local path is not available.
 
 ## Screenshot / clipboard-image paste into a terminal
 

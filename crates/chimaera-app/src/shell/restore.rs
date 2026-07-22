@@ -190,6 +190,10 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                         local_port: Some(*port),
                         token: (up && !*is_compute).then(|| token.clone()),
                         error: None,
+                        reason: (!up).then(|| {
+                            "The SSH tunnel or remote daemon stopped answering health checks."
+                                .to_string()
+                        }),
                     },
                 );
             }

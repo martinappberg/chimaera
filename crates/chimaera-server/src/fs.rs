@@ -68,12 +68,17 @@ const MAX_VALIDATE_CANDIDATES: usize = 50;
 /// can hold hundreds of thousands of entries; without a ceiling a single
 /// listing balloons the response and the allocation. Past this the answer is
 /// honestly `truncated`.
-const MAX_DIR_ENTRIES: usize = 4000;
+pub(crate) const MAX_DIR_ENTRIES: usize = 1000;
 /// How long a raw-access ticket stays valid.
 const TICKET_TTL: Duration = Duration::from_secs(600);
 /// In-memory capability ceiling. A buggy or hostile bearer-authenticated
 /// client must not grow the ticket map without bound during that TTL.
 const MAX_TICKETS: usize = 4096;
+/// Shared ceiling for metadata-heavy and parser-heavy file requests. Tokio's
+/// blocking pool can grow very large under a request burst; on NFS/Lustre that
+/// turns one stalled mount into host-wide thread and syscall pressure. Queued
+/// requests remain asynchronous, so terminals/chat/health stay responsive.
+static FILESYSTEM_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
 /// The daemon user's home directory (`$HOME`).
 fn home_dir() -> anyhow::Result<PathBuf> {
@@ -241,7 +246,16 @@ async fn blocking_json<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
         Ok(Ok(body)) => Json(body).into_response(),
         Ok(Err(err)) => bad_request(&err),
         Err(join) => (
@@ -257,7 +271,16 @@ async fn blocking_response<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<Response> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => bad_request(&err),
         Err(join) => (
@@ -309,7 +332,8 @@ fn list_dirs(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
             name,
             path: entry.path().to_string_lossy().into_owned(),
         });
-        if dirs.len() >= MAX_DIR_ENTRIES {
+        if dirs.len() > MAX_DIR_ENTRIES {
+            dirs.pop();
             truncated = true;
             break;
         }
@@ -411,7 +435,8 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
                     target,
                     broken: true,
                 });
-                if entries.len() >= MAX_DIR_ENTRIES {
+                if entries.len() > MAX_DIR_ENTRIES {
+                    entries.pop();
                     truncated = true;
                     break;
                 }
@@ -433,7 +458,8 @@ fn list_entries(raw: &str, hidden: bool) -> anyhow::Result<serde_json::Value> {
             target,
             broken: false,
         });
-        if entries.len() >= MAX_DIR_ENTRIES {
+        if entries.len() > MAX_DIR_ENTRIES {
+            entries.pop();
             truncated = true;
             break;
         }

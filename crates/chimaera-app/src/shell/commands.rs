@@ -101,7 +101,8 @@ pub(super) async fn add_host(alias: String) -> Result<HostState, String> {
 
 #[tauri::command]
 pub(super) async fn remove_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
-    if let Some(tunnel) = state.tunnels.lock().await.remove(&alias) {
+    let tunnel = state.tunnels.lock().await.remove(&alias);
+    if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
     HostsStore::load_default()
@@ -132,7 +133,8 @@ pub(super) async fn connect_host(
 
 #[tauri::command]
 pub(super) async fn disconnect_host(state: State<'_, Shell>, alias: String) -> Result<(), String> {
-    if let Some(tunnel) = state.tunnels.lock().await.remove(&alias) {
+    let tunnel = state.tunnels.lock().await.remove(&alias);
+    if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
     Ok(())
@@ -199,7 +201,8 @@ pub(super) async fn shutdown_host(state: State<'_, Shell>, alias: String) -> Res
     sent.map_err(|e| format!("could not shut down {alias}: {e}"))?;
     // The daemon is on its way out; cancel our forward so the host reads as
     // down instead of lingering on a socket that's about to close.
-    if let Some(tunnel) = state.tunnels.lock().await.remove(&alias) {
+    let tunnel = state.tunnels.lock().await.remove(&alias);
+    if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
     Ok(())
@@ -497,12 +500,12 @@ pub(super) async fn cancel_compute_session(
     })
     .await
     .map_err(|e| format!("{e}"))??;
-    if let Some(tunnel) = state
+    let tunnel = state
         .compute_tunnels
         .lock()
         .await
-        .remove(&compute_key(&alias, &job_id))
-    {
+        .remove(&compute_key(&alias, &job_id));
+    if let Some(tunnel) = tunnel {
         tunnel.close().await;
     }
     Ok(())
@@ -541,7 +544,8 @@ pub(super) async fn connect_compute_session(
     };
     if let Some((port, token)) = existing {
         if !chimaera_remote::http_alive_authed(port, &token).await {
-            if let Some(tunnel) = state.compute_tunnels.lock().await.remove(&key) {
+            let tunnel = state.compute_tunnels.lock().await.remove(&key);
+            if let Some(tunnel) = tunnel {
                 tunnel.close().await;
             }
         }
@@ -675,6 +679,7 @@ pub(super) async fn connect_compute_session(
             local_port: Some(local_port),
             token: None,
             error: None,
+            reason: None,
         },
     );
     Ok(())

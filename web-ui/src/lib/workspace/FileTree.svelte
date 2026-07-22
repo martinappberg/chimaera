@@ -78,6 +78,7 @@
   $effect(() => setDiskDirs(diskDirOwner, [root, ...expanded]));
   $effect(() => () => clearDiskDirs(diskDirOwner));
   let listings = $state<Map<string, FsEntry[]>>(new Map());
+  let truncatedDirs = $state<Set<string>>(new Set());
   let loading = $state<Set<string>>(new Set());
   let rootError = $state<string | null>(null);
 
@@ -178,6 +179,7 @@
     untrack(() => {
       expanded = new Set();
       listings = new Map();
+      truncatedDirs = new Set();
       rootError = null;
       lastGitEpoch = -1;
       prevGitEntries = new Map();
@@ -270,8 +272,15 @@
       const next = new Map(listings);
       next.set(dir, listing.entries);
       listings = next;
+      const truncated = new Set(truncatedDirs);
+      if (listing.truncated === true) truncated.add(dir);
+      else truncated.delete(dir);
+      truncatedDirs = truncated;
       if (dir === root) rootError = null;
     } catch (e) {
+      const truncated = new Set(truncatedDirs);
+      truncated.delete(dir);
+      truncatedDirs = truncated;
       if (dir === root) {
         rootError = e instanceof Error ? e.message : "failed to list files";
       } else {
@@ -835,6 +844,11 @@
       {@render createRow(depth + 1)}
     {/if}
   {/each}
+  {#if truncatedDirs.size > 0}
+    <div class="tree-limit" role="status" title={[...truncatedDirs].join("\n")}>
+      Some large folders are partially shown
+    </div>
+  {/if}
   </div>
 </div>
 
@@ -844,6 +858,19 @@
     flex-direction: column;
     min-height: 0;
     flex: 1; /* fill .files-body so the tree's empty area is right-clickable */
+  }
+
+  .tree-limit {
+    position: sticky;
+    bottom: 0;
+    margin: 6px 8px;
+    padding: 5px 7px;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--bg) 94%, transparent);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    text-align: center;
   }
 
   /* Quiet filter affordance: a small magnifier that expands into an input.

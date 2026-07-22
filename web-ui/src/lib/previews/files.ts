@@ -32,6 +32,9 @@ export interface FsListing {
   path: string;
   parent: string | null;
   entries: FsEntry[];
+  /** The daemon stopped at its host-safety listing ceiling. Older daemons
+   *  omit this field, which is equivalent to a complete listing. */
+  truncated?: boolean;
 }
 
 export interface FileChunk {

@@ -27,5 +27,8 @@ Parent map: repo-root [AGENTS.md](../../../../AGENTS.md).
 - **Warm chat detail rides the shared chat pool** (`chat/chatPool.ts`), which
   refcounts holds — acquire/release in pairs, and keep the lane acquisition
   bounded (`RICH_LANE_MAX`).
+- A retained dashboard must pass pane visibility through the Mastermind dock to
+  `ChatView`; a hidden dashboard keeps the socket/reducer warm but freezes chat
+  DOM work like any other hidden chat tab.
 - The dock is reactive-only: nothing in this folder ever triggers a Mastermind
   turn.

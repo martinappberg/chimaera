@@ -16,9 +16,12 @@
     onDecide: (optionId: string, feedback?: string) => void;
     onOpenPath?: (path: string, kind: "file" | "dir") => void;
     resolvePaths?: ResolvePaths;
+    /** False while the owning retained chat tab is hidden. The card and its
+     *  comment stay mounted, but neither face may steal focus. */
+    visible?: boolean;
   }
 
-  let { request, onDecide, onOpenPath, resolvePaths }: Props = $props();
+  let { request, onDecide, onOpenPath, resolvePaths, visible = true }: Props = $props();
   let comment = $state("");
   /** The inline card shows a bounded plan preview; a long plan is easier to
    *  read in a big overlay where the card's controls ride along the bottom. */
@@ -34,7 +37,7 @@
   $effect(() => {
     // Focus the overlay when it opens so Esc closes it (preventScroll: the
     // transcript's own stick-to-bottom owns scrolling).
-    if (expanded) panelEl?.focus({ preventScroll: true });
+    if (visible && expanded) panelEl?.focus({ preventScroll: true });
   });
   function onOverlayKeydown(e: KeyboardEvent) {
     // Esc here just closes the overlay back to the card — the actual
@@ -50,7 +53,7 @@
   // Like the permission card: capture input on arrival, without forcing a
   // scroll (ChatView's own effect handles stick-to-bottom).
   $effect(() => {
-    cardEl?.focus({ preventScroll: true });
+    if (visible) cardEl?.focus({ preventScroll: true });
   });
 
   /** Enter (card focused) = the first option — "Yes, and auto-accept edits",
@@ -75,7 +78,14 @@
      below remain the accessible path. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<div class="plan-approval" role="group" tabindex="0" bind:this={cardEl} onkeydown={onKeydown}>
+<div
+  class="plan-approval"
+  class:visible
+  role="group"
+  tabindex="0"
+  bind:this={cardEl}
+  onkeydown={onKeydown}
+>
   <div class="head">
     <span class="mark">✓</span>
     <span class="label">plan ready — approve to leave plan mode</span>
@@ -171,6 +181,10 @@
     margin: 6px 0;
     outline: none;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
+  }
+  .plan-approval:not(.visible),
+  .plan-approval:not(.visible) ~ .plan-overlay .plan-panel {
+    animation: none;
   }
   @media (prefers-reduced-motion: reduce) {
     .plan-approval {

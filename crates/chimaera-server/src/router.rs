@@ -50,7 +50,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{id}/upload",
             post(upload::upload).layer(axum::extract::DefaultBodyLimit::max(
-                upload::MAX_UPLOAD_BYTES as usize + 64 * 1024,
+                upload::MAX_SESSION_UPLOAD_FILE_BYTES as usize + 64 * 1024,
             )),
         )
         .route("/sessions/{id}/journal", get(api::session_journal))
@@ -100,7 +100,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route(
             "/fs/upload",
             post(upload::upload_to_dir).layer(axum::extract::DefaultBodyLimit::max(
-                upload::MAX_UPLOAD_BYTES as usize + 64 * 1024,
+                upload::MAX_DIR_UPLOAD_BYTES as usize + 64 * 1024,
             )),
         )
         .route("/compute", get(compute::get_compute))

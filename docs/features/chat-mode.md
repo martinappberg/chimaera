@@ -121,7 +121,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Stopping.** Esc (or the header stop chip) interrupts the running turn. A deliberate stop is
   not a failure: the abort event carries a structural `interrupted` flag set by the driver that
   issued the interrupt (claude's result string is free text and never said so), the transcript
-  shows a muted "stopped" notice, and the session rail reads finished — error-red `turn failed`
+  shows a muted "stopped" notice, dangling subagents settle neutrally instead of turning their
+  tool group red, and the session rail reads finished — error-red `turn failed`, failed tool rows,
   and the Errored rail state are reserved for genuine failures.
 - **Rendering.** Streamed prose reveals word-by-word on a ~75ms ticker (respects
   `prefers-reduced-motion`). Markdown and Codex's common LaTeX delimiters (`$…$`, `$$…$$`,
@@ -144,16 +145,32 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
-  message. Reaching a window edge pages 64 blocks in either direction while preserving the paragraph
-  under the reader; the DOM window stays capped at 192 blocks and a jump returns directly to the live
-  tail. Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
+  message. Explicit earlier/later controls page 64 blocks at a time while preserving the paragraph
+  under the reader; the middle of a long conversation is never skipped just because the bounded page
+  no longer contains the live edge. The DOM window stays capped at 192 blocks and a clear jump returns
+  directly to the live tail. Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
   preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
   reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
   Replay/live/control frames are reduced through one order-preserving cooperative queue, yielding
   between bounded slices so a large remote journal cannot monopolize navigation clicks.
+- **Scroll ownership.** Stream events, Markdown reveals, and late artifact sizing all request
+  bottom-follow through one frame-coalesced scroll writer. Paging explicitly into older history
+  keeps that historical page stable until the reader returns to newest; merely scrolling within the
+  live tail does not freeze it. Visible tail rows point directly at the reducer's reactive blocks, so a
+  streamed delta updates its own row instead of cloning/repainting the whole window. The tail keeps
+  rendering while the reader scrolls or types. A non-empty composer draft or attachment pauses only
+  auto-follow; incoming events extend the bounded tail behind a source-row anchor and surface as “new
+  activity” rather than moving the text box or reading position while the user types. Submitting is an
+  explicit return to the live edge, so the sent/queued bubble and its reply stay visible.
 - **Tab lifecycle.** Recently viewed chat tabs retain only that bounded rendered page in the pane's
-  live set. While hidden, its plain-data transcript snapshot freezes and scroll-following, elapsed
-  clocks, question countdown painting, and streaming tool-body scrolling pause; the pooled
+  live set. A visible page uses live reducer references; hiding it takes one plain-data transcript
+  snapshot plus snapshots of plan/subagent/background/permission/question/queued-send chrome, and
+  then scroll-following, Markdown rendering, elapsed clocks, question countdown painting, tray/tool
+  animations, and streaming tool-body scrolling pause. Keyed cards stay mounted, so expanded trays,
+  selected question answers, and typed permission/plan feedback survive. Hidden prompts never steal
+  focus from the active tab; they become focusable again on return. Reactivation catches up behind the saved source-row anchor;
+  a backlog too large for the bounded page remains explicit “new activity” rather than evicting the
+  row the reader left on. The pooled
   store/socket continues folding authoritative events. Activation reconciles one page at the right
   end in a single paint. If the live set evicts or moves the view, `chatPool` preserves the reducer,
   socket, scroll intent, and rendered-range cursor for a bounded warm remount. Dashboard reporting
@@ -174,7 +191,8 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   expandable on demand; the summary badge (`running…` / `failed` / `recovered`) carries the verdict
   without turning live activity or history into a wall of command rows.
   Tool calls upsert by id (a late enriching re-emit never walks a finished tool back to
-  pending); `tool_output_delta` streams live output ahead of the authoritative result. **Dangling
+  pending); `tool_output_delta` streams live output ahead of the authoritative result, but a late
+  delta may only enrich terminal text — it cannot revive the streaming cursor. **Dangling
   rows reconcile at turn end:** on `turn_completed`/`turn_aborted`/`exited` any tool still
   in_progress/pending in the just-ended turn is closed to `completed` (a pure reducer scan back to
   the previous turn boundary). This kills the phantom "running…" a dropped result frame would leave —
@@ -228,8 +246,9 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   (collapsed) tool groups into a live monitor pinned just above the composer, so parallel work stays
   glanceable instead of scrolling away — collapsed by default to a one-line "N subagents working"
   summary, expandable to each agent's progress line (tools · tokens, from `task_progress`) + stop.
-  They keep their in-place "Agent:" row in history; a finished/abandoned run drops from the tray
-  (reconciled shut at turn end). The plan/todo panel likewise surfaces the current step in its
+  They keep their in-place "Agent:"/"Task:" row in history; a finished/abandoned run drops from the
+  tray (reconciled shut at turn end; a deliberate Stop settles neutrally, a genuine error fails).
+  The plan/todo panel likewise surfaces the current step in its
   summary ("plan · 1/3 · ◐ …"). Both are pure derivations over `blocks`/`plan` — no new events
   (`AgentsTray.svelte`).
 - **The task list is the plan panel, whichever tool spells it.** Claude replaced `TodoWrite` with an

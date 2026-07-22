@@ -18,6 +18,20 @@ export function tailWindow(total: number): TranscriptWindow {
 }
 
 /**
+ * Keep an already-rendered live tail current without snapping back to a
+ * one-page window for every event. New blocks append at the bottom; only the
+ * oldest DOM is discarded once the steady-state ceiling is reached.
+ */
+export function advanceTailWindow(
+  current: TranscriptWindow,
+  total: number,
+): TranscriptWindow {
+  const end = boundedTotal(total);
+  const start = Math.max(0, Math.min(Math.floor(current.start), end));
+  return { start: Math.max(start, end - TRANSCRIPT_WINDOW), end };
+}
+
+/**
  * Repair a persisted absolute range against a reducer that may have compacted
  * while the view was unmounted. An entirely stale range falls back to a window
  * ending at the current tail instead of restoring an empty transcript.
