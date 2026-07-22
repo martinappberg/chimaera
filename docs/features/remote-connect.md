@@ -85,8 +85,10 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is
   non-interactive (`BatchMode`) with a ten-second outer deadline. Native liveness transitions carry
   a plain-language reason into a compact, non-blocking reconnect status; only an actual reconnect
-  failure becomes a modal with Retry. A 401 in a native remote window follows that same scoped SSH
-  recovery instead of showing the browser-only "paste a fresh URL" page.
+  failure becomes a modal with Retry. Dismissing that modal downgrades it to a compact persistent
+  Retry action instead of removing the disconnected window's only recovery path. A 401 in a native
+  remote window follows that same scoped SSH recovery instead of showing the browser-only "paste a
+  fresh URL" page; while its credentials remain rejected, the Retry action cannot disappear.
 - **A daemon build change is a navigation boundary.** A reconnect reuses its local forward only
   while the daemon source build still matches the app. Replacing the remote daemon gets a fresh
   loopback port, which makes every already-open window re-home onto the new entry bundle instead of

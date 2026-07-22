@@ -60,6 +60,7 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
+  import { selectRemoteReconnectSurface } from "./lib/net/remoteReconnect";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
   import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment } from "./lib/chat/images";
@@ -325,6 +326,16 @@
   /** The user dismissed the overlay; don't auto-reshow until state changes. */
   let reconnectDismissed = $state(false);
   let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
+  /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
+   *  of removing the only recovery path. Unauthorized native windows never
+   *  fall through to the browser-only manual auth overlay. */
+  const reconnectSurface = $derived(
+    selectRemoteReconnectSurface({
+      open: showReconnect,
+      error: reconnectError,
+      authBlocked: canReconnect && $unauthorized,
+    }),
+  );
 
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
@@ -357,6 +368,12 @@
     // if Svelte has not observed the corresponding events-socket close yet.
     if (!canReconnect || (reason === null && eventsUp)) return;
     if (reason !== null) reconnectReason = reason;
+    reconnectDismissed = false;
+    showReconnect = true;
+    void attemptReconnect();
+  }
+
+  function retryReconnect(): void {
     reconnectDismissed = false;
     showReconnect = true;
     void attemptReconnect();
@@ -4044,12 +4061,14 @@
   </div>
 {/if}
 
-{#if showReconnect && !$askpassActive && $assetTransition === null}
+{#if reconnectSurface !== "hidden" && !$askpassActive && $assetTransition === null}
   <!-- An automatic reconnect is status, not a blocking decision: keep the
        rendered workbench readable while the tunnel heals. Only a failed
        attempt becomes a modal with Retry. A scoped askpass prompt temporarily
-       owns this space when this host actually needs authentication. -->
-  {#if reconnectError === null}
+       owns this space when this host actually needs authentication. Dismissing
+       a failure leaves a compact Retry surface: a native 401 must never become
+       an unrecoverable blank state. -->
+  {#if reconnectSurface === "status"}
     <div class="reconnect-status" role="status" aria-live="polite">
       <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
       <span class="reconnect-status-copy">
@@ -4058,7 +4077,7 @@
       </span>
       <button class="reconnect-status-dismiss" aria-label="dismiss reconnect status" onclick={dismissReconnect}>×</button>
     </div>
-  {:else}
+  {:else if reconnectSurface === "failure"}
     <div class="reconnect-overlay">
       <div
         class="reconnect-panel"
@@ -4079,12 +4098,29 @@
             class="reconnect-retry"
             use:focusOnMount
             disabled={reconnecting}
-            onclick={() => void attemptReconnect()}
+            onclick={retryReconnect}
           >
             {reconnecting ? "reconnecting…" : "retry"}
           </button>
         </div>
       </div>
+    </div>
+  {:else}
+    <div class="reconnect-status" role="status" aria-live="polite">
+      <span class="reconnect-spinner" aria-hidden="true"></span>
+      <span class="reconnect-status-copy">
+        <strong>reconnect to {hostAlias}</strong>
+        <span>
+          {reconnectError ?? "this window still needs fresh remote credentials"}
+        </span>
+      </span>
+      <button
+        class="reconnect-status-retry"
+        disabled={reconnecting}
+        onclick={retryReconnect}
+      >
+        {reconnecting ? "reconnecting…" : "retry"}
+      </button>
     </div>
   {/if}
 {/if}
@@ -5280,6 +5316,28 @@
 
   .reconnect-status-dismiss:hover {
     color: var(--fg);
+  }
+
+  .reconnect-status-retry {
+    flex: none;
+    appearance: none;
+    padding: 4px 10px;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--fg);
+    background: none;
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .reconnect-status-retry:hover:enabled {
+    background: var(--row-hover);
+  }
+
+  .reconnect-status-retry:disabled {
+    color: var(--muted);
+    cursor: default;
   }
 
   @keyframes reconnect-in {
