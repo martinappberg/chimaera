@@ -47,12 +47,18 @@ a constrained schema, humans restyle by swapping tokens. A pure-Rust engine in
 the daemon binary rasterizes a page — or one region, or one object — to
 PNG/JPEG in tens of milliseconds, which is how **the agent sees the board**; a
 prose `describe` dump is how it **reads positions**; and an append-only
-**semantic journal** turns every human gesture (moved `panel-a`, selected
+**semantic journal** turns every human gesture (moved `bench-chart`, selected
 `callout`, pinned "make this stand out") into compact structured events the
 agent reads back — which is how it **knows what you meant**. The editor pane
 displays the engine's own pixels with a vector overlay for handles, so what you
 see *is* what exports, by construction. It is deliberately not a drawing tool:
 no pen, no bezier, no blend modes — text, shapes, images, arrows, groups. The
+Board is **domain-neutral by construction**: nothing in the five primitives, the
+tier model, the journal, or the anchor union knows what a figure is. Scientific
+figure assembly is a *pack* — a preset family plus a handful of annotation
+composites, about 4% of the engineering — shipping in slice 4 because the first
+user is a bioinformatician and a pack is how a tool gets dogfooded into
+correctness. It is not the identity. The
 defensible core is **the bidirectional loop over a plain file on whatever host
 owns the work** — Claude artifacts and claude-canvas can generate a picture;
 nothing lets you drag a panel on a login node and have `codex` read what you did
@@ -150,7 +156,7 @@ would churn every board diff).
 
 ### 3.4 Ids, order, versioning, lenient parsing
 
-Ids are short human slugs (`panel-a`, `deck-title`), unique per board — they are
+Ids are short human slugs (`bench-chart`, `deck-title`), unique per board — they are
 simultaneously the diff anchor, the agent's `Edit` anchor, the journal's
 subject, and the merge key. Z-order is array order within a page.
 `formatVersion` is an integer with explicit migrations. **No churn fields ever**
@@ -198,11 +204,11 @@ The format *prevents* bad output rather than merely permitting good output:
   Near-miss alignment is the highest-value check in the set and it **cannot
   annoy**: 1.5 pt off is always a mistake, never a choice. Every finding names
   object, field, measured value, and expected value — `callout.at.x = 520.0;
-  heading and panel-a align at 80.0` — because the plan's own insight that *the
+  heading and bench-chart align at 80.0` — because the plan's own insight that *the
   reason string is the entire UX* applies verbatim here.
 - `chimaera board lint --target nature-single` **gates export**, and it lints
   *through* panels rather than merely around them. This matters because in a real
-  journal figure almost all the text — axis labels, ticks, legends — lives inside
+  dense figure almost all the text — axis labels, ticks, legends — lives inside
   the imported panel, and the board's own placement is what creates the violation:
   an 8 pt tick label authored at 6 in wide and then placed at 420 pt is scaled to
   ~4.6 pt. So for an imported panel (an `image` with provenance) whose SVG carries real `<text>`, lint reads
@@ -217,55 +223,57 @@ The format *prevents* bad output rather than merely permitting good output:
 
 ### 3.6 A concrete board
 
+A design-review deck, because that is the ordinary case. The figure-assembly
+vocabulary (§3.8's annotation layer) is a *pack* on top of exactly this.
+
 ```json
 {
   "format": "chimaera.board",
   "formatVersion": 1,
-  "title": "Kinase screen — lab meeting",
+  "title": "Parser rewrite — design review",
   "theme": ".chimaera/board/themes/talk-dark.theme.json",
-  "canvas": { "preset": "talk-16x9", "size": [960, 540] },
+  "canvas": { "preset": "talk-16x9", "target": "design-review", "size": [960, 540] },
+  "brief": { "thesis": "The rewrite is 3x faster and removes the retry hack.",
+             "audience": "backend team", "minutes": 10 },
   "pages": [
     {
       "id": "cover",
+      "intent": { "kind": "cover", "why": "names the change and the claim" },
       "background": { "fill": "@bg" },
       "objects": [
-        { "id": "deck-title", "type": "text", "role": "title",
-          "at": [80, 210], "size": [800, 90],
-          "text": ["Kinase inhibitor screen"] },
-        { "id": "subtitle", "type": "text", "role": "subtitle",
-          "at": [80, 310], "size": [800, 50],
+        { "id": "deck-title", "type": "text", "role": "title", "slot": "title",
+          "text": ["The parser rewrite is 3× faster"] },
+        { "id": "subtitle", "type": "text", "role": "subtitle", "slot": "subtitle",
           "text": [{ "runs": [
-            { "t": "Hits from a " },
-            { "t": "1,280-compound", "b": true, "color": "@accent1" },
-            { "t": " library" }
+            { "t": "and it deletes the " },
+            { "t": "retry hack", "b": true, "color": "@accent1" }
           ] }] }
       ]
     },
     {
-      "id": "results",
+      "id": "bench",
+      "intent": { "kind": "claim-evidence", "why": "the speed claim, before the design" },
       "objects": [
-        { "id": "heading", "type": "text", "role": "heading",
-          "at": [80, 48], "size": [800, 56], "text": ["Dose–response"] },
-        { "id": "panel-a", "type": "image",
-          "at": [80, 130], "size": [420, 320],
-          "src": ".chimaera/board/assets/dose_response.svg",
-          "provenance": {
-            "tool": "matplotlib",
-            "script": "scripts/fig2.py",
-            "regen": "python scripts/fig2.py",
-            "themeExport": "talk-dark.mplstyle",
-            "generated": "2026-07-20T09:14:00Z"
-          } },
+        { "id": "heading", "type": "text", "role": "heading", "slot": "title",
+          "text": ["Parse time drops on every fixture"] },
+        { "id": "bench-chart", "type": "chart", "slot": "body-left",
+          "data": { "origin": "command",
+                    "values": [ { "fixture": "large.json", "ms": 812, "build": "before" },
+                                { "fixture": "large.json", "ms": 244, "build": "after" } ] },
+          "x": { "field": "fixture", "type": "nominal" },
+          "y": { "field": "ms", "type": "quantitative", "title": "Parse time (ms)" },
+          "color": { "field": "build" },
+          "marks": [ { "mark": "bar", "stack": "group" } ] },
         { "id": "callout", "type": "shape", "geo": "roundRect",
-          "at": [520, 150], "size": [360, 120],
+          "at": [580, 170], "size": [300, 110],
           "fill": "@surface", "stroke": { "color": "@accent1", "width": 1.5 },
-          "text": [{ "runs": [{ "t": "IC50 = 42 nM", "b": true }] }] },
+          "text": [{ "runs": [{ "t": "3.3× median", "b": true }] }] },
         { "id": "arrow-1", "type": "connector", "geo": "straight",
           "from": { "object": "callout", "side": "left" },
-          "to": { "object": "panel-a", "side": "right" },
+          "to": { "object": "bench-chart", "side": "right" },
           "stroke": { "color": "@fg", "width": 1.5 }, "tailEnd": "arrow" }
       ],
-      "notes": "Emphasize the sub-100 nM potency."
+      "notes": "The retry hack was masking the cost — mention it here."
     }
   ]
 }
@@ -379,6 +387,11 @@ PowerPoint:
   `a:ext`). Group rotation is therefore never composed with child rotation:
   rotating a group rewrites each child's `at` and `rotation` in page space at
   commit, so the file always reads as what you see.
+- **Connectors carry bound text**, exactly as `shape` does — an edge label is a
+  run on the connector, positioned at a fraction along its path, not a
+  free-floating `text` with a manual `at`. Without this, every diagram edge
+  label detaches the moment a node moves, which is precisely what §3.7's
+  anchors exist to prevent.
 - **A connector's `side` names an edge of the target's bounding box** —
   top/right/bottom/left — **not an OOXML `a:cxnLst` index**, whose numbering is
   geometry-specific (rect has four connection sites, hexagon six, star5 more, and
@@ -434,9 +447,11 @@ clauses; one failure and it is an imported panel.
 > that owns text may fall below `grouped` tier.
 
 The one-line form, which goes verbatim into the skill: **Board computes scales,
-layout, and typography. Board never computes statistics.** Colloquially: *you
-could place it correctly with a ruler and the caption, without opening the
-dataset.*
+layout, and typography. Board draws numbers you state; it never derives numbers.**
+Colloquially: *you could place it correctly with a ruler and the caption, without
+opening the dataset.* (The earlier wording — "never computes statistics" — meant
+the same thing but read as a science rule; deriving a number is the general form,
+and it also makes the histogram carve-out legible.)
 
 **C4 is stronger than the clause it replaces, not weaker.** It still decides
 SmartArt, autofit, live layout containers, and Microsoft's `cx:` chartex in one
@@ -476,9 +491,9 @@ regenerated — which is exactly the revision agony the feature exists to kill.
 
 ```json
 "anchor": { "at": [520, 150] }                                           // page pt — the default
-"anchor": { "object": "panel-a", "rel": [0.5, 0.0], "offset": [0, -8] }  // survives move + resize
+"anchor": { "object": "bench-chart", "rel": [0.5, 0.0], "offset": [0, -8] } // survives move + resize
 "anchor": { "object": "micro-1", "px": [512, 300] }                      // survives crop too
-"anchor": { "object": "panel-a", "data": [12.5, 0.83] }                  // panel data space
+"anchor": { "object": "bench-chart", "data": [3, 244] }                     // chart data space
 ```
 
 Anchors **resolve to page points at `normalize()`**, so `describe`, off-canvas
@@ -552,9 +567,9 @@ tick becomes 4.6 pt at Cell's column width; a native chart re-lays-out its ticks
 ```json
 { "id": "fig2a", "type": "chart",
   "at": [80, 130], "size": [420, 320],
-  "alt": "Viability by dose for two cell lines",
+  "alt": "p95 latency by build, two services",
   "data": { "source": "figures/fig2a_source.csv", "sha256": "9c1a…", "rows": 24,
-            "fields": { "x": "dose_nM", "y": "viability", "err": "sem", "series": "cell_line" } },
+            "fields": { "x": "build", "y": "p95_ms", "err": "stderr", "series": "service" } },
   "x": { "scale": "log", "title": "Dose (nM)", "ticks": [0.1, 1, 10], "format": { "sig": 2 } },
   "y": { "scale": "linear", "title": "% viability", "domain": [0, 100], "nice": true },
   "color": { "field": "cell_line", "palette": "@categorical" },
@@ -593,7 +608,7 @@ label, no legend", is otherwise unimplementable natively.** Binding is not
 computing — the subset is a table the agent supplied, not a predicate Board
 evaluates.
 
-**Channels declare their type** — `{ "field": "dose_nM", "type": "quantitative" }`,
+**Channels declare their type** — `{ "field": "build", "type": "ordinal" }`,
 one of `quantitative | ordinal | nominal | temporal`. Inference over CSV is where
 an integer-coded category silently lands on a linear axis and a date parses as a
 number: plausible-looking, wrong, and invisible. Four characters per field buys a
@@ -617,6 +632,14 @@ quartiles.
 the most common "just look at this real quick" plot and it needs binning; bin
 choice changes the story, so it belongs in reviewable code. The error names the
 three-line fix rather than auto-choosing a width.
+
+**Where the numbers came from is a required field, not a paragraph.** `data`
+carries `origin`, one of `file` · `command` · `stated-by-user` ·
+`derived-by-agent`, rendered as a visible chip on the card and printed by
+`describe`. The skill already says *"a confident chart of numbers you inferred
+is the one way this feature does harm"* — and then left it entirely to prose,
+while a merely *stale* digest gets a badge, a lint, an export block and a
+describe line. That asymmetry was backwards; this fixes it.
 
 **Where the data lives:**
 
@@ -663,7 +686,7 @@ plotting library can do for itself:
   is a lint **error, never a guess**.
 - **`sigBracket`** `{ from, to, p: 0.013, tier: 0 }`. Board auto-stacks tiers to
   avoid overlap and maps `p` → `*`/`**`/`n.s.` through a theme-configurable rule,
-  so "this journal wants exact p-values" is a preset switch. **Board draws; Board
+  so "this venue wants exact p-values" is a preset switch. **Board draws; Board
   never tests.** Tier stacking is a collision problem in *page* space — precisely
   what an upstream static panel cannot solve for itself.
 - **`inset`**, **`legend`** (carrying `describes: [...]` so lint can flag drift),
@@ -706,7 +729,7 @@ missing.** A board records *why it exists*, and each page records *why it exists
 ```json
 "brief": { "thesis": "Three sub-100 nM hits came out of the screen, and two share a scaffold.",
            "audience": "lab meeting", "minutes": 10,
-           "asked": "make me a 10-minute talk on the kinase screen for lab meeting",
+           "asked": "make me a 10-minute design review for the parser rewrite",
            "sources": ["results/", "manuscript/draft.md"] }
 ```
 ```json
@@ -714,7 +737,10 @@ missing.** A board records *why it exists*, and each page records *why it exists
 ```
 
 `kind` is a small closed enum — `cover · section · claim-evidence · comparison ·
-data · quote · summary · backup`. `asked` stores the human's words **verbatim**.
+data · quote · summary · backup · agenda · demo · roadmap · metrics ·
+architecture · acknowledgements`. The last six are the general-work members; a
+missing kind silently yields the wrong layout, which is the reason §15 keeps
+the enum out of `formatVersion` 1 until real decks have been built. `asked` stores the human's words **verbatim**.
 `intent` is **never drawn** — stricter than `page.caption`. There are no
 timestamps and no nonces, so §3.4's diff discipline holds and these read as prose.
 
@@ -761,7 +787,7 @@ belongs in a managed home is everything *around* the board:
 .chimaera/board/
   themes/      tracked   *.theme.json      — curated + user themes
   fonts/       tracked   Inter/, …         — vendored fonts (determinism on HPC)
-  assets/      tracked   dose_response.svg — imported figure panels
+  assets/      tracked   *.svg *.png     — imported panels and screenshots
   .gitignore   tracked   — written on first use; ignores the three below
   renders/     IGNORED   <hash>.png        — content-addressed raster cache
   exports/     IGNORED   deck.pptx, fig2.pdf
@@ -800,7 +826,8 @@ including rollback safety — an older daemon renders a v2 board as text rather
 than dropping the tab.
 
 **Regions.** A **theme bar** across the top (theme picker, canvas preset, target
-preset: Talk-16:9 / Nature-single / Nature-double / Cell / PLOS / Poster-A0). A
+preset: Talk-16:9 / Design-review / Exec-update / Teaching / Poster-A0, with the
+figures pack adding Nature-single / Nature-double / Cell / PLOS). A
 left **outline rail** (collapsible): pages as a thumbnail navigator, and under
 the active page an object outline — indented, z-order top-to-bottom, click to
 select, drag to restack, eye/lock toggles. The center is the **stage** (the page
@@ -818,7 +845,7 @@ shift-arrow 10 pt.
 
 **Text resize changes the box, never the font size.** This is the single most
 important interaction decision in the editor: it is what keeps a figure inside
-its journal's font bounds through every resize, and it is exactly what
+its target's font bounds through every resize, and it is exactly what
 Illustrator gets wrong. Font size changes only via the role dropdown or an
 explicit numeric override in the inspector.
 
@@ -898,7 +925,7 @@ region all three designs under-specified despite "presentations first."
 **Empty states.** A new board opens a centered card — Slide deck / Figure panel /
 Poster — with a theme picker, plus **"Ask an agent to draft it"** which opens a
 chat session with a staged prompt naming the board path. An empty figure page
-shows ghost drop-zones sized to the active journal preset. Target: first board
+shows ghost drop-zones sized to the active target preset. Target: first board
 on screen in under 60 seconds, from the file tree or from chat.
 
 **Keymap** (pane-local, through the existing rebindable registry): `V` select,
@@ -921,13 +948,15 @@ same interface as a structured chat session.
 ### 6.1 The agent reads positions — `describe`
 
 ```
-$ chimaera board describe figures/fig2.board.json --page results
-page results (slide, 960×540 pt, theme talk-dark)
-  heading   text  "Dose–response"          at  80,48   size 800×56   role heading (28pt/@fg)
-  panel-a   plot  assets/dose_response.svg at  80,130  size 420×320  from scripts/fig2.py
-  callout   shape roundRect                at 520,150  size 360×120  fill @surface stroke @accent1
-  arrow-1   connector  callout.left → panel-a.right
-  ⚠ caption-1 text 4.5pt — below nature-single minimum (5pt)
+$ chimaera board describe talks/review.board.json --page bench
+page bench (slide, 960×540 pt, theme talk-dark, target design-review)
+  intent  claim-evidence — "the speed claim, before the design"
+  heading      text  "Parse time drops on every fixture"  slot title      native
+  bench-chart  chart bar×2 · fixture/ms/build             slot body-left  grouped
+  callout      shape roundRect  at 580,170  stroke @accent1  [hand-placed] native
+  arrow-1      conn  callout.left → bench-chart.right                     native
+  ui-shot      image before_after.png  at 600,300                         picture
+  ⚠ ui-shot: raster at 96 dpi — 1.4× under this target's floor
 ```
 
 Prose, named objects, integer pt, resolved styles, lint inline. The agent never
@@ -956,12 +985,12 @@ with an error record, crash-torn tail truncated on open). Gestures are
 **coalesced**: a 900 ms drag is one `object.moved` with from/to, not 60 frames.
 
 ```jsonl
-{"seq":41,"ts":"2026-07-21T10:00:01Z","actor":"human","op":"select","page":"results","objects":["panel-a"]}
-{"seq":42,"ts":"2026-07-21T10:00:09Z","actor":"human","op":"move","page":"results","object":"panel-a","from":[80,130],"to":[96,130]}
-{"seq":43,"ts":"2026-07-21T10:00:14Z","actor":"human","op":"resize","page":"results","object":"panel-a","from":[420,320],"to":[460,350]}
-{"seq":44,"ts":"2026-07-21T10:00:21Z","actor":"human","op":"comment","page":"results","object":"callout","pin":"c1","text":"make this the same blue as panel A's points"}
-{"seq":45,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"restyle","page":"results","object":"callout","changed":{"stroke.color":"@accent2"},"note":"matched panel-a series color"}
-{"seq":46,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"render","page":"results","hash":"9c1a…"}
+{"seq":41,"ts":"2026-07-21T10:00:01Z","actor":"human","op":"select","page":"bench","objects":["bench-chart"]}
+{"seq":42,"ts":"2026-07-21T10:00:09Z","actor":"human","op":"move","page":"bench","object":"bench-chart","from":[80,130],"to":[96,130]}
+{"seq":43,"ts":"2026-07-21T10:00:14Z","actor":"human","op":"resize","page":"bench","object":"bench-chart","from":[420,320],"to":[460,350]}
+{"seq":44,"ts":"2026-07-21T10:00:21Z","actor":"human","op":"comment","page":"bench","object":"callout","pin":"c1","text":"say the median, not the best case"}
+{"seq":45,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"restyle","page":"bench","object":"callout","changed":{"stroke.color":"@accent2"},"note":"matched the after-series color"}
+{"seq":46,"ts":"2026-07-21T10:00:40Z","actor":"agent:claude-7f3","op":"render","page":"bench","hash":"9c1a…"}
 ```
 
 `chimaera board journal <board> --since 40` is the agent's cheap read of *what
@@ -1054,7 +1083,7 @@ null-then-refetch). `BoardView` then diffs old vs new **by id** and animates the
 delta: moved and resized objects tween ~180 ms to their new box, created objects
 fade and scale in, deleted objects fade out, restyled objects flash a 1.2 s
 **attribution glow in the acting agent's hue**, and a transient chip narrates it
-("claude moved panel-a, restyled callout") with click-to-focus.
+("claude moved bench-chart, restyled callout") with click-to-focus.
 
 This is the anti-poltergeist mechanism and it is not decoration: an agent that
 silently rearranges your figure is unnerving and untrustworthy, and the fix is
@@ -1084,14 +1113,14 @@ conflict resolution is a **per-object three-way merge**, not textual:
   modal conflict bar; the human is present and undo is cheap, so a combative
   dialog is the wrong instinct.
 
-The common case (agent restyles `callout` while you move `panel-a`) merges
+The common case (agent restyles `callout` while you move `bench-chart`) merges
 cleanly with zero loss, which is only true because ids are the merge key.
 
 ### 6.7 Undo across two actors
 
 Undo is journal-driven and **actor-aware**, but "skip the other actor's entries"
 is only sound when the entries commute — and same-object edits do not. The naive
-version actively causes the harm it was meant to prevent: you nudge `panel-a` to
+version actively causes the harm it was meant to prevent: you nudge `bench-chart` to
 `[96,130]` (seq 42), the agent later re-lays-out the page and moves it to
 `[300,200]` (seq 47), you press `⌘Z` once meaning to undo your nudge, and
 inverting seq 42 writes the *absolute* `[80,130]` — silently destroying the
@@ -1101,7 +1130,7 @@ not the corner case. So the contract is per-field and checked:
 
 - **Events record per-field prior/new values** — `"changed":{"at":{"from":[80,130],"to":[96,130]}}` — so overlap is detectable at all. `move` and `resize` normalize to the shape `restyle` already has.
 - **Undo is overlap-aware.** Undoing entry E scans forward for any later entry, from any actor or another window, touching the same (object id, field path). None found — invert directly and silently; this is the common case and stays a plain `⌘Z`.
-- **On overlap, never clobber silently.** Prompt with attribution ("claude has since moved panel-a — undo your move anyway?" / [Undo mine] [Keep claude's]). "Undo mine" on a numeric geometry field applies the **inverse delta** (−16 pt x) to the current value rather than restoring an absolute box. For non-numeric fields (color token, text, enum) no delta exists, so the honest options are clobber-with-consent or skip-and-say-so. Either way the entry is marked resolved so a second `⌘Z` does not re-prompt.
+- **On overlap, never clobber silently.** Prompt with attribution ("claude has since moved bench-chart — undo your move anyway?" / [Undo mine] [Keep claude's]). "Undo mine" on a numeric geometry field applies the **inverse delta** (−16 pt x) to the current value rather than restoring an absolute box. For non-numeric fields (color token, text, enum) no delta exists, so the honest options are clobber-with-consent or skip-and-say-so. Either way the entry is marked resolved so a second `⌘Z` does not re-prompt.
 - **The invariant:** *an event is invertible only against a journal in which no later event touched the same object and field path; otherwise undo rebases or asks. Undo never writes an absolute value over another actor's later write without attribution.*
 
 A separate menu item explicitly *targets* an agent edit ("Undo claude's restyle
@@ -1294,7 +1323,7 @@ lives here. Ship:
   #0072B2 #D55E00 #CC79A7`; Tol Bright as the alternative), **Viridis** for
   continuous. No red-green encoding, no jet, ever. Minimal chrome: top/right
   spines off, thin axes, direct labels over heavy legends.
-- **journal-nature / journal-cell / plos** — correct column widths, font-size
+- **pub-nature / pub-cell / pub-plos** (the figures pack) — correct column widths, font-size
   bounds, and panel-label style (Nature 8 pt bold lowercase `a b c`; Cell/PLOS
   capitals), with **Arial and not Helvetica for PLOS** — the specific trap that
   bounces submissions.
@@ -1339,7 +1368,10 @@ Where that beauty comes from, ranked — and the ranking is the design:
 **(a) Constraints.** `role` is mandatory on every `text` and size is *derived* —
 there is no `fontSize` field an agent reaches for by default. Sizes come only from
 the theme's named scale. `normalize()` snaps geometry to the 8 pt grid. Per-run
-overrides stay legal but carry a **budget** lint counts. And one fully mechanical
+overrides stay legal but carry a **budget** lint counts — with one carve-out,
+since otherwise a correctly syntax-highlighted code block lints as a violation:
+runs inside an object whose role is `code` are exempt. A monospace `code` role
+is part of the general preset family. And one fully mechanical
 taste rule worth stating because it is enforceable: **text never wears a data
 color** — a type role may not resolve to a `@categorical` token. Design systems
 don't hand you a slider, they hand you an enum, and Board's structural advantage
@@ -1367,9 +1399,39 @@ The demonstration: unconstrained, an agent writes a centered title, a literal
 content is `"layout": "title-3up"` with four objects carrying `slot` + `role` and
 no numbers at all: four fewer decisions per object, zero color literals, gaps
 identical by construction, the accent spent once. What's left to the agent is
-*which slot* and *what words* — the choices it is actually good at. **Target presets are first-class**: switching Nature-single → Cell
-atomically remaps canvas width, font-size bounds, panel-label style, and export
-format — resubmission becomes one click instead of a manual redo.
+*which slot* and *what words* — the choices it is actually good at.
+
+### Target presets carry four axes, not one
+
+A preset is the unit that makes Board domain-neutral, and it is worth spelling out
+because an earlier draft populated it only with journals and thereby made the whole
+design *read* as a science tool. A preset carries:
+
+1. **Geometry** — canvas size, margins, the ~12-layout slot family.
+2. **Floors** — `minPt`, `minLineWidthPt`, `minEffectiveDpi`, `exportFloor`.
+3. **Page furniture** — a list of repeated objects the preset stamps on every page:
+   logo asset, page number, footer, running header, each with a slot and a
+   suppress-on-cover flag. This survives to PPTX **layout** emission so it lands as
+   real master content rather than copies. Nothing in the plan represented this
+   before, and every non-academic deck needs it.
+4. **Rules and refusals** — *which content rules apply here*. This is the axis that
+   stops domain conventions leaking into the core. "Every axis label carries a unit"
+   and the caption-integrity check (states *n*, the error-bar definition, the test)
+   are **publication-preset data, not universal predicates** — a bar chart of
+   signups by channel has no unit. Same for refusals: pie charts, a second y axis,
+   and the histogram are `refuses: [...]` on a publication preset and simply
+   *allowed* on `exec-update`. A global refusal reads as the tool arguing with the
+   user; a preset refusal reads as the venue arguing with the content, which is
+   true and useful.
+
+Switching preset atomically remaps all four. Nature-single → Cell is one click; so
+is design-review → exec-update, which is the same mechanism doing ordinary work.
+
+**The shipped family is general first:** `talk-16x9`, `design-review`,
+`exec-update`, `teaching`, `readme-image`, `poster-a0`. The **figures pack** adds
+`pub-nature-single`, `pub-nature-double`, `pub-cell`, `pub-plos` along with the
+annotation composites (§3.8) and the caption-integrity rules. It ships in slice 4
+and it is *a pack*, not the product's identity.
 
 ## 10. Figures: matplotlib, ggplot, and rescheming
 
@@ -1542,8 +1604,12 @@ shown chart · 9 bars · talk-dark · 720×450 → .chimaera/board/shown/a3f1.bo
 is two calls plus a temp file the agent has to name. That single fact is most of
 whether an agent still reaches for this at turn forty.
 
-**It is not a second schema.** The `chart` value **is** §3.8's chart object minus
-`id`/`at`/`size`. `show` normalizes it into a real one-page board in memory and
+**It is not a second schema.** The spec's top level is `title`, `note`,
+`provenance`, and exactly one of `chart` / `table` / `text` — **`--table` ships in
+slice 0 alongside the chart**, because the most common thing to show mid-work
+(test results, a config diff, a comparison matrix) is a table, and a chart-only
+`show` would send the agent back to prose for it. The `chart` value **is** §3.8's
+chart object minus `id`/`at`/`size`. `show` normalizes it into a real one-page board in memory and
 runs the identical render path. `--emit-board` prints that board, and a Rust test
 asserts *render-the-emitted-board* is byte-identical to *show's own render*. That
 test is the whole defense against `show` quietly becoming a second product.
@@ -1774,15 +1840,19 @@ look at" survives to turn forty.
 >
 > **Reach for it when the answer has shape:** a quantity compared across more than
 > a handful of named things · something changing along an axis · a before/after
-> over many items · a proportion of a whole · the progress of a long job (use
-> `--id` so it updates in place instead of piling up).
+> over many items · a proportion of a whole · **the structure of what you just
+> built or just read** — a pipeline, a call chain, a state machine · a table of
+> results too wide to read as prose · the progress of a long job (use `--id` so it
+> updates in place instead of piling up).
 >
 > **Do not reach for it otherwise, and that is most of the time.** Three numbers
 > are a sentence. Five short ranked things are a list. A code change is a diff. A
 > file you did not make is already previewed. A structure you can say in one line
 > is a line. **A chart that restates a sentence is worse than the sentence** — it
-> costs a scroll and buys nothing. The floor is mechanical: **fewer than four
-> marks is refused.** If you are arguing with that refusal, write the sentence.
+> costs a scroll and buys nothing. The floor is mechanical and low: **fewer than
+> two marks is refused** — a before/after benchmark is two bars and is exactly the
+> right thing to show. If you are arguing with the refusal at two, write the
+> sentence.
 >
 > **You state the numbers; Board draws them.** Board never bins, fits, smooths,
 > aggregates or downsamples. For a distribution, compute the bin counts where the
@@ -1809,8 +1879,8 @@ look at" survives to turn forty.
 > produce twelve slides they will delete.
 >
 > **One page is one claim, and the claim is the title.** The title of a content
-> page is a full sentence stating what the page shows — "IC50 drops tenfold in the
-> resistant line" — not a topic phrase — "Dose–response." A topic phrase makes the
+> page is a full sentence stating what the page shows — "Parse time drops on every
+> fixture" — not a topic phrase — "Dose–response." A topic phrase makes the
 > audience wait for the point. Under that sentence goes the evidence. **A content
 > page whose body is only text is a page whose evidence you have not found yet.**
 >
@@ -1865,7 +1935,7 @@ evidence enough to adopt rather than re-derive:
 > busy for.
 >
 > 1. **Read what the human did first.** `board journal <b> --since-last`. A gesture
->    is a correction you already received. If they moved `panel-a`, your placement
+>    is a correction you already received. If they moved `bench-chart`, your placement
 >    was wrong — do not move it back.
 > 2. **Lint before you look.** `board lint <b>`. Fix everything it names, run it
 >    again, repeat until clean. **Do not open the render yet** — lint fixes change
@@ -1920,8 +1990,8 @@ The skill opens with the line that makes the whole vocabulary teachable in a
 paragraph, and it is worth quoting verbatim because everything else follows from
 it:
 
-> **Board computes scales, layout, and typography. Board never computes
-> statistics.**
+> **Board computes scales, layout, and typography. Board draws numbers you
+> state; it never derives numbers.**
 >
 > There are five object types. Everything else you have heard called an element —
 > chart, table, diagram, bracket, scale bar, legend, colorbar, inset, panel label,
@@ -2074,7 +2144,9 @@ week — learning it after building `BoardView` costs a month.
    Also in slice 1, because all of it is expensive to retrofit and cheap now:
    the **anchor union in the schema** (`at` + `rel` resolving), the `alt`/`link`
    fields carried through, `page.layout` + named slots, and **`brief` +
-   `page.intent` resolution with the structural journal ops of §6.3b**. `table`
+   `page.intent` resolution with the structural journal ops of §6.3b**, plus
+   **log and temporal scales and an interval/range mark** on `chart` (moved up
+   from 4b — see below). `table`
    and `page.caption` move out to slice 3 and slice 5 respectively — the
    `Composite` trait no longer needs a placeholder implementation now that `chart`
    is its first real one, and `page.caption` exists for the figure-integrity lint,
@@ -2088,8 +2160,18 @@ week — learning it after building `BoardView` costs a month.
    remove once boards in the wild use them. The first rich element is admitted
    when a concrete figure is demonstrably blocked, not when expressiveness is
    argued in the abstract.
-2. **Slice 2 — the loop's polish.** The remaining daemon routes (`describe`,
-   `export`) + board epoch; live agent-edit animation with attribution and
+2. **Slice 2 — the loop's polish, and `diagram`.** `diagram` moves here from
+   slice 5, ahead of the figures pack, and the argument for it is *stronger* than
+   the one that justifies the annotation layer: for a figure the upstream tool
+   (matplotlib) already exists and Board merely imports, whereas for an
+   architecture diagram **there is no upstream tool the agent already ran** — the
+   escape hatch is empty, and today's fallback is ASCII art. Nodes, edges,
+   connector-bound edge labels, containers/lanes, deterministic layered layout via
+   vendored `dagre-rs`, plus `board import mermaid` and a `show --mermaid` stdin
+   path (mermaid is the diagram language agents already emit unprompted; the
+   refusal of *client-side* mermaid.js in §7 stands and is a separate question).
+   Also: icons with stated glyph coverage, and `tint`.
+   Then the remaining daemon routes (`describe`, `export`) + board epoch; live agent-edit animation with attribution and
    narration; selection-as-deixis and region snapshots into chat; comments and
    pins; per-object conflict merge; actor-aware undo — extended to derived
    children and `object.detached`. `board arrange` verbs; `lint --fix` for the
@@ -2100,25 +2182,26 @@ week — learning it after building `BoardView` costs a month.
    UI**; `equation` v1 (the picture arm, nearly free once the raster path exists);
    the python-pptx CI oracle and the cross-app fidelity matrix; target presets;
    `lint --target` gating.
-4. **Slice 4 — figures, the wedge.** matplotlib/ggplot import, provenance, stale
+4. **Slice 4 — the figures pack.** matplotlib/ggplot import, provenance, stale
    badges, `theme-export` (JSON, plus `--mplstyle`), `rescheme`; Okabe-Ito/Tol/Viridis
-   themes; journal width presets; poster preset. Then the annotation layer —
+   themes; publication width presets; poster preset. Then the annotation layer —
    `image.pixelSize`, `panelLabel`, `scalebar`, `inset`, `sigBracket`, `legend`,
    `colorbar`, `callout`; `anchor.px`; the sidecar `frame` contract (or two-point
    calibration) unlocking `anchor.data`; cross-panel consistency lints; align-plot-areas;
    the CVD/grayscale preflight. **The annotation layer comes before `chart`
    within this slice** — it is the actual wedge.
-5. **Slice 4b-i — `chart`, first cut, ungated.** `bar`/`line`/`point`, linear and
-   ordinal scales with `sort`, nice ticks, direct labels, per-mark binding, channel
-   types. Because `chart` is now the *answer to case B* rather than a nice-to-have,
-   it must not sit behind PPTX table export. **4b-ii** adds log and temporal scales,
-   `errorbar`, `rect` + colormaps, `box` sugar, and the grouped-shape export path,
-   gated on `table`.
-6. **Slice 5 — decks, diagrams, and parity.** Present mode with presenter view;
-   inline board artifacts and snapshot attachments; cosmic-text-wasm for in-place
-   text editing; `diagram` with vendored `dagre-rs` + orthogonal routing;
-   `board import mermaid`; icons and `tint`; caption-integrity lint; `svgBlip`
-   progressive enhancement; `hayro` PDF-panel import behind a feature flag.
+5. **Slice 4b — chart depth.** `rect` + colormaps, `box` sugar, stacking beyond
+   grouped bars, `source`-file binding with digest staleness. (`chart` v0 itself
+   shipped in slice 0; **log and temporal scales plus an interval/range mark moved
+   up to slice 1** — the plan's own §3.8 says a temporal scale "belongs to `chart`
+   from the start" because half of all slide charts need a date axis, and an
+   interval mark is what makes a timeline, a roadmap, a Gantt or a trace span
+   expressible at all. Leaving both behind the figures pack was the schedule
+   contradicting the design.)
+6. **Slice 5 — decks and parity.** Present mode with presenter view; inline board
+   artifacts and snapshot attachments; cosmic-text-wasm for in-place text editing;
+   caption-integrity lint (figures pack); `svgBlip` progressive enhancement;
+   `hayro` PDF-panel import behind a feature flag.
 7. **Slice 6 — opportunistic, gated on the fidelity matrix.** Native `c:chart` as
    an exporter optimization; the OMML arm of `equation`.
 
@@ -2194,9 +2277,14 @@ Still open:
   parity invariant and cannot run from a login node. If you'd rather agents just
   write mermaid and see it, that's a different product and worth saying now.
 
-- **Does the sentence-headline rule earn a lint check, or stay prose only?** §12's
-  skill says a content page's title should be an assertion ("IC50 drops tenfold in
-  the resistant line"), not a topic phrase ("Dose–response"). That is settled as
+- **~~Does the sentence-headline rule earn a lint check?~~ Resolved: prose only.**
+  Verb detection by heuristic is exactly the false-positive cost §3.5 refuses five
+  other checks over, and title-writing is a task models are human-competitive at —
+  the wrong place to spend a constraint. It stays a skill law with no linter behind
+  it. Recorded rather than deleted because it will be proposed again. *(Original
+  framing below.)* §12's
+  skill says a content page's title should be an assertion ("Parse time drops on
+  every fixture"), not a topic phrase ("Benchmarks"). That is settled as
   *advice*. The open question is whether `lint --style` should also flag it
   mechanically. The catch: detecting "is this a claim" means detecting a verb, and
   verb detection without a parser is heuristics — which is exactly the false-positive
