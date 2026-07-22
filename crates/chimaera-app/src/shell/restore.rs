@@ -105,18 +105,13 @@ fn open_shell_window(
     if let (Some(x), Some(y)) = (record.x, record.y) {
         builder = builder.position(x, y);
     }
-    if let Err(error) = builder.build() {
-        if let Some(shell) = app.try_state::<Shell>() {
-            lock(&shell.allowed_daemon_ports).remove(&label);
-        }
-        return Err(error);
-    }
-    // Track the new window's scope so focus-existing can raise it, and
-    // persist it so the next launch reopens it. Startup manages Shell before
-    // opening any window, so every window registers.
+    // Register the immutable host scope before the webview can execute a
+    // command. `build()` starts navigation, so inserting afterward leaves a
+    // short startup race where `list_askpass` rejects a legitimate window and
+    // the only visible authentication prompt is missed.
     if let Some(shell) = app.try_state::<Shell>() {
         lock(&shell.windows).insert(
-            label,
+            label.clone(),
             WindowScope {
                 alias: scope_alias,
                 ws: record.ws.clone(),
@@ -126,6 +121,18 @@ fn open_shell_window(
                 label: String::new(),
             },
         );
+    }
+    if let Err(error) = builder.build() {
+        if let Some(shell) = app.try_state::<Shell>() {
+            lock(&shell.allowed_daemon_ports).remove(&label);
+            lock(&shell.windows).remove(&label);
+        }
+        return Err(error);
+    }
+    // Persist the new window so the next launch reopens it. Startup manages
+    // Shell before opening any window, so every daemon window registered
+    // above has an authoritative scope before its first native command.
+    if let Some(shell) = app.try_state::<Shell>() {
         lock(&shell.registry).upsert(record.clone());
     }
     // A new window changes the tray's open-windows list.

@@ -1,10 +1,10 @@
 <script lang="ts">
   // The in-app SSH auth prompt (password / keyboard-interactive 2FA). ssh has
-  // no tty in the app, so its prompts arrive via SSH_ASKPASS as a broadcast
-  // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). Remote
-  // windows accept only their own host's prompts; the home window remains the
-  // fallback for startup restore and first-connect prompts raised before a
-  // remote window exists.
+  // no tty in the app, so its prompts arrive via SSH_ASKPASS as a host-scoped
+  // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). The native
+  // command layer applies the same scope to pending-list and answer calls;
+  // this UI filter is defense in depth. The home window remains the fallback
+  // for startup restore and prompts raised before a remote window exists.
   //
   // Prompts queue rather than replace: ssh asks sequentially (password, then
   // a Duo passcode), and clobbering an unanswered prompt would strand its ssh

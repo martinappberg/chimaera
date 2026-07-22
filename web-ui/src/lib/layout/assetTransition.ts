@@ -103,6 +103,26 @@ export function requestAssetReload(force = false): void {
   }));
 }
 
+/** A navigation call returned and this document is still alive, which means
+ *  beforeunload was cancelled. Drop the one-shot force and mint a revision so
+ *  the normal safety gate waits for dirty state to clear before trying again. */
+export function rearmAssetNavigation(cancelledRevision: number): void {
+  assetTransition.update((current) => {
+    if (
+      current === null ||
+      !current.requested ||
+      current.revision !== cancelledRevision
+    ) {
+      return current;
+    }
+    return {
+      ...current,
+      forced: false,
+      revision: current.revision + 1,
+    };
+  });
+}
+
 /** A transient failure may be retried in place. Build/connection transitions
  *  are authoritative and cannot be dismissed. */
 export function clearChunkFailure(): void {

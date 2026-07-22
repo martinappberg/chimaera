@@ -238,6 +238,7 @@
     clearChunkFailure,
     documentBuildSource,
     noteChunkFailure,
+    rearmAssetNavigation,
     requestAssetReload,
     requireAssetNavigation,
   } from "./lib/layout/assetTransition";
@@ -755,6 +756,11 @@
     untrack(() => {
       if (transition.target === null) location.reload();
       else location.replace(transition.target);
+      // This callback can run only if the document survived the navigation
+      // call (normally because the user chose Stay in beforeunload). Re-arm
+      // with `forced` cleared: dirty state holds the next attempt, and saving
+      // it lets the existing effect retry once without a prompt loop.
+      setTimeout(() => rearmAssetNavigation(transition.revision), 0);
     });
   });
 

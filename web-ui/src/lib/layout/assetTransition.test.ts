@@ -7,6 +7,7 @@ import {
   clearChunkFailure,
   documentBuildSource,
   noteChunkFailure,
+  rearmAssetNavigation,
   requestAssetReload,
   requireAssetNavigation,
 } from "./assetTransition";
@@ -40,5 +41,22 @@ describe("asset transition identity", () => {
     expect(get(assetTransition)).toMatchObject({ requested: true, forced: true });
     clearChunkFailure();
     expect(get(assetTransition)).toBeNull();
+  });
+
+  it("re-arms a forced navigation when beforeunload keeps the document alive", () => {
+    requireAssetNavigation("build", null);
+    requestAssetReload(true);
+    const attempted = get(assetTransition);
+    expect(attempted?.forced).toBe(true);
+
+    rearmAssetNavigation(attempted!.revision);
+    expect(get(assetTransition)).toMatchObject({
+      requested: true,
+      forced: false,
+      revision: attempted!.revision + 1,
+    });
+    // A stale callback cannot perturb a newer transition.
+    rearmAssetNavigation(attempted!.revision);
+    expect(get(assetTransition)?.revision).toBe(attempted!.revision + 1);
   });
 });

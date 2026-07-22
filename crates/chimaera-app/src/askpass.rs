@@ -13,7 +13,7 @@
 //! is out of scope here (a first connect to an unknown host still needs the
 //! key in `~/.ssh/known_hosts`).
 //! Each child also frames its normalized host alias with the prompt, so the
-//! app-wide relay can expose it only in that host's windows (plus home).
+//! native relay can target only that host's windows (plus local home).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -55,7 +55,8 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 /// emit (startup window restore kicks off remote connects before any webview
 /// has loaded) would otherwise never learn a prompt exists, and ssh would
 /// silently wait out the timeout — the "host stuck connecting with no
-/// prompt" failure. The UI fetches `pending()` on mount to close that gap.
+/// prompt" failure. Eligible windows fetch `pending_scoped()` on mount to
+/// close that gap without exposing another host's challenge.
 #[derive(Default)]
 pub struct Askpass {
     pending: Mutex<HashMap<u64, PendingPrompt>>,
@@ -66,6 +67,13 @@ struct PendingPrompt {
     alias: Option<String>,
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum AnswerResult {
+    Answered(Option<String>),
+    Missing,
+    Forbidden,
 }
 
 /// `ssh-askpass` event payload: a prompt the UI must answer.
@@ -92,24 +100,45 @@ impl Askpass {
         lock(&self.pending).remove(&id);
     }
 
-    /// Resolve prompt `id` with the user's answer (`None` = cancelled).
-    /// Returns whether the prompt was still pending — the caller broadcasts
-    /// `ssh-askpass-done` so every OTHER window showing it dismisses too.
-    pub fn answer(&self, id: u64, secret: Option<String>) -> bool {
-        match lock(&self.pending).remove(&id) {
-            Some(p) => {
-                let _ = p.tx.send(secret);
-                true
-            }
-            None => false,
+    /// Resolve a prompt only when the shell-owned caller scope is allowed to
+    /// see its alias. Authorization and removal share one lock, so a caller
+    /// cannot race a scope check against another answer.
+    pub fn answer_scoped(
+        &self,
+        id: u64,
+        secret: Option<String>,
+        window_alias: Option<&str>,
+        window_ws: Option<&str>,
+    ) -> AnswerResult {
+        let mut pending = lock(&self.pending);
+        let Some(prompt) = pending.get(&id) else {
+            return AnswerResult::Missing;
+        };
+        if !crate::shell::askpass_scope_matches(window_alias, window_ws, prompt.alias.as_deref()) {
+            return AnswerResult::Forbidden;
         }
+        let prompt = pending.remove(&id).expect("prompt checked above");
+        let alias = prompt.alias.clone();
+        let _ = prompt.tx.send(secret);
+        AnswerResult::Answered(alias)
     }
 
-    /// The prompts still awaiting an answer, oldest first (ssh asks
-    /// sequentially, so order is answer order).
-    pub fn pending(&self) -> Vec<PromptEvent> {
+    /// Prompts this shell-owned caller scope may observe, oldest first (ssh
+    /// asks sequentially, so order is answer order).
+    pub fn pending_scoped(
+        &self,
+        window_alias: Option<&str>,
+        window_ws: Option<&str>,
+    ) -> Vec<PromptEvent> {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
+            .filter(|(_, prompt)| {
+                crate::shell::askpass_scope_matches(
+                    window_alias,
+                    window_ws,
+                    prompt.alias.as_deref(),
+                )
+            })
             .map(|(id, p)| PromptEvent {
                 id: *id,
                 alias: p.alias.clone(),
@@ -119,6 +148,32 @@ impl Askpass {
         prompts.sort_by_key(|p| p.id);
         prompts
     }
+}
+
+/// Emit an askpass event only to shell-registered windows allowed to observe
+/// this host. Tauri event subscriptions are directly available to daemon
+/// pages, so app-wide broadcast plus a Svelte filter is not an auth boundary.
+fn emit_scoped<T: Clone + Serialize>(
+    app: &AppHandle,
+    event: &str,
+    payload: T,
+    alias: Option<&str>,
+) {
+    let Some(shell) = app.try_state::<crate::shell::Shell>() else {
+        return;
+    };
+    for label in shell.askpass_targets(alias) {
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        if let Err(error) = window.emit(event, payload.clone()) {
+            tracing::warn!("askpass: could not emit {event} to {label}: {error}");
+        }
+    }
+}
+
+pub(crate) fn emit_done(app: &AppHandle, id: u64, alias: Option<&str>) {
+    emit_scoped(app, "ssh-askpass-done", id, alias);
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -376,13 +431,10 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
     let prompt = prompt.trim_end().to_string();
     let id = state.register(alias.clone(), prompt.clone(), tx);
     let event = PromptEvent { id, alias, prompt };
-    // The emit reaches only windows that are ALREADY listening; windows that
-    // mount later find this prompt via `pending()` (`list_askpass`). Zero
-    // windows at emit time is therefore fine — not an error.
-    if app.emit("ssh-askpass", event).is_err() {
-        state.discard(id);
-        return String::new();
-    }
+    // Emit only to matching windows that are ALREADY listening. Windows that
+    // mount later find this prompt through the equally scoped list command;
+    // zero targets at emit time is fine during startup restore.
+    emit_scoped(app, "ssh-askpass", event.clone(), event.alias.as_deref());
     match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
         Ok(Ok(Some(secret))) => secret,
         // Cancelled, timed out, or the app dropped the sender: no answer, so
@@ -391,7 +443,7 @@ async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) 
         // an answer.
         _ => {
             state.discard(id);
-            let _ = app.emit("ssh-askpass-done", id);
+            emit_done(app, id, event.alias.as_deref());
             String::new()
         }
     }
@@ -547,5 +599,34 @@ mod tests {
         let (alias, prompt) = split_prompt_request("Passcode or option (1-3):\nDuo prompt".into());
         assert_eq!(alias, None);
         assert_eq!(prompt, "Passcode or option (1-3):\nDuo prompt");
+    }
+
+    #[test]
+    fn pending_and_answer_enforce_the_shell_window_scope() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register(Some("remote-2".into()), "Password:".into(), tx);
+
+        assert!(askpass
+            .pending_scoped(Some("remote-1"), Some("workspace"))
+            .is_empty());
+        assert_eq!(
+            askpass.answer_scoped(
+                id,
+                Some("wrong-window".into()),
+                Some("remote-1"),
+                Some("workspace")
+            ),
+            AnswerResult::Forbidden
+        );
+        assert!(askpass
+            .pending_scoped(None, Some("local-workspace"))
+            .is_empty());
+        assert_eq!(askpass.pending_scoped(None, None).len(), 1);
+        assert_eq!(
+            askpass.answer_scoped(id, Some("secret".into()), None, None),
+            AnswerResult::Answered(Some("remote-2".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
     }
 }

@@ -109,6 +109,50 @@ pub struct WindowScope {
     pub label: String,
 }
 
+/// Whether a shell-owned window may observe or resolve an askpass prompt.
+/// The local home window (`alias` + `ws` both `None`) is the startup fallback.
+/// Remote windows match only their login alias; compute windows carry
+/// `alias#job…` as their registry scope but authenticate through that login.
+pub(crate) fn askpass_scope_matches(
+    window_alias: Option<&str>,
+    window_ws: Option<&str>,
+    prompt_alias: Option<&str>,
+) -> bool {
+    match (window_alias, window_ws, prompt_alias) {
+        // Only the actual local home surface is the cross-host startup
+        // fallback; an unrelated local workspace must stay quiet too.
+        (None, None, _) => true,
+        (None, Some(_), _) | (Some(_), _, None) => false,
+        (Some(window), _, Some(prompt)) => {
+            window == prompt
+                || window
+                    .strip_prefix(prompt)
+                    .and_then(|suffix| suffix.strip_prefix("#job"))
+                    .is_some_and(|job_id| !job_id.is_empty())
+        }
+    }
+}
+
+impl Shell {
+    /// Immutable shell-registered scope for one volatile Tauri window label.
+    pub(crate) fn window_scope(&self, label: &str) -> Option<WindowScope> {
+        lock(&self.windows).get(label).cloned()
+    }
+
+    /// Window labels allowed to receive a prompt event. Event delivery must
+    /// enforce the same boundary as list/answer commands: a daemon page can
+    /// subscribe to raw Tauri events without going through the Svelte modal.
+    pub(crate) fn askpass_targets(&self, prompt_alias: Option<&str>) -> Vec<String> {
+        lock(&self.windows)
+            .iter()
+            .filter(|(_, scope)| {
+                askpass_scope_matches(scope.alias.as_deref(), scope.ws.as_deref(), prompt_alias)
+            })
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
+}
+
 /// A compute-node daemon's coordinates — everything `connect_compute_node`
 /// needs. Kept Rust-side only (see `remote_compute_sessions`): the token
 /// leaves this process solely in the URL of the window opened onto the job.
@@ -719,7 +763,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod origin_tests {
-    use super::daemon_origin_matches;
+    use super::{askpass_scope_matches, daemon_origin_matches};
 
     #[test]
     fn daemon_origin_requires_exact_scheme_host_and_port() {
@@ -736,5 +780,45 @@ mod origin_tests {
             assert!(!daemon_origin_matches(Some(43123), &url), "{rejected}");
         }
         assert!(!daemon_origin_matches(None, &allowed));
+    }
+
+    #[test]
+    fn askpass_scope_is_local_fallback_or_exact_remote_host() {
+        assert!(askpass_scope_matches(None, None, Some("remote-2")));
+        assert!(!askpass_scope_matches(
+            None,
+            Some("local-workspace"),
+            Some("remote-2")
+        ));
+        assert!(askpass_scope_matches(
+            Some("Sherlock"),
+            Some("workspace"),
+            Some("Sherlock")
+        ));
+        assert!(askpass_scope_matches(
+            Some("Sherlock#job123"),
+            Some("workspace"),
+            Some("Sherlock")
+        ));
+        assert!(!askpass_scope_matches(
+            Some("Sherlock#job"),
+            Some("workspace"),
+            Some("Sherlock")
+        ));
+        assert!(!askpass_scope_matches(
+            Some("Sherlock-other"),
+            Some("workspace"),
+            Some("Sherlock")
+        ));
+        assert!(!askpass_scope_matches(
+            Some("remote-1"),
+            Some("workspace"),
+            Some("remote-2")
+        ));
+        assert!(!askpass_scope_matches(
+            Some("Sherlock"),
+            Some("workspace"),
+            None
+        ));
     }
 }
