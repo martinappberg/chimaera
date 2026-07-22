@@ -5,15 +5,24 @@ This document synthesizes eight grounding passes (four over this codebase, four
 over verified July 2026 research — OOXML/PPTX internals, scene-graph format
 prior art, the pure-Rust render stack, and journal-figure/presentation ground
 truth) plus a three-lens design panel (format-first / interaction-first /
-workflow-first) with a judge that scored and merged them. Decisions marked
-**[decide]** are the maintainer's call. Everything else is decided — where a
-design was contested, the resolution and its one-line rationale are stated
-rather than left as options.
+workflow-first) with a judge that scored and merged them. It then survived an
+adversarial pass from five hostile lenses (daemon constraints, interaction,
+export fidelity, agent behavior, product scope) in which each finding had to
+survive an independent attempt to refute it: 31 claims were raised, 23 were
+refuted, and the 8 that held are folded in below — the output ceiling in §7, the
+git-epoch storm in §7, quick-open indexing in §4, overlap-aware undo in §6.7,
+PPTX placeholders in §11, group and connector coordinate spaces in §3.6,
+lint-through-panels in §3.5, and slice 1's real scope in §14.
 
-Companion plan: [skills-manager-plan.md](skills-manager-plan.md) (the "Loadout"
-tab). The board skill is the natural first-party pack that dogfoods Loadout's
-install path, and both features share the "files are the database, the daemon
-only scans/serves" posture.
+Decisions marked **[decide]** are the maintainer's call. Everything else is
+decided — where a design was contested, the resolution and its one-line
+rationale are stated rather than left as options.
+
+Companion plan: `docs/skills-manager-plan.md` (the "Loadout" tab), currently on
+branch `claude/chimaera-skills-manager-4c4110` — not linked here because it is
+not on this branch yet. The board skill is the natural first-party pack that
+dogfoods Loadout's install path, and both features share the same posture: files
+are the database, the daemon only scans and serves.
 
 ## 0. The one-paragraph version
 
@@ -94,7 +103,8 @@ Physical figure sizes convert with one multiply (Nature single column 89 mm =
 board never carries a DPI assumption. Origin top-left, y down. Each object
 carries `at: [x, y]` (top-left of the unrotated box), `size: [w, h]`, optional
 `rotation` (degrees clockwise about center, matching PPTX `ST_Angle/60000`) and
-`flipH`/`flipV`. This is a 1:1 shadow of `spPr/xfrm` decoded into human numbers.
+`flipH`/`flipV`. This is a 1:1 shadow of `spPr/xfrm` decoded into human numbers,
+always in page space — including grouped children (§3.6).
 
 One unit everywhere also kills a whole class of agent arithmetic errors, which
 is worth more here than in a human-only tool.
@@ -118,8 +128,12 @@ exact pt (`spcPts`, never `spcPct`) for cross-app determinism.
 
 Every color is either a token reference `"@accent1"` or a literal `"#1a1a1a"`.
 The sigil makes indirection obvious to both reader and agent, and maps directly
-onto the PPTX color model: **`@`-refs export as `<a:schemeClr>`** (so a slide
-pasted into a themed deck re-themes natively) **and literals as `<a:srgbClr>`**.
+onto the PPTX color model: **`@`-refs export as `<a:schemeClr>`** and literals as
+**`<a:srgbClr>`**, so a slide pasted into a themed deck re-themes natively — fonts
+included, since a run whose family is its theme role unmodified exports as
+`+mj-lt`/`+mn-lt` rather than a literal `a:latin` (which is emitted only for
+explicit instance overrides). Baking resolved families into every run would
+silently defeat half of "re-themes natively".
 Fonts and sizes are referenced *through roles* — `role: "heading"` resolves
 family/size/weight/color from the theme's type scale — with sparse instance
 overrides winning. **Resolved styles are never baked into the file**, and the
@@ -159,8 +173,20 @@ The format *prevents* bad output rather than merely permitting good output:
   round-tripping trap at the schema level.
 - **Colors default to `@`-tokens** drawn from validated palettes.
 - **Off-canvas objects** and **unresolved fonts** lint as warnings/errors.
-- `chimaera board lint --target nature-single` **gates export** — a
-  non-compliant figure is caught before it reaches a submission portal.
+- `chimaera board lint --target nature-single` **gates export**, and it lints
+  *through* panels rather than merely around them. This matters because in a real
+  journal figure almost all the text — axis labels, ticks, legends — lives inside
+  the imported panel, and the board's own placement is what creates the violation:
+  an 8 pt tick label authored at 6 in wide and then placed at 420 pt is scaled to
+  ~4.6 pt. So for a `plot` node whose SVG carries real `<text>`, lint reads
+  `font-size` and `stroke-width`, multiplies by the panel's placed/natural scale,
+  and checks against the target's `minPt` and `minLineWidthPt`; for a raster panel
+  it checks effective DPI at placed size. **Where the panel is outlined glyphs it
+  says so rather than passing.** A clean lint means "nothing detectable is wrong",
+  never "the portal will accept this". (Scale derives from the SVG root `width` ÷
+  `viewBox` width carried through nested transforms — matplotlib writes
+  `font-size: 8px` in user units on `width="432pt" viewBox="0 0 432 288"`, so
+  assuming CSS 96 dpi would under-report by 25%.)
 
 ### 3.6 A concrete board
 
@@ -220,7 +246,7 @@ The format *prevents* bad output rather than merely permitting good output:
 
 Object taxonomy (union on `type`): `text`, `shape` (`geo` from the PPTX-safe
 preset list, optional bound child text), `image`, `plot` (an image carrying
-provenance), `connector`/`line` (point- or object-bound with sides), `group`
+provenance), `connector`/`line` (point- or object-bound by box edge), `group`
 (one nesting level preferred — deeper nesting degrades in Keynote and Google
 Slides). Deferred behind a version bump: `table`, `embed`. Never: freehand,
 bezier, boolean path ops, blend modes, animation.
@@ -231,9 +257,32 @@ straight and bent connectors with arrowheads; solid and 2–3-stop linear fills;
 solid strokes with dash/cap/join; at most one soft outer shadow; explicit runs;
 `buChar`/`buAutoNum` bullets with explicit `buFont`; PNG/JPEG images at ~2× placed
 size with `srcRect` crop; SVG only as `svgBlip`-over-PNG progressive enhancement;
-a generated `clrScheme`/`fontScheme`; plain-text notes slides. Everything in that
-list maps to a first-class editable object in PowerPoint 2016+, Keynote,
-LibreOffice 7.x+, and Google Slides import.
+a generated `clrScheme`/`fontScheme` plus **title/body placeholders on a generated
+master and a minimal layout set** (title, title+body, blank, picture); plain-text
+notes slides. Everything in that list maps to a first-class editable object in
+PowerPoint 2016+, Keynote, LibreOffice 7.x+, and Google Slides import.
+
+Two coordinate spaces the schema must pin down explicitly, because leaving them
+implicit yields a board that renders correctly in the pane and wrong in
+PowerPoint:
+
+- **Grouped children carry page-absolute `at`/`size`, exactly like ungrouped
+  objects.** A group is a selection and z-order envelope, not a coordinate
+  system. That keeps ids, `describe`, journal move events, off-canvas lint, and
+  per-object merge uniform whether or not an object is grouped, and lets the
+  exporter emit an identity child space (`a:chOff` = `a:off`, `a:chExt` =
+  `a:ext`). Group rotation is therefore never composed with child rotation:
+  rotating a group rewrites each child's `at` and `rotation` in page space at
+  commit, so the file always reads as what you see.
+- **A connector's `side` names an edge of the target's bounding box** —
+  top/right/bottom/left — **not an OOXML `a:cxnLst` index**, whose numbering is
+  geometry-specific (rect has four connection sites, hexagon six, star5 more, and
+  "left" has no stable index across them). The exporter always resolves both
+  endpoints to page-space points and writes the `p:cxnSp`'s own `a:xfrm`
+  off/ext/flipH/flipV from them — never omitted, never zero-extent — attaching
+  `a:stCxn`/`a:endCxn` only as an optional reroute-on-edit enhancement where the
+  target preset has a site for that edge. PowerPoint reroutes on edit but renders
+  the *stored* geometry on open, and Keynote and Google Slides never reroute.
 
 ## 4. Where things live
 
@@ -262,6 +311,14 @@ the figure). **Gitignored + reconstructible** = renders (a pure function of
 board + theme + fonts), exports (regenerable final artifacts), and the journal
 (hot state; git holds the durable audit). All three stay on disk, in the file
 tree, one click away — they simply never appear in `git status` or a PR.
+
+**Gitignored is not un-indexed**, and that bites here. No daemon-side walker reads
+`.gitignore`: `quickopen::walk` filters by a fixed directory-*name* list
+(`.git`, `node_modules`, `target`, …). With render-every-turn (§6.2) a bare ⌘P
+would fill with `<hash>.png` noise, and on a Lustre workspace the extra entries
+eat into the walker's file cap and time cap — meaning real source files start
+dropping out of quick-open as a side effect of using boards. The three generated
+directories must be added to the walker's ignore set, not merely gitignored.
 
 **Naming note [decide]:** `~/.chimaera` is the *daemon's* home. A workspace-level
 `.chimaera/` is a different thing in a different place, and establishes a
@@ -449,8 +506,13 @@ conflict resolution is a **per-object three-way merge**, not textual:
 - If the agent writes mid-drag, revalidation applies the agent's changes to
   **every object except the one under your pointer**, tweening them in with
   attribution, and silently advances the base mtime. Your drag is never yanked.
-- On pointer-up the UI writes with `expect_mtime`. A 409 re-reads, re-applies
-  your single-object delta by id, and rewrites.
+- A gesture's end appends to the journal immediately, but the **file write is
+  coalesced on a ~500 ms idle boundary** (forced flush on pane blur/close, on
+  export, and before any `describe`/`render` reads the file). The optimistic
+  overlay already covers the gap, so a burst of drags — and key-repeat arrow
+  nudges, which would otherwise write ~30×/s — becomes one write carrying the
+  accumulated multi-object delta. The write still carries `expect_mtime`; a 409
+  re-reads, re-applies your deltas by id, and rewrites.
 - **Same-object collision:** your in-flight delta re-applies on top of the
   agent's write for that object — you win where you are actively touching, the
   agent wins everywhere else — with an attributed toast and one-click undo. No
@@ -462,11 +524,24 @@ cleanly with zero loss, which is only true because ids are the merge key.
 
 ### 6.7 Undo across two actors
 
-Undo is journal-driven and **actor-aware**. Every committed mutation is an
-invertible event. `⌘Z` walks back *your own* entries by default, stepping over
-the agent's — you should not undo the agent's work by reflex while cleaning up
-your own. An explicit menu item ("Undo claude's restyle of callout?") steps over
-agent edits with attribution shown. Git remains the coarse time-travel backstop.
+Undo is journal-driven and **actor-aware**, but "skip the other actor's entries"
+is only sound when the entries commute — and same-object edits do not. The naive
+version actively causes the harm it was meant to prevent: you nudge `panel-a` to
+`[96,130]` (seq 42), the agent later re-lays-out the page and moves it to
+`[300,200]` (seq 47), you press `⌘Z` once meaning to undo your nudge, and
+inverting seq 42 writes the *absolute* `[80,130]` — silently destroying the
+agent's move, with no attribution, because undo believed it only touched your own
+event. §6.6's merge policy makes interleaved same-object entries the common case,
+not the corner case. So the contract is per-field and checked:
+
+- **Events record per-field prior/new values** — `"changed":{"at":{"from":[80,130],"to":[96,130]}}` — so overlap is detectable at all. `move` and `resize` normalize to the shape `restyle` already has.
+- **Undo is overlap-aware.** Undoing entry E scans forward for any later entry, from any actor or another window, touching the same (object id, field path). None found — invert directly and silently; this is the common case and stays a plain `⌘Z`.
+- **On overlap, never clobber silently.** Prompt with attribution ("claude has since moved panel-a — undo your move anyway?" / [Undo mine] [Keep claude's]). "Undo mine" on a numeric geometry field applies the **inverse delta** (−16 pt x) to the current value rather than restoring an absolute box. For non-numeric fields (color token, text, enum) no delta exists, so the honest options are clobber-with-consent or skip-and-say-so. Either way the entry is marked resolved so a second `⌘Z` does not re-prompt.
+- **The invariant:** *an event is invertible only against a journal in which no later event touched the same object and field path; otherwise undo rebases or asks. Undo never writes an absolute value over another actor's later write without attribution.*
+
+A separate menu item explicitly *targets* an agent edit ("Undo claude's restyle
+of callout?") for when that is what you actually want. Git remains the coarse
+time-travel backstop.
 
 ### 6.8 Latency budget
 
@@ -475,13 +550,16 @@ agent edits with attribution shown. Git remains the coarse time-travel backstop.
 | gesture → optimistic UI | < 16 ms (local overlay, no round trip) |
 | gesture → journal append | async, backpressure-bounded, never blocks a gesture |
 | save → disk (atomic PUT) | < 5 ms local, + RTT remote |
+| save → git panel + tree refetch | **not per gesture** — coalesced; one `git status -uall` per settle window |
 | agent edit → UI animation starts | ~0 ms same-window (client bus); ≤ 2 s cross-process (fs poll) |
 | selection → snapshot attached in chat | < 100 ms (warm render + attach) |
 | warm page render | 20–60 ms; promise < 100 ms, target < 50 ms |
 
 The only segment above 100 ms is cross-process file-watch detection on the 2 s
 poll — acceptable for the human-perceptible "the agent is working" beat, and
-invisible for same-window edits.
+invisible for same-window edits. The `save → disk` figure is the write alone;
+the epoch fan-out it would otherwise trigger is exactly why writes are coalesced
+rather than issued per pointer-up.
 
 ## 7. Rendering, and why the pane shows the engine's pixels
 
@@ -492,9 +570,20 @@ the daemon: **usvg + resvg + tiny-skia** (SVG panels, shapes, compositing),
 **cosmic-text** (our text layout — shares `fontdb` with usvg, so one font world),
 **fontdb** (discovery), **krilla + krilla-svg** (PDF with real selectable text
 and font subsetting), **png** (image-rs, fast profile for previews) and
-**jpeg-encoder**. Roughly 8–14 MB of binary; RSS impact is mmap'd fonts plus one
-~8.3 MB framebuffer per concurrent render, so renders run under the existing
-8-permit `spawn_blocking` semaphore with a size gate before parse.
+**jpeg-encoder**. Roughly 8–14 MB of binary.
+
+**The RSS math, stated honestly, because it constrains the feature set.** A
+framebuffer is one contiguous `w × h × 4` tiny-skia pixmap — it scales with
+*output pixels*, not board complexity, and tiny-skia does not tile. A 1920×1080
+screen preview is 8.3 MB; a 16:9 slide at 300 DPI is 36 MB; a Nature
+double-column figure at 300 DPI is ~24 MB; **A0 at 300 DPI is 139 Mpx = 558 MB**,
+which would take out a daemon whose whole budget is ~150 MB — and with it every
+PTY and chat session it owns. So: a hard **output ceiling of ~12 Mpx (~48 MB)**
+on every raster path, `--scale` included, and renders above ~4 Mpx take a
+**separate 1-permit large-render lane** rather than sharing the 8-permit
+filesystem pool (eight concurrent 48 MB renders is itself over budget). The
+existing size gate covers inputs; this one covers outputs, and the plan needs
+both.
 
 **The parity decision.** The stage displays **server-rendered rasters** with a
 thin client-side vector overlay for selection handles, guides, snap lines, and
@@ -534,6 +623,17 @@ wire): `POST /api/v1/board/render` → mints a `/raw` ticket; `GET
 /api/v1/board/export` → a download ticket. Board mutations bump a per-workspace
 **board epoch** on `/ws/events` — invalidate-and-pull, never payload on the
 firehose.
+
+Board writes go through a **dedicated `PUT /api/v1/board/file`** rather than the
+generic `PUT /fs/file`, for one specific reason: the generic route calls
+`mark_path_dirty` (`git/service.rs:448`), which bumps the *git* epoch, wakes
+`/ws/events`, and makes every window on the workspace refetch
+`git status --porcelain=v2 -uall` under a 4-permit pool — seconds on a large repo
+over Lustre. Boards are tracked files, so at one save per pointer-up a normal
+layout session becomes a sustained `git status` storm. The board route bumps the
+board epoch immediately (that is what drives the pane) and **defers the git bump
+to a ~1 s per-path settle timer**, so a layout session costs one `git status`
+rather than one per gesture.
 
 **Render cache** in `renders/`, content-addressed on
 `hash(page subtree + resolved theme + font-set fingerprint + region + scale)`,
@@ -621,9 +721,23 @@ slice; v1 honestly says "export SVG or PNG from your plotting code."
   Python and no system dependencies, so shelling out breaks remote-transparency.
   The subset is a small fixed vocabulary — tractable to emit directly. **python-pptx
   becomes a CI-only fidelity oracle**: tests open our output and assert object
-  counts, text, and positions round-trip. A PowerPoint / Keynote / LibreOffice /
-  Google Slides fidelity matrix is a release gate, not a hope. Always `noAutofit`;
-  `@`-tokens become `schemeClr` refs against a generated `clrScheme`.
+  counts, text, positions, and **a title placeholder per titled slide** round-trip.
+  A PowerPoint / Keynote / LibreOffice / Google Slides fidelity matrix is a
+  release gate, not a hope. Always `noAutofit`; `@`-tokens become `schemeClr` refs
+  against a generated `clrScheme`.
+
+  Text objects with `role: "title"`/`"heading"` export as **real placeholders**
+  (`p:nvSpPr/p:nvPr/p:ph` with `type`/`idx` matching the generated layout), not
+  free-floating text boxes. This is the one part of the package that is a design
+  decision rather than boilerplate, and getting it wrong fails *silently*: without
+  a `ph`, the deck opens pixel-correct while Outline view is empty, the thumbnail
+  rail shows no slide titles, "Reuse Slides" and "Reset" do nothing, and the
+  Accessibility Checker flags every slide as missing a title — none of which an
+  object-count/text/position oracle would catch. Placeholder shapes still carry
+  their own explicit `xfrm` (board positions are truth; nothing inherits geometry
+  from the layout, so Reset cannot rewrite a figure), and the generated master's
+  `txStyles` are inert so placeholder inheritance cannot reintroduce the
+  `normAutofit` trap §3.5 closes at the schema level.
 - **PDF** via krilla — real selectable text, subsetted fonts.
 - **SVG** in two variants: text-as-paths by default (renders identically
   anywhere) and a real-`<text>` + `@font-face` toggle (editable in Illustrator
@@ -631,8 +745,12 @@ slice; v1 honestly says "export SVG or PNG from your plotting code."
 - **PNG/JPEG** at export DPI (≥300 for journals, 600 for line art).
 
 Exports land in `.chimaera/board/exports/` and are offered as a download ticket.
-`lint --target` runs first and blocks on min-font-size, off-canvas, and
-unresolved-font errors.
+`lint --target` runs first and blocks on min-font-size (board text *and* scaled
+panel-internal text), sub-minimum line weight after panel scaling, effective
+raster DPI below the target floor, off-canvas, and unresolved-font errors. Any
+panel it could not inspect is reported as an unverified-panel warning on the
+export result. Target presets therefore carry `minLineWidthPt` (Nature: 0.25) and
+`minEffectiveDpi` (300 halftone / 600 line art) alongside `minPt`.
 
 ## 12. Skills and chat
 
@@ -660,6 +778,23 @@ no CLI round-trip — the empty-state button and the skill both go through it.
 - **Huge assets** — size-gate before parse; rasters downscaled to ~2× placed
   size; an oversized SVG is refused with an explanation, never an OOM on a
   150 MB-budget daemon.
+- **Huge outputs** — the ceiling is on output pixels too, not just inputs. A
+  render or PNG/JPEG export whose `page size × scale` exceeds ~12 Mpx is refused
+  with a named error stating the computed pixel count and pointing at the vector
+  target, exactly as an oversized input is. A0 at 300 DPI is a 558 MB single
+  allocation and nothing about the board's contents makes it smaller. Poster and
+  ≥600 DPI targets therefore default to PDF (krilla streams — no full-page
+  framebuffer) or SVG; high-DPI PNG is the explicit exception. If a genuine
+  600 DPI poster raster is ever needed the escape hatch is banded rasterization
+  (horizontal strips with a translated transform, streamed into the encoder, with
+  overlap where filters cross strip boundaries) — deferred until something needs
+  it.
+- **An opaque panel.** matplotlib's default `svg.fonttype:'path'` emits outlined
+  glyphs — no `<text>`, no `font-size`, nothing to measure. Such a panel lints as
+  an explicit *"⚠ cannot verify text size in this panel"* in `describe` and on the
+  export result, **never a silent pass**. This is the strongest argument for §10's
+  regenerate-on-theme path: `svg.fonttype:'none'` is what makes a figure fully
+  lintable, not merely on-palette.
 - **Malformed board** — lenient parse; true corruption falls back to the text
   view with a repair banner and an "ask an agent to fix it" affordance.
 - **A future formatVersion** — text fallback, never a dropped tab.
@@ -679,12 +814,22 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    `BoardView` with the stage, select/move/resize/snap, outline rail, numeric
    inspector, page navigator. One theme (`talk-dark`) + PNG export. The journal
    writer **and gesture emission**. The board skill (claude + codex bridge).
+   Plus the two daemon routes this slice's own content already requires:
+   `POST /api/v1/board/render` → a `/raw` ticket (§7 — the stage shows
+   server-rendered rasters, so without it the pane has *no pixel source*) and the
+   journal-append route (§6.3 — one writer per file means the CLI's append routes
+   through the daemon). Both are thin wrappers over the same crate functions the
+   CLI calls, and the ticket-serving half already ships. Live agent-edit refresh
+   in slice 1 is the plain in-place `fileStore` revalidation on the existing 2 s
+   poll; slice 2 adds the epoch's faster invalidation and the tween/attribution
+   on top.
    **The day-one dogfood, which is the whole point of the feature:** an agent
    authors a two-slide deck from the skill, renders it, you drag a box, the agent
    reads `describe` + `journal --since` and adjusts. Rust unit tests on the
    schema, normalize, and lint (the web UI has no component tests — the isolated
    preview is its net).
-2. **Slice 2 — the loop's polish.** Daemon routes + board epoch; live
+2. **Slice 2 — the loop's polish.** The remaining daemon routes (`describe`,
+   `export`) + board epoch; live
    agent-edit animation with attribution and narration; selection-as-deixis and
    region snapshots into chat; comments and pins; per-object conflict merge;
    actor-aware undo.
