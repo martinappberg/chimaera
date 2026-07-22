@@ -14,6 +14,12 @@ git-epoch storm in §7, quick-open indexing in §4, overlap-aware undo in §6.7,
 PPTX placeholders in §11, group and connector coordinate spaces in §3.6,
 lint-through-panels in §3.5, and slice 1's real scope in §14.
 
+A second panel then designed the **element vocabulary** (§3.6–§3.8) — what Board
+draws natively from data versus only imports as a picture — over six further
+research passes, three lenses (minimalist / coverage / export-first), and a judge.
+One of those passes generated its evidence by building real `.pptx` files locally
+and hand-writing a minimal embedded workbook, rather than trusting recall.
+
 Decisions marked **[decide]** are the maintainer's call. Everything else is
 decided — where a design was contested, the resolution and its one-line
 rationale are stated rather than left as options.
@@ -48,22 +54,18 @@ owns the work** — Claude artifacts and claude-canvas can generate a picture;
 nothing lets you drag a panel on a login node and have `codex` read what you did
 and why.
 
-## 1. The name **[decide]**
+## 1. The name — decided: **Board**
 
-The panel called this "composer" throughout. **That name is taken:** the chat
-message input is the composer (`web-ui/src/lib/chat/Composer.svelte`,
-`composerBus.ts`, `attachImageToComposer`, `registerComposerAttach`). Shipping a
-second "composer" would make every future grep ambiguous in the one area — chat
-— where the two features actually meet.
+The design panel called this "composer" throughout, and that name is taken: the
+chat message input is the composer (`web-ui/src/lib/chat/Composer.svelte`,
+`composerBus.ts`, `attachImageToComposer`). A second "composer" would make every
+future grep ambiguous in the one area — chat — where the two features meet.
 
-**Recommendation: Board.** Files are `.board.json`, the pane is `BoardView`, the
-crate is `chimaera-board`, the CLI is `chimaera board render …`, the feature is
-"boards" in prose. Self-describing, collision-free, and it survives the feature
-growing from decks into figures and posters. Alternatives if you want more
-character: *Easel* (evocative, unique, `chimaera easel` reads nicely, files stay
-`.board.json`), or *Plate* (the scientific term for an assembled figure — sharp
-for the wedge use case, opaque for decks). This document uses **board**
-throughout; a rename is a find-and-replace before slice 1.
+**Board** it is (maintainer's call, 2026-07-21). Files are `.board.json`, the
+pane is `BoardView`, the crate is `chimaera-board`, the CLI is
+`chimaera board render …`, the feature is "boards" in prose. Self-describing,
+collision-free, and it survives the feature growing from decks into figures and
+posters.
 
 ## 2. What already exists to build on
 
@@ -178,7 +180,7 @@ The format *prevents* bad output rather than merely permitting good output:
   journal figure almost all the text — axis labels, ticks, legends — lives inside
   the imported panel, and the board's own placement is what creates the violation:
   an 8 pt tick label authored at 6 in wide and then placed at 420 pt is scaled to
-  ~4.6 pt. So for a `plot` node whose SVG carries real `<text>`, lint reads
+  ~4.6 pt. So for an imported panel (an `image` with provenance) whose SVG carries real `<text>`, lint reads
   `font-size` and `stroke-width`, multiplies by the panel's placed/natural scale,
   and checks against the target's `minPt` and `minLineWidthPt`; for a raster panel
   it checks effective DPI at placed size. **Where the panel is outlined glyphs it
@@ -219,7 +221,7 @@ The format *prevents* bad output rather than merely permitting good output:
       "objects": [
         { "id": "heading", "type": "text", "role": "heading",
           "at": [80, 48], "size": [800, 56], "text": ["Dose–response"] },
-        { "id": "panel-a", "type": "plot",
+        { "id": "panel-a", "type": "image",
           "at": [80, 130], "size": [420, 320],
           "src": ".chimaera/board/assets/dose_response.svg",
           "provenance": {
@@ -244,19 +246,48 @@ The format *prevents* bad output rather than merely permitting good output:
 }
 ```
 
-Object taxonomy (union on `type`): `text`, `shape` (`geo` from the PPTX-safe
-preset list, optional bound child text), `image`, `plot` (an image carrying
-provenance), `connector`/`line` (point- or object-bound by box edge), `group`
-(one nesting level preferred — deeper nesting degrades in Keynote and Google
-Slides). Deferred behind a version bump: `table`, `embed`. Never: freehand,
-bezier, boolean path ops, blend modes, animation.
+Object taxonomy — **exactly five primitive types**, and everything else in the
+vocabulary is a composite that expands into them (§3.8):
+
+| Type | Purpose | PPTX |
+|---|---|---|
+| `text` | A box of paragraphs of explicit runs. The only thing that owns glyph layout. | `p:sp` + `a:txBody`; `role: title/heading` → real `p:ph` |
+| `shape` | A preset geometry with fill/stroke and optional bound child text. Absorbs `line`. | `p:sp` + `a:prstGeom` |
+| `connector` | A stroked two-endpoint geometry binding to other objects by box edge. | `p:cxnSp` with its own resolved `a:xfrm` |
+| `image` | Placed pixels or SVG, with optional `srcRect`, `provenance`, `pixelSize`, `frame`, `tint`. Absorbs `plot`. | `p:pic` (+ `svgBlip`) |
+| `group` | A z-order and selection envelope over page-absolute children. | `p:grpSp`, identity child space |
+
+Two deletions from the earlier draft, both because *a type whose whole definition
+is another type plus a field is not a type*. **`plot` is gone** — it was "an image
+carrying provenance", so `provenance`, `pixelSize`, and `frame` become fields on
+`image`, collapsing the stale badge, the Regenerate button, the panel lint, the
+anchor machinery, and the `p:pic` writer to one code path (and letting a pasted
+screenshot carry provenance too). `describe` still *prints* the word `plot` for an
+image that has provenance — the human vocabulary survives, the schema branch does
+not. **`line` is gone** — a connector's irreducible property is *binding*, not
+thinness, so an unbound straight line is `shape` with `geo: "line"`. That removes
+the which-type-do-I-emit ambiguity agents get wrong in every tool carrying both.
+
+Groups prefer one nesting level (deeper degrades in Keynote and Google Slides).
+Never: freehand, bezier, boolean path ops, blend modes, animation.
+
+**Four fields every object carries, none of which is a type:** `anchor` (§3.7),
+`alt` (exports as `p:cNvPr/@descr` — ~5 lines of writer, and it completes the
+accessibility story), `link` (run- or shape-level `a:hlinkClick`, so a DOI
+survives export instead of dying inside a flattened picture), and image-only
+`tint` (recolors a monochrome SVG to a theme token).
 
 The **PPTX-safe subset** the schema targets — verified against OOXML docs — is:
 rect/roundRect/ellipse/triangle/diamond/hexagon/chevron/block-arrows/star5,
 straight and bent connectors with arrowheads; solid and 2–3-stop linear fills;
 solid strokes with dash/cap/join; at most one soft outer shadow; explicit runs;
-`buChar`/`buAutoNum` bullets with explicit `buFont`; PNG/JPEG images at ~2× placed
-size with `srcRect` crop; SVG only as `svgBlip`-over-PNG progressive enhancement;
+`buChar`/`buAutoNum` bullets with explicit `buFont`; **fill alpha** (`<a:alpha>` —
+there is no Venn overlap, highlight band, or legend swatch without it); the extra
+geo presets `flowChartDocument`/`flowChartDecision`/`flowChartMagneticDisk`/
+`flowChartPreparation`/`parallelogram`/`stadium` and `leftBrace`/`rightBrace`/
+`bracketPair` (constant in figures — "these three lanes are the treatment group");
+PNG/JPEG images at ~2× placed size with `srcRect` crop; SVG only as
+`svgBlip`-over-PNG progressive enhancement;
 a generated `clrScheme`/`fontScheme` plus **title/body placeholders on a generated
 master and a minimal layout set** (title, title+body, blank, picture); plain-text
 notes slides. Everything in that list maps to a first-class editable object in
@@ -283,6 +314,253 @@ PowerPoint:
   `a:stCxn`/`a:endCxn` only as an optional reroute-on-edit enhancement where the
   target preset has a site for that edge. PowerPoint reroutes on edit but renders
   the *stored* geometry on open, and Keynote and Google Slides never reroute.
+
+## 3.7 The inclusion principle, and anchors
+
+"Handle practically everything" has two failure modes: a wish list, and a wall
+every real figure hits. What prevents both is a test with an operational
+procedure. A candidate is a **native element** if and only if it passes all four
+clauses; one failure and it is an imported panel.
+
+> **C1 — Deterministic.** Same file + same theme + same vendored fonts ⇒ the same
+> output, byte for byte. No seed, no iteration, no convergence criterion, no
+> layout engine running in the consumer application, no command executed at
+> render time.
+>
+> **C2 — Arithmetic-only.** Geometry is computable from numbers already stated in
+> the file, the theme, or a plot-ready table it references — using scales,
+> layout, and typography, never an estimator, fit, smoother, binner, clusterer,
+> projection, or solver.
+>
+> **C3 — Bounded.** It expands to fewer than 2,000 primitives, and the bound is
+> computable *before* expansion.
+>
+> **C4 — Projectable.** Every primitive it emits is already in §3.6's PPTX-safe
+> subset and lands on a first-class *editable* object at the destination. If the
+> destination application has to compute where things go, Board does not know what
+> it exported.
+
+The one-line form, which goes verbatim into the skill: **Board computes scales,
+layout, and typography. Board never computes statistics.** Colloquially: *you
+could place it correctly with a ruler and the caption, without opening the
+dataset.* C4 alone decides SmartArt, autofit, live layout containers, and
+Microsoft's `cx:` chartex extension in one stroke.
+
+**The corollary that makes this generous rather than restrictive**, and the single
+most useful finding of the whole design pass: *most of the bioinformatics long
+tail passes C2 once the statistics have already happened upstream.* A violin
+outline is a polygon. A Kaplan–Meier curve is a step line. A box is a five-number
+summary. A clustered heatmap is a grid of rects in a supplied leaf order. Board
+needs no statistics engine to draw any of them — it needs the script to emit its
+reduced numbers. **The seam is a two-way street:** a script that gains
+`--emit board-data` upgrades its own picture into a native, lintable,
+re-themeable chart without moving one line of statistics out of your Python.
+
+### Anchors — the enabling change
+
+Every object gets an `anchor`, not just `at`. Without this, annotation is a lie:
+an arrowhead on a cell, a bracket over two bars, a scale bar on a micrograph all
+silently **detach** the moment the panel is moved, resized, cropped, or
+regenerated — which is exactly the revision agony the feature exists to kill.
+
+```json
+"anchor": { "at": [520, 150] }                                           // page pt — the default
+"anchor": { "object": "panel-a", "rel": [0.5, 0.0], "offset": [0, -8] }  // survives move + resize
+"anchor": { "object": "micro-1", "px": [512, 300] }                      // survives crop too
+"anchor": { "object": "panel-a", "data": [12.5, 0.83] }                  // panel data space
+```
+
+Anchors **resolve to page points at `normalize()`**, so `describe`, off-canvas
+lint, journal move events, per-object merge (§6.6), per-field undo (§6.7), and the
+PPTX writer all keep seeing plain integers and are entirely unchanged. `describe`
+prints both the anchor and the resolved point. A `data` anchor requires the target
+image to carry a **`frame`** (plot-area rect in pixels + axis limits + scale
+type), which native charts have by construction and imported panels earn only via
+the regenerate path — a deliberate incentive toward the lintable option.
+Regenerating an image marks its anchored dependents **needs-review**.
+
+Anchors must land in **slice 1's schema** even if only `at` and `rel` resolve at
+first; retrofitting them re-keys every derived element and every journal event.
+
+## 3.8 The composite vocabulary
+
+Everything beyond the five primitives is a **composite**: it stores intent, and
+its geometry is computed at render. Composites are distinct `type` values in the
+file — legible under `git diff`, the natural key for the inspector, and already
+covered by §3.4's lenient parser — but they are implemented behind exactly one
+internal trait:
+
+```rust
+trait Composite {
+    fn bound(&self, ctx: &Ctx) -> usize;           // C3, computed before expansion
+    fn expand(&self, ctx: &Ctx) -> Vec<Primitive>; // pure, total, deterministic
+}
+```
+
+That single trait is what keeps eleven names from costing eleven times: the
+renderer, exporter, `describe`, and `lint` all run on the *expanded* tree and
+never learn a composite's name. Three semantics are load-bearing:
+
+1. **The expansion is never stored.** The file holds ~30 lines of intent and git
+   diffs the intent. Storing it would be a second stored representation — the same
+   normalization ambiguity and diff churn that rules out stored markdown (a theme
+   tweak would churn a hundred diff lines per gesture). Spec-only is also what
+   makes retheme and retarget free.
+2. **Derived children get stable derived ids** — `fig2a/mark.point[3]`,
+   `fig2a/tick.x[0]` — addressable in `describe --expand` and in journal events,
+   never written to the file.
+3. **Detach-on-drag.** Dragging a generated child materializes the expansion as
+   literal primitives in a `group`, drops the spec, and emits `object.detached`.
+   You gain shapes you can edit; you lose live re-layout — **and the UI says so
+   before it happens.**
+
+| Type | Purpose |
+|---|---|
+| `chart` | Scales, axes, ticks and ≤8 marks over a plot-ready table (below) |
+| `table` | Grid of cells with explicit widths, borders, fills → native `a:tbl` |
+| `diagram` | Nodes + edges + containers under a deterministic hierarchical/grid/radial layout |
+| `panelLabel` | Derived `a`/`b`/`c` from an ordered panel list — never stores the letter |
+| `scalebar` | Physical-length bar computed from the target image's `pixelSize` |
+| `sigBracket` | Significance bracket with auto-tier stacking. Draws; never tests |
+| `inset` | Source rect + magnified crop + leader lines, from one `srcRect` |
+| `legend` | Swatch-and-label list bound to the panels it describes |
+| `colorbar` | Continuous ramp with ticks; ramp rasterizes on PPTX export |
+| `callout` | Shape + leader connector — the most common figure annotation, blessed |
+| `equation` | LaTeX, rendered to a cached asset |
+
+### `chart` — eight marks, nine channels, zero transforms
+
+Native charts earn their place because they are the one element where every
+clause pays at once: re-themeable with the deck, diffable as numbers, **lintable
+through** (§3.5's "cannot verify this panel" structurally cannot apply — the
+exporter owns the tick font size), and re-flowable on retarget (a picture's 8 pt
+tick becomes 4.6 pt at Cell's column width; a native chart re-lays-out its ticks).
+
+```json
+{ "id": "fig2a", "type": "chart",
+  "at": [80, 130], "size": [420, 320],
+  "alt": "Viability by dose for two cell lines",
+  "data": { "source": "figures/fig2a_source.csv", "sha256": "9c1a…", "rows": 24,
+            "fields": { "x": "dose_nM", "y": "viability", "err": "sem", "series": "cell_line" } },
+  "x": { "scale": "log", "title": "Dose (nM)", "ticks": [0.1, 1, 10], "format": { "sig": 2 } },
+  "y": { "scale": "linear", "title": "% viability", "domain": [0, 100], "nice": true },
+  "color": { "field": "cell_line", "palette": "@categorical" },
+  "marks": [
+    { "mark": "errorbar", "capPt": 3 },
+    { "mark": "line", "width": 1.2 },
+    { "mark": "point", "size": 4 },
+    { "mark": "rule", "y": 50, "stroke": "@muted", "dash": [3, 3] }
+  ],
+  "axes": { "spines": ["left", "bottom"], "grid": "none" },
+  "provenance": { "script": "scripts/fig2.py", "regen": "python scripts/fig2.py --emit board-data" } }
+```
+
+The eight marks: `bar` (`stack: none|stack|group`) · `line` (`step: none|post` —
+*this is Kaplan–Meier*) · `point` · `area` (explicit `y`/`y2` — a CI ribbon *and* a
+violin half) · `rect` (heatmap cell over a matrix + named colormap) · `errorbar`
+(*this is the forest plot*) · `rule` · `text`. That covers, natively and lintably:
+bar, grouped and stacked bar, line, multi-series line, step/KM, scatter, volcano,
+forest, dot plot, box (given the five-number summary), violin (given the density
+polygon), heatmap (given the matrix and leaf order), CI ribbons, and any of those
+with reference lines and direct labels.
+
+**Rejecting Vega-Lite's `transform` block is not scope triage — it is C2 expressed
+as a schema.** Nineteen transform types is precisely where "we are writing a
+plotting library" begins. Faceting is likewise absent: small multiples are N
+`chart` objects placed by `board arrange --op grid`, which is only possible
+because Board *is* the layout engine.
+
+**Where the data lives:**
+
+| Form | Cap | Why |
+|---|---|---|
+| `values` inline | ≤500 plotted points **and** ≤32 KiB serialized | the write cap is 1 MiB; an inline 50k series is an unwritable file, and it poisons the id-anchored sparse-`Edit` contract |
+| `source` file + column map + `sha256` + `rows` | ≤20,000 rows, ≤5,000 drawn marks | the default — and it *is* the journal's Source Data deliverable |
+| `dataset` | a board-level named table shared across panels | cross-panel consistency for free |
+
+CSV/TSV(.gz) and xlsx only; **parquet is what the regen script reads, never what
+Board binds to**. Above the caps there is no native chart — it is an imported
+panel, refused with a named error pointing at the path. **Board never silently
+downsamples:** choosing how to reduce a dense scatter changes apparent density and
+hides outliers, which is a scientific misstatement, and *how* to reduce is an
+analysis decision belonging in reviewable code. A `sha256` mismatch is **stale** —
+loud in `describe`, `lint`, the pane, and the export result, blocking a
+`--target`-gated export, and **never auto-refreshed**, because silently mutating a
+figure under review is worse than a badge.
+
+Axis tick formatting is specified, not left to `format!` — significant-figure
+default, optional SI prefixes, explicit per-axis `format: { sig, prefix, sep }`,
+log minor ticks off by default, and a fixed rounding rule so C1 holds across
+platforms. Unspecified, this ships `0.30000000000000004` on an axis in week one.
+Continuous colormaps (`viridis`, `magma`, `cividis`, `RdBu`) are 256-entry tables
+**bundled in the crate and referenced by name**, with the theme naming its
+default; a colormap is never expressible as an `a:gradFill`, and lint refuses any
+attempt to approximate one.
+
+### The annotation layer — the actual wedge
+
+Each of these sits *above* an already-rendered panel, which is exactly what no
+plotting library can do for itself:
+
+- **`panelLabel`** stores `{ for, corner }` and **never the literal letter**.
+  Letters derive from the page's ordered panel list, so reordering panels
+  relabels the figure, and a Nature→Cell retarget flips `a b c` → `A B C` with the
+  type role swapped, atomically. Labels snap to a shared left guide rather than
+  per-panel bboxes, because tick-label widths differ and per-panel alignment reads
+  ragged. Lint gains missing / duplicate / gap-in-sequence checks.
+- **`scalebar`** `{ for, length: 50, unit: "um", corner: "br" }`, requiring
+  `image.pixelSize` read on import from OME-XML, ImageJ/baseline TIFF tags, or PNG
+  `pHYs`. Drawn length is computed, so it stays **correct through resize and
+  crop** — the classic silent lie in hand-assembled figures. A missing `pixelSize`
+  is a lint **error, never a guess**.
+- **`sigBracket`** `{ from, to, p: 0.013, tier: 0 }`. Board auto-stacks tiers to
+  avoid overlap and maps `p` → `*`/`**`/`n.s.` through a theme-configurable rule,
+  so "this journal wants exact p-values" is a preset switch. **Board draws; Board
+  never tests.** Tier stacking is a collision problem in *page* space — precisely
+  what an upstream static panel cannot solve for itself.
+- **`inset`**, **`legend`** (carrying `describes: [...]` so lint can flag drift),
+  **`colorbar`**, **`callout`**.
+
+Board draws an `errorbar` from a supplied column and never computes SEM. In
+exchange it ships the integrity check nobody else offers: provenance records
+`errorBar` / `n` / `test`, and lint asserts the caption states them.
+
+### Imported panels are Tier 2, and Tier 2 is not a lesser tier
+
+An `image` with `provenance` is the right representation for everything that fails
+the principle: distributions, violins-from-raw, clustermaps with dendrograms,
+survival fits, UMAPs, hexbins, contours, faceted grids, flow-cytometry gates,
+genome tracks, sequence logos, chemical structures, phylogenies, microscopy
+composites. **This is where the statistics are *correct*** — computed in
+reviewable code, in git, in the Methods section — and it is what LLMs author best.
+§4 already says an imported matplotlib SVG *is* source; the vocabulary must not
+quietly demote it.
+
+Ten mechanisms keep it first-class: the provenance card with Regenerate and
+Re-export-theme; `pixelSize` → scale bars; `srcRect` → insets; `frame` → data
+anchors; `theme-export` with `svg.fonttype:'none'` so lint reads real `<text>`;
+the honest *"⚠ cannot verify text size in this panel"* where glyphs are outlined;
+anchors that survive regeneration as needs-review; the stale badge; `alt` and
+`link`; and the `--emit board-data` upgrade path. And a vocabulary rule enforces
+it: **every composite must work identically over an imported panel and over a
+native chart.** A `sigBracket` over a seaborn PNG and over a native `chart` are
+the same object.
+
+Flow-cytometry gates get a named rule: Board may reposition an illegible gate
+*label*; it may never draw the gate, because the gate polygon *produces* the
+percentages.
+
+### Page level
+
+`page.layout` + **named slots** is the default authoring path and ships in slice 1
+— §11 already generates a master and layout set with `p:ph` placeholders, so it
+costs nothing at export and is expensive to retrofit; it resolves to absolute pt
+at `normalize()` and is never live. **`page.caption`** is structured prose that is
+**not drawn on the page by default** — Nature and Cell want the caption in the
+manuscript, not baked into the artwork — exported alongside the figure and
+rendered in only when the target preset says to. It also gives the
+error-bar/`n`/test integrity lint something concrete to read, and it removes the
+most common reason a figure blows its `minPt` budget.
 
 ## 4. Where things live
 
@@ -357,17 +635,38 @@ its journal's font bounds through every resize, and it is exactly what
 Illustrator gets wrong. Font size changes only via the role dropdown or an
 explicit numeric override in the inspector.
 
-**Alignment tools.** A floating toolbar at ≥2 selected: align left/center/right/
-top/middle/bottom, distribute horizontal/vertical, match size, tidy into grid.
-These write the *same journal events* as the agent's align ops — the human's
-button and the agent's command are the same operation, which is what makes the
-two actors' histories comparable.
+**Alignment tools — layout is a verb, not an object.** A floating toolbar at ≥2
+selected: align left/center/right/top/middle/bottom, distribute
+horizontal/vertical, match size, tidy into grid, align plot areas. The agent gets
+the identical verbs (`board arrange --op align-left|distribute-h|grid|stack-v`),
+and both write the *same journal events* — which is what makes the two actors'
+histories comparable. Crucially these are **deterministic pure functions that
+write absolute `at`/`size` and then disappear**: there are no stored layout
+containers, because a container owning its siblings' positions would break
+§6.6's per-object merge and §6.7's per-field undo (both key on the object's own
+`at`), and PPTX has no container, so a live one would reintroduce exactly the
+consumer-side layout drift C4 forbids.
+
+**The fidelity preflight.** A tier glyph per object in the outline rail (solid =
+native primitive, hollow = composite, square = picture), a running "N objects
+export editable, M as pictures" in the status strip, and `⌘K → Export` opening a
+preflight that lists per-target degradations, unverified-panel warnings, stale
+data digests, missing `pixelSize`, and every blocking lint. `describe` prints the
+same tier per object, so the agent reads the identical contract. Nothing about
+export fidelity should be discovered by opening the file in PowerPoint.
+
+Because charts are now native, the export preflight also carries a **CVD and
+grayscale check** — deuteranope/protanope/tritanope matrices plus a luminance
+transform over the rendered pixmap, shown as four panels side by side, with a lint
+warning when two series in one chart fall within a ΔE threshold under simulation.
+That is ~30 lines over tiny-skia and a scientific-integrity check no presentation
+tool offers.
 
 **Inspector**, contextual: numeric transform (authoritative — you can type
 `x = 80`, because the file is numeric and the UI never hides the coordinate
 system), fill/stroke with theme swatches first and custom hex behind a
 disclosure, text (role dropdown, size shown as *resolved-from-theme* with an
-override affordance that displays "= theme (overridden)"), and for `plot` nodes
+override affordance that displays "= theme (overridden)"), and for imported panels
 a **provenance card** with Regenerate and Re-export-theme buttons.
 
 **Present mode** (decks; `P`): full-screen from the pane — page-at-a-time,
@@ -687,7 +986,7 @@ format — resubmission becomes one click instead of a manual redo.
 ## 10. Figures: matplotlib, ggplot, and rescheming
 
 **Import.** Drop an `.svg`/`.pdf`/`.png` from `results/` onto the stage (or from
-the file tree); it is copied into `assets/` (tracked) and becomes a `plot` node
+the file tree); it is copied into `assets/` (tracked) and becomes an `image` node
 with `provenance {tool, script, regen, themeExport, generated}`. matplotlib SVGs
 exported with the default `svg.fonttype:'path'` render pixel-faithfully with no
 fonts required, which is the easy and common case.
@@ -708,7 +1007,7 @@ fonts required, which is the easy and common case.
    `<text>`, which is precisely why path 1 pushes `fonttype:'none'` upstream
    rather than trying to reverse-engineer outlines.
 
-A `plot` whose script is newer than its asset shows a **stale badge** with a
+A panel whose script is newer than its asset shows a **stale badge** with a
 one-click regenerate. PDF-panel import (via `hayro`) is feature-gated to a late
 slice; v1 honestly says "export SVG or PNG from your plotting code."
 
@@ -744,6 +1043,41 @@ slice; v1 honestly says "export SVG or PNG from your plotting code."
   and Inkscape). This is matplotlib's own tradeoff, surfaced as a choice.
 - **PNG/JPEG** at export DPI (≥300 for journals, 600 for line art).
 
+- **Tables** export as native `a:tbl`. Cells are `a:txBody`, so this reuses the
+  `a:p`/`a:r`/`a:rPr` writer verbatim; `tableStyles.xml` is a single empty element
+  and Board styles every cell explicitly. ~150 lines, universally safe, and the
+  cheapest win in the document.
+- **`alt`** → `p:cNvPr/@descr` and **`link`** → `a:hlinkClick`, so accessibility
+  and DOIs survive rather than dying inside a flattened picture. Note that array
+  order is both z-order *and* screen-reader reading order — a free accessibility
+  win and a constraint on any future auto-restack.
+
+**Charts export as grouped vector shapes, not native `c:chart` — in v1.** Worth
+recording *why*, because the research verified the alternative is feasible rather
+than merely imagined: a minimal `c:chart` part is ~1.9 KB, and a hand-written
+5-part 1.6 KB embedded workbook was built and read back successfully using `zip` +
+`quick-xml` alone. But it is a second XML writer plus a `numCache`/workbook
+duplication hazard; **Google Slides flattens `c:chart` to a non-editable object
+anyway**; Keynote's behavior is *unverified*; and grouped shapes are editable in
+every target, including the two that flatten. Because the expansion is
+deterministic, `c:chart` remains available later as a pure exporter optimization,
+gated on a hand-verified "double-click → Edit Data opens" pass.
+
+**The degradation contract — stated before you export, not discovered after:**
+
+| | PowerPoint | Keynote | LibreOffice | Google Slides | PDF | SVG |
+|---|---|---|---|---|---|---|
+| `text` `shape` `connector` `group` | editable | editable | editable | editable | real text | text/paths |
+| `table` → `a:tbl` | editable | editable | editable | editable | real text | text/paths |
+| `chart` + all composites | editable shapes; **composite identity lost** | editable shapes | editable shapes | editable shapes | vector | vector |
+| `equation` v1 | picture | picture | picture | picture | vector | vector |
+| imported panel | picture | picture | picture | picture | embedded | embedded |
+| `alt`, `link` | preserved | preserved | preserved | preserved | tagged | `aria`/`<a>` |
+
+Composite identity is lost at the destination and that is *correct* — the identity
+lives in the `.board.json`, which stays yours. Keynote's handling of grouped
+composites goes on the fidelity matrix as **unverified and hand-checked**.
+
 Exports land in `.chimaera/board/exports/` and are offered as a download ticket.
 `lint --target` runs first and blocks on min-font-size (board text *and* scaled
 panel-internal text), sub-minimum line weight after panel scaling, effective
@@ -762,6 +1096,22 @@ token model, the id-anchored sparse-edit contract, the CLI, and the loop
 ("after editing, `render` and look; before asking, `describe`; to know what the
 human did, `journal --since`"). A versioned spec is fetchable, because models
 confidently emit stale formats otherwise.
+
+The skill opens with the line that makes the whole vocabulary teachable in a
+paragraph, and it is worth quoting verbatim because everything else follows from
+it:
+
+> **Board computes scales, layout, and typography. Board never computes
+> statistics.**
+>
+> There are five object types. Everything else you have heard called an element —
+> chart, table, diagram, bracket, scale bar, legend, colorbar, inset, panel label,
+> callout, equation — is a composite that expands into those five,
+> deterministically, from numbers you already stated.
+>
+> If drawing it would require reading your dataset or fitting a model, it is a
+> panel your script produces and Board imports, with provenance — and that is a
+> first-class answer, not a consolation prize.
 
 **Chat.** `.board.json` joins `viewKindFor` and `INLINE_PREVIEW_KINDS`, so a
 board an agent writes surfaces as an **inline artifact card** — rendered through
@@ -802,6 +1152,18 @@ no CLI round-trip — the empty-state button and the skill both go through it.
   daemon that owns the files; the same binary is already deployed there, so the
   whole loop is remote-transparent with no new transport. Only ticketed rasters
   cross the tunnel.
+- **A stale `frame`.** A `data:` anchor resolves through its panel's `frame`; if
+  the script is re-run with different axis limits, the anchor points at the wrong
+  data coordinate **with no visible symptom**. This is the one place in the design
+  where a wrong answer is invisible, so `frame` carries the asset's content hash:
+  on mismatch, `data:` anchors degrade to their last resolved `rel` and lint
+  raises an error.
+- **`regen` never runs on the render path.** The Regenerate button executes
+  `provenance.regen` **only** on an explicit human click or agent CLI invocation,
+  in a normal PTY session Chimaera already owns — never on open, never during
+  render, never on export, never as a lint side effect. The render path is a pure
+  function of files on disk, always; otherwise C1 is a fiction and a page that
+  executes a command to draw itself is a security and latency non-starter.
 - **Journal loss** — hot and reconstructible; the agent loses recent context,
   nothing durable. Git holds truth.
 - **Two windows on one board** — the same per-object merge as §6.6.
@@ -828,21 +1190,41 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    reads `describe` + `journal --since` and adjusts. Rust unit tests on the
    schema, normalize, and lint (the web UI has no component tests — the isolated
    preview is its net).
+   Also in slice 1, because all three are expensive to retrofit and cheap now:
+   the **anchor union in the schema** (`at` + `rel` resolving), the `alt`/`link`
+   fields carried through, `page.layout` + named slots, `page.caption`, and the
+   `Composite` trait shipped with exactly one implementation (`table`, rendered
+   but not yet exported) so the mechanism cannot be retrofitted badly.
 2. **Slice 2 — the loop's polish.** The remaining daemon routes (`describe`,
-   `export`) + board epoch; live
-   agent-edit animation with attribution and narration; selection-as-deixis and
-   region snapshots into chat; comments and pins; per-object conflict merge;
-   actor-aware undo.
+   `export`) + board epoch; live agent-edit animation with attribution and
+   narration; selection-as-deixis and region snapshots into chat; comments and
+   pins; per-object conflict merge; actor-aware undo — extended to derived
+   children and `object.detached`. `board arrange` verbs; `lint --fix` for the
+   mechanically repairable classes (off-canvas, collision, sub-minimum font).
 3. **Slice 3 — exports.** Pure-Rust PPTX + krilla PDF + SVG (both variants) +
-   JPEG; the python-pptx CI oracle and the cross-app fidelity matrix; target
-   presets; `lint --target` gating.
-4. **Slice 4 — figures.** matplotlib/ggplot import, provenance, stale badges,
-   `theme-export` to `.mplstyle`/ggtheme, `rescheme`; Okabe-Ito/Tol/Viridis
-   themes; journal width presets; poster preset.
-5. **Slice 5 — decks and parity.** Present mode with presenter view; inline
-   board artifacts and snapshot attachments fully wired; cosmic-text-wasm for
-   in-place text editing; `svgBlip` progressive enhancement; `hayro` PDF-panel
-   import behind a feature flag.
+   JPEG; composite expansion → grouped `p:sp`/`p:cxnSp`; **`table` → native
+   `a:tbl`**; `alt` and `link`; notes + `notesMaster`; the **fidelity preflight
+   UI**; `equation` v1 (the picture arm, nearly free once the raster path exists);
+   the python-pptx CI oracle and the cross-app fidelity matrix; target presets;
+   `lint --target` gating.
+4. **Slice 4 — figures, the wedge.** matplotlib/ggplot import, provenance, stale
+   badges, `theme-export` to `.mplstyle`/ggtheme, `rescheme`; Okabe-Ito/Tol/Viridis
+   themes; journal width presets; poster preset. Then the annotation layer —
+   `image.pixelSize`, `panelLabel`, `scalebar`, `inset`, `sigBracket`, `legend`,
+   `colorbar`, `callout`; `anchor.px`; `theme-export` emitting a hashed `frame`
+   which unlocks `anchor.data`; cross-panel consistency lints; align-plot-areas;
+   the CVD/grayscale preflight. **The annotation layer comes before `chart`
+   within this slice** — it is the actual wedge.
+5. **Slice 4b — `chart`.** Eight marks, file-referenced data, digest staleness,
+   tick formatting, bundled colormaps, the mark-count ceiling. Gated on `table`
+   landing, since both take the grouped-shape export path.
+6. **Slice 5 — decks, diagrams, and parity.** Present mode with presenter view;
+   inline board artifacts and snapshot attachments; cosmic-text-wasm for in-place
+   text editing; `diagram` with vendored `dagre-rs` + orthogonal routing;
+   `board import mermaid`; icons and `tint`; caption-integrity lint; `svgBlip`
+   progressive enhancement; `hayro` PDF-panel import behind a feature flag.
+7. **Slice 6 — opportunistic, gated on the fidelity matrix.** Native `c:chart` as
+   an exporter optimization; the OMML arm of `equation`.
 
 Every slice is independently shippable and live-verified per **verify-app**;
 anything touching chat is gated by `just chat-smoke`. A `feat:` carries its
@@ -851,8 +1233,6 @@ and an intent capture.
 
 ## 15. Open questions **[decide]**
 
-- **The name** (§1) — Board, Easel, Plate, or keep "composer" and rename the
-  chat one. Recommendation: Board.
 - **The workspace dotdir** (§4) — `.chimaera/board/` (one namespace, echoes the
   daemon home) vs `.chimaera-board/` (unambiguous, proliferates).
 - **Figures vs decks first.** Slice 1 ships a deck because 16:9 is one fixed
@@ -865,17 +1245,75 @@ and an intent capture.
   it), publish the *format* spec in an outside repo if you want an ecosystem,
   and defer a general UI-plugin system until three things need it. Worth an
   explicit yes/no, since it was your original framing.
-- **`table` objects.** Deferred behind a version bump here. Scientific decks use
-  them constantly and PPTX `a:tbl` is safe everywhere — is that a slice-4 item
-  rather than "later"?
+- **Mermaid, decided but worth your eye.** `board import mermaid` converts once
+  into a `diagram` spec (mermaid text kept in provenance only) rather than storing
+  mermaid or rendering it client-side — a second stored representation is the
+  anti-pattern §3.2 already rejects, and mermaid.js in the browser breaks §7's
+  parity invariant and cannot run from a login node. If you'd rather agents just
+  write mermaid and see it, that's a different product and worth saying now.
 - **User-scope themes** (`~/.chimaera/board/themes/`) so a lab's house style
   follows you across projects on a shared HPC home — powerful, but it weakens
   the "the repo contains everything needed to rebuild the figure" story.
 
 ## Appendix: what we deliberately do NOT build
 
+**The escape hatch, stated once, for everything in this list:** generate it
+upstream, import it as an `image` with provenance, and annotate it with
+composites. That keeps the regenerate path, the anchors, the theme-export loop,
+and the honest "cannot verify this panel" lint. Board never says *you can't* — it
+says *not natively, and here is where it lives instead.*
+
 - **A drawing tool.** No pen, bezier, boolean ops, gradient mesh, blend modes,
-  or animation. The object set is text, shape, image/plot, connector, group.
+  or animation. The object set is text, shape, image, connector, group.
+- **All statistics** — fits, LOESS, KDE where the density isn't supplied,
+  histogram binning, clustering and linkage, survival estimation, dendrogram leaf
+  order, multiple-testing correction. Their *outputs* are native; the computation
+  never is. A wrong mean in a layout tool is invisible in a way a wrong font size
+  is not.
+- **Aggregation and downsampling of any kind.** An aggregation engine is a
+  statistics engine, and an agent will reach for it.
+- **Vega-Lite-style `transform` blocks and faceting.** Small multiples are N
+  charts placed by `arrange`.
+- **SmartArt** — named explicitly, because "why not SmartArt for the workflow
+  diagram" will be asked on every deck. PowerPoint runs its layout program on
+  open, so Board would be guessing at its own export, and placeholder inheritance
+  silently reopens the `normAutofit` hole §3.5 closes. A grouped-shape `diagram`
+  degrades strictly better and stays yours.
+- **`cx:` chartex** (waterfall, treemap, boxWhisker, histogram, sunburst, funnel)
+  — a Microsoft extension outside ECMA-376, an entire second writer, and only
+  recently supported by LibreOffice. Box-and-whisker is exactly where an imported
+  seaborn panel is better anyway. Likewise `c:stockChart` and `c:surfaceChart`,
+  standardized since 2006 and implemented by essentially nobody.
+- **`a:custGeom` projection of imported SVG** — path-count explosion, arc
+  re-derivation, and it defeats the panel lint that reads the SVG rather than the
+  exported geometry.
+- **Force-directed layout** — iterative and seeded, so it fails C1 and fights
+  byte-stable serialization.
+- **Axis breaks, and any redrawing or annotating over an imported panel's axes.**
+  Implying a scale the data does not have is adjacent to falsification. Board may
+  warn when an object overlaps a panel's plot area; it may never draw over it.
+- **Redrawing flow-cytometry gates** — the gate polygon produces the percentages.
+- **Domain renderers** — genome tracks, sequence logos, alignments, structures,
+  phylogenies, pathway and chemical structures. Newick is the most tempting
+  exception and still fails the ruler test: a tree is a chart plus a layout
+  algorithm plus a long tail of support values, branch scaling, circular layouts,
+  and clade collapse.
+- **Networks, Sankey, alluvial, chord, treemap, sunburst, maps and projections,
+  3-D surfaces, polar/radar/ternary** — coordinate systems Board doesn't own.
+- **Client-side mermaid.js rendering** — breaks §7's parity invariant and remote
+  transparency, and its `<foreignObject>` labels don't survive resvg on export.
+- **Storing composite expansions in the file** — the same normalization ambiguity
+  and diff churn that rules out stored markdown.
+- **Spreadsheet cell-range binding and compute-on-open data sources** — a range is
+  not a data contract, and executing a command to render a page is a security and
+  latency non-starter.
+- **Cross-board transclusion.** A panel appearing in both `figures/fig2.board.json`
+  and `talks/lab-meeting.board.json` is the most common real workflow here, and
+  the answer is that both boards reference the same tracked path under `assets/`
+  — so the stale badge fires for both. No cross-board references: they would break
+  the per-file merge model and the "one file is the figure" story.
+- **Media and `p:oleObj`** — no figure use case, and one dropped screen recording
+  blows the ~150 MB daemon budget.
 - **DOM `measureText` as layout truth.** The stage shows the engine's pixels
   (§7); a browser-measured shortcut would permanently split editor and export.
 - **Autofit.** Unrepresentable in the schema by design (§3.5).
