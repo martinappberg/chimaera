@@ -39,6 +39,7 @@ Each area carries its own `AGENTS.md` map (file table + the invariants that bite
 | `crates/chimaera-core` | shared types, version/build-id, shell integration | [map](crates/chimaera-core/AGENTS.md) |
 | `crates/chimaera-pty` | the persistent PTY / terminal engine | [map](crates/chimaera-pty/AGENTS.md) |
 | `crates/chimaera-agent` | the structured-agent engine (drivers, journal) | [map](crates/chimaera-agent/AGENTS.md) · [PROTOCOL](crates/chimaera-agent/PROTOCOL.md) |
+| `crates/chimaera-board` | the board engine: `.board.json` schema, themes, chart, render | [map](crates/chimaera-board/AGENTS.md) · [plan](docs/board-plan.md) |
 | `crates/chimaera-remote` | SSH orchestration for `connect` (thorough in-code docs) | — |
 | `crates/chimaera-server` | the daemon: every route + WS + business logic; embeds `web-ui/dist` | [map](crates/chimaera-server/AGENTS.md) |
 | `crates/chimaera-app` | the Tauri 2 native shell (its own standalone workspace) | [map](crates/chimaera-app/AGENTS.md) |

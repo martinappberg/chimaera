@@ -30,6 +30,13 @@ not on this branch yet. The board skill is the natural first-party pack that
 dogfoods Loadout's install path, and both features share the same posture: files
 are the database, the daemon only scans and serves.
 
+> **Status (2026-07-22): slice 0 + the slice-1 spine are BUILT** — the
+> `chimaera-board` crate, the CLI (`show`/`new`/`render`/`describe`/`lint`),
+> the daemon routes (render-with-ticket / describe / edit), the BoardView pane
+> with drag-to-move, and the board skill; verified live in both directions.
+> What exists today, precisely: [docs/features/board.md](features/board.md).
+> This document remains the design source of truth for everything else.
+
 ## 0. The one-paragraph version
 
 A **board** is an ordinary git-tracked `.board.json` file — a small, strict
@@ -2296,15 +2303,17 @@ Still open:
   answer.
 
 - **Freeze `intent.kind` into `formatVersion` 1, or leave it open for now?** The
-  enum is `cover · section · claim-evidence · comparison · data · quote · summary ·
-  backup`, and it drives layout selection (§9). If it is part of v1, adding a ninth
-  kind later is a migration with code to write and boards in the wild to handle. If
-  it is left open, `normalize()` treats an unknown kind as `data`, lint says
-  *"unknown intent kind 'agenda' — using the default layout"*, and adding one later
-  costs nothing. **Recommendation:** document the eight as closed, but do not freeze
-  them into v1 until one real deck has been built — you only find out you're missing
-  *agenda*, *demo*, or *acknowledgements* by making a talk, and the cost of being
-  wrong is asymmetric (a migration versus a lint line).
+  enum is the fourteen of §3.8, and it drives layout selection (§9). If it is part
+  of v1, adding a fifteenth later is a migration with code to write and boards in
+  the wild to handle. If it is left open, `normalize()` treats an unknown kind as
+  `data`, lint says *"unknown intent kind 'changelog' — using the default layout"*,
+  and adding one later costs nothing. **Recommendation:** document the fourteen as
+  closed, but do not freeze them into v1 until one real deck has been built. The
+  domain-neutral pass is the argument: the enum was eight, and re-aiming the doc —
+  not building anything — found six more. A list that moved that much before the
+  first deck exists will move again after it, and the cost of being wrong is
+  asymmetric (a migration versus a lint line).
+
 ## 16. Intent — why this exists
 
 *The maintainer's own words, 2026-07-22. Never inferred, never regenerated. A

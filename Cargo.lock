@@ -392,6 +392,7 @@ name = "chimaera"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chimaera-board",
  "chimaera-core",
  "chimaera-remote",
  "chimaera-server",
@@ -489,6 +490,7 @@ dependencies = [
  "bytes",
  "calamine",
  "chimaera-agent",
+ "chimaera-board",
  "chimaera-core",
  "chimaera-pty",
  "comrak",
