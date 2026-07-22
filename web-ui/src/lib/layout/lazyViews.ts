@@ -48,6 +48,7 @@ const viewChunkPrefixes: Record<PaneViewKind, string> = {
   git: "GitView-",
   changes: "SessionChangesView-",
   dashboard: "DashboardView-",
+  browser: "BrowserView-",
   settings: "SettingsView-",
 };
 
