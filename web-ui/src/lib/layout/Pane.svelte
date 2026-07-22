@@ -7,7 +7,12 @@
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
-  import { loadPaneView, type PaneViewKind } from "./lazyViews";
+  import { loadPaneView, retryPaneView, type PaneViewKind } from "./lazyViews";
+  import {
+    clearChunkFailure,
+    noteChunkFailure,
+    requestAssetReload,
+  } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -153,20 +158,44 @@
   // this pane's bounded live set keeps home/workspace startup lean; once a
   // view arrives the existing keep-alive model preserves it across tab swaps.
   let views = $state<Partial<Record<PaneViewKind, Component<any>>>>({});
-  let viewErrors = $state<Partial<Record<PaneViewKind, true>>>({});
+  let viewErrors = $state<Partial<Record<PaneViewKind, unknown>>>({});
 
-  function requestView(kind: PaneViewKind) {
-    void loadPaneView(kind).then(
-      (view) => (views = { ...views, [kind]: view }),
-      () => (viewErrors = { ...viewErrors, [kind]: true }),
+  function requestView(kind: PaneViewKind, retryError?: unknown) {
+    const isRetry = retryError !== undefined;
+    const request = retryError === undefined ? loadPaneView(kind) : retryPaneView(kind, retryError);
+    void request.then(
+      (view) => {
+        views = { ...views, [kind]: view };
+        // The browser may re-emit the original preload failure while the
+        // recovery path fresh-loads its asset. Settle the shared notice only
+        // after the affected pane proves it rendered successfully.
+        if (isRetry) clearChunkFailure();
+      },
+      (error: unknown) => {
+        // Lazy chunks are immutable per daemon build. A reconnect/update can
+        // atomically replace that set underneath an already-open window; the
+        // old import URL can never succeed on Retry. Keep the useful detail in
+        // the console. The shared transition notice covers nested chunks too;
+        // this pane still keeps an in-place retry for ordinary network loss.
+        console.error(`could not load ${kind} view`, error);
+        noteChunkFailure();
+        viewErrors = { ...viewErrors, [kind]: error ?? new Error(`could not load ${kind} view`) };
+      },
     );
   }
 
   function retryView(kind: PaneViewKind) {
+    const error = viewErrors[kind];
+    if (error === undefined) return;
     const next = { ...viewErrors };
     delete next[kind];
     viewErrors = next;
-    requestView(kind);
+    clearChunkFailure();
+    requestView(kind, error);
+  }
+
+  function reloadWindow() {
+    requestAssetReload();
   }
 
   function viewKind(tab: Tab): PaneViewKind | null {
@@ -179,7 +208,7 @@
   $effect(() => {
     const needed = new Set(mountedTabs.map(viewKind).filter((kind) => kind !== null));
     for (const kind of needed) {
-      if (views[kind] !== undefined || viewErrors[kind]) continue;
+      if (views[kind] !== undefined || viewErrors[kind] !== undefined) continue;
       requestView(kind);
     }
   });
@@ -202,6 +231,7 @@
   <div class="hint load-failure">
     <span>could not load {label}</span>
     <button type="button" onclick={() => retryView(kind)}>retry</button>
+    <button type="button" onclick={reloadWindow}>reload window</button>
   </div>
 {/snippet}
 

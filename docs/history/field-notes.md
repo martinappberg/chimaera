@@ -133,16 +133,27 @@ three compounding ways. Findings and the invariants they forced:
   connecting before any webview exists; a Duo prompt emitted then reached zero listeners
   and vanished — ssh waited out its 180s timeout with the host stuck "connecting" and
   nothing on screen to answer (the "blue bar, no prompts" bug). Invariant: pending
-  prompts are held in the shell (`list_askpass`) and every window fetches them on mount;
-  the emit is just the fast path. Answering in one window broadcasts `ssh-askpass-done`
-  so the others dismiss.
+  prompts are held in the shell (`list_askpass`) and eligible windows fetch them on mount;
+  the emit is just the fast path. Each prompt now carries the ssh child's host alias, and the
+  shell targets events plus authorizes list/answer commands from its immutable window scope, so
+  remote windows can reach only their own host while home remains the startup/first-connect
+  fallback. Restore registers that home before starting remote ssh when the persisted local set
+  contains only workspaces; otherwise the stricter scope would leave early password/2FA prompts
+  with no eligible window. The shell stamps that fallback at window creation and does not derive it
+  from later SPA workspace reports, so navigating Home into a workspace cannot hide an in-flight
+  prompt. Answering in one matching window targets `ssh-askpass-done` to the same scope.
+  Compute windows carry an explicit login-host askpass scope alongside their distinct per-job
+  tunnel identity; parsing a `host#job…` prefix as authorization would let a colliding ordinary
+  SSH alias observe the host's prompt.
 - **Connects coalesce per alias.** A drop used to fan out: every window's reconnect plus
   the home screen plus startup restore each called `connect_host`, the first won and the
   rest bounced with "a connection attempt is already running" (or worse, queued more 2FA
   prompts). Now one flight owns the ssh per alias and every concurrent caller awaits its
   outcome — one Duo push per host, ever. The fresh-port retry after a reused-port failure
   is gated on a typed `TunnelPhaseError`, because re-running the whole connect on an auth
-  cancel re-prompted 2FA.
+  cancel re-prompted 2FA. Every successful caller also receives a `connected` endpoint event,
+  including live-tunnel reuse and flight joiners; otherwise a window with a stale token could join
+  a tunnel another window had already healed and remain stuck on its old 401.
 - **Remote windows come back with the first successful connect**, not just the next
   launch: reopening persisted windows rides `connect` itself (dedup'd on stable window
   id), so a host that was unreachable at launch restores its windows the moment a

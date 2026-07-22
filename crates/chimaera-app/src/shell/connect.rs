@@ -54,6 +54,32 @@ pub(super) struct HostStatus {
     /// does not mean a reconnect attempt failed; it explains why one began.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
+    /// Source build behind the tunnel. Open windows use a changed build as a
+    /// navigation boundary even when the forward kept its port and token:
+    /// hashed UI chunks never span daemon builds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) build: Option<String>,
+}
+
+fn connected_status(alias: &str, local_port: u16, token: &str, build: Option<&str>) -> HostStatus {
+    HostStatus {
+        alias: alias.to_string(),
+        status: "connected",
+        local_port: Some(local_port),
+        token: Some(token.to_string()),
+        error: None,
+        reason: None,
+        build: build.map(str::to_string),
+    }
+}
+
+/// A loopback origin is reusable only while it still names the same source
+/// build. Replacing the daemon swaps the complete immutable asset set; keeping
+/// the port would leave already-open windows requesting the prior build's
+/// hashed chunks from the new server.
+fn reusable_tunnel_port(port: u16, old_build: Option<&str>, update_daemon: bool) -> Option<u16> {
+    (!update_daemon && chimaera_core::builds_match(chimaera_core::BUILD_ID, old_build))
+        .then_some(port)
 }
 
 pub(super) fn state_for(
@@ -71,6 +97,31 @@ pub(super) fn state_for(
         remote_build: tunnel.and_then(|t| t.remote_build.clone()),
         live_sessions: tunnel.and_then(|t| t.live_sessions),
     }
+}
+
+/// Publish the current endpoint identity alongside a successful connect
+/// reply. Every success path uses this, including healthy-tunnel reuse and
+/// joined flights: a caller may still hold an old daemon token even though
+/// another window already rebuilt the shared tunnel.
+async fn publish_connected_state(app: &AppHandle, state: &Shell, alias: &str) -> Option<HostState> {
+    let entry = host_entry(alias);
+    let (reply, event) = {
+        let tunnels = state.tunnels.lock().await;
+        let tunnel = tunnels.get(alias)?;
+        (
+            state_for(&entry, "connected", Some(tunnel)),
+            connected_status(
+                alias,
+                tunnel.local_port,
+                &tunnel.manifest.token,
+                tunnel.manifest.build.as_deref(),
+            ),
+        )
+    };
+    // Emit after dropping the tunnel lock. Event handlers can immediately
+    // navigate and invoke native commands; none should queue behind delivery.
+    let _ = app.emit("host-status", event);
+    Some(reply)
 }
 
 /// One `chimaera_remote::connect` attempt, wiring each phase to a
@@ -147,10 +198,8 @@ pub(super) async fn do_connect(
                 .map(|t| (t.local_port, t.manifest.token.clone()));
             if let Some((port, token)) = endpoint {
                 if chimaera_remote::http_alive_authed(port, &token).await {
-                    let tunnels = state.tunnels.lock().await;
-                    if let Some(t) = tunnels.get(&alias) {
-                        let entry = host_entry(&alias);
-                        return Ok(state_for(&entry, "connected", Some(t)));
+                    if let Some(reply) = publish_connected_state(app, &state, &alias).await {
+                        return Ok(reply);
                     }
                 }
             }
@@ -174,16 +223,12 @@ pub(super) async fn do_connect(
                 match outcome {
                     Ok(outcome) => match outcome.expect("wait_for guarantees Some") {
                         Ok(()) if !update_daemon => {
-                            let tunnels = state.tunnels.lock().await;
-                            match tunnels.get(&alias) {
-                                Some(t) => {
-                                    let entry = host_entry(&alias);
-                                    return Ok(state_for(&entry, "connected", Some(t)));
-                                }
+                            match publish_connected_state(app, &state, &alias).await {
+                                Some(reply) => return Ok(reply),
                                 // Disconnected between the flight landing and
                                 // us looking — treat like any failed connect.
                                 None => {
-                                    return Err(format!("{alias} disconnected while connecting"))
+                                    return Err(format!("{alias} disconnected while connecting"));
                                 }
                             }
                         }
@@ -229,6 +274,7 @@ pub(super) async fn do_connect(
                     token: None,
                     error: Some(e.clone()),
                     reason: None,
+                    build: None,
                 },
             );
         }
@@ -236,9 +282,9 @@ pub(super) async fn do_connect(
     }
 }
 
-/// One owned connect attempt: tear down the dead tunnel (keeping its
-/// loopback port so open windows heal in place), run the connect, install
-/// the new tunnel, and reopen this host's persisted windows.
+/// One owned connect attempt: tear down the old tunnel, keeping its loopback
+/// port only when it already points at this source build, run the connect,
+/// install the new tunnel, and reopen this host's persisted windows.
 async fn run_flight(
     app: &AppHandle,
     alias: &str,
@@ -252,8 +298,9 @@ async fn run_flight(
     let reuse_port = match old {
         Some(old) => {
             let port = old.local_port;
+            let reuse = reusable_tunnel_port(port, old.manifest.build.as_deref(), update_daemon);
             old.close().await;
-            (!update_daemon).then_some(port)
+            reuse
         }
         None => None,
     };
@@ -282,26 +329,16 @@ async fn run_flight(
     if let Err(e) = HostsStore::load_default().record_connected(alias) {
         tracing::debug!("could not record host {alias}: {e}");
     }
-    let entry = host_entry(alias);
-    let host_state = state_for(&entry, "connected", Some(&tunnel));
     authorize_scope_origin(app, Some(alias), tunnel.local_port)
         .map_err(|e| format!("could not authorize {alias}'s daemon origin: {e}"))?;
-    // Tell open windows on this host to re-home if the port or token moved
-    // (daemon restart / update); a same-port+token reconnect is a no-op for
-    // them — their WebSocket just reconnects.
-    let _ = app.emit(
-        "host-status",
-        HostStatus {
-            alias: alias.to_string(),
-            status: "connected",
-            local_port: Some(tunnel.local_port),
-            token: Some(tunnel.manifest.token.clone()),
-            error: None,
-            reason: None,
-        },
-    );
     let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());
     state.tunnels.lock().await.insert(alias.to_string(), tunnel);
+    // Publish only after installation, through the same path used by reuse
+    // and flight joiners. Build identity is independently load-bearing: a
+    // window from another immutable asset set must reload even on one port.
+    let host_state = publish_connected_state(app, &state, alias)
+        .await
+        .ok_or_else(|| format!("{alias} disconnected while connecting"))?;
     // Any persisted windows for this host that aren't open come back now.
     // The registry keeps records across a failed launch-time restore
     // precisely so the first connect that DOES land — a home-screen click,
@@ -346,4 +383,28 @@ fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
             added_at: 0,
             last_connected_at: None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{connected_status, reusable_tunnel_port};
+
+    #[test]
+    fn tunnel_port_is_reused_only_for_the_same_source_build() {
+        let current = chimaera_core::BUILD_ID;
+        assert_eq!(reusable_tunnel_port(9700, Some(current), false), Some(9700));
+        assert_eq!(reusable_tunnel_port(9700, Some("different.1"), false), None);
+        assert_eq!(reusable_tunnel_port(9700, None, false), None);
+        assert_eq!(reusable_tunnel_port(9700, Some(current), true), None);
+    }
+
+    #[test]
+    fn connected_status_carries_the_authoritative_endpoint() {
+        let status = connected_status("Sherlock", 43123, "fresh-token", Some("build.2"));
+        assert_eq!(status.alias, "Sherlock");
+        assert_eq!(status.status, "connected");
+        assert_eq!(status.local_port, Some(43123));
+        assert_eq!(status.token.as_deref(), Some("fresh-token"));
+        assert_eq!(status.build.as_deref(), Some("build.2"));
+    }
 }
