@@ -145,10 +145,12 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
 - **Hydration + history window.** A fresh attach folds replay into the reducer behind one quiet
   "loading recent conversation" state until the advertised journal `head` arrives; it then mounts
   the newest 64 blocks bottom-anchored in one paint, rather than visibly growing from the oldest
-  message. Explicit earlier/later controls page 64 blocks at a time while preserving the paragraph
-  under the reader; the middle of a long conversation is never skipped just because the bounded page
-  no longer contains the live edge. The DOM window stays capped at 192 blocks and a clear jump returns
-  directly to the live tail. Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
+  message. Approaching the top automatically pages 64 earlier blocks while preserving the paragraph
+  under the reader; a manual earlier control appears only as a compatibility fallback when automatic
+  observation is unavailable. Paging back toward newer history remains explicit, and the middle of a
+  long conversation is never skipped just because the bounded page no longer contains the live edge.
+  The DOM window stays capped at 192 blocks and a clear jump returns directly to the live tail.
+  Historical artifact tickets, table queries, image decodes, and PDF embeds wait until their
   preview approaches the viewport. This is client-side rendering pagination, not lossy history: the
   reducer still holds the capped 2000-block transcript and the daemon journal remains authoritative.
   Replay/live/control frames are reduced through one order-preserving cooperative queue, yielding
