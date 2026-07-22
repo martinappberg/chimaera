@@ -8,8 +8,8 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 ## What lives here (and what does NOT)
 
 - **IS**: argument parsing, the global allocator + tracing init, and per-command
-  orchestration/output. ~350 LoC of straight-line dispatch. Keep it that way — do
-  not grow a command-abstraction layer for six flat subcommands.
+  orchestration/output. Straight-line dispatch. Keep it that way — do not grow a
+  command-abstraction layer for a handful of flat subcommands.
 - **IS NOT**: the daemon. `serve` is a 3-line delegation to
   `chimaera_server::run`. The **daemon lifecycle you're probably looking for**
   (manifest write/remove, SIGINT/SIGTERM, graceful shutdown, restart handoff,
@@ -25,6 +25,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
+| `board.rs` | `board show/new/render/describe/lint`: thin shells over `chimaera-board` crate functions (the daemon routes wrap the same functions, so CLI and pane cannot disagree). Synchronous, filesystem-only — no daemon needed. |
 
 (`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
 

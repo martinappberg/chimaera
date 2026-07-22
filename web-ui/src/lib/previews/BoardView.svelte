@@ -155,6 +155,20 @@
     if (host !== undefined) stageOrigin = [rect.left - host.left, rect.top - host.top];
   }
 
+  // The image's on-screen size also changes when the PANE does (split drag,
+  // window resize) — with no load event fired. Without this, hit-testing and
+  // the selection overlay drift until the next render swaps the image.
+  $effect(() => {
+    const el = stageEl;
+    if (el === null) return;
+    const ro = new ResizeObserver(() => {
+      const img = el.querySelector("img");
+      if (img !== null) syncStageMetrics(img);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
   /** Board-point coordinates of a pointer event on the stage. */
   function toPt(ev: PointerEvent): [number, number] {
     const host = stageEl?.getBoundingClientRect();
@@ -225,24 +239,31 @@
     void commit(d.id, { at });
   }
 
-  async function commit(
+  /** Commits are chained: edit is server-side load→modify→save, so two
+   *  overlapping gestures (a drag racing an inspector field) would lose one. */
+  let commitChain: Promise<void> = Promise.resolve();
+
+  function commit(
     id: string,
     change: { at?: [number, number]; size?: [number, number] },
   ): Promise<void> {
-    saving = true;
-    saveError = null;
-    try {
-      const mtime = await fsBoardEdit(path, id, change);
-      // Adopt our own write so the watcher doesn't treat it as external; the
-      // chunk refetch (via revalidate) brings the parsed geometry along.
-      noteWrite(path, null);
-      void mtime;
-      await entry?.ensureChunk();
-    } catch (err) {
-      saveError = err instanceof Error ? err.message : String(err);
-    } finally {
-      saving = false;
-    }
+    commitChain = commitChain.then(async () => {
+      saving = true;
+      saveError = null;
+      try {
+        const mtime = await fsBoardEdit(path, id, change);
+        // Adopt our own write: publishing the returned token moves
+        // entry.mtime, which both refreshes the parsed geometry in place and
+        // re-keys the stage render effect — the pixels follow the gesture
+        // immediately instead of trailing the 2s disk watcher.
+        noteWrite(path, mtime);
+      } catch (err) {
+        saveError = err instanceof Error ? err.message : String(err);
+      } finally {
+        saving = false;
+      }
+    });
+    return commitChain;
   }
 
   /** Inspector numeric commit: one field of at/size. */

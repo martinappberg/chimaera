@@ -87,7 +87,6 @@ pub(crate) async fn render(
             .or_else(|| board.theme.clone())
             .unwrap_or_else(|| "talk-dark".to_string());
         let theme = Theme::resolve(&theme_name, Some(&ws))?;
-        let fonts = FontStack::for_workspace(&ws);
         let params = RasterParams {
             scale: req.scale.unwrap_or(2.0).clamp(0.25, 4.0),
         };
@@ -97,17 +96,28 @@ pub(crate) async fn render(
         let dir = chimaera_board::board_dir(&ws).join("renders");
         std::fs::create_dir_all(&dir)?;
         let png_path = dir.join(format!("{key}.png"));
+        // Render diagnostics are part of the same pure function as the pixels,
+        // so they persist beside them — a cache hit that silently dropped the
+        // sub-floor errors would make warnings vanish on every reload.
+        let sidecar = png_path.with_extension("json");
 
-        let (width, height) = if png_path.exists() {
-            // Content-addressed hit: dimensions come cheap from the fixed
-            // IHDR offsets of our own encoder's output.
-            let bytes = std::fs::read(&png_path)?;
-            png_dimensions(&bytes).unwrap_or((0, 0))
-        } else {
-            let out = render_page(&board, req.page, &theme, &fonts, params)?;
-            std::fs::write(&png_path, &out.png)?;
-            diagnostics.extend(out.diagnostics);
-            (out.width, out.height)
+        let (width, height) = match read_sidecar(&sidecar, &png_path) {
+            Some((w, h, cached)) => {
+                diagnostics.extend(cached);
+                (w, h)
+            }
+            None => {
+                // Only a miss pays for the font stack — building one walks
+                // every system font directory, which is not hit-path work on
+                // a shared login node.
+                let fonts = FontStack::for_workspace(&ws);
+                let out = render_page(&board, req.page, &theme, &fonts, params)?;
+                chimaera_board::write_atomic(&png_path, &out.png)?;
+                write_sidecar(&sidecar, out.width, out.height, &out.diagnostics);
+                chimaera_board::prune_renders(&dir, chimaera_board::RENDER_CACHE_CAP);
+                diagnostics.extend(out.diagnostics);
+                (out.width, out.height)
+            }
         };
 
         Ok(json!({
@@ -251,12 +261,80 @@ fn resolve_board_path(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// Width and height from a PNG's IHDR — always at bytes 16..24 of a
-/// well-formed file, which ours are (we wrote them).
-fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+/// The persisted half of a render's output: dimensions plus diagnostics,
+/// written beside the PNG under the same content-addressed key.
+#[derive(serde::Serialize, Deserialize)]
+struct RenderSidecar {
+    width: u32,
+    height: u32,
+    diagnostics: Vec<SidecarDiag>,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct SidecarDiag {
+    severity: String,
+    #[serde(default)]
+    page: Option<String>,
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    field: Option<String>,
+    message: String,
+}
+
+/// A cache hit needs both halves intact; a missing or unreadable sidecar (or
+/// PNG) degrades to a re-render, never to serving broken state.
+fn read_sidecar(
+    sidecar: &std::path::Path,
+    png_path: &std::path::Path,
+) -> Option<(u32, u32, Vec<chimaera_board::Diagnostic>)> {
+    if !png_path.exists() {
         return None;
     }
-    let be = |s: &[u8]| u32::from_be_bytes([s[0], s[1], s[2], s[3]]);
-    Some((be(&bytes[16..20]), be(&bytes[20..24])))
+    let raw = std::fs::read_to_string(sidecar).ok()?;
+    let parsed: RenderSidecar = serde_json::from_str(&raw).ok()?;
+    let diags = parsed
+        .diagnostics
+        .into_iter()
+        .map(|d| {
+            let severity = match d.severity.as_str() {
+                "error" => chimaera_board::Severity::Error,
+                "warning" => chimaera_board::Severity::Warning,
+                _ => chimaera_board::Severity::Info,
+            };
+            let mut diag = chimaera_board::Diagnostic::new(severity, d.message);
+            diag.page = d.page;
+            diag.object = d.object;
+            diag.field = d.field;
+            diag
+        })
+        .collect();
+    Some((parsed.width, parsed.height, diags))
+}
+
+/// Best-effort: a failed sidecar write costs a re-render on the next hit,
+/// nothing more.
+fn write_sidecar(
+    sidecar: &std::path::Path,
+    width: u32,
+    height: u32,
+    diagnostics: &[chimaera_board::Diagnostic],
+) {
+    let payload = RenderSidecar {
+        width,
+        height,
+        diagnostics: diagnostics
+            .iter()
+            .map(|d| SidecarDiag {
+                severity: d.severity.label().to_string(),
+                page: d.page.clone(),
+                object: d.object.clone(),
+                field: d.field.clone(),
+                message: d.message.clone(),
+            })
+            .collect(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        let _ = chimaera_board::write_atomic(sidecar, &bytes);
+    }
 }

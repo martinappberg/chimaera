@@ -73,16 +73,29 @@ async fn board_render_is_content_addressed_across_requests() {
     )
     .await;
     let (_, second) = request(&state, Method::POST, "/api/v1/board/render", Some(body)).await;
-    // Same board, same params → same cached file behind two fresh tickets.
+    // Same board, same params → same cached render behind two fresh tickets,
+    // and the hit reports real dimensions + diagnostics from the sidecar
+    // rather than dropping them.
     assert_eq!(first["width"], second["width"]);
+    assert_eq!(second["width"], 400, "a hit must not report 0×0");
+    assert_eq!(
+        first["diagnostics"], second["diagnostics"],
+        "a hit must serve the same diagnostics the miss computed"
+    );
     let renders = chimaera_board::board_dir(&chimaera_board::workspace_root(std::path::Path::new(
         path.to_str().unwrap(),
     )))
     .join("renders");
-    let count = std::fs::read_dir(renders).unwrap().count();
-    assert_eq!(
-        count, 1,
-        "a re-render of unchanged bytes must hit the cache"
+    let entries: Vec<String> = std::fs::read_dir(renders)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let pngs = entries.iter().filter(|n| n.ends_with(".png")).count();
+    assert_eq!(pngs, 1, "one cached PNG, not a re-render: {entries:?}");
+    assert!(
+        entries.iter().any(|n| n.ends_with(".json")),
+        "the diagnostics sidecar rides beside the PNG: {entries:?}"
     );
 }
 

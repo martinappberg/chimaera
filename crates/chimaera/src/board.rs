@@ -216,8 +216,7 @@ fn show(
         }
     };
     chimaera_board::save(&board_path, &board)?;
-    std::fs::write(&png_path, &rendered.png)
-        .with_context(|| format!("writing {}", png_path.display()))?;
+    chimaera_board::write_atomic(&png_path, &rendered.png)?;
 
     if !quiet {
         let rel = |p: &Path| {
@@ -320,11 +319,14 @@ fn render(
                 dir.join(format!("{key}.png"))
             }
         };
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+        chimaera_board::write_atomic(&dest, &rendered.png)?;
+        // The default destination is the shared content-addressed cache; an
+        // explicit -o is the user's own path and never pruned.
+        if out.is_none() {
+            if let Some(dir) = dest.parent() {
+                chimaera_board::prune_renders(dir, chimaera_board::RENDER_CACHE_CAP);
+            }
         }
-        std::fs::write(&dest, &rendered.png)
-            .with_context(|| format!("writing {}", dest.display()))?;
         println!(
             "page {} ({}) → {} · {}×{}",
             p + 1,

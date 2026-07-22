@@ -90,13 +90,59 @@ pub fn load(path: &Path) -> Result<Board> {
 }
 
 /// Write a board to disk in canonical form, creating parent directories.
+/// Atomic — a board is the user's real, possibly uncommitted work, and a kill
+/// mid-write must never truncate it.
 pub fn save(path: &Path, board: &Board) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(path, to_string(board)?).with_context(|| format!("writing {}", path.display()))
+    write_atomic(path, to_string(board)?.as_bytes())
 }
+
+/// Hidden-temp-sibling + rename. Shared by board saves and render-cache
+/// writes: the render cache is "correct by construction" only if a partial
+/// write can never land at a content-addressed path — a truncated PNG there
+/// would be served as a valid hit forever, because nothing ever invalidates.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("board-write");
+    let tmp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("moving into {}", path.display()))
+}
+
+/// Cap a render-cache directory at `cap` PNGs, evicting oldest-modified
+/// first. Renders are pure and re-creatable, but they land in the *user's
+/// workspace* — often a quota-capped NFS home — at one file per committed
+/// gesture, gitignored and quickopen-hidden, so without a cap they are a
+/// slow invisible leak. Best-effort: an unreadable entry is skipped, never
+/// fatal.
+pub fn prune_renders(dir: &Path, cap: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut pngs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+    if pngs.len() <= cap {
+        return;
+    }
+    pngs.sort_by_key(|(t, _)| *t);
+    for (_, path) in pngs.iter().take(pngs.len() - cap) {
+        let _ = std::fs::remove_file(path);
+        // The diagnostics sidecar rides its PNG's lifetime.
+        let _ = std::fs::remove_file(path.with_extension("json"));
+    }
+}
+
+/// The render-cache ceiling shared by the CLI and the daemon route.
+pub const RENDER_CACHE_CAP: usize = 256;
 
 /// Find the workspace root for `start` by walking up to a `.git` directory,
 /// falling back to `start` itself. Board's managed directories hang off this.

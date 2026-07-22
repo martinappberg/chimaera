@@ -83,15 +83,27 @@ pub fn render_page(
 
     let w = board.canvas.width();
     let h = board.canvas.height();
-    let px_w = (w * params.scale).round() as u64;
-    let px_h = (h * params.scale).round() as u64;
+    // Ceiling arithmetic must not itself be the hazard: a NaN or huge canvas
+    // reaching `as u64` saturates, and an unchecked product could wrap in a
+    // release build — so both axes are bounded first and the product checked.
+    let axis = |v: f64| -> u64 {
+        let px = (v * params.scale).round();
+        if px.is_finite() && px >= 0.0 {
+            px.min(MAX_PIXELS as f64) as u64
+        } else {
+            0
+        }
+    };
+    let px_w = axis(w);
+    let px_h = axis(h);
     if px_w == 0 || px_h == 0 {
         anyhow::bail!("canvas rasterizes to zero pixels");
     }
-    if px_w * px_h > MAX_PIXELS {
+    let total = px_w.saturating_mul(px_h);
+    if total > MAX_PIXELS {
         anyhow::bail!(
             "render would be {px_w}×{px_h} px ({} Mpx), over the {} Mpx ceiling",
-            px_w * px_h / 1_000_000,
+            total / 1_000_000,
             MAX_PIXELS / 1_000_000
         );
     }
