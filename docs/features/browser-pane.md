@@ -108,6 +108,33 @@ plane `ANY /proxy/{id}[/{*path}]`.
   or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
   deliberately unlinkified — the standing terminals decision.
 
+## Links everywhere else (and the real browser)
+
+- **What & when.** One policy for every link chimaera renders — terminal output, chat
+  prose, markdown previews (both the authoritative render and the live split), the
+  launcher's docs links, the update toast. A **proxyable** URL opens in a browser pane;
+  anything else opens in the user's **real browser**.
+- **Why it needs a native command.** In the app the window's navigation guard admits
+  only the daemon origin, and nothing receives a `target="_blank"` new-window request —
+  so an external link was silently swallowed (found live). Markdown previews were worse:
+  their anchors carried no `target` at all, so a click was a *top-level* navigation that
+  would replace the whole workbench in a browser. `open_external(url)`
+  (`chimaera-app/src/shell/commands.rs`) hands the URL to the platform opener;
+  `window.open` remains the plain-browser fallback.
+- **Only http/https.** Hrefs are agent-authored and therefore untrusted, and the
+  platform opener would act on `file:`, a `.desktop`, or an application scheme — so the
+  scheme is checked client-side (`shared/urlOpen.ts`) *and* re-checked in the shell,
+  where the rule is enforced once for every caller.
+- **Where it lives.** `web-ui/src/lib/shared/urlOpen.ts` (the classifier + policy + the
+  shared right-click menu; App registers the pane opener, the same module-handler
+  pattern the reference/upload inserters use), `net/native.ts` (`openExternal`), and the
+  command + its IPC lockstep in `chimaera-app`.
+- **Key behaviors.** Click follows the default above; **Cmd/Ctrl+click** puts the pane in
+  a fresh split (matching file links); **right-click** any rendered link for *Open in
+  Chimaera* / *Open Beside* / *Open in Browser* / *Copy Link* — "Open in Chimaera"
+  appears only when the URL is actually proxyable, so the menu never offers a pane that
+  would just show "can't reach".
+
 ## Key constraints
 
 - **Same-origin trust is deliberate.** The proxied app runs same-origin with the
