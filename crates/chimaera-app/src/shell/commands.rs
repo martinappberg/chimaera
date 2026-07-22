@@ -875,6 +875,34 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
     app.clipboard().write_text(text).map_err(|e| e.to_string())
 }
 
+/// Hand a web URL to the user's real browser.
+///
+/// The shell's navigation guard admits only the exact daemon origin, and a
+/// `target="_blank"` new-window request has nothing wired to receive it — so
+/// in the app an external link was simply swallowed (found live). Every
+/// rendered link surface (chat prose, markdown previews, the browser pane's
+/// "open externally") routes here instead.
+///
+/// **Only http/https.** The href is attacker-influenced — agents author chat
+/// prose and markdown — and `open::that` hands its argument to the platform
+/// opener, which would happily act on `file:`, a `.desktop`, or an
+/// application scheme. Anything but a well-formed web URL is refused here,
+/// where the rule is enforced once for every caller.
+#[tauri::command]
+pub(super) fn open_external(url: String) -> Result<(), String> {
+    let parsed = tauri::Url::parse(&url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("refusing to open a {} URL", parsed.scheme()));
+    }
+    tracing::info!(
+        host = parsed.host_str().unwrap_or("?"),
+        "ipc: open_external"
+    );
+    // Pass the REPARSED url: normalization strips anything the platform
+    // opener might otherwise interpret (stray whitespace, control bytes).
+    open::that_detached(parsed.as_str()).map_err(|e| e.to_string())
+}
+
 /// The one-click update chain, step one: record the user's consent (the
 /// intent file), then download, verify, and install the app bundle and
 /// relaunch into it. Step two — replacing the local daemon — happens in the

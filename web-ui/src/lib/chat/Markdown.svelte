@@ -24,6 +24,8 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
   import { pathCandidate, trimPathWord, type PathHit, type ResolvePaths } from "./paths";
+  import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { contextMenu } from "../shared/contextMenu.svelte";
 
   interface Props {
     text: string;
@@ -256,7 +258,30 @@
     // A local-path anchor that never validated: still swallow the click so a
     // stale relative href can't replace the whole workbench with a 404.
     const local = target?.closest?.("a.md-local");
-    if (local !== null && local !== undefined) e.preventDefault();
+    if (local !== null && local !== undefined) {
+      e.preventDefault();
+      return;
+    }
+    // A web link. The anchor carries target=_blank as a fallback, but in the
+    // native app nothing receives a new-window request (the shell's navigation
+    // guard admits only the daemon origin), so an untouched click went
+    // nowhere. Route it: a live local app opens in a browser pane, anything
+    // else in the user's real browser via the shell.
+    const web = target?.closest?.("a[href]");
+    const href = web?.getAttribute("href") ?? "";
+    if (web !== null && web !== undefined && isWebUrl(href)) {
+      e.preventDefault();
+      activateUrl(href, e.metaKey || e.ctrlKey);
+    }
+  }
+
+  /** Right-click a rendered link: Chimaera / Browser / Copy. */
+  function onContextMenu(e: MouseEvent) {
+    const target = e.target as Element | null;
+    const web = target?.closest?.("a[href]");
+    const href = web?.getAttribute("href") ?? "";
+    if (web === null || web === undefined || !isWebUrl(href)) return;
+    contextMenu.openAt(e, urlMenuEntries(href));
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -434,7 +459,13 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="md" bind:this={el} onclick={onClick} onkeydown={onKeydown}>
+<div
+  class="md"
+  bind:this={el}
+  onclick={onClick}
+  onkeydown={onKeydown}
+  oncontextmenu={onContextMenu}
+>
   <!-- eslint-disable-next-line svelte/no-at-html-tags -- sanitized above -->
   {@html html}
 </div>

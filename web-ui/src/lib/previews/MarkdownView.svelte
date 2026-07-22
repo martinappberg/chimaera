@@ -20,6 +20,8 @@
   import SplitEditPreview from "./SplitEditPreview.svelte";
   import ReferenceChip from "../shared/ReferenceChip.svelte";
   import Spinner from "./Spinner.svelte";
+  import { activateUrl, isWebUrl, urlMenuEntries } from "../shared/urlOpen";
+  import { contextMenu } from "../shared/contextMenu.svelte";
 
   interface Props {
     path: string;
@@ -100,6 +102,33 @@
   // which has real line numbers).
   const selOwner = {};
   let contentEl = $state<HTMLDivElement | null>(null);
+
+  /**
+   * Links in a rendered document. Nothing set a `target` here, so a click was
+   * a TOP-LEVEL navigation: in a browser that replaces the whole workbench,
+   * and in the native app the shell's navigation guard swallows it. Route it
+   * instead — a live local app (loopback / explicit port) opens in a browser
+   * pane, anything else in the user's real browser. Delegated on `.md-content`
+   * so it covers the authoritative render AND the live split preview.
+   */
+  function onLinkClick(e: MouseEvent): void {
+    const anchor = (e.target as Element | null)?.closest?.("a[href]");
+    const href = anchor?.getAttribute("href") ?? "";
+    if (anchor === null || anchor === undefined) return;
+    // Same-document anchors (a heading TOC) keep their native behavior.
+    if (href.startsWith("#")) return;
+    e.preventDefault();
+    if (isWebUrl(href)) activateUrl(href, e.metaKey || e.ctrlKey);
+    // A relative/in-repo href resolves against no meaningful base here, so it
+    // is swallowed rather than allowed to navigate the workbench to a 404.
+  }
+
+  function onLinkContextMenu(e: MouseEvent): void {
+    const anchor = (e.target as Element | null)?.closest?.("a[href]");
+    const href = anchor?.getAttribute("href") ?? "";
+    if (anchor === null || anchor === undefined || !isWebUrl(href)) return;
+    contextMenu.openAt(e, urlMenuEntries(href));
+  }
   let chipPos = $state<{ x: number; y: number } | null>(null);
 
   function syncPreviewSelection(): void {
@@ -202,7 +231,18 @@
     {#if chunkError !== null}<span class="md-bar-err">{chunkError}</span>{/if}
   </div>
 
-  <div class="md-content" bind:this={contentEl}>
+  <!-- Delegated link handling: the interactive targets are the rendered
+       document's own <a> elements, which are already focusable and fire a
+       native click on Enter that bubbles here — so keyboard access needs no
+       separate handler on the container. -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="md-content"
+    bind:this={contentEl}
+    onclick={onLinkClick}
+    oncontextmenu={onLinkContextMenu}
+  >
     {#if mode === "preview" && chipPos !== null}
       <ReferenceChip x={chipPos.x} y={chipPos.y} />
     {/if}

@@ -18,53 +18,19 @@
 
 import type { ILink, ILinkProvider, Terminal } from "@xterm/xterm";
 import { groupText } from "./links";
+import { proxyableUrl, type UrlTarget } from "../shared/urlOpen";
 
-/** A detected proxy target: what the browser pane needs to open it. */
-export interface UrlTarget {
-  host: string;
-  port: number;
-  /** path + query, "/" at minimum. */
-  path: string;
-}
+export type { UrlTarget };
 
 export interface UrlLinkHost {
   open(sessionId: string, target: UrlTarget, newSplit: boolean): void;
+  /** Right-click on a detected URL: the shared Chimaera/Browser/Copy menu. */
+  menu(event: MouseEvent, url: string): void;
 }
 
 const URL_RE = /https?:\/\/[^\s"'`<>\\^]+/g;
 /** Trailing sentence punctuation never belongs to a printed URL. */
 const TRAIL_RE = /[),.;:!?'"\]]+$/;
-
-function isLoopbackName(host: string): boolean {
-  const h = host.toLowerCase();
-  return h === "localhost" || h === "::1" || h === "[::1]" || /^127(\.\d{1,3}){3}$/.test(h);
-}
-
-/**
- * The proxy target a raw URL names, when it is one the daemon can serve.
- * Non-loopback hosts qualify only with an explicit port — that is what keeps
- * ordinary web links (no port) unlinkified.
- */
-export function proxyableUrl(raw: string): UrlTarget | null {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-  if (url.username !== "" || url.password !== "") return null;
-  const loopback = isLoopbackName(url.hostname);
-  if (!loopback && url.port === "") return null;
-  const port =
-    url.port !== "" ? Number.parseInt(url.port, 10) : url.protocol === "https:" ? 443 : 80;
-  if (!(port > 0 && port <= 65535)) return null;
-  return {
-    host: url.hostname.replace(/^\[|\]$/g, ""),
-    port,
-    path: `${url.pathname}${url.search}` || "/",
-  };
-}
 
 /** One URL candidate in a scanned line. */
 export interface UrlCandidate {
@@ -114,16 +80,37 @@ class UrlLinkProvider implements ILinkProvider {
         activate: (event: MouseEvent) => {
           this.host.open(this.sessionId, c.target, event.metaKey || event.ctrlKey);
         },
+        // xterm exposes no contextmenu hook on a link, but right-clicking one
+        // means the pointer is already over it — so remember what's hovered
+        // and let the element-level listener below use it.
+        hover: () => {
+          hovered = c.raw;
+        },
+        leave: () => {
+          if (hovered === c.raw) hovered = null;
+        },
       });
     }
     callback(links.length > 0 ? links : undefined);
   }
 }
 
+/** The URL under the pointer, tracked via the provider's hover/leave. */
+let hovered: string | null = null;
+
 /** Wire proxyable-URL links into a pooled terminal. Returns dispose. */
 export function registerUrlLinks(term: Terminal, sessionId: string, host: UrlLinkHost): () => void {
   const provider = term.registerLinkProvider(new UrlLinkProvider(term, sessionId, host));
-  return () => provider.dispose();
+  const onContextMenu = (e: MouseEvent) => {
+    const url = hovered;
+    if (url === null) return; // not on a link: leave the terminal's own menu
+    host.menu(e, url);
+  };
+  term.element?.addEventListener("contextmenu", onContextMenu);
+  return () => {
+    term.element?.removeEventListener("contextmenu", onContextMenu);
+    provider.dispose();
+  };
 }
 
 // --- dev-only self-checks -------------------------------------------------------

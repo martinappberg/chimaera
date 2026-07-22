@@ -14,6 +14,7 @@
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
   import { computeStatus } from "../workspace/compute";
+  import { openInSystemBrowser } from "../shared/urlOpen";
   import {
     ConfirmRequired,
     isLoopbackHost,
@@ -313,7 +314,9 @@
    *  so it works for remote localhost too). */
   function openExternal(): void {
     if (base === null) return;
-    window.open(`${location.origin}${base}${livePath ?? path}`, "_blank", "noopener");
+    // Through the shell in the native app — a bare window.open goes nowhere
+    // there (the navigation guard admits only the daemon origin).
+    openInSystemBrowser(`${location.origin}${base}${livePath ?? path}`);
   }
 
   function commitAddress(): void {

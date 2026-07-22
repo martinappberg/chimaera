@@ -30,6 +30,7 @@
   import { onMount } from "svelte";
   import { getAgentDefault, listAgents, type AgentInfo, type LaunchPick } from "./launcher";
   import { isMac } from "../shared/keys";
+  import { openInSystemBrowser } from "../shared/urlOpen";
   import SessionGlyph from "../shared/SessionGlyph.svelte";
 
   interface Props {
@@ -297,7 +298,13 @@
                   rel="noreferrer"
                   title="open the official docs"
                   tabindex="-1"
-                  onclick={(e) => e.stopPropagation()}>docs&thinsp;↗</a
+                  onclick={(e) => {
+                    // Through the shell: in the app a _blank navigation is
+                    // swallowed by the window's origin guard.
+                    e.stopPropagation();
+                    e.preventDefault();
+                    openInSystemBrowser(a.installUrl ?? "");
+                  }}>docs&thinsp;↗</a
                 >
               {/if}
             </span>

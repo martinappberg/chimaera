@@ -21,6 +21,8 @@ export interface PoolHandlers {
   onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void;
   /** A proxyable URL link was activated: open it in a browser pane. */
   onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void;
+  /** Right-click on a URL link: the shared Chimaera/Browser/Copy menu. */
+  onUrlMenu(event: MouseEvent, url: string): void;
 }
 
 type Runtime = typeof import("./termPoolRuntime");

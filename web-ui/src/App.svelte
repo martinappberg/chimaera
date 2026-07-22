@@ -149,6 +149,7 @@
   import type { PathKind } from "./lib/terminal/links";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
   import { sweepProxies } from "./lib/browser/proxy";
+  import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
   import { dirtyFiles } from "./lib/shared/editing";
   import {
@@ -885,6 +886,19 @@
       linkContext,
       onOpenPath,
       onOpenUrl,
+      onUrlMenu: (event, url) => contextMenu.openAt(event, urlMenuEntries(url)),
+    });
+    // Every rendered link surface (chat prose, markdown previews, terminal
+    // output) resolves a proxyable URL to a browser pane through here; App is
+    // the only owner of the layout.
+    setUrlPaneOpener((target, newSplit) => {
+      const fromPane = layout.focusedPaneId;
+      if (newSplit) {
+        layout = splitPane(layout, fromPane, "row");
+        layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
+      } else {
+        layout = openBrowser(layout, target.host, target.port, target.path);
+      }
     });
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);

@@ -23,6 +23,7 @@ pub const DAEMON_UI_COMMANDS: &[&str] = &[
     "begin_update",
     "shell_build",
     "write_clipboard",
+    "open_external",
     "set_caffeinate",
     "caffeinate_state",
     "answer_askpass",

@@ -270,6 +270,7 @@ function createEntry(id: string, parent: HTMLElement, fontOverride: number | und
       }),
       registerUrlLinks(term, id, {
         open: (sid, target, newSplit) => handlers?.onOpenUrl(sid, target, newSplit),
+        menu: (event, url) => handlers?.onUrlMenu(event, url),
       }),
     ),
   };
