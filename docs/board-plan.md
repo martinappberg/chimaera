@@ -2193,6 +2193,30 @@ Still open:
   anti-pattern §3.2 already rejects, and mermaid.js in the browser breaks §7's
   parity invariant and cannot run from a login node. If you'd rather agents just
   write mermaid and see it, that's a different product and worth saying now.
+
+- **Does the sentence-headline rule earn a lint check, or stay prose only?** §12's
+  skill says a content page's title should be an assertion ("IC50 drops tenfold in
+  the resistant line"), not a topic phrase ("Dose–response"). That is settled as
+  *advice*. The open question is whether `lint --style` should also flag it
+  mechanically. The catch: detecting "is this a claim" means detecting a verb, and
+  verb detection without a parser is heuristics — which is exactly the false-positive
+  cost §3.5 refuses five other checks over. **Recommendation:** keep it a skill law
+  always, and add a lint warning only at a deliberately conservative threshold —
+  content page, title ≤3 words, no verb-like token. "Dose–response" trips it;
+  "Screen results across three cell lines" does not, and that miss is the right
+  trade. If you'd rather the lint set stay narrow, prose alone is a defensible
+  answer.
+
+- **Freeze `intent.kind` into `formatVersion` 1, or leave it open for now?** The
+  enum is `cover · section · claim-evidence · comparison · data · quote · summary ·
+  backup`, and it drives layout selection (§9). If it is part of v1, adding a ninth
+  kind later is a migration with code to write and boards in the wild to handle. If
+  it is left open, `normalize()` treats an unknown kind as `data`, lint says
+  *"unknown intent kind 'agenda' — using the default layout"*, and adding one later
+  costs nothing. **Recommendation:** document the eight as closed, but do not freeze
+  them into v1 until one real deck has been built — you only find out you're missing
+  *agenda*, *demo*, or *acknowledgements* by making a talk, and the cost of being
+  wrong is asymmetric (a migration versus a lint line).
 ## 16. Intent — why this exists
 
 *The maintainer's own words, 2026-07-22. Never inferred, never regenerated. A
