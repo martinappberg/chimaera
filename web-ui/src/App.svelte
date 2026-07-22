@@ -148,7 +148,6 @@
   } from "./lib/layout/layout";
   import type { PathKind } from "./lib/terminal/links";
   import type { UrlTarget } from "./lib/terminal/urlLinks";
-  import { sweepProxies } from "./lib/browser/proxy";
   import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
   import { dirtyFiles } from "./lib/shared/editing";
@@ -863,19 +862,12 @@
     chatPool.syncChatSessions(new Set(ids));
   });
 
-  // Revoke proxy sessions whose last browser tab closed (hygiene — the
-  // daemon's idle TTL is the backstop, and other windows self-heal by
-  // re-minting).
-  $effect(() => {
-    const active = new Set<string>();
-    for (const p of panesOf(layout.root)) {
-      for (const t of p.tabs) {
-        if (t.surface === "browser" && t.host !== "") active.add(`${t.host}:${t.port}`);
-      }
-    }
-    sweepProxies(active);
-  });
-
+  // Proxy sessions are NOT revoked on tab close: mint is idempotent per
+  // host:port, so a second window onto the same app shares the id, and a
+  // client-side sweep would DELETE it out from under that window (its iframe
+  // then gets expired responses until it re-mints). The daemon's idle TTL is
+  // the reaper — a mounted pane's health ping keeps its own session alive; a
+  // closed one just stops refreshing. See browser/proxy.ts::revokeProxy.
   onMount(() => {
     pool.initPool({
       onTitle,

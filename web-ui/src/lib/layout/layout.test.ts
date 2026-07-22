@@ -205,10 +205,18 @@ describe("serialize / deserialize round-trip", () => {
 });
 
 describe("browser tabs (the reverse-proxied web-app pane)", () => {
-  it("openBrowser dedupes on host:port, not on path", () => {
+  it("openBrowser dedupes on host:port and re-navigates the existing pane to the new path", () => {
     let l = openBrowser(defaultLayout(), "localhost", 8888, "/lab?token=a");
+    // Re-opening the same host:port focuses the ONE pane…
     l = openBrowser(l, "localhost", 8888, "/tree?token=b");
     expect(tabCount(l)).toBe(1);
+    // …AND updates its path, so a freshly clicked URL (new token / route)
+    // navigates the pane you already have instead of leaving it stale.
+    const loc = panes(l.root)
+      .flatMap((p) => p.tabs)
+      .find((t) => t.surface === "browser");
+    expect(loc?.surface === "browser" && loc.path).toBe("/tree?token=b");
+    // A different port is still a distinct pane.
     l = openBrowser(l, "localhost", 8501, "/");
     expect(tabCount(l)).toBe(2);
   });

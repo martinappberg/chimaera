@@ -109,9 +109,13 @@
     if (phase.kind !== "unreachable" || !visible) return;
     const key = `${host}:${port}`;
     if (!isLoopbackHost(host) || probedFor === key) return;
-    probedFor = key;
     const candidates = nodeCandidates();
+    // Mark probed ONLY once there are candidates: if the compute snapshot
+    // hasn't populated yet (the common click-a-Jupyter-URL-at-startup race),
+    // leave the one-shot armed so the next 5s reconnect re-probes once the
+    // snapshot arrives — otherwise the pane would stay stuck on localhost.
     if (candidates.length === 0) return;
+    probedFor = key;
     probing = true;
     void probeNodes(candidates, port).then((hits) => {
       if (probedFor !== key) return;
@@ -189,6 +193,22 @@
     });
   });
 
+  // An EXTERNAL navigation of the SAME target: openBrowser re-pointed this
+  // pane's `path` at a freshly clicked URL (a new Jupyter `?token=`, a
+  // different notebook route on the same host:port). Navigate the live iframe
+  // there. Only `path` is tracked: reading livePath/phase/base untracked is
+  // what breaks the feedback loop — the iframe reporting its OWN location sets
+  // livePath and then converges `path` to it via onNavigate, and re-firing on
+  // that would re-load the pre-redirect URL forever.
+  $effect(() => {
+    const p = path;
+    untrack(() => {
+      if (phase.kind !== "ready" || base === null || livePath === null) return;
+      if (p === livePath) return;
+      iframeSrc = `${base}${p.startsWith("/") ? p : `/${p}`}`;
+    });
+  });
+
   function confirmTarget(): void {
     confirmed = true;
     void connect();
@@ -238,7 +258,10 @@
       const win = el.contentWindow;
       const doc = el.contentDocument;
       if (win === null || doc === null) return; // cross-origin: leave as-is
-      const raw = `${win.location.pathname}${win.location.search}`;
+      // Include the hash so livePath matches a target path that carried one
+      // (a hash-router route) — otherwise the external-navigation effect below
+      // would see a spurious mismatch and re-load on every settle.
+      const raw = `${win.location.pathname}${win.location.search}${win.location.hash}`;
       // Prefixed navigations carry /proxy/{id}; rescued (absolute-path) ones
       // land on root-form paths. Both name the same app location. A /proxy/
       // path under a DIFFERENT id is the previous target's iframe still on

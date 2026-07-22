@@ -566,15 +566,21 @@ export function findFinder(
 
 /**
  * Open a browser pane. An existing tab for the same host:port target is
- * focused instead of duplicated (clicking Jupyter's printed URL twice should
- * land on the pane you already have); a fresh target mints a new instance.
+ * focused (not duplicated) AND re-pointed at `path` — clicking a freshly
+ * printed URL (a new Jupyter `?token=`, a different notebook route) navigates
+ * the pane you already have instead of leaving it on the stale route. A fresh
+ * target mints a new instance.
  */
 export function openBrowser(l: Layout, host: string, port: number, path: string): Layout {
   for (const p of panes(l.root)) {
     const index = p.tabs.findIndex(
       (t) => t.surface === "browser" && t.host === host && t.port === port,
     );
-    if (index >= 0) return activateTab(l, p.id, index);
+    if (index >= 0) {
+      const tab = p.tabs[index] as BrowserTab;
+      const focused = activateTab(l, p.id, index);
+      return tab.path === path ? focused : setBrowserPath(focused, tab.id, path);
+    }
   }
   return openTab(l, freshBrowserTab(host, port, path));
 }

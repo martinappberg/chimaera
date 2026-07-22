@@ -29,9 +29,6 @@ export class ConfirmRequired extends Error {
  * Mint (or refresh — the daemon is idempotent per target) a proxy session.
  * `confirm` asserts the user approved a non-allowlisted target.
  */
-/** Sessions this window minted, by "host:port" — the sweep's bookkeeping. */
-const minted = new Map<string, string>();
-
 export async function mintProxy(
   host: string,
   port: number,
@@ -55,23 +52,7 @@ export async function mintProxy(
       typeof record.error === "string" ? record.error : `proxy mint failed (${res.status})`,
     );
   }
-  minted.set(`${host}:${port}`, record.id);
   return { id: record.id, base: `/proxy/${record.id}` };
-}
-
-/**
- * Revoke sessions this window minted whose target no longer appears in any
- * browser tab (`active` holds "host:port" keys). Hygiene, not correctness —
- * the daemon's idle TTL is the backstop, and a session another window still
- * uses transparently re-mints there.
- */
-export function sweepProxies(active: ReadonlySet<string>): void {
-  for (const [target, id] of minted) {
-    if (!active.has(target)) {
-      minted.delete(target);
-      revokeProxy(id);
-    }
-  }
 }
 
 export interface ProxyHealth {
@@ -95,8 +76,14 @@ export async function proxyHealth(id: string): Promise<ProxyHealth> {
   return { ok: false, error: "unreachable", detail: `health check failed (${res.status})` };
 }
 
-/** Revoke a proxy session (last pane onto the target closed). Best-effort —
- *  idle expiry is the backstop. */
+/**
+ * Revoke a proxy session. Best-effort, and used ONLY for a session this call
+ * just proved unusable (a probe miss) — NEVER for cleanup on tab close: mint
+ * is idempotent per host:port, so two windows onto the same app share one id,
+ * and revoking on close would pull it out from under the other window. The
+ * daemon's idle TTL is the sole reaper of live sessions (a mounted pane's
+ * 60s health ping keeps its own alive; a closed pane simply stops refreshing).
+ */
 export function revokeProxy(id: string): void {
   void api(`/proxy/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {
     // unreachable daemon: the session dies with it anyway
@@ -145,7 +132,8 @@ export async function probeNodes(hosts: string[], port: number): Promise<string[
         const session = await mintProxy(host, port);
         const health = await proxyHealth(session.id);
         if (health.ok) return host;
-        minted.delete(`${host}:${port}`);
+        // A miss: this node didn't answer, no pane will use it, and we just
+        // created it — safe to revoke now rather than wait out the TTL.
         revokeProxy(session.id);
         return null;
       } catch {
@@ -189,6 +177,7 @@ export function parseAddress(
   return {
     host: url.hostname,
     port,
-    path: `${url.pathname}${url.search}` || "/",
+    // Keep the fragment — a hash-router SPA's route lives there (see urlOpen).
+    path: `${url.pathname}${url.search}${url.hash}` || "/",
   };
 }

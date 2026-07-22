@@ -64,7 +64,9 @@ export function proxyableUrl(raw: string): UrlTarget | null {
   return {
     host: url.hostname.replace(/^\[|\]$/g, ""),
     port,
-    path: `${url.pathname}${url.search}` || "/",
+    // Keep the fragment: hash-router SPAs (`/#/runs/42`) carry their route
+    // there, and it never reaches the daemon — the iframe applies it.
+    path: `${url.pathname}${url.search}${url.hash}` || "/",
   };
 }
 
@@ -158,6 +160,7 @@ if (import.meta.env.DEV) {
   ok(t("http://localhost:8888/lab?token=a") === "localhost:8888/lab?token=a", "loopback + token");
   ok(t("http://127.0.0.1:8501") === "127.0.0.1:8501/", "bare loopback origin");
   ok(t("http://sh03-09n14:8888/tree") === "sh03-09n14:8888/tree", "host with explicit port");
+  ok(t("http://localhost:3000/#/runs/42") === "localhost:3000/#/runs/42", "hash-router route kept");
   ok(t("https://github.com/foo/bar") === "", "ordinary web URLs are not proxyable");
   // The upstream hop is clear-text HTTP/1.1: a TLS app must reach the real
   // browser, not fail inside the pane.
