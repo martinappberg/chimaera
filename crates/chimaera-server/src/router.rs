@@ -152,7 +152,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
         .route("/download/{ticket}", get(download::download))
+        // Three spellings because `{*path}` refuses an EMPTY tail: the bare
+        // form redirects to the slashed form, the slashed form IS the app's
+        // root document, and the wildcard carries everything deeper.
         .route("/proxy/{id}", axum::routing::any(proxy::data_plane))
+        .route("/proxy/{id}/", axum::routing::any(proxy::data_plane))
         .route("/proxy/{id}/{*path}", axum::routing::any(proxy::data_plane))
         .with_state(state.clone());
 

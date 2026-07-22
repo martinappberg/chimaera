@@ -285,6 +285,16 @@ async fn bare_proxy_id_redirects_to_slash_form() {
         format!("/proxy/{id}/?token=abc"),
         "query (Jupyter's ?token=) survives the slash redirect"
     );
+
+    // The slashed form IS the app's root document — it must reach the target,
+    // never fall through to the SPA shell (axum's {*path} refuses an empty
+    // tail, so this needs its own route; found live as a workbench-in-a-pane
+    // recursion).
+    let (status, _, bytes) = get_with_headers(&state, &format!("/proxy/{id}/"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let echo = body_json(&bytes);
+    assert_eq!(echo["marker"], "echo-target");
+    assert_eq!(echo["path"], "/");
 }
 
 #[tokio::test]
