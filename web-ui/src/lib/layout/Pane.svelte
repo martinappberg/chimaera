@@ -7,7 +7,12 @@
   import { agentHue, type LinkCtrl } from "../workspace/agentLinks";
   import { activeModLabel, keyHint } from "../shared/keybindings";
   import PaneTabs from "./PaneTabs.svelte";
-  import { loadPaneView, type PaneViewKind } from "./lazyViews";
+  import { loadPaneView, retryPaneView, type PaneViewKind } from "./lazyViews";
+  import {
+    clearChunkFailure,
+    noteChunkFailure,
+    requestAssetReload,
+  } from "./assetTransition";
   import Spinner from "../previews/Spinner.svelte";
   import type { DashCtx } from "../dashboard/dash";
 
@@ -153,24 +158,44 @@
   // this pane's bounded live set keeps home/workspace startup lean; once a
   // view arrives the existing keep-alive model preserves it across tab swaps.
   let views = $state<Partial<Record<PaneViewKind, Component<any>>>>({});
-  let viewErrors = $state<Partial<Record<PaneViewKind, true>>>({});
+  let viewErrors = $state<Partial<Record<PaneViewKind, unknown>>>({});
 
-  function requestView(kind: PaneViewKind) {
-    void loadPaneView(kind).then(
-      (view) => (views = { ...views, [kind]: view }),
+  function requestView(kind: PaneViewKind, retryError?: unknown) {
+    const isRetry = retryError !== undefined;
+    const request = retryError === undefined ? loadPaneView(kind) : retryPaneView(kind, retryError);
+    void request.then(
+      (view) => {
+        views = { ...views, [kind]: view };
+        // The browser may re-emit the original preload failure while the
+        // recovery path fresh-loads its asset. Settle the shared notice only
+        // after the affected pane proves it rendered successfully.
+        if (isRetry) clearChunkFailure();
+      },
       (error: unknown) => {
         // Lazy chunks are immutable per daemon build. A reconnect/update can
         // atomically replace that set underneath an already-open window; the
         // old import URL can never succeed on Retry. Keep the useful detail in
-        // the console, and offer the one recovery that obtains the new entry.
+        // the console. The shared transition notice covers nested chunks too;
+        // this pane still keeps an in-place retry for ordinary network loss.
         console.error(`could not load ${kind} view`, error);
-        viewErrors = { ...viewErrors, [kind]: true };
+        noteChunkFailure();
+        viewErrors = { ...viewErrors, [kind]: error ?? new Error(`could not load ${kind} view`) };
       },
     );
   }
 
+  function retryView(kind: PaneViewKind) {
+    const error = viewErrors[kind];
+    if (error === undefined) return;
+    const next = { ...viewErrors };
+    delete next[kind];
+    viewErrors = next;
+    clearChunkFailure();
+    requestView(kind, error);
+  }
+
   function reloadWindow() {
-    location.reload();
+    requestAssetReload();
   }
 
   function viewKind(tab: Tab): PaneViewKind | null {
@@ -183,7 +208,7 @@
   $effect(() => {
     const needed = new Set(mountedTabs.map(viewKind).filter((kind) => kind !== null));
     for (const kind of needed) {
-      if (views[kind] !== undefined || viewErrors[kind]) continue;
+      if (views[kind] !== undefined || viewErrors[kind] !== undefined) continue;
       requestView(kind);
     }
   });
@@ -202,10 +227,10 @@
   });
 </script>
 
-{#snippet loadFailure(label: string)}
+{#snippet loadFailure(kind: PaneViewKind, label: string)}
   <div class="hint load-failure">
     <span>could not load {label}</span>
-    <span class="load-detail">reload this window to restore the view</span>
+    <button type="button" onclick={() => retryView(kind)}>retry</button>
     <button type="button" onclick={reloadWindow}>reload window</button>
   </div>
 {/snippet}
@@ -237,7 +262,7 @@
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
         />
       {:else if viewErrors.chat}
-        {@render loadFailure("chat view")}
+        {@render loadFailure("chat", "chat view")}
       {:else}
         <Spinner />
       {/if}
@@ -246,7 +271,7 @@
       {#if TerminalView !== undefined}
         <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
       {:else if viewErrors.terminal}
-        {@render loadFailure("terminal view")}
+        {@render loadFailure("terminal", "terminal view")}
       {:else}
         <Spinner />
       {/if}
@@ -256,7 +281,7 @@
     {#if FileView !== undefined}
       <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} />
     {:else if viewErrors.file}
-      {@render loadFailure("file view")}
+      {@render loadFailure("file", "file view")}
     {:else}
       <Spinner />
     {/if}
@@ -270,7 +295,7 @@
         onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
       />
     {:else if viewErrors.finder}
-      {@render loadFailure("Finder")}
+      {@render loadFailure("finder", "Finder")}
     {:else}
       <Spinner />
     {/if}
@@ -279,7 +304,7 @@
     {#if DiffView !== undefined}
       <DiffView path={tab.path} mode={tab.mode} {wsId} />
     {:else if viewErrors.diff}
-      {@render loadFailure("diff view")}
+      {@render loadFailure("diff", "diff view")}
     {:else}
       <Spinner />
     {/if}
@@ -288,7 +313,7 @@
     {#if GitView !== undefined}
       <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
     {:else if viewErrors.git}
-      {@render loadFailure("git view")}
+      {@render loadFailure("git", "git view")}
     {:else}
       <Spinner />
     {/if}
@@ -299,7 +324,7 @@
       {#if SessionChangesView !== undefined}
         <SessionChangesView session={cs} {wsRoot} paneId={node.id} {ctrl} />
       {:else if viewErrors.changes}
-        {@render loadFailure("changes view")}
+        {@render loadFailure("changes", "changes view")}
       {:else}
         <Spinner />
       {/if}
@@ -320,7 +345,7 @@
         visible={active}
       />
     {:else if viewErrors.dashboard}
-      {@render loadFailure("dashboard")}
+      {@render loadFailure("dashboard", "dashboard")}
     {:else}
       <Spinner />
     {/if}
@@ -329,7 +354,7 @@
     {#if SettingsView !== undefined}
       <SettingsView />
     {:else if viewErrors.settings}
-      {@render loadFailure("settings")}
+      {@render loadFailure("settings", "settings")}
     {:else}
       <Spinner />
     {/if}

@@ -48,7 +48,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   command/tunnel/window multiplexes it.
 - **In-app auth.** ssh has no tty under the native shell, so an `SSH_ASKPASS` relay surfaces the raw
   prompt (password, keyboard-interactive Duo passcode) in `AskpassModal.svelte`. Prompts **queue**
-  (ssh asks sequentially) and any window can answer them.
+  (ssh asks sequentially). Every ssh/scp child stamps its host alias into the relay, so a remote
+  window sees auth only for its own host; a local home window remains the fallback for startup
+  restore or a first connection made before any remote window exists.
 - **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
   listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
   HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring
@@ -72,13 +74,17 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   before any process/network wait, so one dead host cannot block health checks or commands for
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is
   non-interactive (`BatchMode`) with a ten-second outer deadline. Native liveness transitions carry
-  a plain-language reason into the reconnect panel, while an actual reconnect failure remains a
-  separate error with Retry.
+  a plain-language reason into a compact, non-blocking reconnect status; only an actual reconnect
+  failure becomes a modal with Retry. A 401 in a native remote window follows that same scoped SSH
+  recovery instead of showing the browser-only "paste a fresh URL" page.
 - **A daemon build change is a navigation boundary.** A reconnect reuses its local forward only
   while the daemon source build still matches the app. Replacing the remote daemon gets a fresh
   loopback port, which makes every already-open window re-home onto the new entry bundle instead of
   asking the new server for hashed JavaScript chunks from the previous release. Connected events
-  also carry the build as a second guard for same-origin transitions.
+  also carry the build as a second guard for same-origin transitions, while the entry document
+  carries its own build stamp so the first asynchronous health poll cannot race the handoff. A
+  window with unsaved edits or memory-only chat input holds the navigation behind one visible
+  notice instead of looping reload prompts or silently discarding local state.
 
 ## Dev builds — the isolated dev daemon on a host
 

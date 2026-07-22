@@ -134,8 +134,9 @@ three compounding ways. Findings and the invariants they forced:
   and vanished — ssh waited out its 180s timeout with the host stuck "connecting" and
   nothing on screen to answer (the "blue bar, no prompts" bug). Invariant: pending
   prompts are held in the shell (`list_askpass`) and every window fetches them on mount;
-  the emit is just the fast path. Answering in one window broadcasts `ssh-askpass-done`
-  so the others dismiss.
+  the emit is just the fast path. Each prompt now carries the ssh child's host alias, so
+  remote windows filter to their own host while the home window remains the startup/first-connect
+  fallback. Answering in one matching window broadcasts `ssh-askpass-done` so the others dismiss.
 - **Connects coalesce per alias.** A drop used to fan out: every window's reconnect plus
   the home screen plus startup restore each called `connect_host`, the first won and the
   rest bounced with "a connection attempt is already running" (or worse, queued more 2FA

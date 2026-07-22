@@ -8,6 +8,8 @@ use serde_json::json;
 #[folder = "../../web-ui/dist"]
 struct Assets;
 
+const BUILD_PLACEHOLDER: &str = "__CHIMAERA_BUILD_ID__";
+
 /// Serve embedded UI files for every non-/api path, with SPA fallback to
 /// index.html for client-side routes — but NOT for missing hashed asset chunks.
 pub(crate) async fn static_handler(uri: Uri) -> Response {
@@ -45,6 +47,17 @@ fn not_found() -> Response {
 fn serve(path: &str) -> Option<Response> {
     let file = Assets::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
+    // The entry document carries the identity of the exact asset graph that
+    // supplied it. A later health response cannot provide this safely: the
+    // daemon may have handed off between the document and that first poll.
+    let body = if path == "index.html" {
+        String::from_utf8(file.data.into_owned())
+            .ok()?
+            .replace(BUILD_PLACEHOLDER, chimaera_core::BUILD_ID)
+            .into_bytes()
+    } else {
+        file.data.into_owned()
+    };
     // A reload after a daemon handoff must obtain the new entry document.
     // Hashed assets are the opposite: their name identifies their bytes and
     // may be cached forever. This pair makes release transitions atomic from
@@ -62,7 +75,7 @@ fn serve(path: &str) -> Option<Response> {
                 (header::CONTENT_TYPE, mime.as_ref()),
                 (header::CACHE_CONTROL, cache),
             ],
-            file.data.into_owned(),
+            body,
         )
             .into_response(),
     )

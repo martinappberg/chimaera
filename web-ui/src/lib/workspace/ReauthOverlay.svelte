@@ -7,6 +7,14 @@
   import { focusOnMount } from "../shared/focusOnMount";
   import { modalFocus } from "../shared/modalFocus";
 
+  interface Props {
+    /** Native remote windows refresh credentials through their scoped SSH
+     *  reconnect instead; browsers/local windows still need this manual path. */
+    enabled?: boolean;
+  }
+
+  let { enabled = true }: Props = $props();
+
   let authRetryMsg = $state<string | null>(null);
   let authRetrying = $state(false);
 
@@ -28,7 +36,7 @@
   }
 </script>
 
-{#if $unauthorized}
+{#if enabled && $unauthorized}
   <!-- Blocking re-auth overlay: the daemon rejected this window's token
        (restart or expiry). Nothing behind it is trustworthy until re-auth. -->
   <div class="auth-overlay">

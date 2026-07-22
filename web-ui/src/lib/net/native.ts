@@ -340,7 +340,7 @@ export interface HostStatusEvent {
 /**
  * Subscribe to tunnel liveness transitions. Broadcast to every window, so a
  * handler filters on its own host alias. A remote window uses `down` to arm
- * its reconnect overlay and `connected` to re-home when the port/token moved;
+ * its reconnect UI and `connected` to re-home when the port/token moved;
  * the home screen uses it to keep host rows live. Returns an unsubscribe.
  */
 export function onHostStatus(
@@ -371,6 +371,9 @@ export async function reportWindowScope(
  */
 export interface AskpassPrompt {
   id: number;
+  /** SSH alias of the child that raised this prompt. Null only for legacy or
+   *  unscoped helpers, which remain available from the home window. */
+  alias?: string | null;
   prompt: string;
 }
 
@@ -406,8 +409,8 @@ export function onAskpassDone(handler: (id: number) => void): Promise<() => void
 
 /**
  * Whether an SSH auth prompt is currently on screen (set by AskpassModal).
- * The reconnect overlay reads it to say "waiting for authentication" instead
- * of showing a competing spinner/error under the prompt.
+ * The reconnect UI hides while its matching auth prompt owns the interaction,
+ * instead of showing a competing status or error beneath the modal.
  */
 export const askpassActive = writable(false);
 

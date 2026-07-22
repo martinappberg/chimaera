@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Replaced by the daemon at serve time. The Vite dev server leaves the
+         sentinel in place, where the UI falls back to its first health read. -->
+    <meta name="chimaera-build" content="__CHIMAERA_BUILD_ID__" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>chimaera</title>
   </head>

@@ -68,9 +68,9 @@ export function getToken(): string | null {
 }
 
 /**
- * True once any REST call or events socket saw a 401/unauthorized; drives
- * the blocking reconnect overlay. Cleared only by a successful re-auth
- * (which reloads the window).
+ * True once any REST call or events socket saw a 401/unauthorized. Browser
+ * windows use the manual re-auth page; native remote windows use their
+ * host-scoped SSH reconnect. Both successful paths reload the window.
  */
 export const unauthorized = writable(false);
 

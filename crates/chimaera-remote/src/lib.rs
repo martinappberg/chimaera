@@ -23,6 +23,12 @@ use anyhow::{bail, Context};
 use chimaera_core::Manifest;
 use tokio::process::{Child, Command};
 
+/// Per-child context inherited by the native app's SSH_ASKPASS helper. This
+/// must be set on every ssh/scp process individually: multiple hosts may
+/// connect concurrently, so a process-global "current host" would race and
+/// show one host's authentication prompt in another host's windows.
+pub const ASKPASS_ALIAS_ENV: &str = "CHIMAERA_ASKPASS_ALIAS";
+
 /// The ssh ControlMaster socket path pattern for chimaera connections. `%C`
 /// is ssh's own hash of (localhost, remotehost, port, user): unique per
 /// destination and short. The parent dir is created on demand (ssh will not
@@ -296,8 +302,9 @@ fn ssh_opts() -> [String; 14] {
 /// An `ssh` command pre-loaded with the shared options, no host yet. For
 /// flag-heavy invocations where the destination must come last
 /// (`-O cancel -L …`, `-N -L …`); otherwise prefer [`ssh_cmd`].
-fn ssh_base() -> Command {
+fn ssh_base(host: &str) -> Command {
     let mut c = transport_command("ssh");
+    c.env(ASKPASS_ALIAS_ENV, host);
     c.args(ssh_opts());
     c
 }
@@ -307,7 +314,7 @@ fn ssh_base() -> Command {
 /// shape (`ssh <opts> host <cmd>`); every plain remote command goes through
 /// here so they all share one authenticated connection.
 fn ssh_cmd(host: &str) -> Command {
-    let mut c = ssh_base();
+    let mut c = ssh_base(host);
     c.arg(host);
     c
 }
@@ -315,8 +322,9 @@ fn ssh_cmd(host: &str) -> Command {
 /// An `scp` command pre-loaded with the shared options, so a binary copy
 /// reuses the connection the probe already authenticated instead of prompting
 /// again.
-fn scp_cmd() -> Command {
+fn scp_cmd(host: &str) -> Command {
     let mut c = transport_command("scp");
+    c.env(ASKPASS_ALIAS_ENV, host);
     c.args(ssh_opts());
     c
 }
@@ -562,6 +570,7 @@ async fn cancel_master_forward(host: &str, spec: &str) {
     // appending an option that looks effective but is silently ignored.
     let mut command = transport_command("ssh");
     command
+        .env(ASKPASS_ALIAS_ENV, host)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
         .args(ssh_opts())
         .args(["-O", "cancel", "-L"])
@@ -1349,7 +1358,7 @@ async fn deploy_binary(
     tracing::info!("installing {} on {host} ({})", path.display(), home.dir());
     ssh_run(host, &format!("mkdir -p {}", home.bin_dir())).await?;
     let output = output_bounded(
-        scp_cmd()
+        scp_cmd(host)
             // Under the WSL transport scp itself runs in the distro, so the
             // "local" side must be spelled as a /mnt path.
             .arg(local_path_for_scp(path))
@@ -1516,7 +1525,7 @@ fn ephemeral_port() -> anyhow::Result<u16> {
 }
 
 fn spawn_tunnel(host: &str, local: u16, remote: u16) -> anyhow::Result<Child> {
-    ssh_base()
+    ssh_base(host)
         // Exit non-zero the instant the local bind fails instead of sitting
         // idle: a reconnect that reuses a not-quite-released port then fails
         // in <1s (caught by wait_for_port's early-exit branch) rather than
@@ -1691,6 +1700,7 @@ fn node_proxy_command(host: &str) -> String {
 /// auth — a cluster that needs it reads as "rung unavailable" for now).
 fn node_ssh_base(host: &str) -> Command {
     let mut c = transport_command("ssh");
+    c.env(ASKPASS_ALIAS_ENV, host);
     c.args([
         "-o",
         "ControlPath=none",
@@ -1716,7 +1726,7 @@ fn node_ssh_base(host: &str) -> Command {
 /// LOCAL username). `ssh -G` resolves config locally — no connection.
 async fn node_target(host: &str, node: &str) -> String {
     let mut cmd = transport_command("ssh");
-    cmd.arg("-G").arg(host);
+    cmd.env(ASKPASS_ALIAS_ENV, host).arg("-G").arg(host);
     let user = match output_bounded(&mut cmd, 15, "ssh -G").await {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -1759,7 +1769,7 @@ fn spawn_chained_node_tunnel(
     relay_port: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base()
+    ssh_base(host)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-L")
         .arg(format!("{local}:127.0.0.1:{relay_port}"))
@@ -1785,7 +1795,7 @@ fn spawn_direct_node_tunnel(
     local: u16,
     remote: u16,
 ) -> anyhow::Result<Child> {
-    ssh_base()
+    ssh_base(host)
         .args(["-o", "ExitOnForwardFailure=yes"])
         .arg("-N")
         .arg("-L")
@@ -2188,6 +2198,25 @@ mod tests {
         assert_eq!(opts[11], "ServerAliveInterval=15");
         assert_eq!(opts[12], "-o");
         assert_eq!(opts[13], "ServerAliveCountMax=3");
+    }
+
+    #[test]
+    fn ssh_and_scp_children_carry_their_askpass_alias() {
+        fn alias(command: &Command) -> Option<String> {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == ASKPASS_ALIAS_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        }
+
+        assert_eq!(alias(&ssh_cmd("Sherlock")), Some("Sherlock".into()));
+        assert_eq!(alias(&scp_cmd("remote-2")), Some("remote-2".into()));
+        assert_eq!(
+            alias(&node_ssh_base("login.example.edu")),
+            Some("login.example.edu".into())
+        );
     }
 
     /// The fresh-port retry in the app keys off this downcast; if the tunnel

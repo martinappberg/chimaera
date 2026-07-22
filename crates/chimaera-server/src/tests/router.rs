@@ -108,7 +108,40 @@ async fn root_serves_html_without_auth() {
         "a daemon handoff must not leave reloads on a cached entry bundle"
     );
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    assert!(!body.is_empty());
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains(&format!(
+        "<meta name=\"chimaera-build\" content=\"{}\"",
+        chimaera_core::BUILD_ID
+    )));
+    assert!(!html.contains("__CHIMAERA_BUILD_ID__"));
+}
+
+#[tokio::test]
+async fn hashed_assets_are_immutable() {
+    let root = app(test_state())
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = root.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    let start = html.find("/assets/").expect("built index has an asset");
+    let end = html[start..]
+        .find('"')
+        .map(|offset| start + offset)
+        .expect("asset URL ends at an attribute quote");
+    let asset = &html[start..end];
+
+    let res = app(test_state())
+        .oneshot(Request::builder().uri(asset).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "missing built asset {asset}");
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
 }
 
 #[tokio::test]
