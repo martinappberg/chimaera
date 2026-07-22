@@ -211,16 +211,17 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
 
 /// Reopen the persisted window set: local-daemon windows immediately;
 /// remote windows as their host tunnels come up (one connect per alias, in
-/// the background — an unreachable host must not hold up launch). Returns
-/// whether any window opens immediately, so startup can fall back to a home
-/// window and never come up invisible.
-pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> bool {
+/// the background — an unreachable host must not hold up launch). A local
+/// home window is registered before those connects start whenever no restored
+/// home can receive their startup askpass prompts.
+pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tauri::Result<()> {
     let records = {
         let shell = handle.state::<Shell>();
         let records = lock(&shell.registry).list();
         records
     };
     let mut opened = false;
+    let mut home_opened = false;
     let mut remote_aliases: Vec<String> = Vec::new();
     for record in &records {
         // A compute window was a view onto a walltime-bounded job tunnel that
@@ -234,7 +235,10 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
         }
         match &record.alias {
             None => match open_ui_window(handle, port, token, record) {
-                Ok(()) => opened = true,
+                Ok(()) => {
+                    opened = true;
+                    home_opened |= record.ws.is_none();
+                }
                 Err(e) => tracing::warn!("could not reopen window {}: {e}", record.id),
             },
             Some(alias) => {
@@ -244,6 +248,16 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
             }
         }
     }
+
+    // Register the safe cross-host askpass surface before spawning any ssh.
+    // A local workspace is already visible, but deliberately cannot observe
+    // another host's prompt; treating it as the startup fallback strands a
+    // password/2FA connect until the 180-second askpass timeout.
+    if needs_startup_home(opened, home_opened, !remote_aliases.is_empty()) {
+        open_ui_window(handle, port, token, &WindowRecord::new(None, None))?;
+        tracing::info!("startup home window open on 127.0.0.1:{port}");
+    }
+
     for alias in remote_aliases {
         let handle = handle.clone();
         tauri::async_runtime::spawn(async move {
@@ -256,5 +270,22 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
             }
         });
     }
-    opened
+    Ok(())
+}
+
+fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool {
+    !opened || (has_remote && !home_opened)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_startup_home;
+
+    #[test]
+    fn startup_home_precedes_remote_auth_when_no_home_was_restored() {
+        assert!(needs_startup_home(false, false, false));
+        assert!(!needs_startup_home(true, false, false));
+        assert!(needs_startup_home(true, false, true));
+        assert!(!needs_startup_home(true, true, true));
+    }
 }

@@ -137,7 +137,10 @@ three compounding ways. Findings and the invariants they forced:
   the emit is just the fast path. Each prompt now carries the ssh child's host alias, and the
   shell targets events plus authorizes list/answer commands from its immutable window scope, so
   remote windows can reach only their own host while home remains the startup/first-connect
-  fallback. Answering in one matching window targets `ssh-askpass-done` to the same scope.
+  fallback. Restore registers that home before starting remote ssh when the persisted local set
+  contains only workspaces; otherwise the stricter scope would leave early password/2FA prompts
+  with no eligible window. Answering in one matching window targets `ssh-askpass-done` to the same
+  scope.
 - **Connects coalesce per alias.** A drop used to fan out: every window's reconnect plus
   the home screen plus startup restore each called `connect_host`, the first won and the
   rest bounced with "a connection attempt is already running" (or worse, queued more 2FA

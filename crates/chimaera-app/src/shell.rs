@@ -434,13 +434,10 @@ pub(crate) fn finish_startup(handle: &tauri::AppHandle, local: LocalDaemon) -> t
     } else {
         *lock(&handle.state::<Shell>().local) = local;
     }
-    // Reopen last session's windows; first launch (or an all-remote set that
-    // is still connecting) gets the home window so the app never comes up
-    // invisible.
-    if !restore::restore_windows(handle, port, &token) {
-        open_ui_window(handle, port, &token, &WindowRecord::new(None, None))?;
-        tracing::info!("home window open on 127.0.0.1:{port}");
-    }
+    // Reopen last session's windows. Restore itself registers a home surface
+    // before launching any remote ssh that may need askpass, and also covers
+    // the empty/failed local restore case so the app never comes up invisible.
+    restore::restore_windows(handle, port, &token)?;
     if fresh {
         restore::spawn_health_monitor(handle.clone());
         crate::update::spawn_update_watch(handle.clone());
