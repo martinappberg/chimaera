@@ -112,14 +112,9 @@ fn open_shell_window(
     if let Some(shell) = app.try_state::<Shell>() {
         lock(&shell.windows).insert(
             label.clone(),
-            WindowScope {
-                alias: scope_alias,
-                ws: record.ws.clone(),
-                stable_id: record.id.clone(),
-                // Named by the SPA once it mounts (report_window_scope); until
-                // then the tray falls back to "Home"/"Loading…" by scope.
-                label: String::new(),
-            },
+            // The constructor also stamps the immutable askpass fallback bit
+            // for a local Home window before navigation can mutate `ws`.
+            WindowScope::new(scope_alias, record.ws.clone(), record.id.clone()),
         );
     }
     if let Err(error) = builder.build() {

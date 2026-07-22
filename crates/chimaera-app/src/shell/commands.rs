@@ -770,7 +770,7 @@ pub(super) async fn answer_askpass(
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
-    match askpass.answer_scoped(id, secret, scope.alias.as_deref(), scope.ws.as_deref()) {
+    match askpass.answer_scoped(id, secret, &scope) {
         crate::askpass::AnswerResult::Answered(alias) => {
             crate::askpass::emit_done(&app, id, alias.as_deref());
             Ok(())
@@ -796,7 +796,7 @@ pub(super) fn list_askpass(
     let scope = state
         .window_scope(webview.label())
         .ok_or_else(|| "this window is not registered".to_string())?;
-    Ok(askpass.pending_scoped(scope.alias.as_deref(), scope.ws.as_deref()))
+    Ok(askpass.pending_scoped(&scope))
 }
 
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
@@ -817,7 +817,9 @@ pub(super) fn report_window_scope(
         .ok_or_else(|| "this window is not registered".to_string())?;
     // The shell fixed the host when it created this window. A daemon-served
     // page may report workspace/label changes, but must never rewrite its
-    // host to gain another remote's native command scope.
+    // host to gain another remote's native command scope. The shell-owned
+    // askpass fallback capability is deliberately not derived from this
+    // mutable workspace report.
     if scope.alias != alias {
         return Err("a window cannot change its registered host".to_string());
     }

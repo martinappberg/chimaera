@@ -54,7 +54,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   that boundary on targeted events, pending-list reads, and answers using the immutable host scope
   it registered when the window opened — a daemon-served page cannot widen it client-side. Startup
   registers a home fallback before launching restored remote connects when only local workspace
-  windows were persisted, so an early password or 2FA prompt always has an eligible surface.
+  windows were persisted, so an early password or 2FA prompt always has an eligible surface. A
+  window created as local Home retains that shell-owned fallback identity if it opens a workspace
+  while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
 - **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
   listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
   HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring

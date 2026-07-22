@@ -107,14 +107,13 @@ impl Askpass {
         &self,
         id: u64,
         secret: Option<String>,
-        window_alias: Option<&str>,
-        window_ws: Option<&str>,
+        window_scope: &crate::shell::WindowScope,
     ) -> AnswerResult {
         let mut pending = lock(&self.pending);
         let Some(prompt) = pending.get(&id) else {
             return AnswerResult::Missing;
         };
-        if !crate::shell::askpass_scope_matches(window_alias, window_ws, prompt.alias.as_deref()) {
+        if !window_scope.allows_askpass(prompt.alias.as_deref()) {
             return AnswerResult::Forbidden;
         }
         let prompt = pending.remove(&id).expect("prompt checked above");
@@ -125,20 +124,10 @@ impl Askpass {
 
     /// Prompts this shell-owned caller scope may observe, oldest first (ssh
     /// asks sequentially, so order is answer order).
-    pub fn pending_scoped(
-        &self,
-        window_alias: Option<&str>,
-        window_ws: Option<&str>,
-    ) -> Vec<PromptEvent> {
+    pub fn pending_scoped(&self, window_scope: &crate::shell::WindowScope) -> Vec<PromptEvent> {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
-            .filter(|(_, prompt)| {
-                crate::shell::askpass_scope_matches(
-                    window_alias,
-                    window_ws,
-                    prompt.alias.as_deref(),
-                )
-            })
+            .filter(|(_, prompt)| window_scope.allows_askpass(prompt.alias.as_deref()))
             .map(|(id, p)| PromptEvent {
                 id: *id,
                 alias: p.alias.clone(),
@@ -606,25 +595,31 @@ mod tests {
         let askpass = Askpass::default();
         let (tx, rx) = oneshot::channel();
         let id = askpass.register(Some("remote-2".into()), "Password:".into(), tx);
+        let remote_1 = crate::shell::WindowScope::new(
+            Some("remote-1".into()),
+            Some("workspace".into()),
+            "remote-1-window".into(),
+        );
 
-        assert!(askpass
-            .pending_scoped(Some("remote-1"), Some("workspace"))
-            .is_empty());
+        assert!(askpass.pending_scoped(&remote_1).is_empty());
         assert_eq!(
-            askpass.answer_scoped(
-                id,
-                Some("wrong-window".into()),
-                Some("remote-1"),
-                Some("workspace")
-            ),
+            askpass.answer_scoped(id, Some("wrong-window".into()), &remote_1),
             AnswerResult::Forbidden
         );
-        assert!(askpass
-            .pending_scoped(None, Some("local-workspace"))
-            .is_empty());
-        assert_eq!(askpass.pending_scoped(None, None).len(), 1);
+        let local_workspace = crate::shell::WindowScope::new(
+            None,
+            Some("local-workspace".into()),
+            "local-window".into(),
+        );
+        assert!(askpass.pending_scoped(&local_workspace).is_empty());
+
+        // Home-granted fallback is shell-owned: later workspace navigation
+        // cannot hide an in-flight startup/first-connect prompt.
+        let mut fallback = crate::shell::WindowScope::new(None, None, "fallback-window".into());
+        fallback.ws = Some("opened-after-connect-started".into());
+        assert_eq!(askpass.pending_scoped(&fallback).len(), 1);
         assert_eq!(
-            askpass.answer_scoped(id, Some("secret".into()), None, None),
+            askpass.answer_scoped(id, Some("secret".into()), &fallback),
             AnswerResult::Answered(Some("remote-2".into()))
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
