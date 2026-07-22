@@ -484,9 +484,11 @@ lint, journal move events, per-object merge (§6.6), per-field undo (§6.7), and
 PPTX writer all keep seeing plain integers and are entirely unchanged. `describe`
 prints both the anchor and the resolved point. A `data` anchor requires the target
 image to carry a **`frame`** (plot-area rect in pixels + axis limits + scale
-type), which native charts have by construction and imported panels earn only via
-the regenerate path — a deliberate incentive toward the lintable option.
-Regenerating an image marks its anchored dependents **needs-review**.
+type), which native charts have by construction and imported panels get from the
+optional sidecar (six numbers any language can write) or from two-point human
+calibration on the image itself — which works on a PNG from 1998. The incentive
+toward the native `chart` carries the weight instead. Regenerating an image marks
+its anchored dependents **needs-review**.
 
 Anchors must land in **slice 1's schema** even if only `at` and `rel` resolve at
 first; retrofitting them re-keys every derived element and every journal event.
@@ -578,6 +580,41 @@ as a schema.** Nineteen transform types is precisely where "we are writing a
 plotting library" begins. Faceting is likewise absent: small multiples are N
 `chart` objects placed by `board arrange --op grid`, which is only possible
 because Board *is* the layout engine.
+
+**Per-mark binding — the one place a global field map is not enough.** Each mark
+may carry its own `fields` override and an optional `from` naming another
+`dataset`, defaulting to the chart's. Without it a `text` mark cannot cover only
+the nine labelled genes of a volcano, or only the end of one series — and since
+`transform` is (rightly) rejected, there is no `filter` to fall back on. This is
+a correctness fix, not an enhancement: **the plan's own headline advice, "direct
+label, no legend", is otherwise unimplementable natively.** Binding is not
+computing — the subset is a table the agent supplied, not a predicate Board
+evaluates.
+
+**Channels declare their type** — `{ "field": "dose_nM", "type": "quantitative" }`,
+one of `quantitative | ordinal | nominal | temporal`. Inference over CSV is where
+an integer-coded category silently lands on a linear axis and a date parses as a
+number: plausible-looking, wrong, and invisible. Four characters per field buys a
+deterministic scale choice, and C1 does not permit the alternative.
+
+Four scale features belong to `chart` from the start rather than later: a
+**temporal scale** with month/quarter/year tick selection (half of all slide
+charts need a date axis, and nice-numbers does not produce one); **ordinal sort
+order** as a declared field (`sort: "-y"` — the most common single request about a
+bar chart, and a transform if it isn't a scale property); **`stack` extended to
+`area`**, since `area` taking explicit `y`/`y2` otherwise forces the agent to
+precompute cumulative sums, which is a transform in disguise; and a `tick` mark, a
+degenerate `rule`, for 1-D strips and rug plots. Deliberately **absent**: a
+secondary y axis (the standard way to imply a correlation that isn't there) and
+`arc`/pie. Both are refusals, and the skill states them as such. **`box` is sugar
+over five marks, not a ninth mark** — a composite expanding to `rect` + `rule`
+from a five-number summary the user supplies; Board still never computes
+quartiles.
+
+**The histogram is refused, loudly, and it will be the most-hit refusal.** It is
+the most common "just look at this real quick" plot and it needs binning; bin
+choice changes the story, so it belongs in reviewable code. The error names the
+three-line fix rather than auto-choosing a width.
 
 **Where the data lives:**
 
@@ -1064,7 +1101,7 @@ chimaera board adopt    <image> [--preset ID]      # promote a throwaway to a bo
 chimaera board rescheme <asset.svg> --theme ID [-o FILE]
 chimaera board fonts    [--board <board>]
 chimaera board validate-theme <theme>
-chimaera board theme-export <theme> [--stdout]     # emits .mplstyle + helper + .R
+chimaera board theme-export <theme> [--mplstyle]   # the theme's numbers as JSON
 ```
 
 Four of those exist because the loop breaks without them, and each closes a gap
@@ -1085,7 +1122,8 @@ worth naming:
 - **`journal --since-last`** keeps a per-actor cursor. The bare `--since SEQ`
   form assumes the agent remembers a sequence number across turns, which a TUI
   agent cannot.
-- **`panel-brief`** is the plotting handshake — §10.
+- **`panel-brief`** answers the only question Board alone can answer — how big is
+  the hole — and **writes nothing** (§10).
 
 Two related schema notes: **`canvas.target` is a field in the board file**
 (defaulted from `canvas.preset`), so `--target` is a retarget override rather than
@@ -1243,10 +1281,29 @@ fonts required, which is the easy and common case.
 
 **Rescheming, two paths, in this order of preference:**
 
-1. **Regenerate on-theme (lossless, preferred) — the brief-then-prove handshake.**
-   This is the *plotting mechanism*, and it deserves stating properly, because
-   Board never computes statistics and therefore the whole quality of "make me a
-   beautiful figure" rides on this seam.
+1. **Regenerate on-theme (lossless, preferred).**
+
+   **Two cases, and Board owns one of them.**
+
+   **Case A — the figure your pipeline already makes.** A Snakemake rule, an R
+   script, a notebook, Prism. Board imports it, lints it, annotates it, and tells
+   you when it is stale. Board does **not** supply the plotting language, a helper
+   library, or a runtime — those are yours and they are already correct. What Board
+   owes you is the theme's numbers and an honest lint, not an API.
+
+   **Case B — the agent needs a plot right now, mid-composition.** The first answer
+   is not Python and not JS: it is the **native `chart` composite** (§3.8). Eight
+   marks over a plot-ready table cover bar, grouped and stacked bar, line,
+   multi-series, step/KM, scatter, volcano, forest, dot, box, heatmap and CI
+   ribbons — re-themeable, diffable, lintable-through, and re-flowing on retarget.
+   Reducing a dataframe to a plot-ready table is exactly what an agent is good at,
+   and for the common small case it needs no runtime at all: twenty-four QC rows go
+   inline as `values`. **Reach for an imported panel when the picture needs a
+   statistic Board refuses to compute** — a fit, a KDE, binning, clustering,
+   survival — not by default. A board full of native charts is the good outcome;
+   every image is a panel Board can only partly verify.
+
+   **When it is an imported panel: one law, one query, one export setting.**
 
    **The law: never write plotting code before asking Board how big the panel is.**
 
@@ -1254,73 +1311,86 @@ fonts required, which is the easy and common case.
    chimaera board panel-brief talks/lab.board.json --slot body-right --json
    ```
    ```json
-   { "sizeMm": [118.0, 74.0], "sizePt": [334.5, 209.8],
-     "target": "talk-16x9", "minPt": 18.0, "minLineWidthPt": 0.75,
-     "mplstyle": ".chimaera/board/themes/talk-dark.mplstyle",
-     "helper":   ".chimaera/board/themes/board_panel.py",
-     "palette":  ["#E69F00", "#56B4E9", "#009E73"] }
+   { "sizeMm": [118.0, 74.0], "sizePt": [334.5, 209.8], "target": "talk-16x9",
+     "minPt": 18.0, "minLineWidthPt": 0.75, "font": "Inter", "basePt": 18,
+     "palette": ["#E69F00", "#56B4E9", "#009E73"], "background": "#141618" }
    ```
 
    `panel-brief` answers the two questions an agent otherwise guesses — how big,
-   and which theme — with answers that are correct by construction because slot
-   geometry comes from `normalize()`. Crucially it **materializes the style file
-   and the helper as a side effect**, which removes the skippable
-   "remember to run `theme-export` first" step. `theme-export --stdout` remains
-   the no-board entry point for a throwaway plot.
+   and which theme — with answers correct by construction, because slot geometry
+   comes from `normalize()`. **It writes nothing.** The brief is data an agent
+   pastes into whatever language it is already writing; a model emitting eight
+   numbers into an rcParams dict does not need a library to do it for it.
+
+   **Board ships no plotting helper, in any language.** A helper would have to
+   track a plotting library's API while versioning with a Rust release — so a
+   one-line fix would need a Chimaera release to land — and it would serve only the
+   one ecosystem it was written for.
 
    ```python
-   # Statistics happen here, in your code, above the plotting. Board never recomputes them.
+   # Statistics happen here, in your code. Board never recomputes them.
    ic50, curve = fit_hill(df)
 
-   from board_panel import panel, finish
-   fig, ax = panel(118, 74)          # mm, straight from panel-brief. Never resize after.
+   fig, ax = plt.subplots(figsize=(118/25.4, 74/25.4), layout="constrained")  # exact, from panel-brief
    ax.semilogx(curve.x, curve.y)
-   ax.set_xlabel("Dose (nM)")        # a unit, always
+   ax.set_xlabel("Dose (nM)")                              # a unit, always
    ax.set_ylabel("Viability (% of vehicle)")
-   ax.set_xticks([0.1, 1, 10, 100])  # ≤5 ticks you chose
    ax.text(curve.x[-1], curve.y[-1], "  KO", va="center")  # direct label, no legend
-   finish(fig, "figures/assets/fig2a.svg")
+   plt.rcParams["svg.fonttype"] = "none"                   # the one export setting that matters
+   fig.savefig("figures/assets/fig2a.svg")
    ```
 
-   **`theme-export` emits three files, not one:** `<theme>.mplstyle`,
-   `board_panel.py`, and `<theme>.R`. The style must carry
-   `figure.constrained_layout.use: True` — without it, "direct-label instead of
-   legend" produces clipped figures and the advice is actively harmful. The helper
-   ships out of `theme-export` rather than out of the skill, so it is versioned
-   with the parser rather than with prose.
+   Three things carry that snippet, and only three. **Exact size, set once and
+   never resized** — and therefore **never `bbox_inches='tight'`**, which crops to
+   the ink box, leaving Board to scale the panel to fill its slot and getting every
+   font inside wrong by an unbounded, data-dependent ratio *with no visible
+   symptom*. **Constrained layout**, without which "direct-label instead of legend"
+   clips. And **`svg.fonttype:'none'`**, which is what makes a panel *verifiable*
+   rather than merely on-palette.
 
-   **`finish()` is the half of the mechanism that was missing.** `panel()` is just
-   style + exact figsize; `finish()` runs seven checks matplotlib does not warn
-   about — canvas overflow (`get_tightbbox` vs `get_size_inches`), per-artist font
-   floor, mathtext detection, hairlines, pairwise text collision, **silent font
-   substitution**, and the rcParam contract (`svg.fonttype == 'none'`,
-   `pdf.fonttype == 42`, `axes.formatter.use_mathtext == False`) — then saves with
-   `metadata={"Date": None}` and writes the sidecar. That metadata argument is not
-   fussiness: `svg.hashsalt` alone does not stop matplotlib embedding `<dc:date>`,
-   so two runs of an identical script otherwise produce different digests,
-   churning the stale badge, invalidating the render cache, and dirtying
-   `git status` on a no-op re-run — a live C1 violation.
+   **Every other check is Board's lint, not the producer's.** Board reads the
+   produced SVG and checks the font floor, hairlines, per-glyph mathtext runs,
+   canvas overflow and text collision — each multiplied by the panel's **placed**
+   scale, a fact only Board has. That last point is decisive: a 7 pt label is legal
+   at 1:1 and illegal at 0.66, so a check run in the producing process is early
+   *and* not authoritative, and Board must re-run it on import regardless. Pushing
+   checks upstream would run them against the pre-placement number, in a runtime
+   that cannot see the board, in one language, and only for panels Board itself
+   authored. Lint-on-import works identically on ggplot, Julia/Makie, Illustrator,
+   and a Prism export with no script at all — and it cannot be skipped by an agent
+   that forgot to call it.
 
-   **Four silent traps, named in the skill because an agent will reach for all
-   four:**
+   The matplotlib footguns live in the skill's `references/plotting.md`, with the
+   one Board cannot catch named first: **`sns.set_theme()` after the board style**
+   resets `font.size` and the background **while leaving `svg.fonttype` intact** —
+   the figure is wrong and still fully lintable. Seaborn first, board style last.
 
-   | Trap | What actually happens | Rule |
-   |---|---|---|
-   | `bbox_inches='tight'` | crops to the *ink* box — measured 2 pt short on both axes of a 252 pt panel, data-dependent and unbounded. Board then scales the panel to fill its slot and every font inside is wrong by that ratio, with no visible symptom | never pass it |
-   | mathtext in labels | one `<tspan>` per glyph, **out of reading order**, sub/superscripts at 0.7× — a 7 pt label containing 4.9 pt glyphs, under Nature's floor | write `IC50`, or Unicode subscripts |
-   | `axes.formatter.use_mathtext: True` | measured: 17 of 19 text elements became per-glyph runs in a *different* family. A cosmetic rcParam that defeats C6 and lint-through-panels | it ships `False`; don't turn it on |
-   | `sns.set_theme()` *after* `plt.style.use()` | resets `font.size` 7 → 12 and the background to grey **while leaving `svg.fonttype` intact** — every Board check passes and the figure is still wrong | seaborn first, board style last |
+   Determinism is Board's problem too: matplotlib embeds `<dc:date>` regardless of
+   `svg.hashsalt`, so **Board's content hash normalizes volatile metadata before
+   hashing.** One line in the digest function, and it fixes determinism for every
+   producer including ones Board has never heard of.
 
-   The last is the worst shape a failure can have: it wrecks beauty and preserves
-   lintability.
+   **Regenerate is "run the command the user recorded."** `provenance.regen` is a
+   string — `snakemake --forcerun figures/fig2a.svg`, `Rscript scripts/fig2.R`.
+   Board runs it, re-hashes, clears the badge. It needs no Board-supplied helper,
+   because the user's own script will never import one — and a regen path that only
+   worked on Board-authored panels would make the user's own figures the tier that
+   doesn't regenerate, inverting "Tier 2 is not a lesser tier". The recorded command
+   may need a conda env, a module load, or a Slurm allocation, so regenerate is
+   **"here is the command I recorded; run it?"** through the same approval path as
+   any shell command, never a silent button. Note also that re-running a ggplot
+   script after a theme switch reproduces the identical off-theme asset: theme-driven
+   regen only closes for scripts written against Board's numbers, which is another
+   reason not to ship those numbers as a runtime.
 
-   **The sidecar is always-on, not gated behind `--emit board-data`** — it carries
-   `sizeMm`, `assetSha256`, `resolvedFont`, `minFontPt`, and a per-axes `frame`
-   (~10 lines, agreeing with `ax.transData` to 0.001 pt). Data anchors (§3.7) are
-   the most differentiated annotation feature in the plan; making a panel "earn"
-   them via a later regenerate delays them for no reason. `--emit board-data` then
-   adds exactly one thing — the tidy CSV plus a `chart` fragment naming the column
-   map — and the skill frames it as a **reward, never a migration**.
+   **An optional sidecar carries the one thing Board cannot recover — the `frame`**
+   (plot-area rect in pixels, axis limits, scale type, plus the asset hash), which
+   unlocks `anchor.data` (§3.7). It is a documented six-number JSON file any
+   language can write, not an artifact of a Board-supplied runtime; where none
+   exists, the human calibrates by clicking two known axis points, which works on a
+   PNG from 1998. `resolvedFont` may ride along; without it, lint warns that a
+   panel's named family is unresolvable here rather than claiming the identity is
+   verified.
 2. **In-place SVG recolor (for what you cannot regenerate).** `board rescheme`
    remaps colors **by element id/group and role — never a global hex
    find-replace**, because the same hex means a data series in one place and a
@@ -1459,24 +1529,21 @@ agent, in a TUI or in chat, locally or over ssh.
 ```
 .claude/skills/board/          SKILL.md  ~330 lines / ~2,000 words
   references/design.md         slot catalog, type table, the anti-slop list
-.claude/skills/board-plot/     SKILL.md  ~200 lines / ~1,200 words
-  references/plotting.md       matplotlib + ggplot footguns: symptom → cause → fix
-.agents/skills/board/SKILL.md        the 8-line Codex bridge
-.agents/skills/board-plot/SKILL.md   same
+  references/plotting.md       the panel recipe + matplotlib footguns
+.agents/skills/board/SKILL.md  the 8-line Codex bridge
 .claude/rules/board.md         engine invariants for people EDITING chimaera-board
 ```
 
-**Two skills, not one.** The deciding case is the throwaway plot — "plot the QC
-metrics real quick" in chat, with no board in existence and none wanted. If panel
-production lived inside `board`, the agent would either load a scene-graph skill
-it doesn't need or, worse, mint a `.board.json` to justify having loaded it. That
-is exactly the wear that makes people stop using a tool. The split matches this
-repo's own `develop`/`verify-app`/`debug-live-app` precedent: distinct trigger
-surfaces, not distinct topics. The composition risk is handled by one line high in
-`board`'s body — *"About to write plotting code? Load `board-plot` first — do not
-write a `savefig` before you have."*
+**One skill. Plotting is a `board` reference file, not a second skill.** An
+earlier draft split out a `board-plot` skill, justified by the throwaway plot with
+no board. But under §10's reframe that case has almost nothing Board-specific to
+say — *plot it however you like; here are the theme's colors* — while everything
+the plotting reference actually contains (exact size, never `bbox_inches`,
+`fonttype:'none'`, the traps) is *about placing a panel in a board*. The trigger
+surface was mislabelled. Folding it back also removes the cross-skill routing line
+that existed only to mitigate a problem the split created.
 
-**Exactly two reference files, not seven.** No `references/format.md` and no
+**Exactly two reference files.** No `references/format.md` and no
 `references/export.md`: their content is `chimaera board spec --section …`,
 emitted from the same Rust types that parse. This is the house doctrine
 `capture-feature-intent` already states — *point at the definition rather than
@@ -1490,9 +1557,8 @@ tempting and rejected — it is Claude-only, so half our users would lose activa
 silently. Same for `allowed-tools` and `context: fork`. Anything we would say in
 frontmatter becomes prose in the body, or it does not exist for Codex.
 
-**No bundled scripts.** `chimaera board` *is* the scripts directory — on `$PATH`,
-on the login node, no Python needed. The one helper the plotting path uses,
-`board_panel.py`, ships out of `theme-export` so it versions with the parser.
+**No bundled scripts, unqualified.** `chimaera board` *is* the scripts directory —
+on `$PATH`, on the login node, no Python needed.
 
 Two placements are load-bearing. **The loop sits in the top third** — the middle
 of a long document is where instructions get dropped. And because Claude Code
@@ -1587,17 +1653,18 @@ Board should *not* serve the throwaway case, and saying so protects both. Mintin
 a `.board.json` plus a journal plus a git entry for "plot me this column real
 quick" is precisely the wear that makes people abandon a tool.
 
-- **Throwaway:** no board. `theme-export --stdout`, a script, a PNG that lands in
-  the chat artifact gallery as an image tile. Zero tracked files. The `board-plot`
-  skill states the fork in one line: *if the answer dies with the turn, do not
-  mint a board.*
+- **Throwaway:** no board, and nothing needed from Board beyond `theme-export` if
+  you want the palette. A script, a PNG that lands in
+  the chat artifact gallery as an image tile. Zero tracked files. The skill's
+  plotting reference states the fork in one line: *if the answer dies with the
+  turn, do not mint a board.*
 - **Figure:** `board new --template figure-2x2 --target nature-single`, `place`
   each panel, `lint` (which names the panels that are outlined glyphs and cannot
-  be verified), regenerate those through `panel-brief`, annotate, export.
+  be verified), regenerate those against the brief, annotate, export.
 - **The promotion, framed as a reward rather than a migration:** `board adopt`
   turns a kept throwaway into a board, and `--emit board-data` turns a picture
-  into a native chart. Both are nearly free because the sidecar is always-on — the
-  frame, the size, and the resolved font are already on disk.
+  into a native chart. Both are cheap where a sidecar exists; where none does, the
+  frame comes from two-point calibration on the image itself.
 
 **Chat.** `.board.json` joins `viewKindFor` and `INLINE_PREVIEW_KINDS`, so a
 board an agent writes surfaces as an **inline artifact card** — rendered through
@@ -1703,16 +1770,19 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    the python-pptx CI oracle and the cross-app fidelity matrix; target presets;
    `lint --target` gating.
 4. **Slice 4 — figures, the wedge.** matplotlib/ggplot import, provenance, stale
-   badges, `theme-export` to `.mplstyle`/ggtheme, `rescheme`; Okabe-Ito/Tol/Viridis
+   badges, `theme-export` (JSON, plus `--mplstyle`), `rescheme`; Okabe-Ito/Tol/Viridis
    themes; journal width presets; poster preset. Then the annotation layer —
    `image.pixelSize`, `panelLabel`, `scalebar`, `inset`, `sigBracket`, `legend`,
-   `colorbar`, `callout`; `anchor.px`; `theme-export` emitting a hashed `frame`
-   which unlocks `anchor.data`; cross-panel consistency lints; align-plot-areas;
+   `colorbar`, `callout`; `anchor.px`; the sidecar `frame` contract (or two-point
+   calibration) unlocking `anchor.data`; cross-panel consistency lints; align-plot-areas;
    the CVD/grayscale preflight. **The annotation layer comes before `chart`
    within this slice** — it is the actual wedge.
-5. **Slice 4b — `chart`.** Eight marks, file-referenced data, digest staleness,
-   tick formatting, bundled colormaps, the mark-count ceiling. Gated on `table`
-   landing, since both take the grouped-shape export path.
+5. **Slice 4b-i — `chart`, first cut, ungated.** `bar`/`line`/`point`, linear and
+   ordinal scales with `sort`, nice ticks, direct labels, per-mark binding, channel
+   types. Because `chart` is now the *answer to case B* rather than a nice-to-have,
+   it must not sit behind PPTX table export. **4b-ii** adds log and temporal scales,
+   `errorbar`, `rect` + colormaps, `box` sugar, and the grouped-shape export path,
+   gated on `table`.
 6. **Slice 5 — decks, diagrams, and parity.** Present mode with presenter view;
    inline board artifacts and snapshot attachments; cosmic-text-wasm for in-place
    text editing; `diagram` with vendored `dagre-rs` + orthogonal routing;
@@ -1740,13 +1810,12 @@ Without it, the day-one dogfood measures the agent loop against a beauty substra
 that does not yet exist.
 
 **If time is short, cut in this order:** the critique loop's second pass (one look
-is ~80% of its value) → the ggplot arm of `theme-export` (matplotlib is >90% of
-traffic, there is no `prop_cycle` equivalent, and the mm-vs-pt `size`/`linewidth`
-trap silently multiplies strokes ~2.8×, so ship it marked unverified or not at
-all) → `rescheme` entirely (path 1 dominates it) → the golden eval as automation,
+is ~80% of its value) → the import-lint checks beyond font floor and hairlines
+(collision, overflow — the two that matter are already in §3.5) → `rescheme`
+entirely (path 1 dominates it) → the golden eval as automation,
 keeping the briefs as a manual checklist → the poster golden board. **Never cut:**
 the theme substrate, slots as the authoring path, near-miss alignment lint,
-`panel-brief` + `board_panel.py`, `board proof`, and the loop section of the skill.
+`panel-brief` and the exact-size law, `board proof`, and the loop section of the skill.
 Those six *are* the mechanism; the rest is documentation of it.
 
 Every slice is independently shippable and live-verified per **verify-app**;
@@ -1865,6 +1934,28 @@ says *not natively, and here is where it lives instead.*
 - **A daemon-side board database.** Files are truth. On a shared NFS home a
   per-host daemon store would show different truth per daemon and none at all to
   a teammate's clone.
+- **A bundled JS engine, and a Board-shipped plotting helper in any language.**
+  Recorded with reasons, because "surely there's a good JS charting library" is the
+  obvious question. On aesthetics the instinct is right — Observable Plot has the
+  best defaults of anything surveyed. On runtime it inverts: Plot needs a DOM,
+  Plotly needs headless Chromium, Chart.js needs Cairo; only Vega-Lite and ECharts
+  render headlessly, and embedding those means embedding V8 (~88 MB vs the current
+  ~17.5 MB binary, paid by every `connect` auto-deploy over a Duo-gated SSH hop,
+  for a feature most users never touch). The technical objection people expect —
+  "V8 won't build for musl" — is actually **dead as of 2026**; it is the size that
+  decides. And availability runs the other way from intuition: Python is *more*
+  likely present on a cluster login node than Node, since `dnf` is itself written
+  in Python. So "JS instead of Python" would trade aesthetics for a worse
+  deployment story. The right answer is neither — the native `chart` renders in
+  Rust with no runtime at all, and a 125-line from-scratch sketch rendered through
+  resvg already looked visibly better than the defaults of `plotters`, `poloto`,
+  and `charts-rs`. (Those crates are also structurally unusable here: `plotters`
+  pulls `freetype-sys` + `fontconfig` via font-kit, colliding with static-musl and
+  fontless nodes, and `charts-rs` bundles a *second* font world that would ignore
+  vendored fonts and break §8's one-font-world guarantee.) Client-side browser
+  rendering is disqualified separately: it breaks §7's what-you-see-is-what-exports
+  with two rasterizers and two font stacks, and there is no browser on the CLI
+  path, in CI, in a Snakemake rule, or in an agent turn.
 - **Shelling out to Python (python-pptx, Inkscape, LibreOffice) at runtime.**
   Breaks the static-binary and remote-transparency invariants; python-pptx is a
   CI oracle only.
