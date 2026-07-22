@@ -27,6 +27,7 @@ pub mod composites;
 pub mod cvd;
 pub mod describe;
 pub mod diagram;
+pub mod equation;
 pub mod export;
 pub mod imginfo;
 pub mod journal;

@@ -180,8 +180,10 @@ fn normalize_objects(objects: &mut [Object], page: &str, diags: &mut Vec<Diagnos
             }
             // Composite children are computed at render, never stored, so
             // there is nothing to canonicalize beyond the snapped frame.
+            // An equation's `tex` is source, not sugar — it stays verbatim.
             Object::Image(_)
             | Object::Diagram(_)
+            | Object::Equation(_)
             | Object::PanelLabel(_)
             | Object::Scalebar(_)
             | Object::SigBracket(_)
@@ -208,6 +210,7 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
         Object::Table(o) => o.id = generated,
         Object::Chart(o) => o.id = generated,
         Object::Diagram(o) => o.id = generated,
+        Object::Equation(o) => o.id = generated,
         Object::PanelLabel(o) => o.id = generated,
         Object::Scalebar(o) => o.id = generated,
         Object::SigBracket(o) => o.id = generated,

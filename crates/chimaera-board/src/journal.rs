@@ -123,6 +123,18 @@ impl Event {
             }
             EventKind::BriefChanged => "edited the brief".to_string(),
             EventKind::Shown => "showed this board".to_string(),
+            EventKind::Comment {
+                page,
+                object,
+                at,
+                pin,
+                text,
+            } => match (object, at) {
+                (Some(object), _) => format!("commented {pin} on {object} on {page}: {text}"),
+                (None, Some(p)) => format!("commented {pin} on {page} at {}: {text}", pt(*p)),
+                (None, None) => format!("commented {pin} on {page}: {text}"),
+            },
+            EventKind::CommentResolved { pin } => format!("resolved comment {pin}"),
         };
         format!("#{} {} {}", self.seq, self.actor, body)
     }
@@ -202,6 +214,30 @@ pub enum EventKind {
     /// card; a re-show with the same id appends another `shown`, which is how
     /// an in-place card update announces itself.
     Shown,
+    /// A comment pin (board plan §6.4): page-scoped, optionally bound to an
+    /// object, optionally at a stored canvas point, with its text. The one
+    /// deliberate exception to "content events carry no content" — pins live
+    /// ONLY in the journal, never in the board file (whose diffability must
+    /// not be polluted by conversation), so the journal is the sole carrier
+    /// of the words. Compaction preserves an unresolved pin regardless of
+    /// age (see [`Journal::append_batch`]'s compaction).
+    Comment {
+        page: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        object: Option<String>,
+        /// The pin's canvas point — where a point pin renders, and where an
+        /// object-bound pin falls back if its object is later removed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<[f64; 2]>,
+        pin: String,
+        text: String,
+    },
+    /// Resolves the pin (`comment-resolved` — the plan's `comment.resolved`
+    /// in this journal's kebab-case). Once resolved, the pair may compact
+    /// away like any other event.
+    CommentResolved {
+        pin: String,
+    },
 }
 
 /// Where a board's journal lives:
@@ -397,16 +433,18 @@ impl Journal {
 
     /// Rewrite the file keeping the newest events that fit the compaction
     /// target, with their seq numbers intact — the resulting leading gap is
-    /// legal and expected. Atomic (temp + rename), and corrupt lines do not
-    /// survive it. Memory stays bounded: the file only ever exceeds the cap
-    /// by one append batch, so reading it whole here is capped too.
+    /// legal and expected. Unresolved comment pins additionally survive
+    /// regardless of age (see inline). Atomic (temp + rename), and corrupt
+    /// lines do not survive it. Memory stays bounded: the file only ever
+    /// exceeds the cap by one append batch, so reading it whole here is
+    /// capped too.
     fn compact(&mut self) -> Result<()> {
         let file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e).with_context(|| format!("opening {}", self.path.display())),
         };
-        let mut lines: Vec<String> = Vec::new();
+        let mut lines: Vec<(String, Event)> = Vec::new();
         let mut reader = std::io::BufReader::new(file);
         let mut line = String::new();
         loop {
@@ -415,8 +453,10 @@ impl Journal {
                 Ok(0) => break,
                 Ok(_) => {
                     let trimmed = line.trim();
-                    if !trimmed.is_empty() && serde_json::from_str::<Event>(trimmed).is_ok() {
-                        lines.push(trimmed.to_string());
+                    if !trimmed.is_empty() {
+                        if let Ok(ev) = serde_json::from_str::<Event>(trimmed) {
+                            lines.push((trimmed.to_string(), ev));
+                        }
                     }
                 }
                 Err(_) => break,
@@ -428,7 +468,7 @@ impl Journal {
         let mut budget = self.compact_target as usize;
         let mut keep_from = lines.len();
         while keep_from > 0 {
-            let cost = lines[keep_from - 1].len() + 1;
+            let cost = lines[keep_from - 1].0.len() + 1;
             if cost > budget && keep_from < lines.len() {
                 break;
             }
@@ -436,10 +476,37 @@ impl Journal {
             keep_from -= 1;
         }
 
+        // Unresolved comment pins in the dropped prefix survive anyway: pins
+        // live only in the journal (board plan §6.3/§6.4), so losing one at a
+        // cap boundary would silently erase an open annotation — a spooky,
+        // hard-to-reproduce bug the plan calls fatal. Judged newest→oldest
+        // against LATER resolutions only, so a re-used pin id (comment →
+        // resolved → comment again) keeps its fresh incarnation. A resolved
+        // pair compacts away like anything else. Preserved pins may push the
+        // result past the compaction target; the file shrinks again once
+        // they resolve.
+        let mut resolved_later: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut preserved = vec![false; keep_from];
+        for i in (0..lines.len()).rev() {
+            match &lines[i].1.kind {
+                EventKind::CommentResolved { pin } => {
+                    resolved_later.insert(pin.as_str());
+                }
+                EventKind::Comment { pin, .. }
+                    if i < keep_from && !resolved_later.contains(pin.as_str()) =>
+                {
+                    preserved[i] = true;
+                }
+                _ => {}
+            }
+        }
+
         let mut out = String::new();
-        for l in &lines[keep_from..] {
-            out.push_str(l);
-            out.push('\n');
+        for (i, (l, _)) in lines.iter().enumerate() {
+            if i >= keep_from || preserved[i] {
+                out.push_str(l);
+                out.push('\n');
+            }
         }
         crate::write_atomic(&self.path, out.as_bytes())?;
         self.needs_newline = false;
@@ -753,6 +820,138 @@ mod tests {
         );
         let events = read_since(&path, 0).unwrap();
         assert_eq!(events[0].render(), "#1 agent showed this board");
+    }
+
+    fn pin(id: &str, object: Option<&str>, at: Option<[f64; 2]>, text: &str) -> Event {
+        Event::new(
+            Actor::Human,
+            EventKind::Comment {
+                page: "bench".to_string(),
+                object: object.map(str::to_string),
+                at,
+                pin: id.to_string(),
+                text: text.to_string(),
+            },
+        )
+    }
+
+    fn resolve(id: &str) -> Event {
+        Event::new(
+            Actor::Human,
+            EventKind::CommentResolved {
+                pin: id.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn comment_pins_round_trip_and_render() {
+        let path = tmp_journal("comment");
+        let mut j = Journal::open(&path).unwrap();
+        j.append(pin(
+            "c1",
+            Some("callout"),
+            None,
+            "say the median, not the best case",
+        ))
+        .unwrap();
+        j.append(pin("c2", None, Some([320.0, 96.0]), "this section drags"))
+            .unwrap();
+        j.append(resolve("c1")).unwrap();
+
+        // The wire shape is the plan's §6.3 line, minus its `ts` (no wall
+        // clock in this journal) and with `event` as the tag key: absent
+        // object/at fields are omitted, never null.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut it = raw.lines();
+        assert_eq!(
+            it.next().unwrap(),
+            r#"{"seq":1,"actor":"human","event":"comment","page":"bench","object":"callout","pin":"c1","text":"say the median, not the best case"}"#
+        );
+        assert_eq!(
+            it.next().unwrap(),
+            r#"{"seq":2,"actor":"human","event":"comment","page":"bench","at":[320.0,96.0],"pin":"c2","text":"this section drags"}"#
+        );
+        assert_eq!(
+            it.next().unwrap(),
+            r#"{"seq":3,"actor":"human","event":"comment-resolved","pin":"c1"}"#
+        );
+
+        let events = read_since(&path, 0).unwrap();
+        assert_eq!(
+            events[0].render(),
+            "#1 human commented c1 on callout on bench: say the median, not the best case"
+        );
+        assert_eq!(
+            events[1].render(),
+            "#2 human commented c2 on bench at [320, 96]: this section drags"
+        );
+        assert_eq!(events[2].render(), "#3 human resolved comment c1");
+    }
+
+    #[test]
+    fn compaction_preserves_unresolved_comment_pins() {
+        let path = tmp_journal("pin-cap");
+        let mut j = Journal::open(&path).unwrap();
+        j.cap_bytes = 8 * 1024;
+        j.compact_target = 4 * 1024;
+
+        // An old unresolved pin, then enough moves to compact several times.
+        j.append(pin("c1", Some("callout"), None, "tighten this"))
+            .unwrap();
+        for i in 0..200u64 {
+            j.append(mv(&format!("obj-{i}"), [0.0, 0.0], [i as f64, i as f64]))
+                .unwrap();
+        }
+        let events = read_since(&path, 0).unwrap();
+        assert!(events.len() < 201, "the oldest moves were dropped");
+        let first_move = events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::Move { .. }))
+            .unwrap();
+        assert!(
+            first_move.seq > 2,
+            "moves right after the pin were compacted away"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::Comment { pin, .. } if pin == "c1")),
+            "the unresolved pin survived every compaction"
+        );
+
+        // Resolving frees the pair: after the next compaction cycles, the
+        // old comment no longer haunts the file.
+        j.append(resolve("c1")).unwrap();
+        for i in 0..200u64 {
+            j.append(mv(&format!("post-{i}"), [0.0, 0.0], [i as f64, i as f64]))
+                .unwrap();
+        }
+        let events = read_since(&path, 0).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::Comment { pin, .. } if pin == "c1")),
+            "a resolved pin's comment compacts away"
+        );
+
+        // A re-used pin id after its resolution is a FRESH pin: only later
+        // resolutions count against a comment.
+        j.append(pin("c1", None, Some([8.0, 8.0]), "second thoughts"))
+            .unwrap();
+        for i in 0..200u64 {
+            j.append(mv(&format!("again-{i}"), [0.0, 0.0], [i as f64, i as f64]))
+                .unwrap();
+        }
+        let events = read_since(&path, 0).unwrap();
+        let kept: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Comment { pin, .. } if pin == "c1"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the re-pinned incarnation survives");
+        assert!(
+            matches!(&kept[0].kind, EventKind::Comment { text, .. } if text == "second thoughts")
+        );
     }
 
     #[test]

@@ -477,6 +477,16 @@ fn emit_object(
                 escape(chip)
             );
         }
+        Object::Equation(eq) => {
+            let Some(f) = frame else {
+                diags.push(
+                    Diagnostic::new(Severity::Warning, "equation has no position; skipped")
+                        .at(&page.id, obj.id()),
+                );
+                return;
+            };
+            emit_equation(s, eq, f, theme, &page.id, diags);
+        }
         Object::Diagram(d) => {
             let Some(f) = frame else {
                 diags.push(
@@ -1135,6 +1145,68 @@ fn emit_table(
                 diags,
             );
             cx += widths[ci];
+        }
+    }
+}
+
+/// Typeset LaTeX into the page: the outline SVG scaled to fit the frame
+/// preserving aspect, centered, inked with the theme's foreground. A TeX
+/// failure gets the standard placeholder-with-reason treatment every broken
+/// image gets — never a silent blank.
+fn emit_equation(
+    s: &mut String,
+    eq: &crate::schema::EquationObject,
+    f: Frame,
+    theme: &Theme,
+    page_id: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let em = match eq.em_size {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        Some(v) => {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("emSize {v} is not a positive point size; the body size is used"),
+                )
+                .at(page_id, &eq.id)
+                .field("emSize"),
+            );
+            theme.body().size
+        }
+        None => theme.body().size,
+    };
+    match crate::equation::render_tex_svg(&eq.tex, em) {
+        Ok(svg) => {
+            // The theme's foreground inks glyphs (fill inheritance through
+            // the <use> shadow trees) and rules (emitted as currentColor).
+            let ink = theme.color_or_fg(None).hex();
+            // SVG ids are page-global: prefix this equation's glyph defs by
+            // its object id so two equations cannot capture each other's.
+            let prefix: String = eq
+                .id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .chain("-".chars())
+                .collect();
+            let body = crate::equation::namespace_glyph_ids(&svg.body, &prefix)
+                .replace("currentColor", &ink);
+            let _ = write!(
+                s,
+                r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="0 0 {} {}" preserveAspectRatio="xMidYMid meet" fill="{ink}">{body}</svg>"#,
+                f.x, f.y, f.w, f.h, svg.width_pt, svg.height_pt
+            );
+        }
+        Err(e) => {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("equation did not render ({e}); a placeholder marks its box"),
+                )
+                .at(page_id, &eq.id)
+                .field("tex"),
+            );
+            image_placeholder(s, f, theme);
         }
     }
 }
@@ -1980,6 +2052,117 @@ mod tests {
         assert!(second.contains("Review"), "{second}");
         // Furniture is generated per render, never written into the board.
         assert!(!crate::to_string(&b).unwrap().contains("furniture/"));
+    }
+
+    // --- equations ------------------------------------------------------
+
+    fn equation_board(fields: &str) -> Board {
+        board(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[400,200]}},
+                "pages":[{{"id":"p","objects":[
+                  {{"id":"eq1","type":"equation","at":[40,40],"size":[320,120],{fields}}}]}}]}}"#
+        ))
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn an_equation_lands_as_theme_inked_glyph_outlines() {
+        let b = equation_board(
+            r#""tex":"\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}","alt":"the quadratic formula""#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        // Real outline paths, referenced by <use>, inked with the theme fg;
+        // defs are namespaced by the object id (page-global SVG ids).
+        assert!(svg.contains("<use"), "{svg}");
+        assert!(svg.contains("<path id=\"eq1-g0\""), "{svg}");
+        let ink = theme.color_or_fg(None).hex();
+        assert!(
+            svg.contains(&format!(r#"fill="{ink}""#)),
+            "glyphs take the theme ink: {svg}"
+        );
+        // The fraction rule recolors too — nothing is left currentColor.
+        assert!(!svg.contains("currentColor"), "{svg}");
+        assert!(
+            !diags.iter().any(|d| d.severity != Severity::Info),
+            "{diags:?}"
+        );
+        // And the whole page parses + rasterizes deterministically.
+        let a = render_page(&b, 0, &theme, &fonts, RasterParams::default()).unwrap();
+        let c = render_page(&b, 0, &theme, &fonts, RasterParams::default()).unwrap();
+        assert_eq!(a.png, c.png, "same board, same bytes");
+        // The glyphs actually draw: some pixel well inside the frame is inked.
+        let pm = tiny_skia::Pixmap::decode_png(&a.png).unwrap();
+        let bg = theme.bg();
+        let inked = pm
+            .pixels()
+            .iter()
+            .filter(|p| {
+                let c = p.demultiply();
+                (c.red(), c.green(), c.blue()) != (bg.r, bg.g, bg.b)
+            })
+            .count();
+        assert!(inked > 200, "the equation drew {inked} non-ground pixels");
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn two_equations_on_one_page_keep_their_glyph_defs_apart() {
+        // SVG ids are page-global; without per-object prefixes the second
+        // equation's <use> would resolve into the first one's defs and draw
+        // scrambled glyphs (observed live before the namespacing).
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[400,300]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"quad","type":"equation","at":[8,8],"size":[380,120],
+                   "tex":"\\frac{1}{2}","alt":"a half"},
+                  {"id":"sum","type":"equation","at":[8,160],"size":[380,120],
+                   "tex":"\\sum_{i=1}^{n} x_i","alt":"sum of x_i"}]}]}"#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(svg.contains(r##"id="quad-g0""##), "{svg}");
+        assert!(svg.contains(r##"id="sum-g0""##), "{svg}");
+        assert!(svg.contains(r##"href="#sum-g0""##), "{svg}");
+        assert!(!svg.contains(r##"id="g0""##), "unprefixed defs: {svg}");
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn a_tex_error_draws_the_placeholder_and_names_the_error() {
+        let b = equation_board(r#""tex":"x \\right)","alt":"broken""#);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(svg.contains("stroke-dasharray"), "placeholder box: {svg}");
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.object.as_deref() == Some("eq1")
+                && d.message.contains("TeX error")),
+            "{diags:?}"
+        );
+    }
+
+    #[cfg(not(feature = "math"))]
+    #[test]
+    fn without_the_math_feature_an_equation_degrades_with_the_reason() {
+        let b = equation_board(r#""tex":"E = mc^2","alt":"E = mc^2""#);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(svg.contains("stroke-dasharray"), "placeholder box: {svg}");
+        assert!(
+            diags.iter().any(|d| d.message.contains("math feature")),
+            "{diags:?}"
+        );
     }
 
     // --- images ---------------------------------------------------------

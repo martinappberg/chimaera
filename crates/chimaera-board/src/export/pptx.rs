@@ -978,6 +978,7 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
         Object::Table(t) => emit_table(w, t, frame),
         Object::Chart(c) => emit_chart(w, c, frame),
         Object::Diagram(d) => emit_diagram(w, d, frame),
+        Object::Equation(eq) => emit_equation(w, eq, frame),
         Object::PanelLabel(o) => {
             let (children, problems) = o.expand(w.theme, w.fonts);
             emit_composite(w, &o.id, children, problems);
@@ -1759,6 +1760,112 @@ fn emit_image_svg(
         &img.id,
         ExportTier::Vector,
         "svg embedded with PNG fallback (svgBlip)",
+    );
+}
+
+/// An equation as a `p:pic`: the typeset outline SVG fitted into the frame
+/// (aspect preserved, centered — matching the renderer's placement exactly),
+/// rasterized to PNG at 2× the placed size through the same machinery SVG
+/// images use, with the SVG itself beside it as an `svgBlip` (the plan's
+/// picture-quality enhancement: modern PowerPoint gets vector, everyone else
+/// gets the PNG, nobody gets worse). The required `alt` — the LaTeX source —
+/// lands as `p:cNvPr/@descr`. Fate `raster` per the degradation contract;
+/// the native OMML arm is deliberately not built in v1.
+fn emit_equation(w: &mut SlideWriter, eq: &crate::schema::EquationObject, frame: Option<Frame>) {
+    let Some(f) = frame else {
+        w.fate(
+            &eq.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
+        return;
+    };
+    let degrade = |w: &mut SlideWriter, reason: String| {
+        placeholder_sp(w, &eq.id, Some(&eq.alt), f);
+        w.fate(&eq.id, ExportTier::Raster, reason);
+    };
+    let em = match eq.em_size {
+        Some(v) if v.is_finite() && v > 0.0 => v,
+        _ => w.theme.body().size,
+    };
+    let svg = match crate::equation::render_tex_svg(&eq.tex, em) {
+        Ok(svg) => svg,
+        Err(e) => {
+            degrade(
+                w,
+                format!("equation did not render ({e}); placeholder box exported"),
+            );
+            return;
+        }
+    };
+    // Fit the natural box into the frame preserving aspect, centered — the
+    // placed picture is the fitted rect, so the destination never stretches.
+    let scale = (f.w / svg.width_pt).min(f.h / svg.height_pt);
+    if !(scale.is_finite() && scale > 0.0) {
+        degrade(
+            w,
+            "equation frame is degenerate; placeholder box exported".to_string(),
+        );
+        return;
+    }
+    let fitted = Frame {
+        x: f.x + (f.w - svg.width_pt * scale) / 2.0,
+        y: f.y + (f.h - svg.height_pt * scale) / 2.0,
+        w: svg.width_pt * scale,
+        h: svg.height_pt * scale,
+    };
+    // The theme foreground inks glyph fills and rules, exactly as the
+    // renderer embeds it.
+    let ink = w.theme.color_or_fg(None).hex();
+    let doc = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}" fill="{ink}">{}</svg>"#,
+        svg.width_pt,
+        svg.height_pt,
+        svg.body.replace("currentColor", &ink)
+    );
+    let px = |v: f64| -> u32 {
+        let p = (v * 2.0).round();
+        if p.is_finite() && p >= 1.0 {
+            p.min(crate::render::MAX_PIXELS as f64) as u32
+        } else {
+            1
+        }
+    };
+    let (px_w, px_h) = (px(fitted.w), px(fitted.h));
+    if (px_w as u64).saturating_mul(px_h as u64) > crate::render::MAX_PIXELS {
+        degrade(
+            w,
+            format!(
+                "equation raster would be {px_w}×{px_h} px, over the {} Mpx ceiling; \
+                 placeholder box exported",
+                crate::render::MAX_PIXELS / 1_000_000
+            ),
+        );
+        return;
+    }
+    let png = match crate::imginfo::rasterize_svg(&doc, w.fonts.db(), px_w, px_h) {
+        Ok(p) => p,
+        Err(e) => {
+            degrade(
+                w,
+                format!("equation rasterization failed ({e}); placeholder box exported"),
+            );
+            return;
+        }
+    };
+    let png_rid = w.media_rel(&format!("equation:{}#png", eq.id), png, "png");
+    let svg_rid = w.media_rel(&format!("equation:{}#svg", eq.id), doc.into_bytes(), "svg");
+    let nv = w.cnvpr(&eq.id, Some(&eq.alt), None);
+    let _ = write!(
+        w.xml,
+        r#"<p:pic><p:nvPicPr>{nv}<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="{png_rid}"><a:extLst><a:ext uri="{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="{svg_rid}"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>{}{}</p:spPr></p:pic>"#,
+        xfrm(fitted, None, false, false),
+        prst_geom("rect", "")
+    );
+    w.fate(
+        &eq.id,
+        ExportTier::Raster,
+        "equation exported as a picture (PNG + svgBlip); native OMML is a later arm",
     );
 }
 
@@ -3346,6 +3453,77 @@ mod tests {
         let fate = report.objects.iter().find(|f| f.id == "panel").unwrap();
         assert_eq!(fate.tier, ExportTier::Vector);
         assert_eq!(fate.reason, "svg embedded with PNG fallback (svgBlip)");
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn an_equation_exports_as_a_picture_with_svgblip_and_the_latex_as_alt() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[400,300]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"quad","type":"equation","at":[40,40],"size":[320,160],
+                   "tex":"\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
+                   "alt":"\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}"}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+
+        // Both bodies land under media/: the 2× PNG and the outline SVG.
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let names: Vec<String> = (0..ar.len())
+            .map(|i| ar.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("ppt/media/") && n.ends_with(".png")),
+            "{names:?}"
+        );
+        let media_svg = names
+            .iter()
+            .find(|n| n.starts_with("ppt/media/") && n.ends_with(".svg"))
+            .expect("the equation SVG in media/");
+
+        // The embedded SVG carries real glyph outlines, inked with the theme.
+        let svg_body = read_part(&bytes, media_svg);
+        assert!(svg_body.contains("<path"), "{svg_body}");
+        assert!(svg_body.contains("<use"), "{svg_body}");
+        assert!(!svg_body.contains("currentColor"), "{svg_body}");
+
+        // The slide: one p:pic with the svgBlip extension beside the PNG
+        // blip, and the LaTeX riding as the picture's alt text.
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        assert!(slide.contains("<asvg:svgBlip"), "{slide}");
+        assert!(
+            slide.contains(r#"descr="\frac{-b \pm \sqrt{b^2-4ac}}{2a}""#),
+            "{slide}"
+        );
+        assert_well_formed(&slide);
+
+        // Fate: raster (the plan pins equation v1 to picture), reason
+        // naming the future OMML arm.
+        let fate = report.objects.iter().find(|f| f.id == "quad").unwrap();
+        assert_eq!(fate.tier, ExportTier::Raster);
+        assert!(fate.reason.contains("OMML"), "{}", fate.reason);
+        assert!(fate.reason.contains("svgBlip"), "{}", fate.reason);
+    }
+
+    #[cfg(not(feature = "math"))]
+    #[test]
+    fn without_the_math_feature_an_equation_exports_a_placeholder_with_the_reason() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[400,300]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"quad","type":"equation","at":[40,40],"size":[320,160],
+                   "tex":"E = mc^2","alt":"E = mc^2"}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        assert_well_formed(&slide);
+        let fate = report.objects.iter().find(|f| f.id == "quad").unwrap();
+        assert_eq!(fate.tier, ExportTier::Raster);
+        assert!(fate.reason.contains("math feature"), "{}", fate.reason);
     }
 
     /// Fidelity oracle against python-pptx, deliberately not required by CI

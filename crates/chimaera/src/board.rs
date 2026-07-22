@@ -1541,6 +1541,7 @@ fn merge_pages(
                 O::Legend(x) => fix(&mut x.id),
                 O::Colorbar(x) => fix(&mut x.id),
                 O::Table(x) => fix(&mut x.id),
+                O::Equation(x) => fix(&mut x.id),
                 O::Callout(x) => {
                     fix(&mut x.id);
                     if let Some(t) = &mut x.tail {

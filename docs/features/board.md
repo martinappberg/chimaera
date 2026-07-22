@@ -7,10 +7,10 @@ things, and the agent reads the gestures back through `describe` and the
 semantic journal. The design source of truth is
 [docs/board-plan.md](../board-plan.md); **all planned slices 0–5 are
 implemented** (slice 6 is opportunistic by design: its native `c:chart` arm
-ships as an opt-in exporter mode — see Exports — while the OMML arm of
-`equation` is not built; in-place rich-text editing ships as a plain-text
-edit op, not cosmic-text-wasm; hayro PDF import exists but only behind the
-non-default `pdf-import` cargo feature — see CLI).
+ships as an opt-in exporter mode — see Exports — and `equation` ships its
+picture arm while the OMML arm is deliberately not built; in-place rich-text
+editing ships as a plain-text edit op, not cosmic-text-wasm; hayro PDF import
+exists but only behind the non-default `pdf-import` cargo feature — see CLI).
 
 **Where it lives.** Engine: `crates/chimaera-board/` — see its
 [map](../../crates/chimaera-board/AGENTS.md) for the module-by-module layout
@@ -35,6 +35,7 @@ on the full `.board.json` suffix. Chat card:
 - Five primitives (`text`, `shape`, `connector`, `image`, `group`) + `table`
   (cells are the same `Paragraph` text model; header row, relative column
   widths, equal row split; exports as a native editable `a:tbl`) +
+  `equation` (LaTeX math — see below) +
   composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
   `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
   to primitives at render/export time.
@@ -57,6 +58,19 @@ on the full `.board.json` suffix. Chat card:
 - **Images**: PNG/JPEG placed with `srcRect` crops; SVG sanitized through a
   usvg round-trip then inlined; `tint` for monochrome sources; effective-DPI
   reporting against preset floors.
+- **Equations** (`math` cargo feature, **on by default**): `tex` (LaTeX math,
+  display style) + optional `emSize` pt + **required `alt`** carrying the
+  LaTeX source — the plan's one named C6 exception (notation, not prose;
+  parse fails into the preserved-Unknown treatment without `alt`, and lint
+  never counts an equation as verified text). Typeset in-process by mathtex
+  (a pure-Rust xetex core; no TeX install) over a bundled STIX Two Math
+  (OFL), scaled to fit the frame aspect-preserved and centered, inked with
+  the theme foreground. A TeX error renders the standard placeholder with the
+  error in diagnostics and is a lint finding. PPTX fate is `raster` — PNG at
+  2× placed size **plus** the `svgBlip` vector beside it, `alt` →
+  `p:cNvPr/@descr`; the native OMML arm is deliberately not built (slice 6
+  opportunistic). A `--no-default-features` build refuses with the exact
+  flag to rebuild with.
 - Themes: `talk-dark` / `talk-light` / `figure-light` bundled (`@token`
   palettes, role type scale with per-role `minPt`, Okabe–Ito ramp,
   WCAG-checked in tests); workspace themes under `.chimaera/board/themes/`.
@@ -173,8 +187,9 @@ seq-preserving compaction. Human gestures append from `/board/edit`; agent
 
 ## Not built (deliberately)
 
-Slice 6's native `c:chart` and OMML equations (opportunistic, gated on the
-fidelity matrix); cosmic-text-wasm in-place editing (the `/board/edit` text
+Slice 6's OMML equation arm (`equation` ships the picture arm only —
+opportunistic, gated on the fidelity matrix) and native `c:chart` by default;
+cosmic-text-wasm in-place editing (the `/board/edit` text
 op covers plain-text edits); hayro PDF-panel import in *default* builds
 (implemented, but only behind the non-default `pdf-import` feature — see
 CLI); the daemon-injected `shown` journal event (the ShownCard detects

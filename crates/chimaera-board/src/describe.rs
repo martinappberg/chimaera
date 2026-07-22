@@ -230,6 +230,16 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeM
                 d.edges.len()
             );
         }
+        Object::Equation(eq) => {
+            // The TeX source is the content — print it, truncated, so the
+            // agent reads the formula without opening the JSON.
+            let _ = writeln!(
+                s,
+                "{indent}{} equation{geo}: {}",
+                eq.id,
+                truncate(&eq.tex, 80)
+            );
+        }
         Object::PanelLabel(pl) => {
             let _ = writeln!(s, "{indent}{} panelLabel{geo}: {:?}", pl.id, pl.label);
         }
@@ -393,6 +403,27 @@ mod tests {
             out.contains(
                 "bench-table table at [80, 80] size [480, 160] · 2×3 · header: \
                  Fixture | Before | After"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn describe_prints_an_equations_tex_source() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Math",
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"quad","type":"equation","at":[80,80],"size":[320,120],
+                   "tex":"\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}",
+                   "alt":"the quadratic formula"}]}]}"#,
+        )
+        .unwrap();
+        crate::normalize(&mut b);
+        let out = describe(&b);
+        assert!(
+            out.contains(
+                "quad equation at [80, 80] size [320, 120]: \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}"
             ),
             "{out}"
         );

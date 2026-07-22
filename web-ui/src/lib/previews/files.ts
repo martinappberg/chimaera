@@ -324,6 +324,80 @@ export async function fsBoardEdit(
   return body.mtime;
 }
 
+/** One event as GET /board/journal returns it: seq-first, the kebab-case
+ *  `event` tag, then the op's own fields flattened beside it. Only the pin
+ *  fields are named here — the pane's overlay reads those; everything else
+ *  passes through untyped. */
+export interface BoardJournalEvent {
+  seq: number;
+  actor: string;
+  event: string;
+  page?: string;
+  object?: string;
+  pin?: string;
+  text?: string;
+  at?: [number, number];
+  [key: string]: unknown;
+}
+
+/** Server page cap for GET /board/journal (its JOURNAL_PAGE_CAP). */
+const BOARD_JOURNAL_PAGE = 500;
+/** Ceiling on pages fetched per read. The journal file is size-capped, so
+ *  this is generous headroom; it exists so a confused server can never loop
+ *  the client. */
+const BOARD_JOURNAL_MAX_PAGES = 16;
+
+/** One page of the board's semantic edit journal, oldest first after `since`. */
+export async function fsBoardJournal(
+  path: string,
+  since = 0,
+): Promise<{ events: BoardJournalEvent[]; latestSeq: number }> {
+  const q = new URLSearchParams({ path, since: String(since) });
+  return json(await api(`/board/journal?${q.toString()}`));
+}
+
+/** Every event the size-capped journal still holds, oldest first — paging
+ *  forward with the last seq seen until `latestSeq` says we're caught up. */
+export async function fsBoardJournalAll(path: string): Promise<BoardJournalEvent[]> {
+  const all: BoardJournalEvent[] = [];
+  let since = 0;
+  for (let i = 0; i < BOARD_JOURNAL_MAX_PAGES; i++) {
+    const page = await fsBoardJournal(path, since);
+    all.push(...page.events);
+    const last = page.events[page.events.length - 1];
+    if (last === undefined || page.events.length < BOARD_JOURNAL_PAGE || last.seq >= page.latestSeq)
+      break;
+    since = last.seq;
+  }
+  return all;
+}
+
+/** The ops the pane appends — §6.4 comment pins. Pins live in the journal
+ *  only, never the board file, so this is a journal POST, not a board edit. */
+export type BoardJournalOp =
+  | {
+      event: "comment";
+      page: string;
+      object?: string;
+      at?: [number, number];
+      pin: string;
+      text: string;
+    }
+  | { event: "comment-resolved"; pin: string };
+
+/** Append one journal event as actor `human` (the pane is the human's hand).
+ *  The daemon validates the op and assigns the seq. */
+export async function fsBoardJournalAppend(path: string, op: BoardJournalOp): Promise<number> {
+  const body = await json<{ seq: number }>(
+    await api("/board/journal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, actor: "human", ...op }),
+    }),
+  );
+  return body.seq;
+}
+
 /**
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must

@@ -14,8 +14,17 @@
    * canonical byte-stable writer stays the one authority on bytes.
    */
   import { untrack } from "svelte";
-  import { fsBoardEdit, fsBoardRender, midTruncate, type BoardRender } from "./files";
+  import {
+    fsBoardEdit,
+    fsBoardJournalAll,
+    fsBoardJournalAppend,
+    fsBoardRender,
+    midTruncate,
+    type BoardJournalOp,
+    type BoardRender,
+  } from "./files";
   import { retain, release, noteWrite, type FileEntry } from "./fileStore.svelte";
+  import { boardNudge } from "./boardEvents";
   import {
     attributeDiff,
     boardFrames,
@@ -25,26 +34,32 @@
     editorTextToParagraphs,
     GRID_PT,
     MIN_RESIZE_PT,
+    nextPinId,
     pageFrames,
     paragraphsToEditorText,
     parseBoard,
+    pinAnchor,
     resizeFrame,
     samePair,
     sameParagraphs,
     snap8,
     snapshotRegion,
     UndoStack,
+    unresolvedPins,
     type BoardInfo,
     type Corner,
     type ExpectedChange,
     type FieldChange,
     type Frame,
     type ObjInfo,
+    type PinInfo,
   } from "./boardInteract";
   import { referenceTarget, workspaceRelative } from "../shared/reference";
   import { matchChord, PINNED, REFERENCE_CHORD } from "../shared/keys";
   import { attachImageToComposer, insertIntoComposer } from "../chat/composerBus";
   import { IMAGE_MAX_BASE64, IMAGE_MAX_DIM, type ImageAttachment } from "../chat/images";
+  import { uploadToSession } from "../net/uploads";
+  import { copyText } from "../shared/clipboard";
   import BoardPresentChrome from "./BoardPresentChrome.svelte";
   import BoardRail from "./BoardRail.svelte";
   import Spinner from "./Spinner.svelte";
@@ -116,9 +131,15 @@
   });
 
   $effect(() => {
-    // A path change resets navigation; a shorter board clamps it.
+    // A path change resets navigation and drops the previous board's pin
+    // overlay (refreshPins guards against a stale fetch landing, but the old
+    // dots must not linger over the new stage meanwhile).
     void path;
     page = 0;
+    pins = [];
+    openPin = null;
+    pinDraft = null;
+    pinMode = false;
   });
   $effect(() => {
     const count = render?.pageCount ?? 1;
@@ -134,6 +155,121 @@
   // --- selection + drag ---------------------------------------------------
   let selected = $state<string | null>(null);
   const selectedObj = $derived(pageObjects.find((o) => o.id === selected) ?? null);
+
+  // --- comment pins (§6.4: journal-only, never the board file) ------------
+  /** Unresolved pins reduced from GET /board/journal. */
+  let pins = $state<PinInfo[]>([]);
+  /** Next pin id to mint (`c<max+1>` across everything the journal holds). */
+  let nextPin = $state("c1");
+  /** The pin tool: while armed, a stage press drops a pin instead of
+   *  selecting/dragging. */
+  let pinMode = $state(false);
+  /** An armed press's pending pin — where it points, awaiting its text. */
+  let pinDraft = $state<{ at: [number, number]; object: string | null } | null>(null);
+  let pinDraftText = $state("");
+  let pinInputEl = $state<HTMLInputElement | null>(null);
+  /** Pin id whose popover is open. */
+  let openPin = $state<string | null>(null);
+  let pinBusy = $state(false);
+  let pinFetchSeq = 0;
+
+  const currentPageId = $derived(board?.pages[page]?.id ?? `page-${page + 1}`);
+  const pagePins = $derived(pins.filter((p) => p.page === currentPageId));
+
+  async function refreshPins(): Promise<void> {
+    const p = path;
+    const seq = ++pinFetchSeq;
+    try {
+      const events = await fsBoardJournalAll(p);
+      if (seq !== pinFetchSeq || p !== path) return;
+      pins = unresolvedPins(events);
+      nextPin = nextPinId(events);
+    } catch {
+      // The overlay is best-effort — keep the last-known pins.
+    }
+  }
+
+  // Pins refetch on the same signals as the stage render (path + on-disk
+  // change) PLUS the board-epoch nudge: a journal append — another window's
+  // pin, a CLI comment — moves no file mtime, so only the epoch frame
+  // carries it.
+  $effect(() => {
+    void path;
+    void entry?.mtime;
+    void $boardNudge;
+    void refreshPins();
+  });
+
+  // Autofocus the draft input on open — the press that dropped the pin
+  // focused the pane root, not the input.
+  $effect(() => {
+    pinInputEl?.focus();
+  });
+
+  function cancelPinDraft(): void {
+    pinDraft = null;
+    pinDraftText = "";
+    pinMode = false;
+    rootEl?.focus({ preventScroll: true });
+  }
+
+  async function commitPinDraft(): Promise<void> {
+    const d = pinDraft;
+    const text = pinDraftText.trim();
+    if (d === null || pinBusy) return;
+    if (text === "") {
+      cancelPinDraft();
+      return;
+    }
+    const id = nextPin;
+    const op: BoardJournalOp = {
+      event: "comment",
+      page: currentPageId,
+      ...(d.object !== null ? { object: d.object } : {}),
+      at: d.at,
+      pin: id,
+      text,
+    };
+    pinBusy = true;
+    try {
+      await fsBoardJournalAppend(path, op);
+      cancelPinDraft();
+      showToast(`pinned ${id}${d.object !== null ? ` on ${d.object}` : ""}`);
+      void refreshPins();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "pin failed");
+    } finally {
+      pinBusy = false;
+    }
+  }
+
+  function onPinDraftKey(ev: KeyboardEvent): void {
+    // The input owns its keys, like the text editor: nothing bubbles to the
+    // pane/window handlers while typing.
+    ev.stopPropagation();
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      cancelPinDraft();
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      void commitPinDraft();
+    }
+  }
+
+  async function resolvePin(id: string): Promise<void> {
+    if (pinBusy) return;
+    pinBusy = true;
+    try {
+      await fsBoardJournalAppend(path, { event: "comment-resolved", pin: id });
+      openPin = null;
+      showToast(`resolved ${id}`);
+      void refreshPins();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "resolve failed");
+    } finally {
+      pinBusy = false;
+    }
+  }
 
   let rootEl = $state<HTMLDivElement | null>(null);
   let stageEl = $state<HTMLDivElement | null>(null);
@@ -245,6 +381,21 @@
     // may answer ⌘Z (multiple board panes, terminals, editors coexist).
     rootEl?.focus({ preventScroll: true });
     const pt = toPt(ev);
+    // Any stage press dismisses an open pin popover (its own chrome stops
+    // propagation, so this only fires for presses outside it).
+    openPin = null;
+    if (pinMode) {
+      // An armed press drops the pin — object-bound when it lands on one —
+      // and opens the text input; it never selects or starts a drag. A
+      // re-press while the input is open just re-drops the draft. Cancel the
+      // press's default so the compatibility mousedown cannot steal focus
+      // from the input the autofocus effect is about to give it.
+      ev.preventDefault();
+      const target = hit(pt);
+      pinDraft = { at: [Math.round(pt[0]), Math.round(pt[1])], object: target?.id ?? null };
+      pinDraftText = "";
+      return;
+    }
     // Handles win over object hit-testing: a handle overhangs the object's
     // corner, and a small object would otherwise be un-resizable.
     const host = stageEl?.getBoundingClientRect();
@@ -524,11 +675,17 @@
   });
 
   // --- selection-as-deixis (§6.4) -----------------------------------------
-  /** The reference target only when it is a chat session: composerBus can
-   *  insert into a mounted (or mounting) chat Composer, but Chimaera never
-   *  types into a TUI's PTY. */
+  /** The reference target when it is a chat session: composerBus can insert
+   *  into a mounted (or mounting) chat Composer. */
   const chatTarget = $derived(
     $referenceTarget !== null && $referenceTarget.ui === "chat" ? $referenceTarget : null,
+  );
+  /** …and when it is a terminal session: Chimaera never types into a TUI's
+   *  PTY, so the affordance degrades to "copy snapshot path" — same region
+   *  snapshot, landed in the session's upload dir, its context line + @path
+   *  on the clipboard for the user to paste themselves. */
+  const termTarget = $derived(
+    $referenceTarget !== null && $referenceTarget.ui === "term" ? $referenceTarget : null,
   );
   const sendableFrame = $derived(
     selectedObj !== null && selectedObj.at !== null && selectedObj.size !== null,
@@ -537,10 +694,15 @@
   const canSendToChat = $derived(
     chatTarget !== null && sendableFrame && board !== null && !snapshotBusy,
   );
+  const canCopyForTerm = $derived(
+    chatTarget === null && termTarget !== null && sendableFrame && board !== null && !snapshotBusy,
+  );
   const sendTitle = $derived.by(() => {
-    if (chatTarget === null) return "no chat-mode agent to send to — open an agent in chat view";
+    if (chatTarget === null && termTarget === null)
+      return "no agent session to send to — open an agent";
     if (!sendableFrame) return "select an object on the stage first";
-    return `send selection to ${chatTarget.name} (${PINNED.reference})`;
+    if (chatTarget !== null) return `send selection to ${chatTarget.name} (${PINNED.reference})`;
+    return `copy a snapshot path for ${termTarget?.name} (${PINNED.reference}) — chimaera never types into a TUI`;
   });
 
   /**
@@ -550,7 +712,7 @@
    * parameter today, so the object scoping happens here — still exclusively
    * the engine's pixels, never a DOM re-layout. Caps mirror chat/images.ts.
    */
-  async function snapshotAttachment(region: Frame, label: string): Promise<ImageAttachment | null> {
+  async function snapshotCanvas(region: Frame): Promise<HTMLCanvasElement | null> {
     const scale = Math.min(4, Math.max(1, window.devicePixelRatio || 1));
     const r = await fsBoardRender(path, page, scale);
     const resp = await fetch(`/raw/${r.ticket}`);
@@ -569,6 +731,13 @@
     canvas.width = Math.max(1, Math.round(sw * shrink));
     canvas.height = Math.max(1, Math.round(sh * shrink));
     canvas.getContext("2d")?.drawImage(bitmap, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  }
+
+  /** The chat half: the crop as a base64 composer attachment. */
+  async function snapshotAttachment(region: Frame, label: string): Promise<ImageAttachment | null> {
+    const canvas = await snapshotCanvas(region);
+    if (canvas === null) return null;
     const url = canvas.toDataURL("image/png");
     const data = url.slice(url.indexOf(",") + 1);
     if (data.length > IMAGE_MAX_BASE64) return null;
@@ -610,6 +779,59 @@
     );
   }
 
+  /**
+   * §6.4's TUI fallback: the same region snapshot, but nothing is ever typed
+   * into a PTY — the crop lands in the session's upload dir (the same
+   * landing pad OS drops use) and the context line + @path go to the
+   * clipboard for the user to paste themselves.
+   */
+  async function copySnapshotPathForTerm(): Promise<void> {
+    const b = board;
+    const o = selectedObj;
+    const target = termTarget;
+    if (b === null || o === null || o.at === null || o.size === null || target === null) return;
+    if (snapshotBusy) return;
+    const pageId = b.pages[page]?.id ?? `page-${page + 1}`;
+    const rel = wsRoot !== null ? workspaceRelative(path, wsRoot) : path;
+    const context = composeBoardContext(rel, pageId, [o.id]);
+    const region = snapshotRegion([{ at: o.at, size: o.size }], b.canvas);
+    if (region === null) return;
+    snapshotBusy = true;
+    try {
+      const canvas = await snapshotCanvas(region);
+      const blob =
+        canvas === null
+          ? null
+          : await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/png"));
+      if (blob === null) {
+        showToast("snapshot failed");
+        return;
+      }
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[-:]/g, "")
+        .replace(/\..+$/, "")
+        .replace("T", "-");
+      const upload = await uploadToSession(target.id, blob, `board-${o.id}-${stamp}.png`);
+      const copied = await copyText(`${context}@${upload.path}`);
+      showToast(
+        copied
+          ? `copied snapshot path for ${target.name}`
+          : "snapshot uploaded — clipboard unavailable",
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "snapshot upload failed");
+    } finally {
+      snapshotBusy = false;
+    }
+  }
+
+  /** One affordance, two targets: the chat composer, or the TUI clipboard. */
+  function sendSelection(): void {
+    if (canSendToChat) void sendSelectionToChat();
+    else if (canCopyForTerm) void copySnapshotPathForTerm();
+  }
+
   // Pane-local keys, same focus-containment pattern as the undo chord: Enter
   // opens the inline editor on a selected text-bearing object; the pinned
   // reference chord (⇧⌘R) sends the selection to the chat composer. Interactive
@@ -638,9 +860,13 @@
         }
         return;
       }
-      if (matchChord(ev, REFERENCE_CHORD) !== null && !ev.defaultPrevented && canSendToChat) {
+      if (
+        matchChord(ev, REFERENCE_CHORD) !== null &&
+        !ev.defaultPrevented &&
+        (canSendToChat || canCopyForTerm)
+      ) {
         ev.preventDefault();
-        void sendSelectionToChat();
+        sendSelection();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -711,6 +937,9 @@
     chromeVisible = true;
     selected = null;
     drag = null;
+    pinMode = false;
+    pinDraft = null;
+    openPin = null;
     const el = rootEl;
     // Full-bleed within the pane works regardless; browser fullscreen is a
     // progressive upgrade the browser may refuse. Exit is handled by the
@@ -822,6 +1051,7 @@
          to the same objects goes through the outline rail's real buttons. -->
     <div
       class="stage"
+      class:pinning={pinMode && !presenting}
       role="presentation"
       bind:this={stageEl}
       onpointerdown={onPointerDown}
@@ -864,6 +1094,71 @@
               style:height={`${f.size[1] * ptScale}px`}
             ></div>
           {/each}
+          <!-- Comment pins (§6.4): numbered dots from the journal, never the
+               board file. Object-bound dots ride the object's frame corner so
+               they track moves; point pins sit at their stored point. Their
+               chrome stops pointer propagation so a click never selects or
+               drags the stage underneath. -->
+          {#each pagePins as p, i (p.pin)}
+            {@const anchor = pinAnchor(p, pageObjects)}
+            {#if anchor !== null}
+              <button
+                class="pin-dot"
+                class:open={openPin === p.pin}
+                style:left={`${stageOrigin[0] + anchor[0] * ptScale - 9}px`}
+                style:top={`${stageOrigin[1] + anchor[1] * ptScale - 9}px`}
+                aria-label={`comment ${p.pin}: ${p.text}`}
+                title={p.text}
+                onpointerdown={(e) => e.stopPropagation()}
+                ondblclick={(e) => e.stopPropagation()}
+                onclick={() => (openPin = openPin === p.pin ? null : p.pin)}
+              >{i + 1}</button>
+              {#if openPin === p.pin}
+                <div
+                  class="pin-pop"
+                  role="presentation"
+                  style:left={`${stageOrigin[0] + anchor[0] * ptScale + 12}px`}
+                  style:top={`${stageOrigin[1] + anchor[1] * ptScale + 12}px`}
+                  onpointerdown={(e) => e.stopPropagation()}
+                  ondblclick={(e) => e.stopPropagation()}
+                >
+                  <div class="pin-pop-text">{p.text}</div>
+                  <div class="pin-pop-bar">
+                    <span class="pin-pop-meta"
+                      >{p.pin} · {p.actor}{p.object !== null ? ` · ${p.object}` : ""}</span
+                    >
+                    <button
+                      class="pin-resolve"
+                      disabled={pinBusy}
+                      onclick={() => void resolvePin(p.pin)}>resolve</button
+                    >
+                  </div>
+                </div>
+              {/if}
+            {/if}
+          {/each}
+          {#if pinDraft !== null}
+            <div
+              class="pin-draft"
+              role="presentation"
+              style:left={`${stageOrigin[0] + pinDraft.at[0] * ptScale}px`}
+              style:top={`${stageOrigin[1] + pinDraft.at[1] * ptScale}px`}
+              onpointerdown={(e) => e.stopPropagation()}
+              ondblclick={(e) => e.stopPropagation()}
+            >
+              <input
+                bind:this={pinInputEl}
+                bind:value={pinDraftText}
+                maxlength="500"
+                placeholder={pinDraft.object !== null
+                  ? `comment on ${pinDraft.object}…`
+                  : "comment…"}
+                aria-label="comment pin text (Enter pins, Esc cancels)"
+                spellcheck="false"
+                onkeydown={onPinDraftKey}
+              />
+            </div>
+          {/if}
           {#if textEdit !== null && editorBox !== null}
             <!-- The overlay covers the object's rendered text at the same
                  frame; the styling is deliberately editor-chrome, not a
@@ -935,10 +1230,27 @@
         {/if}
         <button
           class="nav wide"
-          disabled={!canSendToChat}
-          onclick={() => void sendSelectionToChat()}
-          aria-label="send selection to chat"
-          title={sendTitle}>{snapshotBusy ? "sending…" : "send to chat"}</button
+          class:armed={pinMode}
+          onclick={() => {
+            pinMode = !pinMode;
+            if (!pinMode) pinDraft = null;
+          }}
+          aria-pressed={pinMode}
+          aria-label="drop a comment pin"
+          title="comment pin: click the stage to drop a numbered note (journal-only — never the board file)"
+          >pin</button
+        >
+        <button
+          class="nav wide"
+          disabled={!canSendToChat && !canCopyForTerm}
+          onclick={sendSelection}
+          aria-label={chatTarget !== null ? "send selection to chat" : "copy snapshot path"}
+          title={sendTitle}
+          >{snapshotBusy
+            ? "sending…"
+            : chatTarget === null && termTarget !== null
+              ? "copy snapshot path"
+              : "send to chat"}</button
         >
         <button class="nav wide" onclick={enterPresent} aria-label="present" title="present"
           >present</button
@@ -1073,6 +1385,102 @@
     .flash {
       animation: none;
     }
+  }
+  .stage.pinning {
+    cursor: crosshair;
+  }
+  .pin-dot {
+    position: absolute;
+    z-index: 2;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1.5px solid var(--term-bg);
+    border-radius: 50% 50% 50% 4px;
+    background: var(--accent);
+    color: var(--term-bg);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    box-shadow: 0 1px 4px var(--scrim);
+  }
+  .pin-dot:hover,
+  .pin-dot.open {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  .pin-pop {
+    position: absolute;
+    z-index: 3;
+    min-width: 160px;
+    max-width: 260px;
+    padding: 8px 10px;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px var(--scrim);
+    font-size: var(--text-xs);
+    color: var(--fg);
+  }
+  .pin-pop-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .pin-pop-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .pin-pop-meta {
+    flex: 1;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  .pin-resolve {
+    background: none;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    color: var(--fg);
+    padding: 1px 8px;
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .pin-resolve:not(:disabled):hover {
+    background: var(--row-hover);
+  }
+  .pin-resolve:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  .pin-draft {
+    position: absolute;
+    z-index: 3;
+  }
+  .pin-draft input {
+    width: 220px;
+    padding: 4px 8px;
+    background: var(--term-bg);
+    color: var(--fg);
+    border: 1.5px solid var(--accent);
+    border-radius: 4px;
+    outline: none;
+    font-size: var(--text-xs);
+    font-family: inherit;
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent),
+      0 2px 12px var(--scrim);
+  }
+  .nav.armed {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--term-bg);
+  }
+  .nav.armed:not(:disabled):hover {
+    background: var(--accent);
   }
   .rendering-dot {
     position: absolute;

@@ -455,6 +455,13 @@ pub fn tier_of(object: &Object) -> (ExportTier, &'static str) {
                 (ExportTier::Raster, "raster pixels at placed size")
             }
         }
+        // The plan's degradation contract pins equation v1 to "picture" at
+        // every slide target; the svgBlip beside the PNG is picture-quality
+        // enhancement, not a tier change.
+        Object::Equation(_) => (
+            ExportTier::Raster,
+            "equation exports as a picture (PNG + svgBlip); native OMML is a later arm",
+        ),
         // A group takes its lowest child's tier (and that child's reason):
         // one rasterized member drags the whole group's fate down, which is
         // exactly what the census must surface.
@@ -590,6 +597,10 @@ mod tests {
             (
                 r#"{"id":"ir","type":"image","src":"assets/shot.png"}"#,
                 ExportTier::Raster,
+            ),
+            (
+                r#"{"id":"eq","type":"equation","tex":"x^2","alt":"x^2"}"#,
+                ExportTier::Raster, // picture; the reason names the OMML arm
             ),
             (
                 r#"{"id":"u","type":"hologram"}"#,

@@ -319,6 +319,45 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
                         }
                     }
                 }
+                // The one named C6 exception: an equation is notation, not
+                // prose, so it never counts as verified text — but the
+                // carve-out requires the LaTeX to travel as alt, and the TeX
+                // itself must compile or the render is a placeholder.
+                Object::Equation(eq) => {
+                    if eq.alt.trim().is_empty() {
+                        diags.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                "equation alt is empty; the C6 picture exception requires alt \
+                                 carrying the LaTeX source",
+                            )
+                            .at(&page.id, &eq.id)
+                            .field("alt"),
+                        );
+                    }
+                    if eq.tex.trim().is_empty() {
+                        diags.push(
+                            Diagnostic::new(Severity::Error, "equation tex is empty")
+                                .at(&page.id, &eq.id)
+                                .field("tex"),
+                        );
+                    } else if let Err(e) = crate::equation::render_tex_svg(
+                        &eq.tex,
+                        eq.em_size.unwrap_or_else(|| theme.body().size),
+                    ) {
+                        // A build without the math feature cannot verify the
+                        // TeX; that is a warning, not a claim the TeX is bad.
+                        let (sev, msg) = if e == crate::equation::MISSING_FEATURE {
+                            (Severity::Warning, format!("cannot verify tex: {e}"))
+                        } else {
+                            (
+                                Severity::Error,
+                                format!("tex does not compile ({e}); it renders as a placeholder"),
+                            )
+                        };
+                        diags.push(Diagnostic::new(sev, msg).at(&page.id, &eq.id).field("tex"));
+                    }
+                }
                 Object::Inset(inset) => match by_id.get(inset.of.object.as_str()) {
                     None => diags.push(
                         Diagnostic::new(
@@ -516,8 +555,12 @@ pub fn lint_target(
                     "stroke.width",
                     &mut diags,
                 ),
+                // An equation is the C6 exception: notation lands as a
+                // picture, so it contributes no verified text and no role
+                // floor — its TeX is checked by the legality lint instead.
                 Object::Group(_)
                 | Object::Diagram(_)
+                | Object::Equation(_)
                 | Object::PanelLabel(_)
                 | Object::SigBracket(_)
                 | Object::Legend(_)
@@ -1658,6 +1701,109 @@ mod tests {
             .unwrap();
         assert!(w.message.contains("2000"), "{}", w.message);
         assert!(w.message.contains("960×540"), "{}", w.message);
+    }
+
+    // --- equations (the C6 exception) --------------------------------------
+
+    #[test]
+    fn an_empty_equation_alt_is_an_error_naming_the_c6_condition() {
+        let diags = linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[100,50],
+                "tex":"x^2","alt":"  "}"#,
+        );
+        let e = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.field.as_deref() == Some("alt"))
+            .expect("an empty-alt error");
+        assert!(e.message.contains("LaTeX source"), "{}", e.message);
+        assert_eq!(e.object.as_deref(), Some("eq"));
+    }
+
+    #[test]
+    fn an_empty_equation_tex_is_an_error() {
+        let diags = linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[100,50],
+                "tex":"","alt":"nothing"}"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.field.as_deref() == Some("tex")
+                && d.message.contains("empty")),
+            "{diags:?}"
+        );
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn tex_that_does_not_compile_is_a_lint_error_with_the_reason() {
+        let diags = linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[100,50],
+                "tex":"x \\right)","alt":"broken"}"#,
+        );
+        let e = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.field.as_deref() == Some("tex"))
+            .expect("a compile error");
+        assert!(e.message.contains("TeX error"), "{}", e.message);
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn a_well_formed_equation_lints_clean() {
+        let diags = linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[100,50],
+                "tex":"\\sum_{i=1}^{n} x_i","alt":"sum of x_i"}"#,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[cfg(not(feature = "math"))]
+    #[test]
+    fn without_the_math_feature_tex_verification_degrades_to_a_warning() {
+        let diags = linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[100,50],
+                "tex":"x^2","alt":"x squared"}"#,
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.message.contains("cannot verify tex")),
+            "{diags:?}"
+        );
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn an_equation_is_not_counted_as_verified_text_by_the_target_lint() {
+        // The C6 exception: notation exports as a picture, so the target
+        // lint applies no role floor and no font-resolution requirement to
+        // it — a target-linted board holding only an equation stays clean,
+        // where a text object would put its role on the census.
+        let diags = target_linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[200,100],
+                "tex":"\\hat{\\beta}","alt":"beta hat"}"#,
+            "talk-light",
+            "talk-16x9",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        // At a venue whose export floor is Vector, the census flags the
+        // picture fate exactly as it does any raster — the C6 carve-out is
+        // about text accounting, never a fidelity exemption.
+        let diags = target_linted(
+            r#"{"id":"eq","type":"equation","at":[0,0],"size":[200,100],
+                "tex":"\\hat{\\beta}","alt":"beta hat"}"#,
+            "figure-light",
+            "pub-nature-single",
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("floors exports at")
+                && d.message.contains("OMML")),
+            "{diags:?}"
+        );
     }
 
     // --- lint --target -----------------------------------------------------

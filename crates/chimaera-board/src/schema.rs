@@ -239,6 +239,7 @@ pub enum Object {
     Table(TableObject),
     Chart(ChartObject),
     Diagram(DiagramObject),
+    Equation(EquationObject),
     PanelLabel(PanelLabelObject),
     Scalebar(ScalebarObject),
     SigBracket(SigBracketObject),
@@ -272,6 +273,7 @@ impl Object {
             Object::Table(o) => &o.id,
             Object::Chart(o) => &o.id,
             Object::Diagram(o) => &o.id,
+            Object::Equation(o) => &o.id,
             Object::PanelLabel(o) => &o.id,
             Object::Scalebar(o) => &o.id,
             Object::SigBracket(o) => &o.id,
@@ -294,6 +296,7 @@ impl Object {
             Object::Table(_) => "table",
             Object::Chart(_) => "chart",
             Object::Diagram(_) => "diagram",
+            Object::Equation(_) => "equation",
             Object::PanelLabel(_) => "panelLabel",
             Object::Scalebar(_) => "scalebar",
             Object::SigBracket(_) => "sigBracket",
@@ -318,6 +321,7 @@ impl Object {
             Object::Table(o) => (o.at, o.size),
             Object::Chart(o) => (o.at, o.size),
             Object::Diagram(o) => (o.at, o.size),
+            Object::Equation(o) => (o.at, o.size),
             Object::PanelLabel(o) => (o.at, o.size),
             Object::Legend(o) => (o.at, o.size),
             Object::Colorbar(o) => (o.at, o.size),
@@ -346,6 +350,7 @@ impl Object {
             Object::Table(o) => o.at = Some(at),
             Object::Chart(o) => o.at = Some(at),
             Object::Diagram(o) => o.at = Some(at),
+            Object::Equation(o) => o.at = Some(at),
             Object::PanelLabel(o) => o.at = Some(at),
             Object::Scalebar(o) => o.at = Some(at),
             Object::Legend(o) => o.at = Some(at),
@@ -365,6 +370,7 @@ impl Object {
             Object::Table(o) => o.size = Some(size),
             Object::Chart(o) => o.size = Some(size),
             Object::Diagram(o) => o.size = Some(size),
+            Object::Equation(o) => o.size = Some(size),
             Object::PanelLabel(o) => o.size = Some(size),
             Object::Legend(o) => o.size = Some(size),
             Object::Colorbar(o) => o.size = Some(size),
@@ -388,6 +394,7 @@ impl Object {
             Object::Table(o) => o.slot.as_deref(),
             Object::Chart(o) => o.slot.as_deref(),
             Object::Diagram(o) => o.slot.as_deref(),
+            Object::Equation(o) => o.slot.as_deref(),
             Object::Group(_)
             | Object::Connector(_)
             | Object::PanelLabel(_)
@@ -441,6 +448,7 @@ impl Serialize for Object {
             Object::Table(o) => o.serialize(s),
             Object::Chart(o) => o.serialize(s),
             Object::Diagram(o) => o.serialize(s),
+            Object::Equation(o) => o.serialize(s),
             Object::PanelLabel(o) => o.serialize(s),
             Object::Scalebar(o) => o.serialize(s),
             Object::SigBracket(o) => o.serialize(s),
@@ -495,6 +503,7 @@ impl<'de> Deserialize<'de> for Object {
             "table" => try_variant!(TableObject, Object::Table),
             "chart" => try_variant!(ChartObject, Object::Chart),
             "diagram" => try_variant!(DiagramObject, Object::Diagram),
+            "equation" => try_variant!(EquationObject, Object::Equation),
             "panelLabel" => try_variant!(PanelLabelObject, Object::PanelLabel),
             "scalebar" => try_variant!(ScalebarObject, Object::Scalebar),
             "sigBracket" => try_variant!(SigBracketObject, Object::SigBracket),
@@ -549,6 +558,7 @@ kind_field!(GroupKind, "group");
 kind_field!(TableKind, "table");
 kind_field!(ChartKind, "chart");
 kind_field!(DiagramKind, "diagram");
+kind_field!(EquationKind, "equation");
 kind_field!(PanelLabelKind, "panelLabel");
 kind_field!(ScalebarKind, "scalebar");
 kind_field!(SigBracketKind, "sigBracket");
@@ -998,6 +1008,40 @@ impl TableObject {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Equation
+// ---------------------------------------------------------------------------
+
+/// LaTeX math typeset to a picture (docs/board-plan.md: the one named C6
+/// exception — an equation is *notation*, not prose). `alt` is **required**:
+/// the carve-out only holds because the LaTeX source always travels with the
+/// picture, so an equation without `alt` fails parse into [`Object::Unknown`]
+/// exactly like any other malformed known type. The native OMML export arm is
+/// deliberately not built in v1; every target gets the picture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquationObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: EquationKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// The LaTeX source (math mode, display style; no surrounding `$`).
+    pub tex: String,
+    /// Typeset size in points, independent of the placed `size` (which only
+    /// bounds the fitted picture). Defaults to the theme's body role size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub em_size: Option<f64>,
+    /// Required alt text carrying the LaTeX source — the C6 condition.
+    pub alt: String,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,6 +1811,47 @@ mod tests {
         };
         assert_eq!(rich.runs[0].b, Some(false));
         assert_eq!(rich.runs[1].b, Some(true));
+    }
+
+    #[test]
+    fn an_equation_round_trips_byte_stably_with_canonical_key_order() {
+        let raw = r#"{"id":"eq1","type":"equation","at":[80,80],"size":[240,80],"tex":"E = mc^2","emSize":14,"alt":"E = mc^2","futureKnob":7}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Equation(eq) = &obj else {
+            panic!("expected equation, got {obj:?}")
+        };
+        assert_eq!(eq.tex, "E = mc^2");
+        assert_eq!(eq.em_size, Some(14.0));
+        assert_eq!(eq.alt, "E = mc^2");
+        assert_eq!(eq.extra.get("futureKnob").unwrap(), &Value::from(7));
+        // Canonical key order is declaration order — byte-stable round-trip.
+        let back = serde_json::to_string(&obj).unwrap();
+        assert_eq!(
+            back,
+            r#"{"id":"eq1","type":"equation","at":[80.0,80.0],"size":[240.0,80.0],"tex":"E = mc^2","emSize":14.0,"alt":"E = mc^2","futureKnob":7}"#
+        );
+    }
+
+    #[test]
+    fn an_equation_without_alt_fails_parse_into_unknown_with_a_reason() {
+        // The C6 carve-out: an equation must carry its LaTeX as alt text.
+        let raw = r#"{"id":"eq1","type":"equation","at":[0,0],"size":[10,10],"tex":"x"}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        match &obj {
+            Object::Unknown(u) => {
+                assert_eq!(u.kind, "equation");
+                assert!(
+                    u.error.as_deref().is_some_and(|e| e.contains("alt")),
+                    "the reason names the missing field: {:?}",
+                    u.error
+                );
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // And `tex` is just as required.
+        let raw = r#"{"id":"eq1","type":"equation","alt":"x"}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        assert!(matches!(&obj, Object::Unknown(u) if u.error.is_some()));
     }
 
     #[test]

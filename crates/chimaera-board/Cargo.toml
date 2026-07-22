@@ -47,8 +47,22 @@ pdf-writer = "0.12"
 # pure-Rust PDF rasterizer. Its default features embed the 14 standard PDF
 # fonts + CMaps, so text in plotting-tool PDFs renders without a resolver.
 hayro = { version = "0.7", optional = true }
+# The `equation` object (`math` feature, on by default): mathtex is a pure-Rust
+# TeX layout engine (the real xetex core through Web2C/C2Rust) whose SVG
+# backend emits glyph outlines through the same rustybuzz/ttf-parser pair
+# pinned above — no second text stack, no system TeX. src/equation.rs drives
+# it formatless (ini-xetex + a curated math prelude + one bundled OpenType
+# MATH font under fonts/), so the daemon stays one static binary.
+mathtex = { version = "0.1.0", optional = true }
 
 [features]
+default = ["math"]
+# The `equation` object: LaTeX math typeset to glyph-outline SVG
+# (src/equation.rs). On by default — the plan treats equation as core
+# vocabulary — but skippable (`--no-default-features`) for a build that can
+# spare the engine + bundled STIX Two Math font (~2.4 MB of binary). The
+# schema, ceilings and the missing-feature refusal compile in every build.
+math = ["dep:mathtex"]
 # `board import fig.pdf`: rasterize one PDF page into an image asset
 # (src/pdfimport.rs). Off by default — hayro's interpreter stack is real
 # weight on the static musl binary, and most figure flows export SVG/PNG.

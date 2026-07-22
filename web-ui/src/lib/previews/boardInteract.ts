@@ -8,6 +8,8 @@
  * numbers, and every mutation still routes through POST /board/edit.
  */
 
+import type { BoardJournalEvent } from "./files";
+
 /** The design grid (mirrors the daemon's normalize()); client snaps match it
  *  exactly so an optimistic value never disagrees with the written file. */
 export const GRID_PT = 8;
@@ -188,6 +190,87 @@ export function snapshotRegion(
 export interface Frame {
   at: [number, number];
   size: [number, number];
+}
+
+// --- comment pins (§6.4: journal-only, never the board file) -----------------
+
+/** One unresolved comment pin, reduced from the journal. */
+export interface PinInfo {
+  pin: string;
+  seq: number;
+  actor: string;
+  page: string;
+  /** Bound object id, or null for a point pin. */
+  object: string | null;
+  /** Stored canvas point — where a point pin sits, and the fallback anchor
+   *  for an object-bound pin whose object has since been removed. */
+  at: [number, number] | null;
+  text: string;
+}
+
+/**
+ * Reduce the journal (oldest first) to its unresolved pins: a `comment`
+ * opens a pin, a `comment-resolved` closes it. Order-aware on purpose — a
+ * resolve only clears the incarnations before it, so a re-used pin id after
+ * its resolution is a fresh, open pin (the same rule the journal's own
+ * compaction applies). Returned in seq order, which is also the overlay's
+ * numbering order.
+ */
+export function unresolvedPins(events: BoardJournalEvent[]): PinInfo[] {
+  const open = new Map<string, PinInfo>();
+  for (const ev of events) {
+    if (typeof ev.pin !== "string") continue;
+    if (ev.event === "comment") {
+      open.set(ev.pin, {
+        pin: ev.pin,
+        seq: ev.seq,
+        actor: ev.actor,
+        page: typeof ev.page === "string" ? ev.page : "",
+        object: typeof ev.object === "string" ? ev.object : null,
+        at:
+          Array.isArray(ev.at) && ev.at.length === 2
+            ? [Number(ev.at[0]), Number(ev.at[1])]
+            : null,
+        text: typeof ev.text === "string" ? ev.text : "",
+      });
+    } else if (ev.event === "comment-resolved") {
+      open.delete(ev.pin);
+    }
+  }
+  return [...open.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/**
+ * The next pin id to mint: `c<n>` past the highest `c<digits>` id anywhere in
+ * the journal — resolved pins included, so a fresh pin never collides with a
+ * still-visible resolve marker for an older incarnation.
+ */
+export function nextPinId(events: BoardJournalEvent[]): string {
+  let max = 0;
+  for (const ev of events) {
+    if (ev.event !== "comment" && ev.event !== "comment-resolved") continue;
+    if (typeof ev.pin !== "string") continue;
+    const m = /^c(\d+)$/.exec(ev.pin);
+    if (m !== null) max = Math.max(max, Number(m[1]));
+  }
+  return `c${max + 1}`;
+}
+
+/**
+ * Where a pin's dot anchors, in board points. An object-bound pin rides its
+ * object's top-right frame corner — the file's own literal geometry, so the
+ * dot tracks moves/resizes for free; if the object has since been removed it
+ * falls back to the stored point. A point pin sits at its stored point. Null
+ * (nothing to anchor to) means the dot is not drawn.
+ */
+export function pinAnchor(pin: PinInfo, objects: ObjInfo[]): [number, number] | null {
+  if (pin.object !== null) {
+    const o = objects.find((x) => x.id === pin.object);
+    if (o !== undefined && o.at !== null && o.size !== null) {
+      return [o.at[0] + o.size[0], o.at[1]];
+    }
+  }
+  return pin.at;
 }
 
 /** Float-tolerant tuple equality (values are 8 pt multiples in practice). */

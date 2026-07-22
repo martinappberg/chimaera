@@ -809,3 +809,42 @@ fn write_sidecar(
         let _ = chimaera_board::write_atomic(sidecar, &bytes);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The POST /board/journal body is validated purely by deserializing
+    /// [`JournalAppendRequest`], so the §6.4 comment-pin vocabulary must
+    /// parse exactly as the pane sends it — and an unknown op must not.
+    #[test]
+    fn journal_append_accepts_the_comment_pin_vocabulary() {
+        let req: JournalAppendRequest = serde_json::from_str(
+            r#"{"path":"/w/fig2.board.json","actor":"human","event":"comment","page":"bench","object":"callout","at":[320,96],"pin":"c1","text":"say the median"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.actor, chimaera_board::journal::Actor::Human);
+        assert!(matches!(
+            req.event,
+            chimaera_board::journal::EventKind::Comment { ref pin, ref object, .. }
+                if pin == "c1" && object.as_deref() == Some("callout")
+        ));
+
+        let req: JournalAppendRequest = serde_json::from_str(
+            r#"{"path":"/w/fig2.board.json","actor":"human","event":"comment-resolved","pin":"c1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req.event,
+            chimaera_board::journal::EventKind::CommentResolved { ref pin } if pin == "c1"
+        ));
+
+        assert!(
+            serde_json::from_str::<JournalAppendRequest>(
+                r#"{"path":"/w/fig2.board.json","actor":"human","event":"from-the-future"}"#,
+            )
+            .is_err(),
+            "an unknown op never reaches the journal file"
+        );
+    }
+}

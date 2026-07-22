@@ -247,8 +247,13 @@ pub fn page_metrics(page: &Page) -> ContentMetrics {
             }
             Object::Shape(_) => m.object_count += 1,
             // A table is panel-like content: it claims a body slot exactly as
-            // a chart does, so it counts as a visual for layout selection.
-            Object::Chart(_) | Object::Image(_) | Object::Diagram(_) | Object::Table(_) => {
+            // a chart does, so it counts as a visual for layout selection —
+            // and an equation is a placed picture, the same kind of claim.
+            Object::Chart(_)
+            | Object::Image(_)
+            | Object::Diagram(_)
+            | Object::Table(_)
+            | Object::Equation(_) => {
                 m.object_count += 1;
                 m.has_chart_or_image = true;
             }
@@ -332,6 +337,7 @@ pub fn anchor_of(obj: &Object) -> Option<&Anchor> {
         Object::Group(_)
         | Object::Table(_)
         | Object::Connector(_)
+        | Object::Equation(_)
         | Object::Scalebar(_)
         | Object::SigBracket(_)
         | Object::Legend(_)
@@ -352,6 +358,7 @@ fn explicit_size(obj: &Object) -> Option<[f64; 2]> {
         Object::Table(o) => o.size,
         Object::Chart(o) => o.size,
         Object::Diagram(o) => o.size,
+        Object::Equation(o) => o.size,
         // An anchored letter needs *a* box before its glyph is measured; the
         // nominal keeps `inside-top-left` (the typical binding) exact.
         Object::PanelLabel(o) => o.size.or(Some(crate::composites::PANEL_LABEL_NOMINAL)),
