@@ -149,9 +149,15 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   buffer — same origin-less isolation, but relative assets only load in the authoritative `/raw`
   preview, so that mode stays the fidelity reference.
   PDF metadata arrives progressively so the first pages paint before a long document is scanned;
-  rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Closing or evicting a PDF
-  cancels its active pdf.js raster tasks, text layers, delayed rerenders, and restoration frame
-  before destroying the document worker, so invisible work cannot keep a pane or webview busy.
+  rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Selectable text is a bounded
+  enhancement: a page over 5,000 text items stays canvas-only, and the viewer keeps at most 12,000
+  text items across retained pages; the toolbar says `selection limited` when either ceiling is hit.
+  This protects highly-compressed vector plots whose small PDF stream expands into tens of thousands
+  of browser nodes. Concurrent preview mounts also share and await one in-flight raw-file ticket, so
+  the first mount cannot observe an unfinished URL mint and require a second open. Closing or
+  evicting a PDF cancels its active pdf.js raster tasks, text reads, text layers, delayed rerenders,
+  and restoration frame before destroying the document worker, so invisible work cannot keep a pane
+  or webview busy.
 - **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
   chunks. The entry document is never cached and is stamped with the source build that served it,
   so a later health response cannot mistake a replacement daemon for that document's build. Vite's
