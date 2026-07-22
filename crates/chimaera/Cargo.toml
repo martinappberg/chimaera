@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 nix.workspace = true
 open.workspace = true
 mimalloc.workspace = true
+chimaera-board.workspace = true
 chimaera-core.workspace = true
 chimaera-remote.workspace = true
 chimaera-server.workspace = true

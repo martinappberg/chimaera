@@ -1,3 +1,4 @@
+mod board;
 mod compute;
 mod connect;
 mod daemonize;
@@ -83,6 +84,11 @@ enum Command {
     Compute {
         #[command(subcommand)]
         cmd: ComputeCmd,
+    },
+    /// Boards: compose, render, and read back .board.json visual surfaces.
+    Board {
+        #[command(subcommand)]
+        cmd: board::BoardCmd,
     },
 }
 
@@ -193,6 +199,7 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             update_daemon,
         } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
         Command::Doctor => doctor::run(),
+        Command::Board { cmd } => board::run(cmd),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
             Ok(())
