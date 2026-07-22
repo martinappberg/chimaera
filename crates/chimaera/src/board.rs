@@ -101,10 +101,12 @@ pub enum BoardCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Import a mermaid flowchart as a `diagram` object appended to a board.
-    /// Converted once — the mermaid source rides along as provenance.
+    /// Import a figure (.svg/.png/.jpg → an `image` object, copied into
+    /// .chimaera/board/assets/) or a mermaid flowchart (.mmd → a `diagram`
+    /// object, converted once with the source as provenance), appended to a
+    /// board.
     Import {
-        /// The mermaid file, or `-` for stdin.
+        /// The figure or mermaid file, or `-` for mermaid on stdin.
         path: PathBuf,
         /// The board to append to; created with one page when it does not
         /// exist yet.
@@ -113,9 +115,53 @@ pub enum BoardCmd {
         /// Page id to append to; the first page when omitted.
         #[arg(long)]
         page: Option<String>,
-        /// Object id for the diagram; the mermaid file's stem when omitted.
+        /// Object id; the file's stem when omitted.
         #[arg(long)]
         id: Option<String>,
+        /// Recorded regenerate command for a figure import (overrides an
+        /// `<!-- chimaera:regen ... -->` comment inside an SVG).
+        #[arg(long)]
+        regen: Option<String>,
+    },
+    /// Adopt a shown card into the workspace: move it to
+    /// boards/<id>.board.json (git-visible — that is the point), or append
+    /// its pages to an existing board with --to.
+    Adopt {
+        /// A shown card id (resolves .chimaera/board/shown/<id>.board.json)
+        /// or a path to a board file.
+        shown_id_or_path: String,
+        /// An existing board to append the adopted pages to, instead of
+        /// moving the file.
+        #[arg(long)]
+        to: Option<PathBuf>,
+    },
+    /// Export a theme for external plotting code: the theme JSON as bundled,
+    /// or a matplotlib style file mapping the theme's numbers.
+    ThemeExport {
+        /// Theme id or path (talk-dark, talk-light, figure-light, or a
+        /// .theme.json path).
+        theme_id: String,
+        /// Format: json | mplstyle.
+        #[arg(long)]
+        format: String,
+        /// Write here instead of stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Mechanically recolor an existing SVG onto a theme: its most frequent
+    /// fill/stroke colors map to @bg, @body, and the categorical ramp. This
+    /// is best-effort — prefer regenerating the figure on-theme
+    /// (provenance.regen) when a script exists; rescheme is for what you
+    /// cannot regenerate.
+    Rescheme {
+        /// The SVG file to recolor.
+        path: PathBuf,
+        /// Theme id or path.
+        #[arg(long)]
+        theme: String,
+        /// Output SVG; defaults to <stem>-<theme>.svg beside the input.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// Print the agent-facing description: every object, its position, its
     /// content, in the same points the file uses.
@@ -138,6 +184,48 @@ pub enum BoardCmd {
         /// canvas.target when set; plain legality lint otherwise.
         #[arg(long)]
         target: Option<String>,
+        /// Append the style profile: measured near-miss findings (alignment,
+        /// spacing, off-grid, overfull/underfull, margins, budgets) over
+        /// resolved frames.
+        #[arg(long)]
+        style: bool,
+        /// Escalate the measured style findings from warnings to errors.
+        #[arg(long)]
+        strict: bool,
+        /// Repair the mechanically-unambiguous classes first (clamp
+        /// off-canvas, raise sub-floor run overrides, snap near-miss edges,
+        /// snap to the grid), save canonically, and print each fix.
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Align, distribute, or grid a set of objects by id. Runs as the agent's
+    /// hand: moves are journaled with actor `agent`.
+    Arrange {
+        path: PathBuf,
+        /// One of: align-left | align-right | align-top | align-bottom |
+        /// align-center-h | align-center-v | distribute-h | distribute-v |
+        /// grid. Aligns snap to the FIRST id's edge; distributes equalize
+        /// gaps between the spatial extremes.
+        #[arg(long)]
+        op: String,
+        /// Comma-separated object ids, in order (grid fills row-major in
+        /// this order).
+        #[arg(long)]
+        ids: String,
+        /// Grid gap in points; defaults to the theme's gap.
+        #[arg(long)]
+        gap: Option<f64>,
+        /// Grid column count; defaults to the squarest fit.
+        #[arg(long)]
+        cols: Option<usize>,
+    },
+    /// Validate a theme beyond WCAG contrast: the OKLCH lightness band, the
+    /// chroma floor, and all-pairs CVD ΔE ≥ 8 under Machado 2009 over the
+    /// categorical ramp — printing the computed safe series cap.
+    ValidateTheme {
+        /// Theme id or path (talk-dark, talk-light, figure-light, or a
+        /// .theme.json path).
+        theme_id: String,
     },
 }
 
@@ -172,7 +260,23 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             page,
             out,
         } => export(&path, &format, page, out),
-        BoardCmd::Import { path, to, page, id } => import_mermaid(&path, &to, page, id),
+        BoardCmd::Import {
+            path,
+            to,
+            page,
+            id,
+            regen,
+        } => import(&path, &to, page, id, regen),
+        BoardCmd::Adopt {
+            shown_id_or_path,
+            to,
+        } => adopt(&shown_id_or_path, to),
+        BoardCmd::ThemeExport {
+            theme_id,
+            format,
+            out,
+        } => theme_export(&theme_id, &format, out),
+        BoardCmd::Rescheme { path, theme, out } => rescheme(&path, &theme, out),
         BoardCmd::Describe { path } => {
             let board = load_normalized(&path)?.0;
             let summary = chimaera_board::journal::summary(&journal_path_for(&path));
@@ -187,7 +291,18 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             path,
             theme,
             target,
-        } => lint(&path, theme, target),
+            style,
+            strict,
+            fix,
+        } => lint(&path, theme, target, style, strict, fix),
+        BoardCmd::Arrange {
+            path,
+            op,
+            ids,
+            gap,
+            cols,
+        } => arrange(&path, &op, &ids, gap, cols),
+        BoardCmd::ValidateTheme { theme_id } => validate_theme(&theme_id),
     }
 }
 
@@ -596,22 +711,7 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
             .unwrap_or_else(|| "diagram".to_string())
     });
 
-    if !chimaera_board::is_board_path(to) {
-        bail!(
-            "a board path ends in .board.json — try {}",
-            to.with_extension("board.json").display()
-        );
-    }
-    let mut board = if to.exists() {
-        chimaera_board::load(to)?
-    } else {
-        let title = to
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
-            .unwrap_or_else(|| "Untitled".to_string());
-        chimaera_board::Board::new(title, chimaera_board::Canvas::default())
-    };
+    let mut board = load_or_create_board(to)?;
 
     // The diagram fills the canvas minus a margin; layout inside is computed
     // at render, so this box is all the geometry an import needs.
@@ -622,19 +722,7 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
         (board.canvas.height() - m * 2.0).max(160.0),
     ]);
 
-    let page_index = match &page {
-        Some(pid) => board
-            .pages
-            .iter()
-            .position(|p| &p.id == pid)
-            .with_context(|| format!("no page {pid:?} in {}", to.display()))?,
-        None => {
-            if board.pages.is_empty() {
-                board.pages.push(chimaera_board::Page::new("page-1"));
-            }
-            0
-        }
-    };
+    let page_index = resolve_page_index(&mut board, page.as_deref(), to)?;
     // Ids are the merge and journal key — refuse rather than auto-rename.
     if board.objects().any(|(_, o)| o.id() == diagram.id) {
         bail!(
@@ -671,14 +759,934 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
     Ok(())
 }
 
-fn lint(path: &Path, theme_ref: Option<String>, target: Option<String>) -> Result<()> {
-    let (board, mut diags) = load_normalized(path)?;
+/// Load `to`, or start a fresh one-page board when it does not exist yet —
+/// the shared front half of every import.
+fn load_or_create_board(to: &Path) -> Result<chimaera_board::Board> {
+    if !chimaera_board::is_board_path(to) {
+        bail!(
+            "a board path ends in .board.json — try {}",
+            to.with_extension("board.json").display()
+        );
+    }
+    if to.exists() {
+        chimaera_board::load(to)
+    } else {
+        let title = to
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
+            .unwrap_or_else(|| "Untitled".to_string());
+        Ok(chimaera_board::Board::new(
+            title,
+            chimaera_board::Canvas::default(),
+        ))
+    }
+}
+
+fn resolve_page_index(
+    board: &mut chimaera_board::Board,
+    page: Option<&str>,
+    to: &Path,
+) -> Result<usize> {
+    match page {
+        Some(pid) => board
+            .pages
+            .iter()
+            .position(|p| p.id == pid)
+            .with_context(|| format!("no page {pid:?} in {}", to.display())),
+        None => {
+            if board.pages.is_empty() {
+                board.pages.push(chimaera_board::Page::new("page-1"));
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Dispatch an import by what the file actually is: figures by extension or
+/// magic bytes, mermaid by `.mmd` or a flowchart/graph header. Stdin stays
+/// mermaid — piping pixels through a terminal helps nobody.
+fn import(
+    path: &Path,
+    to: &Path,
+    page: Option<String>,
+    id: Option<String>,
+    regen: Option<String>,
+) -> Result<()> {
+    if path == Path::new("-") {
+        return import_mermaid(path, to, page, id);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("svg" | "png" | "jpg" | "jpeg") => import_figure(path, to, page, id, regen),
+        Some("mmd") => import_mermaid(path, to, page, id),
+        _ => {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if looks_like_mermaid(&bytes) {
+                import_mermaid(path, to, page, id)
+            } else if chimaera_board::imginfo::sniff_image(&bytes, &path.to_string_lossy())
+                != chimaera_board::imginfo::ImgKind::Unknown
+            {
+                import_figure(path, to, page, id, regen)
+            } else {
+                bail!(
+                    "cannot tell what {} is: not .mmd/.svg/.png/.jpg, not mermaid source \
+                     (flowchart/graph), and not a recognizable image",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+fn looks_like_mermaid(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("%%"))
+        .is_some_and(|l| l.starts_with("flowchart") || l.starts_with("graph"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `<!-- chimaera:regen COMMAND -->` inside an SVG records how to regenerate
+/// it; the import lifts it into `provenance.regen`.
+fn sniff_regen_comment(text: &str) -> Option<String> {
+    const OPEN: &str = "<!-- chimaera:regen";
+    let start = text.find(OPEN)?;
+    let rest = &text[start + OPEN.len()..];
+    let end = rest.find("-->")?;
+    let cmd = rest[..end].trim();
+    (!cmd.is_empty()).then(|| cmd.to_string())
+}
+
+/// Copy a figure into `.chimaera/board/assets/` and append it as an `image`
+/// object with sniffed pixel size and provenance.
+fn import_figure(
+    path: &Path,
+    to: &Path,
+    page: Option<String>,
+    id: Option<String>,
+    regen: Option<String>,
+) -> Result<()> {
+    use chimaera_board::imginfo::ImgKind;
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{} has no usable file name", path.display()))?;
+    let kind = chimaera_board::imginfo::sniff_image(&bytes, name);
+    if kind == ImgKind::Unknown {
+        bail!("{} is not a recognizable PNG, JPEG, or SVG", path.display());
+    }
+    if !chimaera_board::is_board_path(to) {
+        bail!(
+            "a board path ends in .board.json — try {}",
+            to.with_extension("board.json").display()
+        );
+    }
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let to_abs = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        cwd.join(to)
+    };
+    let ws = chimaera_board::workspace_root(&to_abs);
+    chimaera_board::ensure_board_dir(&ws)?;
+    let assets = chimaera_board::board_dir(&ws).join("assets");
+    std::fs::create_dir_all(&assets).with_context(|| format!("creating {}", assets.display()))?;
+
+    // Land the asset: an identical name+bytes is reused, a name collision
+    // with different bytes gets a content-hash suffix — nothing is ever
+    // overwritten.
+    let digest = sha256_hex(&bytes);
+    let mut asset_name = name.to_string();
+    let first = assets.join(&asset_name);
+    if first.exists() && std::fs::read(&first).map(|b| b != bytes).unwrap_or(true) {
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((s, e)) => (s.to_string(), format!(".{e}")),
+            None => (name.to_string(), String::new()),
+        };
+        asset_name = format!("{stem}-{}{ext}", &digest[..8]);
+    }
+    let dest = assets.join(&asset_name);
+    if !dest.exists() {
+        chimaera_board::write_atomic(&dest, &bytes)?;
+    }
+    let src_rel = format!("{}/assets/{asset_name}", chimaera_board::BOARD_DIR);
+
+    // Natural size: sniffed pixels for rasters, document units for SVG; both
+    // place at 96 dpi (unit × 0.75 pt), the convention the renderer shares.
+    let (pixel_size, natural_pt) = match kind {
+        ImgKind::Png | ImgKind::Jpeg => {
+            let (w, h) = chimaera_board::imginfo::raster_dimensions(kind, &bytes)
+                .with_context(|| format!("could not read the pixel size of {}", path.display()))?;
+            (
+                Some([w as f64, h as f64]),
+                Some([w as f64 * 0.75, h as f64 * 0.75]),
+            )
+        }
+        ImgKind::Svg => {
+            let text = std::str::from_utf8(&bytes)
+                .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+            let fonts = chimaera_board::layout::FontStack::for_workspace(&ws);
+            match chimaera_board::imginfo::sanitize_svg(text, fonts.db(), "probe-") {
+                Ok(san) => (None, Some([san.width * 0.75, san.height * 0.75])),
+                Err(e) => {
+                    eprintln!("note: svg did not parse ({e}); imported, but it will render as a placeholder");
+                    (None, None)
+                }
+            }
+        }
+        ImgKind::Unknown => unreachable!("refused above"),
+    };
+
+    // The flag wins; an SVG's own regen comment is the fallback.
+    let regen = regen.or_else(|| {
+        (kind == ImgKind::Svg)
+            .then(|| {
+                std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(sniff_regen_comment)
+            })
+            .flatten()
+    });
+
+    let mut board = load_or_create_board(to)?;
+    // Fit into the canvas minus a margin, preserving aspect, never upscaling.
+    let m = 48.0;
+    let bw = (board.canvas.width() - m * 2.0).max(200.0);
+    let bh = (board.canvas.height() - m * 2.0).max(160.0);
+    let size = match natural_pt {
+        Some([nw, nh]) if nw > 0.0 && nh > 0.0 => {
+            let scale = (bw / nw).min(bh / nh).min(1.0);
+            [nw * scale, nh * scale]
+        }
+        _ => [bw, bh],
+    };
+
+    let obj_id = id.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "figure".to_string())
+    });
+    // Ids are the merge and journal key — refuse rather than auto-rename.
+    if board.objects().any(|(_, o)| o.id() == obj_id) {
+        bail!(
+            "id {obj_id:?} already exists in {}; pass --id",
+            to.display()
+        );
+    }
+    let page_index = resolve_page_index(&mut board, page.as_deref(), to)?;
+
+    let image = chimaera_board::schema::ImageObject {
+        id: obj_id.clone(),
+        kind: chimaera_board::schema::ImageKind,
+        src: src_rel.clone(),
+        slot: None,
+        at: Some([m, m]),
+        size: Some(size),
+        src_rect: None,
+        provenance: Some(chimaera_board::schema::Provenance {
+            script: None,
+            regen,
+            sha256: Some(digest),
+            extra: Default::default(),
+        }),
+        pixel_size,
+        tint: None,
+        anchor: None,
+        alt: None,
+        link: None,
+        rotation: None,
+        extra: Default::default(),
+    };
+    board.pages[page_index]
+        .objects
+        .push(chimaera_board::Object::Image(image));
+    let diags = chimaera_board::normalize(&mut board);
+    let mut errors = 0;
+    for d in diags
+        .iter()
+        .filter(|d| d.severity != chimaera_board::Severity::Info)
+    {
+        eprintln!("{}", d.render());
+        if d.severity == chimaera_board::Severity::Error {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        bail!("{errors} error(s); nothing written");
+    }
+    chimaera_board::save(to, &board)?;
+    let px_note = pixel_size
+        .map(|[w, h]| format!(" · {w}×{h} px"))
+        .unwrap_or_default();
+    println!(
+        "imported image {obj_id:?}{px_note} → {} (page {}) · asset {src_rel}",
+        to.display(),
+        board.pages[page_index].id
+    );
+    Ok(())
+}
+
+/// `board adopt` — a shown throwaway becomes real work. Without --to the file
+/// moves to boards/<id>.board.json at the workspace root, which is what makes
+/// it git-visible; with --to its pages append to an existing board, re-id'ing
+/// collisions with a numeric suffix and saying so.
+fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let ws = chimaera_board::workspace_root(&cwd);
+    let direct = PathBuf::from(shown);
+    let shown_candidate = chimaera_board::board_dir(&ws)
+        .join("shown")
+        .join(format!("{shown}.board.json"));
+    let src = if direct.exists() && chimaera_board::is_board_path(&direct) {
+        direct
+    } else if shown_candidate.exists() {
+        shown_candidate.clone()
+    } else {
+        bail!(
+            "no board named {shown:?}: tried {} and {}",
+            direct.display(),
+            shown_candidate.display()
+        );
+    };
+    let src_board = chimaera_board::load(&src)?;
+
+    match to {
+        Some(target) => {
+            if !chimaera_board::is_board_path(&target) {
+                bail!(
+                    "a board path ends in .board.json — got {}",
+                    target.display()
+                );
+            }
+            if !target.exists() {
+                bail!(
+                    "--to {} does not exist; omit --to to adopt as a new board",
+                    target.display()
+                );
+            }
+            let mut board = chimaera_board::load(&target)?;
+            let (adopted, notes) = merge_pages(&mut board, src_board);
+            let diags = chimaera_board::normalize(&mut board);
+            let mut errors = 0;
+            for d in diags
+                .iter()
+                .filter(|d| d.severity != chimaera_board::Severity::Info)
+            {
+                eprintln!("{}", d.render());
+                if d.severity == chimaera_board::Severity::Error {
+                    errors += 1;
+                }
+            }
+            if errors > 0 {
+                bail!("{errors} error(s); nothing written");
+            }
+            chimaera_board::save(&target, &board)?;
+            for n in &notes {
+                println!("note: {n}");
+            }
+            // The semantic trace: one page-added per adopted page. The human
+            // asked for the adoption, so the human is the actor.
+            let mut journal = chimaera_board::journal::Journal::open(&journal_path_for(&target))?;
+            for page in &adopted {
+                journal.append(chimaera_board::journal::Event::new(
+                    chimaera_board::journal::Actor::Human,
+                    chimaera_board::journal::EventKind::PageAdded { page: page.clone() },
+                ))?;
+            }
+            println!(
+                "adopted {} page{} from {} into {} ({})",
+                adopted.len(),
+                if adopted.len() == 1 { "" } else { "s" },
+                src.display(),
+                target.display(),
+                adopted.join(", ")
+            );
+        }
+        None => {
+            let stem = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.trim_end_matches(".board.json").to_string())
+                .unwrap_or_else(|| "adopted".to_string());
+            let dest = ws.join("boards").join(format!("{stem}.board.json"));
+            if dest.exists() {
+                bail!(
+                    "{} already exists; adopt into it with --to, or pick another home by hand",
+                    dest.display()
+                );
+            }
+            let bytes =
+                std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
+            chimaera_board::write_atomic(&dest, &bytes)?;
+            std::fs::remove_file(&src)
+                .with_context(|| format!("removing the shown copy {}", src.display()))?;
+            let mut journal = chimaera_board::journal::Journal::open(&journal_path_for(&dest))?;
+            for page in &src_board.pages {
+                journal.append(chimaera_board::journal::Event::new(
+                    chimaera_board::journal::Actor::Human,
+                    chimaera_board::journal::EventKind::PageAdded {
+                        page: page.id.clone(),
+                    },
+                ))?;
+            }
+            println!(
+                "adopted {} → {} (git-visible now)",
+                src.display(),
+                dest.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Append `src`'s pages to `target`, re-id'ing page and object collisions
+/// with a numeric suffix. Returns the adopted page ids (post-rename) and the
+/// human-readable notes for every rename.
+fn merge_pages(
+    target: &mut chimaera_board::Board,
+    src: chimaera_board::Board,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn free_id(id: &str, taken: &BTreeSet<String>) -> String {
+        if !taken.contains(id) {
+            return id.to_string();
+        }
+        let mut n = 2usize;
+        loop {
+            let candidate = format!("{id}-{n}");
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    fn collect_renames(
+        objects: &[chimaera_board::Object],
+        taken: &mut BTreeSet<String>,
+        renames: &mut BTreeMap<String, String>,
+    ) {
+        for o in objects {
+            let id = o.id().to_string();
+            if !id.is_empty() {
+                // An Unknown object's id lives inside preserved raw JSON, so
+                // it cannot be renamed — it only occupies its id.
+                if matches!(o, chimaera_board::Object::Unknown(_)) {
+                    taken.insert(id);
+                } else {
+                    let new = free_id(&id, taken);
+                    if new != id {
+                        renames.insert(id, new.clone());
+                    }
+                    taken.insert(new);
+                }
+            }
+            if let chimaera_board::Object::Group(g) = o {
+                collect_renames(&g.objects, taken, renames);
+            }
+        }
+    }
+
+    fn fix_endpoint(ep: &mut chimaera_board::schema::EndPoint, renames: &BTreeMap<String, String>) {
+        if let Some(obj) = &mut ep.object {
+            if let Some(n) = renames.get(obj) {
+                *obj = n.clone();
+            }
+        }
+    }
+
+    fn fix_anchor(
+        anchor: &mut Option<chimaera_board::schema::Anchor>,
+        renames: &BTreeMap<String, String>,
+    ) {
+        if let Some(a) = anchor {
+            if let Some(obj) = &mut a.object {
+                if let Some(n) = renames.get(obj) {
+                    *obj = n.clone();
+                }
+            }
+        }
+    }
+
+    fn apply_renames(objects: &mut [chimaera_board::Object], renames: &BTreeMap<String, String>) {
+        use chimaera_board::Object as O;
+        let fix = |s: &mut String| {
+            if let Some(n) = renames.get(s) {
+                *s = n.clone();
+            }
+        };
+        for o in objects {
+            match o {
+                O::Text(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::Shape(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::Connector(x) => {
+                    fix(&mut x.id);
+                    fix_endpoint(&mut x.from, renames);
+                    fix_endpoint(&mut x.to, renames);
+                }
+                O::Image(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::Group(x) => {
+                    fix(&mut x.id);
+                    apply_renames(&mut x.objects, renames);
+                }
+                O::Chart(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::Diagram(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::PanelLabel(x) => {
+                    fix(&mut x.id);
+                    fix_anchor(&mut x.anchor, renames);
+                }
+                O::Scalebar(x) => fix(&mut x.id),
+                O::SigBracket(x) => {
+                    fix(&mut x.id);
+                    fix_endpoint(&mut x.from, renames);
+                    fix_endpoint(&mut x.to, renames);
+                }
+                O::Legend(x) => fix(&mut x.id),
+                O::Colorbar(x) => fix(&mut x.id),
+                O::Callout(x) => {
+                    fix(&mut x.id);
+                    if let Some(t) = &mut x.tail {
+                        fix_endpoint(t, renames);
+                    }
+                }
+                O::Inset(x) => {
+                    fix(&mut x.id);
+                    if let Some(n) = renames.get(&x.of.object) {
+                        x.of.object = n.clone();
+                    }
+                }
+                O::Unknown(_) => {}
+            }
+        }
+    }
+
+    let mut page_ids: BTreeSet<String> = target.pages.iter().map(|p| p.id.clone()).collect();
+    let mut obj_ids: BTreeSet<String> = target.objects().map(|(_, o)| o.id().to_string()).collect();
+    let mut adopted = Vec::new();
+    let mut notes = Vec::new();
+    for mut page in src.pages {
+        let new_id = free_id(&page.id, &page_ids);
+        if new_id != page.id {
+            notes.push(format!(
+                "page {:?} became {new_id:?} (id collision)",
+                page.id
+            ));
+            page.id = new_id.clone();
+        }
+        page_ids.insert(new_id.clone());
+        let mut renames = BTreeMap::new();
+        collect_renames(&page.objects, &mut obj_ids, &mut renames);
+        for (old, new) in &renames {
+            notes.push(format!("object {old:?} became {new:?} (id collision)"));
+        }
+        if !renames.is_empty() {
+            apply_renames(&mut page.objects, &renames);
+        }
+        adopted.push(new_id);
+        target.pages.push(page);
+    }
+    (adopted, notes)
+}
+
+/// `board theme-export` — the theme's numbers for external plotting code.
+fn theme_export(theme_id: &str, format: &str, out: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let ws = chimaera_board::workspace_root(&cwd);
+    let theme = Theme::resolve(theme_id, Some(&ws))?;
+    let body = match format {
+        // The bundled ids export their exact source bytes; anything else is
+        // the parsed theme, pretty-printed deterministically (BTreeMaps).
+        "json" => match theme_id {
+            "talk-dark" => chimaera_board::theme::TALK_DARK.to_string(),
+            "talk-light" => chimaera_board::theme::TALK_LIGHT.to_string(),
+            "figure-light" => chimaera_board::theme::FIGURE_LIGHT.to_string(),
+            _ => {
+                let mut s =
+                    serde_json::to_string_pretty(&theme).context("serializing the theme")?;
+                s.push('\n');
+                s
+            }
+        },
+        "mplstyle" => mplstyle_for(&theme),
+        other => bail!("unknown format {other:?}: use json | mplstyle"),
+    };
+    match out {
+        Some(p) => {
+            chimaera_board::write_atomic(&p, body.as_bytes())?;
+            println!("{} ({format}) → {}", theme.id, p.display());
+        }
+        None => print!("{body}"),
+    }
+    Ok(())
+}
+
+/// The theme as a matplotlib style file. Hex goes without `#` — a `#` starts
+/// a comment in matplotlibrc syntax — and the ordering is fixed, so the same
+/// theme always exports the same bytes.
+fn mplstyle_for(theme: &Theme) -> String {
+    use std::fmt::Write as _;
+    let hex = |rgb: chimaera_board::theme::Rgb| rgb.hex()[1..].to_string();
+    let bg = hex(theme.bg());
+    let body_c = hex(theme.color_or_fg(Some("@body")));
+    let muted = theme
+        .color("@muted")
+        .map(hex)
+        .unwrap_or_else(|| body_c.clone());
+    let grid = theme
+        .color(&theme.chart.grid)
+        .map(hex)
+        .unwrap_or_else(|| muted.clone());
+    let body_role = theme.body();
+    let label = theme.role("label").unwrap_or(body_role);
+    let ramp: Vec<String> = theme
+        .chart
+        .categorical
+        .iter()
+        .filter_map(|c| theme.color(c))
+        .map(|c| format!("'{}'", hex(c)))
+        .collect();
+
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "# chimaera board theme {:?} as a matplotlib style",
+        theme.id
+    );
+    let _ = writeln!(
+        s,
+        "# regenerate: chimaera board theme-export {} --format mplstyle",
+        theme.id
+    );
+    let _ = writeln!(s, "figure.facecolor: {bg}");
+    let _ = writeln!(s, "axes.facecolor: {bg}");
+    let _ = writeln!(s, "text.color: {body_c}");
+    let _ = writeln!(s, "axes.labelcolor: {body_c}");
+    let _ = writeln!(s, "xtick.color: {muted}");
+    let _ = writeln!(s, "ytick.color: {muted}");
+    let _ = writeln!(s, "axes.prop_cycle: cycler('color', [{}])", ramp.join(", "));
+    let _ = writeln!(s, "font.family: {}", body_role.family.join(", "));
+    let _ = writeln!(s, "font.size: {}", label.size);
+    let _ = writeln!(s, "axes.spines.top: False");
+    let _ = writeln!(s, "axes.spines.right: False");
+    let _ = writeln!(s, "grid.color: {grid}");
+    let _ = writeln!(s, "grid.alpha: 1.0");
+    let _ = writeln!(s, "lines.linewidth: {}", theme.chart.series_width);
+    s
+}
+
+/// One row of the rescheme mapping table.
+struct ReschemeRow {
+    from: String,
+    count: usize,
+    target: String,
+    to: Option<String>,
+}
+
+/// One color literal found in the SVG text: its byte span and parsed value.
+struct ColorHit {
+    start: usize,
+    end: usize,
+    rgb: chimaera_board::theme::Rgb,
+}
+
+/// Find every color literal in `fill`/`stroke`/`stop-color` positions — both
+/// the attribute form (`fill="#..."`) and the style-property form
+/// (`style="fill:#...;"`). `url(...)`, `none` and `currentColor` are not
+/// colors and fall out of the parse.
+fn scan_svg_colors(src: &str) -> Vec<ColorHit> {
+    let mut hits = Vec::new();
+    for (needle, quoted) in [
+        ("fill=\"", true),
+        ("stroke=\"", true),
+        ("stop-color=\"", true),
+        ("fill:", false),
+        ("stroke:", false),
+        ("stop-color:", false),
+    ] {
+        let mut at = 0usize;
+        while let Some(p) = src[at..].find(needle) {
+            let vstart = at + p + needle.len();
+            let rest = &src[vstart..];
+            let vlen = if quoted {
+                rest.find('"').unwrap_or(rest.len())
+            } else {
+                rest.find([';', '"', '\'']).unwrap_or(rest.len())
+            };
+            let raw = &rest[..vlen];
+            let value = raw.trim();
+            let lead = raw.len() - raw.trim_start().len();
+            if let Some(rgb) = parse_css_color(value) {
+                hits.push(ColorHit {
+                    start: vstart + lead,
+                    end: vstart + lead + value.len(),
+                    rgb,
+                });
+            }
+            at = vstart + vlen;
+        }
+    }
+    hits.sort_by_key(|h| h.start);
+    hits
+}
+
+fn parse_css_color(v: &str) -> Option<chimaera_board::theme::Rgb> {
+    if let Some(rgb) = chimaera_board::theme::parse_hex(v) {
+        return Some(rgb);
+    }
+    let named = match v.to_ascii_lowercase().as_str() {
+        "black" => "#000000",
+        "white" => "#ffffff",
+        "red" => "#ff0000",
+        "green" => "#008000",
+        "lime" => "#00ff00",
+        "blue" => "#0000ff",
+        "yellow" => "#ffff00",
+        "orange" => "#ffa500",
+        "purple" => "#800080",
+        "gray" | "grey" => "#808080",
+        "silver" => "#c0c0c0",
+        "maroon" => "#800000",
+        "navy" => "#000080",
+        "teal" => "#008080",
+        _ => return None,
+    };
+    chimaera_board::theme::parse_hex(named)
+}
+
+/// The mechanical recolor: map the SVG's own colors onto the theme.
+/// Best-effort by design — luminance extremes (near-white/near-black) are
+/// ground and text, and when both extremes appear the more frequent one is
+/// the ground; remaining saturated colors take the categorical ramp in
+/// frequency order; unsaturated leftovers are kept and say so.
+fn rescheme_svg(src: &str, theme: &Theme) -> (String, Vec<ReschemeRow>) {
+    let hits = scan_svg_colors(src);
+
+    // Frequency in first-seen order, so ties break deterministically.
+    let mut order: Vec<(chimaera_board::theme::Rgb, usize)> = Vec::new();
+    for h in &hits {
+        match order.iter_mut().find(|(c, _)| *c == h.rgb) {
+            Some((_, n)) => *n += 1,
+            None => order.push((h.rgb, 1)),
+        }
+    }
+    let mut ranked: Vec<(usize, chimaera_board::theme::Rgb, usize)> = order
+        .iter()
+        .enumerate()
+        .map(|(i, (c, n))| (i, *c, *n))
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+
+    let saturated = |c: &chimaera_board::theme::Rgb| {
+        (c.r.max(c.g).max(c.b) as i32 - c.r.min(c.g).min(c.b) as i32) >= 25
+    };
+
+    enum Target {
+        Bg,
+        Body,
+        Cat(usize),
+        Kept,
+    }
+
+    let mut decisions: Vec<(chimaera_board::theme::Rgb, usize, Target)> = Vec::new();
+    let mut extremes = Vec::new();
+    let mut mids = Vec::new();
+    for (_, c, n) in ranked {
+        let lum = c.luminance();
+        if lum >= 0.8 || lum <= 0.05 {
+            extremes.push((c, n));
+        } else {
+            mids.push((c, n));
+        }
+    }
+    // The most frequent extreme is the ground; any other extreme is text on
+    // that ground (a white page with black labels, or the inverse).
+    let mut body_taken = false;
+    for (i, (c, n)) in extremes.into_iter().enumerate() {
+        if i == 0 {
+            decisions.push((c, n, Target::Bg));
+        } else {
+            decisions.push((c, n, Target::Body));
+            body_taken = true;
+        }
+    }
+    // Otherwise the darkest unsaturated mid is the text.
+    if !body_taken {
+        if let Some(idx) = mids
+            .iter()
+            .enumerate()
+            .filter(|(_, (c, _))| !saturated(c))
+            .min_by(|a, b| a.1 .0.luminance().total_cmp(&b.1 .0.luminance()))
+            .map(|(i, _)| i)
+        {
+            let (c, n) = mids.remove(idx);
+            decisions.push((c, n, Target::Body));
+        }
+    }
+    // Remaining saturated colors take the ramp, in frequency order.
+    let mut cat = 0usize;
+    for (c, n) in mids {
+        if saturated(&c) {
+            decisions.push((c, n, Target::Cat(cat)));
+            cat += 1;
+        } else {
+            decisions.push((c, n, Target::Kept));
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut map: Vec<(chimaera_board::theme::Rgb, chimaera_board::theme::Rgb)> = Vec::new();
+    for (c, n, t) in &decisions {
+        let (label, to) = match t {
+            Target::Bg => ("@bg".to_string(), theme.color("@bg")),
+            Target::Body => (
+                "@body".to_string(),
+                theme.color("@body").or_else(|| theme.color("@fg")),
+            ),
+            Target::Cat(i) => {
+                let refs = &theme.chart.categorical;
+                if refs.is_empty() {
+                    ("kept".to_string(), None)
+                } else {
+                    (refs[i % refs.len()].clone(), Some(theme.categorical(*i)))
+                }
+            }
+            Target::Kept => ("kept".to_string(), None),
+        };
+        if let Some(to) = to {
+            map.push((*c, to));
+        }
+        rows.push(ReschemeRow {
+            from: c.hex(),
+            count: *n,
+            target: label,
+            to: to.map(|r| r.hex()),
+        });
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut pos = 0usize;
+    for h in &hits {
+        if h.start < pos {
+            continue;
+        }
+        if let Some((_, to)) = map.iter().find(|(from, _)| *from == h.rgb) {
+            out.push_str(&src[pos..h.start]);
+            out.push_str(&to.hex());
+            pos = h.end;
+        }
+    }
+    out.push_str(&src[pos..]);
+    (out, rows)
+}
+
+/// `board rescheme` — path 2 from the plan: recolor what you cannot
+/// regenerate.
+fn rescheme(path: &Path, theme_ref: &str, out: Option<PathBuf>) -> Result<()> {
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let ws = chimaera_board::workspace_root(path);
+    let theme = Theme::resolve(theme_ref, Some(&ws))?;
+    let (recolored, rows) = rescheme_svg(&src, &theme);
+    if rows.is_empty() {
+        bail!(
+            "no fill/stroke colors found in {}; nothing to rescheme",
+            path.display()
+        );
+    }
+    for r in &rows {
+        match &r.to {
+            Some(hex) => println!("{} ×{} → {} {hex}", r.from, r.count, r.target),
+            None => println!("{} ×{} → kept (unmapped)", r.from, r.count),
+        }
+    }
+    let dest = out.unwrap_or_else(|| {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("figure");
+        path.with_file_name(format!("{stem}-{}.svg", theme.id))
+    });
+    chimaera_board::write_atomic(&dest, recolored.as_bytes())?;
+    println!("→ {}", dest.display());
+    Ok(())
+}
+
+fn lint(
+    path: &Path,
+    theme_ref: Option<String>,
+    target: Option<String>,
+    style: bool,
+    strict: bool,
+    fix: bool,
+) -> Result<()> {
+    let ws = chimaera_board::workspace_root(path);
+
+    // --fix runs first, on the file exactly as it stands — normalizing before
+    // the fix would pre-snap the grid and hide the very classes it repairs.
+    // The repaired board saves through the canonical writer; an untouched
+    // board is not re-saved (no mtime churn for a no-op).
+    if fix {
+        let mut board = chimaera_board::load(path)?;
+        let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
+        let fixes = chimaera_board::lint::lint_fix(&mut board, &theme);
+        if fixes.is_empty() {
+            println!("nothing to fix");
+        } else {
+            chimaera_board::save(path, &board)?;
+            for f in &fixes {
+                println!("fixed: {f}");
+            }
+        }
+    }
+
+    let (board, mut diags) = load_normalized(path)?;
     let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
 
     // --target wins; the board's own canvas.target is the default. Neither
     // set → the plain legality profile, exactly as before.
     let target_id = target.or_else(|| board.canvas.target.clone());
+    // Both the target and style profiles measure text, so both need the font
+    // stack; the plain legality profile stays scan-free.
+    let fonts = (style || target_id.is_some()).then(|| FontStack::for_workspace(&ws));
     match target_id.as_deref() {
         None => diags.extend(chimaera_board::lint::lint(&board, &theme)),
         Some(id) => {
@@ -688,9 +1696,9 @@ fn lint(path: &Path, theme_ref: Option<String>, target: Option<String>) -> Resul
                     chimaera_board::presets::ids().join(", ")
                 )
             })?;
-            let fonts = FontStack::for_workspace(&ws);
+            let fonts = fonts.as_ref().expect("built for any target");
             diags.extend(chimaera_board::lint::lint_target(
-                &board, &theme, preset, &fonts,
+                &board, &theme, preset, fonts,
             ));
             // The census: every top-level object's computed export fate, so
             // degradation is stated before an export, never discovered after.
@@ -712,6 +1720,15 @@ fn lint(path: &Path, theme_ref: Option<String>, target: Option<String>) -> Resul
         }
     }
 
+    if style {
+        diags.extend(chimaera_board::lint::lint_style(
+            &board,
+            &theme,
+            fonts.as_ref().expect("built for --style"),
+            strict,
+        ));
+    }
+
     if diags.is_empty() {
         let n = board.pages.len();
         println!("clean · {n} page{}", if n == 1 { "" } else { "s" });
@@ -728,4 +1745,251 @@ fn lint(path: &Path, theme_ref: Option<String>, target: Option<String>) -> Resul
         bail!("{errors} error(s)");
     }
     Ok(())
+}
+
+/// Apply an [`chimaera_board::arrange`] op and save through the same
+/// pipeline a pane gesture takes: mutate → normalize (grid snap) → canonical
+/// save → journal. Run from the CLI this is the *agent's* hand, so the moves
+/// journal with actor `agent` — the mirror of the daemon edit route's
+/// actor-`human` appends.
+fn arrange(
+    path: &Path,
+    op: &str,
+    ids_csv: &str,
+    gap: Option<f64>,
+    cols: Option<usize>,
+) -> Result<()> {
+    let ids: Vec<&str> = ids_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        bail!("--ids wants a comma-separated list of object ids");
+    }
+    let mut board = chimaera_board::load(path)?;
+    let ws = chimaera_board::workspace_root(path);
+    let theme = resolve_theme(None, &board, &ws)?;
+
+    // Prior geometry, for the journal's from/to.
+    let prior: Vec<(String, Option<chimaera_board::schema::Frame>)> = ids
+        .iter()
+        .map(|id| {
+            let f = board
+                .objects()
+                .find(|(_, o)| o.id() == *id)
+                .and_then(|(_, o)| o.frame());
+            (id.to_string(), f)
+        })
+        .collect();
+
+    let moves = chimaera_board::arrange::arrange(
+        &mut board,
+        op,
+        &ids,
+        gap.or(Some(theme.spacing.gap)),
+        cols,
+    )?;
+    if moves.is_empty() {
+        println!("nothing to move — already arranged");
+        return Ok(());
+    }
+    chimaera_board::normalize(&mut board);
+    chimaera_board::save(path, &board)?;
+    for m in &moves {
+        println!("{m}");
+    }
+
+    // The journal narrates the *saved* (post-normalize) geometry. Best-effort
+    // by design, like the daemon's edit route: the board file is truth and
+    // the journal is the audit trail.
+    use chimaera_board::journal::{Actor, Event, EventKind};
+    let mut events = Vec::new();
+    for (id, before) in prior {
+        let after = board
+            .objects()
+            .find(|(_, o)| o.id() == id)
+            .and_then(|(_, o)| o.frame());
+        if let (Some(b), Some(a)) = (before, after) {
+            if (b.x, b.y) != (a.x, a.y) {
+                events.push(Event::new(
+                    Actor::Agent,
+                    EventKind::Move {
+                        object: id,
+                        from: [b.x, b.y],
+                        to: [a.x, a.y],
+                    },
+                ));
+            }
+        }
+    }
+    if !events.is_empty() {
+        let appended = chimaera_board::ensure_board_dir(&ws)
+            .and_then(|_| chimaera_board::journal::Journal::open(&journal_path_for(path)))
+            .and_then(|mut journal| journal.append_batch(events));
+        if let Err(err) = appended {
+            eprintln!("warning: journal append failed: {err:#}");
+        }
+    }
+    Ok(())
+}
+
+/// `board validate-theme`: the §9 preflight — WCAG contrast, the OKLCH
+/// lightness band, the chroma floor, and all-pairs CVD under Machado 2009 —
+/// plus the computed safe series cap the chart lint holds series against.
+fn validate_theme(theme_id: &str) -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let ws = chimaera_board::workspace_root(&cwd);
+    let theme = Theme::resolve(theme_id, Some(&ws))?;
+
+    let ramp: Vec<chimaera_board::theme::Rgb> = theme
+        .chart
+        .categorical
+        .iter()
+        .filter_map(|r| theme.color(r))
+        .collect();
+    let cap = chimaera_board::cvd::safe_series_cap(&ramp);
+    println!(
+        "{}: safe series cap {cap} of {} ramp colors (all-pairs ΔE ≥ 8 under Machado 2009)",
+        theme.id,
+        ramp.len()
+    );
+
+    let findings = chimaera_board::cvd::validate_theme(&theme);
+    if findings.is_empty() {
+        println!("clean");
+        return Ok(());
+    }
+    for f in &findings {
+        println!("{f}");
+    }
+    bail!("{} finding(s)", findings.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_json(json: &str) -> chimaera_board::Board {
+        chimaera_board::parse(json).unwrap()
+    }
+
+    #[test]
+    fn adopt_merge_re_ids_collisions_and_updates_references() {
+        let mut target = board_json(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"page-1","objects":[
+                  {"id":"title","type":"text","at":[8,8],"size":[400,80],"text":["existing"]}]}]}"#,
+        );
+        // The shown card collides on both the page id and an object id, and
+        // carries a connector bound to the colliding object.
+        let src = board_json(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"page-1","objects":[
+                  {"id":"title","type":"text","at":[8,8],"size":[400,80],"text":["adopted"]},
+                  {"id":"box","type":"shape","geo":"rect","at":[8,104],"size":[80,80]},
+                  {"id":"arrow","type":"connector",
+                   "from":{"object":"title"},"to":{"object":"box"}}]}]}"#,
+        );
+        let (adopted, notes) = merge_pages(&mut target, src);
+        assert_eq!(adopted, ["page-1-2"], "{notes:?}");
+        assert_eq!(target.pages.len(), 2);
+        let merged = &target.pages[1];
+        assert_eq!(merged.id, "page-1-2");
+        let ids: Vec<&str> = merged.objects.iter().map(|o| o.id()).collect();
+        assert_eq!(ids, ["title-2", "box", "arrow"], "{notes:?}");
+        // The connector followed its renamed endpoint.
+        let Some(chimaera_board::Object::Connector(c)) =
+            merged.objects.iter().find(|o| o.id() == "arrow")
+        else {
+            panic!("connector survived the merge");
+        };
+        assert_eq!(c.from.object.as_deref(), Some("title-2"));
+        assert_eq!(c.to.object.as_deref(), Some("box"));
+        assert!(
+            notes.iter().any(|n| n.contains("page-1-2")),
+            "the rename is said out loud: {notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("title-2")), "{notes:?}");
+        // No collision → no rename.
+        assert!(!notes.iter().any(|n| n.contains("\"box\" became")));
+    }
+
+    #[test]
+    fn mplstyle_export_is_deterministic_and_carries_the_ramp() {
+        let theme = chimaera_board::theme::default_for(true);
+        let a = mplstyle_for(&theme);
+        let b = mplstyle_for(&theme);
+        assert_eq!(a, b, "same theme, same bytes");
+        assert!(a.contains("axes.prop_cycle: cycler('color', ["), "{a}");
+        // The full 7-color categorical ramp lands in the cycler.
+        let cycle_line = a
+            .lines()
+            .find(|l| l.starts_with("axes.prop_cycle"))
+            .unwrap();
+        // 7 quoted colors plus the quoted word 'color' = 16 single quotes.
+        assert_eq!(cycle_line.matches('\'').count(), 16, "{cycle_line}");
+        // Hex without '#': a '#' starts a comment in matplotlibrc syntax.
+        assert!(!cycle_line.contains('#'), "{cycle_line}");
+        assert!(a.contains("figure.facecolor: 14171c"), "{a}");
+        assert!(a.contains("axes.spines.top: False"), "{a}");
+        assert!(a.contains("axes.spines.right: False"), "{a}");
+        assert!(a.contains("grid.color: "), "{a}");
+        assert!(a.contains("lines.linewidth: 2"), "{a}");
+        assert!(a.contains("font.family: Inter"), "{a}");
+    }
+
+    #[test]
+    fn rescheme_maps_a_three_color_svg_onto_the_ramp() {
+        // White ground, black text, three saturated series colors — red is
+        // the most frequent series and must take the first ramp slot.
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+            <rect width="10" height="10" fill="#ffffff"/>
+            <text style="fill:#000000;">label</text>
+            <rect width="2" height="4" fill="#ff0000"/>
+            <rect width="2" height="5" fill="#ff0000"/>
+            <rect width="2" height="6" fill="#00cc44"/>
+            <path d="M 0 0 L 1 1" stroke="#2244ff" fill="none"/>
+        </svg>"##;
+        let theme = chimaera_board::theme::default_for(true);
+        let (out, rows) = rescheme_svg(svg, &theme);
+        let row = |from: &str| rows.iter().find(|r| r.from == from).unwrap();
+        assert_eq!(row("#ffffff").target, "@bg");
+        assert_eq!(row("#000000").target, "@body");
+        assert_eq!(row("#ff0000").target, "@cat1");
+        assert_eq!(row("#ff0000").count, 2);
+        assert_eq!(row("#00cc44").target, "@cat2");
+        assert_eq!(row("#2244ff").target, "@cat3");
+        // The recolored svg carries the resolved ramp hexes, not the originals.
+        let cat1 = theme.categorical(0).hex();
+        let cat2 = theme.categorical(1).hex();
+        let cat3 = theme.categorical(2).hex();
+        assert!(out.contains(&cat1), "{out}");
+        assert!(out.contains(&cat2), "{out}");
+        assert!(out.contains(&cat3), "{out}");
+        assert!(!out.contains("#ff0000"), "{out}");
+        assert!(!out.contains("#00cc44"), "{out}");
+        // The style-property form was rewritten too.
+        let body_hex = theme.color("@body").unwrap().hex();
+        assert!(out.contains(&format!("fill:{body_hex}")), "{out}");
+        // "none" is not a color and survives untouched.
+        assert!(out.contains(r#"fill="none""#), "{out}");
+        // Determinism.
+        let (out2, _) = rescheme_svg(svg, &theme);
+        assert_eq!(out, out2);
+    }
+
+    #[test]
+    fn regen_comments_and_mermaid_sniffing_parse() {
+        assert_eq!(
+            sniff_regen_comment("<svg><!-- chimaera:regen snakemake --forcerun fig.svg --></svg>"),
+            Some("snakemake --forcerun fig.svg".to_string())
+        );
+        assert_eq!(sniff_regen_comment("<svg></svg>"), None);
+        assert!(looks_like_mermaid(b"%% a comment\nflowchart LR\na-->b"));
+        assert!(looks_like_mermaid(b"graph TD\na-->b"));
+        assert!(!looks_like_mermaid(b"<svg xmlns='x'/>"));
+    }
 }

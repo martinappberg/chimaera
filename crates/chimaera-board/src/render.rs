@@ -30,6 +30,11 @@ use crate::theme::{Rgb, Theme};
 /// answer is an error rather than an allocation.
 pub const MAX_PIXELS: u64 = 12_000_000;
 
+/// The largest image file the renderer will inline as a data URI. Base64
+/// inflates by 4/3 and the daemon lives on shared login nodes, so an oversized
+/// asset is a named diagnostic and a placeholder, never an allocation.
+pub const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Sub-floor text is a render *error*, not a lint finding, in slice 0 — with
 /// no linter shipped yet, the renderer is the only enforcer `minPt` has, and
 /// per the plan's own ranking a constraint beats a report.
@@ -395,28 +400,14 @@ fn emit_object(
         }
         Object::Connector(c) => emit_connector(s, c, theme, fonts, index, diags, &page.id),
         Object::Image(img) => {
-            diags.push(
-                Diagnostic::new(
-                    Severity::Warning,
-                    format!(
-                        "image {:?} is not rendered in this slice; a placeholder marks its box",
-                        img.src
-                    ),
-                )
-                .at(&page.id, obj.id()),
-            );
-            if let Some(f) = frame {
-                let edge = theme.color("@edge").unwrap_or(theme.bg());
-                let _ = write!(
-                    s,
-                    r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none" stroke="{}" stroke-width="1" stroke-dasharray="4 3"/>"#,
-                    f.x,
-                    f.y,
-                    f.w,
-                    f.h,
-                    edge.hex()
+            let Some(f) = frame else {
+                diags.push(
+                    Diagnostic::new(Severity::Warning, "image has no position; skipped")
+                        .at(&page.id, obj.id()),
                 );
-            }
+                return;
+            };
+            emit_image(s, img, f, theme, fonts, workspace, &page.id, diags);
         }
         Object::Group(g) => {
             for child in &g.objects {
@@ -1026,6 +1017,285 @@ fn emit_shape(
     }
 }
 
+/// The dashed box that marks an image which could not be placed — the same
+/// visual the PPTX writer degrades to, so the pane and the deck agree about
+/// what "missing" looks like.
+fn image_placeholder(s: &mut String, f: Frame, theme: &Theme) {
+    let edge = theme.color("@edge").unwrap_or_else(|| theme.bg());
+    let _ = write!(
+        s,
+        r#"<rect x="{}" y="{}" width="{}" height="{}" fill="none" stroke="{}" stroke-width="1" stroke-dasharray="4 3"/>"#,
+        f.x,
+        f.y,
+        f.w,
+        f.h,
+        edge.hex()
+    );
+}
+
+/// The visible sub-rect of a `w`×`h` natural space selected by an
+/// `a:srcRect`-style fractional crop `[l, t, r, b]` (fractions cut from each
+/// side). Returns `(x, y, w, h)` in natural units; a degenerate crop clamps
+/// to at least one unit rather than inverting.
+pub(crate) fn crop_rect(src_rect: Option<[f64; 4]>, w: f64, h: f64) -> (f64, f64, f64, f64) {
+    let sane = |v: f64| {
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let [l, t, r, b] = src_rect.unwrap_or([0.0; 4]);
+    let (l, t, r, b) = (sane(l), sane(t), sane(r), sane(b));
+    let cw = ((1.0 - l - r) * w).max(1.0);
+    let ch = ((1.0 - t - b) * h).max(1.0);
+    (l * w, t * h, cw, ch)
+}
+
+/// Draw an image object for real: PNG/JPEG inline as a data URI inside a
+/// nested `<svg>` viewport (which is how `srcRect` crops without touching the
+/// pixels), SVG inlined after the usvg sanitize round-trip. Every failure is
+/// a named diagnostic plus the dashed placeholder — a blank box with no
+/// reason is the one outcome this function refuses to produce.
+#[allow(clippy::too_many_arguments)]
+fn emit_image(
+    s: &mut String,
+    img: &crate::schema::ImageObject,
+    f: Frame,
+    theme: &Theme,
+    fonts: &FontStack,
+    workspace: Option<&Path>,
+    page_id: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let degrade = |s: &mut String, diags: &mut Vec<Diagnostic>, msg: String| {
+        diags.push(Diagnostic::new(Severity::Warning, msg).at(page_id, &img.id));
+        image_placeholder(s, f, theme);
+    };
+
+    let Some(ws) = workspace else {
+        degrade(
+            s,
+            diags,
+            format!(
+                "image {:?} needs a workspace root to resolve; a placeholder marks its box",
+                img.src
+            ),
+        );
+        return;
+    };
+    let src_path = {
+        let p = Path::new(&img.src);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            ws.join(p)
+        }
+    };
+    let len = match std::fs::metadata(&src_path) {
+        Ok(m) => m.len(),
+        Err(_) => {
+            degrade(
+                s,
+                diags,
+                format!(
+                    "image source {} not found; a placeholder marks its box",
+                    src_path.display()
+                ),
+            );
+            return;
+        }
+    };
+    if len > MAX_IMAGE_BYTES {
+        degrade(
+            s,
+            diags,
+            format!(
+                "image {} is {len} bytes, over the {MAX_IMAGE_BYTES} byte inline ceiling; \
+                 a placeholder marks its box",
+                src_path.display()
+            ),
+        );
+        return;
+    }
+    let bytes = match std::fs::read(&src_path) {
+        Ok(b) => b,
+        Err(e) => {
+            degrade(
+                s,
+                diags,
+                format!(
+                    "image source {} is unreadable ({e}); a placeholder marks its box",
+                    src_path.display()
+                ),
+            );
+            return;
+        }
+    };
+
+    match crate::imginfo::sniff_image(&bytes, &img.src) {
+        kind @ (crate::imginfo::ImgKind::Png | crate::imginfo::ImgKind::Jpeg) => {
+            let Some((w_px, h_px)) = crate::imginfo::raster_dimensions(kind, &bytes) else {
+                degrade(
+                    s,
+                    diags,
+                    format!(
+                        "could not read the natural pixel size of {}; a placeholder marks its box",
+                        src_path.display()
+                    ),
+                );
+                return;
+            };
+            let (w_px, h_px) = (w_px as f64, h_px as f64);
+            if let Some([pw, ph]) = img.pixel_size {
+                if (pw - w_px).abs() > 0.5 || (ph - h_px).abs() > 0.5 {
+                    diags.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!(
+                                "pixelSize [{pw}, {ph}] disagrees with the file's natural \
+                                 {w_px}×{h_px} px"
+                            ),
+                        )
+                        .at(page_id, &img.id)
+                        .field("pixelSize"),
+                    );
+                }
+            }
+            if img.tint.is_some() {
+                diags.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        format!(
+                            "tint applies to SVG sources only; {:?} is a raster",
+                            img.src
+                        ),
+                    )
+                    .at(page_id, &img.id)
+                    .field("tint"),
+                );
+            }
+            let (cx, cy, cw, ch) = crop_rect(img.src_rect, w_px, h_px);
+            if f.w > 0.0 && f.h > 0.0 {
+                let dpi_x = cw / (f.w / 72.0);
+                let dpi_y = ch / (f.h / 72.0);
+                diags.push(
+                    Diagnostic::new(
+                        Severity::Info,
+                        format!(
+                            "effective resolution {dpi_x:.0}×{dpi_y:.0} dpi at the placed size \
+                             ({cw:.0}×{ch:.0} px into {}×{} pt)",
+                            f.w, f.h
+                        ),
+                    )
+                    .at(page_id, &img.id),
+                );
+            }
+            let mime = match kind {
+                crate::imginfo::ImgKind::Png => "image/png",
+                _ => "image/jpeg",
+            };
+            let b64 = crate::imginfo::base64_encode(&bytes);
+            let _ = write!(
+                s,
+                r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="{cx} {cy} {cw} {ch}" preserveAspectRatio="none"><image x="0" y="0" width="{w_px}" height="{h_px}" preserveAspectRatio="none" href="data:{mime};base64,{b64}"/></svg>"#,
+                f.x, f.y, f.w, f.h
+            );
+        }
+        crate::imginfo::ImgKind::Svg => {
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                degrade(
+                    s,
+                    diags,
+                    format!(
+                        "svg {} is not valid UTF-8; a placeholder marks its box",
+                        src_path.display()
+                    ),
+                );
+                return;
+            };
+            // Namespace the figure's internal ids by the object id so two
+            // inlined figures cannot capture each other's defs.
+            let prefix: String = img
+                .id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .chain("-".chars())
+                .collect();
+            let san = match crate::imginfo::sanitize_svg(text, fonts.db(), &prefix) {
+                Ok(v) => v,
+                Err(e) => {
+                    degrade(
+                        s,
+                        diags,
+                        format!(
+                            "svg {} failed to parse ({e}); a placeholder marks its box",
+                            src_path.display()
+                        ),
+                    );
+                    return;
+                }
+            };
+            if let Some([pw, ph]) = img.pixel_size {
+                if (pw - san.width).abs() > 0.5 || (ph - san.height).abs() > 0.5 {
+                    diags.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!(
+                                "pixelSize [{pw}, {ph}] disagrees with the svg's natural {}×{} \
+                                 units",
+                                san.width, san.height
+                            ),
+                        )
+                        .at(page_id, &img.id)
+                        .field("pixelSize"),
+                    );
+                }
+            }
+            let mut xml = san.xml;
+            if let Some(t) = img.tint.as_deref() {
+                match theme.color(t) {
+                    None => diags.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!("tint {t:?} does not resolve in this theme"),
+                        )
+                        .at(page_id, &img.id)
+                        .field("tint"),
+                    ),
+                    Some(rgb) => match crate::imginfo::apply_tint(&xml, &rgb.hex()) {
+                        Ok(tinted) => xml = tinted,
+                        Err(n) => diags.push(
+                            Diagnostic::new(
+                                Severity::Warning,
+                                format!("tint needs a monochrome source (found {n} colors)"),
+                            )
+                            .at(page_id, &img.id)
+                            .field("tint"),
+                        ),
+                    },
+                }
+            }
+            let (cx, cy, cw, ch) = crop_rect(img.src_rect, san.width, san.height);
+            let _ = write!(
+                s,
+                r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="{cx} {cy} {cw} {ch}" preserveAspectRatio="none">{xml}</svg>"#,
+                f.x, f.y, f.w, f.h
+            );
+        }
+        crate::imginfo::ImgKind::Unknown => {
+            degrade(
+                s,
+                diags,
+                format!(
+                    "image {} is not a recognizable PNG, JPEG, or SVG; a placeholder marks its box",
+                    src_path.display()
+                ),
+            );
+        }
+    }
+}
+
 fn emit_connector(
     s: &mut String,
     c: &ConnectorObject,
@@ -1528,5 +1798,218 @@ mod tests {
         assert!(second.contains("Review"), "{second}");
         // Furniture is generated per render, never written into the board.
         assert!(!crate::to_string(&b).unwrap().contains("furniture/"));
+    }
+
+    // --- images ---------------------------------------------------------
+
+    fn tmp_workspace(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-board-render-img-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn solid_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut pm = tiny_skia::Pixmap::new(w, h).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(
+            rgba[0], rgba[1], rgba[2], rgba[3],
+        ));
+        pm.encode_png().unwrap()
+    }
+
+    fn image_board(src: &str, extra_fields: &str) -> Board {
+        board(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[96, 96]}},
+                "pages":[{{"id":"p","objects":[
+                  {{"id":"fig","type":"image","src":"{src}",
+                   "at":[8,8],"size":[80,80]{extra_fields}}}]}}]}}"#
+        ))
+    }
+
+    fn render_ws(b: &Board, ws: &std::path::Path) -> RenderOutput {
+        render_page(
+            b,
+            0,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            RasterParams {
+                scale: 1.0,
+                workspace: Some(ws.to_path_buf()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_png_lands_as_real_pixels_via_a_data_uri() {
+        let ws = tmp_workspace("png");
+        std::fs::write(ws.join("fig.png"), solid_png(2, 2, [255, 0, 0, 255])).unwrap();
+        let b = image_board("fig.png", "");
+        let out = render_ws(&b, &ws);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Error),
+            "{:?}",
+            out.diagnostics
+        );
+        // The Info diagnostic carries the computed effective dpi.
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Info && d.message.contains("dpi")),
+            "{:?}",
+            out.diagnostics
+        );
+        let pm = tiny_skia::Pixmap::decode_png(&out.png).unwrap();
+        let px = pm.pixel(48, 48).unwrap().demultiply();
+        assert_eq!(
+            (px.red(), px.green(), px.blue()),
+            (255, 0, 0),
+            "the fixture color shows at the image's center"
+        );
+    }
+
+    #[test]
+    fn src_rect_crop_arithmetic_and_a_cropped_render() {
+        // Fractions cut from each side of the natural space.
+        assert_eq!(crop_rect(None, 200.0, 100.0), (0.0, 0.0, 200.0, 100.0));
+        assert_eq!(
+            crop_rect(Some([0.25, 0.1, 0.25, 0.4]), 200.0, 100.0),
+            (50.0, 10.0, 100.0, 50.0)
+        );
+        // A degenerate crop clamps to one unit instead of inverting.
+        assert_eq!(crop_rect(Some([0.9, 0.0, 0.9, 0.0]), 10.0, 10.0).2, 1.0);
+        assert_eq!(
+            crop_rect(Some([f64::NAN, 0.0, 0.0, 0.0]), 10.0, 10.0).0,
+            0.0
+        );
+
+        // Left pixel red, right pixel blue; cropping the left half away must
+        // show only blue.
+        let mut pm = tiny_skia::Pixmap::new(2, 1).unwrap();
+        {
+            let px = pm.pixels_mut();
+            px[0] = tiny_skia::ColorU8::from_rgba(255, 0, 0, 255).premultiply();
+            px[1] = tiny_skia::ColorU8::from_rgba(0, 0, 255, 255).premultiply();
+        }
+        let ws = tmp_workspace("crop");
+        std::fs::write(ws.join("half.png"), pm.encode_png().unwrap()).unwrap();
+        let b = image_board("half.png", r#","srcRect":[0.5, 0, 0, 0]"#);
+        let out = render_ws(&b, &ws);
+        let rendered = tiny_skia::Pixmap::decode_png(&out.png).unwrap();
+        // Probe well inside the crop: bilinear sampling blends at the source
+        // pixel boundary, but deep in the visible half only blue remains.
+        let px = rendered.pixel(80, 48).unwrap().demultiply();
+        assert_eq!(
+            (px.red(), px.green(), px.blue()),
+            (0, 0, 255),
+            "only the uncropped half may show"
+        );
+    }
+
+    #[test]
+    fn a_monochrome_svg_tints_and_a_polychrome_one_warns() {
+        let ws = tmp_workspace("tint");
+        std::fs::write(
+            ws.join("mono.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <rect width="10" height="10" fill="#333333"/></svg>"##,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("poly.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <rect width="4" height="10" fill="#ff0000"/>
+                <rect x="4" width="3" height="10" fill="#00ff00"/>
+                <rect x="7" width="3" height="10" fill="#0000ff"/></svg>"##,
+        )
+        .unwrap();
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+
+        let b = image_board("mono.svg", r#","tint":"@accent1""#);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, Some(&ws), &mut diags).unwrap();
+        let accent = theme.color("@accent1").unwrap().hex();
+        assert!(svg.contains(&accent), "tinted to the theme token: {svg}");
+        assert!(!svg.contains("#333333"), "{svg}");
+        assert!(
+            !diags.iter().any(|d| d.message.contains("tint")),
+            "{diags:?}"
+        );
+
+        let b = image_board("poly.svg", r#","tint":"@accent1""#);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, Some(&ws), &mut diags).unwrap();
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("tint needs a monochrome source (found 3 colors)")),
+            "{diags:?}"
+        );
+        assert!(svg.contains("#ff0000"), "untinted polychrome kept: {svg}");
+    }
+
+    #[test]
+    fn a_missing_image_keeps_the_placeholder_and_names_the_path() {
+        let ws = tmp_workspace("missing");
+        let b = image_board("does/not/exist.png", "");
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, Some(&ws), &mut diags).unwrap();
+        assert!(svg.contains("stroke-dasharray"), "placeholder box: {svg}");
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.message.contains("exist.png")
+                && d.message.contains("not found")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn no_workspace_means_a_placeholder_with_the_reason() {
+        let b = image_board("fig.png", "");
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(svg.contains("stroke-dasharray"), "{svg}");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("needs a workspace root")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_inlined_svg_is_sanitized_before_it_reaches_the_page() {
+        let ws = tmp_workspace("sanitize");
+        std::fs::write(
+            ws.join("dirty.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <script>alert(1)</script>
+                <rect width="10" height="10" fill="#00aa00"/></svg>"##,
+        )
+        .unwrap();
+        let b = image_board("dirty.svg", "");
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, Some(&ws), &mut diags).unwrap();
+        assert!(!svg.contains("<script"), "{svg}");
+        assert!(svg.contains("#00aa00"), "the drawing survives: {svg}");
+        // And the whole page still parses through the render stack.
+        let opt = usvg::Options {
+            fontdb: fonts.db(),
+            ..Default::default()
+        };
+        usvg::Tree::from_str(&svg, &opt).expect("page with an inlined figure parses");
     }
 }

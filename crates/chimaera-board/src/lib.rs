@@ -20,12 +20,15 @@
 //! - [`describe`] — what the agent reads back.
 //! - [`lint`] — what refuses to export.
 
+pub mod arrange;
 pub mod chart;
 pub mod colormap;
 pub mod composites;
+pub mod cvd;
 pub mod describe;
 pub mod diagram;
 pub mod export;
+pub mod imginfo;
 pub mod journal;
 pub mod layout;
 pub mod lint;

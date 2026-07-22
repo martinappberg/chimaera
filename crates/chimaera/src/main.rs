@@ -315,12 +315,20 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Board {
-                cmd: board::BoardCmd::Import { path, to, page, id },
+                cmd:
+                    board::BoardCmd::Import {
+                        path,
+                        to,
+                        page,
+                        id,
+                        regen,
+                    },
             } => {
                 assert_eq!(path, std::path::PathBuf::from("arch.mmd"));
                 assert_eq!(to, std::path::PathBuf::from("talks/review.board.json"));
                 assert_eq!(page.as_deref(), Some("arch"));
                 assert_eq!(id.as_deref(), Some("backend"));
+                assert_eq!(regen, None);
             }
             _ => panic!("expected board import"),
         }

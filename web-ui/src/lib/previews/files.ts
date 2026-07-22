@@ -302,15 +302,17 @@ export async function fsBoardRender(
 }
 
 /**
- * Apply one gesture (move/resize by object id) to a board, server-side.
- * The pane never serializes a board itself — a client-side stringify would
- * destroy the canonical byte-stable form. Resolves to the new X-Mtime token
- * so the caller can `noteWrite` and adopt its own edit.
+ * Apply one gesture (move/resize/replace-text by object id) to a board,
+ * server-side. The pane never serializes a board itself — a client-side
+ * stringify would destroy the canonical byte-stable form. `text` replaces a
+ * text/shape object's paragraphs with plain strings (styled runs survive
+ * only by not sending it). Resolves to the new X-Mtime token so the caller
+ * can `noteWrite` and adopt its own edit.
  */
 export async function fsBoardEdit(
   path: string,
   object: string,
-  change: { at?: [number, number]; size?: [number, number] },
+  change: { at?: [number, number]; size?: [number, number]; text?: string[] },
 ): Promise<string | null> {
   const body = await json<{ mtime: string | null }>(
     await api("/board/edit", {

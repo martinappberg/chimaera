@@ -25,7 +25,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
-| `board.rs` | `board show/new/render/export/import/describe/journal/lint`: thin shells over `chimaera-board` crate functions (the daemon routes wrap the same functions, so CLI and pane cannot disagree). Synchronous, filesystem-only — no daemon needed. |
+| `board.rs` | `board show/new/render/export/import/describe/journal/lint/arrange/validate-theme`: thin shells over `chimaera-board` crate functions (the daemon routes wrap the same functions, so CLI and pane cannot disagree). Synchronous, filesystem-only — no daemon needed. `arrange` journals its moves as actor `agent`. |
 
 (`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
 

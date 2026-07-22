@@ -33,6 +33,7 @@ use std::io::Write as _;
 use anyhow::{Context, Result};
 
 use super::{ExportReport, ExportTier, ObjectFate};
+use crate::imginfo::{jpeg_dimensions, png_dimensions, sniff_image, ImgKind};
 use crate::layout::FontStack;
 use crate::schema::{
     Align, Board, ChartObject, ConnectorObject, EndPoint, Frame, GroupObject, ImageObject, Object,
@@ -1372,79 +1373,6 @@ fn emit_connector(w: &mut SlideWriter, c: &ConnectorObject) {
     w.fate(&c.id, ExportTier::Native, reason);
 }
 
-enum ImgKind {
-    Png,
-    Jpeg,
-    Svg,
-    Unknown,
-}
-
-fn sniff_image(bytes: &[u8], src: &str) -> ImgKind {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return ImgKind::Png;
-    }
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        return ImgKind::Jpeg;
-    }
-    let head = &bytes[..bytes.len().min(1024)];
-    if src.to_ascii_lowercase().ends_with(".svg")
-        || std::str::from_utf8(head)
-            .map(|s| s.contains("<svg"))
-            .unwrap_or(false)
-    {
-        return ImgKind::Svg;
-    }
-    ImgKind::Unknown
-}
-
-/// PNG intrinsic size from the IHDR chunk.
-fn png_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    if b.len() < 24 || &b[12..16] != b"IHDR" {
-        return None;
-    }
-    let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
-    let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
-    (w > 0 && h > 0).then_some((w, h))
-}
-
-/// JPEG intrinsic size from the first SOF segment (SOF0–SOF2 and friends).
-fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    if b.len() < 4 || b[0] != 0xFF || b[1] != 0xD8 {
-        return None;
-    }
-    let mut i = 2usize;
-    while i + 3 < b.len() {
-        if b[i] != 0xFF {
-            return None; // lost sync — refuse rather than misread
-        }
-        let marker = b[i + 1];
-        match marker {
-            0xFF => {
-                i += 1;
-                continue;
-            }
-            0x01 | 0xD0..=0xD8 => {
-                i += 2;
-                continue;
-            }
-            0xD9 | 0xDA => return None, // end / entropy data before any SOF
-            _ => {}
-        }
-        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-        let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
-        if is_sof {
-            if i + 9 <= b.len() {
-                let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
-                let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
-                return (w > 0 && h > 0).then_some((w, h));
-            }
-            return None;
-        }
-        i += 2 + len;
-    }
-    None
-}
-
 /// A dashed placeholder box where pixels could not land — the same visual the
 /// renderer draws for an image it cannot place.
 fn placeholder_sp(w: &mut SlideWriter, name: &str, alt: Option<&str>, f: Frame) {
@@ -1489,12 +1417,7 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
         ImgKind::Png => (png_dimensions(&bytes), "png"),
         ImgKind::Jpeg => (jpeg_dimensions(&bytes), "jpeg"),
         ImgKind::Svg => {
-            placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(img.size));
-            w.fate(
-                &img.id,
-                ExportTier::Raster,
-                "svg placement ships later; placeholder box exported",
-            );
+            emit_image_svg(w, img, at, &bytes);
             return;
         }
         ImgKind::Unknown => {
@@ -1550,6 +1473,112 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
         &img.id,
         ExportTier::Native,
         format!("{kind} embedded natively"),
+    );
+}
+
+/// An SVG image as a `p:pic` carrying both bodies: a PNG rasterized at 2× the
+/// placed size (what every consumer can show) and the sanitized SVG itself as
+/// an `svgBlip` extension (what modern PowerPoint renders as a real vector) —
+/// the progressive enhancement from the plan. The SVG that lands in the
+/// package is the usvg round-trip, never the raw file: an imported figure is
+/// untrusted markup and the sanitize pass is what strips anything script-ish.
+fn emit_image_svg(w: &mut SlideWriter, img: &ImageObject, at: [f64; 2], bytes: &[u8]) {
+    let fallback = Frame {
+        x: at[0],
+        y: at[1],
+        w: img.size.map(|s| s[0]).unwrap_or(100.0),
+        h: img.size.map(|s| s[1]).unwrap_or(75.0),
+    };
+    let degrade = |w: &mut SlideWriter, reason: String| {
+        placeholder_sp(w, &img.id, img.alt.as_deref(), fallback);
+        w.fate(&img.id, ExportTier::Raster, reason);
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        degrade(
+            w,
+            "svg source is not valid UTF-8; placeholder box exported".to_string(),
+        );
+        return;
+    };
+    let prefix: String = img
+        .id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .chain("-".chars())
+        .collect();
+    let san = match crate::imginfo::sanitize_svg(text, w.fonts.db(), &prefix) {
+        Ok(v) => v,
+        Err(e) => {
+            degrade(
+                w,
+                format!("svg failed to parse ({e}); placeholder box exported"),
+            );
+            return;
+        }
+    };
+    // Missing size falls back to the document's own units at 96 dpi (unit ×
+    // 0.75 pt), matching the raster path's convention.
+    let size = img.size.unwrap_or([san.width * 0.75, san.height * 0.75]);
+    let f = Frame {
+        x: at[0],
+        y: at[1],
+        w: size[0],
+        h: size[1],
+    };
+    let px = |v: f64| -> u64 {
+        let p = (v * 2.0).round();
+        if p.is_finite() && p >= 1.0 {
+            p.min(crate::render::MAX_PIXELS as f64) as u64
+        } else {
+            1
+        }
+    };
+    let (px_w, px_h) = (px(size[0]), px(size[1]));
+    if px_w.saturating_mul(px_h) > crate::render::MAX_PIXELS {
+        degrade(
+            w,
+            format!(
+                "svg fallback raster would be {px_w}×{px_h} px, over the {} Mpx ceiling; \
+                 placeholder box exported",
+                crate::render::MAX_PIXELS / 1_000_000
+            ),
+        );
+        return;
+    }
+    let png = match crate::imginfo::rasterize_svg(&san.xml, w.fonts.db(), px_w as u32, px_h as u32)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            degrade(
+                w,
+                format!("svg rasterization failed ({e}); placeholder box exported"),
+            );
+            return;
+        }
+    };
+    let png_rid = w.media_rel(&format!("{}#svg-png", img.src), png, "png");
+    let svg_rid = w.media_rel(&format!("{}#svg", img.src), san.xml.into_bytes(), "svg");
+    let src_rect = match img.src_rect {
+        Some([l, t, r, b]) => format!(
+            r#"<a:srcRect l="{}" t="{}" r="{}" b="{}"/>"#,
+            pct100k(l),
+            pct100k(t),
+            pct100k(r),
+            pct100k(b)
+        ),
+        None => String::new(),
+    };
+    let nv = w.cnvpr(&img.id, img.alt.as_deref(), img.link.as_deref());
+    let _ = write!(
+        w.xml,
+        r#"<p:pic><p:nvPicPr>{nv}<p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="{png_rid}"><a:extLst><a:ext uri="{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}"><asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/SVG/main" r:embed="{svg_rid}"/></a:ext></a:extLst></a:blip>{src_rect}<a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>{}{}</p:spPr></p:pic>"#,
+        xfrm(f, img.rotation, false, false),
+        prst_geom("rect", "")
+    );
+    w.fate(
+        &img.id,
+        ExportTier::Vector,
+        "svg embedded with PNG fallback (svgBlip)",
     );
 }
 
@@ -2152,6 +2181,7 @@ pub fn write_pptx(
         let ctype = match *ext {
             "png" => "image/png",
             "jpeg" => "image/jpeg",
+            "svg" => "image/svg+xml",
             _ => continue,
         };
         let _ = write!(ct, r#"<Default Extension="{ext}" ContentType="{ctype}"/>"#);
@@ -2735,6 +2765,82 @@ mod tests {
         assert!(fate("missing-figure").reason.contains("not found"));
         assert!(fate("mystery").reason.starts_with("skipped:"));
         assert!(fate("deck-title").reason.contains("placeholder"));
+    }
+
+    #[test]
+    fn an_svg_image_lands_as_png_plus_svgblip() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-board-pptx-svg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("panel.svg");
+        std::fs::write(
+            &svg_path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+                <script>alert(1)</script>
+                <rect width="20" height="10" fill="#cc0000"/></svg>"##,
+        )
+        .unwrap();
+        let b = board(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[400,300]}},
+                "pages":[{{"id":"p","objects":[
+                  {{"id":"panel","type":"image","src":{src:?},
+                   "at":[8,8],"size":[160,80]}}]}}]}}"#,
+            src = svg_path.to_str().unwrap()
+        ));
+        let (bytes, report) = write(&b);
+
+        // Both bodies land under media/: the 2× PNG fallback and the
+        // sanitized SVG itself.
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let names: Vec<String> = (0..ar.len())
+            .map(|i| ar.by_index(i).unwrap().name().to_string())
+            .collect();
+        let media_png = names
+            .iter()
+            .find(|n| n.starts_with("ppt/media/") && n.ends_with(".png"))
+            .expect("a PNG fallback in media/");
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("ppt/media/") && n.ends_with(".svg")),
+            "{names:?}"
+        );
+
+        // The PNG fallback is 2× the placed 160×80 pt box.
+        let mut png_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut ar.by_name(media_png).unwrap(), &mut png_bytes).unwrap();
+        assert_eq!(png_dimensions(&png_bytes), Some((320, 160)));
+
+        // The embedded SVG is the sanitized round-trip, never the raw file.
+        let media_svg = names
+            .iter()
+            .find(|n| n.starts_with("ppt/media/") && n.ends_with(".svg"))
+            .unwrap();
+        let svg_body = read_part(&bytes, media_svg);
+        assert!(!svg_body.contains("<script"), "{svg_body}");
+
+        // The slide carries the svgBlip extension next to the blip.
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        assert!(
+            slide.contains(r#"uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}""#),
+            "{slide}"
+        );
+        assert!(slide.contains("<asvg:svgBlip"), "{slide}");
+        assert_well_formed(&slide);
+
+        // Content types declare the svg extension.
+        let ct = read_part(&bytes, "[Content_Types].xml");
+        assert!(
+            ct.contains(r#"Extension="svg" ContentType="image/svg+xml""#),
+            "{ct}"
+        );
+
+        // The fate says exactly what happened.
+        let fate = report.objects.iter().find(|f| f.id == "panel").unwrap();
+        assert_eq!(fate.tier, ExportTier::Vector);
+        assert_eq!(fate.reason, "svg embedded with PNG fallback (svgBlip)");
     }
 
     /// Fidelity oracle against python-pptx, deliberately not required by CI

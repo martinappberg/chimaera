@@ -24,7 +24,9 @@ functions; that single-engine property is what keeps the pane, the CLI and
 | `src/show.rs` | the one-shot `board show` spec → one-page board (never a second schema) |
 | `src/describe.rs` | the agent-facing read-back (+ the one-line journal summary) |
 | `src/journal.rs` | the semantic edit journal: seq-first append-only JSONL per board under `.chimaera/board/journal/`, no wall clock, size-capped with seq-preserving compaction |
-| `src/lint.rs` | the legality profile; findings always name object, field, and the numbers |
+| `src/lint.rs` | the legality, target and style profiles + `lint_fix`; findings always name object, field, and the numbers |
+| `src/arrange.rs` | align/distribute/grid over named objects, one pure function; refuses slot-placed targets (their geometry is derived) |
+| `src/cvd.rs` | the CVD preflight: Machado 2009 simulation, CIE76 ΔE, all-pairs palette check, the computed safe series cap, `validate_theme` |
 
 ## Invariants that bite
 

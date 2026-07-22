@@ -258,6 +258,56 @@ async fn board_edit_appends_to_the_semantic_journal() {
 }
 
 #[tokio::test]
+async fn board_edit_replaces_text_and_journals_text_edited() {
+    // The text op: plain paragraphs replace the object's text, the agent
+    // reads the new words back through describe, and the journal records the
+    // gesture as actor human — content-free, because the board file has the
+    // content and the journal never duplicates it.
+    let state = test_state();
+    let path = write_board("board-edit-text");
+
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/edit",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "object": "t",
+            "text": ["Rewritten by the pane", "Second paragraph"],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["journalSeq"], 1, "{json}");
+
+    let (_, described) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/describe",
+        Some(serde_json::json!({"path": path.to_string_lossy()})),
+    )
+    .await;
+    let text = described["text"].as_str().unwrap();
+    assert!(text.contains("Rewritten by the pane"), "{text}");
+
+    let canon = path.canonicalize().unwrap();
+    let ws = chimaera_board::workspace_root(&canon);
+    let journal = chimaera_board::journal::journal_path(&ws, &canon);
+    let events = chimaera_board::journal::read_since(&journal, 0).unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].render(), "#1 human edited text of t");
+    let raw = std::fs::read_to_string(&journal).unwrap();
+    assert!(
+        raw.contains(r#""event":"text-edited""#),
+        "kebab-case on the wire: {raw}"
+    );
+    assert!(
+        !raw.contains("Rewritten"),
+        "the journal carries no content: {raw}"
+    );
+}
+
+#[tokio::test]
 async fn board_edit_refuses_an_unknown_object_by_name() {
     let state = test_state();
     let path = write_board("board-edit-unknown");

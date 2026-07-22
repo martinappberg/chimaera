@@ -5,18 +5,19 @@
 //! balance, "wrong hierarchy") because they are judgement, not measurement.
 //! Every finding names object, field, measured value and expected value.
 //!
-//! Slice 0 ships the legality profile only: duplicate ids, inline data caps,
-//! sub-floor text, off-canvas, unresolved theme tokens, unresolved connector
-//! endpoints, unknown objects. `--style` (near-miss alignment and friends)
-//! arrives with the pane, where its findings can be clicked.
+//! Three profiles live here: the legality lint ([`lint`]: duplicate ids,
+//! inline data caps, off-canvas, unresolved tokens/endpoints, unknown
+//! objects), the target lint ([`lint_target`]: the venue's floors, tiers and
+//! rules), and the style lint ([`lint_style`]: the measured near-miss set).
+//! [`lint_fix`] repairs the mechanically-unambiguous classes in place.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::layout::FontStack;
-use crate::normalize::{Diagnostic, Severity};
+use crate::normalize::{Diagnostic, Severity, GRID_PT, MIN_EXTENT_PT};
 use crate::presets::{tier_of, tier_rank, Preset};
-use crate::schema::{Board, ChartObject, Object, Paragraph, Stroke};
-use crate::theme::Theme;
+use crate::schema::{Board, ChartObject, Frame, Object, Page, Paragraph, Stroke};
+use crate::theme::{Theme, TypeRole};
 
 /// Run the legality lint over a normalized board.
 pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
@@ -358,6 +359,9 @@ pub fn lint_target(
 
     // Role names actually drawn on this board, for the font-resolution check.
     let mut used_roles: BTreeSet<&str> = BTreeSet::new();
+    // The theme ramp's CVD-safe series cap, computed lazily: the Machado
+    // simulation runs only when a chart actually encodes multiple series.
+    let mut series_cap: Option<usize> = None;
 
     for page in &board.pages {
         // Export-floor census over top-level objects: a group is one fate
@@ -466,7 +470,10 @@ pub fn lint_target(
                         (Some(_), _) => {}
                     }
                 }
-                Object::Chart(c) => check_chart_rules(c, preset, &page.id, &mut diags),
+                Object::Chart(c) => {
+                    check_chart_rules(c, preset, &page.id, &mut diags);
+                    check_series_cap(c, theme, &page.id, &mut series_cap, &mut diags);
+                }
                 // A scalebar's stroke is stored; its bar must clear the
                 // venue's line-weight floor like any drawn stroke.
                 Object::Scalebar(sb) => check_stroke_floor(
@@ -624,6 +631,65 @@ fn check_chart_rules(c: &ChartObject, preset: &Preset, page: &str, diags: &mut V
     }
 }
 
+/// The plan's *computed series cap* (§9): a chart may not encode more series
+/// than the theme ramp can keep apart under CVD simulation. The cap is the
+/// largest ramp prefix with no pair under ΔE 8 (Machado 2009, all three
+/// dichromacies) — [`crate::cvd::safe_series_cap`] — computed at most once
+/// per lint run and only when some chart actually encodes ≥2 series.
+fn check_series_cap(
+    c: &ChartObject,
+    theme: &Theme,
+    page: &str,
+    cap: &mut Option<usize>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let series = distinct_series(c);
+    if series < 2 {
+        return;
+    }
+    let cap = *cap.get_or_insert_with(|| {
+        let ramp: Vec<crate::theme::Rgb> = theme
+            .chart
+            .categorical
+            .iter()
+            .filter_map(|r| theme.color(r))
+            .collect();
+        crate::cvd::safe_series_cap(&ramp)
+    });
+    if series > cap {
+        diags.push(
+            Diagnostic::new(
+                Severity::Error,
+                format!(
+                    "{series} series exceed the theme ramp's CVD-safe cap of {cap} \
+                     (all-pairs ΔE ≥ 8 under Machado 2009); split the chart or drop series"
+                ),
+            )
+            .at(page, &c.id)
+            .field("color"),
+        );
+    }
+}
+
+/// Distinct values of the color channel's field over the inline rows — how
+/// many ramp colors the chart will actually consume. No color channel (or no
+/// inline rows to read) counts as one series.
+fn distinct_series(c: &ChartObject) -> usize {
+    let Some(color) = c.color.as_ref() else {
+        return 1;
+    };
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for row in &c.data.values {
+        if let Some(v) = row.get(color.field.as_str()) {
+            seen.insert(match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+        }
+    }
+    seen.len().max(1)
+}
+
 /// Unit-ish: a `(` with a matching `)` after it, non-empty between.
 fn has_unit_parenthetical(title: &str) -> bool {
     match (title.find('('), title.rfind(')')) {
@@ -676,6 +742,771 @@ fn check_color(
             .at(page, id)
             .field(field),
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --style: the measured near-miss profile
+// ---------------------------------------------------------------------------
+
+/// The style lint: measured geometry findings over **resolved** frames
+/// ([`crate::slots::resolve_page_frames`] — the same geometry truth render
+/// and describe use, so a slot-placed object is judged where it actually
+/// lands).
+///
+/// Severities follow §3.5. Errors under `strict`, warnings by default:
+/// near-miss alignment (matching edges 0 < Δ < 3 pt — the highest-value
+/// check; 1.5 pt off is always a mistake, never a choice) · near-miss
+/// spacing (3+ objects in a row/column with gaps differing by 0 < Δ < 3) ·
+/// off-grid geometry (explicit `at`/`size` not on the 8 pt grid; slot
+/// geometry is on-grid by construction and never checked) · overfull box ·
+/// margin violation. Always warnings: underfull box (<40% of frame height
+/// used) · distinct-value counts per page (>2 resolved families, >1
+/// non-neutral accent among literal colors) · override budget (>4 run-level
+/// size/family/color overrides per page; objects with role `"code"` exempt) ·
+/// title widow · a free `at` where the page's layout still has unclaimed
+/// slots.
+///
+/// **Refused at any severity, deliberately unimplemented** (§3.5): general
+/// object overlap (callouts over panels are the entire point of the
+/// annotation layer) · panel-extent consistency (a wide time series beside a
+/// square heatmap is correct; plot-area *edges* matter, panel *extents*
+/// don't) · data-ink ratio (empirically contested — Tufte's direction lives
+/// in theme defaults, never in a rule) · whitespace balance · "wrong
+/// hierarchy" (the last two are judgement, and judgement is the loop's 5%).
+pub fn lint_style(
+    board: &Board,
+    theme: &Theme,
+    fonts: &FontStack,
+    strict: bool,
+) -> Vec<Diagnostic> {
+    let base = if strict {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+    let mut diags = Vec::new();
+
+    for page in &board.pages {
+        let resolved = crate::slots::resolve_page_frames(board, page, theme, Some(fonts));
+        // Z-order, so pair findings attach to the later object and name the
+        // earlier one — the same "second snaps to first" contract lint_fix
+        // repairs by.
+        let framed: Vec<(&str, Frame)> = page
+            .walk()
+            .filter_map(|o| resolved.get(o.id()).map(|f| (o.id(), *f)))
+            .collect();
+
+        near_miss_alignment(&framed, &page.id, base, &mut diags);
+        near_miss_spacing(&framed, &page.id, base, &mut diags);
+        off_grid(page, base, &mut diags);
+        text_boxes(page, &resolved, theme, fonts, base, &mut diags);
+        margin_violations(board, page, &resolved, theme, base, &mut diags);
+        page_budgets(page, theme, fonts, &mut diags);
+        title_widows(page, &resolved, theme, fonts, &mut diags);
+        free_at(board, page, theme, &mut diags);
+    }
+
+    diags
+}
+
+const ALIGN_TOLERANCE_PT: f64 = 3.0;
+const EPS: f64 = 1e-6;
+
+/// A frame measurement (an edge coordinate), named so the edge tables stay
+/// readable.
+type EdgeOf = fn(&Frame) -> f64;
+
+/// Render a point value without float noise: `81.5`, not `81.500000000001`.
+fn pt(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+fn near_miss_alignment(
+    framed: &[(&str, Frame)],
+    page: &str,
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let edges: [(&str, EdgeOf); 4] = [
+        ("left", |f| f.x),
+        ("right", Frame::right),
+        ("top", |f| f.y),
+        ("bottom", Frame::bottom),
+    ];
+    for i in 0..framed.len() {
+        for j in (i + 1)..framed.len() {
+            let ((a, fa), (b, fb)) = (framed[i], framed[j]);
+            for (edge, of) in edges {
+                let (va, vb) = (of(&fa), of(&fb));
+                let d = (va - vb).abs();
+                if d > EPS && d < ALIGN_TOLERANCE_PT {
+                    diags.push(
+                        Diagnostic::new(
+                            base,
+                            format!(
+                                "near-miss alignment: {edge} edge at {} vs {a:?} at {} \
+                                 (Δ {} pt; aligned is 0 or ≥ {ALIGN_TOLERANCE_PT})",
+                                pt(vb),
+                                pt(va),
+                                pt(d)
+                            ),
+                        )
+                        .at(page, b)
+                        .field("at"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Rows are objects whose top edges match within 0.5 pt, columns objects
+/// whose left edges do — the bands a reader's eye actually groups. Within a
+/// band of 3+, consecutive gaps that differ by 0 < Δ < 3 are the
+/// machine-placement tell (20/22/20).
+fn near_miss_spacing(
+    framed: &[(&str, Frame)],
+    page: &str,
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let bands = |key: fn(&Frame) -> f64, order: fn(&Frame) -> f64| -> Vec<Vec<(&str, Frame)>> {
+        let mut sorted: Vec<(&str, Frame)> = framed.to_vec();
+        sorted.sort_by(|a, b| {
+            (key(&a.1), order(&a.1))
+                .partial_cmp(&(key(&b.1), order(&b.1)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut out: Vec<Vec<(&str, Frame)>> = Vec::new();
+        for item in sorted {
+            match out.last_mut() {
+                Some(band) if (key(&band.last().unwrap().1) - key(&item.1)).abs() <= 0.5 => {
+                    band.push(item)
+                }
+                _ => out.push(vec![item]),
+            }
+        }
+        out
+    };
+
+    let mut check = |axis: &str,
+                     bands: Vec<Vec<(&str, Frame)>>,
+                     start: fn(&Frame) -> f64,
+                     end: fn(&Frame) -> f64| {
+        for band in bands.iter().filter(|b| b.len() >= 3) {
+            for w in band.windows(3) {
+                let [(a, fa), (b, fb), (c, fc)] = [w[0], w[1], w[2]];
+                let (g1, g2) = (start(&fb) - end(&fa), start(&fc) - end(&fb));
+                if g1 <= 0.0 || g2 <= 0.0 {
+                    continue; // overlapping or touching — not a spacing run
+                }
+                let d = (g1 - g2).abs();
+                if d > EPS && d < ALIGN_TOLERANCE_PT {
+                    diags.push(
+                        Diagnostic::new(
+                            base,
+                            format!(
+                                "near-miss spacing: gaps {} and {} pt across {a:?} · {b:?} · \
+                                 {c:?} in a {axis} (Δ {} pt)",
+                                pt(g1),
+                                pt(g2),
+                                pt(d)
+                            ),
+                        )
+                        .at(page, b)
+                        .field("at"),
+                    );
+                }
+            }
+        }
+    };
+
+    check("row", bands(|f| f.y, |f| f.x), |f| f.x, Frame::right);
+    check("column", bands(|f| f.x, |f| f.y), |f| f.y, Frame::bottom);
+}
+
+/// Only explicitly-placed geometry: a slot frame is on-grid by construction,
+/// and an anchored offset is a binding, not a stated coordinate.
+fn off_grid(page: &Page, base: Severity, diags: &mut Vec<Diagnostic>) {
+    let on = |v: f64| ((v / GRID_PT).round() * GRID_PT - v).abs() <= EPS;
+    for obj in page.walk() {
+        let Some(f) = obj.frame() else { continue };
+        if !(on(f.x) && on(f.y)) {
+            diags.push(
+                Diagnostic::new(
+                    base,
+                    format!(
+                        "off-grid: at [{}, {}] is not on the {GRID_PT} pt grid (nearest [{}, {}])",
+                        pt(f.x),
+                        pt(f.y),
+                        snap8(f.x),
+                        snap8(f.y)
+                    ),
+                )
+                .at(&page.id, obj.id())
+                .field("at"),
+            );
+        }
+        if !(on(f.w) && on(f.h)) {
+            diags.push(
+                Diagnostic::new(
+                    base,
+                    format!(
+                        "off-grid: size [{}, {}] is not on the {GRID_PT} pt grid \
+                         (nearest [{}, {}])",
+                        pt(f.w),
+                        pt(f.h),
+                        snap8(f.w).max(MIN_EXTENT_PT),
+                        snap8(f.h).max(MIN_EXTENT_PT)
+                    ),
+                )
+                .at(&page.id, obj.id())
+                .field("size"),
+            );
+        }
+    }
+}
+
+/// Overfull (base severity) and underfull (always a warning) text boxes,
+/// measured against the resolved frame.
+fn text_boxes(
+    page: &Page,
+    resolved: &BTreeMap<String, Frame>,
+    theme: &Theme,
+    fonts: &FontStack,
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for obj in page.walk() {
+        let (id, role_name, paras, underfull_applies) = match obj {
+            Object::Text(t) => (
+                t.id.as_str(),
+                t.role.as_deref().unwrap_or("body"),
+                &t.text,
+                true,
+            ),
+            // A shape's text is usually a short label inside a panel; a
+            // mostly-empty panel is normal, so only overfull applies.
+            Object::Shape(sh) if !sh.text.is_empty() => (
+                sh.id.as_str(),
+                sh.role.as_deref().unwrap_or("body"),
+                &sh.text,
+                false,
+            ),
+            _ => continue,
+        };
+        let Some(frame) = resolved.get(id) else {
+            continue;
+        };
+        if paras.is_empty() {
+            continue;
+        }
+        let role = theme.role(role_name).unwrap_or_else(|| theme.body());
+        let block = text_block_height(paras, role, fonts, frame.w);
+        if block > frame.h + 0.5 {
+            diags.push(
+                Diagnostic::new(
+                    base,
+                    format!(
+                        "overfull box: text measures {:.0} pt against a {:.0} pt frame",
+                        block, frame.h
+                    ),
+                )
+                .at(&page.id, id)
+                .field("size"),
+            );
+        } else if underfull_applies && block > 0.0 && block < 0.4 * frame.h {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!(
+                        "underfull box: text fills {:.0} pt of a {:.0} pt frame (under 40%)",
+                        block, frame.h
+                    ),
+                )
+                .at(&page.id, id)
+                .field("size"),
+            );
+        }
+    }
+}
+
+/// The conservative height estimate `--style` shares with the renderer:
+/// plain paragraphs greedy-wrap through the same [`FontStack`] the renderer
+/// shapes with, each line at `size × lineHeight`; a rich paragraph is one
+/// line at its largest run size — exactly `emit_text_block`'s layout today,
+/// with paragraph spacing ignored. Measured height therefore equals what the
+/// renderer draws, and errs low if rich-run wrapping lands later — an
+/// overfull finding is never a false positive.
+fn text_block_height(paras: &[Paragraph], role: &TypeRole, fonts: &FontStack, width: f64) -> f64 {
+    let size = role.size.max(role.min_pt);
+    let mut h = 0.0;
+    for p in paras {
+        match p {
+            Paragraph::Plain(text) => {
+                let lines = fonts.wrap(text, &role.family, size, role.weight, width);
+                h += lines.len() as f64 * size * role.line_height;
+            }
+            Paragraph::Rich(rich) => {
+                let max = rich.runs.iter().filter_map(|r| r.size).fold(size, f64::max);
+                h += max * role.line_height;
+            }
+        }
+    }
+    h
+}
+
+fn margin_violations(
+    board: &Board,
+    page: &Page,
+    resolved: &BTreeMap<String, Frame>,
+    theme: &Theme,
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let [mt, mr, mb, ml] = theme.spacing.margin;
+    let (cw, ch) = (board.canvas.width(), board.canvas.height());
+    for obj in page.walk() {
+        // Slot geometry respects margins by construction (full-bleed ignores
+        // them on purpose), and a fully off-canvas object is parked — the
+        // legality lint already reports it.
+        if obj.slot().is_some() && obj.frame().is_none() {
+            continue;
+        }
+        let Some(f) = resolved.get(obj.id()) else {
+            continue;
+        };
+        if f.right() < 0.0 || f.bottom() < 0.0 || f.x > cw || f.y > ch {
+            continue;
+        }
+        let mut crossed = Vec::new();
+        if f.x < ml - EPS {
+            crossed.push(format!("left edge {} vs margin {}", pt(f.x), pt(ml)));
+        }
+        if f.y < mt - EPS {
+            crossed.push(format!("top edge {} vs margin {}", pt(f.y), pt(mt)));
+        }
+        if f.right() > cw - mr + EPS {
+            crossed.push(format!(
+                "right edge {} vs margin at {}",
+                pt(f.right()),
+                pt(cw - mr)
+            ));
+        }
+        if f.bottom() > ch - mb + EPS {
+            crossed.push(format!(
+                "bottom edge {} vs margin at {}",
+                pt(f.bottom()),
+                pt(ch - mb)
+            ));
+        }
+        if !crossed.is_empty() {
+            diags.push(
+                Diagnostic::new(base, format!("margin violation: {}", crossed.join("; ")))
+                    .at(&page.id, obj.id())
+                    .field("at"),
+            );
+        }
+    }
+}
+
+/// The per-page distinct-value censuses and the override budget — always
+/// warnings: these are budgets, not measurements of a single mistake.
+fn page_budgets(page: &Page, theme: &Theme, fonts: &FontStack, diags: &mut Vec<Diagnostic>) {
+    let resolve_family = |families: &[String], weight: u16| -> String {
+        fonts
+            .resolve(families, weight, false)
+            .map(|r| r.family)
+            .or_else(|| families.first().cloned())
+            .unwrap_or_else(|| "sans-serif".to_string())
+    };
+
+    let mut families: BTreeSet<String> = BTreeSet::new();
+    let mut accents: BTreeSet<String> = BTreeSet::new();
+    let mut overrides = 0usize;
+
+    let mut literal = |color: Option<&str>| {
+        let Some(c) = color else { return };
+        let Some(rgb) = crate::theme::parse_hex(c) else {
+            return; // @tokens are the theme's business, not an accent smell
+        };
+        let (max, min) = (rgb.r.max(rgb.g).max(rgb.b), rgb.r.min(rgb.g).min(rgb.b));
+        if max - min > 16 {
+            accents.insert(rgb.hex());
+        }
+    };
+
+    for obj in page.walk() {
+        let (paras, role_name): (&[Paragraph], &str) = match obj {
+            Object::Text(t) => (&t.text, t.role.as_deref().unwrap_or("body")),
+            Object::Shape(sh) => {
+                literal(sh.fill.as_deref());
+                literal(sh.stroke.as_ref().and_then(|s| s.color.as_deref()));
+                if sh.text.is_empty() {
+                    continue;
+                }
+                (&sh.text, sh.role.as_deref().unwrap_or("body"))
+            }
+            Object::Connector(c) => {
+                literal(c.stroke.as_ref().and_then(|s| s.color.as_deref()));
+                if c.text.is_empty() {
+                    continue;
+                }
+                (&c.text, c.role.as_deref().unwrap_or("label"))
+            }
+            _ => continue,
+        };
+        let role = theme.role(role_name).unwrap_or_else(|| theme.body());
+        families.insert(resolve_family(&role.family, role.weight));
+        let exempt = role_name == "code";
+        for p in paras {
+            let Paragraph::Rich(rich) = p else { continue };
+            for r in &rich.runs {
+                literal(r.color.as_deref());
+                if let Some(f) = &r.family {
+                    families.insert(resolve_family(std::slice::from_ref(f), role.weight));
+                }
+                if !exempt {
+                    overrides += usize::from(r.size.is_some())
+                        + usize::from(r.family.is_some())
+                        + usize::from(r.color.is_some());
+                }
+            }
+        }
+    }
+
+    let mut page_diag = |message: String, field: &str| {
+        let mut d = Diagnostic::new(Severity::Warning, message).field(field);
+        d.page = Some(page.id.clone());
+        diags.push(d);
+    };
+
+    if families.len() > 2 {
+        page_diag(
+            format!(
+                "page resolves {} font families ({}); the budget is 2",
+                families.len(),
+                families.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            "text",
+        );
+    }
+    if accents.len() > 1 {
+        page_diag(
+            format!(
+                "page carries {} non-neutral literal accents ({}); one accent is the budget — \
+                 route the rest through @tokens",
+                accents.len(),
+                accents.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            "fill",
+        );
+    }
+    if overrides > 4 {
+        page_diag(
+            format!(
+                "page carries {overrides} run-level size/family/color overrides; the budget is 4 \
+                 (role \"code\" exempt)"
+            ),
+            "text",
+        );
+    }
+}
+
+/// A title or heading whose last wrapped line is a single word: the widow the
+/// eye reads as a mistake. Uses the same greedy wrap as the renderer.
+fn title_widows(
+    page: &Page,
+    resolved: &BTreeMap<String, Frame>,
+    theme: &Theme,
+    fonts: &FontStack,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for obj in page.walk() {
+        let Object::Text(t) = obj else { continue };
+        if !matches!(t.role.as_deref(), Some("title") | Some("heading")) {
+            continue;
+        }
+        let Some(frame) = resolved.get(&t.id) else {
+            continue;
+        };
+        let Some(last_para) = t.text.last() else {
+            continue;
+        };
+        let role = theme
+            .role(t.role.as_deref().unwrap_or("title"))
+            .unwrap_or_else(|| theme.body());
+        let lines = fonts.wrap(
+            &last_para.plain_text(),
+            &role.family,
+            role.size.max(role.min_pt),
+            role.weight,
+            frame.w,
+        );
+        if lines.len() >= 2 {
+            let last = lines.last().map(String::as_str).unwrap_or("");
+            if !last.is_empty() && !last.contains(' ') {
+                diags.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        format!(
+                            "title widow: the last wrapped line is the one-word {last:?} over \
+                             {} lines; rewrap or rephrase",
+                            lines.len()
+                        ),
+                    )
+                    .at(&page.id, &t.id)
+                    .field("text"),
+                );
+            }
+        }
+    }
+}
+
+/// A hand-placed object on a page whose layout still has unclaimed slots:
+/// the escape hatch is being used where the primary path was available.
+fn free_at(board: &Board, page: &Page, theme: &Theme, diags: &mut Vec<Diagnostic>) {
+    let Some(layout_name) = page.layout.as_deref() else {
+        return;
+    };
+    let Some(slots) = crate::slots::layout(layout_name, board.canvas.size, &theme.spacing) else {
+        return; // the resolver already warns about an unknown layout
+    };
+    let claimed: BTreeSet<&str> = page.walk().filter_map(|o| o.slot()).collect();
+    let unclaimed: Vec<&str> = slots
+        .keys()
+        .map(String::as_str)
+        .filter(|s| !claimed.contains(s))
+        .collect();
+    if unclaimed.is_empty() {
+        return;
+    }
+    for obj in page.walk() {
+        let placeable = matches!(
+            obj,
+            Object::Text(_)
+                | Object::Shape(_)
+                | Object::Image(_)
+                | Object::Chart(_)
+                | Object::Diagram(_)
+        );
+        if placeable && obj.slot().is_none() && obj.frame().is_some() {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!(
+                        "free `at` on a page with layout {layout_name:?}; unclaimed slots: {}",
+                        unclaimed.join(", ")
+                    ),
+                )
+                .at(&page.id, obj.id())
+                .field("at"),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --fix: the mechanically-repairable classes
+// ---------------------------------------------------------------------------
+
+/// Repair the classes whose fix is unambiguous, in place, returning one line
+/// per applied fix. In order: off-canvas objects clamp back into the canvas
+/// (the clamped coordinate floors to the grid so the later snap cannot push
+/// it back out) · sub-floor run-size overrides raise to their role's floor
+/// (the renderer clamps them anyway; the file should say what draws) ·
+/// near-miss-aligned edges snap the SECOND object to the first (Δ < 3 pt
+/// only, one snap per object per axis) · off-grid `at`/`size` snap to the
+/// 8 pt grid.
+///
+/// Geometry fixes touch only top-level objects with explicit `at`/`size` —
+/// never slot-placed objects, whose geometry is derived at read time, and
+/// never group children, whose envelope `normalize()` re-unions. The run
+/// raise is content, not geometry, so it applies everywhere.
+pub fn lint_fix(board: &mut Board, theme: &Theme) -> Vec<String> {
+    let mut fixes = Vec::new();
+    let (cw, ch) = (board.canvas.width(), board.canvas.height());
+
+    for page in &mut board.pages {
+        // 1 — clamp off-canvas objects back in.
+        for obj in &mut page.objects {
+            if obj.slot().is_some() {
+                continue;
+            }
+            let Some(f) = obj.frame() else { continue };
+            let parked = f.right() < 0.0 || f.bottom() < 0.0 || f.x > cw || f.y > ch;
+            if !parked {
+                continue;
+            }
+            let clamp = |v: f64, max: f64| {
+                let c = v.clamp(0.0, max.max(0.0));
+                if c != v {
+                    // Floor to the grid so pass 4's rounding cannot push the
+                    // object back over the canvas edge.
+                    ((c / GRID_PT).floor() * GRID_PT).max(0.0)
+                } else {
+                    c
+                }
+            };
+            let (nx, ny) = (clamp(f.x, cw - f.w), clamp(f.y, ch - f.h));
+            obj.set_at([nx, ny]);
+            fixes.push(format!(
+                "clamped {} into the {cw}×{ch} canvas: at [{}, {}] → [{}, {}]",
+                obj.id(),
+                pt(f.x),
+                pt(f.y),
+                pt(nx),
+                pt(ny)
+            ));
+        }
+
+        // 2 — raise sub-floor run overrides to the role floor.
+        raise_run_floors(&mut page.objects, theme, &mut fixes);
+
+        // 3 — snap near-miss-aligned edges (second object to the first).
+        let mut frames: Vec<(usize, Frame)> = page
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.slot().is_none())
+            .filter_map(|(i, o)| o.frame().map(|f| (i, f)))
+            .collect();
+        // One snap per object per axis: a left-edge snap must not be undone
+        // by a subsequent right-edge near-miss on the same pair.
+        let mut snapped: BTreeSet<(usize, char)> = BTreeSet::new();
+        for i in 0..frames.len() {
+            for j in (i + 1)..frames.len() {
+                let (fa, (jj, fb)) = (frames[i].1, frames[j]);
+                let edges: [(&str, char, f64, f64); 4] = [
+                    ("left", 'x', fa.x, fb.x),
+                    ("right", 'x', fa.right(), fb.right()),
+                    ("top", 'y', fa.y, fb.y),
+                    ("bottom", 'y', fa.bottom(), fb.bottom()),
+                ];
+                for (edge, axis, va, vb) in edges {
+                    let d = (va - vb).abs();
+                    if d <= EPS || d >= ALIGN_TOLERANCE_PT || snapped.contains(&(jj, axis)) {
+                        continue;
+                    }
+                    let mut nf = frames[j].1;
+                    match edge {
+                        "left" => nf.x = fa.x,
+                        "right" => nf.x = fa.right() - nf.w,
+                        "top" => nf.y = fa.y,
+                        _ => nf.y = fa.bottom() - nf.h,
+                    }
+                    let a_id = page.objects[frames[i].0].id().to_string();
+                    page.objects[jj].set_at([nf.x, nf.y]);
+                    let b_id = page.objects[jj].id().to_string();
+                    fixes.push(format!(
+                        "snapped {b_id} {edge} edge {} → {} (aligns with {a_id})",
+                        pt(vb),
+                        pt(va)
+                    ));
+                    frames[j].1 = nf;
+                    snapped.insert((jj, axis));
+                }
+            }
+        }
+
+        // 4 — snap explicit geometry to the grid.
+        for obj in &mut page.objects {
+            if obj.slot().is_some() {
+                continue;
+            }
+            let Some(f) = obj.frame() else { continue };
+            let (nx, ny) = (snap8(f.x), snap8(f.y));
+            let (nw, nh) = (snap8(f.w).max(MIN_EXTENT_PT), snap8(f.h).max(MIN_EXTENT_PT));
+            if (nx, ny, nw, nh) == (f.x, f.y, f.w, f.h) {
+                continue;
+            }
+            obj.set_at([nx, ny]);
+            obj.set_size([nw, nh]);
+            let mut parts = Vec::new();
+            if (nx, ny) != (f.x, f.y) {
+                parts.push(format!(
+                    "at [{}, {}] → [{}, {}]",
+                    pt(f.x),
+                    pt(f.y),
+                    pt(nx),
+                    pt(ny)
+                ));
+            }
+            if (nw, nh) != (f.w, f.h) {
+                parts.push(format!(
+                    "size [{}, {}] → [{}, {}]",
+                    pt(f.w),
+                    pt(f.h),
+                    pt(nw),
+                    pt(nh)
+                ));
+            }
+            fixes.push(format!(
+                "snapped {} to the {GRID_PT} pt grid: {}",
+                obj.id(),
+                parts.join(", ")
+            ));
+        }
+    }
+
+    fixes
+}
+
+fn snap8(v: f64) -> f64 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    (v / GRID_PT).round() * GRID_PT
+}
+
+/// Raise every rich-run `size` override below its role's floor, recursing
+/// into groups (a run override is content, not geometry, so group children
+/// participate).
+fn raise_run_floors(objects: &mut [Object], theme: &Theme, fixes: &mut Vec<String>) {
+    for obj in objects {
+        let (id, role_name, paras) = match obj {
+            Object::Text(t) => (
+                t.id.clone(),
+                t.role.clone().unwrap_or_else(|| "body".into()),
+                &mut t.text,
+            ),
+            Object::Shape(sh) => (
+                sh.id.clone(),
+                sh.role.clone().unwrap_or_else(|| "body".into()),
+                &mut sh.text,
+            ),
+            Object::Connector(c) => (
+                c.id.clone(),
+                c.role.clone().unwrap_or_else(|| "label".into()),
+                &mut c.text,
+            ),
+            Object::Callout(co) => (co.id.clone(), "caption".to_string(), &mut co.text),
+            Object::Group(g) => {
+                raise_run_floors(&mut g.objects, theme, fixes);
+                continue;
+            }
+            _ => continue,
+        };
+        let floor = theme
+            .role(&role_name)
+            .unwrap_or_else(|| theme.body())
+            .min_pt;
+        for p in paras {
+            let Paragraph::Rich(rich) = p else { continue };
+            for r in &mut rich.runs {
+                if let Some(size) = r.size {
+                    if size + 1e-9 < floor {
+                        r.size = Some(floor);
+                        fixes.push(format!(
+                            "raised {id} run override {} pt → {} pt (role {role_name:?} floor)",
+                            pt(size),
+                            pt(floor)
+                        ));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -917,5 +1748,391 @@ mod tests {
                 .any(|d| d.severity == Severity::Error && d.message.contains("\"pie\"")),
             "{diags:?}"
         );
+    }
+
+    #[test]
+    fn too_many_series_for_the_ramp_errors_naming_the_cap() {
+        // The talk ramp is the full 7-color Okabe–Ito set, which passes
+        // all-pairs CVD — so the computed cap is 7, and 8 series refuse.
+        let rows: String = (0..8)
+            .map(|i| format!(r#"{{"t":{i},"v":1,"s":"s{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let chart = format!(
+            r#"{{"id":"c","type":"chart","at":[0,0],"size":[400,300],
+                "data":{{"origin":"command","values":[{rows}]}},
+                "x":{{"field":"t","type":"quantitative"}},
+                "y":{{"field":"v","type":"quantitative"}},
+                "color":{{"field":"s","type":"nominal"}}}}"#
+        );
+        let diags = target_linted(&chart, "talk-light", "talk-16x9");
+        let e = diags
+            .iter()
+            .find(|d| d.message.contains("CVD-safe cap"))
+            .expect("a series-cap error");
+        assert_eq!(e.severity, Severity::Error);
+        assert!(e.message.contains('8'), "{}", e.message);
+        assert!(e.message.contains('7'), "names the cap: {}", e.message);
+        assert_eq!(e.object.as_deref(), Some("c"));
+        assert_eq!(e.field.as_deref(), Some("color"));
+
+        // Three series sit well under the cap: no CVD finding.
+        let rows: String = (0..3)
+            .map(|i| format!(r#"{{"t":{i},"v":1,"s":"s{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let chart = format!(
+            r#"{{"id":"c","type":"chart","at":[0,0],"size":[400,300],
+                "data":{{"origin":"command","values":[{rows}]}},
+                "x":{{"field":"t","type":"quantitative"}},
+                "y":{{"field":"v","type":"quantitative"}},
+                "color":{{"field":"s","type":"nominal"}}}}"#
+        );
+        let diags = target_linted(&chart, "talk-light", "talk-16x9");
+        assert!(
+            diags.iter().all(|d| !d.message.contains("CVD-safe cap")),
+            "{diags:?}"
+        );
+    }
+
+    // --- lint --style --------------------------------------------------------
+
+    /// Parsed but NOT normalized: normalize snaps to the grid, and the style
+    /// lint exists precisely to measure the file as it stands.
+    fn style_board(objects: &str) -> crate::Board {
+        crate::parse(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[960,540]}},
+                "pages":[{{"id":"p1","objects":[{objects}]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn style_linted(objects: &str, strict: bool) -> Vec<Diagnostic> {
+        lint_style(
+            &style_board(objects),
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            strict,
+        )
+    }
+
+    fn rect(id: &str, at: [f64; 2], size: [f64; 2]) -> String {
+        format!(
+            r#"{{"id":"{id}","type":"shape","geo":"rect","at":[{},{}],"size":[{},{}]}}"#,
+            at[0], at[1], size[0], size[1]
+        )
+    }
+
+    #[test]
+    fn near_miss_alignment_fires_at_1_5_pt_naming_both_objects() {
+        let diags = style_linted(
+            &[
+                rect("a", [80.0, 64.0], [160.0, 80.0]),
+                rect("b", [81.5, 200.0], [160.0, 80.0]),
+            ]
+            .join(","),
+            false,
+        );
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("near-miss alignment"))
+            .expect("an alignment finding");
+        assert_eq!(f.severity, Severity::Warning, "warning by default");
+        assert_eq!(f.object.as_deref(), Some("b"), "attached to the second");
+        assert!(
+            f.message.contains("\"a\""),
+            "names the first: {}",
+            f.message
+        );
+        assert!(f.message.contains("81.5"), "{}", f.message);
+        assert!(f.message.contains("80"), "{}", f.message);
+        assert!(f.message.contains("left"), "names the edge: {}", f.message);
+    }
+
+    #[test]
+    fn near_miss_alignment_is_silent_at_exactly_0_and_at_8() {
+        for delta in [0.0, 8.0] {
+            let diags = style_linted(
+                &[
+                    rect("a", [80.0, 64.0], [160.0, 80.0]),
+                    rect("b", [80.0 + delta, 200.0], [160.0, 80.0]),
+                ]
+                .join(","),
+                false,
+            );
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| !d.message.contains("near-miss alignment")),
+                "Δ={delta}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_flips_the_measured_severities() {
+        let objects = [
+            rect("a", [80.0, 64.0], [160.0, 80.0]),
+            rect("b", [81.5, 200.0], [160.0, 80.0]),
+        ]
+        .join(",");
+        let relaxed = style_linted(&objects, false);
+        let strict = style_linted(&objects, true);
+        let sev = |diags: &[Diagnostic]| {
+            diags
+                .iter()
+                .find(|d| d.message.contains("near-miss alignment"))
+                .map(|d| d.severity)
+        };
+        assert_eq!(sev(&relaxed), Some(Severity::Warning));
+        assert_eq!(sev(&strict), Some(Severity::Error));
+    }
+
+    #[test]
+    fn near_miss_spacing_flags_uneven_gaps_in_a_row() {
+        // Gaps of 24 and 26 across an aligned row of three.
+        let diags = style_linted(
+            &[
+                rect("a", [80.0, 64.0], [160.0, 80.0]),  // right 240
+                rect("b", [264.0, 64.0], [160.0, 80.0]), // gap 24, right 424
+                rect("c", [450.0, 64.0], [160.0, 80.0]), // gap 26
+            ]
+            .join(","),
+            false,
+        );
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("near-miss spacing"))
+            .expect("a spacing finding");
+        assert!(f.message.contains("24"), "{}", f.message);
+        assert!(f.message.contains("26"), "{}", f.message);
+        for id in ["\"a\"", "\"b\"", "\"c\""] {
+            assert!(f.message.contains(id), "{}", f.message);
+        }
+    }
+
+    #[test]
+    fn off_grid_geometry_names_the_nearest_snap() {
+        let diags = style_linted(&rect("a", [81.0, 131.0], [301.0, 49.0]), false);
+        let at = diags
+            .iter()
+            .find(|d| d.message.contains("off-grid") && d.field.as_deref() == Some("at"))
+            .expect("an off-grid at finding");
+        assert!(at.message.contains("81"), "{}", at.message);
+        assert!(at.message.contains("[80, 128]"), "{}", at.message);
+        let size = diags
+            .iter()
+            .find(|d| d.message.contains("off-grid") && d.field.as_deref() == Some("size"))
+            .expect("an off-grid size finding");
+        assert!(size.message.contains("[304, 48]"), "{}", size.message);
+    }
+
+    #[test]
+    fn slot_placed_pages_produce_no_measured_findings() {
+        // Slots are on-grid, aligned and inside the margins by construction.
+        let b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","layout":"two-up","objects":[
+                  {"id":"t","type":"text","role":"title","slot":"title","text":["Two columns"]},
+                  {"id":"l","type":"shape","geo":"rect","slot":"body-left"},
+                  {"id":"r","type":"shape","geo":"rect","slot":"body-right"}]}]}"#,
+        )
+        .unwrap();
+        let diags = lint_style(
+            &b,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            false,
+        );
+        for needle in ["near-miss", "off-grid", "margin violation", "free `at`"] {
+            assert!(
+                diags.iter().all(|d| !d.message.contains(needle)),
+                "{needle}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_margin_crossing_names_the_edge_and_the_margin() {
+        // talk margins are [64, 72, 64, 72]: x 16 crosses the 72 pt left.
+        let diags = style_linted(&rect("a", [16.0, 200.0], [160.0, 80.0]), false);
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("margin violation"))
+            .expect("a margin finding");
+        assert!(f.message.contains("left edge 16"), "{}", f.message);
+        assert!(f.message.contains("72"), "{}", f.message);
+        assert_eq!(f.object.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn the_override_budget_exempts_code() {
+        let runs = |role: &str| {
+            format!(
+                r#"{{"id":"t","type":"text","role":"{role}","at":[80,64],"size":[320,160],
+                    "text":[{{"runs":[{{"t":"a","size":19}},{{"t":"b","size":19}},
+                                      {{"t":"c","size":19}},{{"t":"d","size":19}},
+                                      {{"t":"e","size":19}}]}}]}}"#
+            )
+        };
+        // Five run overrides on a body text: over the budget of 4.
+        let diags = style_linted(&runs("body"), false);
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("override"))
+            .expect("a budget finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.message.contains('5'), "{}", f.message);
+        assert!(f.message.contains('4'), "{}", f.message);
+        // Budgets stay warnings even under --strict.
+        let strict = style_linted(&runs("body"), true);
+        let f = strict
+            .iter()
+            .find(|d| d.message.contains("override"))
+            .expect("a budget finding under strict");
+        assert_eq!(f.severity, Severity::Warning, "budgets never escalate");
+        // The same five overrides on role "code" are exempt.
+        let diags = style_linted(&runs("code"), false);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("override")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_title_widow_is_detected_and_a_single_line_is_not() {
+        let widow = r#"{"id":"h","type":"text","role":"title","at":[80,64],"size":[240,240],
+            "text":["Results overview Antidisestablishmentarianism"]}"#;
+        let diags = style_linted(widow, false);
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("title widow"))
+            .expect("a widow finding");
+        assert_eq!(f.object.as_deref(), Some("h"));
+        assert!(
+            f.message.contains("Antidisestablishmentarianism"),
+            "{}",
+            f.message
+        );
+        // One short line has no last-line widow to speak of.
+        let single = r#"{"id":"h","type":"text","role":"title","at":[80,64],"size":[640,80],
+            "text":["Results"]}"#;
+        let diags = style_linted(single, false);
+        assert!(
+            diags.iter().all(|d| !d.message.contains("title widow")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_free_at_warns_when_the_layout_has_unclaimed_slots() {
+        let b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","layout":"title-body","objects":[
+                  {"id":"t","type":"text","role":"title","slot":"title","text":["Hi"]},
+                  {"id":"hand","type":"shape","geo":"rect","at":[80,200],"size":[160,80]}]}]}"#,
+        )
+        .unwrap();
+        let diags = lint_style(
+            &b,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            false,
+        );
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("free `at`"))
+            .expect("a free-at finding");
+        assert_eq!(f.object.as_deref(), Some("hand"));
+        assert!(f.message.contains("body"), "names the slot: {}", f.message);
+    }
+
+    // --- lint --fix ----------------------------------------------------------
+
+    #[test]
+    fn lint_fix_clamps_off_canvas_raises_sub_floor_and_reports() {
+        let mut b = style_board(
+            &[
+                // Fully off the 960×540 canvas: x 2000.
+                r#"{"id":"lost","type":"text","at":[2000,96],"size":[104,48],"text":["parked"]}"#
+                    .to_string(),
+                // A 2 pt run override under body's 18 pt floor. (x 88, so
+                // the only left-edge near-miss on this page is a vs e.)
+                r#"{"id":"tiny","type":"text","at":[88,64],"size":[320,96],
+                    "text":[{"runs":[{"t":"small","size":2}]}]}"#
+                    .to_string(),
+                rect("a", [80.0, 200.0], [160.0, 80.0]),
+                // 1 pt left near-miss vs a, and off-grid y.
+                rect("e", [81.0, 331.0], [160.0, 80.0]),
+            ]
+            .join(","),
+        );
+        let fixes = lint_fix(&mut b, &crate::theme::default_for(true));
+
+        let frame = |id: &str| {
+            b.pages[0]
+                .objects
+                .iter()
+                .find(|o| o.id() == id)
+                .unwrap()
+                .frame()
+                .unwrap()
+        };
+        // Clamped inside, on the grid: x = 960 - 104 = 856.
+        assert_eq!((frame("lost").x, frame("lost").y), (856.0, 96.0));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("clamped lost") && f.contains("2000") && f.contains("856")),
+            "{fixes:?}"
+        );
+        // The run override rose to the role floor and said so.
+        let Object::Text(t) = &b.pages[0].objects[1] else {
+            panic!()
+        };
+        let Paragraph::Rich(rich) = &t.text[0] else {
+            panic!()
+        };
+        assert_eq!(rich.runs[0].size, Some(18.0));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("raised tiny") && f.contains("2") && f.contains("18")),
+            "{fixes:?}"
+        );
+        // e snapped to a's left edge, then its y snapped to the grid.
+        assert_eq!((frame("e").x, frame("e").y), (80.0, 328.0));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("snapped e left edge") && f.contains("aligns with a")),
+            "{fixes:?}"
+        );
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("snapped e to the 8 pt grid")),
+            "{fixes:?}"
+        );
+        // Aligned-and-on-grid objects are untouched.
+        assert_eq!((frame("a").x, frame("a").y), (80.0, 200.0));
+    }
+
+    #[test]
+    fn lint_fix_never_touches_slot_placed_objects() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","layout":"title-body","objects":[
+                  {"id":"t","type":"text","role":"title","slot":"title","text":["Hi"]}]}]}"#,
+        )
+        .unwrap();
+        let before = crate::to_string(&b).unwrap();
+        let fixes = lint_fix(&mut b, &crate::theme::default_for(true));
+        assert!(fixes.is_empty(), "{fixes:?}");
+        assert_eq!(crate::to_string(&b).unwrap(), before, "no bytes moved");
     }
 }

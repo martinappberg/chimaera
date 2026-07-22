@@ -46,7 +46,8 @@ pub(crate) struct DescribeRequest {
     pub path: String,
 }
 
-/// One semantic gesture from the pane: move/resize an object by id.
+/// One semantic gesture from the pane: move/resize an object by id, or
+/// replace a text/shape object's text.
 ///
 /// The pane never serializes a board itself — a client-side
 /// `JSON.stringify` would destroy the canonical byte-stable form and churn
@@ -62,6 +63,12 @@ pub(crate) struct EditRequest {
     pub at: Option<[f64; 2]>,
     #[serde(default)]
     pub size: Option<[f64; 2]>,
+    /// Plain paragraphs replacing the whole text of a text or shape object.
+    /// Bare strings only — a rich (styled-run) text survives edits exactly by
+    /// NOT using this op; sending it flattens the styling by design, because
+    /// the pane's inline editor edits words, not runs.
+    #[serde(default)]
+    pub text: Option<Vec<String>>,
 }
 
 /// POST /api/v1/board/render → `{ticket, width, height, pageCount, pages,
@@ -216,6 +223,22 @@ pub(crate) async fn edit(
                 if let Some(size) = req.size {
                     obj.set_size(size);
                 }
+                if let Some(text) = &req.text {
+                    let paras = || {
+                        text.iter()
+                            .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
+                            .collect()
+                    };
+                    match obj {
+                        chimaera_board::Object::Text(t) => t.text = paras(),
+                        chimaera_board::Object::Shape(sh) => sh.text = paras(),
+                        other => anyhow::bail!(
+                            "text applies to text and shape objects; {:?} is a {}",
+                            req.object,
+                            other.kind()
+                        ),
+                    }
+                }
             }
         }
         if !found {
@@ -278,28 +301,40 @@ fn journal_edit(
 
     // The journaled `to` is the *saved* geometry (post-normalize grid snap),
     // not the requested one — the journal narrates the file, never the wire.
+    // A text edit carries no geometry, so the frame lookup gates only the
+    // move/resize events, never the text-edited one.
     let saved = board
         .objects()
         .find(|(_, o)| o.id() == req.object)
-        .and_then(|(_, o)| o.frame())?;
+        .and_then(|(_, o)| o.frame());
     let mut events = Vec::new();
-    if req.at.is_some() {
-        events.push(Event::new(
-            Actor::Human,
-            EventKind::Move {
-                object: req.object.clone(),
-                from: prior.map(|f| [f.x, f.y]).unwrap_or([saved.x, saved.y]),
-                to: [saved.x, saved.y],
-            },
-        ));
+    if let Some(saved) = saved {
+        if req.at.is_some() {
+            events.push(Event::new(
+                Actor::Human,
+                EventKind::Move {
+                    object: req.object.clone(),
+                    from: prior.map(|f| [f.x, f.y]).unwrap_or([saved.x, saved.y]),
+                    to: [saved.x, saved.y],
+                },
+            ));
+        }
+        if req.size.is_some() {
+            events.push(Event::new(
+                Actor::Human,
+                EventKind::Resize {
+                    object: req.object.clone(),
+                    from: prior.map(|f| [f.w, f.h]).unwrap_or([saved.w, saved.h]),
+                    to: [saved.w, saved.h],
+                },
+            ));
+        }
     }
-    if req.size.is_some() {
+    if req.text.is_some() {
         events.push(Event::new(
             Actor::Human,
-            EventKind::Resize {
+            EventKind::TextEdited {
                 object: req.object.clone(),
-                from: prior.map(|f| [f.w, f.h]).unwrap_or([saved.w, saved.h]),
-                to: [saved.w, saved.h],
             },
         ));
     }
