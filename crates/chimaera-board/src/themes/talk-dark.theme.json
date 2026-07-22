@@ -1,0 +1,96 @@
+{
+  "id": "talk-dark",
+  "name": "Talk — dark",
+  "dark": true,
+  "palette": {
+    "bg": "#14171c",
+    "surface": "#1c2027",
+    "fg": "#f0f2f6",
+    "body": "#ced4de",
+    "muted": "#8b93a1",
+    "accent1": "#7cb8ff",
+    "edge": "#2b313b",
+    "axis": "#6d7684",
+    "grid": "#262c35",
+    "cat1": "#56b4e9",
+    "cat2": "#e69f00",
+    "cat3": "#009e73",
+    "cat4": "#cc79a7",
+    "cat5": "#f0e442",
+    "cat6": "#d55e00",
+    "cat7": "#0072b2"
+  },
+  "type": {
+    "title": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 39,
+      "weight": 600,
+      "color": "@fg",
+      "minPt": 24,
+      "lineHeight": 1.15,
+      "tracking": -0.4
+    },
+    "heading": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 31,
+      "weight": 600,
+      "color": "@fg",
+      "minPt": 20,
+      "lineHeight": 1.18,
+      "tracking": -0.3
+    },
+    "subtitle": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 25,
+      "weight": 400,
+      "color": "@muted",
+      "minPt": 18,
+      "lineHeight": 1.3
+    },
+    "body": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 20,
+      "weight": 400,
+      "color": "@body",
+      "minPt": 18,
+      "lineHeight": 1.4
+    },
+    "caption": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 16,
+      "weight": 400,
+      "color": "@muted",
+      "minPt": 12,
+      "lineHeight": 1.35
+    },
+    "label": {
+      "family": ["Inter", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
+      "size": 13,
+      "weight": 400,
+      "color": "@muted",
+      "minPt": 9,
+      "lineHeight": 1.2
+    },
+    "code": {
+      "family": ["JetBrains Mono", "SF Mono", "Menlo", "Consolas", "Liberation Mono", "DejaVu Sans Mono", "monospace"],
+      "size": 16,
+      "weight": 400,
+      "color": "@body",
+      "minPt": 12,
+      "lineHeight": 1.45
+    }
+  },
+  "spacing": {
+    "grid": 8,
+    "margin": [64, 72, 64, 72],
+    "gap": 24
+  },
+  "chart": {
+    "categorical": ["@cat1", "@cat2", "@cat3", "@cat4", "@cat5", "@cat6", "@cat7"],
+    "axis": "@axis",
+    "grid": "@grid",
+    "axisWidth": 0.75,
+    "seriesWidth": 2,
+    "barRatio": 0.68
+  }
+}

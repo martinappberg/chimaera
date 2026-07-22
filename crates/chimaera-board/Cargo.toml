@@ -1,0 +1,32 @@
+[package]
+name = "chimaera-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+
+# The render stack. usvg parses and resolves (including text-to-path via
+# fontdb + rustybuzz), resvg rasterizes onto a tiny-skia pixmap. Board emits
+# the SVG itself, so nothing here parses untrusted markup from the network —
+# only strings this crate generated.
+usvg = "0.45"
+resvg = "0.45"
+tiny-skia = "0.11"
+# Text measurement. Board shapes with the same rustybuzz/ttf-parser pair usvg
+# resolves through — and shares usvg's own `fontdb` rather than depending on
+# it directly, so the database Board measures against and the one resvg draws
+# with are provably the same type and the same fonts. A second text stack
+# would drift from the renderer and break layout in ways no unit test sees.
+rustybuzz = "0.20"
+ttf-parser = "0.25"
+# The fast preview encoder. PNG is the durable render (content-addressed,
+# lossless); JPEG is what the agent looks at, where decode speed over a
+# `connect` tunnel matters more than the last few dB.
+jpeg-encoder = "0.6"
