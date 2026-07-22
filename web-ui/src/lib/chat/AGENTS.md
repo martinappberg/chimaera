@@ -35,14 +35,14 @@ hard-resets and rebuilds.
 |---|---|
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
-| `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
-| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; it pages in either direction), and hangs the header/composer/overlays/panels off itself. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
+| `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
+| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; explicit earlier/later pages + a direct jump to newest), and hangs the header/composer/overlays/panels off itself. Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
 | `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window; tests cover both paging directions and stale cursor repair after reducer compaction. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
 | `Composer.svelte` / `composer.ts` | Input chrome plus the pure slash-context, argument-completion, and Codex skill-block helpers (covered by `composer.test.ts`). Slash discovery is whitespace-boundary aware; path fragments must stay ordinary text. |
 | `Markdown.svelte` / `MathText.svelte` / `math.ts` | Render agent prose and plain user-message LaTeX (`$`/`$$` and Codex's `\(`/`\[` forms) as KaTeX MathML under one bounded policy. **Sanitize untrusted/replayed content** (marked/KaTeX → DOMPurify, KaTeX trust off, `<style>` forbidden, external links `noopener`); Markdown also stamps validated file paths as clickable. |
-| `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). |
+| `ToolCallCard` / `ToolGroup` | Tool-call rendering (title, status, diff/output, grouping). Terminal rows may accept late output text but must never revive their streaming cursor. |
 | `AgentsTray.svelte` / `BackgroundTray.svelte` | Two of the three pinned strips above the composer: live subagents (derived from in-flight Agent tool rows) and live background tasks (the `background_tasks` level-set), each with a stop affordance. Chrome lives in the shared `../shared/WorkTray.svelte` + `WorkTrayRow.svelte` shell; elapsed/duration text uses `../shared/time.ts`. The **plan strip** is the third, rendered inline in `ChatView` on the same `WorkTray` shell (`pulse` off unless a step is in flight) — three orthogonal readings of the same session: what the agent *means* to do (plan), *who* is working (subagents), what is *detached* (background). |
 | `PermissionCard` / `QuestionCard` | The permission prompt and structured-question cards (their answers ride `socket.send`; `PermissionCard` also carries the deny-with-feedback field; `QuestionCard` presents Codex auto-resolution deadlines without owning the authoritative timeout). |
 | `PlanApprovalCard.svelte` | Claude `ExitPlanMode` plan-approval card — renders the sanitized plan markdown + the three official options (auto-accept / manual / keep-planning) with an optional comment that rides the permission reply. |
@@ -95,14 +95,23 @@ lifted out of the terminal pool) — see the shared/ area.
 - **The seq contract is the daemon's.** Trust `lastSeq`/`head` from the wire; do
   not renumber. A gap is healed by reconnect replay, not by client bookkeeping.
 - **Inactive UI is not an inactive agent.** A hidden retained chat freezes its
-  bounded plain-data DOM snapshot, while `chatPool` keeps its reducer and socket
-  warm and the daemon-owned process continues working. Live-set or client-pool
-  eviction may unmount a view or close a parked *client socket*, never the
-  agent; the next acquire gap-replays the journal.
-- **Scroll restoration is window-aware.** Save both `scrollTop` and the bounded
-  absolute block range. Paging in either direction compensates inserted or
-  removed height so the paragraph under the reader stays fixed; replay never
-  remounts the entire retained transcript.
+  bounded transcript plus auxiliary plan/subagent/background/ask/send snapshots,
+  while `chatPool` keeps its reducer and socket warm and the daemon-owned process
+  continues working. Invisible timers/animations stop, but keyed cards stay
+  mounted so expansion, comments, and question choices survive. A hidden
+  permission/plan card must never call `focus()`; it may focus when its view
+  becomes visible. Live-set or client-pool eviction may unmount a view or close
+  a parked *client socket*, never the agent; the next acquire gap-replays the
+  journal.
+- **Scroll restoration is window-aware and has one writer.** Save `scrollTop`,
+  the bounded absolute block range, whether it still tracks the tail, and the
+  transcript revision the reader followed. Page/activation changes anchor by
+  source-row index; stream/Markdown/content and transcript-viewport resize
+  follow requests coalesce into one frame. Pinned-tray/composer height changes
+  are inputs to that same writer, never independent scroll owners. A live tail
+  continues rendering while the reader scrolls or types, but
+  a non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
+  retain reactive block proxies. Replay never remounts the entire transcript.
 - **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
   latest sequence that makes that message true on replay (a queued user message
   advances on its `sent` update; a final Codex assistant message advances on

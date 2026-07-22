@@ -845,6 +845,24 @@ async fn fs_list_dirs_first_sorted_with_metadata() {
 }
 
 #[tokio::test]
+async fn fs_list_caps_large_directories_and_reports_truncation() {
+    let state = test_state();
+    let root = test_dir("fs-list-cap");
+    for n in 0..=fs::MAX_DIR_ENTRIES {
+        std::fs::File::create(root.join(format!("entry-{n:04}"))).unwrap();
+    }
+
+    let uri = format!("/api/v1/fs/list?path={}", root.to_string_lossy());
+    let (status, json) = request(&state, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["entries"].as_array().unwrap().len(),
+        fs::MAX_DIR_ENTRIES
+    );
+    assert_eq!(json["truncated"], true);
+}
+
+#[tokio::test]
 async fn fs_list_rejects_files_and_missing_paths() {
     let state = test_state();
     let root = test_dir("fs-list-bad");

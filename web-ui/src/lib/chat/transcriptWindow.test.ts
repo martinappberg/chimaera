@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  advanceTailWindow,
   pageEarlier,
   pageLater,
   restoreWindow,
@@ -12,6 +13,17 @@ describe("transcript DOM window", () => {
   it("starts at the newest page", () => {
     expect(tailWindow(500)).toEqual({ start: 436, end: 500 });
     expect(tailWindow(20)).toEqual({ start: 0, end: 20 });
+  });
+
+  it("keeps a visible live tail rendering while staying bounded", () => {
+    expect(advanceTailWindow({ start: 436, end: 500 }, 501)).toEqual({
+      start: 436,
+      end: 501,
+    });
+    expect(advanceTailWindow({ start: 436, end: 501 }, 700)).toEqual({
+      start: 508,
+      end: 700,
+    });
   });
 
   it("pages backward without retaining unbounded newer DOM", () => {

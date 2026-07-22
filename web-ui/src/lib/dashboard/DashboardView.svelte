@@ -46,9 +46,11 @@
     wsRoot: string | null;
     paneId: string;
     ctrl: LayoutCtrl;
+    /** False while this retained dashboard tab is behind another pane tab. */
+    visible?: boolean;
   }
 
-  let { dash, sessions, names, wsId, wsRoot, paneId, ctrl }: Props = $props();
+  let { dash, sessions, names, wsId, wsRoot, paneId, ctrl, visible = true }: Props = $props();
 
   // --- the roster --------------------------------------------------------------
 
@@ -628,6 +630,7 @@
               onCollapse={collapseDock}
               expanded={dockExpanded}
               onToggleExpand={() => (dockExpanded = !dockExpanded)}
+              {visible}
             />
           </div>
         {:else}

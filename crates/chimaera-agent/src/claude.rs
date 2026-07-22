@@ -2234,17 +2234,27 @@ impl ClaudeMapper {
         }
     }
 
-    /// Close every still-open subagent row as failed: the turn died with them
-    /// (error or interrupt), so their task_notification / tool_result will
-    /// never arrive — and the UI's turn-end reconcile would otherwise flip
-    /// them to a green "completed". Clears the map it drains.
-    fn fail_dangling_tasks(&mut self, step: &mut DriverStep) {
+    /// Close every still-open subagent row when its turn dies. A genuine turn
+    /// error is a failure; a user interrupt is a neutral completion whose
+    /// output says it was stopped. ToolStatus has no `stopped` variant, and
+    /// rendering a deliberate Stop as a red "failed" group is the worse lie.
+    /// Clears the map it drains.
+    fn settle_dangling_tasks(&mut self, interrupted: bool, step: &mut DriverStep) {
         for row in std::mem::take(&mut self.task_rows).into_values() {
             step.events.push(AgentEvent::ToolCallUpdate {
                 id: row,
-                status: ToolStatus::Failed,
+                status: if interrupted {
+                    ToolStatus::Completed
+                } else {
+                    ToolStatus::Failed
+                },
                 content: Some(ToolContent::Output {
-                    text: "subagent stopped with the turn".into(),
+                    text: if interrupted {
+                        "subagent stopped with the turn"
+                    } else {
+                        "subagent stopped when the turn failed"
+                    }
+                    .into(),
                     truncated: false,
                 }),
             });
@@ -2266,14 +2276,20 @@ impl ClaudeMapper {
         // unchanged.
         let was_active = self.turn_active;
         self.turn_active = false;
+        // Consume before settling tools: it decides whether their terminal
+        // presentation is a neutral user stop or a genuine failure.
+        // Consumed at EVERY result so a late interrupt can never relabel the
+        // next turn's error.
+        let interrupted = std::mem::take(&mut self.interrupt_requested);
         self.settle_compaction_at_turn_end();
         self.tool_kinds.clear();
         self.streamed.clear();
         // Task maps live per turn (the extension wipes its map on result) —
-        // but an errored turn first closes its still-open subagent rows as
-        // failed, so they never reconcile green.
+        // but an errored turn first closes its still-open subagent rows. User
+        // stops settle neutrally; genuine errors fail, so neither relies on
+        // the client's generic turn-end reconciliation.
         if frame["is_error"] == json!(true) && was_active {
-            self.fail_dangling_tasks(step);
+            self.settle_dangling_tasks(interrupted, step);
         } else {
             self.task_rows.clear();
         }
@@ -2283,11 +2299,6 @@ impl ClaudeMapper {
         // interrupt's own is_error result lands here too, so a genuine turn is
         // never double-aborted by the watchdog).
         self.interrupt_grace = None;
-
-        // Consumed at EVERY result, both branches: an interrupt whose turn
-        // ended before the control request landed must not mislabel the
-        // NEXT turn's genuine failure as a quiet stop.
-        let interrupted = std::mem::take(&mut self.interrupt_requested);
 
         if frame["is_error"] == json!(true) {
             // Only an OPEN turn can be aborted — a bare is_error result with
@@ -2936,11 +2947,11 @@ impl ClaudeMapper {
         self.turn_active = false;
         self.settle_compaction_at_turn_end();
         self.interrupt_requested = false;
-        // Same per-turn cleanup a real result performs — including closing
-        // still-open subagent rows as failed (the interrupt killed them).
+        // Same per-turn cleanup a real result performs — the interrupted
+        // subagents settle neutrally instead of turning a deliberate Stop red.
         self.tool_kinds.clear();
         self.streamed.clear();
-        self.fail_dangling_tasks(&mut step);
+        self.settle_dangling_tasks(true, &mut step);
         self.agent_tools.clear();
         self.thinking_emitted = 0;
         step.events.push(AgentEvent::TurnAborted {
@@ -6280,6 +6291,38 @@ mod tests {
             "dangling row closes failed: {:?}",
             step.events
         );
+    }
+
+    #[test]
+    fn interrupted_turn_stops_dangling_subagent_without_a_failed_badge() {
+        let mut m = mapper();
+        m.on_frame(&json!({
+            "type": "assistant",
+            "message": { "id": "m1", "content": [{ "type": "text", "text": "working" }] },
+        }));
+        m.on_frame(&json!({
+            "type": "system", "subtype": "task_started",
+            "task_type": "local_agent", "task_id": "tk-stop",
+            "description": "stopped agent",
+        }));
+        m.on_command(AgentCommand::Interrupt);
+
+        let step = m.on_frame(&json!({ "type": "result", "is_error": true }));
+        assert!(step.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallUpdate {
+                id,
+                status: ToolStatus::Completed,
+                content: Some(ToolContent::Output { text, .. }),
+            } if id == "task:tk-stop" && text.contains("stopped")
+        )));
+        assert!(step.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnAborted {
+                interrupted: true,
+                ..
+            }
+        )));
     }
 
     #[test]

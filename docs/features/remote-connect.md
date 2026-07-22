@@ -68,6 +68,12 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   connect on an auth failure would re-prompt 2FA). Child control-plane output is collected
   concurrently under 8 MiB stdout / 1 MiB stderr and wall-clock limits; overflow or timeout kills
   and reaps the process. Fetched daemons are cached per triple-and-version.
+- **Tunnel teardown cannot hold the app hostage.** Tunnel objects are removed from shared maps
+  before any process/network wait, so one dead host cannot block health checks or commands for
+  another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is
+  non-interactive (`BatchMode`) with a ten-second outer deadline. Native liveness transitions carry
+  a plain-language reason into the reconnect panel, while an actual reconnect failure remains a
+  separate error with Retry.
 
 ## Dev builds — the isolated dev daemon on a host
 

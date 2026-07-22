@@ -64,6 +64,7 @@
 <WorkTray
   glyph="⧖"
   bind:open
+  {visible}
   label={tasks.length === 1
     ? "background task running"
     : `${tasks.length} background tasks running`}

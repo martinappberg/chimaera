@@ -40,7 +40,7 @@ Daemon side: `crates/chimaera-server/src/{workspaces.rs,view_state.rs,quickopen.
 - **Where it lives.** `web-ui/src/lib/workspace/FolderPicker.svelte`; `fsHome`/`fsDirs`/`fsMkdir`
   in `sessions.ts`. Routes: `GET /api/v1/fs/home`, `GET /api/v1/fs/dirs`, `POST /api/v1/fs/mkdir`,
   `POST /api/v1/workspaces`.
-- **Key behaviors.** Listings are dirs-only and capped server-side (`MAX_DIR_ENTRIES = 4000` —
+- **Key behaviors.** Listings are dirs-only and capped server-side (`MAX_DIR_ENTRIES = 1000` —
   login-node scratch dirs are huge) with an honest `truncated` flag. `new window` targets *this
   window's own daemon* (remote-aware), so a remote workspace doesn't bounce to the launcher.
 

@@ -119,6 +119,7 @@
 <div
   class="question"
   class:answered={readOnly}
+  class:visible
   role="group"
   aria-label={readOnly ? "answered question" : "the agent has a question"}
 >
@@ -224,6 +225,9 @@
   .question.answered {
     border-color: var(--edge);
     background: color-mix(in srgb, var(--fg) 2%, transparent);
+    animation: none;
+  }
+  .question:not(.visible) {
     animation: none;
   }
   @media (prefers-reduced-motion: reduce) {

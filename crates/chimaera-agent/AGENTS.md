@@ -49,7 +49,7 @@ gap-replay idea as the PTY transport, realized for structured streams.
 | `codex.rs` | The Codex driver: `codex app-server` JSON-RPC 2.0, thread/turn/steer lifecycle, cwd-scoped `skills/list` + native skill inputs, questions, approvals + default auto-review, model/mode settings. Pinned to `TESTED_CODEX_VERSION`. | codex protocol work. |
 | `journal.rs` | Per-session append-only JSONL + bounded replay ring + the native-id→session index + dir pruning. The gap-replay crown jewel. | anything touching durability, replay, or seq numbering. |
 | `ndjson.rs` | Line-oriented JSON transport over child stdio (`JsonlChild` and its split halves), with per-line length caps. Shared by both drivers. | transport/framing, process spawn. |
-| `bin/fake-claude.rs` | A scripted fake that speaks just enough of the claude wire to exercise the pipeline hermetically. | writing a hermetic driver/registry test. |
+| `bin/fake-claude.rs` | A scripted fake that speaks enough of the claude wire to exercise ordinary permission turns plus deterministic `background`, `question`, `plan`, `subagent`, hang, and failure modes. | writing a hermetic driver/registry or live-UI test. |
 | `tests/manager.rs` | Hermetic end-to-end tests via `fake-claude` (no network, no billing). | regression-proofing a change. |
 | `tests/live.rs` | The `just chat-smoke` suite against the REAL CLIs. **Env-gated so a plain `cargo test` never bills money.** | verifying protocol facts. |
 

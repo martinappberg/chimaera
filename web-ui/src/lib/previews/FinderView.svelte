@@ -13,7 +13,7 @@
    * the effect below. Opening a file hands off to the workbench via
    * `onOpenFile` — every file viewer is reused unchanged.
    */
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { basename, fsDownload, fsList, type FsEntry, humanSize } from "./files";
   import { fsHome } from "../workspace/sessions";
   import { getSetting } from "../settings/store.svelte";
@@ -64,6 +64,7 @@
   interface Column {
     dir: string;
     entries: FsEntry[];
+    truncated: boolean;
     /** Path of the highlighted entry in this column, if any. */
     selected: string | null;
   }
@@ -159,12 +160,15 @@
       columns = listings.map((l, i) => ({
         dir: l.path,
         entries: l.entries,
+        truncated: l.truncated === true,
         selected: chain[i + 1] ?? null,
       }));
       location = dir;
       activeCol = columns.length - 1;
       error = null;
       onNavigate(dir);
+      await tick();
+      revealColumn(columns.length - 1);
     } catch (e) {
       if (seq === navSeq) error = message(e);
     } finally {
@@ -188,12 +192,19 @@
       if (seq !== navSeq) return;
       columns = [
         ...columns.slice(0, colIndex + 1),
-        { dir: listing.path, entries: listing.entries, selected: null },
+        {
+          dir: listing.path,
+          entries: listing.entries,
+          truncated: listing.truncated === true,
+          selected: null,
+        },
       ];
       location = listing.path;
       activeCol = colIndex + 1;
       error = null;
       onNavigate(listing.path);
+      await tick();
+      revealColumn(colIndex + 1);
     } catch (e) {
       if (seq !== navSeq) return;
       // Couldn't open (permission/gone): drop deeper columns, keep the parent.
@@ -473,9 +484,73 @@
     ];
   }
 
-  // Any fs mutation (this Finder, the tree, a tab rename) rebuilds the whole
-  // visible chain. When the mutation moved or removed the current location
-  // itself, follow it — the App-side tab rewrite then matches and no-ops.
+  function parentOf(p: string): string {
+    const i = p.lastIndexOf("/");
+    return i > 0 ? p.slice(0, i) : "/";
+  }
+
+  /** Reveal a column by the smallest possible horizontal movement. A blanket
+   *  scroll-to-max used to push the selected folder all the way left on every
+   *  refresh, even when the user was inspecting an earlier column. */
+  function revealColumn(index: number): void {
+    const el = colsEl?.querySelector<HTMLElement>(`.col[data-column-index="${index}"]`);
+    el?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  // Coalesce refresh bursts and re-list only the columns whose membership or
+  // visible file metadata changed. Navigation has its own monotonic sequence,
+  // so a stale refresh can never overwrite a newer location.
+  const REFRESH_DEBOUNCE_MS = 200;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let refreshDirs = new Set<string>();
+  function scheduleRefresh(dirs: Iterable<string>): void {
+    for (const dir of dirs) refreshDirs.add(dir);
+    if (refreshTimer !== null) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      const targets = refreshDirs;
+      refreshDirs = new Set();
+      void refreshVisible(targets);
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  async function refreshVisible(targets: Set<string>): Promise<void> {
+    const seq = navSeq;
+    const visible = columns.filter((column) => targets.has(column.dir));
+    if (visible.length === 0) return;
+    try {
+      const listings = await Promise.all(
+        visible.map((column) => fsList(column.dir, getSetting("files.showHidden"))),
+      );
+      if (seq !== navSeq) return;
+      const byDir = new Map(listings.map((listing) => [listing.path, listing]));
+      columns = columns.map((column) => {
+        const listing = byDir.get(column.dir);
+        if (listing === undefined) return column;
+        const selected = column.selected;
+        return {
+          dir: listing.path,
+          entries: listing.entries,
+          truncated: listing.truncated === true,
+          selected:
+            selected !== null && listing.entries.some((entry) => entry.path === selected)
+              ? selected
+              : null,
+        };
+      });
+      error = null;
+    } catch (e) {
+      if (seq === navSeq) error = message(e);
+    }
+  }
+
+  $effect(() => () => {
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+  });
+
+  // Any fs mutation refreshes the directly affected visible folders. When it
+  // moved or removed the current location itself, follow it — the App-side tab
+  // rewrite then matches and no-ops.
   let lastEpoch = 0;
   $effect(() => {
     const epoch = $fsEpoch;
@@ -491,7 +566,18 @@
         const i = m.path.lastIndexOf("/");
         target = i > 0 ? m.path.slice(0, i) : "/";
       }
-      void navigateTo(target);
+      if (target !== location) {
+        void navigateTo(target);
+        return;
+      }
+      const dirs = new Set<string>();
+      if (m?.kind === "rename") {
+        dirs.add(parentOf(m.from));
+        dirs.add(parentOf(m.to));
+      } else if (m !== null && m !== undefined) {
+        dirs.add(parentOf(m.path));
+      }
+      scheduleRefresh(dirs);
     });
   });
 
@@ -504,10 +590,6 @@
     untrack(() => {
       if (change === null || change.seq === lastDiskSeq || location === "") return;
       lastDiskSeq = change.seq;
-      const visibleDirs = new Set(columns.map((column) => column.dir));
-      const listedFileChanged = change.files.some((file) =>
-        columns.some((column) => column.entries.some((entry) => entry.path === file)),
-      );
       let target = location;
       for (const removed of change.removedDirs) {
         if (target === removed || target.startsWith(`${removed}/`)) {
@@ -515,8 +597,14 @@
           target = i > 0 ? removed.slice(0, i) : "/";
         }
       }
-      const listingChanged = change.dirs.some((dir) => visibleDirs.has(dir));
-      if (target !== location || listingChanged || listedFileChanged) void navigateTo(target);
+      if (target !== location) {
+        void navigateTo(target);
+        return;
+      }
+      const dirs = new Set(change.dirs);
+      for (const file of [...change.files, ...change.removed]) dirs.add(parentOf(file));
+      for (const removed of change.removedDirs) dirs.add(parentOf(removed));
+      scheduleRefresh(dirs);
     });
   });
 
@@ -544,12 +632,6 @@
     });
   });
 
-  // Keep the deepest column scrolled into view as the chain grows.
-  $effect(() => {
-    void columns.length;
-    const el = colsEl;
-    if (el !== null) untrack(() => (el.scrollLeft = el.scrollWidth));
-  });
 </script>
 
 <div class="finder">
@@ -610,6 +692,7 @@
         role="group"
         aria-label={col.dir}
         data-finder-dir={col.dir}
+        data-column-index={ci}
         oncontextmenu={(e) => contextMenu.openAt(e, columnMenu(ci))}
       >
         {#if edit?.mode === "create" && edit.colIndex === ci}
@@ -704,6 +787,11 @@
             </button>
           {/if}
         {/each}
+        {#if col.truncated}
+          <div class="listing-limit" role="status">
+            Showing the first {col.entries.length.toLocaleString()} entries
+          </div>
+        {/if}
       </div>
     {/each}
     {#if pendingCol !== null}
@@ -883,6 +971,21 @@
     border-radius: 5px;
     cursor: pointer;
     min-width: 0;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 27px;
+  }
+
+  .listing-limit {
+    position: sticky;
+    bottom: 0;
+    margin: 5px 3px 2px;
+    padding: 5px 7px;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--pane-bg, var(--bg)) 92%, transparent);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    text-align: center;
   }
 
   .row:hover {

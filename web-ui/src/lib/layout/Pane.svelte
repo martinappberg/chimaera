@@ -304,7 +304,16 @@
   {:else if tab.surface === "dashboard"}
     {@const DashboardView = views.dashboard}
     {#if DashboardView !== undefined}
-      <DashboardView {dash} {sessions} {names} {wsId} {wsRoot} paneId={node.id} {ctrl} />
+      <DashboardView
+        {dash}
+        {sessions}
+        {names}
+        {wsId}
+        {wsRoot}
+        paneId={node.id}
+        {ctrl}
+        visible={active}
+      />
     {:else if viewErrors.dashboard}
       {@render loadFailure("dashboard", "dashboard")}
     {:else}

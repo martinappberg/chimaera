@@ -4,9 +4,12 @@
   interface Props {
     request: PendingPermission;
     onDecide: (optionId: string, destination?: string, feedback?: string) => void;
+    /** False while the owning retained chat tab is hidden. Hidden prompts
+     *  remain mounted so typed feedback survives, but may never steal focus. */
+    visible?: boolean;
   }
 
-  let { request, onDecide }: Props = $props();
+  let { request, onDecide, visible = true }: Props = $props();
   let showInput = $state(false);
 
   /** Deny-with-feedback: the typed reason rides the deny so the agent reacts
@@ -16,7 +19,7 @@
   let feedbackEl = $state<HTMLInputElement | null>(null);
   const rejectOption = $derived(request.options.find((o) => o.kind === "reject_once"));
   $effect(() => {
-    if (feedbackOpen) feedbackEl?.focus({ preventScroll: true });
+    if (visible && feedbackOpen) feedbackEl?.focus({ preventScroll: true });
   });
   function submitFeedback() {
     const text = feedbackText.trim();
@@ -74,7 +77,7 @@
   // preventScroll keeps ChatView's stick-to-bottom-unless-reading contract —
   // its own effect (keyed on pending.length) scrolls when the user is at bottom.
   $effect(() => {
-    cardEl?.focus({ preventScroll: true });
+    if (visible) cardEl?.focus({ preventScroll: true });
   });
 
   const preview = $derived(JSON.stringify(request.inputPreview, null, 2));
@@ -95,7 +98,7 @@
       e.preventDefault();
       if (feedbackOpen) {
         feedbackOpen = false;
-        cardEl?.focus({ preventScroll: true });
+        if (visible) cardEl?.focus({ preventScroll: true });
         return;
       }
       const deny = request.options.find((o) => o.kind === "reject_once");

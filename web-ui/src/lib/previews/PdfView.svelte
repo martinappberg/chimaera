@@ -56,7 +56,14 @@
   const rendered = new Map<number, HTMLCanvasElement>();
   const renderingPages = new Set<number>();
   const renderedScale = new Map<number, number>();
+  /** pdf.js work survives ordinary DOM removal unless explicitly cancelled.
+   *  Keep handles so closing a tab cannot leave raster/text work burning the
+   *  UI thread after its pane is gone. */
+  const renderTasks = new Map<number, ReturnType<PDFPageProxy["render"]>>();
+  const textLayers = new Map<number, InstanceType<typeof pdfjs.TextLayer>>();
   let observer: IntersectionObserver | null = null;
+  let disposed = false;
+  let restoreFrame: number | null = null;
   /** Pages inside the observer margin; never evict a canvas the user is at. */
   const nearbyPages = new Set<number>();
   const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, 2) : 1;
@@ -77,7 +84,7 @@
   const scale = $derived(zoom === "fit" ? fitScale : zoom);
 
   onMount(() => {
-    let cancelled = false;
+    disposed = false;
     const mem = memory.get(path);
     if (mem !== undefined) zoom = mem.zoom;
     // Pin + share the ticketed /raw/ URL through the store (cached across a tab
@@ -87,13 +94,14 @@
     void (async () => {
       try {
         await fileEntry.ensureRawUrl();
-        if (cancelled) return;
+        if (disposed) return;
         const url = fileEntry.rawUrl;
         if (url === null) throw new Error(fileEntry.rawError ?? "failed to open pdf");
-        task = pdfjs.getDocument({ url });
-        const d = await task.promise;
-        if (cancelled) {
-          void task.destroy();
+        const loadingTask = pdfjs.getDocument({ url });
+        task = loadingTask;
+        const d = await loadingTask.promise;
+        if (disposed) {
+          void loadingTask.destroy();
           return;
         }
         doc = d;
@@ -101,7 +109,10 @@
         const infos: PageInfo[] = [];
         for (let n = 1; n <= d.numPages; n++) {
           const page = await d.getPage(n);
-          if (cancelled) return;
+          if (disposed) {
+            page.cleanup();
+            return;
+          }
           const vp = page.getViewport({ scale: 1 });
           infos.push({ num: n, w: vp.width, h: vp.height });
           page.cleanup();
@@ -114,7 +125,7 @@
           }
         }
       } catch (e) {
-        if (!cancelled) {
+        if (!disposed) {
           error = e instanceof Error ? e.message : "failed to open pdf";
           loading = false;
         }
@@ -122,10 +133,18 @@
     })();
 
     return () => {
-      cancelled = true;
+      disposed = true;
       release(path);
       saveMemory();
       observer?.disconnect();
+      if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
+      restoreFrame = null;
+      if (reRenderTimer !== null) clearTimeout(reRenderTimer);
+      reRenderTimer = null;
+      for (const renderTask of renderTasks.values()) renderTask.cancel();
+      for (const textLayer of textLayers.values()) textLayer.cancel();
+      renderTasks.clear();
+      textLayers.clear();
       rendered.clear();
       renderingPages.clear();
       renderedScale.clear();
@@ -175,8 +194,9 @@
     restored = true;
     if (mem !== undefined) {
       // wait a frame so slot heights exist
-      requestAnimationFrame(() => {
-        if (scroller !== null) {
+      restoreFrame = requestAnimationFrame(() => {
+        restoreFrame = null;
+        if (!disposed && scroller !== null) {
           scroller.scrollTop = mem.scrollTop;
           scroller.scrollLeft = mem.scrollLeft;
         }
@@ -227,6 +247,7 @@
     if (reRenderTimer !== null) clearTimeout(reRenderTimer);
     reRenderTimer = setTimeout(() => {
       reRenderTimer = null;
+      if (disposed) return;
       for (const [n] of rendered) {
         const slot = scroller?.querySelector<HTMLElement>(`[data-page="${n}"]`);
         if (slot !== null && slot !== undefined) void renderPage(n, slot);
@@ -236,7 +257,7 @@
 
   async function renderPage(n: number, slot: HTMLElement): Promise<void> {
     const d = doc;
-    if (d === null) return;
+    if (d === null || disposed || !slot.isConnected) return;
     const s = zoom === "fit" ? fitScale : zoom;
     if (renderingPages.has(n) || renderedScale.get(n) === s) return;
     renderingPages.add(n);
@@ -244,6 +265,7 @@
     let renderedAtScale = false;
     try {
       page = await d.getPage(n);
+      if (disposed || !slot.isConnected) return;
       const cssViewport = page.getViewport({ scale: s });
       const desired = page.getViewport({ scale: s * dpr });
       const desiredPixels = desired.width * desired.height;
@@ -266,7 +288,11 @@
       canvas.height = Math.max(1, Math.floor(viewport.height));
       canvas.style.width = `${cssViewport.width}px`;
       canvas.style.height = `${cssViewport.height}px`;
-      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      const renderTask = page.render({ canvas, canvasContext: ctx, viewport });
+      renderTasks.set(n, renderTask);
+      await renderTask.promise;
+      if (renderTasks.get(n) === renderTask) renderTasks.delete(n);
+      if (disposed || !slot.isConnected) return;
       renderedScale.set(n, s);
       renderedAtScale = true;
       rememberRendered(n, canvas);
@@ -275,12 +301,13 @@
     } catch {
       // a page failed to render; leave its placeholder in place
     } finally {
+      renderTasks.delete(n);
       page?.cleanup();
       renderingPages.delete(n);
       // A zoom/fit change may land while this page is rasterizing. Never
       // render into the same canvas concurrently; finish once, then catch up.
       const currentScale = zoom === "fit" ? fitScale : zoom;
-      if (renderedAtScale && currentScale !== s && slot.isConnected) {
+      if (!disposed && renderedAtScale && currentScale !== s && slot.isConnected) {
         void renderPage(n, slot);
       }
     }
@@ -303,6 +330,7 @@
 
   async function renderTextLayer(page: PDFPageProxy, slot: HTMLElement, s: number): Promise<void> {
     try {
+      if (disposed || !slot.isConnected) return;
       let layer = slot.querySelector<HTMLDivElement>(".textLayer");
       if (layer === null) {
         layer = document.createElement("div");
@@ -316,9 +344,12 @@
       const viewport = page.getViewport({ scale: s });
       const source = page.streamTextContent({ includeMarkedContent: true, disableNormalization: true });
       const tl = new pdfjs.TextLayer({ textContentSource: source, container: layer, viewport });
+      textLayers.set(page.pageNumber, tl);
       await tl.render();
     } catch {
       // text layer is a progressive enhancement; ignore failures
+    } finally {
+      textLayers.delete(page.pageNumber);
     }
   }
 

@@ -20,10 +20,13 @@ use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 
-/// Hard cap on one uploaded file. Uploads exist for screenshots and small
-/// files dropped from the desktop; datasets belong on the filesystem via the
-/// shell, not in an HTTP body.
-pub(crate) const MAX_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
+/// A session upload lands under bounded daemon state, so one reference/drop
+/// stays comfortably below the session-wide quota.
+pub(crate) const MAX_SESSION_UPLOAD_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// A Finder/tree upload lands on the user's chosen filesystem and streams with
+/// constant memory. Keep a finite request ceiling for abuse/accident safety,
+/// but make it useful for large remote-host artifacts and datasets.
+pub(crate) const MAX_DIR_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Hard cap on a session's whole uploads dir — the bounded-state rule: a
 /// session cannot grow `~/.chimaera` without limit by receiving drops.
 pub(crate) const MAX_SESSION_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
@@ -151,11 +154,12 @@ pub(crate) async fn upload(
             }
         };
         written += chunk.len() as u64;
-        if written > MAX_UPLOAD_BYTES || existing + written > MAX_SESSION_UPLOAD_BYTES {
+        if written > MAX_SESSION_UPLOAD_FILE_BYTES || existing + written > MAX_SESSION_UPLOAD_BYTES
+        {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
-            let limit = if written > MAX_UPLOAD_BYTES {
-                format!("file limit {MAX_UPLOAD_BYTES} bytes")
+            let limit = if written > MAX_SESSION_UPLOAD_FILE_BYTES {
+                format!("file limit {MAX_SESSION_UPLOAD_FILE_BYTES} bytes")
             } else {
                 format!("session upload limit {MAX_SESSION_UPLOAD_BYTES} bytes")
             };
@@ -310,13 +314,13 @@ pub(crate) async fn upload_to_dir(
             }
         };
         written += chunk.len() as u64;
-        if written > MAX_UPLOAD_BYTES {
+        if written > MAX_DIR_UPLOAD_BYTES {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 Json(json!({
-                    "error": format!("upload too large (file limit {MAX_UPLOAD_BYTES} bytes)")
+                    "error": format!("upload too large (file limit {MAX_DIR_UPLOAD_BYTES} bytes)")
                 })),
             )
                 .into_response();

@@ -23,13 +23,24 @@
      *  finished or merely waiting) must be able to go still — a permanent
      *  pulse over nothing is the exact noise these strips exist to avoid. */
     pulse?: boolean;
+    /** False while the retained owner is hidden. Keep the tray mounted so its
+     *  expanded state survives tab switches, but do not animate invisible
+     *  work or announce background count churn. */
+    visible?: boolean;
     /** The expanded row list (typically WorkTrayRow children). */
     children: Snippet;
   }
-  let { glyph, label, open = $bindable(false), pulse = true, children }: Props = $props();
+  let {
+    glyph,
+    label,
+    open = $bindable(false),
+    pulse = true,
+    visible = true,
+    children,
+  }: Props = $props();
 </script>
 
-<div class="tray">
+<div class="tray" class:visible>
   <button
     class="tray-head"
     aria-expanded={open}
@@ -37,10 +48,10 @@
     title={open ? "collapse" : "expand"}
   >
     <Chevron {open} />
-    <span class="spark" class:still={!pulse} aria-hidden="true">{glyph}</span>
+    <span class="spark" class:still={!pulse || !visible} aria-hidden="true">{glyph}</span>
     <!-- aria-live on the summary only: the count changing is worth
          announcing, per-row churn is not. -->
-    <span class="head-label" role="status" aria-live="polite">{label}</span>
+    <span class="head-label" role="status" aria-live={visible ? "polite" : "off"}>{label}</span>
   </button>
   {#if open}
     <div class="rows">
@@ -62,6 +73,9 @@
     overflow-y: auto;
     background: color-mix(in srgb, var(--accent) 4%, transparent);
     animation: rise 0.15s ease; /* shared keyframe in app.css */
+  }
+  .tray:not(.visible) {
+    animation: none;
   }
   /* The whole header is the collapse toggle (button reset), so the one-line
      summary is the click target — like the ToolGroup summary. */

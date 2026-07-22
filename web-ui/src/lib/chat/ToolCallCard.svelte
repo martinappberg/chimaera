@@ -106,7 +106,12 @@
   </div>
 {/snippet}
 
-<div class="tool" class:failed={block.status === "failed"} class:denied={block.denied}>
+<div
+  class="tool"
+  class:visible
+  class:failed={block.status === "failed"}
+  class:denied={block.denied}
+>
   <div class="head">
     <button
       class="expand"
@@ -278,6 +283,11 @@
     background: var(--accent);
     vertical-align: text-bottom;
     animation: pulse 1s steps(2, jump-none) infinite;
+  }
+  .tool:not(.visible) .cursor,
+  .tool:not(.visible) .dot.run {
+    animation: none;
+    opacity: 0.55;
   }
   .head {
     display: flex;

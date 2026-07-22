@@ -39,6 +39,9 @@
      *  grants — the daemon's UserPromptSubmit hook resolves them). */
     terminals: TerminalOption[];
     focused: boolean;
+    /** False while the owning retained chat tab is hidden. The draft remains
+     *  mounted, but invisible running chrome must stay still. */
+    visible?: boolean;
     /** Returns whether the message was accepted (false during reconnect, so
      *  the composer keeps the draft instead of losing it). */
     onSubmit(text: string, images: ImageAttachment[]): boolean;
@@ -47,6 +50,9 @@
     onCycleMode(): void;
     /** Intercept a dialog-only slash command with native UI. True = handled. */
     onSlash(name: string, args?: string): boolean;
+    /** Non-empty draft/attachment state. The transcript uses this to suspend
+     *  live-following while the user is actively composing. */
+    onDraftState(active: boolean): void;
   }
 
   let {
@@ -57,10 +63,12 @@
     workspaceId,
     terminals,
     focused,
+    visible = true,
     onSubmit,
     onInterrupt,
     onCycleMode,
     onSlash,
+    onDraftState,
   }: Props = $props();
 
   const uid = $props.id();
@@ -115,6 +123,10 @@
    *  pick-time caret state is unreliable once a popover button takes focus. */
   let fileToken = $state<{ start: number; text: string } | null>(null);
   let quickOpenTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    onDraftState(draft.trim().length > 0 || images.length > 0 || resizing);
+  });
 
   $effect(() => {
     if (focused) el?.focus();
@@ -550,7 +562,7 @@
   }
 </script>
 
-<div class="composer">
+<div class="composer" class:visible>
   {#if popover === "slash"}
     <div class="overlay-surface pop" id="{uid}-pop" role="listbox" aria-label="slash commands">
       {#each slashMatches as choice, i (choice.key)}
@@ -895,6 +907,9 @@
     color: var(--accent);
     /* Faint breathing ring while the agent works — presence, not alarm. */
     animation: stop-breathe 1.8s ease-in-out infinite;
+  }
+  .composer:not(.visible) .stop {
+    animation: none;
   }
   .stop:hover {
     background: color-mix(in srgb, var(--accent) 22%, transparent);
