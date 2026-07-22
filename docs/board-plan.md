@@ -38,7 +38,9 @@ plot panels, arrows, groups) in **points**, whose every construct is a clean
 constructs project onto PPTX at a **declared fidelity tier per object** — most
 land as natively editable PowerPoint objects by mechanical projection, and the
 rest degrade to a stated tier the preflight tells you *before* you export, never
-after. A **theme-token layer**
+after. The same engine also serves the highest-frequency case, which is smaller
+than a deck: an agent mid-task running `board show` to put a picture in front of
+you instead of a paragraph (§10.1). A **theme-token layer**
 (`@accent1`, `role: "title"`) sits between the board and its literal styling, so
 "strict system by default, fully customizable" is literal: agents author against
 a constrained schema, humans restyle by swapping tokens. A pure-Rust engine in
@@ -698,6 +700,44 @@ percentages.
 
 ### Page level
 
+**`brief` and `page.intent` — the cold-start path, and the one field the plan was
+missing.** A board records *why it exists*, and each page records *why it exists*:
+
+```json
+"brief": { "thesis": "Three sub-100 nM hits came out of the screen, and two share a scaffold.",
+           "audience": "lab meeting", "minutes": 10,
+           "asked": "make me a 10-minute talk on the kinase screen for lab meeting",
+           "sources": ["results/", "manuscript/draft.md"] }
+```
+```json
+"intent": { "kind": "claim-evidence", "why": "establishes the hit rate before naming the hits" }
+```
+
+`kind` is a small closed enum — `cover · section · claim-evidence · comparison ·
+data · quote · summary · backup`. `asked` stores the human's words **verbatim**.
+`intent` is **never drawn** — stricter than `page.caption`. There are no
+timestamps and no nonces, so §3.4's diff discipline holds and these read as prose.
+
+This is not the §3.2 second-representation anti-pattern, because **a page's
+purpose is genuinely not derivable from its objects** — that is precisely the
+problem. And the field is load-bearing three separate times, which is what stops
+it becoming a field nobody fills: `kind` **selects the layout** (below); `why` is
+what makes *"cut this to 8 slides"* a judgement instead of a truncation; and
+writing one line per page is what makes an agent *notice* it has three pages doing
+the same job. Duplicate intents lint.
+
+**Layout stays a pure function; it gains exactly one input.** It was
+underdetermined before: a 40-word claim with one chart and a 40-word "what's next"
+with one chart measure identically and want different layouts. Now it is
+`f(intent.kind, measured_metrics) → slot layout` — still pure, still total, still
+~12 layouts per preset. *"How does an agent decide this slide is a hero image?"*
+**It doesn't, and that's the point** — it states `kind: "data"` and supplies one
+visual and a short title, and the function resolves `hero+caption`. The agent's
+remaining choice becomes **semantic** (what is this page doing?) rather than
+visual, which is the choice models are markedly better at and the one a human can
+verify by reading an outline. Corollary for the skill: **if a page looks wrong,
+the content is wrong.**
+
 `page.layout` + **named slots** is the default authoring path and ships in slice 1
 — §11 already generates a master and layout set with `p:ph` placeholders, so it
 costs nothing at export and is expensive to retrofit; it resolves to absolute pt
@@ -744,12 +784,13 @@ eat into the walker's file cap and time cap — meaning real source files start
 dropping out of quick-open as a side effect of using boards. The three generated
 directories must be added to the walker's ignore set, not merely gitignored.
 
-**Naming note [decide]:** `~/.chimaera` is the *daemon's* home. A workspace-level
-`.chimaera/` is a different thing in a different place, and establishes a
-namespace future workspace-scoped features (Loadout's ack snapshot, for one) can
-share — but the echo is a real readability hazard. The alternative is a distinct
-name like `.board/` or `.chimaera-board/`. Recommendation: `.chimaera/board/`,
-documented once, because one workspace namespace beats N sibling dotdirs.
+**Naming — decided: `.chimaera/board/`, in the workspace.** `~/.chimaera` is the
+*daemon's* home and holds daemon state; this is a different directory in a
+different place, at the root of whatever repo you are working in, and it travels
+with the repo. Nothing about a board ever lives in the daemon's home. The echo is
+a small readability cost, paid once, in exchange for a workspace namespace that
+future workspace-scoped features (Loadout's ack snapshot, for one) can share
+rather than proliferating sibling dotdirs.
 
 ## 5. The pane
 
@@ -942,6 +983,52 @@ semantic causal trace across both, in human-readable named-object terms
    `select` entry — otherwise deixis and pins vanish at a cap boundary, which
    would be a spooky, hard-to-reproduce bug.
 
+### 6.3b Structural revision — where the object-scoped journal breaks
+
+Be blunt about this: **§6.3's journal is object-scoped, and structure-level
+revision has no home in it.** "Cut to 8 slides" and "the middle section drags" are
+not `object.moved` events. §6.6's merge is geometry keyed on object id *within* a
+page, while restructuring moves objects *between* pages and deletes pages outright.
+As written, an agent asked to restructure must infer what changed from a full-file
+diff — exactly what the journal exists to prevent. Three additions:
+
+**Structural journal ops**, emitted by both actors and landing in slice 1 for the
+same reason anchors do (they re-key `journal --since-last`, undo, the merge path,
+and `describe`, so retrofitting means rewriting all four): `page.added`,
+`page.removed`, `page.reordered`, `page.merged`, `page.split`,
+`object.moved-to-page`, `intent.changed`, `brief.changed`. This is vocabulary, not
+machinery — the writer discipline, seq contract, coalescing and compaction all
+already exist.
+
+**The structural merge rule**, which needs no new state because the journal
+already records exactly which objects a human has touched:
+
+> Structural edits are page-scoped and **preserve object identity**. An agent
+> restructuring a deck may reorder, split, merge and delete pages, and may move an
+> object between pages — but it may **never change an object's id**, and may
+> **never rewrite the geometry of an object the journal shows a human has
+> touched**, except by re-slotting it. An object carrying a human
+> `move`/`resize`/`restyle` is **pinned**: it keeps its `at`/`size` where its page
+> survives, and where its page is merged away it lands in the destination's
+> matching slot marked **needs-review** — never silently re-placed.
+
+One requirement here is easy to miss and fatal: **`describe` must print the pin**
+(`callout   shape roundRect   at 520,150 … [hand-placed]`). §6.1 makes `describe`
+the agent's primary read, not the journal — so a pin the agent cannot see in
+`describe` is a pin that gets clobbered.
+
+**Where the request goes:** chat carries the instruction (free-form; the
+interesting revision requests are not enumerable), and the journal carries the
+evidence of what the human already did by hand. Plus one small extension — a
+**page-scoped comment pin**, since §6.4's pins bind to an object or a point and
+"this section drags" has nowhere to land.
+
+And this is where `brief` pays for itself. "Cut to 8" against a deck with no
+recorded intents is twelve arbitrary deletions, almost certainly from the end
+where the conclusions live. Against a briefed deck it is *drop the pages whose
+intent supports the thesis least* — and the agent can name which ones and why in
+one sentence. That behaviour is unavailable at any price without the field.
+
 ### 6.4 Selection is pointing
 
 When objects are selected in the pane and you type "make **this** bigger" into a
@@ -1086,7 +1173,10 @@ door through which drift permanently enters.
 **CLI** (a nested `Board { cmd }` enum, the `Compute` shape):
 
 ```
-chimaera board new      <path> [--template ID] [--target ID] [--theme ID]
+chimaera board show     [--spec FILE | -] [--title T] [--note N] [--id SLUG]
+                        [--preset ID | --size WxH] [--theme ID] [--emit-board]
+chimaera board new      <path> [--brief TEXT] [--minutes N] [--audience TEXT]
+                        [--template ID] [--target ID] [--theme ID]
 chimaera board render   <board> [--page ID] [--object ID | --region X,Y,W,H]
                                 [--scale N] [--format png|jpeg] [-o FILE]
 chimaera board proof    <board> [--page ID]        # PNG *and* a text proof sheet
@@ -1124,6 +1214,16 @@ worth naming:
   agent cannot.
 - **`panel-brief`** answers the only question Board alone can answer — how big is
   the hole — and **writes nothing** (§10).
+- **`show`** is the mid-work path (§10.1) — spec on stdin, no tracked file, a card
+  inline under the tool call that produced it. Likely the highest-frequency verb
+  in the whole surface.
+- **`new --brief`** deliberately does **not** call a model: the binary has none,
+  and pretending otherwise would be the one dishonest seam available here. It
+  writes a *briefed, zero-page* board — canvas, theme, populated `brief`, no pages
+  — and `describe` on it prints the brief and says `0 pages — unbuilt`. The skill's
+  first cold-start move is therefore to record the human's ask verbatim before
+  interpreting it. A free consequence: §5's empty-state card on a briefed board
+  renders the brief instead of the generic picker.
 
 Two related schema notes: **`canvas.target` is a field in the board file**
 (defaulted from `canvas.preset`), so `--target` is a retarget override rather than
@@ -1402,6 +1502,103 @@ A panel whose script is newer than its asset shows a **stale badge** with a
 one-click regenerate. PDF-panel import (via `hayro`) is feature-gated to a late
 slice; v1 honestly says "export SVG or PNG from your plotting code."
 
+## 10.1 `board show` — the agent showing you something mid-work
+
+This is a **top-frequency use**, not a footnote: an agent in the middle of some
+other task — debugging, a QC pass, a benchmark — reaching for a picture instead of
+a paragraph. It gets its own path because the obvious one does not work.
+
+**Why it can't ride the existing artifact gallery** (verified in the code, not
+assumed): `collectTurnArtifacts` keeps a path only when a completed tool block
+carries it in `locations` *and* the tool is `edit` or the path is an image — and
+`locations` is derived from `file_path`/`path` in the **tool input**. A `Bash`
+call carries `command`, so a PNG produced by any CLI invocation is invisible to
+the gallery. It also fires at `turn_end`, which is the wrong beat for "here's what
+I found, continuing."
+
+**The throwaway is a gitignored one-page `.board.json` — not a PNG, and not a
+bespoke spec format.** The earlier draft was right about the *wear* to avoid (the
+journal, the git entry, the ceremony) and wrong about the *mechanism*. Keeping the
+file collapses two code paths into one: same schema, same renderer, same theme,
+same lint, and promotion becomes a `git mv` plus a journal init rather than a
+re-import with two-point calibration.
+
+```
+chimaera board show [--spec FILE | -]        # spec on stdin by default
+    [--title TEXT] [--note TEXT] [--id SLUG]
+    [--preset default|wide|square|tall | --size WxH]
+    [--theme ID] [-o FILE] [--emit-board] [--quiet]
+```
+```
+$ chimaera board show <<'JSON'
+{ "title": "Test failures by file", "note": "after the parser rewrite; 3 runs",
+  "chart": { "x": "file", "y": "failures",
+             "values": [{"file":"parser.rs","failures":12}, …] } }
+JSON
+shown chart · 9 bars · talk-dark · 720×450 → .chimaera/board/shown/a3f1.board.json
+```
+
+**stdin, not a file** — a heredoc is one tool call in every agent; write-then-invoke
+is two calls plus a temp file the agent has to name. That single fact is most of
+whether an agent still reaches for this at turn forty.
+
+**It is not a second schema.** The `chart` value **is** §3.8's chart object minus
+`id`/`at`/`size`. `show` normalizes it into a real one-page board in memory and
+runs the identical render path. `--emit-board` prints that board, and a Rust test
+asserts *render-the-emitted-board* is byte-identical to *show's own render*. That
+test is the whole defense against `show` quietly becoming a second product.
+
+**Four pieces of sugar**, each the difference between an agent bothering and not,
+all specified as `normalize()` extensions rather than a parallel format: `marks`
+may be **omitted** (inferred from channel types — nominal × quantitative → `bar`,
+ordered × quantitative → `line`, two unordered quantitative → `point`; a pure
+function, so C1 holds); **channel types are inferred from inline JSON only** — a
+named exception with its reason, because §3.8 bans inference for CSV precisely
+since CSV is untyped text, whereas inline JSON is typed (number → quantitative,
+ISO-8601 → temporal); `sort` defaults to **descending** by the quantitative
+channel on a nominal axis; and orientation flips to **horizontal bars** above 7
+categories or any label over 12 characters.
+
+**Where it writes, and the trap worth naming.** §4 makes `.chimaera/board/.gitignore`
+a *tracked* file — so a first-ever `board show` in a fresh repo would create a
+tracked file as a side effect of a throwaway, which is exactly the wear this path
+exists to avoid. The fix: `shown/` carries **its own `.gitignore` containing `*`**,
+which ignores itself. A throwaway never produces a `git status` line, ever, even
+the first time.
+
+```
+.chimaera/board/shown/
+  .gitignore          containing "*" — self-ignoring, written on first show
+  <id>.board.json     the spec: tiny, retained long
+  <id>.png            the render: LRU-capped by byte budget
+```
+
+Retention is deliberately asymmetric and falls out of storing the spec: **boards
+outlive PNGs**, so an expired card says "expired — re-render" and can actually do
+it, rather than showing a broken image.
+
+**Defaults.** Theme resolves `--theme` → workspace default → the app's current
+appearance mapped to `talk-dark`/`talk-light`; these render inside the app's
+chrome, and a white card in a dark workbench is a foreign object. Light and dark
+render **lazily, one at a time** — content-addressed and cached forever after, so
+eager double-rendering would only double the ticket cost over a `connect` tunnel
+for a rare event. Size is **720×450 pt @2×**: a 16:9 slide is too wide for a
+600–700 px transcript column. Presets auto-select — over 12 nominal categories →
+`tall`, a `rect` matrix → `square`. Quality is entirely inherited from §9, which
+is the argument for building `show` on the `chart` composite rather than a
+quick-render side path.
+
+**`--id SLUG` is the update handle.** Re-invoking with the same id overwrites and
+re-emits, so the card **updates in place** — essential for a long sweep, where the
+alternative is forty cards.
+
+**Surfacing.** A daemon-injected **`shown` journal event** (not a driver change,
+so not `chat-smoke` territory on its own) renders a `ShownCard` inline **under the
+tool call that produced it**, mid-turn. In a TUI there is no card, so the agent
+prints the one-line stdout and the path — and the session header carries a small
+shown-strip. Promotion is `board adopt`, which is now a file move rather than a
+re-import.
+
 ## 11. Exports
 
 - **PPTX — a pure-Rust OOXML writer** (`zip` + `quick-xml`) inside
@@ -1567,6 +1764,94 @@ phrased as a **standing law of the session, never a numbered step**: "Step 4:
 render" is done after turn four; "every board edit is followed by a render you
 look at" survives to turn forty.
 
+### Showing a result — above the loop, because it fires more often
+
+> **Showing a result — `board show`**
+>
+> When a picture would answer better than a paragraph, run `chimaera board show`
+> with a spec on stdin. One command, ~50 ms, nothing tracked, and the user sees it
+> inline where you ran it. You need no board, file, size, or theme.
+>
+> **Reach for it when the answer has shape:** a quantity compared across more than
+> a handful of named things · something changing along an axis · a before/after
+> over many items · a proportion of a whole · the progress of a long job (use
+> `--id` so it updates in place instead of piling up).
+>
+> **Do not reach for it otherwise, and that is most of the time.** Three numbers
+> are a sentence. Five short ranked things are a list. A code change is a diff. A
+> file you did not make is already previewed. A structure you can say in one line
+> is a line. **A chart that restates a sentence is worse than the sentence** — it
+> costs a scroll and buys nothing. The floor is mechanical: **fewer than four
+> marks is refused.** If you are arguing with that refusal, write the sentence.
+>
+> **You state the numbers; Board draws them.** Board never bins, fits, smooths,
+> aggregates or downsamples. For a distribution, compute the bin counts where the
+> data already is and show them as bars — and say what bin width you chose. Bars
+> always include zero. There is no pie and no second y axis.
+>
+> **Say where the numbers came from.** From a command or file → `provenance.regen`.
+> Derived by you → say so in the note. A confident chart of numbers you inferred is
+> the one way this feature does harm.
+>
+> **One picture per point, at most two per turn.** A third means you are narrating
+> with charts. **Show it, then say what it shows in one sentence** — the picture is
+> evidence for the answer, not the answer.
+
+### Planning a deck — immediately above the loop
+
+> **Plan the argument before you place anything.**
+>
+> A deck is not a pile of slides and a figure is not a pile of panels. Before you
+> create a board, you must be able to state in one sentence what the whole thing
+> claims. Write it down — `board new --brief` records it and `describe` prints it
+> back on every later turn. If you cannot write it, you do not yet know what you
+> are building, and the fastest way to find out is to ask one question rather than
+> produce twelve slides they will delete.
+>
+> **One page is one claim, and the claim is the title.** The title of a content
+> page is a full sentence stating what the page shows — "IC50 drops tenfold in the
+> resistant line" — not a topic phrase — "Dose–response." A topic phrase makes the
+> audience wait for the point. Under that sentence goes the evidence. **A content
+> page whose body is only text is a page whose evidence you have not found yet.**
+>
+> **Every page states why it exists**, in a one-line intent that is never drawn.
+> Its `kind` selects the layout; its sentence is what lets a later turn cut the
+> deck to eight pages on purpose instead of by position. **Two pages with the same
+> intent are one page you have not merged.**
+>
+> **Say the outline before you build it.** In your reply, before the first write:
+> the thesis in one sentence, then one line per page — number, kind, title
+> sentence. Six lines, and the only cheap moment to be wrong. **Do not stop and
+> wait for approval** unless the human asked you to plan first; write the outline,
+> then build. A wrong outline they read in ten seconds beats a right deck they read
+> in ten minutes.
+>
+> **Length is a decision, not an outcome.** Roughly one page per minute. The tenth
+> page you want to add to a ten-minute talk is the one to cut.
+>
+> **You do not choose a layout.** Choose the slot, state the intent, supply the
+> content. If a page looks wrong, the content is wrong — you gave it two heroes, or
+> a title that runs three lines. Fix the content, not the coordinates.
+>
+> **Revising is subtraction first.** Asked to shorten or fix a deck that drags:
+> first pass removes and merges pages, second rewrites titles into sentences, and
+> only the third touches anything visual. And **read the journal before you
+> restructure** — an object the human has moved, resized or restyled is theirs.
+> Keep it, move it whole, or say you could not. Never silently re-place it.
+
+**On the outline step, one decision worth recording:** the outline is prose in the
+agent's turn, **never a Board-owned approval modal.** The evidence cuts both ways —
+Gamma ships an explicit outline step and its consistent complaint is that users
+skip it as ceremony, while Copilot has none and its dominant complaint is exactly
+the rework that predicts. So the step has real value *and* gets routed around when
+it is a gate. Three reasons this shape is right here specifically: the approval
+gate **already ships agent-natively** (`PlanApprovalCard` renders Claude's
+`ExitPlanMode`; a human who wants a gate turns on plan mode, and Board must not
+mint a second, Claude-shaped plan primitive); a TUI on a login node has no modal at
+all; and chat already handles mid-turn disagreement losslessly through
+`pendingSends`/`cancel_queued`/`steer_queued`. Prose evaporates by turn forty
+though — which is why the outline *also* lands in the file, as `brief` + `intent`.
+
 ### The loop, verbatim
 
 Three independent design lenses converged on near-identical wording here, which is
@@ -1653,11 +1938,10 @@ Board should *not* serve the throwaway case, and saying so protects both. Mintin
 a `.board.json` plus a journal plus a git entry for "plot me this column real
 quick" is precisely the wear that makes people abandon a tool.
 
-- **Throwaway:** no board, and nothing needed from Board beyond `theme-export` if
-  you want the palette. A script, a PNG that lands in
-  the chat artifact gallery as an image tile. Zero tracked files. The skill's
-  plotting reference states the fork in one line: *if the answer dies with the
-  turn, do not mint a board.*
+- **Throwaway:** `board show` (§10.1) — a gitignored one-page board under
+  `shown/`, surfaced as a card mid-turn, never a `git status` line. The fork the
+  skill states in one line: *if the answer dies with the turn, do not mint a
+  tracked board.*
 - **Figure:** `board new --template figure-2x2 --target nature-single`, `place`
   each panel, `lint` (which names the panels that are outlined glyphs and cannot
   be verified), regenerate those against the brief, annotate, export.
@@ -1723,7 +2007,51 @@ no CLI round-trip — the empty-state button and the skill both go through it.
 
 ## 14. Phasing
 
-1. **Slice 1 — the spine, dogfoodable in a week.** `chimaera-board` crate:
+**Slice 0 — show, one week, before the pane.** The reorder follows from the
+maintainer's own weighting: the agent showing you a result mid-work is a
+top-frequency usage, it has zero downstream dependencies, and **every line of it
+is substrate the board path needs regardless** — so this is a reorder, not a
+detour. Contents: the `chimaera-board` crate; schema types for the five primitives
+plus `chart`, with `anchor`/`alt`/`link`/`slot`/`caption`/`brief`/`intent`
+**parsed-and-preserved but not resolved**, so nothing written in week one ever
+needs migrating; `normalize()`; the raster path; bundled fonts; the **full theme
+substrate** (type scale, per-role `minPt`, 8 pt grid, one accent); **`chart` v0**;
+`board show`; `POST /board/show` + `/board/render` → `/raw` ticket with the 12 Mpx
+ceiling; the `shown` event and `ShownCard`; and a minimal skill.
+
+**`chart` v0 is exactly:** marks `bar`, `line`, `point`, `rule`, `errorbar`,
+`text`; linear and ordinal scales with `sort`; nice ticks with the fixed rounding
+rule and sig-fig formatting; direct labels, no legend; **inline `values` only**
+(≤500 points, ≤32 KiB — which deletes the CSV reader, the digest, the staleness
+badge and the row caps from v0 entirely). `rule` is in at ~15 lines because it is
+what turns a chart into an argument. `errorbar` is in on **integrity** grounds:
+shipping bars without error bars teaches every agent in week one to draw naked
+bars, and that habit is expensive to unteach. Log scale slips one slice; temporal
+waits for slice 4.
+
+Two rules make shipping the schema this early safe. **The v0 chart spec must be a
+strict SUBSET of §3.8, never a simplification of it** — same key names, same
+declared channel types, same per-mark `fields`; missing capability must be
+*absent*, never *differently spelled*. And with no lint in week zero, `minPt` has
+no enforcer — so per §9's own ranking, **the renderer refuses sub-`minPt` text as
+a constraint** rather than a linter reporting it later. Lint inherits that for
+free.
+
+*Week-zero milestone that matters most:* a grouped bar chart with error bars and
+direct labels that beats matplotlib's defaults on sight. If it doesn't, that is
+the week's most important finding and everything downstream depends on fixing it.
+
+**The trigger, stated now so it cannot erode: week two starts the pane and the
+journal whatever happens in week one.** If slice 0 lands well the pull to keep
+adding marks, scales and legends will be strong — and yielding to it is how Board
+becomes a charting library with a chat tile, which is the one outcome where you
+have built the commodity and skipped the moat. Slice 0 does not test the moat.
+It is worth a week anyway because every line is required substrate, and because if
+`show` turns out to carry most of the value, learning that in week one costs a
+week — learning it after building `BoardView` costs a month.
+
+1. **Slice 1 — the moat.** Slimmer than it was, because the engine, theme and
+   `Composite` trait already exist. `chimaera-board` crate:
    schema, `normalize`, lenient parse, the raster path (usvg/resvg/cosmic-text/
    png), bundled fonts. CLI `new`, `render`, `describe`, `lint`, `journal`.
    `BoardView` with the stage, select/move/resize/snap, outline rail, numeric
@@ -1743,11 +2071,14 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    reads `describe` + `journal --since-last` and adjusts. Rust unit tests on the
    schema, normalize, and lint (the web UI has no component tests — the isolated
    preview is its net).
-   Also in slice 1, because all three are expensive to retrofit and cheap now:
+   Also in slice 1, because all of it is expensive to retrofit and cheap now:
    the **anchor union in the schema** (`at` + `rel` resolving), the `alt`/`link`
-   fields carried through, `page.layout` + named slots, `page.caption`, and the
-   `Composite` trait shipped with exactly one implementation (`table`, rendered
-   but not yet exported) so the mechanism cannot be retrofitted badly. And the
+   fields carried through, `page.layout` + named slots, and **`brief` +
+   `page.intent` resolution with the structural journal ops of §6.3b**. `table`
+   and `page.caption` move out to slice 3 and slice 5 respectively — the
+   `Composite` trait no longer needs a placeholder implementation now that `chart`
+   is its first real one, and `page.caption` exists for the figure-integrity lint,
+   which is slice 5. And the
    **export-tier machinery** (`tier()`, the reason strings, `exportFloor` on
    presets, the census in `lint --target` and `describe`) — **with the §3.6/§3.8
    vocabulary completely unchanged.** *Ship the door, not the rooms:* the
@@ -1823,20 +2154,28 @@ anything touching chat is gated by `just chat-smoke`. A `feat:` carries its
 feature-catalog page ([document-feature](../.claude/skills/document-feature/SKILL.md))
 and an intent capture.
 
-## 15. Open questions **[decide]**
+## 15. Decisions taken, and what's still open
 
-- **The workspace dotdir** (§4) — `.chimaera/board/` (one namespace, echoes the
-  daemon home) vs `.chimaera-board/` (unambiguous, proliferates).
-- **Figures vs decks first.** Slice 1 ships a deck because 16:9 is one fixed
-  canvas and the schema is simplest there, but the *wedge* — the thing nobody
-  else does — is figure assembly. Flipping slices 3 and 4 would put the
-  differentiated use case in your hands two slices earlier at the cost of
-  shipping PPTX later.
-- **How much of the plugin story to honor now.** Recommendation in the earlier
-  brainstorm stands: ship this as an optional built-in surface (a setting hides
-  it), publish the *format* spec in an outside repo if you want an ecosystem,
-  and defer a general UI-plugin system until three things need it. Worth an
-  explicit yes/no, since it was your original framing.
+Settled with the maintainer, 2026-07-22:
+
+- **The workspace dotdir — `.chimaera/board/`, in the workspace** (§4). Never in
+  the daemon's `~/.chimaera`; it is a directory at the repo root that travels with
+  the repo.
+- **Decks first** (§14). Retargeting a board to a figure preset is one click by
+  construction (§9's target presets), so starting on the simpler fixed canvas
+  costs nothing and the figure path arrives through the same door.
+- **A built-in surface, on by default, with a setting to hide it.** Not a plugin.
+  Publishing the *format* spec externally stays available if an ecosystem story
+  ever matters; a general UI-plugin system waits until three things need it.
+- **User-scope themes are in** (`~/.chimaera/board/themes/`), so a lab's house
+  style follows you across projects on a shared HPC home. The tension is real —
+  it weakens "the repo contains everything needed to rebuild the figure" — so the
+  rule is: a board records the **resolved theme id and its source**, and `lint`
+  warns when a board depends on a user-scope theme that is not vendored into the
+  repo. Convenience by default, reproducibility on demand.
+
+Still open:
+
 - **One 60-second hand-check, if you want it.** The SVG-editability question was
   settled on the Mac gap, the manual ritual, and Google Slides — none of which
   depend on the text outcome — so nothing in the plan hinges on this. But if
@@ -1854,9 +2193,29 @@ and an intent capture.
   anti-pattern §3.2 already rejects, and mermaid.js in the browser breaks §7's
   parity invariant and cannot run from a login node. If you'd rather agents just
   write mermaid and see it, that's a different product and worth saying now.
-- **User-scope themes** (`~/.chimaera/board/themes/`) so a lab's house style
-  follows you across projects on a shared HPC home — powerful, but it weakens
-  the "the repo contains everything needed to rebuild the figure" story.
+## 16. Intent — why this exists
+
+*The maintainer's own words, 2026-07-22. Never inferred, never regenerated. A
+future agent reads this as constraints, not suggestions.*
+
+**The core bet.** Make it **super easy to work with your agents' outputs, and to
+present their ideas to other people in a good manner.** Visualization of your
+output is very good, and it is something the workbench should have **natively**.
+
+**What is actually missing, and is therefore the point.** Not generating a
+picture — plenty of things generate pictures. What is missing is **editing it so
+it becomes a good, usable output that can be exported.** The editing surface and
+the export fidelity are the feature; generation alone is the commodity.
+
+**A big usage is the agent showing you results mid-work.** Not only deck-building
+and figure assembly — a large share of the value is an agent, in the middle of
+some other task, reaching for this tool to *show* you what it found rather than
+describe it in prose. That case must stay cheap enough that an agent actually
+reaches for it (§10.1).
+
+**Direction from the start.** You should be able to say in words what you want and
+have the agent work out the best way to build it, rather than only being able to
+correct a board after it exists.
 
 ## Appendix: what we deliberately do NOT build
 
