@@ -137,24 +137,30 @@ plane `ANY /proxy/{id}[/{*path}]`.
 
 ## Key constraints
 
-- **Same-origin today — a known limitation, not a claim of safety.** The proxied app is
-  served from the workbench's own origin, which is what makes Jupyter's
-  `frame-ancestors 'self'`, its cookies, and the absolute-path rescue work. The cost:
-  script in a proxied page can reach `window.parent` — the daemon bearer token in
-  `sessionStorage`, the parent DOM, and in the native app the granted Tauri commands.
-  - For a **loopback / self-host** target this grants nothing new: that app already runs
-    as the user on the daemon's host and can read the manifest token off disk.
-  - For a **confirmed remote** target it IS an escalation — the app is on another
-    machine and could not otherwise obtain the daemon's token. Hence the explicit
-    confirm dialog, which states the consequence.
-  - **The real fix is a separate origin** (the data plane on its own port), so the
-    iframe is cross-origin to the workbench while staying a *real* origin — cookies,
-    `Referer`, and the rescue all keep working. Sandboxing is NOT a substitute:
-    `sandbox` without `allow-same-origin` yields an opaque origin whose requests count
-    as cross-site, so the app's own `SameSite` cookies are withheld (`SameSite=None`
-    needs `Secure`, impossible on http) and the rescue loses both its cookie and its
-    `Referer`. Follow-up work: it touches every tunnel path (`connect`, the Mode 2
-    compute-node ladder), each of which forwards a single port.
+- **Same-origin is deliberate, and for the real cases it costs nothing.** The proxied app
+  is served from the workbench's own origin — that is what makes Jupyter's
+  `frame-ancestors 'self'`, its cookies, and the absolute-path rescue work. It does mean
+  script in a proxied page can reach `window.parent` (the daemon token in
+  `sessionStorage`, the parent DOM). Weigh that against **what the app could already
+  do**, because the token grants code execution *as the user, on the daemon's host*:
+  - **loopback / self-host** — the app runs as the user on that same host and can read
+    the manifest token off disk. Grants nothing new.
+  - **remote workspace** (daemon on a login node, app on that login node — the common
+    HPC case) — same identity, same host. Grants nothing new, and reaches nothing on the
+    user's laptop.
+  - **compute node** — app on the node, daemon on the login node: both the user, sharing
+    `$HOME`. Negligible.
+  - The one non-equivalent case is a **confirmed remote** target *in the native app*,
+    where `window.parent` also reaches granted Tauri commands (`connect_host` et al) —
+    a remote-app -> local-machine hop. It takes deliberately confirming a hostile app.
+  - **If we ever want to close that**, the answer is a separate origin (the data plane on
+    its own port), which keeps a *real* origin so cookies, `Referer`, and the rescue all
+    still work. Sandboxing is NOT a substitute: `sandbox` without `allow-same-origin`
+    yields an opaque origin whose requests count as cross-site, so the app's own
+    `SameSite` cookies are withheld (`SameSite=None` needs `Secure`, impossible on http)
+    and the rescue loses both its cookie and its `Referer`. It would touch every tunnel
+    path (`connect`, the Mode 2 ladder), each forwarding a single port — not worth it for
+    the residual risk above unless the threat model changes.
 - **http upstream only.** The data plane opens a plain `TcpStream` and speaks clear-text
   HTTP/1.1, so a TLS-enabled app (`https://localhost:8443`) is deliberately **not**
   proxyable: `proxyableUrl` and the address bar refuse it and hand it to the user's real

@@ -431,10 +431,6 @@
           {phase.detail !== "" ? phase.detail : "This host isn't this machine or one of your compute nodes."}
           The daemon will forward traffic there on your behalf.
         </div>
-        <div class="state-detail warn">
-          A proxied page runs with this workbench's privileges — only connect to
-          an app you trust.
-        </div>
         <button class="action" onclick={confirmTarget}>connect</button>
       </div>
     {:else if phase.kind === "unreachable"}
@@ -566,12 +562,6 @@
     opacity: 0.85;
   }
 
-  /* The trust consequence of confirming a non-allowlisted target: a proxied
-     page is same-origin with the workbench today (see browser-pane.md). */
-  .warn {
-    font-size: var(--text-xs);
-    color: var(--warn, #c90);
-  }
 
   .node-hits {
     display: flex;
