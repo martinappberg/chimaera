@@ -693,6 +693,22 @@ fn wants_upgrade(headers: &HeaderMap) -> bool {
         && headers.contains_key(header::UPGRADE)
 }
 
+/// How the upstream server sees its own host — what its Host/Origin checks
+/// validate against. When we reach it over loopback (a local loopback target,
+/// or ANY target through the ssh relay, which forwards to the node's
+/// 127.0.0.1) it is a loopback-bound server that only trusts localhost:
+/// Jupyter's `allow_remote_access` 403s any other Host outright, before the
+/// token is even read (found live on a compute node). Present loopback there;
+/// keep the real host only for a directly-dialed routable target, which may
+/// name-based-vhost on it.
+fn upstream_host(host: &str, route: Route) -> String {
+    if matches!(route, Route::Relay(_)) || is_loopback_host(host) {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// Map an absolute-path (or target-absolute) Location back under the proxy
 /// prefix. Relative and foreign locations pass through untouched.
 fn rewrite_location(loc: &str, id: &str, host: &str, port: u16) -> Option<String> {
@@ -972,7 +988,7 @@ async fn forward(
         }
     };
 
-    let (stream, _route) = match dial(&state, &id).await {
+    let (stream, route) = match dial(&state, &id).await {
         Ok(ok) => ok,
         Err(DialError::Expired) => {
             return error_page(
@@ -1017,7 +1033,8 @@ async fn forward(
     let upgrade_proto = strip_hop_by_hop(&mut parts.headers);
     strip_rescue_cookie(&mut parts.headers);
 
-    let authority = format!("{host}:{port}");
+    let up_host = upstream_host(&host, route);
+    let authority = format!("{up_host}:{port}");
     if let Ok(v) = HeaderValue::from_str(&authority) {
         parts.headers.insert(header::HOST, v);
     }
@@ -1035,7 +1052,9 @@ async fn forward(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
     {
-        match map_referer(&referer, &id, &host, port).and_then(|r| HeaderValue::from_str(&r).ok()) {
+        match map_referer(&referer, &id, &up_host, port)
+            .and_then(|r| HeaderValue::from_str(&r).ok())
+        {
             Some(v) => {
                 parts.headers.insert(header::REFERER, v);
             }
@@ -1157,7 +1176,9 @@ async fn forward(
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
         {
-            if let Some(mapped) = rewrite_location(loc, &id, &host, port) {
+            // The app's self-referential absolute redirects use the authority
+            // we told it (up_host), so match that when re-prefixing.
+            if let Some(mapped) = rewrite_location(loc, &id, &up_host, port) {
                 if let Ok(v) = HeaderValue::from_str(&mapped) {
                     rparts.headers.insert(header::LOCATION, v);
                 }
@@ -1226,6 +1247,24 @@ mod tests {
         );
         assert_eq!(expand_nodelist("n[1-100000]", 4).len(), 4, "cap holds");
         assert_eq!(expand_nodelist("", 4), Vec::<String>::new());
+    }
+
+    #[test]
+    fn upstream_host_presents_loopback_over_loopback_routes() {
+        // A relay reaches the node's loopback → present localhost (Jupyter's
+        // allow_remote_access 403s any other Host).
+        assert_eq!(
+            upstream_host("sh04-18n32", Route::Relay(40000)),
+            "127.0.0.1"
+        );
+        // A loopback target is loopback whatever the route.
+        assert_eq!(upstream_host("localhost", Route::Direct), "127.0.0.1");
+        assert_eq!(upstream_host("127.0.0.1", Route::Direct), "127.0.0.1");
+        // A directly-dialed routable target keeps its real host (vhost-safe).
+        assert_eq!(
+            upstream_host("app.cluster.edu", Route::Direct),
+            "app.cluster.edu"
+        );
     }
 
     #[test]

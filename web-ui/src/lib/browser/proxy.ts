@@ -126,6 +126,36 @@ export function targetLabel(host: string, port: number): string {
   return host === "" ? "Browser" : `${host}:${port}`;
 }
 
+/** Loopback spellings a printed URL uses for "this machine". */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
+}
+
+/**
+ * Which of `hosts` answer on `port`, probed through the daemon (mint +
+ * health — compute nodes are auto-allowlisted, and a hit's proven route,
+ * relay included, stays cached on the session the pane will then use).
+ * Misses are revoked immediately.
+ */
+export async function probeNodes(hosts: string[], port: number): Promise<string[]> {
+  const hits = await Promise.all(
+    hosts.map(async (host) => {
+      try {
+        const session = await mintProxy(host, port);
+        const health = await proxyHealth(session.id);
+        if (health.ok) return host;
+        minted.delete(`${host}:${port}`);
+        revokeProxy(session.id);
+        return null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return hits.filter((h): h is string => h !== null);
+}
+
 /**
  * Parse an address-bar entry (or a detected URL) into a proxy target. Accepts
  * `host:port`, `host:port/path`, and full http(s) URLs; a bare `:8888` or

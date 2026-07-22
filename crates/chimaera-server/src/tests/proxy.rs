@@ -217,12 +217,12 @@ async fn proxied_request_streams_back_with_headers_rewritten() {
     assert_eq!(
         echo["host"],
         format!("127.0.0.1:{}", target.port()),
-        "Host is the target's own authority"
+        "a loopback target is presented as loopback (Jupyter allow_remote_access)"
     );
     assert_eq!(
         echo["origin"],
         format!("http://127.0.0.1:{}", target.port()),
-        "Origin moves to the target authority (Jupyter WS origin checks)"
+        "Origin moves to the loopback authority (Jupyter WS origin checks)"
     );
     assert_eq!(
         echo["referer"],

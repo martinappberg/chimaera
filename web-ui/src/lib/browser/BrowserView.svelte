@@ -11,11 +11,15 @@
    * field, with honest overlay states instead of raw browser error pages.
    */
   import { onDestroy, untrack } from "svelte";
+  import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
+  import { computeStatus } from "../workspace/compute";
   import {
     ConfirmRequired,
+    isLoopbackHost,
     mintProxy,
     parseAddress,
+    probeNodes,
     proxyHealth,
     setBrowserTitle,
     targetLabel,
@@ -63,6 +67,66 @@
 
   let draft = $state<string | null>(null);
   let addressEl = $state<HTMLInputElement | null>(null);
+
+  // --- the compute-node hunt --------------------------------------------------
+  //
+  // Apps started inside an allocation print `localhost` URLs, but their
+  // localhost is the COMPUTE NODE's — the daemon's own loopback has nothing
+  // there. So when a loopback target is unreachable on a Slurm host, probe
+  // the same port on the user's running jobs' nodes (already allowlisted;
+  // a hit's proven route stays cached): one answer moves the pane there with
+  // a visible note, several become one-click choices. Probing is honest
+  // spend — a few bounded dials — and silence stays silence.
+  /** Nodes that answered on the target port (multi-hit choice chips). */
+  let nodeHits = $state<string[]>([]);
+  let probing = $state(false);
+  /** One probe per unreachable episode per target. */
+  let probedFor: string | null = null;
+  /** The "moved from localhost:PORT" note shown after an auto-retarget — set
+   *  the instant before we re-point (so it names where we came FROM), and
+   *  deliberately NOT cleared by the target-change reset below. Cleared only
+   *  by an explicit new address, or a click on the chip. */
+  let moved = $state<string | null>(null);
+
+  /** Single-node RUNNING allocations from the compute snapshot, deduped. */
+  function nodeCandidates(): string[] {
+    const snap = get(computeStatus);
+    if (snap === null || snap.scheduler !== "slurm") return [];
+    const out: string[] = [];
+    for (const job of snap.jobs) {
+      if (job.state !== "RUNNING") continue;
+      const node = job.nodes.trim();
+      if (node === "" || node.includes("[") || node.includes(",")) continue;
+      if (node.toLowerCase() === host.toLowerCase()) continue;
+      if (!out.includes(node)) out.push(node);
+      if (out.length >= 4) break;
+    }
+    return out;
+  }
+
+  $effect(() => {
+    if (phase.kind !== "unreachable" || !visible) return;
+    const key = `${host}:${port}`;
+    if (!isLoopbackHost(host) || probedFor === key) return;
+    probedFor = key;
+    const candidates = nodeCandidates();
+    if (candidates.length === 0) return;
+    probing = true;
+    void probeNodes(candidates, port).then((hits) => {
+      if (probedFor !== key) return;
+      probing = false;
+      nodeHits = hits;
+      if (hits.length === 1) {
+        moved = targetLabel(host, port);
+        onRetarget(hits[0], port, path);
+      }
+    });
+  });
+
+  function chooseNode(node: string): void {
+    moved = targetLabel(host, port);
+    onRetarget(node, port, path);
+  }
 
   const address = $derived(
     draft ?? (host === "" ? "" : `${targetLabel(host, port)}${livePath ?? path}`),
@@ -113,6 +177,12 @@
       livePath = null;
       draft = null;
       confirmed = false;
+      nodeHits = [];
+      probing = false;
+      probedFor = null;
+      // `moved` is intentionally NOT reset here — an auto-move sets it right
+      // before it re-points, and this reset runs as a consequence of that
+      // very re-point; clearing it would erase the note we just set.
       setBrowserTitle(tabId, null);
       void connect();
     });
@@ -251,6 +321,8 @@
     draft = null;
     addressEl?.blur();
     if (parsed === null) return;
+    // A deliberate address is the user moving on — drop any auto-move note.
+    moved = null;
     if (parsed.host === host && parsed.port === port) {
       if (base !== null && phase.kind === "ready") {
         iframeSrc = `${base}${parsed.path}`;
@@ -306,6 +378,15 @@
       onkeydown={onAddressKeydown}
       onblur={() => (draft = null)}
     />
+    {#if moved !== null}
+      <button
+        class="moved"
+        title="the app printed {moved}, but it answers on this compute node — chimaera connected there (click to dismiss)"
+        onclick={() => (moved = null)}
+      >
+        moved from {moved}
+      </button>
+    {/if}
     {#if degraded}
       <span class="degraded" title="the server stopped answering — the view stays until you reload">unreachable</span>
     {/if}
@@ -346,6 +427,18 @@
       <div class="state">
         <div class="state-title">Can't reach {targetLabel(host, port)}</div>
         <div class="state-detail">{phase.detail}. Retrying quietly — is the server running?</div>
+        {#if probing}
+          <div class="state-detail probe">checking your compute nodes…</div>
+        {:else if nodeHits.length > 1}
+          <div class="state-detail probe">
+            something answers on port {port} on your compute nodes:
+          </div>
+          <div class="node-hits">
+            {#each nodeHits as node (node)}
+              <button class="action" onclick={() => chooseNode(node)}>{node}</button>
+            {/each}
+          </div>
+        {/if}
         <button class="action" onclick={() => void connect()}>retry now</button>
       </div>
     {/if}
@@ -438,6 +531,32 @@
     color: var(--err, #c66);
     padding: 0 6px;
     user-select: none;
+  }
+
+  /* The "moved from localhost" note: quiet accent chip, click to dismiss. */
+  .moved {
+    flex: none;
+    font-family: var(--mono);
+    font-size: var(--text-xs);
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border: none;
+    border-radius: 4px;
+    padding: 1px 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .probe {
+    font-size: var(--text-xs);
+    opacity: 0.85;
+  }
+
+  .node-hits {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    justify-content: center;
   }
 
   .stage {

@@ -89,6 +89,14 @@ plane `ANY /proxy/{id}[/{*path}]`.
   notebook) over a globe glyph; states are honest overlays — connecting, confirm (for
   non-allowlisted hosts), can't-reach with quiet auto-retry, and a non-destructive
   "unreachable" chip when a running app stops answering.
+- **The compute-node hunt.** An app started inside an allocation prints `localhost`
+  URLs whose loopback is the *compute node's* — the daemon's own has nothing there. So
+  when a loopback target is unreachable on a Slurm host, the pane probes the same port
+  on the user's RUNNING jobs' nodes (single-node jobs, capped at 4 — already
+  allowlisted, and a hit's proven route, relay included, stays cached). Exactly one
+  answer moves the pane there with a dismissable "moved from localhost:PORT" chip in
+  the chrome; several answers become one-click node choices in the can't-reach state;
+  none stays honest silence.
 - **Key behaviors.** The pane keeps its iframe alive across tab switches (the keep-alive
   layer model — a notebook never reloads because you glanced at a terminal); mounted
   panes ping health every 60s (doubles as the proxy keep-alive); navigation inside the
@@ -124,13 +132,20 @@ plane `ANY /proxy/{id}[/{*path}]`.
 > be "helpfully" changed without asking.
 
 ### Why the browser pane exists
-_Intent: pending — drafted with the feature (2026-07-21); to be confirmed by the maintainer._
+_Captured 2026-07-21 (from the maintainer, on the shipping PR)._
 
-- **Problem it solves (from the build request):** the deliverables of bioinformatics
-  work are often *live apps* (a Jupyter/marimo notebook, a Streamlit dashboard, RStudio)
-  running on the machine that owns the data — usually a cluster login or compute node
-  whose `localhost` the laptop cannot reach. The pane makes them one click from the
-  terminal that started them, through the daemon the user already trusts.
-- **Constraints stated up front:** never an open relay (ticket-gated, target
-  allowlisted to detected/user-confirmed addresses); bounded memory (streaming, no
-  buffering); the daemon↔UI wire stays stable.
+- **Problem it solves (maintainer's words):** "a native browser within the workflow
+  so that you can see everything from developing web apps to jupyter notebook to
+  marimo etc. — it is a crucial part of an agent workbench and very helpful for the
+  user." Not a bolt-on preview: the live-app surface belongs *inside* the workbench,
+  beside the terminals and agents that produce those apps.
+- **How settled:** "a crucial part of an agent workbench" — treat the capability
+  itself (live web apps as first-class panes, remote-transparent through the daemon)
+  as core to the workbench vision. The mechanics (rescue cookie, relay rungs, chrome
+  layout) are how it works for now, improvable freely.
+- **Constraints stated in the build request:** never an open relay (ticket-gated,
+  target allowlisted to detected/user-confirmed addresses); bounded memory
+  (streaming, no buffering); the daemon↔UI wire stays stable.
+- **Follow-up he flagged immediately:** compute-node apps printing `localhost` URLs
+  must not dead-end ("this we need to fix") — the compute-node hunt above is that
+  fix, shipped in the same PR.
