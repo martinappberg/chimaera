@@ -499,6 +499,7 @@ impl ChatManager {
         // lock across it would let a slow write freeze the whole manager
         // (list() takes info locks under the sessions lock).
         let mut native_to_index: Option<String> = None;
+        let mut effort_to_index: Option<(String, Option<String>)> = None;
         {
             let mut info = session.info.lock().expect("info lock");
             fold_session_metadata(&mut info, &ev);
@@ -510,6 +511,16 @@ impl ChatManager {
                     if !native_session_id.is_empty() {
                         info.native_session_id = Some(native_session_id.clone());
                         native_to_index = Some(native_session_id.clone());
+                    }
+                }
+                AgentEvent::EffortState { effort, .. } => {
+                    // This index field drives Codex thread-open parameters.
+                    // Claude has its own argv/settings lifecycle and must not
+                    // overwrite the latest Codex choice used for new chats.
+                    if info.agent == "codex" {
+                        if let Some(native) = &info.native_session_id {
+                            effort_to_index = Some((native.clone(), effort.clone()));
+                        }
                     }
                 }
                 // "Pending permission" really means "waiting on a human
@@ -555,6 +566,14 @@ impl ChatManager {
             // so a detached late write is harmless. Awaiting the JoinHandle here
             // (the old code) re-coupled the pump to that write.
             tokio::task::spawn_blocking(move || index.record(&native, &session_id));
+        }
+        if let Some((native, effort)) = effort_to_index {
+            let index = Arc::clone(&self.index);
+            let session_id = id.to_string();
+            // Same NFS rule as the native-id mapping above. This read-back is
+            // infrequent (spawn or a user effort change) and bounded by the
+            // index cap; never park the async pump on its atomic rewrite.
+            tokio::task::spawn_blocking(move || index.record_effort(&native, &session_id, effort));
         }
         let entry = session.journal.append(ev).await;
         let _ = session.events_tx.send(Arc::clone(&entry));

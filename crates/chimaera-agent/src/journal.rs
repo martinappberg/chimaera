@@ -487,6 +487,10 @@ fn now_ms() -> u64 {
 pub struct JournalIndex {
     path: PathBuf,
     entries: Mutex<Vec<IndexEntry>>,
+    /// Serialize mutate+snapshot+rename as one transaction. Init and its
+    /// initial EffortState are persisted on separate blocking workers; without
+    /// this guard an older snapshot can win the rename race after newer state.
+    persist_lock: Mutex<()>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -494,6 +498,20 @@ struct IndexEntry {
     native_id: String,
     session_id: String,
     ts: u64,
+    /// Last authoritative effort read-back for this native conversation.
+    /// Codex rollout history records turn contexts but app-server resume does
+    /// not rehydrate the setting, so this small side-index must carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    /// Monotonic order for actual effort changes. Ordinary resume/index
+    /// refreshes preserve it, so reopening an older conversation does not
+    /// replace the latest Codex choice used for brand-new threads.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    effort_revision: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 const INDEX_MAX_ENTRIES: usize = 200;
@@ -508,16 +526,26 @@ impl JournalIndex {
         Self {
             path,
             entries: Mutex::new(entries),
+            persist_lock: Mutex::new(()),
         }
     }
 
     pub fn record(&self, native_id: &str, session_id: &str) {
+        let _persist = self.persist_lock.lock().expect("index persist lock");
         let mut entries = self.entries.lock().expect("index lock");
+        // Init can race the immediately-following EffortState because both
+        // disk writes run on blocking workers. Preserve an effort upsert that
+        // won that race instead of replacing it with an empty Init record.
+        let previous = entries.iter().rev().find(|e| e.native_id == native_id);
+        let effort = previous.and_then(|e| e.effort.clone());
+        let effort_revision = previous.map_or(0, |e| e.effort_revision);
         entries.retain(|e| e.native_id != native_id);
         entries.push(IndexEntry {
             native_id: native_id.to_string(),
             session_id: session_id.to_string(),
             ts: now_ms(),
+            effort,
+            effort_revision,
         });
         if entries.len() > INDEX_MAX_ENTRIES {
             let excess = entries.len() - INDEX_MAX_ENTRIES;
@@ -539,6 +567,118 @@ impl JournalIndex {
             .find(|e| e.native_id == native_id)
             .map(|e| e.session_id.clone())
     }
+
+    /// Persist the latest parent-thread effort beside its resume mapping.
+    /// Upsert rather than update-only: Init and EffortState are detached onto
+    /// blocking workers and may reach this lock in either order.
+    pub fn record_effort(&self, native_id: &str, session_id: &str, effort: Option<String>) {
+        let effort = effort.filter(|value| value.len() <= crate::model::COMMAND_SELECTOR_MAX);
+        let _persist = self.persist_lock.lock().expect("index persist lock");
+        let mut entries = self.entries.lock().expect("index lock");
+        let previous = entries.iter().rev().find(|e| e.native_id == native_id);
+        let effort_revision = if previous.is_some_and(|entry| entry.effort == effort) {
+            previous.map_or(0, |entry| entry.effort_revision)
+        } else if effort.is_some() {
+            entries
+                .iter()
+                .map(|entry| entry.effort_revision)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        } else {
+            0
+        };
+        entries.retain(|e| e.native_id != native_id);
+        entries.push(IndexEntry {
+            native_id: native_id.to_string(),
+            session_id: session_id.to_string(),
+            ts: now_ms(),
+            effort,
+            effort_revision,
+        });
+        if entries.len() > INDEX_MAX_ENTRIES {
+            let excess = entries.len() - INDEX_MAX_ENTRIES;
+            entries.drain(..excess);
+        }
+        let snapshot = entries.clone();
+        drop(entries);
+        if let Err(err) = save_atomic(&self.path, &snapshot) {
+            tracing::warn!(%err, "failed to save journal index effort");
+        }
+    }
+
+    pub fn effort(&self, native_id: &str) -> Option<String> {
+        self.entries
+            .lock()
+            .expect("index lock")
+            .iter()
+            .rev()
+            .find(|e| e.native_id == native_id)
+            .and_then(|e| e.effort.clone())
+    }
+
+    /// Return the indexed effort, or migrate a pre-effort index entry from
+    /// its bounded Chimaera journal. This is a blocking, one-time upgrade path
+    /// called only while spawning a Codex process (the spawn path already does
+    /// filesystem/process work); successful recovery is immediately indexed.
+    pub fn effort_or_recover(&self, native_id: &str) -> Option<String> {
+        let session_id = {
+            let entries = self.entries.lock().expect("index lock");
+            let entry = entries
+                .iter()
+                .rev()
+                .find(|entry| entry.native_id == native_id)?;
+            if entry.effort.is_some() {
+                return entry.effort.clone();
+            }
+            entry.session_id.clone()
+        };
+        let journal_path = self.path.parent()?.join(format!("{session_id}.jsonl"));
+        let content = fs::read_to_string(&journal_path).ok()?;
+        let effort = recover_selected_effort(&content)?;
+        tracing::info!(%native_id, %session_id, %effort, "recovered Codex effort from journal");
+        self.record_effort(native_id, &session_id, Some(effort.clone()));
+        Some(effort)
+    }
+
+    /// Latest effective Codex choice across native conversations. Revisions
+    /// advance only when a conversation's effort changes, not when it is
+    /// merely reopened and re-indexed.
+    pub fn latest_effort(&self) -> Option<String> {
+        self.entries
+            .lock()
+            .expect("index lock")
+            .iter()
+            .filter(|entry| entry.effort.is_some() && entry.effort_revision > 0)
+            .max_by_key(|entry| entry.effort_revision)
+            .and_then(|entry| entry.effort.clone())
+    }
+}
+
+/// Recover the user's last pre-index selection while ignoring each process
+/// handshake's bootstrap read-back. The latter is precisely the bad `low`
+/// event old app-server resumes appended after an `Init`; later EffortState
+/// events in the same process lifetime came from real settings changes.
+fn recover_selected_effort(content: &str) -> Option<String> {
+    let mut awaiting_bootstrap_effort = false;
+    let mut selected = None;
+    for entry in content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<SeqEvent>(line).ok())
+    {
+        match entry.ev {
+            AgentEvent::Init { .. } => awaiting_bootstrap_effort = true,
+            AgentEvent::EffortState { .. } if awaiting_bootstrap_effort => {
+                awaiting_bootstrap_effort = false;
+                // This state describes process startup, not a user choice.
+            }
+            AgentEvent::EffortState { effort, .. } => {
+                selected = effort.filter(|value| value.len() <= crate::model::COMMAND_SELECTOR_MAX);
+            }
+            _ => {}
+        }
+    }
+    selected
 }
 
 fn save_atomic(path: &Path, entries: &[IndexEntry]) -> Result<()> {
@@ -895,20 +1035,91 @@ mod tests {
         let index = JournalIndex::load(dir.path());
         index.record("native-a", "s-1");
         index.record("native-b", "s-2");
+        index.record_effort("native-a", "s-1", Some("xhigh".into()));
         index.record("native-a", "s-3"); // re-record moves, not duplicates
         assert_eq!(index.lookup("native-a").as_deref(), Some("s-3"));
+        assert_eq!(index.effort("native-a").as_deref(), Some("xhigh"));
+        assert_eq!(index.latest_effort().as_deref(), Some("xhigh"));
         assert_eq!(index.lookup("native-b").as_deref(), Some("s-2"));
         assert_eq!(index.lookup("native-zzz"), None);
 
         // Persisted: a fresh load sees the same entries.
         let reloaded = JournalIndex::load(dir.path());
         assert_eq!(reloaded.lookup("native-a").as_deref(), Some("s-3"));
+        assert_eq!(reloaded.effort("native-a").as_deref(), Some("xhigh"));
+
+        // The inverse detached-write order also converges: an effort upsert
+        // can create the row before Init records the native/session mapping.
+        index.record_effort("native-race", "s-race", Some("high".into()));
+        index.record("native-race", "s-race");
+        assert_eq!(index.effort("native-race").as_deref(), Some("high"));
+        assert_eq!(index.latest_effort().as_deref(), Some("high"));
+
+        // Merely reopening the older xhigh thread must not make it the global
+        // new-thread choice again; an actual change still does.
+        index.record_effort("native-a", "s-3", Some("xhigh".into()));
+        assert_eq!(index.latest_effort().as_deref(), Some("high"));
+        index.record_effort("native-a", "s-3", Some("medium".into()));
+        assert_eq!(index.latest_effort().as_deref(), Some("medium"));
 
         for i in 0..(INDEX_MAX_ENTRIES + 50) {
             index.record(&format!("n{i}"), "s-x");
         }
         let entries = index.entries.lock().unwrap();
         assert!(entries.len() <= INDEX_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn pre_index_effort_recovery_ignores_process_bootstrap_resets() {
+        let init = || AgentEvent::Init {
+            native_session_id: "native-old".into(),
+            model: Some("gpt-test".into()),
+            modes: Vec::new(),
+            current_mode: None,
+            slash_commands: Vec::new(),
+            models: Vec::new(),
+            agent_version: None,
+        };
+        let event = |seq, ev| serde_json::to_string(&SeqEvent { seq, ts: seq, ev }).unwrap();
+        let content = [
+            event(1, init()),
+            event(
+                2,
+                AgentEvent::EffortState {
+                    effort: Some("low".into()),
+                    ultracode: false,
+                },
+            ),
+            event(
+                3,
+                AgentEvent::EffortState {
+                    effort: Some("xhigh".into()),
+                    ultracode: false,
+                },
+            ),
+            event(4, init()),
+            event(
+                5,
+                AgentEvent::EffortState {
+                    effort: Some("low".into()),
+                    ultracode: false,
+                },
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(recover_selected_effort(&content).as_deref(), Some("xhigh"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = JournalIndex::load(dir.path());
+        index.record("native-old", "s-old");
+        fs::write(dir.path().join("s-old.jsonl"), content).unwrap();
+        assert_eq!(
+            index.effort_or_recover("native-old").as_deref(),
+            Some("xhigh")
+        );
+        let reloaded = JournalIndex::load(dir.path());
+        assert_eq!(reloaded.effort("native-old").as_deref(), Some("xhigh"));
     }
 
     #[test]

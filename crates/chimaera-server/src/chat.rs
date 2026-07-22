@@ -2896,6 +2896,17 @@ pub(crate) fn spawn_chat_session(
     // already received the same recipe value through build_chat_command.
     if recipe.kind == AgentKind::Codex {
         spec.initial_model = recipe.model.clone();
+        // Codex's rollout survives app-server restarts, but its selected
+        // effort does not: thread/resume otherwise falls back to the model's
+        // default. Prefer that conversation's value; a brand-new conversation
+        // inherits Chimaera's latest observed Codex choice, like native Codex.
+        // The index is updated only from authoritative parent EffortState
+        // events (foreign auto-review threads are filtered in the driver).
+        spec.initial_effort = recipe
+            .resume
+            .as_deref()
+            .and_then(|native| state.chat.index().effort_or_recover(native))
+            .or_else(|| state.chat.index().latest_effort());
     }
     // The binary version the launcher resolved alongside `recipe.bin`: the
     // harness journals it on Init and warns (non-fatally) when it drifts from
