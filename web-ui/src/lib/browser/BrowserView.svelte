@@ -14,7 +14,7 @@
   import { get } from "svelte/store";
   import Spinner from "../previews/Spinner.svelte";
   import { computeStatus } from "../workspace/compute";
-  import { openInSystemBrowser } from "../shared/urlOpen";
+  import { isWebUrl, openInSystemBrowser } from "../shared/urlOpen";
   import {
     ConfirmRequired,
     isLoopbackHost,
@@ -320,10 +320,17 @@
   }
 
   function commitAddress(): void {
-    const parsed = parseAddress(draft ?? "");
+    const entered = (draft ?? "").trim();
+    const parsed = parseAddress(entered);
     draft = null;
     addressEl?.blur();
-    if (parsed === null) return;
+    if (parsed === null) {
+      // Not something the pane can serve — an https app (the upstream hop is
+      // clear-text) or a plain web URL. Hand it to the real browser rather
+      // than swallowing the entry silently.
+      if (isWebUrl(entered)) openInSystemBrowser(entered);
+      return;
+    }
     // A deliberate address is the user moving on — drop any auto-move note.
     moved = null;
     if (parsed.host === host && parsed.port === port) {
@@ -423,6 +430,10 @@
         <div class="state-detail">
           {phase.detail !== "" ? phase.detail : "This host isn't this machine or one of your compute nodes."}
           The daemon will forward traffic there on your behalf.
+        </div>
+        <div class="state-detail warn">
+          A proxied page runs with this workbench's privileges — only connect to
+          an app you trust.
         </div>
         <button class="action" onclick={confirmTarget}>connect</button>
       </div>
@@ -553,6 +564,13 @@
   .probe {
     font-size: var(--text-xs);
     opacity: 0.85;
+  }
+
+  /* The trust consequence of confirming a non-allowlisted target: a proxied
+     page is same-origin with the workbench today (see browser-pane.md). */
+  .warn {
+    font-size: var(--text-xs);
+    color: var(--warn, #c90);
   }
 
   .node-hits {

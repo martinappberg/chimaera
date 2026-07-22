@@ -179,8 +179,12 @@ export function parseAddress(
     return null;
   }
   if (url.hostname === "") return null;
-  const port =
-    url.port !== "" ? Number.parseInt(url.port, 10) : url.protocol === "https:" ? 443 : 80;
+  // http only: the daemon dials plain TCP and speaks clear-text HTTP/1.1
+  // upstream, so a TLS app can't be served through the pane. Returning null
+  // lets the caller hand it to the real browser instead of showing a pane
+  // that could only ever fail (see shared/urlOpen.ts).
+  if (url.protocol !== "http:") return null;
+  const port = url.port !== "" ? Number.parseInt(url.port, 10) : 80;
   if (!(port > 0 && port <= 65535)) return null;
   return {
     host: url.hostname,

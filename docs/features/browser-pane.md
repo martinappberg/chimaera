@@ -137,12 +137,28 @@ plane `ANY /proxy/{id}[/{*path}]`.
 
 ## Key constraints
 
-- **Same-origin trust is deliberate.** The proxied app runs same-origin with the
-  workbench — that is exactly why Jupyter's `frame-ancestors 'self'` and its cookies
-  work through the pane. The delta over the status quo is small (the proxied server
-  already runs as the user on the daemon's host and could read the manifest token off
-  disk), but it is why non-local targets get the explicit confirm dialog. Don't proxy
-  apps you don't trust.
+- **Same-origin today — a known limitation, not a claim of safety.** The proxied app is
+  served from the workbench's own origin, which is what makes Jupyter's
+  `frame-ancestors 'self'`, its cookies, and the absolute-path rescue work. The cost:
+  script in a proxied page can reach `window.parent` — the daemon bearer token in
+  `sessionStorage`, the parent DOM, and in the native app the granted Tauri commands.
+  - For a **loopback / self-host** target this grants nothing new: that app already runs
+    as the user on the daemon's host and can read the manifest token off disk.
+  - For a **confirmed remote** target it IS an escalation — the app is on another
+    machine and could not otherwise obtain the daemon's token. Hence the explicit
+    confirm dialog, which states the consequence.
+  - **The real fix is a separate origin** (the data plane on its own port), so the
+    iframe is cross-origin to the workbench while staying a *real* origin — cookies,
+    `Referer`, and the rescue all keep working. Sandboxing is NOT a substitute:
+    `sandbox` without `allow-same-origin` yields an opaque origin whose requests count
+    as cross-site, so the app's own `SameSite` cookies are withheld (`SameSite=None`
+    needs `Secure`, impossible on http) and the rescue loses both its cookie and its
+    `Referer`. Follow-up work: it touches every tunnel path (`connect`, the Mode 2
+    compute-node ladder), each of which forwards a single port.
+- **http upstream only.** The data plane opens a plain `TcpStream` and speaks clear-text
+  HTTP/1.1, so a TLS-enabled app (`https://localhost:8443`) is deliberately **not**
+  proxyable: `proxyableUrl` and the address bar refuse it and hand it to the user's real
+  browser rather than showing a pane that could only fail.
 - **Streaming, bounded, capped** — no response buffering, fixed tunnel buffers, capped
   registry/tunnels/relay children. Same review bar as previews.
 - **The Vite dev loop can't exercise the rescue** (unknown root paths aren't proxied to

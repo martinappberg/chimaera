@@ -39,6 +39,14 @@ function isLoopbackName(host: string): boolean {
  * The proxy target a raw URL names, when it is one the daemon can serve.
  * Non-loopback hosts qualify only with an explicit port — that is what keeps
  * ordinary web links (no port) out of the pane and in the real browser.
+ *
+ * **http only.** The daemon's data plane opens a plain `TcpStream` and speaks
+ * clear-text HTTP/1.1 upstream, so a TLS-enabled app (`https://localhost:8443`,
+ * a Jupyter started with a cert) could never be served — it would fail inside
+ * the pane instead of just working. Refusing it here sends it to the user's
+ * real browser, which speaks TLS. Carrying the scheme through and TLS-dialling
+ * upstream is the alternative, and would also have to answer self-signed
+ * local certs; not supported beats silently broken.
  */
 export function proxyableUrl(raw: string): UrlTarget | null {
   let url: URL;
@@ -47,12 +55,11 @@ export function proxyableUrl(raw: string): UrlTarget | null {
   } catch {
     return null;
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.protocol !== "http:") return null;
   if (url.username !== "" || url.password !== "") return null;
   const loopback = isLoopbackName(url.hostname);
   if (!loopback && url.port === "") return null;
-  const port =
-    url.port !== "" ? Number.parseInt(url.port, 10) : url.protocol === "https:" ? 443 : 80;
+  const port = url.port !== "" ? Number.parseInt(url.port, 10) : 80;
   if (!(port > 0 && port <= 65535)) return null;
   return {
     host: url.hostname.replace(/^\[|\]$/g, ""),
@@ -152,6 +159,10 @@ if (import.meta.env.DEV) {
   ok(t("http://127.0.0.1:8501") === "127.0.0.1:8501/", "bare loopback origin");
   ok(t("http://sh03-09n14:8888/tree") === "sh03-09n14:8888/tree", "host with explicit port");
   ok(t("https://github.com/foo/bar") === "", "ordinary web URLs are not proxyable");
+  // The upstream hop is clear-text HTTP/1.1: a TLS app must reach the real
+  // browser, not fail inside the pane.
+  ok(t("https://localhost:8443/lab") === "", "TLS loopback apps are not proxyable");
+  ok(t("https://sh03-09n14:8888/tree") === "", "TLS is refused even with a port");
   ok(t("http://user:pw@localhost:1/") === "", "userinfo URLs never qualify");
   ok(isWebUrl("https://x.dev") && !isWebUrl("javascript:alert(1)"), "only web schemes pass");
   ok(!isWebUrl("file:///etc/passwd"), "file: never passes");
