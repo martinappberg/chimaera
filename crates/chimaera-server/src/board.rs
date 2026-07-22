@@ -11,10 +11,11 @@
 //! theme and raster params, so a cache hit is correct by construction and the
 //! cache needs pruning, never invalidation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -25,6 +26,59 @@ use crate::{fs, AppState};
 use chimaera_board::layout::FontStack;
 use chimaera_board::render::{render_page, RasterParams};
 use chimaera_board::theme::Theme;
+
+/// Journal page ceiling for GET /board/journal: oldest-first after `since`,
+/// so a client pages forward by re-asking with the last seq it saw;
+/// `latestSeq` tells it when it is caught up. The journal file itself is
+/// size-capped, so this bounds one response, not total history.
+const JOURNAL_PAGE_CAP: usize = 500;
+
+/// How long after the last board gesture the deferred git bump fires. Board
+/// edits arrive one per pointer-up; bumping the git epoch per gesture makes
+/// every window refetch `git status` (seconds on a big repo over Lustre), so
+/// a layout session settles to ONE status run (board plan §7).
+const GIT_SETTLE: Duration = Duration::from_millis(1000);
+
+/// Ceiling on distinct paths with a settle timer pending. Past it the bump
+/// degrades to immediate (the pre-settle behavior) rather than growing the
+/// map — bounded memory beats coalescing under a pathological client.
+const GIT_SETTLE_MAX_PENDING: usize = 128;
+
+/// Per-path write serialization for the mutating board routes: two concurrent
+/// read-modify-write cycles on one file (edit vs. edit, or an edit's journal
+/// append racing a POSTed journal event's seq stamp) would lose an update.
+/// A striped lock — 16 async mutexes indexed by the canonical path's hash —
+/// is bounded by construction (no per-path map to grow) and a cross-path
+/// collision only costs a moment of false serialization.
+const EDIT_SHARDS: usize = 16;
+static EDIT_LOCKS: [tokio::sync::Mutex<()>; EDIT_SHARDS] =
+    [const { tokio::sync::Mutex::const_new(()) }; EDIT_SHARDS];
+
+fn edit_shard(path: &Path) -> &'static tokio::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    &EDIT_LOCKS[(hasher.finish() as usize) % EDIT_SHARDS]
+}
+
+/// 400 with the same JSON error body every board route answers.
+fn board_error(err: &anyhow::Error) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": format!("{err:#}")})),
+    )
+        .into_response()
+}
+
+/// Resolve the board path off the reactor (canonicalize can stall on NFS),
+/// before any shard lock — the shard key must be the canonical path or two
+/// spellings of one file would take different locks.
+async fn resolve_board_path_blocking(raw: String) -> anyhow::Result<PathBuf> {
+    match tokio::task::spawn_blocking(move || resolve_board_path(&raw)).await {
+        Ok(result) => result,
+        Err(join) => Err(anyhow::anyhow!("filesystem task failed: {join}")),
+    }
+}
 
 #[derive(Deserialize)]
 pub(crate) struct RenderRequest {
@@ -201,65 +255,371 @@ pub(crate) async fn edit(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EditRequest>,
 ) -> Response {
-    let outcome = fs::blocking_value(move || {
-        let path = resolve_board_path(&req.path)?;
-        let mut board = chimaera_board::load(&path)?;
+    let path = match resolve_board_path_blocking(req.path.clone()).await {
+        Ok(path) => path,
+        Err(err) => return board_error(&err),
+    };
+    // Held across the whole read→mutate→write (and its journal append):
+    // without it, two concurrent edits interleave load/save and the earlier
+    // gesture is silently lost.
+    let _guard = edit_shard(&path).lock().await;
+    let outcome = fs::blocking_value({
+        let path = path.clone();
+        move || {
+            let mut board = chimaera_board::load(&path)?;
 
-        let mut found = false;
-        let mut prior = None;
-        for page in &mut board.pages {
-            // Top-level objects only: group children are page-absolute too,
-            // but moving one without its siblings is a different gesture
-            // (enter-the-group), which the pane does not offer yet.
-            for obj in &mut page.objects {
-                if obj.id() != req.object {
-                    continue;
-                }
-                found = true;
-                prior = obj.frame();
-                if let Some(at) = req.at {
-                    obj.set_at(at);
-                }
-                if let Some(size) = req.size {
-                    obj.set_size(size);
-                }
-                if let Some(text) = &req.text {
-                    let paras = || {
-                        text.iter()
-                            .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
-                            .collect()
-                    };
-                    match obj {
-                        chimaera_board::Object::Text(t) => t.text = paras(),
-                        chimaera_board::Object::Shape(sh) => sh.text = paras(),
-                        other => anyhow::bail!(
-                            "text applies to text and shape objects; {:?} is a {}",
-                            req.object,
-                            other.kind()
-                        ),
+            let mut found = false;
+            let mut prior = None;
+            for page in &mut board.pages {
+                // Top-level objects only: group children are page-absolute too,
+                // but moving one without its siblings is a different gesture
+                // (enter-the-group), which the pane does not offer yet.
+                for obj in &mut page.objects {
+                    if obj.id() != req.object {
+                        continue;
+                    }
+                    found = true;
+                    prior = obj.frame();
+                    if let Some(at) = req.at {
+                        obj.set_at(at);
+                    }
+                    if let Some(size) = req.size {
+                        obj.set_size(size);
+                    }
+                    if let Some(text) = &req.text {
+                        let paras = || {
+                            text.iter()
+                                .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
+                                .collect()
+                        };
+                        match obj {
+                            chimaera_board::Object::Text(t) => t.text = paras(),
+                            chimaera_board::Object::Shape(sh) => sh.text = paras(),
+                            other => anyhow::bail!(
+                                "text applies to text and shape objects; {:?} is a {}",
+                                req.object,
+                                other.kind()
+                            ),
+                        }
                     }
                 }
             }
-        }
-        if !found {
-            anyhow::bail!("no object {:?} in {}", req.object, path.display());
-        }
+            if !found {
+                anyhow::bail!("no object {:?} in {}", req.object, path.display());
+            }
 
-        // Normalize (grid snap, group re-union) before the canonical save —
-        // the same pipeline an agent edit goes through, so a human drag and
-        // an agent Edit produce bytes of identical shape.
+            // Normalize (grid snap, group re-union) before the canonical save —
+            // the same pipeline an agent edit goes through, so a human drag and
+            // an agent Edit produce bytes of identical shape.
+            chimaera_board::normalize(&mut board);
+            chimaera_board::save(&path, &board)?;
+
+            let journal_seq = journal_edit(&path, &board, &req, prior);
+
+            let meta = std::fs::metadata(&path)?;
+            let mut response = json!({
+                "mtime": fs::mtime_token(&meta),
+            });
+            if let Some(seq) = journal_seq {
+                response["journalSeq"] = json!(seq);
+            }
+            Ok(response)
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(value) => {
+            // The pane invalidates on this immediately (invalidate-and-pull);
+            // the git bump — every window's `git status` — is deferred behind
+            // the per-path settle so a layout session costs one status run,
+            // not one per pointer-up.
+            bump_board_epoch(&state, &path);
+            schedule_git_settle(state.clone(), path.to_string_lossy().into_owned());
+            Json(value).into_response()
+        }
+        Err(err) => board_error(&err),
+    }
+}
+
+/// Bump the board epoch of every workspace whose root contains `path`, then
+/// wake the events bus — the board-mutation counterpart of
+/// `git::mark_path_dirty`. `/ws/events` carries only
+/// `{"type":"board","epochs":{…}}` and the pane refetches `/board/render`:
+/// invalidate-and-pull, never payload on the firehose. `path` is canonical
+/// (every mutating route resolves first) and workspace roots are stored
+/// canonical, so the component-wise prefix check holds.
+pub(crate) fn bump_board_epoch(state: &AppState, path: &Path) {
+    let workspaces = crate::lock(&state.workspaces).list();
+    let mut bumped = false;
+    for ws in workspaces {
+        if path.starts_with(&ws.root) {
+            *crate::lock(&state.board_epochs).entry(ws.id).or_insert(0) += 1;
+            bumped = true;
+        }
+    }
+    if bumped {
+        state.changes.notify_waiters();
+    }
+}
+
+/// Defer a board edit's git bump behind the per-path settle timer, reset by
+/// every further edit — the board-plan §7 rule that keeps a layout session at
+/// one `git status` instead of one per pointer-up. One timer task per active
+/// path: a follow-up gesture only pushes the deadline the running task
+/// re-reads when it wakes. Past [`GIT_SETTLE_MAX_PENDING`] distinct paths the
+/// bump degrades to immediate (the pre-settle behavior) rather than growing
+/// the map.
+fn schedule_git_settle(state: Arc<AppState>, path: String) {
+    let deadline = tokio::time::Instant::now() + GIT_SETTLE;
+    {
+        let mut pending = crate::lock(&state.board_git_settle);
+        if let Some(existing) = pending.get_mut(&path) {
+            *existing = deadline;
+            return;
+        }
+        if pending.len() >= GIT_SETTLE_MAX_PENDING {
+            drop(pending);
+            tokio::spawn(async move {
+                crate::git::mark_path_dirty(&state, &path).await;
+            });
+            return;
+        }
+        pending.insert(path.clone(), deadline);
+    }
+    tokio::spawn(async move {
+        let mut deadline = deadline;
+        loop {
+            tokio::time::sleep_until(deadline).await;
+            let now = tokio::time::Instant::now();
+            let pushed = {
+                let mut pending = crate::lock(&state.board_git_settle);
+                match pending.get(&path).copied() {
+                    Some(d) if d > now => Some(d),
+                    _ => {
+                        pending.remove(&path);
+                        None
+                    }
+                }
+            };
+            match pushed {
+                Some(d) => deadline = d,
+                None => break,
+            }
+        }
+        crate::git::mark_path_dirty(&state, &path).await;
+    });
+}
+
+#[derive(Deserialize)]
+pub(crate) struct JournalQuery {
+    pub path: String,
+    /// Only events with seq strictly greater than this; 0 (the default)
+    /// reads everything the size-capped journal still holds.
+    #[serde(default)]
+    pub since: u64,
+}
+
+/// GET /api/v1/board/journal?path=…&since=N → `{events, latestSeq}` — the
+/// semantic edit history after `since`, oldest first, capped at
+/// [`JOURNAL_PAGE_CAP`] entries per response (page forward by re-asking with
+/// the last seq received; `latestSeq` says when the reader is caught up).
+/// Events serialize exactly as the journal lines do: seq-first, kebab-case
+/// op, no timestamps.
+pub(crate) async fn journal(Query(query): Query<JournalQuery>) -> Response {
+    fs::blocking_json(move || {
+        let path = resolve_board_path(&query.path)?;
+        let ws = chimaera_board::workspace_root(&path);
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let mut events = chimaera_board::journal::read_since(&journal_path, query.since)?;
+        let latest = chimaera_board::journal::latest_seq(&journal_path)?;
+        events.truncate(JOURNAL_PAGE_CAP);
+        Ok(json!({
+            "events": events,
+            "latestSeq": latest,
+        }))
+    })
+    .await
+}
+
+/// One journal event to append: the board it belongs to, who did it, and the
+/// op in the journal file's own tagged vocabulary (`"event":"move"`, …) —
+/// validated by deserialization, so an unknown op or missing actor never
+/// reaches the file. `seq` is assigned server-side by the append API, never
+/// by the caller. This is the hook the pane's comment-pins ride.
+#[derive(Deserialize)]
+pub(crate) struct JournalAppendRequest {
+    pub path: String,
+    pub actor: chimaera_board::journal::Actor,
+    #[serde(flatten)]
+    pub event: chimaera_board::journal::EventKind,
+}
+
+/// POST /api/v1/board/journal → `{seq}`.
+pub(crate) async fn journal_append(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JournalAppendRequest>,
+) -> Response {
+    let path = match resolve_board_path_blocking(req.path.clone()).await {
+        Ok(path) => path,
+        Err(err) => return board_error(&err),
+    };
+    // Seq assignment is a read-modify-append on the same journal file an
+    // edit's best-effort append touches — same shard, same serialization.
+    let _guard = edit_shard(&path).lock().await;
+    let outcome = fs::blocking_value({
+        let path = path.clone();
+        move || {
+            let ws = chimaera_board::workspace_root(&path);
+            // First use mints the surround's .gitignore so journals stay out
+            // of git.
+            chimaera_board::ensure_board_dir(&ws)?;
+            let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+            let mut journal = chimaera_board::journal::Journal::open(&journal_path)?;
+            let seq = journal.append(chimaera_board::journal::Event::new(req.actor, req.event))?;
+            Ok(json!({"seq": seq}))
+        }
+    })
+    .await;
+    match outcome {
+        Ok(value) => {
+            // A journal event is a board mutation on the plan's terms (§7):
+            // announce it so other windows' overlays refetch. No git settle —
+            // the journal is gitignored, so nothing tracked changed.
+            bump_board_epoch(&state, &path);
+            Json(value).into_response()
+        }
+        Err(err) => board_error(&err),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ExportRequest {
+    pub path: String,
+    /// pptx | pdf | svg | svg-outlined — the CLI's vocabulary exactly
+    /// (`svg` keeps real text; `svg-outlined` flattens glyphs to paths).
+    pub format: String,
+    /// 0-based page for the SVG variants; all pages when omitted. Does not
+    /// apply to pdf/pptx, which take the whole deck.
+    #[serde(default)]
+    pub page: Option<usize>,
+}
+
+/// POST /api/v1/board/export → `{ticket, filename, pageCount}` (+ `objects`,
+/// the per-object fidelity fates, for pptx). Bytes land in the same
+/// `.chimaera/board/exports/` the CLI writes — same exporter functions, so
+/// the two cannot disagree — and the ticket rides `GET /download/{ticket}`;
+/// a multi-page SVG export tickets a directory, which downloads as a zip.
+pub(crate) async fn export(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ExportRequest>,
+) -> Response {
+    // Exporters share the render engine (text shaping, zip/pdf encode) and
+    // the board read may cross NFS, so the work runs under the same blocking
+    // semaphore as render.
+    let outcome = fs::blocking_value(move || {
+        let path = resolve_board_path(&req.path)?;
+        let ws = chimaera_board::workspace_root(&path);
+        let mut board = chimaera_board::load(&path)?;
         chimaera_board::normalize(&mut board);
-        chimaera_board::save(&path, &board)?;
+        let theme_name = board
+            .theme
+            .clone()
+            .unwrap_or_else(|| "talk-dark".to_string());
+        let theme = Theme::resolve(&theme_name, Some(&ws))?;
+        let fonts = FontStack::for_workspace(&ws);
+        let stem = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".board.json").to_string())
+            .unwrap_or_else(|| "board".to_string());
+        let exports_dir = chimaera_board::ensure_board_dir(&ws)?.join("exports");
+        std::fs::create_dir_all(&exports_dir)?;
+        let page_count = board.pages.len();
 
-        let journal_seq = journal_edit(&path, &board, &req, prior);
+        let mut fates = None;
+        let dest: PathBuf = match req.format.as_str() {
+            "svg" | "svg-outlined" => {
+                use chimaera_board::export::svg::{export_svg, SvgVariant};
+                let (variant, base) = if req.format == "svg" {
+                    (SvgVariant::Text, stem.clone())
+                } else {
+                    (SvgVariant::Outlined, format!("{stem}-outlined"))
+                };
+                let pages: Vec<usize> = match req.page {
+                    Some(p) => vec![p],
+                    None => (0..board.pages.len()).collect(),
+                };
+                if pages.len() == 1 {
+                    let svg = export_svg(&board, pages[0], &theme, &fonts, Some(&ws), variant)?;
+                    let dest = exports_dir.join(format!("{base}.svg"));
+                    chimaera_board::write_atomic(&dest, svg.as_bytes())?;
+                    dest
+                } else {
+                    // All pages of a multi-page board: one file per page in a
+                    // per-export directory, ticketed whole (the download
+                    // route zips a directory on the fly). Cleared first so a
+                    // page deleted since the last export cannot ride along.
+                    let dir = exports_dir.join(format!("{base}-svg"));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    std::fs::create_dir_all(&dir)?;
+                    for p in pages {
+                        let svg = export_svg(&board, p, &theme, &fonts, Some(&ws), variant)?;
+                        chimaera_board::write_atomic(
+                            &dir.join(format!("{base}-{}.svg", board.pages[p].id)),
+                            svg.as_bytes(),
+                        )?;
+                    }
+                    dir
+                }
+            }
+            "pdf" => {
+                if req.page.is_some() {
+                    anyhow::bail!(
+                        "page does not apply to pdf: the whole deck exports as one document"
+                    );
+                }
+                let pdf =
+                    chimaera_board::export::pdf::export_pdf(&board, &theme, &fonts, Some(&ws))?;
+                let dest = exports_dir.join(format!("{stem}.pdf"));
+                chimaera_board::write_atomic(&dest, &pdf)?;
+                dest
+            }
+            "pptx" => {
+                if req.page.is_some() {
+                    anyhow::bail!(
+                        "page does not apply to pptx: the whole deck exports as one file"
+                    );
+                }
+                let mut bytes = Vec::new();
+                let report = chimaera_board::export::write_pptx(
+                    &board,
+                    &theme,
+                    &fonts,
+                    Some(&ws),
+                    &mut bytes,
+                )?;
+                // The degradation contract as data — the same per-object
+                // fates the CLI prints, stated before the deck is opened.
+                fates = Some(serde_json::to_value(&report.objects)?);
+                let dest = exports_dir.join(format!("{stem}.pptx"));
+                chimaera_board::write_atomic(&dest, &bytes)?;
+                dest
+            }
+            other => anyhow::bail!("unknown format {other:?}: use svg | svg-outlined | pdf | pptx"),
+        };
 
-        let meta = std::fs::metadata(&path)?;
+        let filename = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "export".to_string());
         let mut response = json!({
-            "mtime": fs::mtime_token(&meta),
-            "path": path.to_string_lossy(),
+            "exportPath": dest,
+            "filename": filename,
+            "pageCount": page_count,
         });
-        if let Some(seq) = journal_seq {
-            response["journalSeq"] = json!(seq);
+        if let Some(objects) = fates {
+            response["objects"] = objects;
         }
         Ok(response)
     })
@@ -267,21 +627,22 @@ pub(crate) async fn edit(
 
     match outcome {
         Ok(mut value) => {
-            // Nudge the git watcher so the FILES tree's dirty badge follows a
-            // drag without waiting for the poll.
-            if let Some(p) = value.get("path").and_then(|p| p.as_str()) {
-                crate::git::mark_path_dirty(&state, p).await;
-            }
-            if let Some(obj) = value.as_object_mut() {
-                obj.remove("path");
+            // Swap the private filesystem path for a download ticket — the
+            // same post-blocking mint as render's /raw ticket.
+            if let Some(path) = value
+                .get("exportPath")
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from)
+            {
+                let ticket = crate::lock(&state.tickets).create(path, fs::TICKET_TTL);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.remove("exportPath");
+                    obj.insert("ticket".into(), json!(ticket));
+                }
             }
             Json(value).into_response()
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("{err:#}")})),
-        )
-            .into_response(),
+        Err(err) => board_error(&err),
     }
 }
 

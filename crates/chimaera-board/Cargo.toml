@@ -43,3 +43,13 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # multi-page document its high-level `to_pdf` cannot produce.
 svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 pdf-writer = "0.12"
+# PDF-panel *import* (`pdf-import` feature only): hayro is LaurenzV's
+# pure-Rust PDF rasterizer. Its default features embed the 14 standard PDF
+# fonts + CMaps, so text in plotting-tool PDFs renders without a resolver.
+hayro = { version = "0.7", optional = true }
+
+[features]
+# `board import fig.pdf`: rasterize one PDF page into an image asset
+# (src/pdfimport.rs). Off by default — hayro's interpreter stack is real
+# weight on the static musl binary, and most figure flows export SVG/PNG.
+pdf-import = ["dep:hayro"]

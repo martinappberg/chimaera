@@ -37,7 +37,7 @@ use crate::imginfo::{jpeg_dimensions, png_dimensions, sniff_image, ImgKind};
 use crate::layout::FontStack;
 use crate::schema::{
     Align, Board, ChartObject, ConnectorObject, EndPoint, Frame, GroupObject, ImageObject, Object,
-    Page, Paragraph, Run, ShapeObject, Side, Stroke, TextObject, VAlign,
+    Page, Paragraph, Run, ShapeObject, Side, Stroke, TableObject, TextObject, VAlign,
 };
 use crate::theme::{Rgb, Theme, TypeRole};
 
@@ -45,10 +45,11 @@ use crate::theme::{Rgb, Theme, TypeRole};
 // Constants
 // ---------------------------------------------------------------------------
 
-const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
-const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+pub(super) const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
+pub(super) const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+pub(super) const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const NS_P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+pub(super) const NS_C: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
 
 const REL_OFFICE_DOC: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
@@ -71,6 +72,18 @@ const REL_NOTES_SLIDE: &str =
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
 const REL_HYPERLINK: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+const REL_TABLE_STYLES: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/tableStyles";
+
+/// The style GUID every emitted `a:tbl` names. tableStyles.xml is one empty
+/// `a:tblStyleLst` carrying only this `def` — Board styles every cell
+/// explicitly, so no consumer's built-in table styling can restyle a deck.
+/// The GUID is PowerPoint's own default ("Medium Style 2 - Accent 1"), which
+/// keeps "Insert row" in a real consumer styling sanely.
+const TABLE_STYLE_ID: &str = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}";
+const REL_CHART: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+const REL_PACKAGE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package";
 
 /// The empty root group every `p:spTree` opens with.
 const ROOT_GRP: &str = concat!(
@@ -85,7 +98,7 @@ const ROOT_GRP: &str = concat!(
 
 /// Points to EMU, exactly: 1 pt = 12700 EMU. Non-finite input degrades to 0
 /// rather than panicking — malformed geometry is a reported fate, not a crash.
-fn emu(pt: f64) -> i64 {
+pub(super) fn emu(pt: f64) -> i64 {
     if !pt.is_finite() {
         return 0;
     }
@@ -120,7 +133,7 @@ fn rot60k(deg: f64) -> i64 {
 /// XML-escape text content and attribute values. Every user-authored string
 /// passes through here — a board is agent-written input and gets no chance to
 /// inject markup.
-fn esc(text: &str) -> String {
+pub(super) fn esc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -173,7 +186,7 @@ fn color_choice(theme: &Theme, reference: Option<&str>, alpha: Option<f64>) -> S
 }
 
 /// A resolved RGB as `srgbClr`, with an optional alpha child.
-fn srgb(rgb: Rgb, alpha: Option<f64>) -> String {
+pub(super) fn srgb(rgb: Rgb, alpha: Option<f64>) -> String {
     match alpha {
         Some(a) if a < 1.0 => format!(
             r#"<a:srgbClr val="{}"><a:alpha val="{}"/></a:srgbClr>"#,
@@ -707,6 +720,9 @@ struct Shared {
     media_by_src: BTreeMap<String, usize>,
     exts: BTreeSet<&'static str>,
     fates: Vec<ObjectFate>,
+    /// Native `c:chart` parts (opt-in), numbered `chart1…` across the deck;
+    /// each carries its own embedded workbook.
+    charts: Vec<super::chart_xml::NativeChartPart>,
 }
 
 /// Everything needed while emitting one slide's `p:spTree`.
@@ -721,6 +737,9 @@ struct SlideWriter<'a> {
     workspace: Option<std::path::PathBuf>,
     /// Page-space frames by object id, for connector endpoint resolution.
     index: BTreeMap<String, Frame>,
+    /// Grouped shapes by default; `Native` tries a real `c:chart` per chart
+    /// and degrades per-chart with a stated reason.
+    chart_fidelity: ChartFidelity,
     xml: String,
     rels: Vec<Rel>,
     next_id: u32,
@@ -956,6 +975,7 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
         Object::Connector(c) => emit_connector(w, c),
         Object::Image(img) => emit_image(w, img, frame),
         Object::Group(g) => emit_group(w, g, frame),
+        Object::Table(t) => emit_table(w, t, frame),
         Object::Chart(c) => emit_chart(w, c, frame),
         Object::Diagram(d) => emit_diagram(w, d, frame),
         Object::PanelLabel(o) => {
@@ -1000,6 +1020,126 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
             w.fate(&u.id, ExportTier::Raster, why);
         }
     }
+}
+
+/// A table as a native `a:tbl` inside a `p:graphicFrame` — the highest tier
+/// in the degradation contract, editable in every consumer.
+///
+/// Every cell is styled explicitly (fill, borders, margins on `a:tcPr`;
+/// tableStyles.xml is one empty `a:tblStyleLst`), and each cell's text body
+/// goes through [`tx_body`] — the same `a:p`/`a:r`/`a:rPr` writer every text
+/// shape uses (C6: one text stack, run boundaries preserved). Geometry
+/// matches the renderer exactly: [`TableObject::column_widths`] for columns,
+/// rows splitting the frame height equally, with the last column/row
+/// absorbing EMU rounding so the grid sums to the frame's ext.
+fn emit_table(w: &mut SlideWriter, t: &TableObject, frame: Option<Frame>) {
+    let Some(f) = frame else {
+        w.fate(
+            &t.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
+        return;
+    };
+    let cols = t.column_count();
+    if t.rows.is_empty() || cols == 0 {
+        w.fate(&t.id, ExportTier::Raster, "skipped: table has no cells");
+        return;
+    }
+    let role = role_of(w.theme, t.role.as_deref()).clone();
+
+    let total_w = emu(f.w).max(1);
+    let mut grid_cols: Vec<i64> = t
+        .column_widths(f.w)
+        .iter()
+        .map(|width| emu(*width).max(1))
+        .collect();
+    let acc: i64 = grid_cols[..cols - 1].iter().sum();
+    grid_cols[cols - 1] = (total_w - acc).max(1);
+
+    let total_h = emu(f.h).max(1);
+    let nrows = t.rows.len();
+    let row_h_emu = (total_h / nrows as i64).max(1);
+    let last_row_h = (total_h - row_h_emu * (nrows as i64 - 1)).max(1);
+
+    let nv = w.cnvpr(&t.id, t.alt.as_deref(), None);
+    let _ = write!(
+        w.xml,
+        concat!(
+            r#"<p:graphicFrame><p:nvGraphicFramePr>{nv}"#,
+            r#"<p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr>"#,
+            r#"<p:nvPr/></p:nvGraphicFramePr>"#,
+            r#"<p:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></p:xfrm>"#,
+            r#"<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">"#,
+            r#"<a:tbl><a:tblPr{first_row}><a:tableStyleId>{style}</a:tableStyleId></a:tblPr><a:tblGrid>"#
+        ),
+        nv = nv,
+        x = emu(f.x),
+        y = emu(f.y),
+        cx = total_w,
+        cy = total_h,
+        first_row = if t.header { r#" firstRow="1""# } else { "" },
+        style = TABLE_STYLE_ID,
+    );
+    for gc in &grid_cols {
+        let _ = write!(w.xml, r#"<a:gridCol w="{gc}"/>"#);
+    }
+    w.xml.push_str("</a:tblGrid>");
+
+    // The renderer's grid, restated as explicit per-cell properties: fixed
+    // margins, hairline @edge borders on every side, @surface header ground.
+    let pad = emu(crate::render::TABLE_CELL_PAD_PT).max(0);
+    let hairline = emu(1.0).max(1);
+    let edge_fill = solid_fill(w.theme, Some("@edge"), None);
+    let borders = format!(
+        r#"<a:lnL w="{hairline}" cap="flat">{edge_fill}</a:lnL><a:lnR w="{hairline}" cap="flat">{edge_fill}</a:lnR><a:lnT w="{hairline}" cap="flat">{edge_fill}</a:lnT><a:lnB w="{hairline}" cap="flat">{edge_fill}</a:lnB>"#
+    );
+    let header_fill = solid_fill(w.theme, Some("@surface"), None);
+
+    for (ri, row) in t.rows.iter().enumerate() {
+        let h = if ri + 1 == nrows {
+            last_row_h
+        } else {
+            row_h_emu
+        };
+        let _ = write!(w.xml, r#"<a:tr h="{h}">"#);
+        for ci in 0..cols {
+            // Ragged rows fill out with empty cells: an a:tr must carry a tc
+            // per grid column or consumers mis-align the row.
+            let paras: Vec<Paragraph> = match row.get(ci) {
+                Some(cell) if t.header && ri == 0 => vec![TableObject::header_cell(cell)],
+                Some(cell) => vec![cell.clone()],
+                None => Vec::new(),
+            };
+            let body = tx_body(
+                w,
+                &TextSpec {
+                    paragraphs: &paras,
+                    role: &role,
+                    align: None,
+                    valign: None,
+                    inset: 0.0,
+                    wrap: true,
+                },
+            );
+            // A cell body is the same CT_TextBody as a shape's; only the
+            // qualifying prefix differs inside a:tbl.
+            let inner = &body["<p:txBody>".len()..body.len() - "</p:txBody>".len()];
+            let fill = if t.header && ri == 0 {
+                header_fill.as_str()
+            } else {
+                ""
+            };
+            let _ = write!(
+                w.xml,
+                r#"<a:tc><a:txBody>{inner}</a:txBody><a:tcPr marL="{pad}" marR="{pad}" marT="{pad}" marB="{pad}">{borders}{fill}</a:tcPr></a:tc>"#
+            );
+        }
+        w.xml.push_str("</a:tr>");
+    }
+    w.xml
+        .push_str("</a:tbl></a:graphicData></a:graphic></p:graphicFrame>");
+    w.fate(&t.id, ExportTier::Native, "native table (a:tbl)");
 }
 
 /// A diagram as a group of the very primitives its expansion produces —
@@ -1655,8 +1795,11 @@ fn emit_group(w: &mut SlideWriter, g: &GroupObject, frame: Option<Frame>) {
 
 /// A chart as a group of real editable shapes — rects, freeform paths,
 /// ellipses and *text* shapes, so every label stays text at the destination.
-/// This is the vector tier that is still text-editable; native `c:chart` is a
-/// later, deterministic optimization (§11).
+/// This is the vector tier that is still text-editable. Under
+/// [`ChartFidelity::Native`] (opt-in) a chart that maps cleanly onto a
+/// `c:barChart`/`c:lineChart`/`c:scatterChart` becomes a real chart part
+/// instead; anything the native writer cannot express degrades per-chart to
+/// these grouped shapes with the reason in its fate.
 fn emit_chart(w: &mut SlideWriter, c: &ChartObject, frame: Option<Frame>) {
     let Some(f) = frame else {
         w.fate(
@@ -1670,12 +1813,26 @@ fn emit_chart(w: &mut SlideWriter, c: &ChartObject, frame: Option<Frame>) {
     // uses — without this, a CSV-bound chart exports as empty axes with a
     // fate line that reads like success.
     let (loaded, src_problems) = crate::chart::resolve_rows(c, w.workspace.as_deref());
+    let mut native_reason: Option<String> = None;
+    if w.chart_fidelity == ChartFidelity::Native {
+        match super::chart_xml::build_native(c, loaded.as_deref(), w.theme) {
+            Ok(part) => {
+                emit_native_chart(w, c, f, part);
+                return;
+            }
+            Err(why) => native_reason = Some(why),
+        }
+    }
     let scene = match loaded.as_deref() {
         Some(rows) => crate::chart::build_with_rows(c, Some(rows), f, w.theme, w.fonts),
         None => crate::chart::build(c, f, w.theme, w.fonts),
     };
-    let mut reason =
-        String::from("chart exports as grouped shapes; native c:chart is a later optimization");
+    let mut reason = match native_reason {
+        Some(why) => format!("native chart unsupported: {why}; exported as grouped shapes"),
+        None => {
+            String::from("chart exports as grouped shapes; native c:chart is a later optimization")
+        }
+    };
     let problems: Vec<String> = src_problems
         .into_iter()
         .chain(scene.problems.iter().cloned())
@@ -1698,6 +1855,45 @@ fn emit_chart(w: &mut SlideWriter, c: &ChartObject, frame: Option<Frame>) {
     }
     w.xml.push_str("</p:grpSp>");
     w.fate(&c.id, ExportTier::Grouped, reason);
+}
+
+/// Host a native chart part on the slide: a `p:graphicFrame` with the chart
+/// graphic reference; the part itself (plus its embedded workbook) is
+/// registered on `Shared` and written by the package assembler.
+fn emit_native_chart(
+    w: &mut SlideWriter,
+    c: &ChartObject,
+    f: Frame,
+    part: super::chart_xml::NativeChartPart,
+) {
+    let n = w.shared.charts.len() + 1;
+    w.shared.charts.push(part);
+    let rid = w.rel(REL_CHART, format!("../charts/chart{n}.xml"), false);
+    let nv = w.cnvpr(&c.id, c.alt.as_deref(), c.link.as_deref());
+    let _ = write!(
+        w.xml,
+        concat!(
+            "<p:graphicFrame><p:nvGraphicFramePr>{nv}<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>",
+            r#"<p:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></p:xfrm>"#,
+            r#"<a:graphic><a:graphicData uri="{ns_c}">"#,
+            r#"<c:chart xmlns:c="{ns_c}" xmlns:r="{ns_r}" r:id="{rid}"/>"#,
+            "</a:graphicData></a:graphic></p:graphicFrame>"
+        ),
+        nv = nv,
+        x = emu(f.x),
+        y = emu(f.y),
+        cx = emu(f.w).max(1),
+        cy = emu(f.h).max(1),
+        ns_c = NS_C,
+        ns_r = NS_R,
+        rid = rid,
+    );
+    w.fate(
+        &c.id,
+        ExportTier::Native,
+        "native c:chart with an embedded workbook (opt-in; the desktop-PowerPoint \
+         Edit Data pass is not yet hand-verified)",
+    );
 }
 
 fn emit_chart_item(w: &mut SlideWriter, chart_id: &str, i: usize, item: &crate::chart::ChartItem) {
@@ -2126,6 +2322,30 @@ fn app_xml(slide_count: usize) -> String {
 // The writer
 // ---------------------------------------------------------------------------
 
+/// How a `chart` object lands in the deck.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChartFidelity {
+    /// The default: a group of editable vector shapes with real text —
+    /// editable in every consumer, including the ones that flatten `c:chart`.
+    #[default]
+    Grouped,
+    /// Opt-in: a real `c:chart` part with an embedded minimal workbook where
+    /// the chart maps cleanly (plain/grouped/stacked bars, lines, scatters on
+    /// category or linear axes); everything else degrades per-chart to
+    /// grouped shapes with the reason in its fate. Stays opt-in until the
+    /// plan's hand-verified "Edit Data opens" pass in desktop PowerPoint
+    /// (docs/board-plan.md §11).
+    Native,
+}
+
+/// Options for [`write_pptx_with`]. Non-exhaustive by convention: construct
+/// via `PptxOptions::default()` and set fields, so new knobs never break
+/// callers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PptxOptions {
+    pub chart_fidelity: ChartFidelity,
+}
+
 /// Write a normalized board as a native `.pptx`, returning the per-object
 /// fate report.
 ///
@@ -2140,11 +2360,25 @@ pub fn write_pptx(
     workspace: Option<&std::path::Path>,
     out: &mut impl std::io::Write,
 ) -> Result<ExportReport> {
+    write_pptx_with(board, theme, fonts, workspace, &PptxOptions::default(), out)
+}
+
+/// [`write_pptx`] with explicit [`PptxOptions`] — the default options write
+/// byte-identical output to `write_pptx`.
+pub fn write_pptx_with(
+    board: &Board,
+    theme: &Theme,
+    fonts: &FontStack,
+    workspace: Option<&std::path::Path>,
+    opts: &PptxOptions,
+    out: &mut impl std::io::Write,
+) -> Result<ExportReport> {
     let mut shared = Shared {
         media: Vec::new(),
         media_by_src: BTreeMap::new(),
         exts: BTreeSet::new(),
         fates: Vec::new(),
+        charts: Vec::new(),
     };
 
     // Build every slide first: media, fates and content types accumulate.
@@ -2157,11 +2391,15 @@ pub fn write_pptx(
             theme,
             fonts,
             workspace,
+            opts,
             &mut shared,
         ));
     }
     let notes: Vec<Option<&str>> = board.pages.iter().map(|p| p.notes.as_deref()).collect();
     let any_notes = notes.iter().any(Option::is_some);
+    // Decks without a table stay byte-identical: the tableStyles part, its
+    // content type and its rel exist only when an a:tbl references them.
+    let any_table = board.objects().any(|(_, o)| matches!(o, Object::Table(_)));
 
     // --- presentation.xml + rels --------------------------------------
     let mut pres_rels: Vec<Rel> = vec![Rel {
@@ -2196,6 +2434,13 @@ pub fn write_pptx(
         target: "theme/theme1.xml".to_string(),
         external: false,
     });
+    if any_table {
+        pres_rels.push(Rel {
+            kind: REL_TABLE_STYLES,
+            target: "tableStyles.xml".to_string(),
+            external: false,
+        });
+    }
 
     let mut sld_ids = String::new();
     for i in 0..slides.len() {
@@ -2250,6 +2495,12 @@ pub fn write_pptx(
         };
         let _ = write!(ct, r#"<Default Extension="{ext}" ContentType="{ctype}"/>"#);
     }
+    if !shared.charts.is_empty() {
+        // The embedded chart workbooks under ppt/embeddings/.
+        ct.push_str(
+            r#"<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>"#,
+        );
+    }
     let over = |part: &str, ctype: &str| -> String {
         format!(r#"<Override PartName="{part}" ContentType="{ctype}"/>"#)
     };
@@ -2279,6 +2530,12 @@ pub fn write_pptx(
             "application/vnd.openxmlformats-officedocument.presentationml.slide+xml",
         ));
     }
+    for i in 0..shared.charts.len() {
+        ct.push_str(&over(
+            &format!("/ppt/charts/chart{}.xml", i + 1),
+            "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+        ));
+    }
     if any_notes {
         ct.push_str(&over(
             "/ppt/notesMasters/notesMaster1.xml",
@@ -2292,6 +2549,12 @@ pub fn write_pptx(
                 ));
             }
         }
+    }
+    if any_table {
+        ct.push_str(&over(
+            "/ppt/tableStyles.xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml",
+        ));
     }
     ct.push_str(&over(
         "/docProps/core.xml",
@@ -2395,6 +2658,13 @@ pub fn write_pptx(
             .into_bytes(),
         ));
     }
+    if any_table {
+        parts.push((
+            "ppt/tableStyles.xml".to_string(),
+            format!(r#"{XML_DECL}<a:tblStyleLst xmlns:a="{NS_A}" def="{TABLE_STYLE_ID}"/>"#)
+                .into_bytes(),
+        ));
+    }
     for (i, (xml, rels)) in slides.iter().enumerate() {
         parts.push((
             format!("ppt/slides/slide{}.xml", i + 1),
@@ -2403,6 +2673,27 @@ pub fn write_pptx(
         parts.push((
             format!("ppt/slides/_rels/slide{}.xml.rels", i + 1),
             rels_xml(rels).into_bytes(),
+        ));
+    }
+    for (i, cp) in shared.charts.iter().enumerate() {
+        parts.push((
+            format!("ppt/charts/chart{}.xml", i + 1),
+            cp.xml.clone().into_bytes(),
+        ));
+        // rId1 in a chart part's rels is always its embedded workbook — the
+        // chartSpace's c:externalData counts on it.
+        parts.push((
+            format!("ppt/charts/_rels/chart{}.xml.rels", i + 1),
+            rels_xml(&[Rel {
+                kind: REL_PACKAGE,
+                target: format!("../embeddings/data{}.xlsx", i + 1),
+                external: false,
+            }])
+            .into_bytes(),
+        ));
+        parts.push((
+            format!("ppt/embeddings/data{}.xlsx", i + 1),
+            cp.xlsx.clone(),
         ));
     }
     for (i, n) in notes.iter().enumerate() {
@@ -2439,11 +2730,11 @@ pub fn write_pptx(
     let mut zw = zip::ZipWriter::new(cursor);
     let mtime = zip::DateTime::from_date_and_time(2000, 1, 1, 0, 0, 0)
         .expect("a constant, valid zip datetime");
-    let opts = zip::write::SimpleFileOptions::default()
+    let zip_opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .last_modified_time(mtime);
     for (name, bytes) in &parts {
-        zw.start_file(name.clone(), opts)
+        zw.start_file(name.clone(), zip_opts)
             .with_context(|| format!("starting zip entry {name}"))?;
         zw.write_all(bytes)
             .with_context(|| format!("writing zip entry {name}"))?;
@@ -2457,6 +2748,7 @@ pub fn write_pptx(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_slide(
     board: &Board,
     page: &Page,
@@ -2464,6 +2756,7 @@ fn build_slide(
     theme: &Theme,
     fonts: &FontStack,
     workspace: Option<&std::path::Path>,
+    opts: &PptxOptions,
     shared: &mut Shared,
 ) -> (String, Vec<Rel>) {
     // Slot and anchor resolution — the same single geometry truth the
@@ -2476,6 +2769,7 @@ fn build_slide(
         page,
         workspace: workspace.map(|p| p.to_path_buf()),
         index,
+        chart_fidelity: opts.chart_fidelity,
         xml: String::new(),
         rels: Vec::new(),
         next_id: 2,
@@ -2897,6 +3191,85 @@ mod tests {
             fate("lost").reason
         );
         assert!(!slide.contains("never lands"), "{slide}");
+    }
+
+    #[test]
+    fn a_table_exports_as_a_native_a_tbl() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"bench-table","type":"table","at":[80,80],"size":[480,160],
+                   "header":true,"columns":[2,1,1],"alt":"benchmark table",
+                   "rows":[["Fixture","Before","After"],
+                           ["large.json","812",{"runs":[{"t":"244","b":true}]}]]}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        assert_well_formed(&slide);
+
+        // A native table in a graphicFrame, styled per cell.
+        assert!(slide.contains("<p:graphicFrame>"), "{slide}");
+        assert!(
+            slide.contains(r#"uri="http://schemas.openxmlformats.org/drawingml/2006/table""#),
+            "{slide}"
+        );
+        assert!(
+            slide.contains(&format!(
+                r#"<a:tblPr firstRow="1"><a:tableStyleId>{TABLE_STYLE_ID}</a:tableStyleId>"#
+            )),
+            "{slide}"
+        );
+        // 2:1:1 weights over 480 pt → 240/120/120 pt columns, in EMU, summing
+        // exactly to the frame ext.
+        assert_eq!(slide.matches("<a:gridCol").count(), 3, "{slide}");
+        assert!(slide.contains(r#"<a:gridCol w="3048000"/>"#), "{slide}");
+        assert!(slide.contains(r#"<a:gridCol w="1524000"/>"#), "{slide}");
+        // Two rows splitting 160 pt equally.
+        assert_eq!(slide.matches("<a:tr ").count(), 2, "{slide}");
+        assert!(slide.contains(r#"<a:tr h="1016000">"#), "{slide}");
+        // Six cells, each a real a:txBody through the shared run writer.
+        assert_eq!(slide.matches("<a:tc>").count(), 6, "{slide}");
+        assert!(slide.contains("<a:t>Fixture</a:t>"), "{slide}");
+        assert!(slide.contains("<a:t>244</a:t>"), "{slide}");
+        // Fixed 6 pt cell margins and hairline borders on every cell.
+        assert!(slide.contains(r#"marL="76200""#), "{slide}");
+        assert_eq!(slide.matches("<a:lnL ").count(), 6, "{slide}");
+        // Alt text survives as descr.
+        assert!(slide.contains(r#"descr="benchmark table""#), "{slide}");
+
+        // The minimal tableStyles part, its content type and its rel.
+        let styles = read_part(&bytes, "ppt/tableStyles.xml");
+        assert!(
+            styles.contains(&format!(
+                r#"<a:tblStyleLst xmlns:a="{NS_A}" def="{TABLE_STYLE_ID}"/>"#
+            )),
+            "{styles}"
+        );
+        let ct = read_part(&bytes, "[Content_Types].xml");
+        assert!(ct.contains("tableStyles+xml"), "{ct}");
+        let pres_rels = read_part(&bytes, "ppt/_rels/presentation.xml.rels");
+        assert!(pres_rels.contains("tableStyles.xml"), "{pres_rels}");
+
+        // Fate: the highest tier, with the reason naming a:tbl.
+        let fate = report
+            .objects
+            .iter()
+            .find(|f| f.id == "bench-table")
+            .unwrap();
+        assert_eq!(fate.tier, ExportTier::Native);
+        assert!(fate.reason.contains("a:tbl"), "{}", fate.reason);
+    }
+
+    #[test]
+    fn a_deck_without_tables_carries_no_tablestyles_part() {
+        let b = board(DECK);
+        let (bytes, _) = write(&b);
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(
+            ar.by_name("ppt/tableStyles.xml").is_err(),
+            "tableStyles must exist only when a table references it"
+        );
     }
 
     #[test]

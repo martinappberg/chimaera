@@ -236,6 +236,7 @@ pub enum Object {
     Connector(ConnectorObject),
     Image(ImageObject),
     Group(GroupObject),
+    Table(TableObject),
     Chart(ChartObject),
     Diagram(DiagramObject),
     PanelLabel(PanelLabelObject),
@@ -268,6 +269,7 @@ impl Object {
             Object::Connector(o) => &o.id,
             Object::Image(o) => &o.id,
             Object::Group(o) => &o.id,
+            Object::Table(o) => &o.id,
             Object::Chart(o) => &o.id,
             Object::Diagram(o) => &o.id,
             Object::PanelLabel(o) => &o.id,
@@ -289,6 +291,7 @@ impl Object {
             Object::Connector(_) => "connector",
             Object::Image(_) => "image",
             Object::Group(_) => "group",
+            Object::Table(_) => "table",
             Object::Chart(_) => "chart",
             Object::Diagram(_) => "diagram",
             Object::PanelLabel(_) => "panelLabel",
@@ -312,6 +315,7 @@ impl Object {
             Object::Shape(o) => (o.at, o.size),
             Object::Image(o) => (o.at, o.size),
             Object::Group(o) => (o.at, o.size),
+            Object::Table(o) => (o.at, o.size),
             Object::Chart(o) => (o.at, o.size),
             Object::Diagram(o) => (o.at, o.size),
             Object::PanelLabel(o) => (o.at, o.size),
@@ -339,6 +343,7 @@ impl Object {
             Object::Shape(o) => o.at = Some(at),
             Object::Image(o) => o.at = Some(at),
             Object::Group(o) => o.at = Some(at),
+            Object::Table(o) => o.at = Some(at),
             Object::Chart(o) => o.at = Some(at),
             Object::Diagram(o) => o.at = Some(at),
             Object::PanelLabel(o) => o.at = Some(at),
@@ -357,6 +362,7 @@ impl Object {
             Object::Shape(o) => o.size = Some(size),
             Object::Image(o) => o.size = Some(size),
             Object::Group(o) => o.size = Some(size),
+            Object::Table(o) => o.size = Some(size),
             Object::Chart(o) => o.size = Some(size),
             Object::Diagram(o) => o.size = Some(size),
             Object::PanelLabel(o) => o.size = Some(size),
@@ -379,6 +385,7 @@ impl Object {
             Object::Text(o) => o.slot.as_deref(),
             Object::Shape(o) => o.slot.as_deref(),
             Object::Image(o) => o.slot.as_deref(),
+            Object::Table(o) => o.slot.as_deref(),
             Object::Chart(o) => o.slot.as_deref(),
             Object::Diagram(o) => o.slot.as_deref(),
             Object::Group(_)
@@ -431,6 +438,7 @@ impl Serialize for Object {
             Object::Connector(o) => o.serialize(s),
             Object::Image(o) => o.serialize(s),
             Object::Group(o) => o.serialize(s),
+            Object::Table(o) => o.serialize(s),
             Object::Chart(o) => o.serialize(s),
             Object::Diagram(o) => o.serialize(s),
             Object::PanelLabel(o) => o.serialize(s),
@@ -484,6 +492,7 @@ impl<'de> Deserialize<'de> for Object {
             "connector" => try_variant!(ConnectorObject, Object::Connector),
             "image" => try_variant!(ImageObject, Object::Image),
             "group" => try_variant!(GroupObject, Object::Group),
+            "table" => try_variant!(TableObject, Object::Table),
             "chart" => try_variant!(ChartObject, Object::Chart),
             "diagram" => try_variant!(DiagramObject, Object::Diagram),
             "panelLabel" => try_variant!(PanelLabelObject, Object::PanelLabel),
@@ -537,6 +546,7 @@ kind_field!(ShapeKind, "shape");
 kind_field!(ConnectorKind, "connector");
 kind_field!(ImageKind, "image");
 kind_field!(GroupKind, "group");
+kind_field!(TableKind, "table");
 kind_field!(ChartKind, "chart");
 kind_field!(DiagramKind, "diagram");
 kind_field!(PanelLabelKind, "panelLabel");
@@ -890,6 +900,104 @@ pub struct GroupObject {
     pub alt: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Table
+// ---------------------------------------------------------------------------
+
+/// A grid of cells — the tier-1 element that lands as a native, editable
+/// `a:tbl` at every export target. A cell is one [`Paragraph`]: the same text
+/// model text objects use (bare-string sugar, rich runs, run-level overrides),
+/// because a second cell text model would split canonicalization, measurement
+/// and the PPTX run writer in three places.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: TableKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// Relative column widths — pt widths keep their ratio and fill the box.
+    /// Absent means an equal split; see [`TableObject::column_widths`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<f64>>,
+    /// First row styled as a header: surface fill, bold runs, `firstRow` on
+    /// the exported `a:tblPr`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub header: bool,
+    /// One paragraph per cell, row-major. Ragged rows are legal; missing
+    /// cells draw empty.
+    pub rows: Vec<Vec<Paragraph>>,
+    /// Resolves cell family/size/weight/color from the theme's type scale,
+    /// exactly as bound shape text does. Defaults to `body`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl TableObject {
+    /// The grid's column count: the widest row, or `columns` when it names
+    /// more.
+    pub fn column_count(&self) -> usize {
+        let widest = self.rows.iter().map(Vec::len).max().unwrap_or(0);
+        widest.max(self.columns.as_ref().map_or(0, Vec::len))
+    }
+
+    /// Column widths in points across `total`. Stated `columns` are relative
+    /// weights; the fallback to an equal split — when `columns` is absent,
+    /// does not match the grid, or carries an unusable weight — is deliberate:
+    /// a half-stated grid must still resolve deterministically (lint reports
+    /// the mismatch).
+    pub fn column_widths(&self, total: f64) -> Vec<f64> {
+        let n = self.column_count();
+        if n == 0 {
+            return Vec::new();
+        }
+        if let Some(cols) = &self.columns {
+            if cols.len() == n && cols.iter().all(|w| w.is_finite() && *w > 0.0) {
+                let sum: f64 = cols.iter().sum();
+                return cols.iter().map(|w| w / sum * total).collect();
+            }
+        }
+        vec![total / n as f64; n]
+    }
+
+    /// A header cell's paragraph: every run bold unless it states otherwise.
+    /// Transient — computed at render/export, never written back.
+    pub fn header_cell(cell: &Paragraph) -> Paragraph {
+        match cell {
+            Paragraph::Plain(s) => {
+                let mut run = Run::plain(s.clone());
+                run.b = Some(true);
+                Paragraph::Rich(RichParagraph {
+                    runs: vec![run],
+                    align: None,
+                    space_before: None,
+                    space_after: None,
+                    bullet: None,
+                    extra: Extra::new(),
+                })
+            }
+            Paragraph::Rich(rich) => {
+                let mut rich = rich.clone();
+                for r in &mut rich.runs {
+                    if r.b.is_none() {
+                        r.b = Some(true);
+                    }
+                }
+                Paragraph::Rich(rich)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,6 +1713,60 @@ mod tests {
         assert_eq!(p.plain_text(), "hello");
         let p: Paragraph = serde_json::from_str(r#"{"runs":[{"t":"a"},{"t":"b"}]}"#).unwrap();
         assert_eq!(p.plain_text(), "ab");
+    }
+
+    #[test]
+    fn a_table_cell_is_the_text_model_and_unknown_fields_survive() {
+        let raw = r#"{"id":"tb","type":"table","at":[0,0],"size":[300,100],
+            "header":true,
+            "rows":[["Fixture","ms"],["large.json",{"runs":[{"t":"244","b":true}]}]],
+            "futureKnob":7}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Table(t) = &obj else {
+            panic!("expected table, got {obj:?}")
+        };
+        assert!(t.header);
+        assert_eq!(t.rows[0][0].plain_text(), "Fixture");
+        assert_eq!(t.rows[1][1].plain_text(), "244");
+        assert_eq!(t.column_count(), 2);
+        assert_eq!(t.extra.get("futureKnob").unwrap(), &Value::from(7));
+        let back = serde_json::to_value(&obj).unwrap();
+        assert_eq!(back.get("futureKnob").unwrap(), &Value::from(7));
+    }
+
+    #[test]
+    fn table_column_widths_are_relative_with_an_equal_fallback() {
+        let t: TableObject = serde_json::from_str(
+            r#"{"id":"tb","type":"table","columns":[2,1,1],
+                "rows":[["a","b","c"]]}"#,
+        )
+        .unwrap();
+        // Weights 2:1:1 over 400 pt — pt widths keep their ratio.
+        assert_eq!(t.column_widths(400.0), vec![200.0, 100.0, 100.0]);
+        // A mismatched `columns` falls back to the equal split.
+        let ragged: TableObject = serde_json::from_str(
+            r#"{"id":"tb","type":"table","columns":[2,1],
+                "rows":[["a","b","c"]]}"#,
+        )
+        .unwrap();
+        assert_eq!(ragged.column_widths(300.0), vec![100.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn a_header_cell_bolds_runs_that_do_not_state_otherwise() {
+        let bolded = TableObject::header_cell(&Paragraph::Plain("hi".into()));
+        let Paragraph::Rich(rich) = &bolded else {
+            panic!("expected rich, got {bolded:?}")
+        };
+        assert_eq!(rich.runs[0].b, Some(true));
+        // An explicit b:false survives — the author's word wins.
+        let styled: Paragraph =
+            serde_json::from_str(r#"{"runs":[{"t":"a","b":false},{"t":"b"}]}"#).unwrap();
+        let Paragraph::Rich(rich) = TableObject::header_cell(&styled) else {
+            panic!()
+        };
+        assert_eq!(rich.runs[0].b, Some(false));
+        assert_eq!(rich.runs[1].b, Some(true));
     }
 
     #[test]

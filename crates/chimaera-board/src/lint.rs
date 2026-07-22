@@ -135,6 +135,28 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
                         );
                     }
                 }
+                Object::Table(t) => {
+                    for row in &t.rows {
+                        check_colors_in_paragraphs(row, theme, &page.id, &t.id, &mut diags);
+                    }
+                    if let Some(cols) = &t.columns {
+                        if !t.rows.is_empty() && cols.len() != t.column_count() {
+                            diags.push(
+                                Diagnostic::new(
+                                    Severity::Warning,
+                                    format!(
+                                        "columns states {} widths for a {}-column grid; the \
+                                         equal split is used",
+                                        cols.len(),
+                                        t.column_count()
+                                    ),
+                                )
+                                .at(&page.id, &t.id)
+                                .field("columns"),
+                            );
+                        }
+                    }
+                }
                 Object::Unknown(u) => {
                     diags.push(
                         Diagnostic::new(
@@ -473,6 +495,16 @@ pub fn lint_target(
                 Object::Chart(c) => {
                     check_chart_rules(c, preset, &page.id, &mut diags);
                     check_series_cap(c, theme, &page.id, &mut series_cap, &mut diags);
+                }
+                // Table cells are text at the cell role's size, so they count
+                // toward the venue's per-role floor exactly as bound shape
+                // text does.
+                Object::Table(t) => {
+                    if t.rows.iter().any(|r| !r.is_empty()) {
+                        let role = t.role.as_deref().unwrap_or("body");
+                        used_roles.insert(role);
+                        check_role_floor(role, theme, preset, &page.id, &t.id, &mut diags);
+                    }
                 }
                 // A scalebar's stroke is stored; its bar must clear the
                 // venue's line-weight floor like any drawn stroke.
@@ -994,6 +1026,13 @@ fn text_boxes(
                 &sh.text,
                 false,
             ),
+            // A table's budget is per cell, not per box; underfull cells are
+            // normal (a short number in a wide column), so only overfull
+            // applies.
+            Object::Table(t) => {
+                table_cell_overfull(t, page, resolved, theme, fonts, base, diags);
+                continue;
+            }
             _ => continue,
         };
         let Some(frame) = resolved.get(id) else {
@@ -1028,6 +1067,55 @@ fn text_boxes(
                 .at(&page.id, id)
                 .field("size"),
             );
+        }
+    }
+}
+
+/// Per-cell overfull, under the renderer's own geometry rule: columns take
+/// [`crate::schema::TableObject::column_widths`], rows split the frame height
+/// equally, and every cell loses the fixed padding on each side. A cell whose
+/// measured text exceeds its budget is reported with the cell named — the
+/// grid never resizes to fit.
+fn table_cell_overfull(
+    t: &crate::schema::TableObject,
+    page: &Page,
+    resolved: &BTreeMap<String, Frame>,
+    theme: &Theme,
+    fonts: &FontStack,
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(frame) = resolved.get(t.id.as_str()) else {
+        return;
+    };
+    let cols = t.column_count();
+    if t.rows.is_empty() || cols == 0 {
+        return;
+    }
+    let widths = t.column_widths(frame.w);
+    let row_h = frame.h / t.rows.len() as f64;
+    let role = theme
+        .role(t.role.as_deref().unwrap_or("body"))
+        .unwrap_or_else(|| theme.body());
+    let pad = crate::render::TABLE_CELL_PAD_PT;
+    for (ri, row) in t.rows.iter().enumerate() {
+        for (ci, cell) in row.iter().enumerate() {
+            let avail_w = (widths[ci] - pad * 2.0).max(1.0);
+            let avail_h = row_h - pad * 2.0;
+            let block = text_block_height(std::slice::from_ref(cell), role, fonts, avail_w);
+            if block > avail_h + 0.5 {
+                diags.push(
+                    Diagnostic::new(
+                        base,
+                        format!(
+                            "overfull cell [{ri}][{ci}]: text measures {block:.0} pt against \
+                             a {avail_h:.0} pt cell",
+                        ),
+                    )
+                    .at(&page.id, &t.id)
+                    .field("rows"),
+                );
+            }
         }
     }
 }
@@ -1822,6 +1910,58 @@ mod tests {
             r#"{{"id":"{id}","type":"shape","geo":"rect","at":[{},{}],"size":[{},{}]}}"#,
             at[0], at[1], size[0], size[1]
         )
+    }
+
+    #[test]
+    fn an_overfull_table_cell_is_reported_with_the_cell_named() {
+        let diags = style_linted(
+            r#"{"id":"tb","type":"table","at":[80,80],"size":[240,48],
+                "rows":[["a cell holding far more prose than a 24 pt row can seat","b"],
+                        ["c","d"]]}"#,
+            false,
+        );
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("overfull cell"))
+            .expect("an overfull-cell finding");
+        assert_eq!(f.object.as_deref(), Some("tb"));
+        assert!(f.message.contains("[0][0]"), "{}", f.message);
+        // Short cells never trip an underfull finding.
+        assert!(
+            !diags.iter().any(|d| d.message.contains("underfull")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_with_mismatched_columns_warns_and_counts_role_floors() {
+        let diags = linted(
+            r#"{"id":"tb","type":"table","at":[80,80],"size":[320,160],
+                "columns":[2,1],
+                "rows":[["a","b","c"]]}"#,
+        );
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("3-column grid"))
+            .expect("a columns-mismatch finding");
+        assert_eq!(f.object.as_deref(), Some("tb"));
+        assert!(f.message.contains("2 widths"), "{}", f.message);
+
+        // Cells count toward the venue's per-role floor: talk-dark body
+        // (20 pt, minPt 18) under pub-plos's 1.6× scale errors exactly as
+        // bound shape text would.
+        let target = target_linted(
+            r#"{"id":"tb","type":"table","at":[80,80],"size":[320,160],
+                "rows":[["a","b"]]}"#,
+            "talk-dark",
+            "pub-plos",
+        );
+        assert!(
+            target
+                .iter()
+                .any(|d| d.object.as_deref() == Some("tb") && d.message.contains("floors")),
+            "{target:?}"
+        );
     }
 
     #[test]

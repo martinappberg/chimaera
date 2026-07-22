@@ -707,7 +707,7 @@
   $effect(() => {
     const t = refTargetSession;
     referenceTarget.set(
-      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t) },
+      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t), ui: t.ui ?? null },
     );
   });
 

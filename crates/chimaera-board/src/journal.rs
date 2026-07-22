@@ -122,6 +122,7 @@ impl Event {
                 format!("set intent of page {page} to {kind}")
             }
             EventKind::BriefChanged => "edited the brief".to_string(),
+            EventKind::Shown => "showed this board".to_string(),
         };
         format!("#{} {} {}", self.seq, self.actor, body)
     }
@@ -195,6 +196,12 @@ pub enum EventKind {
         kind: String,
     },
     BriefChanged,
+    /// The board was (re-)emitted by `board show` — the surfacing signal a
+    /// ShownCard consumer keys on (board plan §10). Content-free like the
+    /// other content events: the shown board file beside this journal is the
+    /// card; a re-show with the same id appends another `shown`, which is how
+    /// an in-place card update announces itself.
+    Shown,
 }
 
 /// Where a board's journal lives:
@@ -728,6 +735,24 @@ mod tests {
         // The key is path-derived: moving the board re-keys the journal.
         let d = journal_path(ws, Path::new("/work/repo/figures/v2/fig2.board.json"));
         assert_ne!(a, d);
+    }
+
+    #[test]
+    fn shown_event_round_trips() {
+        let path = tmp_journal("shown");
+        let mut j = Journal::open(&path).unwrap();
+        let seq = j
+            .append(Event::new(Actor::Agent, EventKind::Shown))
+            .unwrap();
+        assert_eq!(seq, 1);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.trim(),
+            r#"{"seq":1,"actor":"agent","event":"shown"}"#,
+            "content-free, seq-first, no timestamp"
+        );
+        let events = read_since(&path, 0).unwrap();
+        assert_eq!(events[0].render(), "#1 agent showed this board");
     }
 
     #[test]

@@ -12,9 +12,10 @@ functions; that single-engine property is what keeps the pane, the CLI and
 | File | What it is |
 |---|---|
 | `src/lib.rs` | parse/save, `is_board_path`, the workspace surround (`.chimaera/board/`, the self-ignoring `shown/`) |
-| `src/schema.rs` | the format: 5 primitives + `chart` + `diagram` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`) |
+| `src/schema.rs` | the format: 5 primitives + `table` + `chart` + `diagram` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`); table cells reuse the `Paragraph` text model |
 | `src/pretty.rs` | the canonical byte-stable JSON layout — the exact bytes are part of the format |
 | `src/normalize.rs` | sugar expansion + the constraints that make ugly unrepresentable; pure and idempotent |
+| `src/merge.rs` | the per-object three-way merge on slug ids (git-merge-driver semantics: ours-wins on true conflicts + a `Conflict` report; page membership follows the mover; canonical byte-stable output; never journals) |
 | `src/theme.rs` | `@token` palettes, role type scale with per-role `minPt`, bundled `themes/*.theme.json` |
 | `src/chart.rs` | marks over a plot-ready table → flat draw items; scales, d3 nice ticks, measured gutters |
 | `src/diagram.rs` | the `diagram` composite: deterministic layered layout (Sugiyama-lite, in-crate — no maintained dagre exists) expanding to primitives at render; the mermaid flowchart import |
@@ -27,6 +28,7 @@ functions; that single-engine property is what keeps the pane, the CLI and
 | `src/lint.rs` | the legality, target and style profiles + `lint_fix`; findings always name object, field, and the numbers |
 | `src/arrange.rs` | align/distribute/grid over named objects, one pure function; refuses slot-placed targets (their geometry is derived) |
 | `src/cvd.rs` | the CVD preflight: Machado 2009 simulation, CIE76 ΔE, all-pairs palette check, the computed safe series cap, `validate_theme` |
+| `src/pdfimport.rs` | one PDF page → PNG via hayro, behind the non-default `pdf-import` feature (binary weight); sniff, ceilings and the missing-feature refusal compile in every build |
 
 ## Invariants that bite
 

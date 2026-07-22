@@ -1,8 +1,9 @@
-//! Board route tests: render → ticket → raw fetch, describe, auth coverage.
+//! Board route tests: render → ticket → raw fetch, describe, edit
+//! serialization + epochs, journal round-trip, exports, auth coverage.
 
 use axum::http::{Method, StatusCode};
 
-use super::support::{request, request_bytes, test_dir, test_state};
+use super::support::{request, request_bytes, test_dir, test_state, urlencode};
 
 const BOARD: &str = r#"{
   "format": "chimaera.board",
@@ -21,11 +22,69 @@ const BOARD: &str = r#"{
 }
 "#;
 
+/// Two independently movable objects — the lost-update race needs a second
+/// victim.
+const BOARD_TWO_OBJECTS: &str = r#"{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "title": "Race test",
+  "canvas": { "size": [400, 300] },
+  "pages": [
+    {
+      "id": "p1",
+      "objects": [
+        { "id": "a", "type": "text", "role": "heading", "at": [16, 16], "size": [96, 32],
+          "text": ["a"] },
+        { "id": "b", "type": "text", "role": "heading", "at": [16, 96], "size": [96, 32],
+          "text": ["b"] }
+      ]
+    }
+  ]
+}
+"#;
+
+/// Two pages — the all-pages SVG export tickets a directory (zip download).
+const BOARD_TWO_PAGES: &str = r#"{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "title": "Deck",
+  "canvas": { "size": [400, 300] },
+  "pages": [
+    {
+      "id": "p1",
+      "objects": [
+        { "id": "t1", "type": "text", "role": "heading", "at": [40, 40], "size": [320, 64],
+          "text": ["One"] }
+      ]
+    },
+    {
+      "id": "p2",
+      "objects": [
+        { "id": "t2", "type": "text", "role": "heading", "at": [40, 40], "size": [320, 64],
+          "text": ["Two"] }
+      ]
+    }
+  ]
+}
+"#;
+
 fn write_board(label: &str) -> std::path::PathBuf {
+    write_board_src(label, BOARD)
+}
+
+fn write_board_src(label: &str, src: &str) -> std::path::PathBuf {
     let root = test_dir(label);
     let path = root.join("demo.board.json");
-    std::fs::write(&path, BOARD).unwrap();
+    std::fs::write(&path, src).unwrap();
     path
+}
+
+/// The path-derived journal key for a board fixture, as the daemon computes
+/// it (canonical path first).
+fn journal_path_of(path: &std::path::Path) -> std::path::PathBuf {
+    let canon = path.canonicalize().unwrap();
+    let ws = chimaera_board::workspace_root(&canon);
+    chimaera_board::journal::journal_path(&ws, &canon)
 }
 
 #[tokio::test]
@@ -333,8 +392,349 @@ async fn board_endpoints_without_token_are_401() {
         "/api/v1/board/render",
         "/api/v1/board/describe",
         "/api/v1/board/edit",
+        "/api/v1/board/journal",
+        "/api/v1/board/export",
     ] {
         let (status, _, _) = request_bytes(&state, Method::POST, uri, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} must be authed");
+    }
+    let (status, _, _) =
+        request_bytes(&state, Method::GET, "/api/v1/board/journal?path=x", None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "journal GET must be authed"
+    );
+}
+
+#[tokio::test]
+async fn board_edit_serializes_concurrent_gestures_per_path() {
+    // Two read-modify-write cycles on one file, started together: without
+    // the per-path shard lock one save clobbers the other and a gesture is
+    // silently lost.
+    let state = test_state();
+    let path = write_board_src("board-edit-race", BOARD_TWO_OBJECTS);
+    let body = |object: &str, at: [f64; 2]| serde_json::json!({"path": path.to_string_lossy(), "object": object, "at": at});
+
+    let (a, b) = tokio::join!(
+        request(
+            &state,
+            Method::POST,
+            "/api/v1/board/edit",
+            Some(body("a", [200.0, 16.0])),
+        ),
+        request(
+            &state,
+            Method::POST,
+            "/api/v1/board/edit",
+            Some(body("b", [200.0, 96.0])),
+        ),
+    );
+    assert_eq!(a.0, StatusCode::OK, "{}", a.1);
+    assert_eq!(b.0, StatusCode::OK, "{}", b.1);
+
+    let (_, described) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/describe",
+        Some(serde_json::json!({"path": path.to_string_lossy()})),
+    )
+    .await;
+    let text = described["text"].as_str().unwrap();
+    assert!(text.contains("a text/heading at [200, 16]"), "{text}");
+    assert!(text.contains("b text/heading at [200, 96]"), "{text}");
+
+    // Both gestures journaled with distinct server-assigned seqs — the
+    // append rides the same shard, so seq stamping cannot race either.
+    let events = chimaera_board::journal::read_since(&journal_path_of(&path), 0).unwrap();
+    let mut seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+    seqs.sort_unstable();
+    assert_eq!(seqs, [1, 2], "{events:?}");
+}
+
+#[tokio::test]
+async fn board_edit_bumps_the_board_epoch_and_defers_the_git_bump() {
+    let state = test_state();
+    let root = test_dir("board-epoch");
+    let path = root.join("epoch.board.json");
+    std::fs::write(&path, BOARD).unwrap();
+    // Both epochs key on the registered workspace containing the board.
+    let (status, ws) = request(
+        &state,
+        Method::POST,
+        "/api/v1/workspaces",
+        Some(serde_json::json!({"root": root.to_string_lossy()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ws}");
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+    let git_before = state
+        .git
+        .epochs_snapshot()
+        .get(&ws_id)
+        .copied()
+        .unwrap_or(0);
+
+    for at in [[120.0, 80.0], [200.0, 80.0]] {
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/board/edit",
+            Some(serde_json::json!({"path": path.to_string_lossy(), "object": "t", "at": at})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    // The board epoch moves immediately, once per gesture — that is what the
+    // pane invalidates on instead of its poll.
+    assert_eq!(
+        crate::lock(&state.board_epochs).get(&ws_id).copied(),
+        Some(2),
+        "one board-epoch bump per successful edit"
+    );
+    // The git epoch does NOT move per gesture: it settles ~1s after the last
+    // edit, so a layout session costs one `git status` announcement.
+    assert_eq!(
+        state
+            .git
+            .epochs_snapshot()
+            .get(&ws_id)
+            .copied()
+            .unwrap_or(0),
+        git_before,
+        "no per-gesture git bump"
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let epoch = state
+            .git
+            .epochs_snapshot()
+            .get(&ws_id)
+            .copied()
+            .unwrap_or(0);
+        if epoch > git_before {
+            assert_eq!(
+                epoch,
+                git_before + 1,
+                "both gestures coalesced into one settle bump"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the git settle timer never fired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn board_journal_post_and_get_round_trip() {
+    let state = test_state();
+    let path = write_board("board-journal-routes");
+    let encoded = urlencode(&path.to_string_lossy());
+
+    // POST appends one validated event; seq is assigned server-side.
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/journal",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "actor": "agent",
+            "event": "object-added", "object": "note", "kind": "text", "page": "p1",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["seq"], 1, "{json}");
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/journal",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "actor": "human",
+            "event": "text-edited", "object": "note",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["seq"], 2, "{json}");
+
+    // GET reads everything after `since`, oldest first, in the journal
+    // file's own shape (seq-first, kebab-case op), plus latestSeq.
+    let (status, json) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/board/journal?path={encoded}&since=0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["latestSeq"], 2, "{json}");
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "{json}");
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["actor"], "agent");
+    assert_eq!(events[0]["event"], "object-added");
+    assert_eq!(events[0]["object"], "note");
+    assert_eq!(events[1]["event"], "text-edited");
+
+    // since=N means strictly after N.
+    let (_, json) = request(
+        &state,
+        Method::GET,
+        &format!("/api/v1/board/journal?path={encoded}&since=1"),
+        None,
+    )
+    .await;
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{json}");
+    assert_eq!(events[0]["seq"], 2);
+
+    // An op outside the journal vocabulary — or a missing actor — is
+    // rejected at deserialization and never reaches the file.
+    for bad in [
+        serde_json::json!({
+            "path": path.to_string_lossy(),
+            "actor": "agent",
+            "event": "from-the-future",
+        }),
+        serde_json::json!({
+            "path": path.to_string_lossy(),
+            "event": "brief-changed",
+        }),
+    ] {
+        let (status, _) = request(&state, Method::POST, "/api/v1/board/journal", Some(bad)).await;
+        assert!(status.is_client_error(), "{status}");
+    }
+    let events = chimaera_board::journal::read_since(&journal_path_of(&path), 0).unwrap();
+    assert_eq!(events.len(), 2, "rejected events never landed: {events:?}");
+}
+
+#[tokio::test]
+async fn board_export_pdf_mints_a_download_ticket() {
+    let state = test_state();
+    let path = write_board("board-export-pdf");
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/export",
+        Some(serde_json::json!({"path": path.to_string_lossy(), "format": "pdf"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["filename"], "demo.pdf", "{json}");
+    assert_eq!(json["pageCount"], 1, "{json}");
+    assert!(json.get("exportPath").is_none(), "no fs paths: {json}");
+
+    let ticket = json["ticket"].as_str().unwrap();
+    let (status, _, body) =
+        request_bytes(&state, Method::GET, &format!("/download/{ticket}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..5], b"%PDF-");
+}
+
+#[tokio::test]
+async fn board_export_pptx_reports_object_fates() {
+    let state = test_state();
+    let path = write_board("board-export-pptx");
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/export",
+        Some(serde_json::json!({"path": path.to_string_lossy(), "format": "pptx"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["filename"], "demo.pptx", "{json}");
+    // The degradation contract rides the response, per object.
+    let fates = json["objects"].as_array().unwrap();
+    assert!(fates.iter().any(|f| f["id"] == "t"), "{json}");
+
+    let ticket = json["ticket"].as_str().unwrap();
+    let (status, _, body) =
+        request_bytes(&state, Method::GET, &format!("/download/{ticket}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..4], b"PK\x03\x04", "a pptx is a zip");
+}
+
+#[tokio::test]
+async fn board_export_svg_single_page_serves_markup() {
+    let state = test_state();
+    let path = write_board("board-export-svg");
+    for (format, filename) in [("svg", "demo.svg"), ("svg-outlined", "demo-outlined.svg")] {
+        let (status, json) = request(
+            &state,
+            Method::POST,
+            "/api/v1/board/export",
+            Some(serde_json::json!({"path": path.to_string_lossy(), "format": format})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["filename"], filename, "{json}");
+        let ticket = json["ticket"].as_str().unwrap();
+        let (status, _, body) =
+            request_bytes(&state, Method::GET, &format!("/download/{ticket}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&body).contains("<svg"),
+            "{format} serves svg markup"
+        );
+    }
+}
+
+#[tokio::test]
+async fn board_export_svg_all_pages_downloads_as_zip() {
+    let state = test_state();
+    let path = write_board_src("board-export-svg-zip", BOARD_TWO_PAGES);
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/export",
+        Some(serde_json::json!({"path": path.to_string_lossy(), "format": "svg"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["pageCount"], 2, "{json}");
+    assert_eq!(json["filename"], "demo-svg", "{json}");
+
+    // The ticket names the per-export directory; the download route streams
+    // it as a zip.
+    let ticket = json["ticket"].as_str().unwrap();
+    let (status, headers, body) =
+        request_bytes(&state, Method::GET, &format!("/download/{ticket}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").unwrap().to_str().unwrap(),
+        "application/zip"
+    );
+    assert_eq!(&body[..2], b"PK");
+}
+
+#[tokio::test]
+async fn board_export_refuses_bad_format_and_page_misuse() {
+    let state = test_state();
+    let path = write_board("board-export-refusals");
+    for (body, needle) in [
+        (
+            serde_json::json!({"path": path.to_string_lossy(), "format": "docx"}),
+            "unknown format",
+        ),
+        (
+            serde_json::json!({"path": path.to_string_lossy(), "format": "pdf", "page": 0}),
+            "does not apply",
+        ),
+        (
+            serde_json::json!({"path": path.to_string_lossy(), "format": "pptx", "page": 0}),
+            "does not apply",
+        ),
+    ] {
+        let (status, json) =
+            request(&state, Method::POST, "/api/v1/board/export", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(json["error"].as_str().unwrap().contains(needle), "{json}");
     }
 }

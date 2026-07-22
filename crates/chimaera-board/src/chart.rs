@@ -2322,22 +2322,35 @@ fn build_heatmap(
 }
 
 fn series_color(ctx: &Ctx, chart: &ChartObject, mark: &Mark, i: usize, n: usize) -> Rgb {
+    series_color_for(ctx.theme, chart, mark, i, n)
+}
+
+/// The colour one series draws with — mark fill/stroke tokens resolved
+/// through the theme, else the categorical ramp. Shared with the native
+/// `c:chart` exporter so both export paths resolve identically.
+pub(crate) fn series_color_for(
+    theme: &Theme,
+    chart: &ChartObject,
+    mark: &Mark,
+    i: usize,
+    n: usize,
+) -> Rgb {
     if let Some(c) = mark.fill.as_deref().or(mark.stroke.as_deref()) {
-        if let Some(rgb) = ctx.theme.color(c) {
+        if let Some(rgb) = theme.color(c) {
             return rgb;
         }
     }
     if n <= 1 && chart.color.is_none() {
-        return ctx.theme.categorical(0);
+        return theme.categorical(0);
     }
-    ctx.theme.categorical(i)
+    theme.categorical(i)
 }
 
 // ---------------------------------------------------------------------------
 // Row helpers
 // ---------------------------------------------------------------------------
 
-fn number(row: &Value, field: &str) -> Option<f64> {
+pub(crate) fn number(row: &Value, field: &str) -> Option<f64> {
     row.get(field)?.as_f64()
 }
 
@@ -2350,7 +2363,7 @@ fn as_text(v: &Value) -> Option<String> {
     }
 }
 
-fn category_of(row: &Value, field: &str) -> Option<String> {
+pub(crate) fn category_of(row: &Value, field: &str) -> Option<String> {
     row.get(field).and_then(as_text)
 }
 
@@ -2367,7 +2380,7 @@ fn coord(row: &Value, field: &str, kind: ChannelType) -> Option<f64> {
     }
 }
 
-fn in_series(row: &Value, color_field: Option<&str>, series: &str) -> bool {
+pub(crate) fn in_series(row: &Value, color_field: Option<&str>, series: &str) -> bool {
     match color_field {
         None => true,
         Some(f) => category_of(row, f).as_deref() == Some(series),
@@ -2376,7 +2389,7 @@ fn in_series(row: &Value, color_field: Option<&str>, series: &str) -> bool {
 
 /// Distinct series values in first-seen order — stable, so a re-render does
 /// not reshuffle colours.
-fn series_values(rows: &[Value], color: Option<&Channel>) -> Vec<String> {
+pub(crate) fn series_values(rows: &[Value], color: Option<&Channel>) -> Vec<String> {
     let Some(c) = color else {
         return vec![String::new()];
     };

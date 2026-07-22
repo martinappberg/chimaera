@@ -171,6 +171,13 @@ fn normalize_objects(objects: &mut [Object], page: &str, diags: &mut Vec<Diagnos
             // A callout's bound text is real paragraphs, so it canonicalizes
             // exactly like a shape's.
             Object::Callout(c) => canonicalize_paragraphs(&mut c.text),
+            // Table cells are the same text model, so each row canonicalizes
+            // exactly like a text object's paragraphs.
+            Object::Table(t) => {
+                for row in &mut t.rows {
+                    canonicalize_paragraphs(row);
+                }
+            }
             // Composite children are computed at render, never stored, so
             // there is nothing to canonicalize beyond the snapped frame.
             Object::Image(_)
@@ -198,6 +205,7 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
         Object::Connector(o) => o.id = generated,
         Object::Image(o) => o.id = generated,
         Object::Group(o) => o.id = generated,
+        Object::Table(o) => o.id = generated,
         Object::Chart(o) => o.id = generated,
         Object::Diagram(o) => o.id = generated,
         Object::PanelLabel(o) => o.id = generated,
@@ -520,6 +528,25 @@ mod tests {
         normalize(&mut b);
         let out = crate::to_string(&b).unwrap();
         assert!(out.contains(r#""b": true"#), "{out}");
+    }
+
+    #[test]
+    fn a_table_save_is_byte_stable_and_cells_canonicalize() {
+        let mut b = board_with(
+            r#"{"id":"tb","type":"table","at":[80,80],"size":[320,160],"header":true,
+                "columns":[2,1,1],
+                "rows":[["Fixture","Before","After"],
+                        [{"runs":[{"t":"large.json"}]},"812","244"]]}"#,
+        );
+        normalize(&mut b);
+        let once = crate::to_string(&b).unwrap();
+        let mut again = crate::parse(&once).unwrap();
+        normalize(&mut again);
+        let twice = crate::to_string(&again).unwrap();
+        assert_eq!(once, twice, "a table save must be a fixed point");
+        // A bare rich cell collapses to its string form, exactly like text.
+        assert!(once.contains(r#""large.json""#), "{once}");
+        assert!(!once.contains(r#""runs""#), "{once}");
     }
 
     #[test]

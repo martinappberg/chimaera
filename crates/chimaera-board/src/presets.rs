@@ -429,6 +429,7 @@ pub fn tier_of(object: &Object) -> (ExportTier, &'static str) {
         Object::Text(_) => (ExportTier::Native, "editable text at the destination"),
         Object::Shape(_) => (ExportTier::Native, "native shape geometry"),
         Object::Connector(_) => (ExportTier::Native, "native connector"),
+        Object::Table(_) => (ExportTier::Native, "native table (a:tbl)"),
         Object::Chart(_) => (
             ExportTier::Grouped,
             "chart decomposes to editable primitives",
@@ -568,6 +569,10 @@ mod tests {
             ),
             (
                 r#"{"id":"c","type":"connector","from":{"at":[0,0]},"to":{"at":[1,1]}}"#,
+                ExportTier::Native,
+            ),
+            (
+                r#"{"id":"tb","type":"table","rows":[["a","b"]]}"#,
                 ExportTier::Native,
             ),
             (

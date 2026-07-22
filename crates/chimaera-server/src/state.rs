@@ -105,6 +105,16 @@ pub(crate) struct AppState {
     /// Read-only git service (status/diff): discovery cache, per-workspace nudge
     /// epochs, and a bounded pool for `git` child processes. Never persisted.
     pub(crate) git: git::GitService,
+    /// workspace id -> board nudge epoch, bumped on every board mutation
+    /// (`board::bump_board_epoch`). Same invalidate-and-pull contract as the
+    /// git epochs: `/ws/events` carries only the number, the pane refetches
+    /// `/board/render`. Bounded by the workspace count.
+    pub(crate) board_epochs: Mutex<HashMap<String, u64>>,
+    /// board path -> deadline for the deferred git bump after a board edit
+    /// (`board::schedule_git_settle`). Entries live ~1s (removed when the
+    /// settle timer fires) and the scheduler flushes immediately past a hard
+    /// cap, so the map stays bounded by the per-second edit fan-out.
+    pub(crate) board_git_settle: Mutex<HashMap<String, tokio::time::Instant>>,
     /// Compute-scheduler awareness (Slurm detection + the user's queue),
     /// cached + single-flight; empty-tagged on a laptop. Never persisted.
     pub(crate) compute: compute::ComputeService,
@@ -217,6 +227,8 @@ impl AppState {
             tickets: Mutex::new(fs::TicketStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             git: git::GitService::new(),
+            board_epochs: Mutex::new(HashMap::new()),
+            board_git_settle: Mutex::new(HashMap::new()),
             compute: compute::ComputeService::new(),
             changes: tokio::sync::Notify::new(),
             restored: tokio::sync::watch::channel(true).0,

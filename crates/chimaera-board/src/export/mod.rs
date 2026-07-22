@@ -8,11 +8,12 @@
 //! text, and declares a per-object fate ([`ObjectFate`]) so degradation is
 //! stated before the file is opened, never discovered after.
 
+mod chart_xml;
 pub mod pdf;
 pub mod pptx;
 pub mod svg;
 
-pub use pptx::write_pptx;
+pub use pptx::{write_pptx, write_pptx_with, ChartFidelity, PptxOptions};
 
 use serde::Serialize;
 

@@ -177,6 +177,31 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeM
                 describe_object(s, child, depth + 1, resolved);
             }
         }
+        Object::Table(t) => {
+            let _ = write!(
+                s,
+                "{indent}{} table{geo} · {}×{}",
+                t.id,
+                t.rows.len(),
+                t.column_count()
+            );
+            if t.header {
+                let _ = write!(s, " · header");
+            }
+            // The first row is the cheapest orientation: usually the header,
+            // always the top of what the human sees.
+            if let Some(first) = t.rows.first() {
+                let preview = first
+                    .iter()
+                    .map(|c| c.plain_text())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                if !preview.is_empty() {
+                    let _ = write!(s, ": {}", truncate(&preview, 60));
+                }
+            }
+            let _ = writeln!(s);
+        }
         Object::Chart(c) => {
             let marks = c
                 .marks
@@ -348,6 +373,29 @@ mod tests {
         assert!(out.contains("from command"), "{out}");
         // An image with provenance prints as plot.
         assert!(out.contains("fig plot"), "{out}");
+    }
+
+    #[test]
+    fn describe_prints_a_tables_dims_header_and_first_row() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Tables",
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"bench-table","type":"table","at":[80,80],"size":[480,160],
+                   "header":true,
+                   "rows":[["Fixture","Before","After"],
+                           ["large.json","812","244"]]}]}]}"#,
+        )
+        .unwrap();
+        crate::normalize(&mut b);
+        let out = describe(&b);
+        assert!(
+            out.contains(
+                "bench-table table at [80, 80] size [480, 160] · 2×3 · header: \
+                 Fixture | Before | After"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

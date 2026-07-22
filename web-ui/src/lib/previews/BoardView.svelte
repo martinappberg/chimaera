@@ -2,14 +2,16 @@
   /**
    * The board pane: server-rendered raster stage + outline rail + numeric
    * inspector + page navigator, plus present mode, corner-resize handles,
-   * an actor-aware undo stack, and agent-edit attribution flashes.
+   * an actor-aware undo stack, agent-edit attribution flashes, an in-place
+   * text editor (double-click or Enter on a text-bearing object), and the
+   * §6.4 selection-as-deixis "send to chat" affordance.
    *
    * Layout truth is server-side — the stage shows exactly the engine's pixels,
    * never a DOM re-layout of the scene. The client parses the board JSON only
    * for *identity and geometry* (hit-testing, the outline, the inspector
-   * numbers), which are the file's own literal values, not derived layout.
-   * Every mutation routes through POST /board/edit so the canonical
-   * byte-stable writer stays the one authority on bytes.
+   * numbers, editor seeds), which are the file's own literal values, not
+   * derived layout. Every mutation routes through POST /board/edit so the
+   * canonical byte-stable writer stays the one authority on bytes.
    */
   import { untrack } from "svelte";
   import { fsBoardEdit, fsBoardRender, midTruncate, type BoardRender } from "./files";
@@ -17,14 +19,20 @@
   import {
     attributeDiff,
     boardFrames,
+    composeBoardContext,
     CORNERS,
+    editorFontPx,
+    editorTextToParagraphs,
     GRID_PT,
     MIN_RESIZE_PT,
     pageFrames,
+    paragraphsToEditorText,
     parseBoard,
     resizeFrame,
     samePair,
+    sameParagraphs,
     snap8,
+    snapshotRegion,
     UndoStack,
     type BoardInfo,
     type Corner,
@@ -33,14 +41,20 @@
     type Frame,
     type ObjInfo,
   } from "./boardInteract";
+  import { referenceTarget, workspaceRelative } from "../shared/reference";
+  import { matchChord, PINNED, REFERENCE_CHORD } from "../shared/keys";
+  import { attachImageToComposer, insertIntoComposer } from "../chat/composerBus";
+  import { IMAGE_MAX_BASE64, IMAGE_MAX_DIM, type ImageAttachment } from "../chat/images";
   import BoardPresentChrome from "./BoardPresentChrome.svelte";
   import BoardRail from "./BoardRail.svelte";
   import Spinner from "./Spinner.svelte";
 
   interface Props {
     path: string;
+    /** Active workspace root, for the deixis context line's relative path. */
+    wsRoot?: string | null;
   }
-  let { path }: Props = $props();
+  let { path, wsRoot = null }: Props = $props();
 
   // --- file entry: revalidation signal -----------------------------------
   let entry = $state<FileEntry | null>(null);
@@ -151,8 +165,8 @@
     return () => ro.disconnect();
   });
 
-  /** Board-point coordinates of a pointer event on the stage. */
-  function toPt(ev: PointerEvent): [number, number] {
+  /** Board-point coordinates of a pointer/mouse event on the stage. */
+  function toPt(ev: MouseEvent): [number, number] {
     const host = stageEl?.getBoundingClientRect();
     if (host === undefined || ptScale === 0) return [0, 0];
     return [
@@ -222,7 +236,11 @@
   }
 
   function onPointerDown(ev: PointerEvent): void {
-    if (ev.button !== 0 || presenting) return;
+    // While the text editor is open the stage underneath is inert: no drag,
+    // resize, or reselection may start beneath it. A press outside the
+    // textarea still blurs it, which commits and closes — the next press
+    // interacts normally.
+    if (ev.button !== 0 || presenting || textEdit !== null) return;
     // Focus scoping for the undo keys: only the pane the user is working in
     // may answer ⌘Z (multiple board panes, terminals, editors coexist).
     rootEl?.focus({ preventScroll: true });
@@ -317,14 +335,20 @@
 
   function commit(
     id: string,
-    change: { at?: [number, number]; size?: [number, number] },
+    change: { at?: [number, number]; size?: [number, number]; text?: string[] },
   ): Promise<void> {
     commitChain = commitChain.then(async () => {
       saving = true;
       saveError = null;
       try {
         const mtime = await fsBoardEdit(path, id, change);
-        ownExpected.set(id, { ...change });
+        // Only geometry participates in the attribution diff (a text change
+        // moves no frame), so a text-only commit must not clobber a still-
+        // pending geometry expectation for the same object.
+        const expected: ExpectedChange = {};
+        if (change.at !== undefined) expected.at = change.at;
+        if (change.size !== undefined) expected.size = change.size;
+        if (expected.at !== undefined || expected.size !== undefined) ownExpected.set(id, expected);
         if (mtime !== null) {
           ownWrites.add(mtime);
           if (ownWrites.size > 64) {
@@ -367,6 +391,95 @@
     }
   }
 
+  // --- in-place text editing ----------------------------------------------
+  /** The open inline editor: which object, the live textarea value, and the
+   *  seed paragraphs (the no-change gate + the font approximation's line
+   *  count). Editing is offered only where `ObjInfo.text` is non-null — the
+   *  kinds the /board/edit text op accepts. */
+  let textEdit = $state<{ id: string; value: string; seed: string[] } | null>(null);
+  let editorEl = $state<HTMLTextAreaElement | null>(null);
+
+  function beginTextEdit(o: ObjInfo): void {
+    if (presenting || o.text === null || o.at === null || o.size === null) return;
+    selected = o.id;
+    drag = null;
+    textEdit = { id: o.id, value: paragraphsToEditorText(o.text), seed: o.text };
+  }
+
+  /**
+   * Close the editor. `commitValue` false is the Esc cancel; `refocus` is
+   * keyboard-close only — a blur-driven close must not yank focus back from
+   * wherever the user just clicked. Nulls the state FIRST so the blur that
+   * follows a keyboard close cannot double-commit. A no-change commit sends
+   * nothing (rich styled runs survive exactly by not being rewritten).
+   */
+  function closeTextEdit(commitValue: boolean, refocus = false): void {
+    const ed = textEdit;
+    if (ed === null) return;
+    textEdit = null;
+    if (refocus) rootEl?.focus({ preventScroll: true });
+    if (!commitValue) return;
+    const paras = editorTextToParagraphs(ed.value);
+    if (sameParagraphs(paras, ed.seed)) return;
+    // Text edits stay off the undo stack: its actor-rule staleness check is
+    // frame-based (§6.7); the journal still records the TextEdited event.
+    void commit(ed.id, { text: paras });
+  }
+
+  function onEditorKey(ev: KeyboardEvent): void {
+    // The editor owns its keys — nothing bubbles to the pane/window handlers
+    // (undo chord, Enter-to-edit, app chords) while typing. Plain Enter falls
+    // through to the textarea's native newline.
+    ev.stopPropagation();
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeTextEdit(false, true);
+    } else if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+      ev.preventDefault();
+      closeTextEdit(true, true);
+    }
+  }
+
+  function onDblClick(ev: MouseEvent): void {
+    if (presenting || textEdit !== null) return;
+    const target = hit(toPt(ev));
+    if (target === null || target.text === null) return;
+    beginTextEdit(target);
+  }
+
+  // The editor's overlay frame in stage pixels, tracking the object's own
+  // literal geometry (an agent moving it mid-edit moves the editor with it).
+  const editorBox = $derived.by(() => {
+    const ed = textEdit;
+    if (ed === null) return null;
+    const o = pageObjects.find((x) => x.id === ed.id);
+    if (o === undefined || o.at === null || o.size === null) return null;
+    return {
+      left: stageOrigin[0] + o.at[0] * ptScale,
+      top: stageOrigin[1] + o.at[1] * ptScale,
+      width: Math.max(48, o.size[0] * ptScale),
+      height: Math.max(28, o.size[1] * ptScale),
+      font: editorFontPx(o.size, ptScale, Math.max(1, ed.seed.length)),
+    };
+  });
+
+  // Autofocus on open, caret at the end (the seed is existing prose, not a
+  // field to overtype).
+  $effect(() => {
+    const el = editorEl;
+    if (el === null) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  });
+
+  // If the edited object vanishes (agent deleted it, page switched under a
+  // clamp), drop the editor without committing — there is nothing to anchor
+  // a write to. Reads and writes textEdit, but the null write terminates it.
+  $effect(() => {
+    const ed = textEdit;
+    if (ed !== null && !pageObjects.some((o) => o.id === ed.id)) textEdit = null;
+  });
+
   // --- actor-aware undo (§6.7) --------------------------------------------
   const undoStack = new UndoStack();
   let toast = $state<string | null>(null);
@@ -405,6 +518,130 @@
       if (t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
       ev.preventDefault();
       runUndoRedo(ev.shiftKey);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // --- selection-as-deixis (§6.4) -----------------------------------------
+  /** The reference target only when it is a chat session: composerBus can
+   *  insert into a mounted (or mounting) chat Composer, but Chimaera never
+   *  types into a TUI's PTY. */
+  const chatTarget = $derived(
+    $referenceTarget !== null && $referenceTarget.ui === "chat" ? $referenceTarget : null,
+  );
+  const sendableFrame = $derived(
+    selectedObj !== null && selectedObj.at !== null && selectedObj.size !== null,
+  );
+  let snapshotBusy = $state(false);
+  const canSendToChat = $derived(
+    chatTarget !== null && sendableFrame && board !== null && !snapshotBusy,
+  );
+  const sendTitle = $derived.by(() => {
+    if (chatTarget === null) return "no chat-mode agent to send to — open an agent in chat view";
+    if (!sendableFrame) return "select an object on the stage first";
+    return `send selection to ${chatTarget.name} (${PINNED.reference})`;
+  });
+
+  /**
+   * Crop the selection's padded bounds out of the server's own page render.
+   * The render request matches the stage's (content-addressed server cache →
+   * a stat + ticket mint, not a re-render); /board/render has no region
+   * parameter today, so the object scoping happens here — still exclusively
+   * the engine's pixels, never a DOM re-layout. Caps mirror chat/images.ts.
+   */
+  async function snapshotAttachment(region: Frame, label: string): Promise<ImageAttachment | null> {
+    const scale = Math.min(4, Math.max(1, window.devicePixelRatio || 1));
+    const r = await fsBoardRender(path, page, scale);
+    const resp = await fetch(`/raw/${r.ticket}`);
+    if (!resp.ok) throw new Error(`snapshot fetch failed (${resp.status})`);
+    const bitmap = await createImageBitmap(await resp.blob());
+    const b = board;
+    if (b === null) return null;
+    const pxPerPt = bitmap.width / b.canvas[0];
+    const sx = Math.max(0, Math.floor(region.at[0] * pxPerPt));
+    const sy = Math.max(0, Math.floor(region.at[1] * pxPerPt));
+    const sw = Math.min(bitmap.width - sx, Math.ceil(region.size[0] * pxPerPt));
+    const sh = Math.min(bitmap.height - sy, Math.ceil(region.size[1] * pxPerPt));
+    if (sw < 1 || sh < 1) return null;
+    const shrink = Math.min(1, IMAGE_MAX_DIM / Math.max(sw, sh));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(sw * shrink));
+    canvas.height = Math.max(1, Math.round(sh * shrink));
+    canvas.getContext("2d")?.drawImage(bitmap, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    const url = canvas.toDataURL("image/png");
+    const data = url.slice(url.indexOf(",") + 1);
+    if (data.length > IMAGE_MAX_BASE64) return null;
+    return { media_type: "image/png", data, label: `${label} ${canvas.width}×${canvas.height}` };
+  }
+
+  /**
+   * §6.4: push the compact context line + an object-scoped region snapshot
+   * into the target chat composer via composerBus. The context line goes
+   * even when the snapshot pipeline hiccups — pointing still works without
+   * pixels, and the toast says which happened.
+   */
+  async function sendSelectionToChat(): Promise<void> {
+    const b = board;
+    const o = selectedObj;
+    const target = chatTarget;
+    if (b === null || o === null || o.at === null || o.size === null || target === null) return;
+    if (snapshotBusy) return;
+    const pageId = b.pages[page]?.id ?? `page-${page + 1}`;
+    const rel = wsRoot !== null ? workspaceRelative(path, wsRoot) : path;
+    const context = composeBoardContext(rel, pageId, [o.id]);
+    const region = snapshotRegion([{ at: o.at, size: o.size }], b.canvas);
+    snapshotBusy = true;
+    let attachment: ImageAttachment | null = null;
+    let failed = false;
+    try {
+      if (region !== null) attachment = await snapshotAttachment(region, `board ${o.id}`);
+    } catch {
+      failed = true;
+    } finally {
+      snapshotBusy = false;
+    }
+    insertIntoComposer(target.id, context);
+    if (attachment !== null) attachImageToComposer(target.id, attachment);
+    showToast(
+      attachment !== null
+        ? `sent ${o.id} to ${target.name}`
+        : `sent ${o.id} to ${target.name}${failed ? " — snapshot failed" : " (no snapshot)"}`,
+    );
+  }
+
+  // Pane-local keys, same focus-containment pattern as the undo chord: Enter
+  // opens the inline editor on a selected text-bearing object; the pinned
+  // reference chord (⇧⌘R) sends the selection to the chat composer. Interactive
+  // targets keep their own Enter, and a defaultPrevented chord means the
+  // app-level reference bridge already claimed it (a live text selection).
+  $effect(() => {
+    const onKey = (ev: KeyboardEvent): void => {
+      if (presenting || textEdit !== null) return;
+      const root = rootEl;
+      if (root === null || !root.contains(document.activeElement)) return;
+      const t = ev.target;
+      if (
+        t instanceof HTMLElement &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "BUTTON" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      )
+        return;
+      if (ev.key === "Enter" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
+        const o = selectedObj;
+        if (o !== null && o.text !== null && o.at !== null && o.size !== null) {
+          ev.preventDefault();
+          beginTextEdit(o);
+        }
+        return;
+      }
+      if (matchChord(ev, REFERENCE_CHORD) !== null && !ev.defaultPrevented && canSendToChat) {
+        ev.preventDefault();
+        void sendSelectionToChat();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -591,6 +828,7 @@
       onpointermove={onPointerMove}
       onpointerup={onPointerUp}
       onpointercancel={() => (drag = null)}
+      ondblclick={onDblClick}
     >
       {#if imgUrl !== null}
         <img
@@ -626,6 +864,26 @@
               style:height={`${f.size[1] * ptScale}px`}
             ></div>
           {/each}
+          {#if textEdit !== null && editorBox !== null}
+            <!-- The overlay covers the object's rendered text at the same
+                 frame; the styling is deliberately editor-chrome, not a
+                 WYSIWYG imitation — layout truth stays server-side. -->
+            <textarea
+              class="text-editor"
+              bind:this={editorEl}
+              bind:value={textEdit.value}
+              style:left={`${editorBox.left}px`}
+              style:top={`${editorBox.top}px`}
+              style:width={`${editorBox.width}px`}
+              style:height={`${editorBox.height}px`}
+              style:font-size={`${editorBox.font}px`}
+              aria-label="edit object text (Esc cancels, ⌘/Ctrl+Enter commits)"
+              spellcheck="false"
+              onkeydown={onEditorKey}
+              onblur={() => closeTextEdit(true)}
+              ondblclick={(e) => e.stopPropagation()}
+            ></textarea>
+          {/if}
         {/if}
       {:else if renderError !== null}
         <div class="board-error">{renderError}</div>
@@ -675,6 +933,13 @@
         {:else if saveError !== null}
           <span class="save-state err" title={saveError}>{midTruncate(saveError, 60)}</span>
         {/if}
+        <button
+          class="nav wide"
+          disabled={!canSendToChat}
+          onclick={() => void sendSelectionToChat()}
+          aria-label="send selection to chat"
+          title={sendTitle}>{snapshotBusy ? "sending…" : "send to chat"}</button
+        >
         <button class="nav wide" onclick={enterPresent} aria-label="present" title="present"
           >present</button
         >
@@ -778,6 +1043,23 @@
     pointer-events: none;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
     animation: flash-fade 1.2s ease-out forwards;
+  }
+  .text-editor {
+    position: absolute;
+    box-sizing: border-box;
+    padding: 2px 6px;
+    background: var(--term-bg);
+    color: var(--fg);
+    border: 1.5px solid var(--accent);
+    border-radius: 2px;
+    outline: none;
+    resize: none;
+    overflow: auto;
+    line-height: 1.3;
+    font-family: inherit;
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent),
+      0 2px 12px var(--scrim);
   }
   @keyframes flash-fade {
     from {

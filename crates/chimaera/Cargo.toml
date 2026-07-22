@@ -24,3 +24,15 @@ chimaera-board.workspace = true
 chimaera-core.workspace = true
 chimaera-remote.workspace = true
 chimaera-server.workspace = true
+
+[dev-dependencies]
+# The PDF-import tests build their fixture in-test instead of committing a
+# binary one; same pin as chimaera-board's export dependency.
+pdf-writer = "0.12"
+
+[features]
+# `board import fig.pdf` (hayro rasterization). Off by default — and off in
+# CI and the release matrix — because the PDF interpreter stack is real
+# weight on the static musl binary; see chimaera-board's feature of the
+# same name.
+pdf-import = ["chimaera-board/pdf-import"]

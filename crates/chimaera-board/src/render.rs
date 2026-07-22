@@ -21,9 +21,14 @@ use crate::chart::{ChartItem, TextAnchor};
 use crate::layout::{css_font_family, FontStack};
 use crate::normalize::{Diagnostic, Severity};
 use crate::schema::{
-    Align, Board, ConnectorObject, Frame, Object, Page, Paragraph, Run, Side, VAlign,
+    Align, Board, ConnectorObject, Frame, Object, Page, Paragraph, Run, Side, TableObject, VAlign,
 };
 use crate::theme::{Rgb, Theme};
+
+/// Fixed table-cell padding in points. One number shared by the renderer, the
+/// cell-overfull lint and the PPTX writer's `a:tcPr` margins, so the pane and
+/// the deck agree about where cell text sits.
+pub(crate) const TABLE_CELL_PAD_PT: f64 = 6.0;
 
 /// The raster ceiling, in pixels. 12 Mpx is a 4K slide at 2× with headroom;
 /// past it a render request is a mistake or an attack on daemon RSS, and the
@@ -397,6 +402,16 @@ fn emit_object(
                     diags,
                 );
             }
+        }
+        Object::Table(t) => {
+            let Some(frame) = frame else {
+                diags.push(
+                    Diagnostic::new(Severity::Warning, "table has no position; skipped")
+                        .at(&page.id, obj.id()),
+                );
+                return;
+            };
+            emit_table(s, t, frame, theme, fonts, &page.id, diags);
         }
         Object::Connector(c) => emit_connector(s, c, theme, fonts, index, diags, &page.id),
         Object::Image(img) => {
@@ -1013,6 +1028,113 @@ fn emit_shape(
                 f.h,
                 edge.hex()
             );
+        }
+    }
+}
+
+/// A table as a deterministic grid: header fill, hairline strokes, cell text
+/// through the same text stack as every other glyph.
+///
+/// Geometry rule, stated because it is a format-visible decision: columns
+/// take [`TableObject::column_widths`] (stated weights or an equal split) and
+/// **rows split the box height equally** — content never resizes the grid.
+/// An overfull cell reports (here and in `lint --style`) rather than silently
+/// pushing later rows around, exactly as a text box reports rather than
+/// autofitting.
+#[allow(clippy::too_many_arguments)]
+fn emit_table(
+    s: &mut String,
+    t: &TableObject,
+    f: Frame,
+    theme: &Theme,
+    fonts: &FontStack,
+    page_id: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let cols = t.column_count();
+    if t.rows.is_empty() || cols == 0 {
+        diags.push(
+            Diagnostic::new(Severity::Warning, "table has no cells; skipped").at(page_id, &t.id),
+        );
+        return;
+    }
+    let widths = t.column_widths(f.w);
+    let row_h = f.h / t.rows.len() as f64;
+
+    // Z-order within the table: header ground, then the grid, then glyphs.
+    if t.header {
+        let surface = theme.color("@surface").unwrap_or_else(|| theme.bg());
+        let _ = write!(
+            s,
+            r#"<rect x="{}" y="{}" width="{}" height="{row_h}" fill="{}"/>"#,
+            f.x,
+            f.y,
+            f.w,
+            surface.hex()
+        );
+    }
+    let edge = theme.color("@edge").unwrap_or_else(|| theme.bg());
+    for r in 0..=t.rows.len() {
+        let y = f.y + row_h * r as f64;
+        let _ = write!(
+            s,
+            r#"<line x1="{}" y1="{y}" x2="{}" y2="{y}" stroke="{}" stroke-width="1"/>"#,
+            f.x,
+            f.right(),
+            edge.hex()
+        );
+    }
+    // Column boundaries: one line per left edge, then the right edge.
+    let mut x = f.x;
+    let vline = |s: &mut String, x: f64| {
+        let _ = write!(
+            s,
+            r#"<line x1="{x}" y1="{}" x2="{x}" y2="{}" stroke="{}" stroke-width="1"/>"#,
+            f.y,
+            f.bottom(),
+            edge.hex()
+        );
+    };
+    for width in &widths {
+        vline(s, x);
+        x += width;
+    }
+    vline(s, x);
+
+    let role = t
+        .role
+        .as_deref()
+        .and_then(|r| theme.role(r))
+        .unwrap_or_else(|| theme.body());
+    let pad = TABLE_CELL_PAD_PT;
+    for (ri, row) in t.rows.iter().enumerate() {
+        let mut cx = f.x;
+        for (ci, cell) in row.iter().enumerate() {
+            let inner = Frame {
+                x: cx + pad,
+                y: f.y + row_h * ri as f64 + pad,
+                w: (widths[ci] - pad * 2.0).max(1.0),
+                h: (row_h - pad * 2.0).max(1.0),
+            };
+            let paras = if t.header && ri == 0 {
+                vec![TableObject::header_cell(cell)]
+            } else {
+                vec![cell.clone()]
+            };
+            emit_text_block(
+                s,
+                &paras,
+                inner,
+                role,
+                Some(Align::Left),
+                Some(VAlign::Top),
+                theme,
+                fonts,
+                page_id,
+                &t.id,
+                diags,
+            );
+            cx += widths[ci];
         }
     }
 }
@@ -1703,6 +1825,66 @@ mod tests {
         let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
         assert!(!svg.contains("<script"), "unescaped markup: {svg}");
         assert!(svg.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn a_table_renders_its_grid_and_cell_text() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"tb","type":"table","at":[80,80],"size":[480,160],"header":true,
+                   "rows":[["Fixture","Before","After"],
+                           ["large.json","812","244"]]}]}]}"#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        for text in ["Fixture", "Before", "After", "large.json", "812", "244"] {
+            assert!(svg.contains(text), "missing cell text {text:?}: {svg}");
+        }
+        // The hairline grid: 3 horizontal lines (2 rows) + 4 vertical (3 cols),
+        // all in the theme's edge color.
+        let edge = theme.color("@edge").unwrap().hex();
+        let grid_lines = svg
+            .matches(&format!(r#"stroke="{edge}" stroke-width="1""#))
+            .count();
+        assert_eq!(grid_lines, 7, "{svg}");
+        // The header row ground is the surface token.
+        let surface = theme.color("@surface").unwrap().hex();
+        assert!(
+            svg.contains(&format!(r#"height="80" fill="{surface}""#)),
+            "{svg}"
+        );
+        // Header cells render bold; body cells at the role weight.
+        assert!(svg.contains(r#"font-weight="700""#), "{svg}");
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_overfull_table_cell_reports_rather_than_resizing() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"tb","type":"table","at":[80,80],"size":[240,48],
+                   "rows":[["a cell holding far more prose than a 24 pt row can seat","b"],
+                           ["c","d"]]}]}]}"#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let _ = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.object.as_deref() == Some("tb") && d.message.contains("overfull")),
+            "{diags:?}"
+        );
     }
 
     #[test]

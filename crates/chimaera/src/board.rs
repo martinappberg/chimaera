@@ -100,13 +100,21 @@ pub enum BoardCmd {
         /// to .chimaera/board/exports/<stem>.<ext>.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Chart fidelity, pptx only: `grouped` (the default — editable
+        /// vector shapes, safe in every consumer) or `native` (real c:chart
+        /// parts with an embedded workbook; charts the native writer cannot
+        /// express fall back per-chart with the reason in the fate line).
+        /// Opt-in until the hand-verified PowerPoint "Edit Data" pass.
+        #[arg(long, default_value = "grouped")]
+        charts: String,
     },
     /// Import a figure (.svg/.png/.jpg → an `image` object, copied into
-    /// .chimaera/board/assets/) or a mermaid flowchart (.mmd → a `diagram`
-    /// object, converted once with the source as provenance), appended to a
-    /// board.
+    /// .chimaera/board/assets/), a mermaid flowchart (.mmd → a `diagram`
+    /// object, converted once with the source as provenance), or — in a
+    /// build with the `pdf-import` feature — one page of a .pdf rasterized
+    /// to a PNG asset, appended to a board.
     Import {
-        /// The figure or mermaid file, or `-` for mermaid on stdin.
+        /// The figure, mermaid, or PDF file, or `-` for mermaid on stdin.
         path: PathBuf,
         /// The board to append to; created with one page when it does not
         /// exist yet.
@@ -122,6 +130,12 @@ pub enum BoardCmd {
         /// `<!-- chimaera:regen ... -->` comment inside an SVG).
         #[arg(long)]
         regen: Option<String>,
+        /// PDF only: the 1-based source page to rasterize (default 1).
+        #[arg(long)]
+        pdf_page: Option<usize>,
+        /// PDF only: rasterization density (default 300, capped at 600).
+        #[arg(long)]
+        dpi: Option<f64>,
     },
     /// Adopt a shown card into the workspace: move it to
     /// boards/<id>.board.json (git-visible — that is the point), or append
@@ -227,6 +241,25 @@ pub enum BoardCmd {
         /// .theme.json path).
         theme_id: String,
     },
+    /// Three-way merge two board histories per object id, git-merge-driver
+    /// compatible: `merge.board.driver = chimaera board merge %O %A %B`. The
+    /// result overwrites OURS; exits 0 on a clean merge, 1 with conflicts
+    /// (the file still carries the ours-wins best effort — how a driver
+    /// signals "look at my stderr report").
+    Merge {
+        /// The common ancestor (git's %O).
+        base: PathBuf,
+        /// Our side (git's %A) — rewritten with the merge result.
+        ours: PathBuf,
+        /// Their side (git's %B).
+        theirs: PathBuf,
+        /// Write the result here instead of overwriting OURS.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Print the conflict report without writing anything.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 pub fn run(cmd: BoardCmd) -> Result<()> {
@@ -259,14 +292,17 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             format,
             page,
             out,
-        } => export(&path, &format, page, out),
+            charts,
+        } => export(&path, &format, page, out, &charts),
         BoardCmd::Import {
             path,
             to,
             page,
             id,
             regen,
-        } => import(&path, &to, page, id, regen),
+            pdf_page,
+            dpi,
+        } => import(&path, &to, page, id, regen, pdf_page, dpi),
         BoardCmd::Adopt {
             shown_id_or_path,
             to,
@@ -303,6 +339,13 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             cols,
         } => arrange(&path, &op, &ids, gap, cols),
         BoardCmd::ValidateTheme { theme_id } => validate_theme(&theme_id),
+        BoardCmd::Merge {
+            base,
+            ours,
+            theirs,
+            out,
+            check,
+        } => merge(&base, &ours, &theirs, out, check),
     }
 }
 
@@ -442,6 +485,7 @@ fn show(
     };
     chimaera_board::save(&board_path, &board)?;
     chimaera_board::write_atomic(&png_path, &rendered.png)?;
+    append_shown_event(&board_path);
 
     if !quiet {
         let rel = |p: &Path| {
@@ -463,6 +507,20 @@ fn show(
         }
     }
     Ok(())
+}
+
+/// Journal the show: a `shown` event, actor `agent` (show is the agent's
+/// verb), on the written board's own journal — the surfacing signal a
+/// ShownCard consumer keys on (board plan §10). Best-effort: the card is
+/// already on disk and the one-line stdout is the contract, so a journal
+/// failure warns rather than failing a show that succeeded.
+fn append_shown_event(board_path: &Path) {
+    use chimaera_board::journal::{Actor, Event, EventKind, Journal};
+    let appended = Journal::open(&journal_path_for(board_path))
+        .and_then(|mut journal| journal.append(Event::new(Actor::Agent, EventKind::Shown)));
+    if let Err(err) = appended {
+        eprintln!("note: shown journal append failed: {err:#}");
+    }
 }
 
 fn parse_size(s: &str) -> Result<[f64; 2]> {
@@ -576,7 +634,23 @@ fn render(
 
 /// Export a board. SVG is per page (mirroring `render`); PDF — and PPTX,
 /// when its writer lands — take the whole deck as one document.
-fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) -> Result<()> {
+fn export(
+    path: &Path,
+    format: &str,
+    page: Option<usize>,
+    out: Option<PathBuf>,
+    charts: &str,
+) -> Result<()> {
+    // --charts is a pptx knob; validate up front so a typo is loud and a
+    // stray `--charts native` on an SVG export never silently no-ops.
+    let chart_fidelity = match charts {
+        "grouped" => chimaera_board::export::ChartFidelity::Grouped,
+        "native" => chimaera_board::export::ChartFidelity::Native,
+        other => bail!("unknown --charts {other:?}: use grouped | native"),
+    };
+    if chart_fidelity != chimaera_board::export::ChartFidelity::Grouped && format != "pptx" {
+        bail!("--charts applies to pptx only");
+    }
     let (board, diags) = load_normalized(path)?;
     for d in diags
         .iter()
@@ -655,8 +729,15 @@ fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) 
                 bail!("--page does not apply to pptx: the whole deck exports as one file");
             }
             let mut bytes = Vec::new();
-            let report =
-                chimaera_board::export::write_pptx(&board, &theme, &fonts, Some(&ws), &mut bytes)?;
+            let opts = chimaera_board::export::PptxOptions { chart_fidelity };
+            let report = chimaera_board::export::write_pptx_with(
+                &board,
+                &theme,
+                &fonts,
+                Some(&ws),
+                &opts,
+                &mut bytes,
+            )?;
             let dest = match out {
                 Some(o) => o,
                 None => exports_dir()?.join(format!("{stem}.pptx")),
@@ -805,16 +886,27 @@ fn resolve_page_index(
 }
 
 /// Dispatch an import by what the file actually is: figures by extension or
-/// magic bytes, mermaid by `.mmd` or a flowchart/graph header. Stdin stays
-/// mermaid — piping pixels through a terminal helps nobody.
+/// magic bytes, PDFs by `.pdf` or the `%PDF-` header, mermaid by `.mmd` or a
+/// flowchart/graph header. Stdin stays mermaid — piping pixels through a
+/// terminal helps nobody.
 fn import(
     path: &Path,
     to: &Path,
     page: Option<String>,
     id: Option<String>,
     regen: Option<String>,
+    pdf_page: Option<usize>,
+    dpi: Option<f64>,
 ) -> Result<()> {
+    // The PDF flags mean nothing to the other importers; say so out loud
+    // rather than silently dropping an explicit request.
+    let pdf_only_note = || {
+        if pdf_page.is_some() || dpi.is_some() {
+            eprintln!("note: --pdf-page/--dpi apply only to PDF imports; ignored");
+        }
+    };
     if path == Path::new("-") {
+        pdf_only_note();
         return import_mermaid(path, to, page, id);
     }
     let ext = path
@@ -822,20 +914,31 @@ fn import(
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     match ext.as_deref() {
-        Some("svg" | "png" | "jpg" | "jpeg") => import_figure(path, to, page, id, regen),
-        Some("mmd") => import_mermaid(path, to, page, id),
+        Some("svg" | "png" | "jpg" | "jpeg") => {
+            pdf_only_note();
+            import_figure(path, to, page, id, regen)
+        }
+        Some("pdf") => import_pdf(path, to, page, id, regen, pdf_page, dpi),
+        Some("mmd") => {
+            pdf_only_note();
+            import_mermaid(path, to, page, id)
+        }
         _ => {
             let bytes =
                 std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-            if looks_like_mermaid(&bytes) {
+            if chimaera_board::pdfimport::sniff_pdf(&bytes) {
+                import_pdf(path, to, page, id, regen, pdf_page, dpi)
+            } else if looks_like_mermaid(&bytes) {
+                pdf_only_note();
                 import_mermaid(path, to, page, id)
             } else if chimaera_board::imginfo::sniff_image(&bytes, &path.to_string_lossy())
                 != chimaera_board::imginfo::ImgKind::Unknown
             {
+                pdf_only_note();
                 import_figure(path, to, page, id, regen)
             } else {
                 bail!(
-                    "cannot tell what {} is: not .mmd/.svg/.png/.jpg, not mermaid source \
+                    "cannot tell what {} is: not .mmd/.svg/.png/.jpg/.pdf, not mermaid source \
                      (flowchart/graph), and not a recognizable image",
                     path.display()
                 )
@@ -1044,6 +1147,160 @@ fn import_figure(
         .unwrap_or_default();
     println!(
         "imported image {obj_id:?}{px_note} → {} (page {}) · asset {src_rel}",
+        to.display(),
+        board.pages[page_index].id
+    );
+    Ok(())
+}
+
+/// Rasterize one page of a PDF (feature `pdf-import`) into a PNG asset and
+/// append it as an `image` object — the same landing and insertion flow as
+/// `import_figure`. Provenance anchors on the *source* PDF: `sha256` is the
+/// PDF's digest (regenerating it flags the panel stale) and `source` records
+/// `path#page=N`. Compiled in every build; without the feature the board
+/// crate's stub returns the one clear refusal.
+fn import_pdf(
+    path: &Path,
+    to: &Path,
+    page: Option<String>,
+    id: Option<String>,
+    regen: Option<String>,
+    pdf_page: Option<usize>,
+    dpi: Option<f64>,
+) -> Result<()> {
+    use chimaera_board::pdfimport;
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let src_digest = sha256_hex(&bytes);
+    let pdf_page = pdf_page.unwrap_or(1);
+    let dpi_req = dpi.unwrap_or(300.0);
+    if dpi_req > pdfimport::MAX_DPI {
+        eprintln!("note: --dpi capped at {:.0}", pdfimport::MAX_DPI);
+    }
+    let raster = pdfimport::rasterize_pdf_page(bytes, pdf_page, dpi_req)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !chimaera_board::is_board_path(to) {
+        bail!(
+            "a board path ends in .board.json — try {}",
+            to.with_extension("board.json").display()
+        );
+    }
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let to_abs = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        cwd.join(to)
+    };
+    let ws = chimaera_board::workspace_root(&to_abs);
+    chimaera_board::ensure_board_dir(&ws)?;
+    let assets = chimaera_board::board_dir(&ws).join("assets");
+    std::fs::create_dir_all(&assets).with_context(|| format!("creating {}", assets.display()))?;
+
+    // Land the PNG under the figure convention: stem + source page names it,
+    // a name collision with different bytes gets a content-hash suffix —
+    // nothing is ever overwritten.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("figure");
+    let mut asset_name = format!("{stem}-p{pdf_page}.png");
+    let first = assets.join(&asset_name);
+    if first.exists()
+        && std::fs::read(&first)
+            .map(|b| b != raster.png)
+            .unwrap_or(true)
+    {
+        let png_digest = sha256_hex(&raster.png);
+        asset_name = format!("{stem}-p{pdf_page}-{}.png", &png_digest[..8]);
+    }
+    let dest = assets.join(&asset_name);
+    if !dest.exists() {
+        chimaera_board::write_atomic(&dest, &raster.png)?;
+    }
+    let src_rel = format!("{}/assets/{asset_name}", chimaera_board::BOARD_DIR);
+
+    let mut board = load_or_create_board(to)?;
+    // Fit into the canvas minus a margin, preserving aspect, never upscaling
+    // — the natural size is the PDF page's own point size.
+    let m = 48.0;
+    let bw = (board.canvas.width() - m * 2.0).max(200.0);
+    let bh = (board.canvas.height() - m * 2.0).max(160.0);
+    let [nw, nh] = raster.point_size;
+    let size = if nw > 0.0 && nh > 0.0 {
+        let scale = (bw / nw).min(bh / nh).min(1.0);
+        [nw * scale, nh * scale]
+    } else {
+        [bw, bh]
+    };
+
+    let obj_id = id.unwrap_or_else(|| {
+        // Page 1 keeps the bare stem like every figure; later pages carry
+        // the page so two panels from one PDF don't collide by default.
+        if pdf_page == 1 {
+            stem.to_string()
+        } else {
+            format!("{stem}-p{pdf_page}")
+        }
+    });
+    // Ids are the merge and journal key — refuse rather than auto-rename.
+    if board.objects().any(|(_, o)| o.id() == obj_id) {
+        bail!(
+            "id {obj_id:?} already exists in {}; pass --id",
+            to.display()
+        );
+    }
+    let page_index = resolve_page_index(&mut board, page.as_deref(), to)?;
+
+    let mut extra = chimaera_board::schema::Extra::default();
+    extra.insert(
+        "source".to_string(),
+        serde_json::Value::String(format!("{}#page={pdf_page}", path.display())),
+    );
+    let [px_w, px_h] = raster.pixel_size;
+    let image = chimaera_board::schema::ImageObject {
+        id: obj_id.clone(),
+        kind: chimaera_board::schema::ImageKind,
+        src: src_rel.clone(),
+        slot: None,
+        at: Some([m, m]),
+        size: Some(size),
+        src_rect: None,
+        provenance: Some(chimaera_board::schema::Provenance {
+            script: None,
+            regen,
+            sha256: Some(src_digest),
+            extra,
+        }),
+        pixel_size: Some([px_w as f64, px_h as f64]),
+        tint: None,
+        anchor: None,
+        alt: None,
+        link: None,
+        rotation: None,
+        extra: Default::default(),
+    };
+    board.pages[page_index]
+        .objects
+        .push(chimaera_board::Object::Image(image));
+    let diags = chimaera_board::normalize(&mut board);
+    let mut errors = 0;
+    for d in diags
+        .iter()
+        .filter(|d| d.severity != chimaera_board::Severity::Info)
+    {
+        eprintln!("{}", d.render());
+        if d.severity == chimaera_board::Severity::Error {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        bail!("{errors} error(s); nothing written");
+    }
+    chimaera_board::save(to, &board)?;
+    println!(
+        "imported image {obj_id:?} · {px_w}×{px_h} px · pdf page {pdf_page}/{} → {} (page {}) · asset {src_rel}",
+        raster.page_count,
         to.display(),
         board.pages[page_index].id
     );
@@ -1283,6 +1540,7 @@ fn merge_pages(
                 }
                 O::Legend(x) => fix(&mut x.id),
                 O::Colorbar(x) => fix(&mut x.id),
+                O::Table(x) => fix(&mut x.id),
                 O::Callout(x) => {
                     fix(&mut x.id);
                     if let Some(t) = &mut x.tail {
@@ -1867,6 +2125,46 @@ fn validate_theme(theme_id: &str) -> Result<()> {
     bail!("{} finding(s)", findings.len())
 }
 
+/// `board merge` — the per-object three-way merge, shaped as a git merge
+/// driver: base/ours/theirs are %O/%A/%B, the result overwrites OURS, and a
+/// non-zero exit means "conflicts — the file carries my ours-wins best
+/// effort" (the `bail!` after a successful write is deliberate: `main`
+/// exits 1 on `Err`, which is the driver convention for a conflicted merge).
+///
+/// Deliberately NO journal append: a merge driver runs from bare/index
+/// contexts — rebases, cherry-picks, CI — with no live session behind it,
+/// and minting journal events there would fabricate interactive history for
+/// a board nobody touched.
+fn merge(base: &Path, ours: &Path, theirs: &Path, out: Option<PathBuf>, check: bool) -> Result<()> {
+    let read = |p: &Path| -> Result<String> {
+        std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))
+    };
+    let outcome = chimaera_board::merge::merge(&read(base)?, &read(ours)?, &read(theirs)?)?;
+    // The report goes to stderr — git shows a driver's stderr to the user,
+    // and stdout stays clean for scripting.
+    for c in &outcome.conflicts {
+        eprintln!("{}", c.render());
+    }
+    if check {
+        if outcome.conflicts.is_empty() {
+            println!("clean merge");
+            return Ok(());
+        }
+        bail!("{} conflict(s)", outcome.conflicts.len());
+    }
+    let dest = out.unwrap_or_else(|| ours.to_path_buf());
+    chimaera_board::save(&dest, &outcome.board)?;
+    if outcome.conflicts.is_empty() {
+        println!("merged → {}", dest.display());
+        return Ok(());
+    }
+    bail!(
+        "{} conflict(s); {} carries the resolutions above",
+        outcome.conflicts.len(),
+        dest.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1992,5 +2290,176 @@ mod tests {
         assert!(looks_like_mermaid(b"%% a comment\nflowchart LR\na-->b"));
         assert!(looks_like_mermaid(b"graph TD\na-->b"));
         assert!(!looks_like_mermaid(b"<svg xmlns='x'/>"));
+    }
+
+    #[test]
+    fn show_appends_a_shown_event_to_the_cards_journal() {
+        // The surfacing signal (board plan §10): every show — including a
+        // re-show updating the same card — appends `shown`, actor agent, to
+        // the written board's own path-derived journal.
+        let dir = std::env::temp_dir().join(format!("chimaera-shown-event-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".chimaera/board")).unwrap();
+        let board_path = dir.join("card.board.json");
+        std::fs::write(
+            &board_path,
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"t","canvas":{"size":[100,100]},"pages":[]}"#,
+        )
+        .unwrap();
+
+        append_shown_event(&board_path);
+        append_shown_event(&board_path);
+
+        let events =
+            chimaera_board::journal::read_since(&journal_path_for(&board_path), 0).unwrap();
+        let lines: Vec<String> = events.iter().map(|e| e.render()).collect();
+        assert_eq!(
+            lines,
+            ["#1 agent showed this board", "#2 agent showed this board"],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn merge_verb_honors_the_git_driver_contract() {
+        // Exit-code + overwrite semantics: OURS is rewritten even when the
+        // merge conflicts (Err after the write), and --check writes nothing.
+        let dir = std::env::temp_dir().join(format!("chimaera-board-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, fill: &str| -> PathBuf {
+            let p = dir.join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"format":"chimaera.board","formatVersion":1,"canvas":{{"size":[960,540]}},
+                        "pages":[{{"id":"p1","objects":[{{"id":"box","type":"shape","geo":"rect",
+                        "at":[80,80],"size":[160,80],"fill":"{fill}"}}]}}]}}"#
+                ),
+            )
+            .unwrap();
+            p
+        };
+        let base = write("base.board.json", "@accent1");
+        let ours = write("ours.board.json", "@accent2");
+        let theirs = write("theirs.board.json", "@accent3");
+
+        // --check reports without touching OURS.
+        let before = std::fs::read_to_string(&ours).unwrap();
+        assert!(merge(&base, &ours, &theirs, None, true).is_err());
+        assert_eq!(std::fs::read_to_string(&ours).unwrap(), before);
+
+        // The real merge rewrites OURS with the ours-wins result AND errors,
+        // which is how a driver reports conflicts to git.
+        assert!(merge(&base, &ours, &theirs, None, false).is_err());
+        let merged = std::fs::read_to_string(&ours).unwrap();
+        assert!(merged.contains("@accent2"), "{merged}");
+        assert_ne!(merged, before, "rewritten canonically");
+
+        // A clean merge exits Ok. theirs == base → ours' edit wins silently.
+        let theirs_clean = write("theirs2.board.json", "@accent1");
+        merge(&base, &ours, &theirs_clean, None, false).unwrap();
+        assert!(std::fs::read_to_string(&ours).unwrap().contains("@accent2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-page 200×100 pt PDF with a full-bleed red rectangle, built
+    /// in-test (no binary fixtures in the repo).
+    fn tiny_pdf_fixture() -> Vec<u8> {
+        use pdf_writer::{Content, Finish, Pdf, Rect, Ref};
+
+        let catalog_id = Ref::new(1);
+        let page_tree_id = Ref::new(2);
+        let page_id = Ref::new(3);
+        let content_id = Ref::new(4);
+        let mut pdf = Pdf::new();
+        pdf.catalog(catalog_id).pages(page_tree_id);
+        pdf.pages(page_tree_id).kids([page_id]).count(1);
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, 200.0, 100.0));
+        page.parent(page_tree_id);
+        page.contents(content_id);
+        page.finish();
+        let mut content = Content::new();
+        content.set_fill_rgb(1.0, 0.0, 0.0);
+        content.rect(0.0, 0.0, 200.0, 100.0);
+        content.fill_nonzero();
+        pdf.stream(content_id, &content.finish());
+        pdf.finish()
+    }
+
+    /// A throwaway workspace with its own `.git` marker so `workspace_root`
+    /// stops there instead of walking out of the temp tree.
+    fn pdf_test_workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chimaera-board-pdfimport-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    #[cfg(feature = "pdf-import")]
+    #[test]
+    fn pdf_import_lands_the_png_with_provenance() {
+        let dir = pdf_test_workspace("full");
+        let pdf_path = dir.join("fig.pdf");
+        let pdf_bytes = tiny_pdf_fixture();
+        std::fs::write(&pdf_path, &pdf_bytes).unwrap();
+        let board_path = dir.join("deck.board.json");
+
+        import(&pdf_path, &board_path, None, None, None, None, None).unwrap();
+
+        // The rendered PNG landed under the shared asset convention.
+        let asset = dir.join(".chimaera/board/assets/fig-p1.png");
+        let png = std::fs::read(&asset).unwrap();
+        // 200×100 pt at the default 300 dpi.
+        assert_eq!(
+            chimaera_board::imginfo::png_dimensions(&png),
+            Some((833, 416))
+        );
+
+        // The image object carries the source PDF's digest + origin.
+        let board = chimaera_board::load(&board_path).unwrap();
+        let Some(chimaera_board::Object::Image(img)) =
+            board.pages[0].objects.iter().find(|o| o.id() == "fig")
+        else {
+            panic!("no image object landed");
+        };
+        assert_eq!(img.src, ".chimaera/board/assets/fig-p1.png");
+        assert_eq!(img.pixel_size, Some([833.0, 416.0]));
+        let prov = img.provenance.as_ref().unwrap();
+        assert_eq!(
+            prov.sha256.as_deref(),
+            Some(sha256_hex(&pdf_bytes).as_str())
+        );
+        let source = prov.extra["source"].as_str().unwrap();
+        assert!(source.ends_with("fig.pdf#page=1"), "{source}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "pdf-import"))]
+    #[test]
+    fn pdf_import_without_the_feature_says_how_to_get_it() {
+        let dir = pdf_test_workspace("stub");
+        let pdf_path = dir.join("fig.pdf");
+        std::fs::write(&pdf_path, tiny_pdf_fixture()).unwrap();
+        let err = import(
+            &pdf_path,
+            &dir.join("deck.board.json"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "this build lacks pdf-import (build with --features pdf-import)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,9 +6,11 @@ server-side, the BoardView pane shows the pixels and lets the human move
 things, and the agent reads the gestures back through `describe` and the
 semantic journal. The design source of truth is
 [docs/board-plan.md](../board-plan.md); **all planned slices 0–5 are
-implemented** (slice 6 — native `c:chart`/OMML — is opportunistic by design
-and not built; in-place rich-text editing ships as a plain-text edit op, not
-cosmic-text-wasm; hayro PDF import was skipped).
+implemented** (slice 6 is opportunistic by design: its native `c:chart` arm
+ships as an opt-in exporter mode — see Exports — while the OMML arm of
+`equation` is not built; in-place rich-text editing ships as a plain-text
+edit op, not cosmic-text-wasm; hayro PDF import exists but only behind the
+non-default `pdf-import` cargo feature — see CLI).
 
 **Where it lives.** Engine: `crates/chimaera-board/` — see its
 [map](../../crates/chimaera-board/AGENTS.md) for the module-by-module layout
@@ -30,7 +32,9 @@ on the full `.board.json` suffix. Chat card:
   serialization (a semantically identical save is byte-identical); lenient
   parsing — unknown fields round-trip, unknown/malformed objects are
   preserved-but-not-drawn.
-- Five primitives (`text`, `shape`, `connector`, `image`, `group`) +
+- Five primitives (`text`, `shape`, `connector`, `image`, `group`) + `table`
+  (cells are the same `Paragraph` text model; header row, relative column
+  widths, equal row split; exports as a native editable `a:tbl`) +
   composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
   `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
   to primitives at render/export time.
@@ -74,7 +78,46 @@ as actor `agent`) · `import` (mermaid / SVG / PNG figures into
 · `export --format pptx|pdf|svg|svg-outlined` · `theme-export --format
 mplstyle|json` · `rescheme` (recolor an existing SVG onto a theme) ·
 `validate-theme` (WCAG + OKLCH + Machado-2009 CVD all-pairs ΔE with the
-computed safe series cap).
+computed safe series cap) · `merge <base> <ours> <theirs> [--check] [-o]`
+(the git merge driver — see Merging below).
+
+**PDF-panel import** (`board import fig.pdf [--pdf-page N] [--dpi D]`) is
+feature-flagged: builds with `--features pdf-import` rasterize one page
+(1-based, default 1; dpi default 300, capped 600; refuses >200-page
+documents and >12 Mpx renders) via hayro into a PNG asset, with the source
+PDF's sha256 + `path#page=N` in provenance for staleness. Off by default —
+including CI and every release — because hayro's interpreter stack is real
+weight on the static musl binary; the mainline path stays "export SVG or
+PNG from your plotting code". A default build refuses `*.pdf` with the
+exact flag to rebuild with.
+
+## Merging
+
+`chimaera board merge <base> <ours> <theirs>` is a per-object three-way merge
+on slug ids (engine: `crates/chimaera-board/src/merge.rs`), shaped as a git
+merge driver. Wire it up per repo:
+
+```gitattributes
+# .gitattributes
+*.board.json merge=board
+```
+
+```sh
+git config merge.board.name "chimaera board merge"
+git config merge.board.driver "chimaera board merge %O %A %B"
+```
+
+Exit-code contract: **0** for a clean merge, **1** with conflicts — the
+result still overwrites `%A` (ours) with the ours-wins best effort, and the
+report (one human-readable line per conflict) goes to stderr. `--check`
+prints the report without writing; `-o OUT` writes elsewhere. Semantics:
+objects keyed by id globally (page restructuring never orphans them),
+one-side changes win silently, field-level three-way when both sides touched
+one object (both-different → ours + a conflict line), delete-vs-modify keeps
+the modified side, page membership follows the mover, theirs-only pages
+insert after their nearest surviving predecessor, output through the
+canonical byte-stable writer. Merges never touch the journal — a driver runs
+from bare/index contexts with no live session.
 
 ## Exports
 
@@ -86,6 +129,15 @@ pdf-writer document, embedded subsetted fonts) · SVG in text and outlined
 variants — all off the single `page_svg` emission. Per-object export tiers
 (`native`/`grouped`/`vector`/`raster`) with reason strings, gated by preset
 `exportFloor` in `lint --target`.
+
+Charts default to grouped editable shapes; `export --format pptx --charts
+native` opts into real `c:chart` parts with an embedded minimal workbook
+behind Edit Data, for charts that map cleanly (plain/grouped/stacked bars,
+lines, scatters on category or linear axes — anything else falls back
+per-chart with the reason in its fate line). Native stays **opt-in**: the
+board plan gates default-on behind a hand-verified "double-click → Edit Data
+opens" pass in desktop PowerPoint that has not run yet, and Google Slides
+flattens `c:chart` to a non-editable object either way.
 
 ## Daemon routes
 
@@ -123,8 +175,9 @@ seq-preserving compaction. Human gestures append from `/board/edit`; agent
 
 Slice 6's native `c:chart` and OMML equations (opportunistic, gated on the
 fidelity matrix); cosmic-text-wasm in-place editing (the `/board/edit` text
-op covers plain-text edits); hayro PDF-panel import (feature-flagged
-optional); the daemon-injected `shown` journal event (the ShownCard detects
+op covers plain-text edits); hayro PDF-panel import in *default* builds
+(implemented, but only behind the non-default `pdf-import` feature — see
+CLI); the daemon-injected `shown` journal event (the ShownCard detects
 client-side for now); server-side per-path edit serialization (client
 commits are chained; concurrent multi-client edits are last-writer-wins like
 `PUT /fs/file`).

@@ -246,7 +246,9 @@ pub fn page_metrics(page: &Page) -> ContentMetrics {
                 }
             }
             Object::Shape(_) => m.object_count += 1,
-            Object::Chart(_) | Object::Image(_) | Object::Diagram(_) => {
+            // A table is panel-like content: it claims a body slot exactly as
+            // a chart does, so it counts as a visual for layout selection.
+            Object::Chart(_) | Object::Image(_) | Object::Diagram(_) | Object::Table(_) => {
                 m.object_count += 1;
                 m.has_chart_or_image = true;
             }
@@ -328,6 +330,7 @@ pub fn anchor_of(obj: &Object) -> Option<&Anchor> {
         Object::Diagram(o) => o.anchor.as_ref(),
         Object::PanelLabel(o) => o.anchor.as_ref(),
         Object::Group(_)
+        | Object::Table(_)
         | Object::Connector(_)
         | Object::Scalebar(_)
         | Object::SigBracket(_)
@@ -346,6 +349,7 @@ fn explicit_size(obj: &Object) -> Option<[f64; 2]> {
         Object::Shape(o) => o.size,
         Object::Image(o) => o.size,
         Object::Group(o) => o.size,
+        Object::Table(o) => o.size,
         Object::Chart(o) => o.size,
         Object::Diagram(o) => o.size,
         // An anchored letter needs *a* box before its glyph is measured; the

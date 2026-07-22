@@ -322,6 +322,8 @@ mod tests {
                         page,
                         id,
                         regen,
+                        pdf_page,
+                        dpi,
                     },
             } => {
                 assert_eq!(path, std::path::PathBuf::from("arch.mmd"));
@@ -329,12 +331,77 @@ mod tests {
                 assert_eq!(page.as_deref(), Some("arch"));
                 assert_eq!(id.as_deref(), Some("backend"));
                 assert_eq!(regen, None);
+                assert_eq!(pdf_page, None);
+                assert_eq!(dpi, None);
             }
             _ => panic!("expected board import"),
         }
         // `--to` is how import knows the destination; without it the parse
         // must refuse rather than guess.
         assert!(Cli::try_parse_from(["chimaera", "board", "import", "arch.mmd"]).is_err());
+    }
+
+    #[test]
+    fn board_import_parses_the_pdf_flags() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "import",
+            "fig.pdf",
+            "--to",
+            "deck.board.json",
+            "--pdf-page",
+            "2",
+            "--dpi",
+            "150",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Import { pdf_page, dpi, .. },
+            } => {
+                assert_eq!(pdf_page, Some(2));
+                assert_eq!(dpi, Some(150.0));
+            }
+            _ => panic!("expected board import"),
+        }
+    }
+
+    #[test]
+    fn board_merge_parses_the_git_driver_shape() {
+        // Exactly `%O %A %B` positional — the .gitattributes driver line must
+        // keep parsing forever.
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "merge",
+            "base.board.json",
+            "ours.board.json",
+            "theirs.board.json",
+            "--check",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd:
+                    board::BoardCmd::Merge {
+                        base,
+                        ours,
+                        theirs,
+                        out,
+                        check,
+                    },
+            } => {
+                assert_eq!(base, std::path::PathBuf::from("base.board.json"));
+                assert_eq!(ours, std::path::PathBuf::from("ours.board.json"));
+                assert_eq!(theirs, std::path::PathBuf::from("theirs.board.json"));
+                assert_eq!(out, None);
+                assert!(check);
+            }
+            _ => panic!("expected board merge"),
+        }
+        // All three inputs are required.
+        assert!(Cli::try_parse_from(["chimaera", "board", "merge", "a", "b"]).is_err());
     }
 
     #[test]
