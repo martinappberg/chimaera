@@ -169,7 +169,10 @@
       if (win === null || doc === null) return; // cross-origin: leave as-is
       const raw = `${win.location.pathname}${win.location.search}`;
       // Prefixed navigations carry /proxy/{id}; rescued (absolute-path) ones
-      // land on root-form paths. Both name the same app location.
+      // land on root-form paths. Both name the same app location. A /proxy/
+      // path under a DIFFERENT id is the previous target's iframe still on
+      // screen mid-retarget — never record it as this target's location.
+      if (raw.startsWith("/proxy/") && !raw.startsWith(b)) return;
       const inApp = raw.startsWith(b) ? raw.slice(b.length) || "/" : raw;
       livePath = inApp;
       if (inApp !== path) onNavigate(inApp);
