@@ -18,6 +18,7 @@ mime_guess.workspace = true
 hostname.workspace = true
 rustix.workspace = true
 chimaera-agent.workspace = true
+chimaera-board.workspace = true
 chimaera-core.workspace = true
 chimaera-pty.workspace = true
 futures.workspace = true

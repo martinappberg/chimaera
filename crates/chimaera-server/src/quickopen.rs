@@ -187,6 +187,15 @@ pub(crate) fn walk_bounded(
         Some(list) => list.iter().any(|d| d == name),
         None => IGNORED_DIRS.contains(&name),
     };
+    // Board's generated output, matched by parent so a user's real `exports/`
+    // or `renders/` elsewhere stays indexed. Gitignored is not un-indexed —
+    // without this, render-every-turn fills a bare ⌘P with <hash>.png noise,
+    // and on Lustre the extra entries eat the walker's file cap, dropping
+    // real source files out of quick-open as a side effect of using boards.
+    let board_generated = |dir: &Path, name: &str| {
+        matches!(name, "renders" | "exports" | "journal" | "shown")
+            && dir.ends_with(".chimaera/board")
+    };
     let mut files = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -210,7 +219,7 @@ pub(crate) fn walk_bounded(
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = file_type.is_dir();
             if is_dir {
-                if ignored(&name) {
+                if ignored(&name) || board_generated(&dir, &name) {
                     continue;
                 }
                 if depth + 1 < max_depth {

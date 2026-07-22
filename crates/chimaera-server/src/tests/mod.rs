@@ -1,4 +1,5 @@
 mod agents;
+mod board;
 mod chat;
 mod download;
 mod environment;

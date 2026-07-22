@@ -3,6 +3,7 @@ mod agent_updates;
 mod agents;
 mod api;
 mod assets;
+mod board;
 mod chat;
 mod compute;
 mod compute_jobs;
