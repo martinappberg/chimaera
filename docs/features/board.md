@@ -155,8 +155,10 @@ flattens `c:chart` to a non-editable object either way.
 
 ## Daemon routes
 
-Bearer-authed `POST /api/v1/board/render` (content-addressed cache +
-diagnostics sidecar → `/raw` ticket), `/board/describe`, `/board/edit`
+Bearer-authed `POST /api/v1/board/render` (content-addressed cache — keyed by
+content *and* the render engine's version/epoch, so an upgraded daemon never
+serves the old engine's pixels — + diagnostics sidecar → `/raw` ticket),
+`/board/describe`, `/board/edit`
 (move/resize/text ops by object id; canonical save; appends actor-`human`
 journal events; returns `X-Mtime` + `journalSeq`). Blocking work under the
 shared fs semaphore; render cache capped at 256, atomic writes;

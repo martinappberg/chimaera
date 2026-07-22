@@ -125,31 +125,45 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("moving into {}", path.display()))
 }
 
-/// Cap a render-cache directory at `cap` PNGs, evicting oldest-modified
-/// first. Renders are pure and re-creatable, but they land in the *user's
-/// workspace* — often a quota-capped NFS home — at one file per committed
-/// gesture, gitignored and quickopen-hidden, so without a cap they are a
-/// slow invisible leak. Best-effort: an unreadable entry is skipped, never
-/// fatal.
+/// Prune a render-cache directory: sweep entries another engine build
+/// addressed — their keys embed [`render::RENDER_EPOCH`] + the crate version,
+/// so no current request can ever hit them again — then cap what remains at
+/// `cap` PNGs, evicting oldest-modified first. Renders are pure and
+/// re-creatable, but they land in the *user's workspace* — often a
+/// quota-capped NFS home — at one file per committed gesture, gitignored and
+/// quickopen-hidden, so without this they are a slow invisible leak.
+/// Best-effort: an unreadable entry is skipped, never fatal.
 pub fn prune_renders(dir: &Path, cap: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut pngs: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
-        .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((modified, e.path()))
-        })
-        .collect();
+    let live_prefix = format!("{}-", render::engine_fingerprint());
+    let mut pngs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for e in entries.filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "png") {
+            continue;
+        }
+        let current = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&live_prefix));
+        if !current {
+            let _ = std::fs::remove_file(&path);
+            // The diagnostics sidecar rides its PNG's lifetime.
+            let _ = std::fs::remove_file(path.with_extension("json"));
+            continue;
+        }
+        if let Some(modified) = e.metadata().ok().and_then(|m| m.modified().ok()) {
+            pngs.push((modified, path));
+        }
+    }
     if pngs.len() <= cap {
         return;
     }
     pngs.sort_by_key(|(t, _)| *t);
     for (_, path) in pngs.iter().take(pngs.len() - cap) {
         let _ = std::fs::remove_file(path);
-        // The diagnostics sidecar rides its PNG's lifetime.
         let _ = std::fs::remove_file(path.with_extension("json"));
     }
 }
@@ -274,6 +288,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not a board"), "{err}");
+    }
+
+    #[test]
+    fn prune_sweeps_other_epoch_renders_and_keeps_current_ones() {
+        let dir = std::env::temp_dir().join(format!("chimaera-board-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp = render::engine_fingerprint();
+        let live = dir.join(format!("{fp}-aaaaaaaaaaaaaaaa.png"));
+        // A pre-fingerprint bare-hash key, and an upgrade's foreign fingerprint.
+        let bare = dir.join("bbbbbbbbbbbbbbbb.png");
+        let foreign = dir.join("0.0.0r0-cccccccccccccccc.png");
+        let foreign_sidecar = foreign.with_extension("json");
+        for (p, bytes) in [
+            (&live, &b"png"[..]),
+            (&bare, &b"png"[..]),
+            (&foreign, &b"png"[..]),
+            (&foreign_sidecar, &b"{}"[..]),
+        ] {
+            std::fs::write(p, bytes).unwrap();
+        }
+        prune_renders(&dir, RENDER_CACHE_CAP);
+        assert!(live.exists(), "a current-engine render survives under cap");
+        assert!(!bare.exists(), "a pre-fingerprint render can never be hit");
+        assert!(
+            !foreign.exists(),
+            "another engine's render can never be hit"
+        );
+        assert!(!foreign_sidecar.exists(), "its sidecar rides its lifetime");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

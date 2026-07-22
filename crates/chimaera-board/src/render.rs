@@ -7,9 +7,12 @@
 //! text-to-path with the same `fontdb`, draws.
 //!
 //! Renders are content-addressed: the cache key is a digest of the canonical
-//! board bytes, the theme, and the raster parameters. A render is a pure
-//! function of those, so a cache hit is *correct*, not merely probably fine —
-//! and the cache never needs invalidation, only pruning.
+//! board bytes, the theme, the raster parameters — and the engine itself
+//! ([`RENDER_EPOCH`] + the crate version), because a render is a pure
+//! function of code as much as of content. A cache hit is *correct*, not
+//! merely probably fine — and the cache never needs invalidation, only
+//! pruning: an upgraded engine addresses different keys, and
+//! [`crate::prune_renders`] sweeps the generation no current key can reach.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -72,15 +75,46 @@ impl Default for RasterParams {
     }
 }
 
-/// The content-addressed key for a render.
+/// The rendering-engine epoch, part of every render key. Bump this whenever
+/// identical board bytes raster differently — a newly drawn object type, a
+/// glyph or layout fix, a changed placeholder — or an upgraded daemon serves
+/// PNGs the *old* engine drew (observed live during equation development).
+/// Released upgrades are already covered by the crate version in the
+/// fingerprint; the epoch exists for changes within one version, i.e. the
+/// dev loop, where the version is pinned at the 0.0.1 sentinel.
+pub const RENDER_EPOCH: u32 = 1;
+
+/// The engine identity folded into every render key and prefixed onto it —
+/// the visible prefix is what lets [`crate::prune_renders`] recognize, by
+/// name alone, entries no current key can ever address again.
+pub(crate) fn engine_fingerprint() -> String {
+    format!("{}r{}", env!("CARGO_PKG_VERSION"), RENDER_EPOCH)
+}
+
+/// The content-addressed key for a render: the engine fingerprint, a dash,
+/// then a digest over the fingerprint and everything else the raster is a
+/// pure function of.
 pub fn render_key(board_bytes: &str, theme: &Theme, page: usize, params: RasterParams) -> String {
+    fingerprinted_key(&engine_fingerprint(), board_bytes, theme, page, params)
+}
+
+fn fingerprinted_key(
+    fingerprint: &str,
+    board_bytes: &str,
+    theme: &Theme,
+    page: usize,
+    params: RasterParams,
+) -> String {
     let mut h = Sha256::new();
+    h.update(fingerprint.as_bytes());
     h.update(board_bytes.as_bytes());
     h.update(serde_json::to_string(theme).unwrap_or_default().as_bytes());
     h.update(page.to_le_bytes());
     h.update(params.scale.to_bits().to_le_bytes());
     let digest = h.finalize();
-    let mut s = String::with_capacity(16);
+    let mut s = String::with_capacity(fingerprint.len() + 17);
+    s.push_str(fingerprint);
+    s.push('-');
     for b in &digest[..8] {
         let _ = write!(s, "{b:02x}");
     }
@@ -1998,6 +2032,20 @@ mod tests {
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert_eq!(a, render_key("board-a", &theme, 0, RasterParams::default()));
+    }
+
+    #[test]
+    fn render_keys_change_across_engine_epochs() {
+        let theme = crate::theme::default_for(true);
+        let a = fingerprinted_key("0.0.1r1", "board-a", &theme, 0, RasterParams::default());
+        let b = fingerprinted_key("0.0.1r2", "board-a", &theme, 0, RasterParams::default());
+        assert_ne!(a, b, "a bumped epoch must address a different render");
+        // The visible prefix is what prune_renders recognizes by name.
+        let current = render_key("board-a", &theme, 0, RasterParams::default());
+        assert!(
+            current.starts_with(&format!("{}-", engine_fingerprint())),
+            "key {current:?} must be prefixed by the engine fingerprint"
+        );
     }
 
     #[test]

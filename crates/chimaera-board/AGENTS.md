@@ -45,8 +45,13 @@ functions; that single-engine property is what keeps the pane, the CLI and
 - **Ids are sacred.** They are simultaneously the diff anchor, the agent's
   Edit anchor, the journal subject, and the merge key. Duplicate ids are an
   error, never an auto-rename.
-- **Renders are pure.** PNG = f(board bytes, theme, params); the
-  content-addressed cache is correct by construction and never needs
-  invalidation. Keep `Date`-like nondeterminism out of the render path.
+- **Renders are pure — of code as much as content.** PNG = f(engine, board
+  bytes, theme, params); the content-addressed cache is correct by
+  construction and never needs invalidation. The engine half of the key is
+  the crate version + `render::RENDER_EPOCH` — **bump the epoch whenever
+  identical board bytes raster differently** (new object type drawn, glyph or
+  layout fix), or a dev-build upgrade serves the old engine's pixels;
+  `prune_renders` sweeps other-epoch entries. Keep `Date`-like
+  nondeterminism out of the render path.
 - **The 12 Mpx raster ceiling refuses rather than allocating** — the daemon
   runs on shared login nodes.
