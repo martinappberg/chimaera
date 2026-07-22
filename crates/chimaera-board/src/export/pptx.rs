@@ -712,6 +712,9 @@ struct Shared {
 struct SlideWriter<'a> {
     theme: &'a Theme,
     fonts: &'a FontStack,
+    /// The page being emitted — composite expansions (an inset's target
+    /// image) look their subjects up here.
+    page: &'a Page,
     /// Page-space frames by object id, for connector endpoint resolution.
     index: BTreeMap<String, Frame>,
     xml: String,
@@ -945,6 +948,40 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
         Object::Group(g) => emit_group(w, g, obj.frame()),
         Object::Chart(c) => emit_chart(w, c, obj.frame()),
         Object::Diagram(d) => emit_diagram(w, d, obj.frame()),
+        Object::PanelLabel(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::Scalebar(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::SigBracket(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts, &w.index);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::Legend(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::Colorbar(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::Callout(o) => {
+            let (children, problems) = o.expand(w.theme, w.fonts);
+            emit_composite(w, &o.id, children, problems);
+        }
+        Object::Inset(o) => {
+            let page = w.page;
+            let target = page.walk().find_map(|t| match t {
+                Object::Image(i) if i.id == o.of.object => Some(i),
+                _ => None,
+            });
+            let target_frame = w.index.get(o.of.object.as_str()).copied();
+            let (children, problems) = o.expand(w.theme, w.fonts, target, target_frame);
+            emit_composite(w, &o.id, children, problems);
+        }
         Object::Unknown(u) => {
             let why = match &u.error {
                 Some(e) => format!("skipped: object of type {:?} failed to parse: {e}", u.kind),
@@ -996,6 +1033,63 @@ fn emit_diagram(w: &mut SlideWriter, d: &crate::schema::DiagramObject, frame: Op
     w.shared.fates.truncate(fates_before);
     w.index = saved_index;
     w.fate(&d.id, ExportTier::Grouped, reason);
+}
+
+/// An annotation composite as a group of the primitives its expansion
+/// produces — the same `expand` the renderer draws, exactly as `emit_diagram`
+/// does. One fate for the composite; the group's box is the union of its
+/// children's frames, because a bracket or scalebar stores no box of its own.
+fn emit_composite(w: &mut SlideWriter, id: &str, children: Vec<Object>, problems: Vec<String>) {
+    let mut reason = String::from("annotation composite as grouped shapes");
+    if !problems.is_empty() {
+        let _ = write!(reason, " ({})", problems.join("; "));
+    }
+    let mut hull: Option<Frame> = None;
+    for c in &children {
+        let Some(f) = c.frame() else { continue };
+        hull = Some(match hull {
+            None => f,
+            Some(hb) => {
+                let x = hb.x.min(f.x);
+                let y = hb.y.min(f.y);
+                Frame {
+                    x,
+                    y,
+                    w: hb.right().max(f.right()) - x,
+                    h: hb.bottom().max(f.bottom()) - y,
+                }
+            }
+        });
+    }
+    let Some(f) = hull else {
+        // Nothing expanded (a dangling target, a missing position): the fate
+        // carries the reason and nothing lands on the slide.
+        w.fate(id, ExportTier::Grouped, reason);
+        return;
+    };
+    // Children may bind to each other (a callout's tail to its box) — extend
+    // the index for the duration of the expansion, exactly as the renderer
+    // does, and fold the children's fates into the composite's one.
+    let saved_index = w.index.clone();
+    for c in &children {
+        if let Some(cf) = c.frame() {
+            w.index.insert(c.id().to_string(), cf);
+        }
+    }
+    let fates_before = w.shared.fates.len();
+    let nv = w.cnvpr(id, None, None);
+    let _ = write!(
+        w.xml,
+        r#"<p:grpSp><p:nvGrpSpPr>{nv}<p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr>{}</p:grpSpPr>"#,
+        grp_xfrm(f)
+    );
+    for c in &children {
+        emit_object(w, c);
+    }
+    w.xml.push_str("</p:grpSp>");
+    w.shared.fates.truncate(fates_before);
+    w.index = saved_index;
+    w.fate(id, ExportTier::Grouped, reason);
 }
 
 fn role_of<'a>(theme: &'a Theme, name: Option<&str>) -> &'a TypeRole {
@@ -1601,6 +1695,42 @@ fn emit_chart_item(w: &mut SlideWriter, chart_id: &str, i: usize, item: &crate::
                 xfrm(f, None, false, false),
                 prst_geom("ellipse", ""),
                 srgb(*fill, None)
+            );
+        }
+        ChartItem::Polygon {
+            points,
+            fill,
+            opacity,
+        } => {
+            if points.len() < 3 {
+                return;
+            }
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for (px, py) in points {
+                x0 = x0.min(*px);
+                y0 = y0.min(*py);
+                x1 = x1.max(*px);
+                y1 = y1.max(*py);
+            }
+            let f = Frame {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            };
+            let mut segs = Vec::with_capacity(points.len() + 1);
+            segs.push(Seg::Move([points[0].0, points[0].1]));
+            for (px, py) in &points[1..] {
+                segs.push(Seg::Line([*px, *py]));
+            }
+            segs.push(Seg::Close);
+            let nv = w.cnvpr(&name, None, None);
+            let _ = write!(
+                w.xml,
+                r#"<p:sp><p:nvSpPr>{nv}<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}{}<a:solidFill>{}</a:solidFill>{NO_LINE}</p:spPr></p:sp>"#,
+                xfrm(f, None, false, false),
+                cust_geom(&segs, f),
+                srgb(*fill, Some(*opacity))
             );
         }
         ChartItem::Text {
@@ -2244,6 +2374,7 @@ fn build_slide(
     let mut w = SlideWriter {
         theme,
         fonts,
+        page,
         index,
         xml: String::new(),
         rels: Vec::new(),

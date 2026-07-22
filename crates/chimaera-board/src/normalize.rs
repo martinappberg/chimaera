@@ -168,9 +168,20 @@ fn normalize_objects(objects: &mut [Object], page: &str, diags: &mut Vec<Diagnos
                     );
                 }
             }
-            // A diagram's children are computed at render, never stored, so
+            // A callout's bound text is real paragraphs, so it canonicalizes
+            // exactly like a shape's.
+            Object::Callout(c) => canonicalize_paragraphs(&mut c.text),
+            // Composite children are computed at render, never stored, so
             // there is nothing to canonicalize beyond the snapped frame.
-            Object::Image(_) | Object::Diagram(_) | Object::Unknown(_) => {}
+            Object::Image(_)
+            | Object::Diagram(_)
+            | Object::PanelLabel(_)
+            | Object::Scalebar(_)
+            | Object::SigBracket(_)
+            | Object::Legend(_)
+            | Object::Colorbar(_)
+            | Object::Inset(_)
+            | Object::Unknown(_) => {}
         }
     }
 }
@@ -189,6 +200,13 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
         Object::Group(o) => o.id = generated,
         Object::Chart(o) => o.id = generated,
         Object::Diagram(o) => o.id = generated,
+        Object::PanelLabel(o) => o.id = generated,
+        Object::Scalebar(o) => o.id = generated,
+        Object::SigBracket(o) => o.id = generated,
+        Object::Legend(o) => o.id = generated,
+        Object::Colorbar(o) => o.id = generated,
+        Object::Callout(o) => o.id = generated,
+        Object::Inset(o) => o.id = generated,
         Object::Unknown(o) => o.id = generated,
     }
 }
@@ -429,7 +447,13 @@ fn duplicate_ids(board: &Board) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// Every object on a page, keyed by id, for anchor and connector resolution.
+/// Every object on a page with *explicit* geometry, keyed by id.
+///
+/// This sees only stated `at`/`size` — slot- and anchor-placed objects are
+/// absent. Where slots or anchors may be in play (render, describe, export),
+/// use [`crate::slots::resolve_page_frames`] instead: resolution happens
+/// there, at read time, never here — writing resolved geometry back would
+/// churn the file and break byte-stability.
 pub fn index_page(page: &Page) -> std::collections::BTreeMap<String, crate::schema::Frame> {
     page.walk()
         .filter_map(|o| o.frame().map(|f| (o.id().to_string(), f)))

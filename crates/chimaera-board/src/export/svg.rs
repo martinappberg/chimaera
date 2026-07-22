@@ -38,7 +38,7 @@ pub fn export_svg(
     // Render-path diagnostics (off-canvas, overfull) belong to `render` and
     // `lint`; the export is the same emission and does not re-report them.
     let mut diags = Vec::new();
-    let svg = crate::render::page_svg(board, page, theme, fonts, &mut diags)?;
+    let svg = crate::render::page_svg(board, page, theme, fonts, None, &mut diags)?;
     match variant {
         SvgVariant::Text => Ok(svg),
         SvgVariant::Outlined => {

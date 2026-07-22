@@ -11,6 +11,8 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+# Chart `data.source` binding reads CSV/TSV(.gz); same pin as chimaera-server.
+flate2 = "1.1"
 
 # The render stack. usvg parses and resolves (including text-to-path via
 # fontdb + rustybuzz), resvg rasterizes onto a tiny-skia pixmap. Board emits

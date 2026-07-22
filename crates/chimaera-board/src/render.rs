@@ -12,6 +12,7 @@
 //! and the cache never needs invalidation, only pruning.
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -41,15 +42,23 @@ pub struct RenderOutput {
 }
 
 /// Raster parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RasterParams {
     /// Device scale; 2.0 is the default everywhere Board renders for a UI.
     pub scale: f64,
+    /// Workspace root for resolving chart `data.source` files. `None` renders
+    /// a source-bound chart with a "source not loaded" note instead of rows.
+    /// Deliberately absent from [`render_key`]: the key hashes content, and
+    /// the board's own `sha256` is what pins the file bytes.
+    pub workspace: Option<PathBuf>,
 }
 
 impl Default for RasterParams {
     fn default() -> Self {
-        RasterParams { scale: 2.0 }
+        RasterParams {
+            scale: 2.0,
+            workspace: None,
+        }
     }
 }
 
@@ -109,7 +118,14 @@ pub fn render_page(
     }
 
     let mut diagnostics = Vec::new();
-    let svg = page_svg(board, page, theme, fonts, &mut diagnostics)?;
+    let svg = page_svg(
+        board,
+        page,
+        theme,
+        fonts,
+        params.workspace.as_deref(),
+        &mut diagnostics,
+    )?;
 
     let opt = usvg::Options {
         fontdb: fonts.db(),
@@ -188,6 +204,7 @@ pub(crate) fn page_svg(
     page: &Page,
     theme: &Theme,
     fonts: &FontStack,
+    workspace: Option<&Path>,
     diags: &mut Vec<Diagnostic>,
 ) -> Result<String> {
     let w = board.canvas.width();
@@ -210,10 +227,58 @@ pub(crate) fn page_svg(
         bg.hex()
     );
 
-    let index = crate::normalize::index_page(page);
+    // Slot and anchor resolution happens here, at render — never in
+    // `normalize`, which would churn the file. The resolved map is the single
+    // geometry truth: connectors bind to it, and slot-placed objects take
+    // their frames from it.
+    let (index, slot_diags) =
+        crate::slots::resolve_page_frames_with_diags(board, page, theme, Some(fonts));
+    diags.extend(slot_diags);
 
     for obj in &page.objects {
-        emit_object(&mut s, obj, page, board, theme, fonts, &index, diags);
+        emit_object(
+            &mut s, obj, page, board, theme, fonts, workspace, &index, diags,
+        );
+    }
+
+    // Page furniture: the preset's repeated objects (page number, footer,
+    // logo), generated per render and drawn above content — never written
+    // into the board file. The cover — the first page, or one marked by
+    // intent or id — suppresses what the preset says to suppress.
+    let preset_id = board
+        .canvas
+        .target
+        .as_deref()
+        .or(board.canvas.preset.as_deref());
+    if let Some(preset) = preset_id.and_then(crate::presets::get) {
+        let page_index = board
+            .pages
+            .iter()
+            .position(|p| std::ptr::eq(p, page))
+            .unwrap_or(0);
+        let is_cover = page_index == 0
+            || page.id == "cover"
+            || page.intent.as_ref().is_some_and(|i| i.kind == "cover");
+        for mut o in crate::presets::furniture_objects(
+            preset,
+            page_index,
+            board.pages.len(),
+            is_cover,
+            [w, h],
+        ) {
+            // A footer whose preset carries no literal text shows the deck's
+            // own title.
+            if let Object::Text(t) = &mut o {
+                if t.text.is_empty() {
+                    if let Some(title) = &board.title {
+                        t.text = vec![Paragraph::Plain(title.clone())];
+                    }
+                }
+            }
+            emit_object(
+                &mut s, &o, page, board, theme, fonts, workspace, &index, diags,
+            );
+        }
     }
 
     s.push_str("</svg>");
@@ -228,13 +293,20 @@ fn emit_object(
     board: &Board,
     theme: &Theme,
     fonts: &FontStack,
+    workspace: Option<&Path>,
     index: &std::collections::BTreeMap<String, Frame>,
     diags: &mut Vec<Diagnostic>,
 ) {
+    // The object's page frame as resolution decided it: slot- and
+    // anchor-placed objects live only in `index`, and explicit frames are
+    // there too, so this lookup is the single geometry truth. The fallback
+    // covers diagram-generated children, which are never on the page.
+    let frame = index.get(obj.id()).copied().or_else(|| obj.frame());
+
     // Off-canvas is a warning, not silence: the object may be intentionally
     // parked, but nobody parks something by accident and finds out from a
     // blank render.
-    if let Some(f) = obj.frame() {
+    if let Some(f) = frame {
         let c = &board.canvas;
         if f.right() < 0.0 || f.bottom() < 0.0 || f.x > c.width() || f.y > c.height() {
             diags.push(
@@ -257,7 +329,7 @@ fn emit_object(
 
     match obj {
         Object::Text(t) => {
-            let Some(frame) = obj.frame() else {
+            let Some(frame) = frame else {
                 diags.push(
                     Diagnostic::new(Severity::Warning, "text object has no position; skipped")
                         .at(&page.id, obj.id()),
@@ -284,7 +356,7 @@ fn emit_object(
             );
         }
         Object::Shape(sh) => {
-            let Some(frame) = obj.frame() else {
+            let Some(frame) = frame else {
                 diags.push(
                     Diagnostic::new(Severity::Warning, "shape has no position; skipped")
                         .at(&page.id, obj.id()),
@@ -333,7 +405,7 @@ fn emit_object(
                 )
                 .at(&page.id, obj.id()),
             );
-            if let Some(f) = obj.frame() {
+            if let Some(f) = frame {
                 let edge = theme.color("@edge").unwrap_or(theme.bg());
                 let _ = write!(
                     s,
@@ -348,18 +420,34 @@ fn emit_object(
         }
         Object::Group(g) => {
             for child in &g.objects {
-                emit_object(s, child, page, board, theme, fonts, index, diags);
+                emit_object(s, child, page, board, theme, fonts, workspace, index, diags);
             }
         }
         Object::Chart(c) => {
-            let Some(frame) = obj.frame() else {
+            let Some(frame) = frame else {
                 diags.push(
                     Diagnostic::new(Severity::Warning, "chart has no position; skipped")
                         .at(&page.id, obj.id()),
                 );
                 return;
             };
-            let scene = crate::chart::build(c, frame, theme, fonts);
+            // Source-bound rows resolve against the caller's workspace. A
+            // stale digest is an Error and the chart draws no marks — loud
+            // and blocking, per the plan; export picks the Error up from
+            // these diagnostics.
+            let (loaded, src_problems) = crate::chart::resolve_rows(c, workspace);
+            for p in src_problems {
+                let sev = if p.contains("stale") {
+                    Severity::Error
+                } else {
+                    Severity::Warning
+                };
+                diags.push(Diagnostic::new(sev, p).at(&page.id, obj.id()));
+            }
+            let scene = match loaded.as_deref() {
+                Some(rows) => crate::chart::build_with_rows(c, Some(rows), frame, theme, fonts),
+                None => crate::chart::build(c, frame, theme, fonts),
+            };
             for p in scene.problems {
                 diags.push(Diagnostic::new(Severity::Warning, p).at(&page.id, obj.id()));
             }
@@ -384,13 +472,26 @@ fn emit_object(
             );
         }
         Object::Diagram(d) => {
-            if obj.frame().is_none() {
+            let Some(f) = frame else {
                 diags.push(
                     Diagnostic::new(Severity::Warning, "diagram has no position; skipped")
                         .at(&page.id, obj.id()),
                 );
                 return;
-            }
+            };
+            // `expand` reads the diagram's own at/size; a slot- or
+            // anchor-placed diagram carries neither, so hand it the frame
+            // resolution decided.
+            let placed;
+            let d = if d.at.is_none() || d.size.is_none() {
+                let mut c = d.clone();
+                c.at = Some([f.x, f.y]);
+                c.size = Some([f.w, f.h]);
+                placed = c;
+                &placed
+            } else {
+                d
+            };
             let (children, problems) = crate::diagram::expand(d, theme, fonts);
             for p in problems {
                 diags.push(Diagnostic::new(Severity::Warning, p).at(&page.id, obj.id()));
@@ -405,8 +506,122 @@ fn emit_object(
                 }
             }
             for c in &children {
-                emit_object(s, c, page, board, theme, fonts, &child_index, diags);
+                emit_object(
+                    s,
+                    c,
+                    page,
+                    board,
+                    theme,
+                    fonts,
+                    workspace,
+                    &child_index,
+                    diags,
+                );
             }
+        }
+        // The annotation composites: expand exactly like a diagram —
+        // problems become warnings, children render recursively against an
+        // index extended with their own frames.
+        Object::PanelLabel(o) => {
+            // An anchored label carries no `at` of its own; hand it the frame
+            // resolution decided, exactly as a slot-placed diagram gets its.
+            let placed;
+            let o = if o.at.is_none() {
+                let Some(f) = frame else {
+                    diags.push(
+                        Diagnostic::new(Severity::Warning, "panelLabel has no position; skipped")
+                            .at(&page.id, obj.id()),
+                    );
+                    return;
+                };
+                let mut c = o.clone();
+                c.at = Some([f.x, f.y]);
+                placed = c;
+                &placed
+            } else {
+                o
+            };
+            let (children, problems) = o.expand(theme, fonts);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::Scalebar(o) => {
+            let (children, problems) = o.expand(theme, fonts);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::SigBracket(o) => {
+            // Targets resolve against the same index connectors bind through,
+            // so the bracket lands on slot- and anchor-placed panels too.
+            let (children, problems) = o.expand(theme, fonts, index);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::Legend(o) => {
+            let (children, problems) = o.expand(theme, fonts);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::Colorbar(o) => {
+            let placed;
+            let o = if o.at.is_none() || o.size.is_none() {
+                let Some(f) = frame else {
+                    diags.push(
+                        Diagnostic::new(Severity::Warning, "colorbar has no position; skipped")
+                            .at(&page.id, obj.id()),
+                    );
+                    return;
+                };
+                let mut c = o.clone();
+                c.at = Some([f.x, f.y]);
+                c.size = Some([f.w, f.h]);
+                placed = c;
+                &placed
+            } else {
+                o
+            };
+            let (children, problems) = o.expand(theme, fonts);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::Callout(o) => {
+            let placed;
+            let o = if o.at.is_none() || o.size.is_none() {
+                let Some(f) = frame else {
+                    diags.push(
+                        Diagnostic::new(Severity::Warning, "callout has no position; skipped")
+                            .at(&page.id, obj.id()),
+                    );
+                    return;
+                };
+                let mut c = o.clone();
+                c.at = Some([f.x, f.y]);
+                c.size = Some([f.w, f.h]);
+                placed = c;
+                &placed
+            } else {
+                o
+            };
+            let (children, problems) = o.expand(theme, fonts);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
+        }
+        Object::Inset(o) => {
+            let target = page.walk().find_map(|t| match t {
+                Object::Image(i) if i.id == o.of.object => Some(i),
+                _ => None,
+            });
+            let target_frame = index.get(o.of.object.as_str()).copied();
+            let (children, problems) = o.expand(theme, fonts, target, target_frame);
+            emit_expanded(
+                s, &children, problems, obj, page, board, theme, fonts, workspace, index, diags,
+            );
         }
         Object::Unknown(u) => {
             diags.push(
@@ -423,6 +638,48 @@ fn emit_object(
                 .at(&page.id, &u.id),
             );
         }
+    }
+}
+
+/// Draw one composite's expansion: problems become warnings on the composite,
+/// and children render recursively against the page index extended with their
+/// own frames — generated children are never on the page, so a connector
+/// bound to `<composite>/<part>` resolves only through this extension.
+#[allow(clippy::too_many_arguments)]
+fn emit_expanded(
+    s: &mut String,
+    children: &[Object],
+    problems: Vec<String>,
+    obj: &Object,
+    page: &Page,
+    board: &Board,
+    theme: &Theme,
+    fonts: &FontStack,
+    workspace: Option<&Path>,
+    index: &std::collections::BTreeMap<String, Frame>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for p in problems {
+        diags.push(Diagnostic::new(Severity::Warning, p).at(&page.id, obj.id()));
+    }
+    let mut child_index = index.clone();
+    for c in children {
+        if let Some(f) = c.frame() {
+            child_index.insert(c.id().to_string(), f);
+        }
+    }
+    for c in children {
+        emit_object(
+            s,
+            c,
+            page,
+            board,
+            theme,
+            fonts,
+            workspace,
+            &child_index,
+            diags,
+        );
     }
 }
 
@@ -1008,6 +1265,32 @@ fn emit_chart_item(
                 fill.hex()
             );
         }
+        ChartItem::Polygon {
+            points,
+            fill,
+            opacity,
+        } => {
+            if points.len() < 3 {
+                return;
+            }
+            let d: String = points
+                .iter()
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    if i == 0 {
+                        format!("M{x} {y}")
+                    } else {
+                        format!(" L{x} {y}")
+                    }
+                })
+                .collect();
+            let op = if *opacity < 1.0 {
+                format!(r#" fill-opacity="{opacity}""#)
+            } else {
+                String::new()
+            };
+            let _ = write!(s, r#"<path d="{d} Z" fill="{}"{op}/>"#, fill.hex());
+        }
         ChartItem::Text {
             x,
             y,
@@ -1147,7 +1430,7 @@ mod tests {
         let theme = crate::theme::default_for(false);
         let fonts = FontStack::new(&[]);
         let mut diags = Vec::new();
-        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, &mut diags).unwrap();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
         assert!(!svg.contains("<script"), "unescaped markup: {svg}");
         assert!(svg.contains("&lt;script&gt;"));
     }
@@ -1157,8 +1440,18 @@ mod tests {
         let b = board(DECK);
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let jpeg =
-            render_page_jpeg(&b, 0, &theme, &fonts, RasterParams { scale: 1.0 }, 80).unwrap();
+        let jpeg = render_page_jpeg(
+            &b,
+            0,
+            &theme,
+            &fonts,
+            RasterParams {
+                scale: 1.0,
+                ..Default::default()
+            },
+            80,
+        )
+        .unwrap();
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "JPEG SOI marker");
     }
 
@@ -1168,7 +1461,15 @@ mod tests {
         let a = render_key("board-a", &theme, 0, RasterParams::default());
         let b = render_key("board-b", &theme, 0, RasterParams::default());
         let c = render_key("board-a", &theme, 1, RasterParams::default());
-        let d = render_key("board-a", &theme, 0, RasterParams { scale: 1.0 });
+        let d = render_key(
+            "board-a",
+            &theme,
+            0,
+            RasterParams {
+                scale: 1.0,
+                ..Default::default()
+            },
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
@@ -1185,10 +1486,47 @@ mod tests {
         );
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let out = render_page(&b, 0, &theme, &fonts, RasterParams { scale: 1.0 }).unwrap();
+        let out = render_page(
+            &b,
+            0,
+            &theme,
+            &fonts,
+            RasterParams {
+                scale: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(out
             .diagnostics
             .iter()
             .any(|d| d.message.contains("dodecahedron")));
+    }
+
+    #[test]
+    fn preset_furniture_draws_on_content_pages_but_not_the_cover() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Review",
+                "canvas":{"preset":"design-review","size":[960,540]},
+                "pages":[
+                  {"id":"cover","objects":[
+                    {"id":"t","type":"text","role":"title","at":[72,224],"size":[816,88],
+                     "text":["The parser rewrite"]}]},
+                  {"id":"bench","objects":[
+                    {"id":"h","type":"text","role":"heading","at":[72,64],"size":[816,56],
+                     "text":["Numbers"]}]}]}"#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let cover = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        let second = page_svg(&b, &b.pages[1], &theme, &fonts, None, &mut diags).unwrap();
+        // design-review suppresses the page number on the cover, not after.
+        assert!(!cover.contains("1 / 2"), "{cover}");
+        assert!(second.contains("2 / 2"), "{second}");
+        // The footer carries the board title on both (empty preset text).
+        assert!(second.contains("Review"), "{second}");
+        // Furniture is generated per render, never written into the board.
+        assert!(!crate::to_string(&b).unwrap().contains("furniture/"));
     }
 }

@@ -76,7 +76,7 @@ selection.
 The journal event stream (gestures currently land only as file changes),
 slots/layouts and `brief`/`intent` resolution (parsed and preserved, not
 resolved), anchors resolution, image/SVG placement, exports (PPTX/PDF/SVG),
-`board adopt`, the chat `ShownCard`, `lint --style`, and the figures pack.
+`board adopt`, `lint --style`, and the figures pack.
 
 ## Intent
 

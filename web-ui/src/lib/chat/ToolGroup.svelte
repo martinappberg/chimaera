@@ -13,6 +13,9 @@
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
     onOpenFile?: (path: string) => void;
+    /** Session working directory, forwarded to the rows so `board show`
+     *  ShownCards can resolve workspace-relative paths. */
+    cwd?: string;
     /** Background/stop a running row (claude only — the host omits these
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
@@ -29,6 +32,7 @@
   let {
     tools,
     onOpenFile,
+    cwd,
     onBackground,
     onStopTask,
     visible = true,
@@ -123,6 +127,7 @@
           block={tool}
           {visible}
           {onOpenFile}
+          {cwd}
           onBackground={onBackground !== undefined ? () => onBackground?.(tool.id) : undefined}
           onStop={onStopTask !== undefined ? () => onStopTask?.(tool.id) : undefined}
         />

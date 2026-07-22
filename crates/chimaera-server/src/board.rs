@@ -89,10 +89,11 @@ pub(crate) async fn render(
         let theme = Theme::resolve(&theme_name, Some(&ws))?;
         let params = RasterParams {
             scale: req.scale.unwrap_or(2.0).clamp(0.25, 4.0),
+            workspace: Some(ws.clone()),
         };
 
         let canonical = chimaera_board::to_string(&board)?;
-        let key = chimaera_board::render::render_key(&canonical, &theme, req.page, params);
+        let key = chimaera_board::render::render_key(&canonical, &theme, req.page, params.clone());
         let dir = chimaera_board::board_dir(&ws).join("renders");
         std::fs::create_dir_all(&dir)?;
         let png_path = dir.join(format!("{key}.png"));

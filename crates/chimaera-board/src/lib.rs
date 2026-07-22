@@ -21,6 +21,8 @@
 //! - [`lint`] — what refuses to export.
 
 pub mod chart;
+pub mod colormap;
+pub mod composites;
 pub mod describe;
 pub mod diagram;
 pub mod export;
@@ -28,10 +30,12 @@ pub mod journal;
 pub mod layout;
 pub mod lint;
 pub mod normalize;
+pub mod presets;
 pub mod pretty;
 pub mod render;
 pub mod schema;
 pub mod show;
+pub mod slots;
 pub mod theme;
 
 use std::path::{Path, PathBuf};

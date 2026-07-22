@@ -438,6 +438,7 @@ name = "chimaera-board"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "flate2",
  "jpeg-encoder",
  "pdf-writer",
  "resvg",

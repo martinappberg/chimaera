@@ -1,11 +1,16 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
+  import { joinPath } from "../previews/files";
+  import ShownCard from "./ShownCard.svelte";
   import type { ChatBlock, ToolContent } from "./store.svelte";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
     /** Open a touched file in an adjacent pane (existing path-click flow). */
     onOpenFile?: (path: string) => void;
+    /** Session working directory — resolves the workspace-relative paths
+     *  `chimaera board show` prints (the prose-path base, `session.cwd`). */
+    cwd?: string;
     /** Move this running tool to the background (claude background_tasks —
      *  the TUI's Ctrl-B). Provided only when the agent supports it. */
     onBackground?: () => void;
@@ -15,7 +20,7 @@
     visible?: boolean;
   }
 
-  let { block, onOpenFile, onBackground, onStop, visible = true }: Props = $props();
+  let { block, onOpenFile, cwd, onBackground, onStop, visible = true }: Props = $props();
 
   const running = $derived(block.status === "in_progress" || block.status === "pending");
 
@@ -60,6 +65,32 @@
   const statusTitle = $derived(
     block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " "),
   );
+
+  /** Boards this completed command "showed" (`chimaera board show` — plan
+   *  §10.1): the result text's `shown … → <path>.board.json` signature,
+   *  detected client-side so no wire change is needed. The daemon-injected
+   *  `shown` journal event can replace this detection later; the card itself
+   *  won't change. Relative paths (board prints workspace-relative) resolve
+   *  against the session cwd; absolute paths pass through. */
+  const shownPaths = $derived.by(() => {
+    if (block.status !== "completed" || block.denied) return [];
+    if (block.content?.kind !== "output") return [];
+    const text = block.content.text ?? "";
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const m of text.matchAll(/^shown .+ → (.+\.board\.json)$/gm)) {
+      const raw = m[1].trim();
+      const p = raw.startsWith("/")
+        ? raw
+        : cwd !== undefined
+          ? joinPath(cwd, raw.replace(/^\.\//, ""))
+          : raw;
+      if (seen.has(p)) continue;
+      seen.add(p);
+      out.push(p);
+    }
+    return out;
+  });
 
   // Live output follows its own tail (terminal-style) while streaming.
   let bodyEl = $state<HTMLElement | null>(null);
@@ -264,6 +295,11 @@
       {/if}
     </div>
   {/if}
+  <!-- The agent showed a board mid-work: the card renders under the producing
+       command even while the row's output stays collapsed. -->
+  {#each shownPaths as p (p)}
+    <ShownCard path={p} onOpen={onOpenFile} />
+  {/each}
 </div>
 
 <style>

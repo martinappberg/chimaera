@@ -1377,6 +1377,7 @@
           sourceEnd={item.endIndex}
           {visible}
           {onOpenFile}
+          cwd={session.cwd}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />

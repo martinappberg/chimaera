@@ -9,9 +9,10 @@
 //! Vocabulary note: an `image` with provenance prints as `plot` — the human
 //! word survives even though the schema branch does not.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::schema::{Board, Object};
+use crate::schema::{Board, Frame, Object};
 
 /// Render the whole board as the agent-facing description.
 pub fn describe(board: &Board) -> String {
@@ -49,7 +50,19 @@ pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> Stri
         if let Some(t) = &brief.thesis {
             let _ = writeln!(s, "thesis: {t}");
         }
+        if let Some(a) = &brief.audience {
+            let _ = writeln!(s, "audience: {a}");
+        }
+        if let Some(m) = brief.minutes {
+            let _ = writeln!(s, "minutes: {m}");
+        }
     }
+
+    // Slot/anchor geometry is derived, never stored, so describe resolves it
+    // the same way render does. The bundled default supplies spacing when no
+    // theme is in hand — every bundled talk theme shares one spacing block —
+    // and `None` for fonts skips the system font scan resolution never needs.
+    let theme = crate::theme::default_for(false);
 
     for (i, page) in board.pages.iter().enumerate() {
         let _ = writeln!(s);
@@ -61,8 +74,9 @@ pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> Stri
             }
         }
         let _ = writeln!(s);
+        let resolved = crate::slots::resolve_page_frames(board, page, &theme, None);
         for obj in &page.objects {
-            describe_object(&mut s, obj, 1);
+            describe_object(&mut s, obj, 1, &resolved);
         }
         if let Some(notes) = &page.notes {
             let _ = writeln!(s, "  notes: {notes}");
@@ -71,12 +85,19 @@ pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> Stri
     s
 }
 
-fn describe_object(s: &mut String, obj: &Object, depth: usize) {
+fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeMap<String, Frame>) {
     let indent = "  ".repeat(depth);
-    let geo = obj
-        .frame()
-        .map(|f| format!(" at [{}, {}] size [{}, {}]", f.x, f.y, f.w, f.h))
-        .unwrap_or_default();
+    // Slot- and anchor-placed objects print BOTH the source and the
+    // resolution — `slot=title → at [72, 64] size [816, 64]` — so the agent
+    // sees what it wrote and where that landed without doing the arithmetic.
+    let frame = resolved.get(obj.id()).copied().or_else(|| obj.frame());
+    let source = placement_source(obj);
+    let geo = match (&source, frame) {
+        (Some(src), Some(f)) => format!(" {src} → at [{}, {}] size [{}, {}]", f.x, f.y, f.w, f.h),
+        (Some(src), None) => format!(" {src} (unresolved)"),
+        (None, Some(f)) => format!(" at [{}, {}] size [{}, {}]", f.x, f.y, f.w, f.h),
+        (None, None) => String::new(),
+    };
 
     match obj {
         Object::Text(t) => {
@@ -153,7 +174,7 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize) {
                 g.objects.len()
             );
             for child in &g.objects {
-                describe_object(s, child, depth + 1);
+                describe_object(s, child, depth + 1, resolved);
             }
         }
         Object::Chart(c) => {
@@ -184,6 +205,76 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize) {
                 d.edges.len()
             );
         }
+        Object::PanelLabel(pl) => {
+            let _ = writeln!(s, "{indent}{} panelLabel{geo}: {:?}", pl.id, pl.label);
+        }
+        Object::Scalebar(sb) => {
+            let _ = write!(s, "{indent}{} scalebar{geo} · {} pt", sb.id, sb.length_pt);
+            if let Some(label) = &sb.label {
+                let _ = write!(s, " {label:?}");
+            }
+            let _ = writeln!(s);
+        }
+        Object::SigBracket(sig) => {
+            let ep = |e: &crate::schema::EndPoint| -> String {
+                e.object.clone().unwrap_or_else(|| "?".to_string())
+            };
+            let _ = write!(
+                s,
+                "{indent}{} sigBracket {}↔{}",
+                sig.id,
+                ep(&sig.from),
+                ep(&sig.to)
+            );
+            if let Some(label) = &sig.label {
+                let _ = write!(s, " {label:?}");
+            }
+            let _ = writeln!(s);
+        }
+        Object::Legend(lg) => {
+            let _ = write!(
+                s,
+                "{indent}{} legend{geo} · {} entr{}",
+                lg.id,
+                lg.entries.len(),
+                if lg.entries.len() == 1 { "y" } else { "ies" }
+            );
+            if lg.entries.len() <= 3 {
+                let _ = write!(s, " · prefer direct labels at ≤3 series");
+            }
+            let _ = writeln!(s);
+        }
+        Object::Colorbar(cb) => {
+            let _ = writeln!(
+                s,
+                "{indent}{} colorbar{geo} · {} · [{}, {}]",
+                cb.id, cb.colormap, cb.domain[0], cb.domain[1]
+            );
+        }
+        Object::Callout(co) => {
+            let _ = write!(s, "{indent}{} callout{geo}", co.id);
+            if let Some(target) = co.tail.as_ref().and_then(|t| t.object.as_deref()) {
+                let _ = write!(s, " → {target}");
+            }
+            let text = co
+                .text
+                .iter()
+                .map(|p| p.plain_text())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            if !text.is_empty() {
+                let _ = write!(s, ": {}", truncate(&text, 60));
+            }
+            let _ = writeln!(s);
+        }
+        Object::Inset(inset) => {
+            let [x, y, w, h] = inset.of.px;
+            let _ = writeln!(
+                s,
+                "{indent}{} inset{geo} of {} px [{x}, {y}, {w}, {h}]",
+                inset.id, inset.of.object
+            );
+        }
         Object::Unknown(u) => {
             let why = match &u.error {
                 Some(e) => format!("failed to parse: {}", truncate(e, 60)),
@@ -192,6 +283,27 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize) {
             let _ = writeln!(s, "{indent}{} {}? ({why})", u.id, u.kind);
         }
     }
+}
+
+/// How this object is placed, when not by explicit geometry alone:
+/// `slot=title`, `anchor=chart.below`, `anchor=micro-1.px`. `None` for a
+/// plainly-placed object, whose line stays exactly as it always was.
+fn placement_source(obj: &Object) -> Option<String> {
+    if let Some(slot) = obj.slot() {
+        return Some(format!("slot={slot}"));
+    }
+    let a = crate::slots::anchor_of(obj)?;
+    let target = a.object.as_deref()?;
+    if a.px.is_some() {
+        return Some(format!("anchor={target}.px"));
+    }
+    if a.data.is_some() {
+        return Some(format!("anchor={target}.data"));
+    }
+    Some(format!(
+        "anchor={target}.{}",
+        a.rel.as_deref().unwrap_or("center-of")
+    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -255,6 +367,47 @@ mod tests {
         assert!(one.contains("journal: 1 event · latest seq 1"), "{one}");
         // No journal, no line — the wrapper stays byte-identical.
         assert!(!describe(&b).contains("journal:"));
+    }
+
+    #[test]
+    fn describe_prints_slot_source_and_resolution() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Slots",
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","layout":"title-body","objects":[
+                  {"id":"heading","type":"text","role":"heading","slot":"title",
+                   "text":["Slot-placed heading"]},
+                  {"id":"note","type":"shape","geo":"rect","size":[48,32],
+                   "anchor":{"object":"heading","rel":"below"}}]}]}"#,
+        )
+        .unwrap();
+        crate::normalize(&mut b);
+        let out = describe(&b);
+        // Both the source and the resolution, on one line.
+        assert!(
+            out.contains("heading text/heading slot=title → at [72, 64] size [816, 64]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("note shape/rect anchor=heading.below → at [456, 128] size [48, 32]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn describe_prints_the_brief_up_top() {
+        let b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Review",
+                "canvas":{"size":[960,540]},
+                "brief":{"thesis":"ship it","audience":"the team","minutes":10},
+                "pages":[{"id":"p","objects":[]}]}"#,
+        )
+        .unwrap();
+        let out = describe(&b);
+        let head: Vec<&str> = out.lines().take(4).collect();
+        assert_eq!(head[1], "thesis: ship it", "{out}");
+        assert_eq!(head[2], "audience: the team", "{out}");
+        assert_eq!(head[3], "minutes: 10", "{out}");
     }
 
     #[test]

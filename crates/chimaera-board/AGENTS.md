@@ -12,12 +12,13 @@ functions; that single-engine property is what keeps the pane, the CLI and
 | File | What it is |
 |---|---|
 | `src/lib.rs` | parse/save, `is_board_path`, the workspace surround (`.chimaera/board/`, the self-ignoring `shown/`) |
-| `src/schema.rs` | the format: 5 primitives + `chart` + `diagram`, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`) |
+| `src/schema.rs` | the format: 5 primitives + `chart` + `diagram` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`) |
 | `src/pretty.rs` | the canonical byte-stable JSON layout — the exact bytes are part of the format |
 | `src/normalize.rs` | sugar expansion + the constraints that make ugly unrepresentable; pure and idempotent |
 | `src/theme.rs` | `@token` palettes, role type scale with per-role `minPt`, bundled `themes/*.theme.json` |
 | `src/chart.rs` | marks over a plot-ready table → flat draw items; scales, d3 nice ticks, measured gutters |
 | `src/diagram.rs` | the `diagram` composite: deterministic layered layout (Sugiyama-lite, in-crate — no maintained dagre exists) expanding to primitives at render; the mermaid flowchart import |
+| `src/composites.rs` | the annotation layer: `panelLabel`, `scalebar`, `sigBracket`, `legend`, `colorbar`, `callout`, `inset` — each expands to primitives at render exactly like `diagram`, children id'd `<composite-id>/<part>` |
 | `src/layout.rs` | text measurement/wrapping over usvg's own `fontdb` + rustybuzz |
 | `src/render.rs` | scene graph → SVG (self-emitted, always escaped) → PNG/JPEG via resvg |
 | `src/show.rs` | the one-shot `board show` spec → one-page board (never a second schema) |

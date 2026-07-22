@@ -140,6 +140,11 @@ pub struct ChartTheme {
     /// Fraction of a band a bar occupies, 0..=1.
     #[serde(default = "default_bar_ratio")]
     pub bar_ratio: f64,
+    /// Default continuous colormap for `rect` heatmap cells — one of the
+    /// bundled names in [`crate::colormap`]. Named, never a literal ramp:
+    /// perceptual uniformity is not a theme decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colormap: Option<String>,
 }
 
 fn default_axis_width() -> f64 {
@@ -292,7 +297,7 @@ impl Theme {
     }
 }
 
-pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light"];
+pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light", "figure-light"];
 
 /// The bundled themes, as the very `.theme.json` documents `board init`
 /// writes out. Keeping them as source text rather than Rust literals means
@@ -301,11 +306,17 @@ pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light"];
 /// would be a lie about the format.
 pub const TALK_DARK: &str = include_str!("themes/talk-dark.theme.json");
 pub const TALK_LIGHT: &str = include_str!("themes/talk-light.theme.json");
+/// The publication-leaning figure theme: a small type scale (9 pt body) with
+/// Nature-compatible per-role floors (5 pt), Arial-first families (PLOS
+/// requires Arial, not Helvetica — the trap that bounces submissions), the
+/// Okabe–Ito ramp, and thin 0.5 pt chart chrome.
+pub const FIGURE_LIGHT: &str = include_str!("themes/figure-light.theme.json");
 
 pub fn bundled(id: &str) -> Option<Theme> {
     let src = match id {
         "talk-dark" => TALK_DARK,
         "talk-light" => TALK_LIGHT,
+        "figure-light" => FIGURE_LIGHT,
         _ => return None,
     };
     Theme::parse(src).ok()

@@ -238,6 +238,13 @@ pub enum Object {
     Group(GroupObject),
     Chart(ChartObject),
     Diagram(DiagramObject),
+    PanelLabel(PanelLabelObject),
+    Scalebar(ScalebarObject),
+    SigBracket(SigBracketObject),
+    Legend(LegendObject),
+    Colorbar(ColorbarObject),
+    Callout(CalloutObject),
+    Inset(InsetObject),
     /// Preserved verbatim, skipped in render. Carries the reason so `describe`
     /// and the repair banner can say *why* rather than just dropping it.
     Unknown(UnknownObject),
@@ -263,6 +270,13 @@ impl Object {
             Object::Group(o) => &o.id,
             Object::Chart(o) => &o.id,
             Object::Diagram(o) => &o.id,
+            Object::PanelLabel(o) => &o.id,
+            Object::Scalebar(o) => &o.id,
+            Object::SigBracket(o) => &o.id,
+            Object::Legend(o) => &o.id,
+            Object::Colorbar(o) => &o.id,
+            Object::Callout(o) => &o.id,
+            Object::Inset(o) => &o.id,
             Object::Unknown(o) => &o.id,
         }
     }
@@ -277,12 +291,21 @@ impl Object {
             Object::Group(_) => "group",
             Object::Chart(_) => "chart",
             Object::Diagram(_) => "diagram",
+            Object::PanelLabel(_) => "panelLabel",
+            Object::Scalebar(_) => "scalebar",
+            Object::SigBracket(_) => "sigBracket",
+            Object::Legend(_) => "legend",
+            Object::Colorbar(_) => "colorbar",
+            Object::Callout(_) => "callout",
+            Object::Inset(_) => "inset",
             Object::Unknown(o) => &o.kind,
         }
     }
 
     /// The object's page-space box, where it has one. A connector's box is
-    /// derived from its endpoints at render time, so it has none here.
+    /// derived from its endpoints at render time, so it has none here — and
+    /// the same holds for a `sigBracket` (endpoint-bound) and a `scalebar`
+    /// (its extent derives from `lengthPt` and the theme at expansion).
     pub fn frame(&self) -> Option<Frame> {
         let (at, size) = match self {
             Object::Text(o) => (o.at, o.size),
@@ -291,7 +314,13 @@ impl Object {
             Object::Group(o) => (o.at, o.size),
             Object::Chart(o) => (o.at, o.size),
             Object::Diagram(o) => (o.at, o.size),
-            Object::Connector(_) | Object::Unknown(_) => (None, None),
+            Object::PanelLabel(o) => (o.at, o.size),
+            Object::Legend(o) => (o.at, o.size),
+            Object::Colorbar(o) => (o.at, o.size),
+            Object::Callout(o) => (o.at, o.size),
+            Object::Inset(o) => (o.at, o.size),
+            Object::Scalebar(o) => (o.at, None),
+            Object::Connector(_) | Object::SigBracket(_) | Object::Unknown(_) => (None, None),
         };
         match (at, size) {
             (Some(at), Some(size)) => Some(Frame {
@@ -312,7 +341,13 @@ impl Object {
             Object::Group(o) => o.at = Some(at),
             Object::Chart(o) => o.at = Some(at),
             Object::Diagram(o) => o.at = Some(at),
-            Object::Connector(_) | Object::Unknown(_) => {}
+            Object::PanelLabel(o) => o.at = Some(at),
+            Object::Scalebar(o) => o.at = Some(at),
+            Object::Legend(o) => o.at = Some(at),
+            Object::Colorbar(o) => o.at = Some(at),
+            Object::Callout(o) => o.at = Some(at),
+            Object::Inset(o) => o.at = Some(at),
+            Object::Connector(_) | Object::SigBracket(_) | Object::Unknown(_) => {}
         }
     }
 
@@ -324,11 +359,21 @@ impl Object {
             Object::Group(o) => o.size = Some(size),
             Object::Chart(o) => o.size = Some(size),
             Object::Diagram(o) => o.size = Some(size),
-            Object::Connector(_) | Object::Unknown(_) => {}
+            Object::PanelLabel(o) => o.size = Some(size),
+            Object::Legend(o) => o.size = Some(size),
+            Object::Colorbar(o) => o.size = Some(size),
+            Object::Callout(o) => o.size = Some(size),
+            Object::Inset(o) => o.size = Some(size),
+            // A scalebar's extent is `lengthPt`, never a stored box.
+            Object::Connector(_)
+            | Object::Scalebar(_)
+            | Object::SigBracket(_)
+            | Object::Unknown(_) => {}
         }
     }
 
-    /// The declared slot, where the object has one.
+    /// The declared slot, where the object has one. Annotation composites sit
+    /// *over* slot content, so they never occupy a slot themselves.
     pub fn slot(&self) -> Option<&str> {
         match self {
             Object::Text(o) => o.slot.as_deref(),
@@ -336,7 +381,16 @@ impl Object {
             Object::Image(o) => o.slot.as_deref(),
             Object::Chart(o) => o.slot.as_deref(),
             Object::Diagram(o) => o.slot.as_deref(),
-            Object::Group(_) | Object::Connector(_) | Object::Unknown(_) => None,
+            Object::Group(_)
+            | Object::Connector(_)
+            | Object::PanelLabel(_)
+            | Object::Scalebar(_)
+            | Object::SigBracket(_)
+            | Object::Legend(_)
+            | Object::Colorbar(_)
+            | Object::Callout(_)
+            | Object::Inset(_)
+            | Object::Unknown(_) => None,
         }
     }
 }
@@ -379,6 +433,13 @@ impl Serialize for Object {
             Object::Group(o) => o.serialize(s),
             Object::Chart(o) => o.serialize(s),
             Object::Diagram(o) => o.serialize(s),
+            Object::PanelLabel(o) => o.serialize(s),
+            Object::Scalebar(o) => o.serialize(s),
+            Object::SigBracket(o) => o.serialize(s),
+            Object::Legend(o) => o.serialize(s),
+            Object::Colorbar(o) => o.serialize(s),
+            Object::Callout(o) => o.serialize(s),
+            Object::Inset(o) => o.serialize(s),
             Object::Unknown(o) => o.raw.serialize(s),
         }
     }
@@ -425,6 +486,13 @@ impl<'de> Deserialize<'de> for Object {
             "group" => try_variant!(GroupObject, Object::Group),
             "chart" => try_variant!(ChartObject, Object::Chart),
             "diagram" => try_variant!(DiagramObject, Object::Diagram),
+            "panelLabel" => try_variant!(PanelLabelObject, Object::PanelLabel),
+            "scalebar" => try_variant!(ScalebarObject, Object::Scalebar),
+            "sigBracket" => try_variant!(SigBracketObject, Object::SigBracket),
+            "legend" => try_variant!(LegendObject, Object::Legend),
+            "colorbar" => try_variant!(ColorbarObject, Object::Colorbar),
+            "callout" => try_variant!(CalloutObject, Object::Callout),
+            "inset" => try_variant!(InsetObject, Object::Inset),
             _ => Ok(Object::Unknown(UnknownObject {
                 id,
                 kind,
@@ -471,6 +539,13 @@ kind_field!(ImageKind, "image");
 kind_field!(GroupKind, "group");
 kind_field!(ChartKind, "chart");
 kind_field!(DiagramKind, "diagram");
+kind_field!(PanelLabelKind, "panelLabel");
+kind_field!(ScalebarKind, "scalebar");
+kind_field!(SigBracketKind, "sigBracket");
+kind_field!(LegendKind, "legend");
+kind_field!(ColorbarKind, "colorbar");
+kind_field!(CalloutKind, "callout");
+kind_field!(InsetKind, "inset");
 
 /// A box of paragraphs. The only object that owns glyph layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -821,11 +896,15 @@ pub struct GroupObject {
 // Anchors
 // ---------------------------------------------------------------------------
 
-/// Positional binding. Parsed and preserved in slice 0; `at`/`rel` resolve in
-/// slice 1.
+/// Positional binding. `at` and `object`+`rel` resolve at render via
+/// [`crate::slots::resolve_page_frames`]; `px`/`data` need the target's
+/// pixel/data frame and resolve with the figures pack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Anchor {
+    /// Absolute page points — the default spelling of a position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
     /// The object this one is positioned relative to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
@@ -1091,18 +1170,30 @@ impl Mark {
     }
 }
 
-/// The v0 mark set. A strict SUBSET of the full vocabulary, never a
+/// The mark set. A strict SUBSET of the full vocabulary, never a
 /// differently-spelled simplification of it — missing capability must be
 /// *absent*, so nothing written in week one needs migrating.
+///
+/// `bar` with an `x2`/`y2` field in `fields` is an interval — v to v2 rather
+/// than zero to v — which is what makes a timeline or trace-span expressible.
+/// `area` takes explicit `y`/`y2` (a CI ribbon) or `stack: "stack"`. `rect`
+/// is a heatmap cell over a matrix. `tick` is a degenerate rule for strips
+/// and rugs. `box` is sugar, not a real mark: it expands at build time into
+/// interval + whisker + median marks from a five-number summary the rows
+/// supply — Board never computes quartiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MarkKind {
     Bar,
     Line,
     Point,
+    Area,
+    Rect,
+    Tick,
     Rule,
     Errorbar,
     Text,
+    Box,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1250,6 +1341,210 @@ pub struct DiagramLane {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Annotation composites
+// ---------------------------------------------------------------------------
+//
+// The figures pack's vocabulary: each of these sits *above* an already-placed
+// panel — which is exactly what no upstream plotting library can do for
+// itself. Like `diagram`, the file stores intent and
+// [`crate::composites`] expands it into primitives at render; the expansion is
+// never written back, so retheme and resize stay free. Every composite works
+// identically over an imported panel and over a native chart.
+
+/// A panel letter — `a`, `b`, `c` over a figure's panels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelLabelObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: PanelLabelKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    /// Optional; the expansion measures the letter when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// Typically `{ object: <panel>, rel: "inside-top-left" }`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
+    /// `nature` (bold lowercase a/b/c, the default) or `capital` (A/B/C) —
+    /// a venue retarget flips the case without touching the stored letter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<PanelLabelStyle>,
+    pub label: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelLabelStyle {
+    #[default]
+    Nature,
+    Capital,
+}
+
+/// A drawn length with its caption — `100 µm` under a micrograph. `at` is
+/// the left end of the bar; `lengthPt` is the drawn length in page points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScalebarObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ScalebarKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    pub length_pt: f64,
+    /// `"100 µm"` — Board draws the stated caption, it never converts units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Bar weight and color; width defaults to 2 pt, color to `@fg`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<Stroke>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A significance bracket spanning two objects' top edges, with its label —
+/// `**` or `p = 0.03`. Board draws the stated label; Board never tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SigBracketObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: SigBracketKind,
+    /// `{ object, side? }` — the bracket's endpoints bind like a connector's,
+    /// so the bracket survives any move of what it spans.
+    pub from: EndPoint,
+    pub to: EndPoint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// How far the crossbar rises above the taller target's top edge, in
+    /// points. Defaults to 12.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drop_pt: Option<f64>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A swatch/line/point key. The plan prefers direct labels — lint says so at
+/// ≤3 entries — but a legend stays expressible for the panels that need one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegendObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: LegendKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    /// Optional; the expansion measures the widest label when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    pub entries: Vec<LegendEntry>,
+    /// Defaults to 1 — a vertical stack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u32>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegendEntry {
+    pub label: String,
+    /// `@cat1` or a literal; defaults to the theme's categorical ramp in
+    /// entry order, which is what the chart itself would have used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marker: Option<LegendMarker>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LegendMarker {
+    #[default]
+    Swatch,
+    Line,
+    Point,
+}
+
+/// A continuous color scale strip: a bundled colormap sampled across `domain`,
+/// with end tick labels. Vertical or horizontal by the box's aspect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColorbarObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ColorbarKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// A bundled name ([`crate::colormap::NAMES`]) — never a literal ramp.
+    pub colormap: String,
+    /// `[lo, hi]` in data units; the ends label through the chart's own tick
+    /// formatter so a colorbar and an axis can never disagree on rounding.
+    pub domain: [f64; 2],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The roundRect-with-a-tail the demo deck hand-builds, as one object:
+/// a `@surface`/`@accent1` box with bound text and a connector to its target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalloutObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: CalloutKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text: Vec<Paragraph>,
+    /// `{ object, side? }` — where the tail points.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<EndPoint>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A magnified crop of an image: the same `src` re-placed with a computed
+/// `srcRect`, plus a border at the inset and a dashed region mark on the
+/// target. Needs the target's `pixelSize` — a missing one is reported, never
+/// guessed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsetObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: InsetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    pub of: InsetSource,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsetSource {
+    /// The id of an `image` on the same page.
+    pub object: String,
+    /// `[x, y, w, h]` in the target's natural pixel space.
+    pub px: [f64; 4],
     #[serde(flatten)]
     pub extra: Extra,
 }

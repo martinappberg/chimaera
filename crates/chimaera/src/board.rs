@@ -133,6 +133,11 @@ pub enum BoardCmd {
         path: PathBuf,
         #[arg(long)]
         theme: Option<String>,
+        /// Target preset to lint against (floors, export tiers, venue rules),
+        /// e.g. talk-16x9 or pub-nature-single. Defaults to the board's
+        /// canvas.target when set; plain legality lint otherwise.
+        #[arg(long)]
+        target: Option<String>,
     },
 }
 
@@ -178,7 +183,11 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             Ok(())
         }
         BoardCmd::Journal { path, since } => journal(&path, since),
-        BoardCmd::Lint { path, theme } => lint(&path, theme),
+        BoardCmd::Lint {
+            path,
+            theme,
+            target,
+        } => lint(&path, theme, target),
     }
 }
 
@@ -392,7 +401,10 @@ fn render(
     let ws = chimaera_board::workspace_root(path);
     let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
     let fonts = FontStack::for_workspace(&ws);
-    let params = RasterParams { scale };
+    let params = RasterParams {
+        scale,
+        workspace: Some(ws.clone()),
+    };
 
     for d in diags
         .iter()
@@ -409,14 +421,14 @@ fn render(
     let canonical = chimaera_board::to_string(&board)?;
 
     for p in pages {
-        let rendered = render_page(&board, p, &theme, &fonts, params)?;
+        let rendered = render_page(&board, p, &theme, &fonts, params.clone())?;
         let dest = match (&out, single) {
             (Some(o), true) => o.clone(),
             (Some(o), false) => o.join(format!("{}.png", board.pages[p].id)),
             (None, _) => {
                 let dir = chimaera_board::ensure_board_dir(&ws)?.join("renders");
                 std::fs::create_dir_all(&dir)?;
-                let key = chimaera_board::render::render_key(&canonical, &theme, p, params);
+                let key = chimaera_board::render::render_key(&canonical, &theme, p, params.clone());
                 dir.join(format!("{key}.png"))
             }
         };
@@ -659,11 +671,46 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
     Ok(())
 }
 
-fn lint(path: &Path, theme_ref: Option<String>) -> Result<()> {
+fn lint(path: &Path, theme_ref: Option<String>, target: Option<String>) -> Result<()> {
     let (board, mut diags) = load_normalized(path)?;
     let ws = chimaera_board::workspace_root(path);
     let theme = resolve_theme(theme_ref.as_deref(), &board, &ws)?;
-    diags.extend(chimaera_board::lint::lint(&board, &theme));
+
+    // --target wins; the board's own canvas.target is the default. Neither
+    // set → the plain legality profile, exactly as before.
+    let target_id = target.or_else(|| board.canvas.target.clone());
+    match target_id.as_deref() {
+        None => diags.extend(chimaera_board::lint::lint(&board, &theme)),
+        Some(id) => {
+            let preset = chimaera_board::presets::get(id).with_context(|| {
+                format!(
+                    "unknown target {id:?}; presets are {}",
+                    chimaera_board::presets::ids().join(", ")
+                )
+            })?;
+            let fonts = FontStack::for_workspace(&ws);
+            diags.extend(chimaera_board::lint::lint_target(
+                &board, &theme, preset, &fonts,
+            ));
+            // The census: every top-level object's computed export fate, so
+            // degradation is stated before an export, never discovered after.
+            let (mut native, mut grouped, mut vector, mut raster) = (0u32, 0u32, 0u32, 0u32);
+            for page in &board.pages {
+                for obj in &page.objects {
+                    match chimaera_board::presets::tier_of(obj).0 {
+                        chimaera_board::export::ExportTier::Native => native += 1,
+                        chimaera_board::export::ExportTier::Grouped => grouped += 1,
+                        chimaera_board::export::ExportTier::Vector => vector += 1,
+                        chimaera_board::export::ExportTier::Raster => raster += 1,
+                    }
+                }
+            }
+            println!(
+                "tier census: {native} native · {grouped} grouped · {vector} vector · \
+                 {raster} raster"
+            );
+        }
+    }
 
     if diags.is_empty() {
         let n = board.pages.len();

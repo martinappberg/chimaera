@@ -51,6 +51,7 @@ hard-resets and rebuilds.
 | `AgentMessageMeta.svelte` | The hover/focus rail below assistant prose: localized journal-backed timestamp, full-message copy, and the conversation-fork affordance. Its pure time ladder lives in `../shared/time.ts`. |
 | `McpPanel.svelte` / `UsagePanel.svelte` | The `/mcp` linked-server panel and the token-usage panel. |
 | `InlinePreview` / `ArtifactGallery` | Inline file/image previews inside the transcript; expensive tickets/table reads/image/PDF loads are intersection-gated near the viewport. |
+| `ShownCard.svelte` | Inline board card for `chimaera board show`: `ToolCallCard` detects the `shown … → *.board.json` line in a completed result (client-side v1 — a daemon `shown` journal event can replace the detection), renders the server-side content-addressed PNG, and opens the board pane on click. |
 | `UserText.svelte` | User-message bubble: plain text (never Markdown), validated path/mention affordances, recognized LaTeX spans delegated to `MathText`. |
 | `paths.ts` | Path-candidate detection + validation types (shared with Markdown's stamping). |
 | `composerBus.ts` | Cross-component channel to insert text/attachments into the active composer (e.g. `@term:` grants, references, dropped-file paths). |

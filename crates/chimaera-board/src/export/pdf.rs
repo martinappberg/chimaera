@@ -49,7 +49,7 @@ pub fn export_pdf(board: &Board, theme: &Theme, fonts: &FontStack) -> Result<Vec
     let mut pages = Vec::with_capacity(board.pages.len());
     for (i, page) in board.pages.iter().enumerate() {
         let mut diags = Vec::new();
-        let svg = crate::render::page_svg(board, page, theme, fonts, &mut diags)?;
+        let svg = crate::render::page_svg(board, page, theme, fonts, None, &mut diags)?;
         let opt = usvg::Options {
             fontdb: fonts.db(),
             ..Default::default()
