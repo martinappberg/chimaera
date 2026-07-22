@@ -178,6 +178,26 @@ The format *prevents* bad output rather than merely permitting good output:
   round-tripping trap at the schema level.
 - **Colors default to `@`-tokens** drawn from validated palettes.
 - **Off-canvas objects** and **unresolved fonts** lint as warnings/errors.
+- **`lint --style` is a second profile** beside the legality lint, reusing the
+  `exportFloor` mechanism. False positives are a real cost, so the set is narrow
+  on purpose. *Errors under `--strict`, warnings by default:* near-miss alignment
+  (edges 0 < Δ < 3 pt) · near-miss spacing · off-grid geometry · overfull box ·
+  margin violation · body line length outside 45–90 chars. *Always warnings:*
+  underfull box (<40%) · distinct-value counts per page (>2 families, sizes beyond
+  the role count, >1 non-neutral accent) · override budget exceeded · title widow ·
+  plot-area misalignment across a row · text-over-text overlap · a free `at` where
+  a slot exists. **Refused at any severity** — general object overlap (callouts
+  over panels are the entire point of the annotation layer), "inconsistent panel
+  sizes" (a wide time series beside a square heatmap is correct; check plot-area
+  *edges*, never panel *extents*), data-ink ratio (empirically contested — express
+  Tufte's direction in theme defaults, never in a rule), whitespace balance, and
+  "wrong hierarchy". The last two are judgement, and judgement is the loop's 5%.
+
+  Near-miss alignment is the highest-value check in the set and it **cannot
+  annoy**: 1.5 pt off is always a mistake, never a choice. Every finding names
+  object, field, measured value, and expected value — `callout.at.x = 520.0;
+  heading and panel-a align at 80.0` — because the plan's own insight that *the
+  reason string is the entire UX* applies verbatim here.
 - `chimaera board lint --target nature-single` **gates export**, and it lints
   *through* panels rather than merely around them. This matters because in a real
   journal figure almost all the text — axis labels, ticks, legends — lives inside
@@ -1029,17 +1049,50 @@ door through which drift permanently enters.
 **CLI** (a nested `Board { cmd }` enum, the `Compute` shape):
 
 ```
-chimaera board new      <path> [--kind slide|figure|poster] [--preset ID] [--theme ID]
+chimaera board new      <path> [--template ID] [--target ID] [--theme ID]
 chimaera board render   <board> [--page ID] [--object ID | --region X,Y,W,H]
                                 [--scale N] [--format png|jpeg] [-o FILE]
-chimaera board describe <board> [--page ID]
-chimaera board journal  <board> [--since SEQ] [--limit N]
-chimaera board lint     <board> [--target nature-single|cell|plos|talk|poster-a0]
+chimaera board proof    <board> [--page ID]        # PNG *and* a text proof sheet
+chimaera board describe <board> [--page ID]        # defaults to the active page
+chimaera board journal  <board> [--since-last | --since SEQ] [--limit N]
+chimaera board lint     <board> [--style] [--strict] [--fix] [--target ID]
+chimaera board spec     [--section text|chart|anchor|export] [--example figure]
+chimaera board panel-brief <board> --slot ID [--json]
+chimaera board place    <board> --slot ID --asset PATH [--regen CMD]
 chimaera board export   <board> --to pptx|pdf|svg|png [--target ID] [-o FILE]
+chimaera board adopt    <image> [--preset ID]      # promote a throwaway to a board
 chimaera board rescheme <asset.svg> --theme ID [-o FILE]
 chimaera board fonts    [--board <board>]
-chimaera board theme-export <theme> --as mplstyle|ggtheme [-o FILE]
+chimaera board validate-theme <theme>
+chimaera board theme-export <theme> [--stdout]     # emits .mplstyle + helper + .R
 ```
+
+Four of those exist because the loop breaks without them, and each closes a gap
+worth naming:
+
+- **`spec`** is emitted from the same Rust types that parse, and prints
+  `formatVersion`. It is why the skill contains **no schema detail at all** — a
+  reference file describing the schema is a second stored representation of the
+  schema, the exact anti-pattern §3.2 rejects for markdown. (This also retires the
+  earlier idea that "the skill is the format's `llms.txt`": with `spec` shipping,
+  the skill must not be the schema document.)
+- **`proof`** is `render` plus a *text* proof sheet — the tier census, a
+  guide-cluster report (`x-guides: 80.0 (3 objects) · 82.5 (1: callout)`), a slot
+  occupancy map, box fill ratios, top design-lint findings. On a display-less
+  login node in a codex TUI, "render and look" silently fails; `proof` degrades
+  it into text instead. Board owns the geometry, so localization is free — which
+  is its structural advantage over every screenshot-based critique pipeline.
+- **`journal --since-last`** keeps a per-actor cursor. The bare `--since SEQ`
+  form assumes the agent remembers a sequence number across turns, which a TUI
+  agent cannot.
+- **`panel-brief`** is the plotting handshake — §10.
+
+Two related schema notes: **`canvas.target` is a field in the board file**
+(defaulted from `canvas.preset`), so `--target` is a retarget override rather than
+a value an agent linting from a login node has to guess; and `render` and `proof`
+print unresolved lint at the foot of their own output
+(`⚠ 2 unresolved lint errors — run board lint`), because instruction placement
+does not reliably move adherence but mechanical coupling does.
 
 **Daemon routes** (bearer-authed, versioned envelopes, additive to the stable
 wire): `POST /api/v1/board/render` → mints a `/raw` ticket; `GET
@@ -1074,11 +1127,17 @@ OFL defaults baked into the binary via `include_bytes!` (Inter, Source Sans, a
 Noto subset) → **system** scan via `fontdb` (pure-Rust fontconfig parsing, no C
 linkage, works headless).
 
-A missing font **never fails and is never silent**: the nearest family
-substitutes, and the substitution is surfaced in the status strip (naming the
-missing family), in `describe`, as a `lint` error, on the render response, and
-as a faint corner watermark on the raster — so a wrong-font export cannot be
-mistaken for a correct one. Vendoring carries OFL attribution and redistribution
+A missing font **never fails and is never silent — for Board's own text**: the
+nearest family substitutes, and the substitution is surfaced in the status strip
+(naming the missing family), in `describe`, as a `lint` error, on the render
+response, and as a faint corner watermark on the raster.
+
+**That guarantee does not extend to imported panels, and the plan should not
+pretend otherwise.** matplotlib substitutes silently *and the resulting SVG still
+records the requested font stack*, so §3.5's lint-through-panels can verify a
+panel's font **size** and structurally cannot verify its **identity**. The only
+fix is the panel sidecar's `resolvedFont` (§10) — which is one more reason it is
+always-on rather than opt-in. Vendoring carries OFL attribution and redistribution
 obligations; the bundled set ships its licenses and `board fonts` prints them.
 
 ## 9. Themes and the curated defaults
@@ -1104,7 +1163,73 @@ lives here. Ship:
 - **poster-a0**.
 
 Themes validate for WCAG text contrast, reusing the app-theme legibility
-contract. **Target presets are first-class**: switching Nature-single → Cell
+contract, and `board validate-theme` extends that to an OKLCH lightness band, a
+chroma floor, and **all-pairs CVD ΔE ≥ 8 under Machado 2009** — with the pair list
+taken from the chart's actual marks, which yields a *computed series cap*. That is
+what turns "too many colors" from a taste argument into an error message.
+
+### Beauty is a mechanism, not a theme list
+
+A theme list makes output *on-palette*. It does not make it *composed*, and §9's
+claim that defaults are an acceptance criterion is empty until beauty is
+something Board can evaluate. So, stated as a predicate:
+
+**A talk page is beautiful when** ≤2 resolved families and ≤4 resolved sizes, all
+from the theme's named scale · every position slot-derived or an 8 pt multiple ·
+exactly one non-neutral accent, under ~15% of page ink · one hero (largest content
+object ≥40% of the content rect) · ≤6 top-level objects · body ≥18 pt and never
+centered · no edge within 0 < Δ < 3 pt of another edge · margins uncrossed, no box
+overfull or under 40% full · text contrast ≥4.5:1 locally.
+
+**A figure is beautiful when** all of the above, plus every axis label carries a
+unit or explicit `(a.u.)` · ≤5 ticks per axis · no legend where ≤3 series and
+direct labels fit · panel **plot areas** (never bounding boxes) share top and
+bottom edges within a row to 0.5 pt · every panel-internal glyph clears the
+target's `minPt` **after placement scale** · the palette passes all-pairs CVD ·
+no red-green as sole encoding and no jet · panel labels sequential · the caption
+states *n*, the error-bar definition, and the test.
+
+Where that beauty comes from, ranked — and the ranking is the design:
+
+| | Mechanism | Share | Lives in |
+|---|---|---|---|
+| **(a)** | Constraints that make ugly unrepresentable | **~50%** | schema + `normalize()` |
+| **(b)** | Slot layouts that carry composition | **~25%** | theme presets + `board new --template` |
+| **(c)** | Design lint | **~20%** | `board lint --style` |
+| **(d)** | The critique loop | **~5%** | the skill's six questions |
+
+**(a) Constraints.** `role` is mandatory on every `text` and size is *derived* —
+there is no `fontSize` field an agent reaches for by default. Sizes come only from
+the theme's named scale. `normalize()` snaps geometry to the 8 pt grid. Per-run
+overrides stay legal but carry a **budget** lint counts. And one fully mechanical
+taste rule worth stating because it is enforceable: **text never wears a data
+color** — a type role may not resolve to a `@categorical` token. Design systems
+don't hand you a slider, they hand you an enum, and Board's structural advantage
+over any artifact-generation prompt is that the agent need not choose pixels.
+
+**(b) Slots — and this is the plan's most important reframe.** `page.layout` +
+named slots were justified earlier as an *export* convenience ("§11 already
+generates placeholders, so it costs nothing"). Right thing, wrong reason, and the
+wrong reason is dangerous: a feature justified as an export detail gets built as
+one. Slots are **the primary authoring path and the second-largest beauty
+mechanism.** Not one layout per page kind but a **family of ~12 per canvas
+preset** (title, title+body, two-up, image-left, full-bleed, 2×2 figure grid, 1+2,
+3-across, quote, section break, hero+caption, panel-row+legend), selected by a
+**pure function of measured content metrics** — bullet count, has-image, measured
+title extent. Deterministic, so C1 holds; measurable, because cosmic-text measures
+server-side; and needing no autofit, which §3.5 makes unrepresentable. Variable
+content overflowing fixed slots is the documented failure of every template
+system, and a family plus real measurement is what solves it. `--slot body-left`
+is the agent's normal move; a free `at: [x, y]` stays legal as the escape hatch,
+and lint warns on it.
+
+The demonstration: unconstrained, an agent writes a centered title, a literal
+`#3B82F6`, an inline `size: 40`, and three near-equal boxes at gaps of 20/22/20 —
+**and it lints clean under the plan as written**. Through slots and roles the same
+content is `"layout": "title-3up"` with four objects carrying `slot` + `role` and
+no numbers at all: four fewer decisions per object, zero color literals, gaps
+identical by construction, the accent spent once. What's left to the agent is
+*which slot* and *what words* — the choices it is actually good at. **Target presets are first-class**: switching Nature-single → Cell
 atomically remaps canvas width, font-size bounds, panel-label style, and export
 format — resubmission becomes one click instead of a manual redo.
 
@@ -1118,13 +1243,84 @@ fonts required, which is the easy and common case.
 
 **Rescheming, two paths, in this order of preference:**
 
-1. **Regenerate on-theme (lossless, preferred).** `chimaera board theme-export`
-   emits the theme as a `.mplstyle` or a ggplot `theme()` snippet — palette as
-   `axes.prop_cycle`, family and per-role sizes, spines off, `svg.fonttype:'none'`
-   (real text!), `pdf.fonttype:42`, transparent background, exact figsize in mm,
-   and never `bbox_inches='tight'` (which silently breaks exact sizing). The
-   provenance `regen` command re-runs the script; the agent or the Regenerate
-   button reproduces the panel natively on-theme.
+1. **Regenerate on-theme (lossless, preferred) — the brief-then-prove handshake.**
+   This is the *plotting mechanism*, and it deserves stating properly, because
+   Board never computes statistics and therefore the whole quality of "make me a
+   beautiful figure" rides on this seam.
+
+   **The law: never write plotting code before asking Board how big the panel is.**
+
+   ```sh
+   chimaera board panel-brief talks/lab.board.json --slot body-right --json
+   ```
+   ```json
+   { "sizeMm": [118.0, 74.0], "sizePt": [334.5, 209.8],
+     "target": "talk-16x9", "minPt": 18.0, "minLineWidthPt": 0.75,
+     "mplstyle": ".chimaera/board/themes/talk-dark.mplstyle",
+     "helper":   ".chimaera/board/themes/board_panel.py",
+     "palette":  ["#E69F00", "#56B4E9", "#009E73"] }
+   ```
+
+   `panel-brief` answers the two questions an agent otherwise guesses — how big,
+   and which theme — with answers that are correct by construction because slot
+   geometry comes from `normalize()`. Crucially it **materializes the style file
+   and the helper as a side effect**, which removes the skippable
+   "remember to run `theme-export` first" step. `theme-export --stdout` remains
+   the no-board entry point for a throwaway plot.
+
+   ```python
+   # Statistics happen here, in your code, above the plotting. Board never recomputes them.
+   ic50, curve = fit_hill(df)
+
+   from board_panel import panel, finish
+   fig, ax = panel(118, 74)          # mm, straight from panel-brief. Never resize after.
+   ax.semilogx(curve.x, curve.y)
+   ax.set_xlabel("Dose (nM)")        # a unit, always
+   ax.set_ylabel("Viability (% of vehicle)")
+   ax.set_xticks([0.1, 1, 10, 100])  # ≤5 ticks you chose
+   ax.text(curve.x[-1], curve.y[-1], "  KO", va="center")  # direct label, no legend
+   finish(fig, "figures/assets/fig2a.svg")
+   ```
+
+   **`theme-export` emits three files, not one:** `<theme>.mplstyle`,
+   `board_panel.py`, and `<theme>.R`. The style must carry
+   `figure.constrained_layout.use: True` — without it, "direct-label instead of
+   legend" produces clipped figures and the advice is actively harmful. The helper
+   ships out of `theme-export` rather than out of the skill, so it is versioned
+   with the parser rather than with prose.
+
+   **`finish()` is the half of the mechanism that was missing.** `panel()` is just
+   style + exact figsize; `finish()` runs seven checks matplotlib does not warn
+   about — canvas overflow (`get_tightbbox` vs `get_size_inches`), per-artist font
+   floor, mathtext detection, hairlines, pairwise text collision, **silent font
+   substitution**, and the rcParam contract (`svg.fonttype == 'none'`,
+   `pdf.fonttype == 42`, `axes.formatter.use_mathtext == False`) — then saves with
+   `metadata={"Date": None}` and writes the sidecar. That metadata argument is not
+   fussiness: `svg.hashsalt` alone does not stop matplotlib embedding `<dc:date>`,
+   so two runs of an identical script otherwise produce different digests,
+   churning the stale badge, invalidating the render cache, and dirtying
+   `git status` on a no-op re-run — a live C1 violation.
+
+   **Four silent traps, named in the skill because an agent will reach for all
+   four:**
+
+   | Trap | What actually happens | Rule |
+   |---|---|---|
+   | `bbox_inches='tight'` | crops to the *ink* box — measured 2 pt short on both axes of a 252 pt panel, data-dependent and unbounded. Board then scales the panel to fill its slot and every font inside is wrong by that ratio, with no visible symptom | never pass it |
+   | mathtext in labels | one `<tspan>` per glyph, **out of reading order**, sub/superscripts at 0.7× — a 7 pt label containing 4.9 pt glyphs, under Nature's floor | write `IC50`, or Unicode subscripts |
+   | `axes.formatter.use_mathtext: True` | measured: 17 of 19 text elements became per-glyph runs in a *different* family. A cosmetic rcParam that defeats C6 and lint-through-panels | it ships `False`; don't turn it on |
+   | `sns.set_theme()` *after* `plt.style.use()` | resets `font.size` 7 → 12 and the background to grey **while leaving `svg.fonttype` intact** — every Board check passes and the figure is still wrong | seaborn first, board style last |
+
+   The last is the worst shape a failure can have: it wrecks beauty and preserves
+   lintability.
+
+   **The sidecar is always-on, not gated behind `--emit board-data`** — it carries
+   `sizeMm`, `assetSha256`, `resolvedFont`, `minFontPt`, and a per-axes `frame`
+   (~10 lines, agreeing with `ax.transData` to 0.001 pt). Data anchors (§3.7) are
+   the most differentiated annotation feature in the plan; making a panel "earn"
+   them via a later regenerate delays them for no reason. `--emit board-data` then
+   adds exactly one thing — the tidy CSV plus a `chart` fragment naming the column
+   map — and the skill frames it as a **reward, never a migration**.
 2. **In-place SVG recolor (for what you cannot regenerate).** `board rescheme`
    remaps colors **by element id/group and role — never a global hex
    find-replace**, because the same hex means a data series in one place and a
@@ -1244,19 +1440,130 @@ Exports land in `.chimaera/board/exports/` and are offered as a download ticket.
 panel-internal text), sub-minimum line weight after panel scaling, effective
 raster DPI below the target floor, off-canvas, and unresolved-font errors. Any
 panel it could not inspect is reported as an unverified-panel warning on the
-export result. Target presets therefore carry `minLineWidthPt` (Nature: 0.25) and
+export result. **Verify the per-target `minLineWidthPt` numbers before they gate
+exports in slice 3** — 0.25 pt was the working figure, but current journal guidance
+is ≥0.5 pt for most and ACS ≥1 pt, so one of those is stale and it is a blocking
+threshold. Target presets carry `minLineWidthPt` and
 `minEffectiveDpi` (300 halftone / 600 line art) alongside `minPt`.
 
 ## 12. Skills and chat
 
-Canonical `.claude/skills/board/SKILL.md` + a `.agents/skills/board/` Codex
-bridge — the interface is **files + CLI, zero MCP**, which is what makes it work
-for any agent, in a TUI or in chat, locally or over ssh. The skill is the
-format's `llms.txt`: the coordinate system, the object taxonomy, the run and
-token model, the id-anchored sparse-edit contract, the CLI, and the loop
-("after editing, `render` and look; before asking, `describe`; to know what the
-human did, `journal --since`"). A versioned spec is fetchable, because models
-confidently emit stale formats otherwise.
+The skill is not documentation for Board — it is Board's **authoring API**. Every
+affordance the engine ships is reachable only if the skill routes to it under
+context pressure, forty turns into a session. That makes this section load-bearing
+rather than a closing note.
+
+The interface is **files + CLI, zero MCP**, which is what makes it work for any
+agent, in a TUI or in chat, locally or over ssh.
+
+```
+.claude/skills/board/          SKILL.md  ~330 lines / ~2,000 words
+  references/design.md         slot catalog, type table, the anti-slop list
+.claude/skills/board-plot/     SKILL.md  ~200 lines / ~1,200 words
+  references/plotting.md       matplotlib + ggplot footguns: symptom → cause → fix
+.agents/skills/board/SKILL.md        the 8-line Codex bridge
+.agents/skills/board-plot/SKILL.md   same
+.claude/rules/board.md         engine invariants for people EDITING chimaera-board
+```
+
+**Two skills, not one.** The deciding case is the throwaway plot — "plot the QC
+metrics real quick" in chat, with no board in existence and none wanted. If panel
+production lived inside `board`, the agent would either load a scene-graph skill
+it doesn't need or, worse, mint a `.board.json` to justify having loaded it. That
+is exactly the wear that makes people stop using a tool. The split matches this
+repo's own `develop`/`verify-app`/`debug-live-app` precedent: distinct trigger
+surfaces, not distinct topics. The composition risk is handled by one line high in
+`board`'s body — *"About to write plotting code? Load `board-plot` first — do not
+write a `savefig` before you have."*
+
+**Exactly two reference files, not seven.** No `references/format.md` and no
+`references/export.md`: their content is `chimaera board spec --section …`,
+emitted from the same Rust types that parse. This is the house doctrine
+`capture-feature-intent` already states — *point at the definition rather than
+restating it, so the two can never drift.* Note that Board would be this repo's
+first canonical skill to use a `references/` directory at all (all nine current
+ones are a single SKILL.md), so `scripts/check-agent-assets.mjs` needs extending
+to assert every referenced file exists.
+
+**Frontmatter is `name` + `description` only.** `paths: ["**/*.board.json"]` is
+tempting and rejected — it is Claude-only, so half our users would lose activation
+silently. Same for `allowed-tools` and `context: fork`. Anything we would say in
+frontmatter becomes prose in the body, or it does not exist for Codex.
+
+**No bundled scripts.** `chimaera board` *is* the scripts directory — on `$PATH`,
+on the login node, no Python needed. The one helper the plotting path uses,
+`board_panel.py`, ships out of `theme-export` so it versions with the parser.
+
+Two placements are load-bearing. **The loop sits in the top third** — the middle
+of a long document is where instructions get dropped. And because Claude Code
+renders a SKILL.md **once per session and never re-reads it**, every instruction is
+phrased as a **standing law of the session, never a numbered step**: "Step 4:
+render" is done after turn four; "every board edit is followed by a render you
+look at" survives to turn forty.
+
+### The loop, verbatim
+
+Three independent design lenses converged on near-identical wording here, which is
+evidence enough to adopt rather than re-derive:
+
+> **The loop — you do not get to declare a board done**
+>
+> You can render your own output and you can machine-check it. A board you have not
+> rendered and not linted is not finished; it is unreviewed. The whole loop is about
+> a second — a warm render is 20–60 ms — so there is no version of this you are too
+> busy for.
+>
+> 1. **Read what the human did first.** `board journal <b> --since-last`. A gesture
+>    is a correction you already received. If they moved `panel-a`, your placement
+>    was wrong — do not move it back.
+> 2. **Lint before you look.** `board lint <b>`. Fix everything it names, run it
+>    again, repeat until clean. **Do not open the render yet** — lint fixes change
+>    the picture, so any critique you form before they land is stale.
+> 3. **Then look, once, at six questions and nothing else.** `board proof <b>
+>    --page <id>` — and actually open the PNG. If you cannot view images here, the
+>    text proof sheet answers four of the six. *Does the eye land first on what the
+>    page is about? Is anything crowded or touching that shouldn't be? Are edges on
+>    a shared guide, or nearly-but-not-quite aligned? Is exactly one accent doing
+>    the emphasizing? Is the whitespace distributed or pooled in one corner? Does it
+>    read at arm's length (talk) or at column width (figure)?*
+> 4. **Name at most three defects, each as: object id → property → why.**
+>    "`callout` → fill → competes with `fig2a`'s series color" is a defect. "Make it
+>    pop" is not. **If you cannot put it in that form, it is not a defect and you
+>    are done.**
+> 5. **Apply, re-lint, proof once more, look once more — then stop.** Stop earlier
+>    if the second render looks like the first. There is no third pass; a third pass
+>    is how figures get worse.
+> 6. **Say what you ran.** Paste the census line and name the two things you changed
+>    after looking. That sentence is the deliverable.
+>
+> **Lint blocks; your opinion does not.** `board export` refuses on a lint error, so
+> a clean lint is the definition of shippable. Your visual pass exists only for what
+> lint structurally cannot see — emphasis, rhythm, whether the composition makes the
+> argument. It never blocks and never runs more than twice.
+>
+> **Do not restyle to feel productive.** If the edit you are reaching for is a bigger
+> accent, another shadow, a heavier weight, or one more color — stop. That is polish
+> that scores well to its own author and reads as noise to everyone else. Your
+> strongest available edit is almost always removing something, or aligning it.
+
+Each clause earns its place. *"Do not open the render yet"* is a prohibition rather
+than an ordering hint, because ordering hints compress away and prohibitions
+survive. *"Six questions and nothing else"* closes the rubric — an open aesthetic
+prompt re-rolls an implicit threshold every pass, and that variance **is** the
+oscillation the literature reports. *"If you cannot put it in that form, you are
+done"* is an explicit licence to stop, without which the model manufactures a
+finding. *"Paste the census line"* demands an artifact only the tool emits, which
+is the one real mitigation for agents reporting checks they never ran. And the
+closing paragraph names over-styling specifically because that is the documented
+shape of aesthetic reward hacking.
+
+**Self-critique from rendered PNGs: yes, with three hard constraints** —
+rubric-grounded and object-localized, capped at two passes, never blocking.
+Unguided "render and look" at an already-valid artifact is close to worthless and
+can be net-negative; the value is entirely in the rubric. Board gets the expensive
+half of every published critique pipeline for free, because `describe` already
+emits named objects with integer coordinates. There is deliberately **no `board
+critique` verb** — the verb is the six questions, and they live in prose.
 
 The skill opens with the line that makes the whole vocabulary teachable in a
 paragraph, and it is worth quoting verbatim because everything else follows from
@@ -1273,6 +1580,24 @@ it:
 > If drawing it would require reading your dataset or fitting a model, it is a
 > panel your script produces and Board imports, with provenance — and that is a
 > first-class answer, not a consolation prize.
+
+### Quick visuals vs paper figures — one format, two entry points
+
+Board should *not* serve the throwaway case, and saying so protects both. Minting
+a `.board.json` plus a journal plus a git entry for "plot me this column real
+quick" is precisely the wear that makes people abandon a tool.
+
+- **Throwaway:** no board. `theme-export --stdout`, a script, a PNG that lands in
+  the chat artifact gallery as an image tile. Zero tracked files. The `board-plot`
+  skill states the fork in one line: *if the answer dies with the turn, do not
+  mint a board.*
+- **Figure:** `board new --template figure-2x2 --target nature-single`, `place`
+  each panel, `lint` (which names the panels that are outlined glyphs and cannot
+  be verified), regenerate those through `panel-brief`, annotate, export.
+- **The promotion, framed as a reward rather than a migration:** `board adopt`
+  turns a kept throwaway into a board, and `--emit board-data` turns a picture
+  into a native chart. Both are nearly free because the sidecar is always-on — the
+  frame, the size, and the resolved font are already on disk.
 
 **Chat.** `.board.json` joins `viewKindFor` and `INLINE_PREVIEW_KINDS`, so a
 board an agent writes surfaces as an **inline artifact card** — rendered through
@@ -1348,7 +1673,7 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    on top.
    **The day-one dogfood, which is the whole point of the feature:** an agent
    authors a two-slide deck from the skill, renders it, you drag a box, the agent
-   reads `describe` + `journal --since` and adjusts. Rust unit tests on the
+   reads `describe` + `journal --since-last` and adjusts. Rust unit tests on the
    schema, normalize, and lint (the web UI has no component tests — the isolated
    preview is its net).
    Also in slice 1, because all three are expensive to retrofit and cheap now:
@@ -1395,6 +1720,34 @@ no CLI round-trip — the empty-state button and the skill both go through it.
    progressive enhancement; `hayro` PDF-panel import behind a feature flag.
 7. **Slice 6 — opportunistic, gated on the fidelity matrix.** Native `c:chart` as
    an exporter optimization; the OMML arm of `equation`.
+
+**Write neither skill until the slice-1 CLI runs.** A format skill's value is
+concentrated in facts learned by running the tool and watching it fail — the
+exemplar document skills' footgun lists are bug logs with prose around them — and
+it cannot be written from this design document. Sequence inside slice 1:
+substrate → CLI → dogfood → *then* `board/SKILL.md` from the bug log, plus three
+golden boards (`talk`, `figure`, `poster`) under the skill's `assets/`, dogfooded
+in a Rust test that asserts they parse, `normalize()` idempotently, lint clean at
+their declared target, and round-trip byte-identically. A stale golden in a format
+skill teaches the wrong idiom with authority. Then baseline-test the finished
+skill with three realistic prompts in a **fresh** session, with and without it —
+fresh matters, because leftover authoring context masks gaps in the written
+instructions.
+
+Slice 1 also gains the **full theme substrate** (type scale with per-role `minPt`,
+the 8 pt grid, margins, the one-accent rule) rather than deferring it to slice 4.
+Without it, the day-one dogfood measures the agent loop against a beauty substrate
+that does not yet exist.
+
+**If time is short, cut in this order:** the critique loop's second pass (one look
+is ~80% of its value) → the ggplot arm of `theme-export` (matplotlib is >90% of
+traffic, there is no `prop_cycle` equivalent, and the mm-vs-pt `size`/`linewidth`
+trap silently multiplies strokes ~2.8×, so ship it marked unverified or not at
+all) → `rescheme` entirely (path 1 dominates it) → the golden eval as automation,
+keeping the briefs as a manual checklist → the poster golden board. **Never cut:**
+the theme substrate, slots as the authoring path, near-miss alignment lint,
+`panel-brief` + `board_panel.py`, `board proof`, and the loop section of the skill.
+Those six *are* the mechanism; the rest is documentation of it.
 
 Every slice is independently shippable and live-verified per **verify-app**;
 anything touching chat is gated by `just chat-smoke`. A `feat:` carries its
