@@ -142,6 +142,9 @@ three compounding ways. Findings and the invariants they forced:
   with no eligible window. The shell stamps that fallback at window creation and does not derive it
   from later SPA workspace reports, so navigating Home into a workspace cannot hide an in-flight
   prompt. Answering in one matching window targets `ssh-askpass-done` to the same scope.
+  Compute windows carry an explicit login-host askpass scope alongside their distinct per-job
+  tunnel identity; parsing a `host#job…` prefix as authorization would let a colliding ordinary
+  SSH alias observe the host's prompt.
 - **Connects coalesce per alias.** A drop used to fan out: every window's reconnect plus
   the home screen plus startup restore each called `connect_host`, the first won and the
   rest bounced with "a connection attempt is already running" (or worse, queued more 2FA

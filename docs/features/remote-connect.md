@@ -57,6 +57,8 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   windows were persisted, so an early password or 2FA prompt always has an eligible surface. A
   window created as local Home retains that shell-owned fallback identity if it opens a workspace
   while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
+  Compute windows store their login-host askpass identity separately from the composite per-job
+  tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
 - **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
   listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
   HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring

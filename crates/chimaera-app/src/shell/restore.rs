@@ -40,14 +40,17 @@ pub fn open_ui_window(
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
-    open_shell_window(app, &url, &title, record, record.alias.clone())
+    let scope = WindowScope::new(record.alias.clone(), record.ws.clone(), record.id.clone());
+    open_shell_window(app, &url, &title, record, scope)
 }
 
 /// Open a window on a compute-node daemon (Mode 2). Same shell wiring as
 /// `open_ui_window`, but the URL is the ComputeTunnel's own (token + host +
 /// job + node already ride its hash; only `win=` is added here) and the
 /// tracked scope alias is the composite `"{alias}#job{id}"` so focus-existing
-/// never confuses a job window with the login host's.
+/// never confuses a job window with the login host's. Its askpass identity is
+/// recorded separately as the login alias; it is never inferred by parsing
+/// that composite key.
 pub(super) fn open_compute_window(
     app: &AppHandle,
     url: &str,
@@ -56,7 +59,17 @@ pub(super) fn open_compute_window(
     scope_alias: &str,
 ) -> tauri::Result<()> {
     let url = format!("{url}&win={}", urlencoding::encode(&record.id));
-    open_shell_window(app, &url, title, record, Some(scope_alias.to_string()))
+    let login_alias = record
+        .alias
+        .clone()
+        .expect("compute windows always carry their login alias");
+    let scope = WindowScope::new_compute(
+        scope_alias.to_string(),
+        login_alias,
+        record.ws.clone(),
+        record.id.clone(),
+    );
+    open_shell_window(app, &url, title, record, scope)
 }
 
 fn open_shell_window(
@@ -64,7 +77,7 @@ fn open_shell_window(
     url: &str,
     title: &str,
     record: &WindowRecord,
-    scope_alias: Option<String>,
+    window_scope: WindowScope,
 ) -> tauri::Result<()> {
     let url: tauri::Url = url.parse().expect("daemon url is always valid");
     let port = url
@@ -110,12 +123,10 @@ fn open_shell_window(
     // short startup race where `list_askpass` rejects a legitimate window and
     // the only visible authentication prompt is missed.
     if let Some(shell) = app.try_state::<Shell>() {
-        lock(&shell.windows).insert(
-            label.clone(),
-            // The constructor also stamps the immutable askpass fallback bit
-            // for a local Home window before navigation can mutate `ws`.
-            WindowScope::new(scope_alias, record.ws.clone(), record.id.clone()),
-        );
+        // The scope already carries both the window identity and its separate
+        // immutable askpass authorization. Register it before navigation can
+        // execute a native command.
+        lock(&shell.windows).insert(label.clone(), window_scope);
     }
     if let Err(error) = builder.build() {
         if let Some(shell) = app.try_state::<Shell>() {

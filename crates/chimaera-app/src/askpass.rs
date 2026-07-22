@@ -624,4 +624,37 @@ mod tests {
         );
         assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
     }
+
+    #[test]
+    fn compute_prompts_require_an_explicit_login_host_scope() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register(Some("cluster".into()), "Password:".into(), tx);
+
+        // This is a valid ordinary ssh alias, not proof that the window is a
+        // compute view reached through `cluster`.
+        let colliding_remote = crate::shell::WindowScope::new(
+            Some("cluster#job123".into()),
+            Some("workspace".into()),
+            "ordinary-remote".into(),
+        );
+        assert!(askpass.pending_scoped(&colliding_remote).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("wrong-window".into()), &colliding_remote),
+            AnswerResult::Forbidden
+        );
+
+        let compute = crate::shell::WindowScope::new_compute(
+            "cluster#job123".into(),
+            "cluster".into(),
+            Some("workspace".into()),
+            "compute-window".into(),
+        );
+        assert_eq!(askpass.pending_scoped(&compute).len(), 1);
+        assert_eq!(
+            askpass.answer_scoped(id, Some("secret".into()), &compute),
+            AnswerResult::Answered(Some("cluster".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
+    }
 }

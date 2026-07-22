@@ -103,58 +103,73 @@ pub struct WindowScope {
     pub alias: Option<String>,
     pub ws: Option<String>,
     pub stable_id: String,
-    /// Shell-owned capability granted only when this window is created as
-    /// local Home. It survives later workspace navigation so an in-flight
-    /// startup/first-connect prompt cannot lose its only safe surface.
-    askpass_fallback: bool,
+    /// Shell-owned askpass identity. This is separate from `alias`: compute
+    /// windows use a composite alias for focus/liveness, but authenticate
+    /// through their explicitly recorded login host. Keeping the two facts
+    /// separate prevents ordinary aliases that happen to contain `#job` from
+    /// inheriting another host's prompts.
+    askpass_scope: AskpassScope,
     /// Human name for the tray's window list ("Home", or the workspace name),
     /// reported by the SPA alongside the scope so the tray never has to read the
     /// racy OS titlebar. Empty until the first scope report lands.
     pub label: String,
 }
 
+#[derive(Clone, PartialEq)]
+enum AskpassScope {
+    None,
+    Fallback,
+    Host(String),
+}
+
 /// Whether a shell-owned window may observe or resolve an askpass prompt.
 /// A local window currently at Home, or created there, is the cross-host
-/// fallback. Remote windows match only their login alias; compute windows
-/// carry `alias#job…` but authenticate through that login.
-pub(crate) fn askpass_scope_matches(
-    window_alias: Option<&str>,
-    window_ws: Option<&str>,
-    window_fallback: bool,
-    prompt_alias: Option<&str>,
-) -> bool {
-    let Some(window) = window_alias else {
-        return window_fallback || window_ws.is_none();
-    };
-    let Some(prompt) = prompt_alias else {
-        return false;
-    };
-    window == prompt
-        || window
-            .strip_prefix(prompt)
-            .and_then(|suffix| suffix.strip_prefix("#job"))
-            .is_some_and(|job_id| !job_id.is_empty())
+/// fallback. Host-scoped windows match only their explicitly registered login
+/// alias; no authorization is inferred from the window's display alias.
+fn askpass_scope_matches(scope: &AskpassScope, prompt_alias: Option<&str>) -> bool {
+    match scope {
+        AskpassScope::None => false,
+        AskpassScope::Fallback => true,
+        AskpassScope::Host(alias) => prompt_alias.is_some_and(|prompt| prompt == alias),
+    }
 }
 
 impl WindowScope {
     pub(crate) fn new(alias: Option<String>, ws: Option<String>, stable_id: String) -> Self {
-        let askpass_fallback = alias.is_none() && ws.is_none();
+        let askpass_scope = match &alias {
+            Some(alias) => AskpassScope::Host(alias.clone()),
+            None if ws.is_none() => AskpassScope::Fallback,
+            None => AskpassScope::None,
+        };
         Self {
             alias,
             ws,
             stable_id,
-            askpass_fallback,
+            askpass_scope,
+            label: String::new(),
+        }
+    }
+
+    /// A compute window is keyed by its per-job tunnel alias while ssh still
+    /// authenticates through the login host. Both identities come from the
+    /// shell's typed connect state; neither is parsed from the other.
+    pub(crate) fn new_compute(
+        alias: String,
+        login_alias: String,
+        ws: Option<String>,
+        stable_id: String,
+    ) -> Self {
+        Self {
+            alias: Some(alias),
+            ws,
+            stable_id,
+            askpass_scope: AskpassScope::Host(login_alias),
             label: String::new(),
         }
     }
 
     pub(crate) fn allows_askpass(&self, prompt_alias: Option<&str>) -> bool {
-        askpass_scope_matches(
-            self.alias.as_deref(),
-            self.ws.as_deref(),
-            self.askpass_fallback,
-            prompt_alias,
-        )
+        askpass_scope_matches(&self.askpass_scope, prompt_alias)
     }
 }
 
@@ -783,7 +798,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{askpass_scope_matches, daemon_origin_matches};
+    use super::{daemon_origin_matches, WindowScope};
 
     #[test]
     fn daemon_origin_requires_exact_scheme_host_and_port() {
@@ -803,55 +818,40 @@ mod origin_tests {
     }
 
     #[test]
-    fn askpass_scope_is_local_fallback_or_exact_remote_host() {
-        assert!(askpass_scope_matches(None, None, false, Some("remote-2")));
-        assert!(!askpass_scope_matches(
-            None,
-            Some("local-workspace"),
-            false,
-            Some("remote-2")
-        ));
-        assert!(askpass_scope_matches(
-            None,
-            Some("local-workspace"),
-            true,
-            Some("remote-2")
-        ));
-        assert!(askpass_scope_matches(
-            Some("Sherlock"),
-            Some("workspace"),
-            false,
-            Some("Sherlock")
-        ));
-        assert!(askpass_scope_matches(
-            Some("Sherlock#job123"),
-            Some("workspace"),
-            false,
-            Some("Sherlock")
-        ));
-        assert!(!askpass_scope_matches(
-            Some("Sherlock#job"),
-            Some("workspace"),
-            false,
-            Some("Sherlock")
-        ));
-        assert!(!askpass_scope_matches(
-            Some("Sherlock-other"),
-            Some("workspace"),
-            false,
-            Some("Sherlock")
-        ));
-        assert!(!askpass_scope_matches(
-            Some("remote-1"),
-            Some("workspace"),
-            false,
-            Some("remote-2")
-        ));
-        assert!(!askpass_scope_matches(
-            Some("Sherlock"),
-            Some("workspace"),
-            false,
-            None
-        ));
+    fn askpass_scope_is_immutable_and_explicit() {
+        let mut fallback = WindowScope::new(None, None, "home".into());
+        assert!(fallback.allows_askpass(Some("remote-2")));
+        fallback.ws = Some("local-workspace".into());
+        assert!(fallback.allows_askpass(Some("remote-2")));
+
+        let local = WindowScope::new(None, Some("local-workspace".into()), "local".into());
+        assert!(!local.allows_askpass(Some("remote-2")));
+
+        let remote = WindowScope::new(
+            Some("Sherlock".into()),
+            Some("workspace".into()),
+            "remote".into(),
+        );
+        assert!(remote.allows_askpass(Some("Sherlock")));
+        assert!(!remote.allows_askpass(Some("remote-2")));
+        assert!(!remote.allows_askpass(None));
+
+        // `Sherlock#job123` is itself a valid ordinary ssh alias. Its shape
+        // must not grant access to Sherlock's prompt.
+        let colliding_remote = WindowScope::new(
+            Some("Sherlock#job123".into()),
+            Some("workspace".into()),
+            "colliding-remote".into(),
+        );
+        assert!(!colliding_remote.allows_askpass(Some("Sherlock")));
+
+        let compute = WindowScope::new_compute(
+            "Sherlock#job123".into(),
+            "Sherlock".into(),
+            Some("workspace".into()),
+            "compute".into(),
+        );
+        assert!(compute.allows_askpass(Some("Sherlock")));
+        assert!(!compute.allows_askpass(Some("Sherlock#job123")));
     }
 }
