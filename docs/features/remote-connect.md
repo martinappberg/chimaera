@@ -74,6 +74,11 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   non-interactive (`BatchMode`) with a ten-second outer deadline. Native liveness transitions carry
   a plain-language reason into the reconnect panel, while an actual reconnect failure remains a
   separate error with Retry.
+- **A daemon build change is a navigation boundary.** A reconnect reuses its local forward only
+  while the daemon source build still matches the app. Replacing the remote daemon gets a fresh
+  loopback port, which makes every already-open window re-home onto the new entry bundle instead of
+  asking the new server for hashed JavaScript chunks from the previous release. Connected events
+  also carry the build as a second guard for same-origin transitions.
 
 ## Dev builds — the isolated dev daemon on a host
 

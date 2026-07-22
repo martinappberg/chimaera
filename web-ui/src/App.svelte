@@ -237,6 +237,21 @@
   import Pane from "./lib/layout/Pane.svelte";
 
   let health = $state<Health | null>(null);
+  /** Source identity of the daemon that supplied this document. A different
+   *  source means its immutable lazy-chunk namespace changed underneath us. */
+  let servedBuild: string | null = null;
+  function buildSource(build: string | null | undefined): string | null {
+    if (build === null || build === undefined || build.length === 0) return null;
+    const dot = build.lastIndexOf(".");
+    const source = dot > 0 ? build.slice(0, dot) : build;
+    // Mirror chimaera_core::builds_match: unknown source refs only match
+    // byte-for-byte, because two source-less builds may contain anything.
+    return source.startsWith("unknown") ? build : source;
+  }
+  function daemonBuildChanged(next: string | null | undefined): boolean {
+    const nextSource = buildSource(next);
+    return servedBuild !== null && nextSource !== null && nextSource !== servedBuild;
+  }
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
   /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
@@ -677,6 +692,14 @@
   $effect(() =>
     pollHealth(
       (h) => {
+        if (daemonBuildChanged(h.build)) {
+          // The origin can stay stable across a daemon handoff, but the
+          // hashed JS namespace cannot. Reload before the user opens a lazy
+          // surface whose old URL now correctly 404s.
+          location.reload();
+          return;
+        }
+        servedBuild ??= buildSource(h.build);
         health = h;
       },
       () => {
@@ -858,15 +881,17 @@
           }
         }),
       );
-      // The local daemon was replaced (self-update). With the restart
-      // handoff the new daemon usually keeps the port AND token — then the
-      // origin is intact and the sockets just reconnect; reloading would
-      // only flicker. Re-home (carrying the window id, so the layout
-      // follows) only when the origin actually moved.
+      // The local daemon was replaced (self-update). Re-home (carrying the
+      // window id, so the layout follows) when its origin moved; when the
+      // handoff retained port+token, a changed build still requires a reload
+      // because the immutable hashed asset namespace changed.
       unlistenDaemonMoved = asyncDisposer(
-        onLocalDaemonUpdated(({ port, token }) => {
+        onLocalDaemonUpdated(({ port, token, build }) => {
           if (getHostLabel() !== "local") return;
-          if (String(port) === location.port && token === getToken()) return;
+          if (String(port) === location.port && token === getToken()) {
+            if (daemonBuildChanged(build)) location.reload();
+            return;
+          }
           const params = new URLSearchParams();
           params.set("token", token);
           params.set("win", windowKey());
@@ -876,11 +901,10 @@
       );
       // This remote window's tunnel dropped or came back. "down" → reconnect
       // now (the shell confirmed the forward is dead); "connected" → re-home
-      // only if the origin actually moved (daemon restart / update / rebuilt
-      // job tunnel), else the heal is in place and the WebSocket just
-      // reconnects. Matching is on statusAlias: a job window heeds ONLY its
-      // composite key's events — the login alias's port/token are a
-      // different daemon entirely.
+      // if the origin moved, or reload if only the daemon build moved. A pure
+      // same-build heal stays in place and its WebSocket just reconnects.
+      // Matching is on statusAlias: a job window heeds ONLY its composite
+      // key's events — the login alias's port/token are another daemon.
       unlistenHostStatus = asyncDisposer(
         onHostStatus((e) => {
           if (!canReconnect || e.alias !== statusAlias) return;
@@ -896,6 +920,7 @@
           const token = e.token ?? (jobCtx !== null ? getToken() : null);
           const portMoved = port !== null && String(port) !== location.port;
           const tokenMoved = token !== null && token !== getToken();
+          const buildMoved = daemonBuildChanged(e.build);
           if (portMoved || tokenMoved) {
             const params = new URLSearchParams();
             if (token !== null) params.set("token", token);
@@ -907,6 +932,8 @@
               if (jobCtx.node !== null) params.set("node", jobCtx.node);
             }
             location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
+          } else if (buildMoved) {
+            location.reload();
           }
         }),
       );

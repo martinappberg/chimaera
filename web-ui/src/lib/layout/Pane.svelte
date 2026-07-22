@@ -158,15 +158,19 @@
   function requestView(kind: PaneViewKind) {
     void loadPaneView(kind).then(
       (view) => (views = { ...views, [kind]: view }),
-      () => (viewErrors = { ...viewErrors, [kind]: true }),
+      (error: unknown) => {
+        // Lazy chunks are immutable per daemon build. A reconnect/update can
+        // atomically replace that set underneath an already-open window; the
+        // old import URL can never succeed on Retry. Keep the useful detail in
+        // the console, and offer the one recovery that obtains the new entry.
+        console.error(`could not load ${kind} view`, error);
+        viewErrors = { ...viewErrors, [kind]: true };
+      },
     );
   }
 
-  function retryView(kind: PaneViewKind) {
-    const next = { ...viewErrors };
-    delete next[kind];
-    viewErrors = next;
-    requestView(kind);
+  function reloadWindow() {
+    location.reload();
   }
 
   function viewKind(tab: Tab): PaneViewKind | null {
@@ -198,10 +202,11 @@
   });
 </script>
 
-{#snippet loadFailure(kind: PaneViewKind, label: string)}
+{#snippet loadFailure(label: string)}
   <div class="hint load-failure">
     <span>could not load {label}</span>
-    <button type="button" onclick={() => retryView(kind)}>retry</button>
+    <span class="load-detail">reload this window to restore the view</span>
+    <button type="button" onclick={reloadWindow}>reload window</button>
   </div>
 {/snippet}
 
@@ -232,7 +237,7 @@
             ctrl.revealWorktreeSession(forked.id, forked.workspace_id)}
         />
       {:else if viewErrors.chat}
-        {@render loadFailure("chat", "chat view")}
+        {@render loadFailure("chat view")}
       {:else}
         <Spinner />
       {/if}
@@ -241,7 +246,7 @@
       {#if TerminalView !== undefined}
         <TerminalView sessionId={tab.sessionId} focused={focused && active} fontSize={node.fontSize} />
       {:else if viewErrors.terminal}
-        {@render loadFailure("terminal", "terminal view")}
+        {@render loadFailure("terminal view")}
       {:else}
         <Spinner />
       {/if}
@@ -251,7 +256,7 @@
     {#if FileView !== undefined}
       <FileView path={tab.path} {wsRoot} fontSize={node.fontSize} />
     {:else if viewErrors.file}
-      {@render loadFailure("file", "file view")}
+      {@render loadFailure("file view")}
     {:else}
       <Spinner />
     {/if}
@@ -265,7 +270,7 @@
         onNavigate={(p: string) => ctrl.navigateFinder(tab.id, p)}
       />
     {:else if viewErrors.finder}
-      {@render loadFailure("finder", "Finder")}
+      {@render loadFailure("Finder")}
     {:else}
       <Spinner />
     {/if}
@@ -274,7 +279,7 @@
     {#if DiffView !== undefined}
       <DiffView path={tab.path} mode={tab.mode} {wsId} />
     {:else if viewErrors.diff}
-      {@render loadFailure("diff", "diff view")}
+      {@render loadFailure("diff view")}
     {:else}
       <Spinner />
     {/if}
@@ -283,7 +288,7 @@
     {#if GitView !== undefined}
       <GitView {wsId} paneId={node.id} {ctrl} {sessions} {names} onOpenSession={ctrl.revealWorktreeSession} />
     {:else if viewErrors.git}
-      {@render loadFailure("git", "git view")}
+      {@render loadFailure("git view")}
     {:else}
       <Spinner />
     {/if}
@@ -294,7 +299,7 @@
       {#if SessionChangesView !== undefined}
         <SessionChangesView session={cs} {wsRoot} paneId={node.id} {ctrl} />
       {:else if viewErrors.changes}
-        {@render loadFailure("changes", "changes view")}
+        {@render loadFailure("changes view")}
       {:else}
         <Spinner />
       {/if}
@@ -315,7 +320,7 @@
         visible={active}
       />
     {:else if viewErrors.dashboard}
-      {@render loadFailure("dashboard", "dashboard")}
+      {@render loadFailure("dashboard")}
     {:else}
       <Spinner />
     {/if}
@@ -324,7 +329,7 @@
     {#if SettingsView !== undefined}
       <SettingsView />
     {:else if viewErrors.settings}
-      {@render loadFailure("settings", "settings")}
+      {@render loadFailure("settings")}
     {:else}
       <Spinner />
     {/if}

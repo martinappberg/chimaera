@@ -42,9 +42,11 @@ export function loadPaneView(kind: PaneViewKind): Promise<Component<any>> {
   if (request === undefined) {
     request = loaders[kind]().then((module) => module.default);
     pending.set(kind, request);
-    // A chunk can fail transiently while a tunnel or daemon is reconnecting.
-    // Cache successes, not failures, so the pane's retry can issue a fresh
-    // request without reloading the whole workbench and losing live state.
+    // A chunk can fail while a tunnel reconnects or when a daemon handoff
+    // replaces the immutable asset set. Cache successes, not failures, so a
+    // later request never inherits an already-rejected shared promise; Pane
+    // still asks for a full reload because browsers can memoize failed module
+    // imports by URL.
     void request.catch(() => {
       if (pending.get(kind) === request) pending.delete(kind);
     });

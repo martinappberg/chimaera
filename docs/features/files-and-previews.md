@@ -152,6 +152,10 @@ viewer (`DiffView.svelte`) is shared with git — see [git.md](git.md).
   rasters cap at 12M pixels and inactive canvases use an 8-page LRU. Closing or evicting a PDF
   cancels its active pdf.js raster tasks, text layers, delayed rerenders, and restoration frame
   before destroying the document worker, so invisible work cannot keep a pane or webview busy.
+- **Release-safe lazy views.** File and other heavyweight workbench views load from immutable hashed
+  chunks. The entry document is never cached; if a daemon build changes beneath an open window and a
+  lazy chunk still fails, the pane explains the transition and offers a full-window reload rather
+  than repeatedly retrying an asset name that no longer exists.
 - **Binary / Finder.** Non-text files get a hex/summary view (`BinaryView`); `FinderView` is a
   directory browser surface.
 

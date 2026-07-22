@@ -100,6 +100,13 @@ async fn root_serves_html_without_auth() {
         .unwrap()
         .to_string();
     assert!(content_type.starts_with("text/html"));
+    assert_eq!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a daemon handoff must not leave reloads on a cached entry bundle"
+    );
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert!(!body.is_empty());
 }

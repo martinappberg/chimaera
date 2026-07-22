@@ -194,6 +194,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                             "The SSH tunnel or remote daemon stopped answering health checks."
                                 .to_string()
                         }),
+                        build: None,
                     },
                 );
             }

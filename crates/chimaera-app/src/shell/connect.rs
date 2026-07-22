@@ -54,6 +54,20 @@ pub(super) struct HostStatus {
     /// does not mean a reconnect attempt failed; it explains why one began.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
+    /// Source build behind the tunnel. Open windows use a changed build as a
+    /// navigation boundary even when the forward kept its port and token:
+    /// hashed UI chunks never span daemon builds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) build: Option<String>,
+}
+
+/// A loopback origin is reusable only while it still names the same source
+/// build. Replacing the daemon swaps the complete immutable asset set; keeping
+/// the port would leave already-open windows requesting the prior build's
+/// hashed chunks from the new server.
+fn reusable_tunnel_port(port: u16, old_build: Option<&str>, update_daemon: bool) -> Option<u16> {
+    (!update_daemon && chimaera_core::builds_match(chimaera_core::BUILD_ID, old_build))
+        .then_some(port)
 }
 
 pub(super) fn state_for(
@@ -229,6 +243,7 @@ pub(super) async fn do_connect(
                     token: None,
                     error: Some(e.clone()),
                     reason: None,
+                    build: None,
                 },
             );
         }
@@ -236,9 +251,9 @@ pub(super) async fn do_connect(
     }
 }
 
-/// One owned connect attempt: tear down the dead tunnel (keeping its
-/// loopback port so open windows heal in place), run the connect, install
-/// the new tunnel, and reopen this host's persisted windows.
+/// One owned connect attempt: tear down the old tunnel, keeping its loopback
+/// port only when it already points at this source build, run the connect,
+/// install the new tunnel, and reopen this host's persisted windows.
 async fn run_flight(
     app: &AppHandle,
     alias: &str,
@@ -252,8 +267,9 @@ async fn run_flight(
     let reuse_port = match old {
         Some(old) => {
             let port = old.local_port;
+            let reuse = reusable_tunnel_port(port, old.manifest.build.as_deref(), update_daemon);
             old.close().await;
-            (!update_daemon).then_some(port)
+            reuse
         }
         None => None,
     };
@@ -286,9 +302,9 @@ async fn run_flight(
     let host_state = state_for(&entry, "connected", Some(&tunnel));
     authorize_scope_origin(app, Some(alias), tunnel.local_port)
         .map_err(|e| format!("could not authorize {alias}'s daemon origin: {e}"))?;
-    // Tell open windows on this host to re-home if the port or token moved
-    // (daemon restart / update); a same-port+token reconnect is a no-op for
-    // them — their WebSocket just reconnects.
+    // Tell open windows on this host to re-home if the port/token/build moved.
+    // Build is independently load-bearing: the daemon serves one immutable
+    // set of hashed UI chunks, so a window from another build must reload.
     let _ = app.emit(
         "host-status",
         HostStatus {
@@ -298,6 +314,7 @@ async fn run_flight(
             token: Some(tunnel.manifest.token.clone()),
             error: None,
             reason: None,
+            build: tunnel.manifest.build.clone(),
         },
     );
     let (port, token) = (tunnel.local_port, tunnel.manifest.token.clone());
@@ -346,4 +363,18 @@ fn host_entry(alias: &str) -> chimaera_remote::hosts::HostEntry {
             added_at: 0,
             last_connected_at: None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reusable_tunnel_port;
+
+    #[test]
+    fn tunnel_port_is_reused_only_for_the_same_source_build() {
+        let current = chimaera_core::BUILD_ID;
+        assert_eq!(reusable_tunnel_port(9700, Some(current), false), Some(9700));
+        assert_eq!(reusable_tunnel_port(9700, Some("different.1"), false), None);
+        assert_eq!(reusable_tunnel_port(9700, None, false), None);
+        assert_eq!(reusable_tunnel_port(9700, Some(current), true), None);
+    }
 }

@@ -45,9 +45,23 @@ fn not_found() -> Response {
 fn serve(path: &str) -> Option<Response> {
     let file = Assets::get(path)?;
     let mime = mime_guess::from_path(path).first_or_octet_stream();
+    // A reload after a daemon handoff must obtain the new entry document.
+    // Hashed assets are the opposite: their name identifies their bytes and
+    // may be cached forever. This pair makes release transitions atomic from
+    // the browser's point of view.
+    let cache = if path == "index.html" {
+        "no-store"
+    } else if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     Some(
         (
-            [(header::CONTENT_TYPE, mime.as_ref())],
+            [
+                (header::CONTENT_TYPE, mime.as_ref()),
+                (header::CACHE_CONTROL, cache),
+            ],
             file.data.into_owned(),
         )
             .into_response(),

@@ -34,6 +34,7 @@ pub struct LocalState {
 struct LocalDaemonMoved {
     port: u16,
     token: String,
+    build: Option<String>,
 }
 
 /// The label of an open window showing `(alias, ws)`, if any, excluding
@@ -235,6 +236,7 @@ pub(super) async fn update_local_daemon(
     let moved = LocalDaemonMoved {
         port: fresh.port,
         token: fresh.token.clone(),
+        build: fresh.build.clone(),
     };
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
@@ -680,6 +682,7 @@ pub(super) async fn connect_compute_session(
             token: None,
             error: None,
             reason: None,
+            build: None,
         },
     );
     Ok(())

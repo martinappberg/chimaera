@@ -143,11 +143,11 @@ export async function updateLocalDaemon(): Promise<void> {
  * on the local daemon navigate themselves to the new one.
  */
 export function onLocalDaemonUpdated(
-  handler: (p: { port: number; token: string }) => void,
+  handler: (p: { port: number; token: string; build?: string }) => void,
 ): Promise<() => void> {
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
-  return t.event.listen<{ port: number; token: string }>("local-daemon-updated", (e) =>
+  return t.event.listen<{ port: number; token: string; build?: string }>("local-daemon-updated", (e) =>
     handler(e.payload),
   );
 }
@@ -333,6 +333,8 @@ export interface HostStatusEvent {
   /** Why a live connection transitioned down. This is context for the
    *  automatic reconnect, not a failed reconnect attempt. */
   reason?: string;
+  /** Source build now served through this tunnel. */
+  build?: string;
 }
 
 /**
