@@ -48,10 +48,12 @@
   } from "./store.svelte";
   import {
     advanceTailWindow,
+    autoPageEarlier,
     pageEarlier,
     pageLater,
     restoreWindow,
     tailWindow,
+    type PagePlan,
   } from "./transcriptWindow";
   import { getSetting } from "../settings/store.svelte";
 
@@ -127,6 +129,8 @@
 
   let transcriptEl = $state<HTMLElement | null>(null);
   let columnEl = $state<HTMLElement | null>(null);
+  let historySentinelEl = $state<HTMLElement | null>(null);
+  const canAutoLoadHistory = typeof IntersectionObserver !== "undefined";
   // Seed scroll intent from the pool so a remount restores the reading
   // position instead of snapping to the bottom.
   // svelte-ignore state_referenced_locally
@@ -458,16 +462,31 @@
     queueBottomScroll(true);
   }
 
-  function revealEarlier() {
+  function applyEarlierPage(plan: PagePlan, preserveTail: boolean) {
     const el = transcriptEl;
     if (el === null || pagingTranscript || renderStart === 0 || store.hydrating) return;
     pagingTranscript = true;
-    const plan = pageEarlier({ start: renderStart, end: renderEnd }, store.blocks.length);
-    atBottom = false;
-    setRangeAnchored(plan.settled.start, plan.settled.end, { live: false, tail: false });
+    if (preserveTail) {
+      setRange(plan.settled.start, plan.settled.end, { live: true, tail: true });
+      atBottom = true;
+      queueBottomScroll();
+    } else {
+      atBottom = false;
+      setRangeAnchored(plan.settled.start, plan.settled.end, {
+        live: false,
+        tail: false,
+      });
+    }
     void tick().then(() => {
       pagingTranscript = false;
     });
+  }
+
+  function revealEarlier() {
+    applyEarlierPage(
+      pageEarlier({ start: renderStart, end: renderEnd }, store.blocks.length),
+      false,
+    );
   }
 
   function revealLater() {
@@ -491,6 +510,40 @@
       pagingTranscript = false;
     });
   }
+
+  // Earlier pages should feel like ordinary transcript scrolling, not a
+  // pagination workflow. The sentinel also fills a tall/empty viewport where
+  // no scroll event can fire. Keep the button below only as a compatibility
+  // fallback for a browser without IntersectionObserver.
+  $effect(() => {
+    const root = transcriptEl;
+    const sentinel = historySentinelEl;
+    const hasEarlier = renderStart > 0;
+    if (
+      !canAutoLoadHistory ||
+      !visible ||
+      !hasEarlier ||
+      store.hydrating ||
+      root === null ||
+      sentinel === null
+    ) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        const plan = autoPageEarlier(
+          { start: renderStart, end: renderEnd },
+          store.blocks.length,
+          atBottom,
+        );
+        if (plan !== null) applyEarlierPage(plan, plan.preserveTail);
+      },
+      { root, rootMargin: "96px 0px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  });
 
   // On (re)mount, restore the saved reading position ONCE: bottom-pinned
   // sessions stick to the bottom, otherwise jump back to where the user was
@@ -1180,6 +1233,14 @@
     pinnedSends = store.pendingSends;
   });
 
+  const jumpLabel = $derived(
+    followedVersion !== store.transcriptVersion
+      ? "jump to newest — new activity"
+      : pinnedPermissions.length > 0
+        ? "jump to newest — permission needed"
+        : "jump to newest",
+  );
+
   const planDone = $derived(pinnedPlan.filter((p) => p.status === "done").length);
   /** The step the agent is on now — surfaced in the plan summary so the
    *  current goal is legible without expanding the panel. `activeForm` is the
@@ -1361,13 +1422,17 @@
       </div>
     {/if}
     {#if renderStart > 0}
-      <button
-        class="history-more"
-        title="Older history stays available without keeping the whole conversation mounted"
-        onclick={revealEarlier}
-      >
-        ↑ show {renderStart.toLocaleString()} earlier conversation item{renderStart === 1 ? "" : "s"}
-      </button>
+      {#if canAutoLoadHistory}
+        <span class="history-sentinel" bind:this={historySentinelEl} aria-hidden="true"></span>
+      {:else}
+        <button
+          class="history-more"
+          title="Automatic history loading is unavailable in this browser"
+          onclick={revealEarlier}
+        >
+          ↑ show {renderStart.toLocaleString()} earlier conversation item{renderStart === 1 ? "" : "s"}
+        </button>
+      {/if}
     {/if}
     {#each renderItems as item (item.key)}
       {#if item.t === "group"}
@@ -1602,12 +1667,13 @@
     {/if}
 
     {#if hasDeferredActivity || !atBottom}
-      <button class="jump" onclick={scrollToBottom}>
-        {followedVersion !== store.transcriptVersion
-          ? "new activity"
-          : pinnedPermissions.length > 0
-            ? "permission needed"
-            : "jump to newest"} ↓
+      <button
+        class="jump"
+        title={jumpLabel}
+        aria-label={jumpLabel}
+        onclick={scrollToBottom}
+      >
+        <span aria-hidden="true">↓</span>
       </button>
     {/if}
     {/if}
@@ -1848,6 +1914,11 @@
   .history-more:hover {
     color: var(--fg);
     border-color: color-mix(in srgb, var(--accent) 48%, var(--edge));
+  }
+  .history-sentinel {
+    width: 100%;
+    height: 1px;
+    pointer-events: none;
   }
   .history-later {
     margin-top: 10px;
@@ -2241,16 +2312,34 @@
     position: sticky;
     bottom: 4px;
     align-self: center;
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
     font: inherit;
-    font-size: var(--text-sm);
-    color: var(--warn);
-    background: var(--term-bg);
-    border: 1px solid color-mix(in srgb, var(--warn) 55%, var(--edge));
-    border-radius: 999px;
-    padding: 2px 12px;
+    font-size: var(--text-lg);
+    line-height: 1;
+    color: color-mix(in srgb, var(--fg) 40%, transparent);
+    background: none;
+    border: none;
+    text-shadow:
+      0 1px 2px var(--term-bg),
+      0 0 6px var(--term-bg);
     cursor: pointer;
+    transition:
+      color 0.12s ease,
+      transform 0.12s ease;
+  }
+  .jump:hover,
+  .jump:focus-visible {
+    color: color-mix(in srgb, var(--fg) 72%, transparent);
   }
   .jump:hover {
-    border-color: var(--warn);
+    transform: translateY(1px);
+  }
+  .jump:focus-visible {
+    outline: 1px solid var(--focus-ring);
+    outline-offset: 2px;
   }
 </style>

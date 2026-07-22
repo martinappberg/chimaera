@@ -56,6 +56,11 @@ export interface PagePlan {
   settled: TranscriptWindow;
 }
 
+export interface AutoEarlierPagePlan extends PagePlan {
+  /** Keep rendering and following the live tail while a short viewport fills. */
+  preserveTail: boolean;
+}
+
 /** Prepend one page, then discard the farthest newer page past the cap. */
 export function pageEarlier(current: TranscriptWindow, total: number): PagePlan {
   const end = Math.min(current.end, boundedTotal(total));
@@ -64,6 +69,25 @@ export function pageEarlier(current: TranscriptWindow, total: number): PagePlan 
   const settled =
     end - start > TRANSCRIPT_WINDOW ? { start, end: start + TRANSCRIPT_WINDOW } : expanded;
   return { expanded, settled };
+}
+
+/**
+ * Plan an observer-driven earlier page. A visible sentinel can mean either
+ * that the reader scrolled upward or that a short live tail has not filled
+ * the viewport yet. The latter may grow backward without suspending follow,
+ * but stops at the DOM cap instead of silently paging away from the live edge.
+ */
+export function autoPageEarlier(
+  current: TranscriptWindow,
+  total: number,
+  atBottom: boolean,
+): AutoEarlierPagePlan | null {
+  const bounded = boundedTotal(total);
+  const plan = pageEarlier(current, bounded);
+  const atLiveTail = atBottom && current.end >= bounded;
+  if (!atLiveTail) return { ...plan, preserveTail: false };
+  if (plan.settled.end < bounded) return null;
+  return { ...plan, preserveTail: true };
 }
 
 /** Append one page, then discard the farthest older page past the cap. */

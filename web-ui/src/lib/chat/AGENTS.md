@@ -36,7 +36,7 @@ hard-resets and rebuilds.
 | `store.svelte.ts` | `ChatStore` — the reducer + all reactive view state (`blocks`, `pending`, `pendingSends`, `questions`, model/mode, activity, exited/degraded/connected), including initial replay hydration through the ready-frame `head`. **The single source of truth for the view.** Its reducer has a vitest test (`store.svelte.test.ts`) — the one place the UI is unit-tested. |
 | `chatWs.ts` / `cooperativeQueue.ts` | `ChatSocket` — connect/auth/reconnect(backoff)/gap-replay, then dispatch replay/live/control frames through one order-preserving cooperative queue so a cold history cannot starve browser input. Per-command refusals (`command_failed` / `invalid_command`) are visible but nonfatal. Shares reconnect accounting with `../terminal/ws.ts`. |
 | `chatPool.ts` | Session-keyed warm reducer/socket + scroll/render-window/followed-revision cursor. The agent keeps folding while a tab's bounded DOM snapshot is hidden or its view is evicted; client-pool eviction never stops the daemon-owned process. |
-| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; explicit earlier/later pages + a direct jump to newest), and hangs the header/composer/overlays/panels off itself. Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
+| `ChatView.svelte` | The host: renders a bottom-anchored transcript window (64 blocks initially, 192 maximum; automatically pages earlier near the top, with a compatibility fallback button; explicit later pages + a direct jump to newest), and hangs the header/composer/overlays/panels off itself. Visible tail rows are reducer proxies; hidden/history rows are one inert snapshot. A fresh replay stays gated until `head`, so it never paints oldest-to-newest. Still the big one — keep new chrome in child components, not inline. |
 | `transcriptWindow.ts` | Pure range math for the 64-block/192-block sliding transcript DOM window; tests cover both paging directions and stale cursor repair after reducer compaction. |
 | `ChatHeader.svelte` | The header row: model / mode / effort pickers, usage + `/mcp` entry, session identity (always names which agent — Claude or Codex). |
 | `EffortPopover.svelte` | The reasoning-effort ladder picker (uses the agent-native vocabulary verbatim — never relabel `xhigh`). |
@@ -112,6 +112,9 @@ lifted out of the terminal pool) — see the shared/ area.
   continues rendering while the reader scrolls or types, but
   a non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
   retain reactive block proxies. Replay never remounts the entire transcript.
+  A visible top sentinel while a short live tail fills the viewport is layout,
+  not reader intent: it may prepend only while retaining the tail, and stops at
+  the DOM cap instead of silently paging the reader away from live activity.
 - **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
   latest sequence that makes that message true on replay (a queued user message
   advances on its `sent` update; a final Codex assistant message advances on
