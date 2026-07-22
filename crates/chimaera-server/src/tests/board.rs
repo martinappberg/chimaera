@@ -128,9 +128,73 @@ async fn board_routes_refuse_non_board_paths() {
 }
 
 #[tokio::test]
+async fn board_edit_moves_an_object_and_the_agent_reads_it_back() {
+    // The core bet, as a route round-trip: human gesture → canonical file →
+    // describe shows the new position.
+    let state = test_state();
+    let path = write_board("board-edit");
+
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/edit",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "object": "t",
+            "at": [120.0, 80.0],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json["mtime"].as_str().is_some(), "{json}");
+    assert!(
+        json.get("path").is_none(),
+        "no fs paths on the wire: {json}"
+    );
+
+    let (_, described) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/describe",
+        Some(serde_json::json!({"path": path.to_string_lossy()})),
+    )
+    .await;
+    let text = described["text"].as_str().unwrap();
+    assert!(text.contains("t text/heading at [120, 80]"), "{text}");
+
+    // The write is canonical: a re-save of the file moves no bytes.
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let board = chimaera_board::parse(&on_disk).unwrap();
+    assert_eq!(chimaera_board::to_string(&board).unwrap(), on_disk);
+}
+
+#[tokio::test]
+async fn board_edit_refuses_an_unknown_object_by_name() {
+    let state = test_state();
+    let path = write_board("board-edit-unknown");
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/edit",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "object": "ghost",
+            "at": [0.0, 0.0],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("ghost"), "{json}");
+}
+
+#[tokio::test]
 async fn board_endpoints_without_token_are_401() {
     let state = test_state();
-    for uri in ["/api/v1/board/render", "/api/v1/board/describe"] {
+    for uri in [
+        "/api/v1/board/render",
+        "/api/v1/board/describe",
+        "/api/v1/board/edit",
+    ] {
         let (status, _, _) = request_bytes(&state, Method::POST, uri, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} must be authed");
     }

@@ -41,6 +41,7 @@
   let HtmlView = $state<Component<{ path: string }> | null>(null);
   let XlsxView = $state<Component<{ path: string }> | null>(null);
   let PdfView = $state<Component<{ path: string }> | null>(null);
+  let BoardView = $state<Component<{ path: string }> | null>(null);
   let lazyError = $state<string | null>(null);
   $effect(() => {
     if (kind !== "text" || CodeView !== null) return;
@@ -75,6 +76,13 @@
     void import("./PdfView.svelte").then(
       (m) => (PdfView = m.default),
       () => (lazyError = "failed to load the PDF preview"),
+    );
+  });
+  $effect(() => {
+    if (kind !== "board" || BoardView !== null) return;
+    void import("./BoardView.svelte").then(
+      (m) => (BoardView = m.default),
+      () => (lazyError = "failed to load the board view"),
     );
   });
   $effect(() => {
@@ -170,6 +178,16 @@
           {#key entry?.mtime ?? path}
             <PdfView {path} />
           {/key}
+        {:else if lazyError !== null}
+          <div class="file-error">{lazyError}</div>
+        {:else}
+          <Spinner />
+        {/if}
+      {:else if kind === "board"}
+        {#if BoardView !== null}
+          <!-- No mtime key: BoardView re-renders in place on the entry's mtime
+               so the stage never flashes through a spinner mid-edit. -->
+          <BoardView {path} />
         {:else if lazyError !== null}
           <div class="file-error">{lazyError}</div>
         {:else}

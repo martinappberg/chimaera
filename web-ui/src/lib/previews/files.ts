@@ -272,6 +272,56 @@ export async function fsXlsx(
   return json(await api(`/fs/xlsx?${q.toString()}`));
 }
 
+/** One board-page render: a /raw ticket to the cached PNG plus what the
+ *  renderer had to say. Diagnostics are pre-rendered strings — the pane shows
+ *  them verbatim, it never re-derives layout truth client-side. */
+export interface BoardRender {
+  ticket: string;
+  width: number;
+  height: number;
+  pageCount: number;
+  pages: string[];
+  diagnostics: { severity: string; object: string | null; message: string; rendered: string }[];
+}
+
+/** Render one page of a board server-side. The daemon caches by content, so
+ *  re-asking for an unchanged board is a file stat, not a re-render. */
+export async function fsBoardRender(
+  path: string,
+  page = 0,
+  scale = 2.0,
+  theme?: string,
+): Promise<BoardRender> {
+  return json(
+    await api("/board/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, page, scale, theme }),
+    }),
+  );
+}
+
+/**
+ * Apply one gesture (move/resize by object id) to a board, server-side.
+ * The pane never serializes a board itself — a client-side stringify would
+ * destroy the canonical byte-stable form. Resolves to the new X-Mtime token
+ * so the caller can `noteWrite` and adopt its own edit.
+ */
+export async function fsBoardEdit(
+  path: string,
+  object: string,
+  change: { at?: [number, number]; size?: [number, number] },
+): Promise<string | null> {
+  const body = await json<{ mtime: string | null }>(
+    await api("/board/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, object, ...change }),
+    }),
+  );
+  return body.mtime;
+}
+
 /**
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
@@ -518,6 +568,7 @@ export type FileViewKind =
   | "table"
   | "xlsx"
   | "pdf"
+  | "board"
   | "binary"
   | "text";
 
@@ -564,6 +615,10 @@ export function viewKindFor(path: string): FileViewKind {
   // every other gzip goes down the text path (fs/file decompresses, then the
   // NUL sniff falls back to the binary card for gzipped binaries).
   if (isGzipped(path)) return TABLE_EXTS.has(ext) ? "table" : "text";
+  // Boards match on the full compound suffix — `extension()` only ever sees
+  // the last dot segment, so a plain `.json` never lands here, and an older
+  // build (or a failed parse) falls back to the ordinary text view.
+  if (basename(path).toLowerCase().endsWith(".board.json")) return "board";
   if (IMAGE_EXTS.has(ext)) return "image";
   if (MARKDOWN_EXTS.has(ext)) return "markdown";
   if (HTML_EXTS.has(ext)) return "html";

@@ -178,7 +178,9 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// header and PUT `expect_mtime` conflict check. mtime remains the primary
 /// signal, but length plus Unix inode/ctime identity catch a same-size rewrite
 /// whose timestamp was preserved or rounded by a coarse shared filesystem.
-fn mtime_token(meta: &std::fs::Metadata) -> String {
+/// `pub(crate)` so the board edit route hands the client the same token a
+/// PUT /fs/file would, keeping the fileStore's invalidation uniform.
+pub(crate) fn mtime_token(meta: &std::fs::Metadata) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     meta.modified()
         .ok()

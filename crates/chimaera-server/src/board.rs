@@ -46,6 +46,24 @@ pub(crate) struct DescribeRequest {
     pub path: String,
 }
 
+/// One semantic gesture from the pane: move/resize an object by id.
+///
+/// The pane never serializes a board itself — a client-side
+/// `JSON.stringify` would destroy the canonical byte-stable form and churn
+/// every diff — so a gesture routes through here, where the crate's writer is
+/// the one authority on bytes.
+#[derive(Deserialize)]
+pub(crate) struct EditRequest {
+    pub path: String,
+    /// The object's id — the same id that is the diff anchor, the journal
+    /// subject, and the merge key.
+    pub object: String,
+    #[serde(default)]
+    pub at: Option<[f64; 2]>,
+    #[serde(default)]
+    pub size: Option<[f64; 2]>,
+}
+
 /// POST /api/v1/board/render → `{ticket, width, height, pageCount, pages,
 /// diagnostics}`. The PNG is fetched as `/raw/{ticket}`.
 pub(crate) async fn render(
@@ -153,6 +171,73 @@ pub(crate) async fn describe(
         }))
     })
     .await
+}
+
+/// POST /api/v1/board/edit → `{mtime}`. Applies the gesture, renormalizes,
+/// saves canonically, and returns the new `X-Mtime` token so the fileStore
+/// adopts the write as its own rather than treating it as external.
+pub(crate) async fn edit(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EditRequest>,
+) -> Response {
+    let outcome = fs::blocking_value(move || {
+        let path = resolve_board_path(&req.path)?;
+        let mut board = chimaera_board::load(&path)?;
+
+        let mut found = false;
+        for page in &mut board.pages {
+            // Top-level objects only: group children are page-absolute too,
+            // but moving one without its siblings is a different gesture
+            // (enter-the-group), which the pane does not offer yet.
+            for obj in &mut page.objects {
+                if obj.id() != req.object {
+                    continue;
+                }
+                found = true;
+                if let Some(at) = req.at {
+                    obj.set_at(at);
+                }
+                if let Some(size) = req.size {
+                    obj.set_size(size);
+                }
+            }
+        }
+        if !found {
+            anyhow::bail!("no object {:?} in {}", req.object, path.display());
+        }
+
+        // Normalize (grid snap, group re-union) before the canonical save —
+        // the same pipeline an agent edit goes through, so a human drag and
+        // an agent Edit produce bytes of identical shape.
+        chimaera_board::normalize(&mut board);
+        chimaera_board::save(&path, &board)?;
+
+        let meta = std::fs::metadata(&path)?;
+        Ok(json!({
+            "mtime": fs::mtime_token(&meta),
+            "path": path.to_string_lossy(),
+        }))
+    })
+    .await;
+
+    match outcome {
+        Ok(mut value) => {
+            // Nudge the git watcher so the FILES tree's dirty badge follows a
+            // drag without waiting for the poll.
+            if let Some(p) = value.get("path").and_then(|p| p.as_str()) {
+                crate::git::mark_path_dirty(&state, p).await;
+            }
+            if let Some(obj) = value.as_object_mut() {
+                obj.remove("path");
+            }
+            Json(value).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("{err:#}")})),
+        )
+            .into_response(),
+    }
 }
 
 fn resolve_board_path(raw: &str) -> anyhow::Result<PathBuf> {

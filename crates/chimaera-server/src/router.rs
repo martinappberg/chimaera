@@ -125,6 +125,7 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
         // the agent-facing read-back. Same crate functions as the CLI.
         .route("/board/render", post(board::render))
         .route("/board/describe", post(board::describe))
+        .route("/board/edit", post(board::edit))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
