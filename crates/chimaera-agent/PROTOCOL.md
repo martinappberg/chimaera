@@ -1959,7 +1959,7 @@ reconnect. The journal contained only parent `EffortState(xhigh)` entries and no
 guardian effort event. Hermetic coverage pins both the correctly scoped foreign
 case and the unscoped defensive case.
 
-## Pass 29 (2026-07-21 — codex effort survives reopen and seeds new threads). ADOPTED.
+## Pass 29 (2026-07-21 — codex effort survives reopen and honors new-thread config). ADOPTED.
 
 A Sherlock session exposed a different `low` failure after Pass 28. Its
 Chimaera journal recorded the parent changing from the model default `low` to
@@ -1978,20 +1978,19 @@ two-second-bounded read before opening a thread. Chimaera's own durable,
 daemon/app-server restarts and applies this precedence at open:
 
 1. the resumed/forked native thread's last observed parent effort;
-2. Chimaera's latest observed Codex effort for a brand-new or previously
-   unindexed thread;
-3. Codex's configured `model_reasoning_effort`;
-4. app-server's model default when none of those exists.
+2. Codex's configured `model_reasoning_effort` for a brand-new thread, or a
+   resumed thread whose legacy journal has no recoverable selection;
+3. app-server's model default when neither exists.
 
 The open request sends the chosen `effort` on `thread/start`, `thread/resume`,
 or `thread/fork`; the response remains the effective read-back shown in the
-header. Index revisions advance only when a conversation's effort changes, so
-merely reopening an older thread does not make its historical value the global
-new-thread choice. Init/effort writes are serialized through the index's
-blocking persistence lane so their atomic renames cannot commit out of order.
-Only Codex parent `EffortState` events feed this state; Pass 28's foreign and
-unscoped guardian filters remain the boundary. For pre-Pass-29 index entries,
-the first resume performs a bounded one-time migration from that Chimaera
-journal: it ignores the bootstrap EffortState after every process `Init` and
-recovers the last later settings read-back. Thus an already-recorded explicit
-`xhigh` outranks the erroneous `low` that an old restart appended.
+header. Effort is conversation-local: changing or reopening one thread never
+changes another thread or the new-thread default. Init/effort writes are
+serialized through the index's blocking persistence lane so their atomic
+renames cannot commit out of order. Only Codex parent `EffortState` events feed
+this state; Pass 28's foreign and unscoped guardian filters remain the boundary.
+For pre-Pass-29 index entries, the first resume performs a bounded one-time
+migration from that Chimaera journal on a blocking worker: it ignores the
+bootstrap EffortState after every process `Init` and recovers the last later
+settings read-back. Thus an already-recorded explicit `xhigh` outranks the
+erroneous `low` that an old restart appended without blocking Tokio's reactor.

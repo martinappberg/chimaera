@@ -67,10 +67,10 @@ pub struct SpawnSpec {
     /// model through launcher argv and ignores this protocol-side copy.
     pub initial_model: Option<String>,
     /// Reasoning effort to apply while opening a Codex thread. For resumes,
-    /// this is the thread's last user-selected value; for a fresh thread it
-    /// may be Chimaera's latest Codex selection. When absent, the driver reads
-    /// Codex's own `model_reasoning_effort` config before falling back to the
-    /// model default. Claude ignores this protocol-side copy.
+    /// this is that thread's last user-selected value. When absent (including
+    /// every fresh thread), the driver reads Codex's own
+    /// `model_reasoning_effort` config before falling back to the model
+    /// default. Claude ignores this protocol-side copy.
     pub initial_effort: Option<String>,
     /// The binary's `--version` line as the server probed it (`None` when
     /// the probe failed). Neither wire protocol offers a reliable version

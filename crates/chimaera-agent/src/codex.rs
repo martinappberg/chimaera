@@ -305,7 +305,7 @@ async fn codex_handshake(
 
     // Match native Codex's new-thread default instead of silently taking the
     // selected model's catalog default. The config read is optional for older
-    // app-server builds; a Chimaera-carried thread/latest selection wins.
+    // app-server builds; a Chimaera-carried resumed-thread selection wins.
     let configured_effort = if spec.initial_effort.is_none() {
         let config_id = 1u64;
         if sink

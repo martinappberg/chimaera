@@ -503,15 +503,6 @@ struct IndexEntry {
     /// not rehydrate the setting, so this small side-index must carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
-    /// Monotonic order for actual effort changes. Ordinary resume/index
-    /// refreshes preserve it, so reopening an older conversation does not
-    /// replace the latest Codex choice used for brand-new threads.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    effort_revision: u64,
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
 }
 
 const INDEX_MAX_ENTRIES: usize = 200;
@@ -536,16 +527,17 @@ impl JournalIndex {
         // Init can race the immediately-following EffortState because both
         // disk writes run on blocking workers. Preserve an effort upsert that
         // won that race instead of replacing it with an empty Init record.
-        let previous = entries.iter().rev().find(|e| e.native_id == native_id);
-        let effort = previous.and_then(|e| e.effort.clone());
-        let effort_revision = previous.map_or(0, |e| e.effort_revision);
+        let effort = entries
+            .iter()
+            .rev()
+            .find(|e| e.native_id == native_id)
+            .and_then(|e| e.effort.clone());
         entries.retain(|e| e.native_id != native_id);
         entries.push(IndexEntry {
             native_id: native_id.to_string(),
             session_id: session_id.to_string(),
             ts: now_ms(),
             effort,
-            effort_revision,
         });
         if entries.len() > INDEX_MAX_ENTRIES {
             let excess = entries.len() - INDEX_MAX_ENTRIES;
@@ -575,26 +567,12 @@ impl JournalIndex {
         let effort = effort.filter(|value| value.len() <= crate::model::COMMAND_SELECTOR_MAX);
         let _persist = self.persist_lock.lock().expect("index persist lock");
         let mut entries = self.entries.lock().expect("index lock");
-        let previous = entries.iter().rev().find(|e| e.native_id == native_id);
-        let effort_revision = if previous.is_some_and(|entry| entry.effort == effort) {
-            previous.map_or(0, |entry| entry.effort_revision)
-        } else if effort.is_some() {
-            entries
-                .iter()
-                .map(|entry| entry.effort_revision)
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-        } else {
-            0
-        };
         entries.retain(|e| e.native_id != native_id);
         entries.push(IndexEntry {
             native_id: native_id.to_string(),
             session_id: session_id.to_string(),
             ts: now_ms(),
             effort,
-            effort_revision,
         });
         if entries.len() > INDEX_MAX_ENTRIES {
             let excess = entries.len() - INDEX_MAX_ENTRIES;
@@ -618,9 +596,9 @@ impl JournalIndex {
     }
 
     /// Return the indexed effort, or migrate a pre-effort index entry from
-    /// its bounded Chimaera journal. This is a blocking, one-time upgrade path
-    /// called only while spawning a Codex process (the spawn path already does
-    /// filesystem/process work); successful recovery is immediately indexed.
+    /// its bounded Chimaera journal. This is a blocking, one-time upgrade path;
+    /// callers must run it on a blocking worker. Successful recovery is
+    /// immediately indexed for this native conversation only.
     pub fn effort_or_recover(&self, native_id: &str) -> Option<String> {
         let session_id = {
             let entries = self.entries.lock().expect("index lock");
@@ -639,19 +617,6 @@ impl JournalIndex {
         tracing::info!(%native_id, %session_id, %effort, "recovered Codex effort from journal");
         self.record_effort(native_id, &session_id, Some(effort.clone()));
         Some(effort)
-    }
-
-    /// Latest effective Codex choice across native conversations. Revisions
-    /// advance only when a conversation's effort changes, not when it is
-    /// merely reopened and re-indexed.
-    pub fn latest_effort(&self) -> Option<String> {
-        self.entries
-            .lock()
-            .expect("index lock")
-            .iter()
-            .filter(|entry| entry.effort.is_some() && entry.effort_revision > 0)
-            .max_by_key(|entry| entry.effort_revision)
-            .and_then(|entry| entry.effort.clone())
     }
 }
 
@@ -1039,7 +1004,6 @@ mod tests {
         index.record("native-a", "s-3"); // re-record moves, not duplicates
         assert_eq!(index.lookup("native-a").as_deref(), Some("s-3"));
         assert_eq!(index.effort("native-a").as_deref(), Some("xhigh"));
-        assert_eq!(index.latest_effort().as_deref(), Some("xhigh"));
         assert_eq!(index.lookup("native-b").as_deref(), Some("s-2"));
         assert_eq!(index.lookup("native-zzz"), None);
 
@@ -1053,14 +1017,14 @@ mod tests {
         index.record_effort("native-race", "s-race", Some("high".into()));
         index.record("native-race", "s-race");
         assert_eq!(index.effort("native-race").as_deref(), Some("high"));
-        assert_eq!(index.latest_effort().as_deref(), Some("high"));
 
-        // Merely reopening the older xhigh thread must not make it the global
-        // new-thread choice again; an actual change still does.
+        // Effort is conversation-local: reopening or changing one thread
+        // cannot alter any other thread's persisted value.
         index.record_effort("native-a", "s-3", Some("xhigh".into()));
-        assert_eq!(index.latest_effort().as_deref(), Some("high"));
+        assert_eq!(index.effort("native-race").as_deref(), Some("high"));
         index.record_effort("native-a", "s-3", Some("medium".into()));
-        assert_eq!(index.latest_effort().as_deref(), Some("medium"));
+        assert_eq!(index.effort("native-a").as_deref(), Some("medium"));
+        assert_eq!(index.effort("native-race").as_deref(), Some("high"));
 
         for i in 0..(INDEX_MAX_ENTRIES + 50) {
             index.record(&format!("n{i}"), "s-x");
