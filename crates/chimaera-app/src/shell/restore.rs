@@ -40,14 +40,17 @@ pub fn open_ui_window(
         Some(alias) => format!("{alias} — chimaera"),
         None => "chimaera".to_string(),
     };
-    open_shell_window(app, &url, &title, record, record.alias.clone())
+    let scope = WindowScope::new(record.alias.clone(), record.ws.clone(), record.id.clone());
+    open_shell_window(app, &url, &title, record, scope)
 }
 
 /// Open a window on a compute-node daemon (Mode 2). Same shell wiring as
 /// `open_ui_window`, but the URL is the ComputeTunnel's own (token + host +
 /// job + node already ride its hash; only `win=` is added here) and the
 /// tracked scope alias is the composite `"{alias}#job{id}"` so focus-existing
-/// never confuses a job window with the login host's.
+/// never confuses a job window with the login host's. Its askpass identity is
+/// recorded separately as the login alias; it is never inferred by parsing
+/// that composite key.
 pub(super) fn open_compute_window(
     app: &AppHandle,
     url: &str,
@@ -56,7 +59,17 @@ pub(super) fn open_compute_window(
     scope_alias: &str,
 ) -> tauri::Result<()> {
     let url = format!("{url}&win={}", urlencoding::encode(&record.id));
-    open_shell_window(app, &url, title, record, Some(scope_alias.to_string()))
+    let login_alias = record
+        .alias
+        .clone()
+        .expect("compute windows always carry their login alias");
+    let scope = WindowScope::new_compute(
+        scope_alias.to_string(),
+        login_alias,
+        record.ws.clone(),
+        record.id.clone(),
+    );
+    open_shell_window(app, &url, title, record, scope)
 }
 
 fn open_shell_window(
@@ -64,7 +77,7 @@ fn open_shell_window(
     url: &str,
     title: &str,
     record: &WindowRecord,
-    scope_alias: Option<String>,
+    window_scope: WindowScope,
 ) -> tauri::Result<()> {
     let url: tauri::Url = url.parse().expect("daemon url is always valid");
     let port = url
@@ -105,27 +118,27 @@ fn open_shell_window(
     if let (Some(x), Some(y)) = (record.x, record.y) {
         builder = builder.position(x, y);
     }
+    // Register the immutable host scope before the webview can execute a
+    // command. `build()` starts navigation, so inserting afterward leaves a
+    // short startup race where `list_askpass` rejects a legitimate window and
+    // the only visible authentication prompt is missed.
+    if let Some(shell) = app.try_state::<Shell>() {
+        // The scope already carries both the window identity and its separate
+        // immutable askpass authorization. Register it before navigation can
+        // execute a native command.
+        lock(&shell.windows).insert(label.clone(), window_scope);
+    }
     if let Err(error) = builder.build() {
         if let Some(shell) = app.try_state::<Shell>() {
             lock(&shell.allowed_daemon_ports).remove(&label);
+            lock(&shell.windows).remove(&label);
         }
         return Err(error);
     }
-    // Track the new window's scope so focus-existing can raise it, and
-    // persist it so the next launch reopens it. Startup manages Shell before
-    // opening any window, so every window registers.
+    // Persist the new window so the next launch reopens it. Startup manages
+    // Shell before opening any window, so every daemon window registered
+    // above has an authoritative scope before its first native command.
     if let Some(shell) = app.try_state::<Shell>() {
-        lock(&shell.windows).insert(
-            label,
-            WindowScope {
-                alias: scope_alias,
-                ws: record.ws.clone(),
-                stable_id: record.id.clone(),
-                // Named by the SPA once it mounts (report_window_scope); until
-                // then the tray falls back to "Home"/"Loading…" by scope.
-                label: String::new(),
-            },
-        );
         lock(&shell.registry).upsert(record.clone());
     }
     // A new window changes the tray's open-windows list.
@@ -194,6 +207,7 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
                             "The SSH tunnel or remote daemon stopped answering health checks."
                                 .to_string()
                         }),
+                        build: None,
                     },
                 );
             }
@@ -203,16 +217,17 @@ pub(super) fn spawn_health_monitor(handle: AppHandle) {
 
 /// Reopen the persisted window set: local-daemon windows immediately;
 /// remote windows as their host tunnels come up (one connect per alias, in
-/// the background — an unreachable host must not hold up launch). Returns
-/// whether any window opens immediately, so startup can fall back to a home
-/// window and never come up invisible.
-pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> bool {
+/// the background — an unreachable host must not hold up launch). A local
+/// home window is registered before those connects start whenever no restored
+/// home can receive their startup askpass prompts.
+pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> tauri::Result<()> {
     let records = {
         let shell = handle.state::<Shell>();
         let records = lock(&shell.registry).list();
         records
     };
     let mut opened = false;
+    let mut home_opened = false;
     let mut remote_aliases: Vec<String> = Vec::new();
     for record in &records {
         // A compute window was a view onto a walltime-bounded job tunnel that
@@ -226,7 +241,10 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
         }
         match &record.alias {
             None => match open_ui_window(handle, port, token, record) {
-                Ok(()) => opened = true,
+                Ok(()) => {
+                    opened = true;
+                    home_opened |= record.ws.is_none();
+                }
                 Err(e) => tracing::warn!("could not reopen window {}: {e}", record.id),
             },
             Some(alias) => {
@@ -236,6 +254,16 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
             }
         }
     }
+
+    // Register the safe cross-host askpass surface before spawning any ssh.
+    // A local workspace is already visible, but deliberately cannot observe
+    // another host's prompt; treating it as the startup fallback strands a
+    // password/2FA connect until the 180-second askpass timeout.
+    if needs_startup_home(opened, home_opened, !remote_aliases.is_empty()) {
+        open_ui_window(handle, port, token, &WindowRecord::new(None, None))?;
+        tracing::info!("startup home window open on 127.0.0.1:{port}");
+    }
+
     for alias in remote_aliases {
         let handle = handle.clone();
         tauri::async_runtime::spawn(async move {
@@ -248,5 +276,22 @@ pub(super) fn restore_windows(handle: &AppHandle, port: u16, token: &str) -> boo
             }
         });
     }
-    opened
+    Ok(())
+}
+
+fn needs_startup_home(opened: bool, home_opened: bool, has_remote: bool) -> bool {
+    !opened || (has_remote && !home_opened)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_startup_home;
+
+    #[test]
+    fn startup_home_precedes_remote_auth_when_no_home_was_restored() {
+        assert!(needs_startup_home(false, false, false));
+        assert!(!needs_startup_home(true, false, false));
+        assert!(needs_startup_home(true, false, true));
+        assert!(!needs_startup_home(true, true, true));
+    }
 }

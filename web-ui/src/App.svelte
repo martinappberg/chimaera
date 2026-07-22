@@ -9,6 +9,7 @@
     notifyUnauthorized,
     pollHealth,
     setActiveWorkspaceId,
+    unauthorized,
     type Health,
   } from "./lib/net/api";
   import {
@@ -59,7 +60,9 @@
   } from "./lib/workspace/agentLinks";
   import { typeIntoDetachedSession } from "./lib/terminal/ws";
   import { reconnectingSockets } from "./lib/net/reconnect";
+  import { selectRemoteReconnectSurface } from "./lib/net/remoteReconnect";
   import { attachImageToComposer, insertIntoComposer } from "./lib/chat/composerBus";
+  import { volatileChatDrafts } from "./lib/chat/drafts";
   import { imageToAttachment } from "./lib/chat/images";
   import {
     reportUploadError,
@@ -228,6 +231,18 @@
     notifyDiskChange,
   } from "./lib/workspace/diskWatch";
   import ReauthOverlay from "./lib/workspace/ReauthOverlay.svelte";
+  import AssetTransitionNotice from "./lib/layout/AssetTransitionNotice.svelte";
+  import {
+    assetTransition,
+    BUILD_META_NAME,
+    buildSource,
+    clearChunkFailure,
+    documentBuildSource,
+    noteChunkFailure,
+    rearmAssetNavigation,
+    requestAssetReload,
+    requireAssetNavigation,
+  } from "./lib/layout/assetTransition";
   import { focusOnMount } from "./lib/shared/focusOnMount";
   import Launcher from "./lib/workspace/Launcher.svelte";
   import SessionGlyph from "./lib/shared/SessionGlyph.svelte";
@@ -237,6 +252,15 @@
   import Pane from "./lib/layout/Pane.svelte";
 
   let health = $state<Health | null>(null);
+  /** Source identity of the daemon that supplied this document. A different
+   *  source means its immutable lazy-chunk namespace changed underneath us. */
+  let servedBuild = documentBuildSource(
+    document.querySelector<HTMLMetaElement>(`meta[name="${BUILD_META_NAME}"]`)?.content,
+  );
+  function daemonBuildChanged(next: string | null | undefined): boolean {
+    const nextSource = buildSource(next);
+    return servedBuild !== null && nextSource !== null && nextSource !== servedBuild;
+  }
   /** This app binary's build id (native only); vs health.build = skew. */
   let appBuild = $state<string | null>(null);
   /** Caffeinate (native, LOCAL macOS window only): whole-machine keep-awake.
@@ -291,7 +315,7 @@
   const canReconnect = isRemoteWindow && isNativeShell();
   /** This window's scope key for the shell registry (null alias = local). */
   const scopeAlias = isRemoteWindow ? (jobCtx !== null ? statusAlias : hostAlias) : null;
-  /** The reconnect overlay is showing (tunnel dropped, healing). */
+  /** The reconnect status or failure dialog is showing. */
   let showReconnect = $state(false);
   /** A connectHost call is in flight. */
   let reconnecting = $state(false);
@@ -302,6 +326,16 @@
   /** The user dismissed the overlay; don't auto-reshow until state changes. */
   let reconnectDismissed = $state(false);
   let reconnectGrace: ReturnType<typeof setTimeout> | null = null;
+  /** Dismissing a failed reconnect downgrades it to an ambient Retry instead
+   *  of removing the only recovery path. Unauthorized native windows never
+   *  fall through to the browser-only manual auth overlay. */
+  const reconnectSurface = $derived(
+    selectRemoteReconnectSurface({
+      open: showReconnect,
+      error: reconnectError,
+      authBlocked: canReconnect && $unauthorized,
+    }),
+  );
 
   /** Re-establish this remote window's ssh tunnel. Idempotent: the shell
    *  reuses a live tunnel, and reuses the old loopback port so a heal needs no
@@ -339,6 +373,12 @@
     void attemptReconnect();
   }
 
+  function retryReconnect(): void {
+    reconnectDismissed = false;
+    showReconnect = true;
+    void attemptReconnect();
+  }
+
   function dismissReconnect(): void {
     showReconnect = false;
     reconnectDismissed = true;
@@ -347,6 +387,19 @@
       reconnectGrace = null;
     }
   }
+
+  // A 401 in a native remote window usually means the daemon restarted and
+  // minted a fresh tunnel token. Let the shell reconnect this exact host and
+  // re-home the window; the generic "paste a URL" auth page is only correct
+  // for browser tunnels, which cannot re-run ssh themselves.
+  let handledRemoteUnauthorized = false;
+  $effect(() => {
+    if (!canReconnect || !$unauthorized || handledRemoteUnauthorized) return;
+    handledRemoteUnauthorized = true;
+    untrack(() =>
+      beginReconnect("The remote daemon changed credentials; reconnecting will refresh this window."),
+    );
+  });
 
   // A remote window whose events socket stays down past a short grace has lost
   // its tunnel (not just a daemon blip): show the overlay and reconnect. When
@@ -677,6 +730,14 @@
   $effect(() =>
     pollHealth(
       (h) => {
+        if (daemonBuildChanged(h.build)) {
+          // The origin can stay stable across a daemon handoff, but the
+          // hashed JS namespace cannot. Reload before the user opens a lazy
+          // surface whose old URL now correctly 404s.
+          requireAssetNavigation("build", null);
+          return;
+        }
+        servedBuild ??= buildSource(h.build);
         health = h;
       },
       () => {
@@ -684,6 +745,41 @@
       },
     ),
   );
+
+  // Vite reports every failed production dynamic import here, including the
+  // nested PDF/editor/spreadsheet chunks that never pass through Pane's
+  // top-level loader. Keep the rejection flowing to its local error boundary
+  // while one shared notice offers build-safe recovery.
+  $effect(() => {
+    const onPreloadError = (event: VitePreloadErrorEvent) => {
+      console.error("interface chunk failed to load", event.payload);
+      noteChunkFailure();
+    };
+    window.addEventListener("vite:preloadError", onPreloadError);
+    return () => window.removeEventListener("vite:preloadError", onPreloadError);
+  });
+
+  // Build/connection transitions navigate automatically only when all local
+  // state survives navigation. A blocked transition stays visible instead of
+  // looping beforeunload prompts or silently dropping a memory-only draft.
+  let handledAssetRevision = 0;
+  $effect(() => {
+    const transition = $assetTransition;
+    if (transition === null || !transition.requested) return;
+    const blocked = $dirtyFiles.size > 0 || $volatileChatDrafts.size > 0;
+    if (blocked && !transition.forced) return;
+    if (transition.revision === handledAssetRevision) return;
+    handledAssetRevision = transition.revision;
+    untrack(() => {
+      if (transition.target === null) location.reload();
+      else location.replace(transition.target);
+      // This callback can run only if the document survived the navigation
+      // call (normally because the user chose Stay in beforeunload). Re-arm
+      // with `forced` cleared: dirty state holds the next attempt, and saving
+      // it lets the existing effect retry once without a prompt loop.
+      setTimeout(() => rearmAssetNavigation(transition.revision), 0);
+    });
+  });
 
   // Slurm strip: one probe at boot; the store keeps its own 60s poll gated on
   // "scheduler is slurm" + a visible window (see workspace/compute.ts).
@@ -858,29 +954,33 @@
           }
         }),
       );
-      // The local daemon was replaced (self-update). With the restart
-      // handoff the new daemon usually keeps the port AND token — then the
-      // origin is intact and the sockets just reconnect; reloading would
-      // only flicker. Re-home (carrying the window id, so the layout
-      // follows) only when the origin actually moved.
+      // The local daemon was replaced (self-update). Re-home (carrying the
+      // window id, so the layout follows) when its origin moved; when the
+      // handoff retained port+token, a changed build still requires a reload
+      // because the immutable hashed asset namespace changed.
       unlistenDaemonMoved = asyncDisposer(
-        onLocalDaemonUpdated(({ port, token }) => {
+        onLocalDaemonUpdated(({ port, token, build }) => {
           if (getHostLabel() !== "local") return;
-          if (String(port) === location.port && token === getToken()) return;
+          if (String(port) === location.port && token === getToken()) {
+            if (daemonBuildChanged(build)) requireAssetNavigation("build", null);
+            return;
+          }
           const params = new URLSearchParams();
           params.set("token", token);
           params.set("win", windowKey());
           if (activeWsId !== null) params.set("ws", activeWsId);
-          location.replace(`http://127.0.0.1:${port}/#${params.toString()}`);
+          requireAssetNavigation(
+            "build",
+            `http://127.0.0.1:${port}/#${params.toString()}`,
+          );
         }),
       );
       // This remote window's tunnel dropped or came back. "down" → reconnect
       // now (the shell confirmed the forward is dead); "connected" → re-home
-      // only if the origin actually moved (daemon restart / update / rebuilt
-      // job tunnel), else the heal is in place and the WebSocket just
-      // reconnects. Matching is on statusAlias: a job window heeds ONLY its
-      // composite key's events — the login alias's port/token are a
-      // different daemon entirely.
+      // if the origin moved, or reload if only the daemon build moved. A pure
+      // same-build heal stays in place and its WebSocket just reconnects.
+      // Matching is on statusAlias: a job window heeds ONLY its composite
+      // key's events — the login alias's port/token are another daemon.
       unlistenHostStatus = asyncDisposer(
         onHostStatus((e) => {
           if (!canReconnect || e.alias !== statusAlias) return;
@@ -896,6 +996,7 @@
           const token = e.token ?? (jobCtx !== null ? getToken() : null);
           const portMoved = port !== null && String(port) !== location.port;
           const tokenMoved = token !== null && token !== getToken();
+          const buildMoved = daemonBuildChanged(e.build);
           if (portMoved || tokenMoved) {
             const params = new URLSearchParams();
             if (token !== null) params.set("token", token);
@@ -906,7 +1007,12 @@
               params.set("job", jobCtx.jobId);
               if (jobCtx.node !== null) params.set("node", jobCtx.node);
             }
-            location.replace(`http://127.0.0.1:${port ?? location.port}/#${params.toString()}`);
+            requireAssetNavigation(
+              buildMoved ? "build" : "connection",
+              `http://127.0.0.1:${port ?? location.port}/#${params.toString()}`,
+            );
+          } else if (buildMoved) {
+            requireAssetNavigation("build", null);
           }
         }),
       );
@@ -3882,11 +3988,11 @@
 
 <!-- Blocking re-auth overlay: the daemon rejected this window's token
      (restart or expiry). Self-gating on the `unauthorized` store. -->
-<ReauthOverlay />
+<ReauthOverlay enabled={!canReconnect} />
 
 <!-- SSH auth prompt (password / 2FA), app-wide so a mid-session reconnect on
      the workbench can prompt just like the home screen. Self-gating. -->
-<AskpassModal />
+<AskpassModal hostAlias={isRemoteWindow ? hostAlias : null} />
 <!-- The right-click context-menu singleton (rail rows, file tree, Finder,
      pane tabs all open it via contextMenu.openAt). Self-gating. -->
 <ContextMenuHost />
@@ -3912,7 +4018,17 @@
 
 <!-- Ambient update offer (small, snoozable): a newer release, or a daemon
      older than this app. One per window; dismissals are origin-wide. -->
-{#if updateOffer !== null}
+{#if $assetTransition !== null}
+  <AssetTransitionNotice
+    transition={$assetTransition}
+    blockedFiles={$dirtyFiles.size}
+    blockedDrafts={$volatileChatDrafts.size}
+    onReload={requestAssetReload}
+    onDismiss={clearChunkFailure}
+  />
+{/if}
+
+{#if updateOffer !== null && $assetTransition === null}
   <UpdateToast offer={updateOffer} />
 {/if}
 
@@ -3945,48 +4061,68 @@
   </div>
 {/if}
 
-{#if showReconnect && !$askpassActive}
-  <!-- A remote window's tunnel dropped: we re-run the SSH connect. While ssh is
-       asking for auth the askpass modal owns the interaction, so this overlay
-       stays hidden (`!$askpassActive`) — the user never faces a spinner, an
-       error, AND a password field all claiming the same reconnect, and the
-       modal's field is never trapped behind this scrim. When the prompt is
-       answered (or there is no prompt) the overlay returns to its quiet status
-       line. A same-port heal resumes this window in place; a moved daemon
-       re-homes. -->
-  <div class="reconnect-overlay">
-    <div
-      class="reconnect-panel"
-      role="alertdialog"
-      aria-modal="true"
-      aria-label="reconnecting"
-      tabindex="-1"
-      use:modalFocus
-    >
-      <div class="reconnect-head">
-        <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
-        <span class="reconnect-title">
-          {reconnectError !== null ? `can’t reach ${hostAlias}` : `reconnecting to ${hostAlias}…`}
-        </span>
-      </div>
-      <p class="reconnect-body">
-        {reconnectError ??
-          reconnectReason ??
-          "re-establishing the SSH tunnel — this window resumes where it left off."}
-      </p>
-      <div class="reconnect-actions">
-        <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
-        <button
-          class="reconnect-retry"
-          use:focusOnMount
-          disabled={reconnecting}
-          onclick={() => void attemptReconnect()}
-        >
-          {reconnecting ? "reconnecting…" : "retry"}
-        </button>
+{#if reconnectSurface !== "hidden" && !$askpassActive && $assetTransition === null}
+  <!-- An automatic reconnect is status, not a blocking decision: keep the
+       rendered workbench readable while the tunnel heals. Only a failed
+       attempt becomes a modal with Retry. A scoped askpass prompt temporarily
+       owns this space when this host actually needs authentication. Dismissing
+       a failure leaves a compact Retry surface: a native 401 must never become
+       an unrecoverable blank state. -->
+  {#if reconnectSurface === "status"}
+    <div class="reconnect-status" role="status" aria-live="polite">
+      <span class="reconnect-spinner" class:spin={reconnecting} aria-hidden="true"></span>
+      <span class="reconnect-status-copy">
+        <strong>{reconnecting ? `reconnecting to ${hostAlias}…` : `waiting for ${hostAlias}…`}</strong>
+        <span>{reconnectReason ?? "the workbench will resume in place"}</span>
+      </span>
+      <button class="reconnect-status-dismiss" aria-label="dismiss reconnect status" onclick={dismissReconnect}>×</button>
+    </div>
+  {:else if reconnectSurface === "failure"}
+    <div class="reconnect-overlay">
+      <div
+        class="reconnect-panel"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label="reconnect failed"
+        tabindex="-1"
+        use:modalFocus
+      >
+        <div class="reconnect-head">
+          <span class="reconnect-spinner" aria-hidden="true"></span>
+          <span class="reconnect-title">can’t reach {hostAlias}</span>
+        </div>
+        <p class="reconnect-body">{reconnectError}</p>
+        <div class="reconnect-actions">
+          <button class="reconnect-dismiss" onclick={dismissReconnect}>dismiss</button>
+          <button
+            class="reconnect-retry"
+            use:focusOnMount
+            disabled={reconnecting}
+            onclick={retryReconnect}
+          >
+            {reconnecting ? "reconnecting…" : "retry"}
+          </button>
+        </div>
       </div>
     </div>
-  </div>
+  {:else}
+    <div class="reconnect-status" role="status" aria-live="polite">
+      <span class="reconnect-spinner" aria-hidden="true"></span>
+      <span class="reconnect-status-copy">
+        <strong>reconnect to {hostAlias}</strong>
+        <span>
+          {reconnectError ?? "this window still needs fresh remote credentials"}
+        </span>
+      </span>
+      <button
+        class="reconnect-status-retry"
+        disabled={reconnecting}
+        onclick={retryReconnect}
+      >
+        {reconnecting ? "reconnecting…" : "retry"}
+      </button>
+    </div>
+  {/if}
 {/if}
 
 <style>
@@ -5125,7 +5261,90 @@
 
   /* --- blocking re-auth overlay --- */
 
-  /* --- remote reconnect overlay --- */
+  /* --- remote reconnect status + failure dialog --- */
+
+  .reconnect-status {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    z-index: 190;
+    width: min(430px, calc(100vw - 28px));
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    transform: translateX(-50%);
+    background: var(--overlay-bg);
+    border: 1px solid var(--edge);
+    border-radius: 9px;
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--fg) 12%, transparent);
+    animation: reconnect-in 0.1s ease-out;
+  }
+
+  .reconnect-status-copy {
+    min-width: 0;
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    font-size: var(--text-xs);
+  }
+
+  .reconnect-status-copy strong {
+    overflow: hidden;
+    color: var(--fg);
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reconnect-status-copy span {
+    overflow: hidden;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reconnect-status-dismiss {
+    flex: none;
+    padding: 2px 5px;
+    border: 0;
+    color: var(--muted);
+    background: none;
+    cursor: pointer;
+  }
+
+  .reconnect-status-dismiss:hover {
+    color: var(--fg);
+  }
+
+  .reconnect-status-retry {
+    flex: none;
+    appearance: none;
+    padding: 4px 10px;
+    border: 1px solid var(--edge);
+    border-radius: 5px;
+    color: var(--fg);
+    background: none;
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .reconnect-status-retry:hover:enabled {
+    background: var(--row-hover);
+  }
+
+  .reconnect-status-retry:disabled {
+    color: var(--muted);
+    cursor: default;
+  }
+
+  @keyframes reconnect-in {
+    from {
+      opacity: 0;
+    }
+  }
 
   .reconnect-overlay {
     position: fixed;
@@ -5135,7 +5354,7 @@
     align-items: flex-start;
     justify-content: center;
     background: var(--scrim);
-    animation: authfade 0.1s ease-out;
+    animation: reconnect-in 0.1s ease-out;
   }
 
   .reconnect-panel {

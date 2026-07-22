@@ -10,6 +10,7 @@
  */
 
 import type { ImageAttachment } from "./images";
+import { writable } from "svelte/store";
 
 export interface Draft {
   text: string;
@@ -17,6 +18,11 @@ export interface Draft {
 }
 
 const drafts = new Map<string, Draft>();
+
+/** Sessions whose current composer state cannot survive a page navigation.
+ *  Small text drafts are mirrored to sessionStorage; images, oversized text,
+ *  and storage failures stay memory-only and must hold an asset transition. */
+export const volatileChatDrafts = writable<Set<string>>(new Set());
 
 const STORAGE_PREFIX = "chimaera.chatDraft.";
 /** Per-draft sessionStorage cap: a paste larger than this survives tab
@@ -39,24 +45,49 @@ function storedKeys(): string[] {
   return keys;
 }
 
-function storeText(sessionId: string, text: string) {
+function setVolatile(sessionId: string, volatile: boolean): void {
+  volatileChatDrafts.update((current) => {
+    if (volatile === current.has(sessionId)) return current;
+    const next = new Set(current);
+    if (volatile) next.add(sessionId);
+    else next.delete(sessionId);
+    return next;
+  });
+}
+
+function storeText(sessionId: string, text: string): boolean {
   const key = STORAGE_PREFIX + sessionId;
-  try {
-    if (text.length === 0 || text.length > MAX_STORED_TEXT) {
+  if (text.length === 0) {
+    try {
       sessionStorage.removeItem(key);
-      return;
+    } catch {
+      // There is no content to lose even when storage itself is unavailable.
+    }
+    return true;
+  }
+  try {
+    if (text.length > MAX_STORED_TEXT) {
+      sessionStorage.removeItem(key);
+      return false;
     }
     const keys = storedKeys();
-    if (keys.length >= MAX_STORED_KEYS) {
+    if (keys.length >= MAX_STORED_KEYS && !keys.includes(key)) {
       // Over budget: sessionStorage keeps no age order, so shed arbitrary
       // other drafts — the active one is the one that matters.
       for (const k of keys.filter((k2) => k2 !== key).slice(0, keys.length - MAX_STORED_KEYS + 1)) {
         sessionStorage.removeItem(k);
+        const evictedSession = k.slice(STORAGE_PREFIX.length);
+        // A loaded draft still exists across chat switches but no longer
+        // survives navigation after the bounded persistence layer sheds it.
+        if (drafts.has(evictedSession)) setVolatile(evictedSession, true);
       }
     }
     sessionStorage.setItem(key, text);
+    return true;
   } catch {
-    // Quota or storage disabled: the in-memory draft still covers tab switches.
+    // Quota or storage disabled: the in-memory draft still covers tab switches,
+    // but an asset-transition reload must wait or ask explicitly.
+    return false;
   }
 }
 
@@ -78,6 +109,7 @@ export function loadDraft(sessionId: string): Draft {
 export function saveDraft(sessionId: string, text: string, images: ImageAttachment[]) {
   if (text.length === 0 && images.length === 0) {
     drafts.delete(sessionId);
+    setVolatile(sessionId, false);
   } else {
     drafts.set(sessionId, { text, images });
     // Over budget: Map keeps insertion order, so shed the oldest OTHER draft
@@ -87,10 +119,12 @@ export function saveDraft(sessionId: string, text: string, images: ImageAttachme
       for (const k of drafts.keys()) {
         if (k !== sessionId) {
           drafts.delete(k);
+          setVolatile(k, false);
           break;
         }
       }
     }
   }
-  storeText(sessionId, text);
+  const textStored = storeText(sessionId, text);
+  setVolatile(sessionId, images.length > 0 || !textStored);
 }

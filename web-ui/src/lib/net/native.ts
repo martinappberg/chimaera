@@ -143,11 +143,11 @@ export async function updateLocalDaemon(): Promise<void> {
  * on the local daemon navigate themselves to the new one.
  */
 export function onLocalDaemonUpdated(
-  handler: (p: { port: number; token: string }) => void,
+  handler: (p: { port: number; token: string; build?: string }) => void,
 ): Promise<() => void> {
   const t = tauri();
   if (t === null) return Promise.resolve(() => {});
-  return t.event.listen<{ port: number; token: string }>("local-daemon-updated", (e) =>
+  return t.event.listen<{ port: number; token: string; build?: string }>("local-daemon-updated", (e) =>
     handler(e.payload),
   );
 }
@@ -315,7 +315,8 @@ export function onConnectProgress(
   return t.event.listen<ConnectProgress>("connect-progress", (e) => handler(e.payload));
 }
 
-/** Live tunnel liveness pushed by the shell (health monitor + reconnect). */
+/** Live tunnel identity pushed by the shell (health monitor + every successful
+ *  connect, including reuse of an existing healthy tunnel). */
 export interface HostStatusEvent {
   alias: string;
   /** "down" = the forward stopped answering (remote daemon or ssh died);
@@ -333,12 +334,14 @@ export interface HostStatusEvent {
   /** Why a live connection transitioned down. This is context for the
    *  automatic reconnect, not a failed reconnect attempt. */
   reason?: string;
+  /** Source build now served through this tunnel. */
+  build?: string;
 }
 
 /**
  * Subscribe to tunnel liveness transitions. Broadcast to every window, so a
  * handler filters on its own host alias. A remote window uses `down` to arm
- * its reconnect overlay and `connected` to re-home when the port/token moved;
+ * its reconnect UI and `connected` to re-home when the port/token moved;
  * the home screen uses it to keep host rows live. Returns an unsubscribe.
  */
 export function onHostStatus(
@@ -369,6 +372,9 @@ export async function reportWindowScope(
  */
 export interface AskpassPrompt {
   id: number;
+  /** SSH alias of the child that raised this prompt. Null only for legacy or
+   *  unscoped helpers, which remain available from the home window. */
+  alias?: string | null;
   prompt: string;
 }
 
@@ -404,8 +410,8 @@ export function onAskpassDone(handler: (id: number) => void): Promise<() => void
 
 /**
  * Whether an SSH auth prompt is currently on screen (set by AskpassModal).
- * The reconnect overlay reads it to say "waiting for authentication" instead
- * of showing a competing spinner/error under the prompt.
+ * The reconnect UI hides while its matching auth prompt owns the interaction,
+ * instead of showing a competing status or error beneath the modal.
  */
 export const askpassActive = writable(false);
 

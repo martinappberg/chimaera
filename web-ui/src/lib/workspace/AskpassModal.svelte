@@ -1,9 +1,10 @@
 <script lang="ts">
   // The in-app SSH auth prompt (password / keyboard-interactive 2FA). ssh has
-  // no tty in the app, so its prompts arrive via SSH_ASKPASS as a broadcast
-  // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). Mounted once
-  // at the App root so ANY window can answer — a mid-session reconnect on the
-  // workbench needs to prompt just as much as the home screen does.
+  // no tty in the app, so its prompts arrive via SSH_ASKPASS as a host-scoped
+  // `ssh-askpass` event (see crates/chimaera-app/src/askpass.rs). The native
+  // command layer applies the same scope to pending-list and answer calls;
+  // this UI filter is defense in depth. The home window remains the fallback
+  // for startup restore and prompts raised before a remote window exists.
   //
   // Prompts queue rather than replace: ssh asks sequentially (password, then
   // a Duo passcode), and clobbering an unanswered prompt would strand its ssh
@@ -19,6 +20,14 @@
   } from "../net/native";
   import { asyncDisposer } from "../shared/asyncDisposer";
   import { modalFocus } from "../shared/modalFocus";
+  import { askpassBelongsToHost } from "./askpassScope";
+
+  interface Props {
+    /** Null on the local/home window, which is the fallback prompt surface. */
+    hostAlias: string | null;
+  }
+
+  let { hostAlias }: Props = $props();
 
   /** Prompts awaiting an answer, oldest first; the head is on screen. */
   let queue = $state<AskpassPrompt[]>([]);
@@ -28,12 +37,13 @@
   /** Reveal the typed secret (a passcode is easier to check than a password). */
   let revealSecret = $state(false);
 
-  // Tell the rest of the UI (the reconnect overlay) a prompt is on screen.
+  // Tell the rest of the UI (the reconnect status/dialog) a prompt is on screen.
   $effect(() => {
     askpassActive.set(askpass !== null);
   });
 
   function enqueue(p: AskpassPrompt): void {
+    if (!askpassBelongsToHost(p, hostAlias)) return;
     if (queue.some((q) => q.id === p.id)) return;
     if (queue.length === 0) {
       secretValue = "";
@@ -104,7 +114,9 @@
     >
       <div class="askpass-head">
         <span class="askpass-glyph" aria-hidden="true">&#128274;</span>
-        <span class="askpass-title">authenticate</span>
+        <span class="askpass-title">
+          authenticate{askpass.alias != null ? ` · ${askpass.alias}` : ""}
+        </span>
       </div>
       <pre class="askpass-prompt">{askpass.prompt}</pre>
       <div class="askpass-field">
@@ -147,7 +159,7 @@
     position: fixed;
     inset: 0;
     /* SSH is synchronously blocked on this answer. Keep it above every
-       ordinary picker, confirm dialog, toast, and reconnect overlay. */
+       ordinary picker, confirm dialog, toast, and reconnect UI. */
     z-index: 230;
     display: grid;
     place-items: center;

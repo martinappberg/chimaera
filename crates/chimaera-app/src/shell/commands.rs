@@ -34,6 +34,7 @@ pub struct LocalState {
 struct LocalDaemonMoved {
     port: u16,
     token: String,
+    build: Option<String>,
 }
 
 /// The label of an open window showing `(alias, ws)`, if any, excluding
@@ -235,6 +236,7 @@ pub(super) async fn update_local_daemon(
     let moved = LocalDaemonMoved {
         port: fresh.port,
         token: fresh.token.clone(),
+        build: fresh.build.clone(),
     };
     authorize_scope_origin(&app, None, fresh.port)
         .map_err(|e| format!("could not authorize the updated daemon origin: {e}"))?;
@@ -680,6 +682,7 @@ pub(super) async fn connect_compute_session(
             token: None,
             error: None,
             reason: None,
+            build: None,
         },
     );
     Ok(())
@@ -753,30 +756,47 @@ pub(super) async fn check_app_update(app: AppHandle) -> Result<Option<String>, S
 
 /// Answer an in-flight SSH auth prompt (see `askpass`): `secret` None means
 /// the user cancelled, which lets the waiting ssh fail cleanly. The done
-/// broadcast dismisses the prompt in every other window showing it.
+/// scoped completion event dismisses the prompt in every eligible window
+/// showing it.
 #[tauri::command]
 pub(super) async fn answer_askpass(
     app: AppHandle,
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
     askpass: State<'_, crate::askpass::Askpass>,
     id: u64,
     secret: Option<String>,
 ) -> Result<(), String> {
-    if askpass.answer(id, secret) {
-        let _ = app.emit("ssh-askpass-done", id);
+    let scope = state
+        .window_scope(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    match askpass.answer_scoped(id, secret, &scope) {
+        crate::askpass::AnswerResult::Answered(alias) => {
+            crate::askpass::emit_done(&app, id, alias.as_deref());
+            Ok(())
+        }
+        crate::askpass::AnswerResult::Missing => Ok(()),
+        crate::askpass::AnswerResult::Forbidden => {
+            Err("that authentication prompt is not available to this window".to_string())
+        }
     }
-    Ok(())
 }
 
-/// SSH prompts still awaiting an answer. Each window fetches this on mount:
+/// SSH prompts still awaiting an answer. Each eligible window fetches this on mount:
 /// the `ssh-askpass` emit reaches only windows that already exist, and
 /// startup window restore starts connecting before the first webview has
 /// loaded — without this, that prompt is lost and the host sits in
 /// "connecting" until ssh times out, with nothing for the user to answer.
 #[tauri::command]
 pub(super) fn list_askpass(
+    webview: tauri::WebviewWindow,
+    state: State<'_, Shell>,
     askpass: State<'_, crate::askpass::Askpass>,
-) -> Vec<crate::askpass::PromptEvent> {
-    askpass.pending()
+) -> Result<Vec<crate::askpass::PromptEvent>, String> {
+    let scope = state
+        .window_scope(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    Ok(askpass.pending_scoped(&scope))
 }
 
 /// The SPA reporting what this window now shows — it swaps `ws` client-side,
@@ -790,30 +810,33 @@ pub(super) fn report_window_scope(
     alias: Option<String>,
     ws: Option<String>,
     label: Option<String>,
-) {
+) -> Result<(), String> {
     let mut windows = lock(&state.windows);
-    let stable_id = windows
-        .get(webview.label())
-        .map(|s| s.stable_id.clone())
-        .unwrap_or_default();
-    windows.insert(
-        webview.label().to_string(),
-        WindowScope {
-            alias: alias.clone(),
-            ws: ws.clone(),
-            stable_id: stable_id.clone(),
-            label: label.unwrap_or_default(),
-        },
-    );
+    let scope = windows
+        .get_mut(webview.label())
+        .ok_or_else(|| "this window is not registered".to_string())?;
+    // The shell fixed the host when it created this window. A daemon-served
+    // page may report workspace/label changes, but must never rewrite its
+    // host to gain another remote's native command scope. The shell-owned
+    // askpass fallback capability is deliberately not derived from this
+    // mutable workspace report.
+    if scope.alias != alias {
+        return Err("a window cannot change its registered host".to_string());
+    }
+    scope.ws = ws.clone();
+    scope.label = label.unwrap_or_default();
+    let stable_id = scope.stable_id.clone();
+    let registered_alias = scope.alias.clone();
     drop(windows);
     if !stable_id.is_empty() {
-        lock(&state.registry).set_scope(&stable_id, alias, ws);
+        lock(&state.registry).set_scope(&stable_id, registered_alias, ws);
     }
     // The reported label names this window in the tray's list; rebuild so it
     // shows the fresh name (the store above happened before this call).
     crate::tray::rebuild(webview.app_handle());
     // Its workspace also decides whether Settings applies (home screen = no).
     crate::menu::sync_settings_enabled(webview.app_handle());
+    Ok(())
 }
 
 /// The UI's caffeinate toggle. The real work — and the same `caffeinate-changed`
