@@ -174,7 +174,10 @@ pub(crate) async fn describe(
         let path = resolve_board_path(&req.path)?;
         let mut board = chimaera_board::load(&path)?;
         let diagnostics = chimaera_board::normalize(&mut board);
-        let text = chimaera_board::describe::describe(&board);
+        let ws = chimaera_board::workspace_root(&path);
+        let journal =
+            chimaera_board::journal::summary(&chimaera_board::journal::journal_path(&ws, &path));
+        let text = chimaera_board::describe::describe_with_journal(&board, journal);
         Ok(json!({
             "text": text,
             "diagnostics": diagnostics.iter().map(|d| d.render()).collect::<Vec<_>>(),
@@ -195,6 +198,7 @@ pub(crate) async fn edit(
         let mut board = chimaera_board::load(&path)?;
 
         let mut found = false;
+        let mut prior = None;
         for page in &mut board.pages {
             // Top-level objects only: group children are page-absolute too,
             // but moving one without its siblings is a different gesture
@@ -204,6 +208,7 @@ pub(crate) async fn edit(
                     continue;
                 }
                 found = true;
+                prior = obj.frame();
                 if let Some(at) = req.at {
                     obj.set_at(at);
                 }
@@ -222,11 +227,17 @@ pub(crate) async fn edit(
         chimaera_board::normalize(&mut board);
         chimaera_board::save(&path, &board)?;
 
+        let journal_seq = journal_edit(&path, &board, &req, prior);
+
         let meta = std::fs::metadata(&path)?;
-        Ok(json!({
+        let mut response = json!({
             "mtime": fs::mtime_token(&meta),
             "path": path.to_string_lossy(),
-        }))
+        });
+        if let Some(seq) = journal_seq {
+            response["journalSeq"] = json!(seq);
+        }
+        Ok(response)
     })
     .await;
 
@@ -247,6 +258,69 @@ pub(crate) async fn edit(
             Json(json!({"error": format!("{err:#}")})),
         )
             .into_response(),
+    }
+}
+
+/// Append the gesture to the board's semantic edit journal, actor `human` —
+/// the pane's edit route is the human's hand. Best-effort by design: the
+/// board file is truth and the journal is the audit trail, so a journal
+/// failure warns and returns `None` rather than failing an edit that already
+/// saved. Returns the last appended seq (the resize's, when both moved and
+/// resized) for the additive `journalSeq` response field.
+fn journal_edit(
+    path: &std::path::Path,
+    board: &chimaera_board::Board,
+    req: &EditRequest,
+    prior: Option<chimaera_board::schema::Frame>,
+) -> Option<u64> {
+    use chimaera_board::journal::{Actor, Event, EventKind};
+
+    // The journaled `to` is the *saved* geometry (post-normalize grid snap),
+    // not the requested one — the journal narrates the file, never the wire.
+    let saved = board
+        .objects()
+        .find(|(_, o)| o.id() == req.object)
+        .and_then(|(_, o)| o.frame())?;
+    let mut events = Vec::new();
+    if req.at.is_some() {
+        events.push(Event::new(
+            Actor::Human,
+            EventKind::Move {
+                object: req.object.clone(),
+                from: prior.map(|f| [f.x, f.y]).unwrap_or([saved.x, saved.y]),
+                to: [saved.x, saved.y],
+            },
+        ));
+    }
+    if req.size.is_some() {
+        events.push(Event::new(
+            Actor::Human,
+            EventKind::Resize {
+                object: req.object.clone(),
+                from: prior.map(|f| [f.w, f.h]).unwrap_or([saved.w, saved.h]),
+                to: [saved.w, saved.h],
+            },
+        ));
+    }
+    if events.is_empty() {
+        return None;
+    }
+
+    let ws = chimaera_board::workspace_root(path);
+    // First use mints the surround's .gitignore so journals stay out of git.
+    if let Err(err) = chimaera_board::ensure_board_dir(&ws) {
+        tracing::warn!(?err, "board dir setup failed; skipping journal");
+        return None;
+    }
+    let journal_path = chimaera_board::journal::journal_path(&ws, path);
+    let appended = chimaera_board::journal::Journal::open(&journal_path)
+        .and_then(|mut journal| journal.append_batch(events));
+    match appended {
+        Ok(seqs) => seqs.last().copied(),
+        Err(err) => {
+            tracing::warn!(?err, path = %journal_path.display(), "board journal append failed");
+            None
+        }
     }
 }
 

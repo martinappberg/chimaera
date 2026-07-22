@@ -168,7 +168,9 @@ fn normalize_objects(objects: &mut [Object], page: &str, diags: &mut Vec<Diagnos
                     );
                 }
             }
-            Object::Image(_) | Object::Unknown(_) => {}
+            // A diagram's children are computed at render, never stored, so
+            // there is nothing to canonicalize beyond the snapped frame.
+            Object::Image(_) | Object::Diagram(_) | Object::Unknown(_) => {}
         }
     }
 }
@@ -186,6 +188,7 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
         Object::Image(o) => o.id = generated,
         Object::Group(o) => o.id = generated,
         Object::Chart(o) => o.id = generated,
+        Object::Diagram(o) => o.id = generated,
         Object::Unknown(o) => o.id = generated,
     }
 }

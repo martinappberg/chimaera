@@ -277,6 +277,70 @@ mod tests {
     }
 
     #[test]
+    fn board_journal_parses_the_since_cursor() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "journal",
+            "talks/review.board.json",
+            "--since",
+            "40",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Journal { path, since },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("talks/review.board.json"));
+                assert_eq!(since, Some(40));
+            }
+            _ => panic!("expected board journal"),
+        }
+    }
+
+    #[test]
+    fn board_import_parses_the_mermaid_flags() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "import",
+            "arch.mmd",
+            "--to",
+            "talks/review.board.json",
+            "--page",
+            "arch",
+            "--id",
+            "backend",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Import { path, to, page, id },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("arch.mmd"));
+                assert_eq!(to, std::path::PathBuf::from("talks/review.board.json"));
+                assert_eq!(page.as_deref(), Some("arch"));
+                assert_eq!(id.as_deref(), Some("backend"));
+            }
+            _ => panic!("expected board import"),
+        }
+        // `--to` is how import knows the destination; without it the parse
+        // must refuse rather than guess.
+        assert!(Cli::try_parse_from(["chimaera", "board", "import", "arch.mmd"]).is_err());
+    }
+
+    #[test]
+    fn board_show_parses_the_mermaid_switch() {
+        let cli = Cli::try_parse_from(["chimaera", "board", "show", "--mermaid"]).unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Show { mermaid, .. },
+            } => assert!(mermaid),
+            _ => panic!("expected board show"),
+        }
+    }
+
+    #[test]
     fn parse_port_reads_valid_values_only() {
         assert_eq!(parse_port(Some("9700".into())), Some(9700));
         assert_eq!(parse_port(Some("  8080 ".into())), Some(8080));

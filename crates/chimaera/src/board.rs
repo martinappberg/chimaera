@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
+use chimaera_board::export::pdf::export_pdf;
+use chimaera_board::export::svg::{export_svg, SvgVariant};
 use chimaera_board::layout::FontStack;
 use chimaera_board::render::{render_page, RasterParams};
 use chimaera_board::theme::Theme;
@@ -23,6 +25,10 @@ pub enum BoardCmd {
         /// Read the spec from a file instead of stdin.
         #[arg(long)]
         spec: Option<PathBuf>,
+        /// Treat the input as mermaid flowchart source instead of a JSON
+        /// spec — `cat arch.mmd | chimaera board show --mermaid`.
+        #[arg(long)]
+        mermaid: bool,
         /// Title, overriding the spec's.
         #[arg(long)]
         title: Option<String>,
@@ -78,9 +84,50 @@ pub enum BoardCmd {
         #[arg(long)]
         theme: Option<String>,
     },
+    /// Export a board: SVG (per page), PDF (the whole deck), PPTX.
+    Export {
+        path: PathBuf,
+        /// Format: svg | svg-outlined | pdf | pptx. `svg` keeps real text
+        /// (editable, needs the fonts); `svg-outlined` flattens glyphs to
+        /// paths (renders identically without them).
+        #[arg(long)]
+        format: String,
+        /// Page index (0-based) for the SVG variants; all pages when
+        /// omitted. Does not apply to pdf/pptx, which take the whole deck.
+        #[arg(long)]
+        page: Option<usize>,
+        /// Output file (single page) or directory (all SVG pages). Defaults
+        /// to .chimaera/board/exports/<stem>.<ext>.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Import a mermaid flowchart as a `diagram` object appended to a board.
+    /// Converted once — the mermaid source rides along as provenance.
+    Import {
+        /// The mermaid file, or `-` for stdin.
+        path: PathBuf,
+        /// The board to append to; created with one page when it does not
+        /// exist yet.
+        #[arg(long)]
+        to: PathBuf,
+        /// Page id to append to; the first page when omitted.
+        #[arg(long)]
+        page: Option<String>,
+        /// Object id for the diagram; the mermaid file's stem when omitted.
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Print the agent-facing description: every object, its position, its
     /// content, in the same points the file uses.
     Describe { path: PathBuf },
+    /// Print the board's semantic edit journal: what changed, by whom, one
+    /// event per line — the cheap read of "what did the human just do".
+    Journal {
+        path: PathBuf,
+        /// Only events with seq strictly greater than N.
+        #[arg(long)]
+        since: Option<u64>,
+    },
     /// Check a board without rendering it.
     Lint {
         path: PathBuf,
@@ -93,6 +140,7 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
     match cmd {
         BoardCmd::Show {
             spec,
+            mermaid,
             title,
             note,
             id,
@@ -103,7 +151,7 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             emit_board,
             quiet,
         } => show(
-            spec, title, note, id, &preset, size, theme, out, emit_board, quiet,
+            spec, mermaid, title, note, id, &preset, size, theme, out, emit_board, quiet,
         ),
         BoardCmd::New { path, title, theme } => new(&path, title, &theme),
         BoardCmd::Render {
@@ -113,11 +161,23 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             scale,
             theme,
         } => render(&path, page, out, scale, theme),
+        BoardCmd::Export {
+            path,
+            format,
+            page,
+            out,
+        } => export(&path, &format, page, out),
+        BoardCmd::Import { path, to, page, id } => import_mermaid(&path, &to, page, id),
         BoardCmd::Describe { path } => {
             let board = load_normalized(&path)?.0;
-            print!("{}", chimaera_board::describe::describe(&board));
+            let summary = chimaera_board::journal::summary(&journal_path_for(&path));
+            print!(
+                "{}",
+                chimaera_board::describe::describe_with_journal(&board, summary)
+            );
             Ok(())
         }
+        BoardCmd::Journal { path, since } => journal(&path, since),
         BoardCmd::Lint { path, theme } => lint(&path, theme),
     }
 }
@@ -129,6 +189,34 @@ fn load_normalized(
     let mut board = chimaera_board::load(path)?;
     let diags = chimaera_board::normalize(&mut board);
     Ok((board, diags))
+}
+
+/// The journal key for a board named on the command line. Canonicalized
+/// first — the journal key is derived from the workspace-relative path, and
+/// the daemon canonicalizes too, so a relative CLI path must not mint a
+/// second key for the same board.
+fn journal_path_for(path: &Path) -> PathBuf {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let ws = chimaera_board::workspace_root(&abs);
+    chimaera_board::journal::journal_path(&ws, &abs)
+}
+
+fn journal(path: &Path, since: Option<u64>) -> Result<()> {
+    if !chimaera_board::is_board_path(path) {
+        bail!(
+            "not a board: {} does not end in .board.json",
+            path.display()
+        );
+    }
+    let events = chimaera_board::journal::read_since(&journal_path_for(path), since.unwrap_or(0))?;
+    if events.is_empty() {
+        println!("no journal events");
+        return Ok(());
+    }
+    for event in &events {
+        println!("{}", event.render());
+    }
+    Ok(())
 }
 
 fn resolve_theme(
@@ -146,6 +234,7 @@ fn resolve_theme(
 #[allow(clippy::too_many_arguments)]
 fn show(
     spec_path: Option<PathBuf>,
+    mermaid: bool,
     title: Option<String>,
     note: Option<String>,
     id: Option<String>,
@@ -172,8 +261,20 @@ fn show(
         bail!("no spec: pipe JSON on stdin or pass --spec FILE");
     }
 
-    let mut spec: chimaera_board::show::ShowSpec =
-        serde_json::from_str(&raw).context("parsing the show spec")?;
+    // --mermaid wraps the raw input as the spec's fourth body kind; the JSON
+    // path stays exactly what it was.
+    let mut spec: chimaera_board::show::ShowSpec = if mermaid {
+        chimaera_board::show::ShowSpec {
+            title: None,
+            note: None,
+            chart: None,
+            table: None,
+            text: None,
+            mermaid: Some(raw.clone()),
+        }
+    } else {
+        serde_json::from_str(&raw).context("parsing the show spec")?
+    };
     if title.is_some() {
         spec.title = title;
     }
@@ -343,6 +444,218 @@ fn render(
             eprintln!("{}", d.render());
         }
     }
+    Ok(())
+}
+
+/// Export a board. SVG is per page (mirroring `render`); PDF — and PPTX,
+/// when its writer lands — take the whole deck as one document.
+fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) -> Result<()> {
+    let (board, diags) = load_normalized(path)?;
+    for d in diags
+        .iter()
+        .filter(|d| d.severity != chimaera_board::Severity::Info)
+    {
+        eprintln!("{}", d.render());
+    }
+    let ws = chimaera_board::workspace_root(path);
+    let theme = resolve_theme(None, &board, &ws)?;
+    let fonts = FontStack::for_workspace(&ws);
+
+    // Default destination: .chimaera/board/exports/<stem>.<ext>. The writes
+    // are atomic, and write_atomic creates the directory itself.
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .unwrap_or_else(|| "board".to_string());
+    let exports_dir =
+        || -> Result<PathBuf> { Ok(chimaera_board::ensure_board_dir(&ws)?.join("exports")) };
+
+    match format {
+        "svg" | "svg-outlined" => {
+            // Two files that must not clobber each other: the outlined
+            // variant carries its name.
+            let (variant, base) = if format == "svg" {
+                (SvgVariant::Text, stem.clone())
+            } else {
+                (SvgVariant::Outlined, format!("{stem}-outlined"))
+            };
+            let pages: Vec<usize> = match page {
+                Some(p) => vec![p],
+                None => (0..board.pages.len()).collect(),
+            };
+            let single = pages.len() == 1;
+            let count = pages.len();
+            for p in pages {
+                let svg = export_svg(&board, p, &theme, &fonts, variant)?;
+                let dest = match (&out, single) {
+                    (Some(o), true) => o.clone(),
+                    (Some(o), false) => o.join(format!("{base}-{}.svg", board.pages[p].id)),
+                    (None, true) => exports_dir()?.join(format!("{base}.svg")),
+                    (None, false) => {
+                        exports_dir()?.join(format!("{base}-{}.svg", board.pages[p].id))
+                    }
+                };
+                chimaera_board::write_atomic(&dest, svg.as_bytes())?;
+                println!(
+                    "page {} ({}) → {}",
+                    p + 1,
+                    board.pages[p].id,
+                    dest.display()
+                );
+            }
+            println!("{count} page{} exported", if count == 1 { "" } else { "s" });
+        }
+        "pdf" => {
+            if page.is_some() {
+                bail!("--page does not apply to pdf: the whole deck exports as one document");
+            }
+            let pdf = export_pdf(&board, &theme, &fonts)?;
+            let dest = match out {
+                Some(o) => o,
+                None => exports_dir()?.join(format!("{stem}.pdf")),
+            };
+            chimaera_board::write_atomic(&dest, &pdf)?;
+            let n = board.pages.len();
+            println!(
+                "{n} page{} → {}",
+                if n == 1 { "" } else { "s" },
+                dest.display()
+            );
+        }
+        "pptx" => {
+            if page.is_some() {
+                bail!("--page does not apply to pptx: the whole deck exports as one file");
+            }
+            let mut bytes = Vec::new();
+            let report = chimaera_board::export::write_pptx(&board, &theme, &fonts, &mut bytes)?;
+            let dest = match out {
+                Some(o) => o,
+                None => exports_dir()?.join(format!("{stem}.pptx")),
+            };
+            chimaera_board::write_atomic(&dest, &bytes)?;
+            // The degradation contract, stated per object rather than
+            // discovered after the deck is opened.
+            for fate in &report.objects {
+                println!(
+                    "  {}: {} — {}",
+                    fate.id,
+                    format!("{:?}", fate.tier).to_lowercase(),
+                    fate.reason
+                );
+            }
+            let n = board.pages.len();
+            println!(
+                "{n} page{} → {}",
+                if n == 1 { "" } else { "s" },
+                dest.display()
+            );
+        }
+        other => bail!("unknown format {other:?}: use svg | svg-outlined | pdf | pptx"),
+    }
+    Ok(())
+}
+
+/// Parse mermaid and append the resulting `diagram` object to a board,
+/// creating a one-page board when `to` does not exist. The object gets the
+/// canvas minus margins; the human drags it from there.
+fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<String>) -> Result<()> {
+    let src = if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading mermaid from stdin")?;
+        buf
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    };
+    if src.trim().is_empty() {
+        bail!("no mermaid source: pass a file, or `-` with the source on stdin");
+    }
+    let (mut diagram, notes) = chimaera_board::diagram::from_mermaid_with_notes(&src)?;
+    for n in &notes {
+        eprintln!("note: {n}");
+    }
+    diagram.id = id.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| *s != "-")
+            .map(String::from)
+            .unwrap_or_else(|| "diagram".to_string())
+    });
+
+    if !chimaera_board::is_board_path(to) {
+        bail!(
+            "a board path ends in .board.json — try {}",
+            to.with_extension("board.json").display()
+        );
+    }
+    let mut board = if to.exists() {
+        chimaera_board::load(to)?
+    } else {
+        let title = to
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
+            .unwrap_or_else(|| "Untitled".to_string());
+        chimaera_board::Board::new(title, chimaera_board::Canvas::default())
+    };
+
+    // The diagram fills the canvas minus a margin; layout inside is computed
+    // at render, so this box is all the geometry an import needs.
+    let m = 48.0;
+    diagram.at = Some([m, m]);
+    diagram.size = Some([
+        (board.canvas.width() - m * 2.0).max(200.0),
+        (board.canvas.height() - m * 2.0).max(160.0),
+    ]);
+
+    let page_index = match &page {
+        Some(pid) => board
+            .pages
+            .iter()
+            .position(|p| &p.id == pid)
+            .with_context(|| format!("no page {pid:?} in {}", to.display()))?,
+        None => {
+            if board.pages.is_empty() {
+                board.pages.push(chimaera_board::Page::new("page-1"));
+            }
+            0
+        }
+    };
+    // Ids are the merge and journal key — refuse rather than auto-rename.
+    if board.objects().any(|(_, o)| o.id() == diagram.id) {
+        bail!(
+            "id {:?} already exists in {}; pass --id",
+            diagram.id,
+            to.display()
+        );
+    }
+
+    let (obj_id, n_nodes, n_edges) = (diagram.id.clone(), diagram.nodes.len(), diagram.edges.len());
+    board.pages[page_index]
+        .objects
+        .push(chimaera_board::Object::Diagram(diagram));
+    let diags = chimaera_board::normalize(&mut board);
+    let mut errors = 0;
+    for d in diags
+        .iter()
+        .filter(|d| d.severity != chimaera_board::Severity::Info)
+    {
+        eprintln!("{}", d.render());
+        if d.severity == chimaera_board::Severity::Error {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        bail!("{errors} error(s); nothing written");
+    }
+    chimaera_board::save(to, &board)?;
+    println!(
+        "imported {obj_id:?} · {n_nodes} nodes · {n_edges} edges → {} (page {})",
+        to.display(),
+        board.pages[page_index].id
+    );
     Ok(())
 }
 

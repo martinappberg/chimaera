@@ -180,7 +180,10 @@ fn image_from_png(png: &[u8]) -> Result<RgbImage> {
 // SVG emission
 // ---------------------------------------------------------------------------
 
-fn page_svg(
+/// Emit one page as SVG. `pub(crate)` because the exporters ([`crate::export`])
+/// reuse this exact emission — a second SVG writer is how the pane and the
+/// export quietly stop agreeing.
+pub(crate) fn page_svg(
     board: &Board,
     page: &Page,
     theme: &Theme,
@@ -379,6 +382,31 @@ fn emit_object(
                 muted.hex(),
                 escape(chip)
             );
+        }
+        Object::Diagram(d) => {
+            if obj.frame().is_none() {
+                diags.push(
+                    Diagnostic::new(Severity::Warning, "diagram has no position; skipped")
+                        .at(&page.id, obj.id()),
+                );
+                return;
+            }
+            let (children, problems) = crate::diagram::expand(d, theme, fonts);
+            for p in problems {
+                diags.push(Diagnostic::new(Severity::Warning, p).at(&page.id, obj.id()));
+            }
+            // Generated children are never on the page, so the page index
+            // cannot resolve a connector bound to `<diagram>/<node>`; extend
+            // it with the expansion's own frames.
+            let mut child_index = index.clone();
+            for c in &children {
+                if let Some(f) = c.frame() {
+                    child_index.insert(c.id().to_string(), f);
+                }
+            }
+            for c in &children {
+                emit_object(s, c, page, board, theme, fonts, &child_index, diags);
+            }
         }
         Object::Unknown(u) => {
             diags.push(

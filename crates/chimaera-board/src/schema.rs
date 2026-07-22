@@ -217,7 +217,7 @@ pub struct Background {
 // Objects
 // ---------------------------------------------------------------------------
 
-/// The five primitives, `chart`, and the preservation fallback.
+/// The five primitives, `chart`, `diagram`, and the preservation fallback.
 ///
 /// Serialized with a `type` discriminator. Deserialization is hand-written
 /// rather than `#[serde(tag = "type")]` for one reason that matters: an
@@ -237,6 +237,7 @@ pub enum Object {
     Image(ImageObject),
     Group(GroupObject),
     Chart(ChartObject),
+    Diagram(DiagramObject),
     /// Preserved verbatim, skipped in render. Carries the reason so `describe`
     /// and the repair banner can say *why* rather than just dropping it.
     Unknown(UnknownObject),
@@ -261,6 +262,7 @@ impl Object {
             Object::Image(o) => &o.id,
             Object::Group(o) => &o.id,
             Object::Chart(o) => &o.id,
+            Object::Diagram(o) => &o.id,
             Object::Unknown(o) => &o.id,
         }
     }
@@ -274,6 +276,7 @@ impl Object {
             Object::Image(_) => "image",
             Object::Group(_) => "group",
             Object::Chart(_) => "chart",
+            Object::Diagram(_) => "diagram",
             Object::Unknown(o) => &o.kind,
         }
     }
@@ -287,6 +290,7 @@ impl Object {
             Object::Image(o) => (o.at, o.size),
             Object::Group(o) => (o.at, o.size),
             Object::Chart(o) => (o.at, o.size),
+            Object::Diagram(o) => (o.at, o.size),
             Object::Connector(_) | Object::Unknown(_) => (None, None),
         };
         match (at, size) {
@@ -307,6 +311,7 @@ impl Object {
             Object::Image(o) => o.at = Some(at),
             Object::Group(o) => o.at = Some(at),
             Object::Chart(o) => o.at = Some(at),
+            Object::Diagram(o) => o.at = Some(at),
             Object::Connector(_) | Object::Unknown(_) => {}
         }
     }
@@ -318,6 +323,7 @@ impl Object {
             Object::Image(o) => o.size = Some(size),
             Object::Group(o) => o.size = Some(size),
             Object::Chart(o) => o.size = Some(size),
+            Object::Diagram(o) => o.size = Some(size),
             Object::Connector(_) | Object::Unknown(_) => {}
         }
     }
@@ -329,6 +335,7 @@ impl Object {
             Object::Shape(o) => o.slot.as_deref(),
             Object::Image(o) => o.slot.as_deref(),
             Object::Chart(o) => o.slot.as_deref(),
+            Object::Diagram(o) => o.slot.as_deref(),
             Object::Group(_) | Object::Connector(_) | Object::Unknown(_) => None,
         }
     }
@@ -371,6 +378,7 @@ impl Serialize for Object {
             Object::Image(o) => o.serialize(s),
             Object::Group(o) => o.serialize(s),
             Object::Chart(o) => o.serialize(s),
+            Object::Diagram(o) => o.serialize(s),
             Object::Unknown(o) => o.raw.serialize(s),
         }
     }
@@ -416,6 +424,7 @@ impl<'de> Deserialize<'de> for Object {
             "image" => try_variant!(ImageObject, Object::Image),
             "group" => try_variant!(GroupObject, Object::Group),
             "chart" => try_variant!(ChartObject, Object::Chart),
+            "diagram" => try_variant!(DiagramObject, Object::Diagram),
             _ => Ok(Object::Unknown(UnknownObject {
                 id,
                 kind,
@@ -461,6 +470,7 @@ kind_field!(ConnectorKind, "connector");
 kind_field!(ImageKind, "image");
 kind_field!(GroupKind, "group");
 kind_field!(ChartKind, "chart");
+kind_field!(DiagramKind, "diagram");
 
 /// A box of paragraphs. The only object that owns glyph layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1113,6 +1123,133 @@ pub struct Axes {
     /// `none`, `x`, `y`, or `both`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grid: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
+// Diagram
+// ---------------------------------------------------------------------------
+
+/// A composite: nodes + edges + lanes under a deterministic layered layout.
+///
+/// The file stores the *intent* — which nodes exist, what connects to what,
+/// which lane each belongs to — and [`crate::diagram::expand`] computes the
+/// geometry at render time. The expansion is never written back: storing it
+/// would be a second representation, and spec-only is what makes retheme and
+/// resize free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagramObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: DiagramKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// Layer flow: `down` (the default) or `right`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<DiagramDirection>,
+    pub nodes: Vec<DiagramNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<DiagramEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<DiagramLane>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl DiagramObject {
+    pub fn direction(&self) -> DiagramDirection {
+        self.direction.unwrap_or(DiagramDirection::Down)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagramDirection {
+    #[default]
+    Down,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagramNode {
+    pub id: String,
+    pub label: String,
+    /// Defaults to `roundRect` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<NodeShape>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<String>,
+    /// Names a lane this node belongs to; the lane's container rect is drawn
+    /// behind its members.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeShape {
+    Rect,
+    RoundRect,
+    Ellipse,
+    Diamond,
+}
+
+impl NodeShape {
+    /// The shape geometry this node expands to.
+    pub fn geo(&self) -> &'static str {
+        match self {
+            NodeShape::Rect => "rect",
+            NodeShape::RoundRect => "roundRect",
+            NodeShape::Ellipse => "ellipse",
+            NodeShape::Diamond => "diamond",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagramEdge {
+    pub from: String,
+    pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<EdgeStyle>,
+    /// Arrowhead at the destination; absent means `true`. An `Option` rather
+    /// than a defaulted `bool` so an explicit `"arrow": true` round-trips
+    /// byte-identically instead of being canonicalized away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrow: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeStyle {
+    Solid,
+    Dashed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagramLane {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }

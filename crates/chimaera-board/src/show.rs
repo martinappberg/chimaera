@@ -23,7 +23,7 @@ use crate::schema::{
 };
 
 /// The `show` spec: `title`, `note`, and exactly one of `chart` / `table` /
-/// `text`.
+/// `text` / `mermaid`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShowSpec {
@@ -37,6 +37,10 @@ pub struct ShowSpec {
     pub table: Option<TableSpec>,
     #[serde(default)]
     pub text: Option<Vec<String>>,
+    /// Mermaid flowchart source, converted to a `diagram` object — the
+    /// `show --mermaid` stdin path.
+    #[serde(default)]
+    pub mermaid: Option<String>,
 }
 
 /// A table to show: column order plus rows. The most common thing to show
@@ -75,12 +79,13 @@ pub fn build_board(spec: &ShowSpec, size: [f64; 2], theme_id: &str) -> Result<Bo
         spec.chart.is_some(),
         spec.table.is_some(),
         spec.text.is_some(),
+        spec.mermaid.is_some(),
     ]
     .iter()
     .filter(|b| **b)
     .count();
     if n_bodies != 1 {
-        bail!("a show spec carries exactly one of `chart`, `table` or `text`");
+        bail!("a show spec carries exactly one of `chart`, `table`, `text` or `mermaid`");
     }
 
     let canvas = Canvas {
@@ -134,6 +139,8 @@ pub fn build_board(spec: &ShowSpec, size: [f64; 2], theme_id: &str) -> Result<Bo
         page.objects.push(chart_object(chart, body)?);
     } else if let Some(table) = &spec.table {
         table_objects(table, body, &mut page)?;
+    } else if let Some(mermaid) = &spec.mermaid {
+        page.objects.push(diagram_object(mermaid, body)?);
     } else if let Some(text) = &spec.text {
         page.objects.push(Object::Text(TextObject {
             id: "body".into(),
@@ -247,6 +254,16 @@ fn chart_object(chart: &Value, body: [f64; 4]) -> Result<Object> {
     Ok(Object::Chart(chart))
 }
 
+/// Convert mermaid source to a diagram filling the body. `show` owns only the
+/// id and geometry; the parse itself is [`crate::diagram::from_mermaid`].
+fn diagram_object(src: &str, body: [f64; 4]) -> Result<Object> {
+    let mut d = crate::diagram::from_mermaid(src)?;
+    d.id = "diagram".to_string();
+    d.at = Some([body[0], body[1]]);
+    d.size = Some([body[2], body[3]]);
+    Ok(Object::Diagram(d))
+}
+
 /// Lay a table out as text rows. A real `table` composite arrives in slice 3;
 /// this is the honest slice-0 rendering — monospace-free, role-driven, and
 /// readable — not a second table implementation to migrate away from.
@@ -315,6 +332,7 @@ pub fn summary(board: &Board, theme_id: &str) -> String {
         .iter()
         .find_map(|o| match o {
             Object::Chart(c) => Some(format!("chart · {} rows", c.data.values.len())),
+            Object::Diagram(d) => Some(format!("diagram · {} nodes", d.nodes.len())),
             _ => None,
         })
         .unwrap_or_else(|| {
@@ -447,6 +465,38 @@ mod tests {
         assert!(out.png.len() > 1000);
         // Header + 2 rows × 2 cols + title.
         assert!(board.pages[0].objects.len() >= 7);
+    }
+
+    #[test]
+    fn a_mermaid_spec_becomes_a_diagram_that_renders() {
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"title": "Ingestion",
+                "mermaid": "flowchart TD\nA[Reader] --> B{Valid?}\nB -->|yes| C((Store))"}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Diagram(d) = &board.pages[0].objects[1] else {
+            panic!("expected a diagram body, got {:?}", board.pages[0].objects)
+        };
+        assert_eq!(d.nodes.len(), 3);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let out = render_page(&board, 0, &theme, &fonts, RasterParams::default()).unwrap();
+        assert!(out.png.len() > 1000);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.severity == crate::Severity::Error),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn unreadable_mermaid_is_refused_loudly() {
+        let spec: ShowSpec =
+            serde_json::from_str(r#"{"mermaid": "flowchart TD\n%% nothing"}"#).unwrap();
+        assert!(build_board(&spec, [720.0, 450.0], "talk-dark").is_err());
     }
 
     #[test]

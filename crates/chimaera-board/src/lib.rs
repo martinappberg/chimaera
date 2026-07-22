@@ -22,6 +22,9 @@
 
 pub mod chart;
 pub mod describe;
+pub mod diagram;
+pub mod export;
+pub mod journal;
 pub mod layout;
 pub mod lint;
 pub mod normalize;

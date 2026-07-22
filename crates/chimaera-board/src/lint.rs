@@ -139,6 +139,14 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
                         .at(&page.id, &u.id),
                     );
                 }
+                Object::Diagram(d) => {
+                    for node in &d.nodes {
+                        if let Some(fill) = node.fill.as_deref() {
+                            let field = format!("nodes[{:?}].fill", node.id);
+                            check_color(fill, theme, &page.id, &d.id, &field, &mut diags);
+                        }
+                    }
+                }
                 Object::Image(_) | Object::Group(_) => {}
             }
         }

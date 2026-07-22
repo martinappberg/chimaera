@@ -182,6 +182,82 @@ async fn board_edit_moves_an_object_and_the_agent_reads_it_back() {
 }
 
 #[tokio::test]
+async fn board_edit_appends_to_the_semantic_journal() {
+    // Every human gesture that lands in the file also lands in the journal:
+    // seq-first, actor human, from/to in the saved (post-normalize) points,
+    // and the response carries the seq additively as journalSeq.
+    let state = test_state();
+    let path = write_board("board-edit-journal");
+
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/edit",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "object": "t",
+            "at": [120.0, 80.0],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["journalSeq"], 1, "{json}");
+
+    // A move + resize gesture appends two events; seq continues across
+    // requests because the journal is reopened from disk each time.
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/edit",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "object": "t",
+            "at": [200.0, 96.0],
+            "size": [400.0, 160.0],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["journalSeq"], 3, "the last appended seq: {json}");
+
+    // The journal file sits at the path-derived key beside the board's
+    // workspace, and reads back the exact gesture history.
+    let canon = path.canonicalize().unwrap();
+    let ws = chimaera_board::workspace_root(&canon);
+    let journal = chimaera_board::journal::journal_path(&ws, &canon);
+    let events = chimaera_board::journal::read_since(&journal, 0).unwrap();
+    let lines: Vec<String> = events.iter().map(|e| e.render()).collect();
+    assert_eq!(
+        lines,
+        [
+            "#1 human moved t [40, 40] → [120, 80]",
+            "#2 human moved t [120, 80] → [200, 96]",
+            "#3 human resized t [320, 64] → [400, 160]",
+        ],
+        "{lines:?}"
+    );
+    let raw = std::fs::read_to_string(&journal).unwrap();
+    assert!(
+        raw.lines()
+            .next()
+            .unwrap()
+            .starts_with(r#"{"seq":1,"actor":"human","event":"move","object":"t""#),
+        "seq-first, no timestamp: {raw}"
+    );
+
+    // The read half advertises the change history.
+    let (_, described) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/describe",
+        Some(serde_json::json!({"path": path.to_string_lossy()})),
+    )
+    .await;
+    let text = described["text"].as_str().unwrap();
+    assert!(text.contains("journal: 3 events · latest seq 3"), "{text}");
+}
+
+#[tokio::test]
 async fn board_edit_refuses_an_unknown_object_by_name() {
     let state = test_state();
     let path = write_board("board-edit-unknown");

@@ -30,3 +30,14 @@ ttf-parser = "0.25"
 # lossless); JPEG is what the agent looks at, where decode speed over a
 # `connect` tunnel matters more than the last few dB.
 jpeg-encoder = "0.6"
+# The PPTX exporter's container. Same pin as chimaera-server's zip; deflate
+# only — no time crate, no encryption, nothing that could smuggle a timestamp
+# into what must be deterministic output.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# PDF export. svg2pdf pins usvg ^0.45 (the same tree Board already builds)
+# and embeds subsetted fonts from that tree's fontdb; only the `text`
+# feature is needed — Board's SVG has no filters and no raster images yet.
+# pdf-writer is svg2pdf's own document layer, used directly to assemble the
+# multi-page document its high-level `to_pdf` cannot produce.
+svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
+pdf-writer = "0.12"

@@ -15,6 +15,15 @@ use crate::schema::{Board, Object};
 
 /// Render the whole board as the agent-facing description.
 pub fn describe(board: &Board) -> String {
+    describe_with_journal(board, None)
+}
+
+/// [`describe`], plus one line pointing at the semantic edit journal when the
+/// board has one: `journal: N events · latest seq M` — `journal` is
+/// `(event count, latest seq)`, i.e. [`crate::journal::summary`]. The line
+/// sits right under the board summary so an agent reading positions also
+/// learns there is change history worth `--since`-ing.
+pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> String {
     let mut s = String::new();
     let title = board.title.as_deref().unwrap_or("(untitled)");
     let _ = writeln!(
@@ -26,6 +35,13 @@ pub fn describe(board: &Board) -> String {
         board.pages.len(),
         if board.pages.len() == 1 { "" } else { "s" }
     );
+    if let Some((events, latest)) = journal {
+        let _ = writeln!(
+            s,
+            "journal: {events} event{} · latest seq {latest}",
+            if events == 1 { "" } else { "s" }
+        );
+    }
     if let Some(theme) = &board.theme {
         let _ = writeln!(s, "theme {theme}");
     }
@@ -159,6 +175,15 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize) {
             }
             let _ = writeln!(s);
         }
+        Object::Diagram(d) => {
+            let _ = writeln!(
+                s,
+                "{indent}{} diagram{geo} · {} nodes · {} edges",
+                d.id,
+                d.nodes.len(),
+                d.edges.len()
+            );
+        }
         Object::Unknown(u) => {
             let why = match &u.error {
                 Some(e) => format!("failed to parse: {}", truncate(e, 60)),
@@ -211,6 +236,25 @@ mod tests {
         assert!(out.contains("from command"), "{out}");
         // An image with provenance prints as plot.
         assert!(out.contains("fig plot"), "{out}");
+    }
+
+    #[test]
+    fn describe_with_journal_prints_one_summary_line() {
+        let b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Review",
+                "canvas":{"size":[100,100]},"pages":[{"id":"p","objects":[]}]}"#,
+        )
+        .unwrap();
+        let out = describe_with_journal(&b, Some((3, 41)));
+        assert_eq!(
+            out.lines().nth(1).unwrap(),
+            "journal: 3 events · latest seq 41",
+            "right under the board summary: {out}"
+        );
+        let one = describe_with_journal(&b, Some((1, 1)));
+        assert!(one.contains("journal: 1 event · latest seq 1"), "{one}");
+        // No journal, no line — the wrapper stays byte-identical.
+        assert!(!describe(&b).contains("journal:"));
     }
 
     #[test]
