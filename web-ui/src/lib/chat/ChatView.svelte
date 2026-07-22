@@ -48,10 +48,12 @@
   } from "./store.svelte";
   import {
     advanceTailWindow,
+    autoPageEarlier,
     pageEarlier,
     pageLater,
     restoreWindow,
     tailWindow,
+    type PagePlan,
   } from "./transcriptWindow";
   import { getSetting } from "../settings/store.svelte";
 
@@ -460,16 +462,31 @@
     queueBottomScroll(true);
   }
 
-  function revealEarlier() {
+  function applyEarlierPage(plan: PagePlan, preserveTail: boolean) {
     const el = transcriptEl;
     if (el === null || pagingTranscript || renderStart === 0 || store.hydrating) return;
     pagingTranscript = true;
-    const plan = pageEarlier({ start: renderStart, end: renderEnd }, store.blocks.length);
-    atBottom = false;
-    setRangeAnchored(plan.settled.start, plan.settled.end, { live: false, tail: false });
+    if (preserveTail) {
+      setRange(plan.settled.start, plan.settled.end, { live: true, tail: true });
+      atBottom = true;
+      queueBottomScroll();
+    } else {
+      atBottom = false;
+      setRangeAnchored(plan.settled.start, plan.settled.end, {
+        live: false,
+        tail: false,
+      });
+    }
     void tick().then(() => {
       pagingTranscript = false;
     });
+  }
+
+  function revealEarlier() {
+    applyEarlierPage(
+      pageEarlier({ start: renderStart, end: renderEnd }, store.blocks.length),
+      false,
+    );
   }
 
   function revealLater() {
@@ -514,7 +531,13 @@
     }
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) revealEarlier();
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        const plan = autoPageEarlier(
+          { start: renderStart, end: renderEnd },
+          store.blocks.length,
+          atBottom,
+        );
+        if (plan !== null) applyEarlierPage(plan, plan.preserveTail);
       },
       { root, rootMargin: "96px 0px 0px" },
     );

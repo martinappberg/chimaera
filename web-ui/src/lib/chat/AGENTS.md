@@ -112,6 +112,9 @@ lifted out of the terminal pool) — see the shared/ area.
   continues rendering while the reader scrolls or types, but
   a non-empty draft pauses auto-follow. Hidden tabs snapshot once and must not
   retain reactive block proxies. Replay never remounts the entire transcript.
+  A visible top sentinel while a short live tail fills the viewport is layout,
+  not reader intent: it may prepend only while retaining the tail, and stops at
+  the DOM cap instead of silently paging the reader away from live activity.
 - **Fork boundaries are event-backed.** A rendered block's `forkSeq` is the
   latest sequence that makes that message true on replay (a queued user message
   advances on its `sent` update; a final Codex assistant message advances on

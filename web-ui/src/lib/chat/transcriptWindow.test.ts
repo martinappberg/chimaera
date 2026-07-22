@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   advanceTailWindow,
+  autoPageEarlier,
   pageEarlier,
   pageLater,
   restoreWindow,
@@ -33,6 +34,23 @@ describe("transcript DOM window", () => {
       expect(current.end - current.start).toBeLessThanOrEqual(TRANSCRIPT_WINDOW);
     }
     expect(current).toEqual({ start: 0, end: 192 });
+  });
+
+  it("fills a short viewport without abandoning live-tail follow", () => {
+    expect(autoPageEarlier(tailWindow(500), 500, true)).toEqual({
+      expanded: { start: 372, end: 500 },
+      settled: { start: 372, end: 500 },
+      preserveTail: true,
+    });
+    expect(autoPageEarlier({ start: 308, end: 500 }, 500, true)).toBeNull();
+  });
+
+  it("treats a reader at the top as ordinary history paging", () => {
+    expect(autoPageEarlier({ start: 308, end: 500 }, 500, false)).toEqual({
+      expanded: { start: 244, end: 500 },
+      settled: { start: 244, end: 436 },
+      preserveTail: false,
+    });
   });
 
   it("pages forward again and returns to the live tail", () => {
