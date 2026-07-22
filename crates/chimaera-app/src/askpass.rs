@@ -12,6 +12,8 @@
 //! both password and 2FA. Host-key confirmation is not an askpass prompt and
 //! is out of scope here (a first connect to an unknown host still needs the
 //! key in `~/.ssh/known_hosts`).
+//! Each child also frames its normalized host alias with the prompt, so the
+//! native relay can target only that host's windows (plus local home).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -38,6 +40,7 @@ use tokio::sync::oneshot;
 /// passes its environment through to the askpass program it runs).
 #[cfg(unix)]
 const SOCK_ENV: &str = "CHIMAERA_ASKPASS_SOCK";
+pub(crate) const SCOPE_FRAME: &str = "chimaera-askpass-scope-v1";
 
 /// How long a prompt waits for the UI before giving up. A dropped window or
 /// an ignored modal must not pin an ssh process open forever — on timeout we
@@ -52,7 +55,8 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 /// emit (startup window restore kicks off remote connects before any webview
 /// has loaded) would otherwise never learn a prompt exists, and ssh would
 /// silently wait out the timeout — the "host stuck connecting with no
-/// prompt" failure. The UI fetches `pending()` on mount to close that gap.
+/// prompt" failure. Eligible windows fetch `pending_scoped()` on mount to
+/// close that gap without exposing another host's challenge.
 #[derive(Default)]
 pub struct Askpass {
     pending: Mutex<HashMap<u64, PendingPrompt>>,
@@ -60,21 +64,35 @@ pub struct Askpass {
 }
 
 struct PendingPrompt {
+    alias: Option<String>,
     prompt: String,
     tx: oneshot::Sender<Option<String>>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum AnswerResult {
+    Answered(Option<String>),
+    Missing,
+    Forbidden,
 }
 
 /// `ssh-askpass` event payload: a prompt the UI must answer.
 #[derive(Clone, Serialize)]
 pub struct PromptEvent {
     id: u64,
+    alias: Option<String>,
     prompt: String,
 }
 
 impl Askpass {
-    fn register(&self, prompt: String, tx: oneshot::Sender<Option<String>>) -> u64 {
+    fn register(
+        &self,
+        alias: Option<String>,
+        prompt: String,
+        tx: oneshot::Sender<Option<String>>,
+    ) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        lock(&self.pending).insert(id, PendingPrompt { prompt, tx });
+        lock(&self.pending).insert(id, PendingPrompt { alias, prompt, tx });
         id
     }
 
@@ -82,32 +100,69 @@ impl Askpass {
         lock(&self.pending).remove(&id);
     }
 
-    /// Resolve prompt `id` with the user's answer (`None` = cancelled).
-    /// Returns whether the prompt was still pending — the caller broadcasts
-    /// `ssh-askpass-done` so every OTHER window showing it dismisses too.
-    pub fn answer(&self, id: u64, secret: Option<String>) -> bool {
-        match lock(&self.pending).remove(&id) {
-            Some(p) => {
-                let _ = p.tx.send(secret);
-                true
-            }
-            None => false,
+    /// Resolve a prompt only when the shell-owned caller scope is allowed to
+    /// see its alias. Authorization and removal share one lock, so a caller
+    /// cannot race a scope check against another answer.
+    pub fn answer_scoped(
+        &self,
+        id: u64,
+        secret: Option<String>,
+        window_scope: &crate::shell::WindowScope,
+    ) -> AnswerResult {
+        let mut pending = lock(&self.pending);
+        let Some(prompt) = pending.get(&id) else {
+            return AnswerResult::Missing;
+        };
+        if !window_scope.allows_askpass(prompt.alias.as_deref()) {
+            return AnswerResult::Forbidden;
         }
+        let prompt = pending.remove(&id).expect("prompt checked above");
+        let alias = prompt.alias.clone();
+        let _ = prompt.tx.send(secret);
+        AnswerResult::Answered(alias)
     }
 
-    /// The prompts still awaiting an answer, oldest first (ssh asks
-    /// sequentially, so order is answer order).
-    pub fn pending(&self) -> Vec<PromptEvent> {
+    /// Prompts this shell-owned caller scope may observe, oldest first (ssh
+    /// asks sequentially, so order is answer order).
+    pub fn pending_scoped(&self, window_scope: &crate::shell::WindowScope) -> Vec<PromptEvent> {
         let mut prompts: Vec<PromptEvent> = lock(&self.pending)
             .iter()
+            .filter(|(_, prompt)| window_scope.allows_askpass(prompt.alias.as_deref()))
             .map(|(id, p)| PromptEvent {
                 id: *id,
+                alias: p.alias.clone(),
                 prompt: p.prompt.clone(),
             })
             .collect();
         prompts.sort_by_key(|p| p.id);
         prompts
     }
+}
+
+/// Emit an askpass event only to shell-registered windows allowed to observe
+/// this host. Tauri event subscriptions are directly available to daemon
+/// pages, so app-wide broadcast plus a Svelte filter is not an auth boundary.
+fn emit_scoped<T: Clone + Serialize>(
+    app: &AppHandle,
+    event: &str,
+    payload: T,
+    alias: Option<&str>,
+) {
+    let Some(shell) = app.try_state::<crate::shell::Shell>() else {
+        return;
+    };
+    for label in shell.askpass_targets(alias) {
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        if let Err(error) = window.emit(event, payload.clone()) {
+            tracing::warn!("askpass: could not emit {event} to {label}: {error}");
+        }
+    }
+}
+
+pub(crate) fn emit_done(app: &AppHandle, id: u64, alias: Option<&str>) {
+    emit_scoped(app, "ssh-askpass-done", id, alias);
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -237,6 +292,26 @@ pub fn relay_endpoint() -> Option<(u16, String)> {
     RELAY.get().cloned()
 }
 
+/// A version marker and per-child host context precede the arbitrary ssh
+/// prompt. The marker matters during rolling updates: an older helper can send
+/// a multi-line Duo prompt, and treating its first line as an alias would show
+/// it in no remote window. Unknown/old framing remains deliberately unscoped.
+fn split_prompt_request(input: String) -> (Option<String>, String) {
+    let Some(scoped) = input
+        .strip_prefix(SCOPE_FRAME)
+        .and_then(|rest| rest.strip_prefix('\n'))
+    else {
+        return (None, input);
+    };
+    let Some((alias, prompt)) = scoped.split_once('\n') else {
+        return (None, input);
+    };
+    (
+        (!alias.is_empty()).then(|| alias.to_string()),
+        prompt.to_string(),
+    )
+}
+
 #[cfg(windows)]
 pub fn install(app: &AppHandle) -> Result<()> {
     let token = chimaera_core::generate_token();
@@ -305,7 +380,7 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
             return;
         }
     }
-    let Some((client_token, prompt)) = input.split_once('\n') else {
+    let Some((client_token, request)) = input.split_once('\n') else {
         tracing::warn!("askpass: malformed relay request");
         return;
     };
@@ -313,7 +388,8 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
         tracing::warn!("askpass: relay request with a bad token refused");
         return;
     }
-    let answer = resolve_prompt(&app, prompt.to_string()).await;
+    let (alias, prompt) = split_prompt_request(request.to_string());
+    let answer = resolve_prompt(&app, alias, prompt).await;
     let _ = stream.write_all(answer.as_bytes()).await;
     let _ = stream.write_all(b"\n").await;
     let _ = stream.shutdown().await;
@@ -323,12 +399,13 @@ async fn serve_one_tcp(app: AppHandle, mut stream: tokio::net::TcpStream, token:
 /// write side to mark the end), ask the UI, write the answer back.
 #[cfg(unix)]
 async fn serve_one(app: AppHandle, mut stream: UnixStream) {
-    let mut prompt = String::new();
-    if let Err(e) = stream.read_to_string(&mut prompt).await {
+    let mut request = String::new();
+    if let Err(e) = stream.read_to_string(&mut request).await {
         tracing::warn!("askpass: could not read prompt: {e}");
         return;
     }
-    let answer = resolve_prompt(&app, prompt).await;
+    let (alias, prompt) = split_prompt_request(request);
+    let answer = resolve_prompt(&app, alias, prompt).await;
     // ssh reads the secret up to the first newline; terminate with exactly one.
     let _ = stream.write_all(answer.as_bytes()).await;
     let _ = stream.write_all(b"\n").await;
@@ -337,19 +414,16 @@ async fn serve_one(app: AppHandle, mut stream: UnixStream) {
 
 /// Register the prompt, ask the UI, wait out the timeout — the transport-
 /// agnostic middle both the unix socket and the Windows TCP relay feed.
-async fn resolve_prompt(app: &AppHandle, prompt: String) -> String {
+async fn resolve_prompt(app: &AppHandle, alias: Option<String>, prompt: String) -> String {
     let state = app.state::<Askpass>();
     let (tx, rx) = oneshot::channel();
     let prompt = prompt.trim_end().to_string();
-    let id = state.register(prompt.clone(), tx);
-    let event = PromptEvent { id, prompt };
-    // The emit reaches only windows that are ALREADY listening; windows that
-    // mount later find this prompt via `pending()` (`list_askpass`). Zero
-    // windows at emit time is therefore fine — not an error.
-    if app.emit("ssh-askpass", event).is_err() {
-        state.discard(id);
-        return String::new();
-    }
+    let id = state.register(alias.clone(), prompt.clone(), tx);
+    let event = PromptEvent { id, alias, prompt };
+    // Emit only to matching windows that are ALREADY listening. Windows that
+    // mount later find this prompt through the equally scoped list command;
+    // zero targets at emit time is fine during startup restore.
+    emit_scoped(app, "ssh-askpass", event.clone(), event.alias.as_deref());
     match tokio::time::timeout(PROMPT_TIMEOUT, rx).await {
         Ok(Ok(Some(secret))) => secret,
         // Cancelled, timed out, or the app dropped the sender: no answer, so
@@ -358,7 +432,7 @@ async fn resolve_prompt(app: &AppHandle, prompt: String) -> String {
         // an answer.
         _ => {
             state.discard(id);
-            let _ = app.emit("ssh-askpass-done", id);
+            emit_done(app, id, event.alias.as_deref());
             String::new()
         }
     }
@@ -376,16 +450,20 @@ pub fn run_helper() {
     let Some(sock) = std::env::var_os(SOCK_ENV) else {
         return;
     };
-    let answer = ask(&sock, &prompt).unwrap_or_default();
+    let alias = std::env::var(chimaera_remote::ASKPASS_ALIAS_ENV)
+        .ok()
+        .filter(|alias| !alias.is_empty());
+    let answer = ask(&sock, alias.as_deref(), &prompt).unwrap_or_default();
     print!("{answer}");
     std::io::stdout().flush().ok();
 }
 
 /// Windows `--askpass`: invoked THROUGH WSL interop by the distro-side
 /// wrapper script. Everything arrives on stdin — line 1 `"<port> <token>"`,
-/// then the prompt to EOF — never argv, whose Linux→Windows marshaling for
-/// arbitrary prompt text is unverified. Any failure prints nothing: ssh gets
-/// an empty answer and fails cleanly, never hangs.
+/// then the versioned scope frame, alias, and prompt to EOF — never argv,
+/// whose Linux→Windows marshaling for arbitrary prompt text is unverified.
+/// Any failure prints nothing: ssh gets an empty answer and fails cleanly,
+/// never hangs.
 #[cfg(windows)]
 pub fn run_helper() {
     let mut input = String::new();
@@ -421,8 +499,12 @@ pub fn run_helper() {
 }
 
 #[cfg(unix)]
-fn ask(sock: &std::ffi::OsStr, prompt: &str) -> Result<String> {
+fn ask(sock: &std::ffi::OsStr, alias: Option<&str>, prompt: &str) -> Result<String> {
     let mut stream = StdUnixStream::connect(sock).context("connect askpass socket")?;
+    stream.write_all(SCOPE_FRAME.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.write_all(alias.unwrap_or_default().as_bytes())?;
+    stream.write_all(b"\n")?;
     stream.write_all(prompt.as_bytes())?;
     // Half-close so the server's read-to-EOF returns the whole prompt.
     stream.shutdown(Shutdown::Write)?;
@@ -482,13 +564,97 @@ mod tests {
             let (mut s, _) = listener.accept().unwrap();
             let mut prompt = String::new();
             s.read_to_string(&mut prompt).unwrap(); // returns on the client's half-close
-            assert_eq!(prompt, "user@host's password:");
+            assert_eq!(
+                prompt,
+                "chimaera-askpass-scope-v1\nSherlock\nuser@host's password:"
+            );
             s.write_all(b"hunter2\n").unwrap(); // secret + newline, same as serve_one
         });
 
-        let got = ask(sock.as_os_str(), "user@host's password:").unwrap();
+        let got = ask(sock.as_os_str(), Some("Sherlock"), "user@host's password:").unwrap();
         assert_eq!(got, "hunter2");
         server.join().unwrap();
         std::fs::remove_file(&sock).ok();
+    }
+
+    #[test]
+    fn prompt_scope_round_trips_and_old_helpers_stay_unscoped() {
+        let (alias, prompt) = split_prompt_request(
+            "chimaera-askpass-scope-v1\nSherlock\nPasscode or option (1-3):\nDuo".into(),
+        );
+        assert_eq!(alias.as_deref(), Some("Sherlock"));
+        assert_eq!(prompt, "Passcode or option (1-3):\nDuo");
+
+        let (alias, prompt) = split_prompt_request("Passcode or option (1-3):\nDuo prompt".into());
+        assert_eq!(alias, None);
+        assert_eq!(prompt, "Passcode or option (1-3):\nDuo prompt");
+    }
+
+    #[test]
+    fn pending_and_answer_enforce_the_shell_window_scope() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register(Some("remote-2".into()), "Password:".into(), tx);
+        let remote_1 = crate::shell::WindowScope::new(
+            Some("remote-1".into()),
+            Some("workspace".into()),
+            "remote-1-window".into(),
+        );
+
+        assert!(askpass.pending_scoped(&remote_1).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("wrong-window".into()), &remote_1),
+            AnswerResult::Forbidden
+        );
+        let local_workspace = crate::shell::WindowScope::new(
+            None,
+            Some("local-workspace".into()),
+            "local-window".into(),
+        );
+        assert!(askpass.pending_scoped(&local_workspace).is_empty());
+
+        // Home-granted fallback is shell-owned: later workspace navigation
+        // cannot hide an in-flight startup/first-connect prompt.
+        let mut fallback = crate::shell::WindowScope::new(None, None, "fallback-window".into());
+        fallback.ws = Some("opened-after-connect-started".into());
+        assert_eq!(askpass.pending_scoped(&fallback).len(), 1);
+        assert_eq!(
+            askpass.answer_scoped(id, Some("secret".into()), &fallback),
+            AnswerResult::Answered(Some("remote-2".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
+    }
+
+    #[test]
+    fn compute_prompts_require_an_explicit_login_host_scope() {
+        let askpass = Askpass::default();
+        let (tx, rx) = oneshot::channel();
+        let id = askpass.register(Some("cluster".into()), "Password:".into(), tx);
+
+        // This is a valid ordinary ssh alias, not proof that the window is a
+        // compute view reached through `cluster`.
+        let colliding_remote = crate::shell::WindowScope::new(
+            Some("cluster#job123".into()),
+            Some("workspace".into()),
+            "ordinary-remote".into(),
+        );
+        assert!(askpass.pending_scoped(&colliding_remote).is_empty());
+        assert_eq!(
+            askpass.answer_scoped(id, Some("wrong-window".into()), &colliding_remote),
+            AnswerResult::Forbidden
+        );
+
+        let compute = crate::shell::WindowScope::new_compute(
+            "cluster#job123".into(),
+            "cluster".into(),
+            Some("workspace".into()),
+            "compute-window".into(),
+        );
+        assert_eq!(askpass.pending_scoped(&compute).len(), 1);
+        assert_eq!(
+            askpass.answer_scoped(id, Some("secret".into()), &compute),
+            AnswerResult::Answered(Some("cluster".into()))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), Some("secret".into()));
     }
 }

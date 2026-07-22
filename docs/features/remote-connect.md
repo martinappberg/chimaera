@@ -48,12 +48,24 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   command/tunnel/window multiplexes it.
 - **In-app auth.** ssh has no tty under the native shell, so an `SSH_ASKPASS` relay surfaces the raw
   prompt (password, keyboard-interactive Duo passcode) in `AskpassModal.svelte`. Prompts **queue**
-  (ssh asks sequentially) and any window can answer them.
+  (ssh asks sequentially). Every ssh/scp child stamps its host alias into the relay, so a remote
+  window sees auth only for its own host; a local home window remains the fallback for startup
+  restore or a first connection made before any remote window exists. The native shell enforces
+  that boundary on targeted events, pending-list reads, and answers using the immutable host scope
+  it registered when the window opened — a daemon-served page cannot widen it client-side. Startup
+  registers a home fallback before launching restored remote connects when only local workspace
+  windows were persisted, so an early password or 2FA prompt always has an eligible surface. A
+  window created as local Home retains that shell-owned fallback identity if it opens a workspace
+  while SSH is still waiting; mutable workspace reports cannot revoke or grant another host scope.
+  Compute windows store their login-host askpass identity separately from the composite per-job
+  tunnel key, so the shape of an ordinary SSH alias can never imply access to another host's prompt.
 - **Liveness is an HTTP probe, not a bare TCP connect** — after laptop sleep an ssh forward's local
   listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
   HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring
   require a bearer-authenticated 200 (`http_alive_authed`), so a 401 or a foreign service on a
-  recycled port cannot be mistaken for the intended daemon.
+  recycled port cannot be mistaken for the intended daemon. Every successful connect call
+  republishes the tunnel's current port, token, and build even when it only reused a healthy
+  tunnel, so a window holding credentials from before another window's reconnect can re-home.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.
@@ -72,8 +84,19 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   before any process/network wait, so one dead host cannot block health checks or commands for
   another. Child reaping gets a two-second ceiling; ControlMaster forward cancellation is
   non-interactive (`BatchMode`) with a ten-second outer deadline. Native liveness transitions carry
-  a plain-language reason into the reconnect panel, while an actual reconnect failure remains a
-  separate error with Retry.
+  a plain-language reason into a compact, non-blocking reconnect status; only an actual reconnect
+  failure becomes a modal with Retry. Dismissing that modal downgrades it to a compact persistent
+  Retry action instead of removing the disconnected window's only recovery path. A 401 in a native
+  remote window follows that same scoped SSH recovery instead of showing the browser-only "paste a
+  fresh URL" page; while its credentials remain rejected, the Retry action cannot disappear.
+- **A daemon build change is a navigation boundary.** A reconnect reuses its local forward only
+  while the daemon source build still matches the app. Replacing the remote daemon gets a fresh
+  loopback port, which makes every already-open window re-home onto the new entry bundle instead of
+  asking the new server for hashed JavaScript chunks from the previous release. Connected events
+  also carry the build as a second guard for same-origin transitions, while the entry document
+  carries its own build stamp so the first asynchronous health poll cannot race the handoff. A
+  window with unsaved edits or memory-only chat input holds the navigation behind one visible
+  notice instead of looping reload prompts or silently discarding local state.
 
 ## Dev builds — the isolated dev daemon on a host
 

@@ -303,11 +303,40 @@ async fn codex_handshake(
         return Err("initialized write failed".into());
     }
 
-    let open = thread_open_request(spec);
+    // Match native Codex's new-thread default instead of silently taking the
+    // selected model's catalog default. The config read is optional for older
+    // app-server builds; a Chimaera-carried resumed-thread selection wins.
+    let configured_effort = if spec.initial_effort.is_none() {
+        let config_id = 1u64;
+        if sink
+            .send(&json!({
+                "id": config_id,
+                "method": "config/read",
+                "params": { "cwd": spec.cwd, "includeLayers": false },
+            }))
+            .await
+            .is_ok()
+        {
+            match tokio::time::timeout(Duration::from_secs(2), await_rpc_result(stream, config_id))
+                .await
+            {
+                Ok(Ok(result)) => configured_effort(&result),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let opening_effort = spec.initial_effort.clone().or(configured_effort);
+
+    let open_id = 2u64;
+    let open = thread_open_request(spec, open_id, opening_effort.as_deref());
     if sink.send(&open).await.is_err() {
         return Err("thread open write failed".into());
     }
-    let result = await_rpc_result(stream, 1).await?;
+    let result = await_rpc_result(stream, open_id).await?;
     let thread_id = result["thread"]["id"]
         .as_str()
         .map(String::from)
@@ -319,8 +348,11 @@ async fn codex_handshake(
         .as_str()
         .map(String::from)
         .or_else(|| spec.initial_model.clone());
-    let mut effort = result["reasoningEffort"].as_str().map(String::from);
-    let mut next_id = 2u64;
+    let mut effort = result["reasoningEffort"]
+        .as_str()
+        .map(String::from)
+        .or(opening_effort);
+    let mut next_id = 3u64;
 
     // Conversation rewind: drop the trailing turns right after the resume,
     // while the exchange is still lock-step (live-verified: thread/rollback
@@ -501,12 +533,19 @@ fn parse_codex_skills(list: &Value) -> Vec<SlashCommand> {
     commands
 }
 
+fn configured_effort(result: &Value) -> Option<String> {
+    result["config"]["model_reasoning_effort"]
+        .as_str()
+        .filter(|effort| effort.len() <= crate::model::COMMAND_SELECTOR_MAX)
+        .map(String::from)
+}
+
 /// Build the thread-open request separately from I/O so the launch recipe's
-/// create-time model contract stays hermetically testable.
-fn thread_open_request(spec: &SpawnSpec) -> Value {
+/// create-time model/effort contract stays hermetically testable.
+fn thread_open_request(spec: &SpawnSpec, id: u64, effort: Option<&str>) -> Value {
     let mut open = match (&spec.pinned_native_id, &spec.fork_at) {
         (Some(thread_id), Some(last_turn_id)) => json!({
-            "id": 1, "method": "thread/fork",
+            "id": id, "method": "thread/fork",
             "params": {
                 "threadId": thread_id,
                 "lastTurnId": last_turn_id,
@@ -515,11 +554,11 @@ fn thread_open_request(spec: &SpawnSpec) -> Value {
             },
         }),
         (Some(thread_id), None) => json!({
-            "id": 1, "method": "thread/resume",
+            "id": id, "method": "thread/resume",
             "params": { "threadId": thread_id, "cwd": spec.cwd },
         }),
         (None, _) => json!({
-            "id": 1, "method": "thread/start",
+            "id": id, "method": "thread/start",
             "params": { "cwd": spec.cwd },
         }),
     };
@@ -529,6 +568,13 @@ fn thread_open_request(spec: &SpawnSpec) -> Value {
     // changed the model a second time in the header.
     if let Some(model) = &spec.initial_model {
         open["params"]["model"] = json!(model);
+    }
+    // Codex persists the conversation but not its effective effort across an
+    // app-server process restart. Chimaera's native-thread index carries the
+    // last authoritative parent read-back so resume/fork cannot silently fall
+    // back to the model default (notably gpt-5.6-sol -> low).
+    if let Some(effort) = effort {
+        open["params"]["effort"] = json!(effort);
     }
     // Portable forks must open quietly: developerInstructions initializes the
     // fresh/resumed thread with the normalized source transcript without
@@ -861,8 +907,9 @@ impl CodexMapper {
             last_usage: Usage::default(),
             last_checkpoint: None,
             mcp_auto_approve,
-            // The handshake minted 0..next_id (init, thread open, optional
-            // rollback, model/list, skills/list) and hands over the next id.
+            // The handshake minted 0..next_id (init, config read, thread
+            // open, optional rollback, model/list, skills/list) and hands
+            // over the next id.
             next_id,
         }
     }
@@ -4788,37 +4835,63 @@ mod tests {
     }
 
     #[test]
-    fn thread_open_carries_the_create_time_model_for_start_and_resume() {
+    fn thread_open_carries_the_create_time_model_and_resumed_effort() {
         let mut spec = SpawnSpec::new("session", Vec::new(), std::path::PathBuf::from("/work"));
         spec.initial_model = Some("gpt-test".into());
-        let start = thread_open_request(&spec);
+        spec.initial_effort = Some("xhigh".into());
+        let start = thread_open_request(&spec, 7, spec.initial_effort.as_deref());
+        assert_eq!(start["id"], 7);
         assert_eq!(start["method"], "thread/start");
         assert_eq!(start["params"]["model"], "gpt-test");
+        assert_eq!(start["params"]["effort"], "xhigh");
         assert_eq!(start["params"]["sandbox"], "workspace-write");
         assert_eq!(start["params"]["approvalPolicy"], "on-request");
         assert_eq!(start["params"]["approvalsReviewer"], "auto_review");
 
         spec.pinned_native_id = Some("thread-old".into());
-        let resume = thread_open_request(&spec);
+        let resume = thread_open_request(&spec, 8, spec.initial_effort.as_deref());
         assert_eq!(resume["method"], "thread/resume");
         assert_eq!(resume["params"]["threadId"], "thread-old");
         assert_eq!(resume["params"]["model"], "gpt-test");
+        assert_eq!(resume["params"]["effort"], "xhigh");
         assert_eq!(resume["params"]["approvalsReviewer"], "auto_review");
 
         spec.fork_at = Some("turn-7".into());
-        let fork = thread_open_request(&spec);
+        let fork = thread_open_request(&spec, 9, spec.initial_effort.as_deref());
         assert_eq!(fork["method"], "thread/fork");
         assert_eq!(fork["params"]["threadId"], "thread-old");
         assert_eq!(fork["params"]["lastTurnId"], "turn-7");
         assert_eq!(fork["params"]["ephemeral"], false);
         assert_eq!(fork["params"]["model"], "gpt-test");
+        assert_eq!(fork["params"]["effort"], "xhigh");
         assert_eq!(fork["params"]["approvalsReviewer"], "auto_review");
 
         spec.portable_context = Some("quiet imported transcript".into());
-        let contextual = thread_open_request(&spec);
+        let contextual = thread_open_request(&spec, 10, spec.initial_effort.as_deref());
         assert_eq!(
             contextual["params"]["developerInstructions"],
             "quiet imported transcript"
+        );
+    }
+
+    #[test]
+    fn config_read_extracts_only_a_bounded_reasoning_effort() {
+        assert_eq!(
+            configured_effort(&json!({
+                "config": { "model_reasoning_effort": "xhigh" }
+            }))
+            .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(configured_effort(&json!({ "config": {} })), None);
+        assert_eq!(
+            configured_effort(&json!({
+                "config": {
+                    "model_reasoning_effort":
+                        "x".repeat(crate::model::COMMAND_SELECTOR_MAX + 1)
+                }
+            })),
+            None
         );
     }
 

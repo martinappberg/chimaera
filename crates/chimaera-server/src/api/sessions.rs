@@ -449,7 +449,7 @@ async fn spawn_chat_ui(
         };
     }
 
-    match crate::chat::spawn_chat_session(state, id.clone(), recipe, None) {
+    match crate::chat::spawn_chat_session(state, id.clone(), recipe, None).await {
         Ok(info) => {
             crate::agents::spawn_agent_watch(state.clone(), id.clone());
             state.changes.notify_waiters();

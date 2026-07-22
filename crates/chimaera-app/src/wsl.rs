@@ -182,6 +182,14 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
     }
 }
 
+/// POSIX optional-variable expansion used by the generated askpass wrapper.
+/// Kept pure and cross-platform-tested because macOS cannot compile the
+/// surrounding Windows implementation.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn optional_env(name: &str) -> String {
+    format!("${{{name}-}}")
+}
+
 /// Everything runs through POSIX sh inside the distro; `$HOME` expansion is
 /// the reason these are `sh -c` scripts and not bare `--exec` argv.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -949,12 +957,17 @@ mod imp {
         // unverified for arbitrary prompt text, so only fixed tokens ride
         // argv. Missing exe / disabled interop exits 0 with no output — ssh
         // gets an empty answer and fails cleanly.
+        let askpass_alias = optional_env(chimaera_remote::ASKPASS_ALIAS_ENV);
+        let scope_frame = crate::askpass::SCOPE_FRAME;
         let wrapper = format!(
             "#!/bin/sh\n\
              # chimaera ssh-askpass relay (generated at app launch; do not edit).\n\
              exe='{exe_quoted}'\n\
              [ -x \"$exe\" ] || exit 0\n\
-             {{ printf '%s %s\\n' '{port}' '{token}'; printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
+             {{ printf '%s %s\\n' '{port}' '{token}'; \
+                printf '%s\\n' '{scope_frame}'; \
+                printf '%s\\n' \"{askpass_alias}\"; \
+                printf '%s' \"$1\"; }} | \"$exe\" --askpass\n"
         );
         let out = target_script(
             t,
@@ -977,7 +990,11 @@ mod imp {
         // idempotent across re-wires.)
         std::env::set_var("SSH_ASKPASS", format!("{}/.chimaera/askpass.sh", t.home));
         std::env::set_var("SSH_ASKPASS_REQUIRE", "force");
-        extend_wslenv(&["SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"]);
+        extend_wslenv(&[
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            chimaera_remote::ASKPASS_ALIAS_ENV,
+        ]);
         Ok(())
     }
 
@@ -1068,6 +1085,14 @@ mod tests {
             ready,
             is_default,
         }
+    }
+
+    #[test]
+    fn optional_env_uses_posix_unset_safe_expansion() {
+        assert_eq!(
+            optional_env(chimaera_remote::ASKPASS_ALIAS_ENV),
+            "${CHIMAERA_ASKPASS_ALIAS-}"
+        );
     }
 
     #[test]
