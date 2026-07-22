@@ -148,7 +148,9 @@ three compounding ways. Findings and the invariants they forced:
   prompts). Now one flight owns the ssh per alias and every concurrent caller awaits its
   outcome — one Duo push per host, ever. The fresh-port retry after a reused-port failure
   is gated on a typed `TunnelPhaseError`, because re-running the whole connect on an auth
-  cancel re-prompted 2FA.
+  cancel re-prompted 2FA. Every successful caller also receives a `connected` endpoint event,
+  including live-tunnel reuse and flight joiners; otherwise a window with a stale token could join
+  a tunnel another window had already healed and remain stuck on its old 401.
 - **Remote windows come back with the first successful connect**, not just the next
   launch: reopening persisted windows rides `connect` itself (dedup'd on stable window
   id), so a host that was unreachable at launch restores its windows the moment a

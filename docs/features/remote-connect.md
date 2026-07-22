@@ -61,7 +61,9 @@ a `RemoteOps` trait. See also [native-app.md](native-app.md) for the windows/hos
   listener still accepts while the connection behind it is dead. Initial tunnel polling accepts any
   HTTP response (`http_alive`); once a manifest/token is known, native reuse and health monitoring
   require a bearer-authenticated 200 (`http_alive_authed`), so a 401 or a foreign service on a
-  recycled port cannot be mistaken for the intended daemon.
+  recycled port cannot be mistaken for the intended daemon. Every successful connect call
+  republishes the tunnel's current port, token, and build even when it only reused a healthy
+  tunnel, so a window holding credentials from before another window's reconnect can re-home.
 - **TOFU host keys.** `StrictHostKeyChecking=accept-new` lets a windowed app with no tty reach a
   never-seen host (it still refuses a *changed* key). `ServerAliveInterval/CountMax` notice a dead
   link within ~45s.

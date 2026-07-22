@@ -315,7 +315,8 @@ export function onConnectProgress(
   return t.event.listen<ConnectProgress>("connect-progress", (e) => handler(e.payload));
 }
 
-/** Live tunnel liveness pushed by the shell (health monitor + reconnect). */
+/** Live tunnel identity pushed by the shell (health monitor + every successful
+ *  connect, including reuse of an existing healthy tunnel). */
 export interface HostStatusEvent {
   alias: string;
   /** "down" = the forward stopped answering (remote daemon or ssh died);
