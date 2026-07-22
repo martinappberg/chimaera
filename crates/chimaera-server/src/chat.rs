@@ -2816,6 +2816,10 @@ pub(crate) async fn spawn_chat_session(
     } else {
         None
     };
+    // The board capability note rides every chat spawn with a workspace
+    // (boards are workspace files; every recipe carries its workspace root,
+    // so this holds on all of today's paths).
+    let board_note = !recipe.workspace_root.as_os_str().is_empty();
     let (argv, pinned): (Vec<String>, Option<String>) = match recipe.kind {
         AgentKind::Claude => {
             let (settings, mcp) = (
@@ -2845,6 +2849,7 @@ pub(crate) async fn spawn_chat_session(
                     recipe.fork_at.as_deref(),
                     fork_context_file.as_deref(),
                     recipe.mastermind.is_some(),
+                    board_note,
                 ),
                 pinned,
             )
@@ -2867,6 +2872,7 @@ pub(crate) async fn spawn_chat_session(
                     &recipe.bin,
                     mcp_url.as_deref(),
                     recipe.mastermind,
+                    board_note,
                 ),
                 recipe.resume.clone(),
             )

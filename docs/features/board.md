@@ -176,7 +176,12 @@ outline; own writes don't). Gestures commit through `/board/edit`; agent
 edits arrive via the 2 s disk watch and re-render in place. Chat renders a
 **ShownCard** under completed tool calls whose output carries the
 `board show` signature line (client-detected v1; the daemon `shown` event can
-replace the detection later).
+replace the detection later). Discovery is wired, not hoped for: chat spawns
+with a workspace get an injected board note (`launcher::BOARD_SYSTEM_PROMPT`
+— claude `--append-system-prompt`, codex `developer_instructions`) pointing
+at `chimaera board show`, and the daemon writes a `chimaera` shim (its own
+binary) into the shims dir on every session's PATH, so agents in arbitrary
+workspaces can run it without a user install.
 
 ## The journal
 
