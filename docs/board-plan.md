@@ -30,12 +30,16 @@ not on this branch yet. The board skill is the natural first-party pack that
 dogfoods Loadout's install path, and both features share the same posture: files
 are the database, the daemon only scans and serves.
 
-> **Status (2026-07-22): slice 0 + the slice-1 spine are BUILT** — the
-> `chimaera-board` crate, the CLI (`show`/`new`/`render`/`describe`/`lint`),
-> the daemon routes (render-with-ticket / describe / edit), the BoardView pane
-> with drag-to-move, and the board skill; verified live in both directions.
-> What exists today, precisely: [docs/features/board.md](features/board.md).
-> This document remains the design source of truth for everything else.
+> **Status (2026-07-22, second pass): ALL SLICES 0–5 ARE BUILT** — the full
+> crate (schema/slots/chart/diagram/composites/render/journal/presets/lint/
+> arrange/cvd/exports), the CLI (16 verbs), the daemon routes, the pane
+> (present mode, resize, actor-aware undo, attribution), the chat ShownCard,
+> and the skill; verified live end to end including PPTX oracle validation.
+> Deliberately not built: slice 6 (native `c:chart`/OMML — opportunistic by
+> design), cosmic-text-wasm in-place editing (a plain-text edit op ships
+> instead), hayro PDF import. What exists, precisely:
+> [docs/features/board.md](features/board.md). This document remains the
+> rationale record.
 
 ## 0. The one-paragraph version
 

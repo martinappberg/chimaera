@@ -814,23 +814,36 @@ pub fn build_with_rows(
         Orient::Vertical => xt,
         Orient::Horizontal => yt,
     };
+    // A horizontal chart puts the temporal channel on the magnitude axis —
+    // the Gantt/roadmap case — so magnitude values must parse dates, the
+    // axis must tick calendars, and "include zero" must never apply (day
+    // zero is 1970-01-01, not a meaningful baseline).
+    let mag_type = match orient {
+        Orient::Vertical => yt,
+        Orient::Horizontal => xt,
+    };
+    let mag_temporal = matches!(mag_type, ChannelType::Temporal);
 
     let series = series_values(rows, chart.color.as_ref());
     let has_bar = marks.iter().any(|m| m.mark == MarkKind::Bar);
     // A bar whose axis does not include zero misstates the ratio it exists to
     // communicate, so zero is forced in — except for an *interval* bar
-    // (x2/y2), which states a span from v to v2, not a ratio from zero.
-    let zero_forced = marks
-        .iter()
-        .any(|m| m.mark == MarkKind::Bar && interval_end(m).is_none());
+    // (x2/y2), which states a span from v to v2, not a ratio from zero, and
+    // except on a temporal axis, where zero is an arbitrary epoch.
+    let zero_forced = !mag_temporal
+        && marks
+            .iter()
+            .any(|m| m.mark == MarkKind::Bar && interval_end(m).is_none());
 
     // Magnitude domain, over every field each mark actually draws from: the
     // mark's own magnitude override, its interval end, err spans, absolute
-    // lo/hi whisker bounds, and cumulative stacked totals.
+    // lo/hi whisker bounds, and cumulative stacked totals. `coord` rather
+    // than `number`, so a temporal magnitude parses its ISO dates.
+    let magv = |row: &Value, f: &str| coord(row, f, mag_type);
     let mut mag_min = f64::INFINITY;
     let mut mag_max = f64::NEG_INFINITY;
     for row in rows {
-        if let Some(v) = number(row, &mag_ch.field) {
+        if let Some(v) = magv(row, &mag_ch.field) {
             mag_min = mag_min.min(v);
             mag_max = mag_max.max(v);
         }
@@ -863,12 +876,12 @@ pub fn build_with_rows(
             continue;
         }
         for row in mrows {
-            let base = number(row, mf);
+            let base = magv(row, mf);
             if let Some(v) = base {
                 mag_min = mag_min.min(v);
                 mag_max = mag_max.max(v);
             }
-            if let Some(v) = interval_end(m).and_then(|f| number(row, f)) {
+            if let Some(v) = interval_end(m).and_then(|f| magv(row, f)) {
                 mag_min = mag_min.min(v);
                 mag_max = mag_max.max(v);
             }
@@ -879,7 +892,7 @@ pub fn build_with_rows(
                 }
             }
             for k in ["lo", "hi"] {
-                if let Some(v) = m.fields.get(k).and_then(|f| number(row, f)) {
+                if let Some(v) = m.fields.get(k).and_then(|f| magv(row, f)) {
                     mag_min = mag_min.min(v);
                     mag_max = mag_max.max(v);
                 }
@@ -905,8 +918,16 @@ pub fn build_with_rows(
     }
 
     // Log scale on the magnitude channel: decades, or a refusal that names
-    // the offending value — never a silent clamp.
-    let mag_log = mag_ch.scale == Some(ScaleKind::Log);
+    // the offending value — never a silent clamp. Meaningless off a
+    // quantitative channel; say so and draw linear.
+    let mut mag_log = mag_ch.scale == Some(ScaleKind::Log);
+    if mag_log && !matches!(mag_type, ChannelType::Quantitative) {
+        scene.problems.push(format!(
+            "log scale on {:?} needs a quantitative channel; it is {mag_type:?}",
+            mag_ch.field
+        ));
+        mag_log = false;
+    }
     if mag_log {
         if zero_forced {
             scene.problems.push(
@@ -926,26 +947,56 @@ pub fn build_with_rows(
         }
     }
 
-    let (mag_ticks, mag_d0, mag_d1) = match (mag_log, mag_ch.domain) {
-        (true, Some([a, b])) => {
-            let (t, _, _) = log_ticks(a, b, 5);
-            (
-                t.into_iter()
-                    .filter(|v| *v >= a * (1.0 - 1e-9) && *v <= b * (1.0 + 1e-9))
-                    .collect(),
-                a,
-                b,
-            )
-        }
-        (true, None) => log_ticks(mag_min, mag_max, 5),
-        (false, Some([a, b])) => {
-            let (t, _, _) = nice_ticks(a, b, 5);
-            (t.into_iter().filter(|v| *v >= a && *v <= b).collect(), a, b)
-        }
-        (false, None) => nice_ticks(mag_min, mag_max, 5),
+    // Ticks with their labels, computed once: a temporal magnitude ticks
+    // calendar boundaries (nice-numbers over epoch days land on arbitrary
+    // Tuesdays and print as day counts), a log one ticks decades, a linear
+    // one ticks nice numbers.
+    let (mag_ticks, mag_d0, mag_d1): (Vec<(f64, String)>, f64, f64) = if mag_temporal {
+        let (d0, d1) = match mag_ch.domain {
+            Some([a, b]) => (a, b),
+            None => (mag_min, mag_max),
+        };
+        (temporal_ticks(d0, d1, 5), d0, d1)
+    } else {
+        let (ticks, d0, d1) = match (mag_log, mag_ch.domain) {
+            (true, Some([a, b])) => {
+                let (t, _, _) = log_ticks(a, b, 5);
+                (
+                    t.into_iter()
+                        .filter(|v| *v >= a * (1.0 - 1e-9) && *v <= b * (1.0 + 1e-9))
+                        .collect(),
+                    a,
+                    b,
+                )
+            }
+            (true, None) => log_ticks(mag_min, mag_max, 5),
+            (false, Some([a, b])) => {
+                let (t, _, _) = nice_ticks(a, b, 5);
+                (t.into_iter().filter(|v| *v >= a && *v <= b).collect(), a, b)
+            }
+            (false, None) => nice_ticks(mag_min, mag_max, 5),
+        };
+        let step = if ticks.len() > 1 {
+            ticks[1] - ticks[0]
+        } else {
+            1.0
+        };
+        (
+            ticks
+                .into_iter()
+                .map(|v| {
+                    // On a log axis the step is meaningless; each decade
+                    // formats to its own precision (0.1, 1, 10).
+                    let s = if mag_log { v } else { step };
+                    (v, format_tick(v, s, mag_ch.format.as_ref()))
+                })
+                .collect(),
+            d0,
+            d1,
+        )
     };
     let mag_step = if mag_ticks.len() > 1 {
-        mag_ticks[1] - mag_ticks[0]
+        mag_ticks[1].0 - mag_ticks[0].0
     } else {
         1.0
     };
@@ -1029,16 +1080,9 @@ pub fn build_with_rows(
 
     let mag_label_w = mag_ticks
         .iter()
-        .map(|v| {
-            // On a log axis the step is meaningless; each decade formats to
-            // its own precision (0.1, 1, 10).
-            let step = if mag_log { *v } else { mag_step };
-            ctx.fonts.measure(
-                &format_tick(*v, step, mag_ch.format.as_ref()),
-                &ctx.label_family,
-                ctx.label_size,
-                ctx.label_weight,
-            )
+        .map(|(_, label)| {
+            ctx.fonts
+                .measure(label, &ctx.label_family, ctx.label_size, ctx.label_weight)
         })
         .fold(0.0f64, f64::max);
     let cat_label_w = cat_labels
@@ -1178,8 +1222,6 @@ pub fn build_with_rows(
         plot,
         orient,
         &mag_ticks,
-        mag_step,
-        mag_log,
         mag_scale,
         mag_ch,
         &band,
@@ -1191,8 +1233,8 @@ pub fn build_with_rows(
     );
 
     draw_marks(
-        &mut scene, &ctx, chart, &marks, rows, plot, orient, mag_scale, &band, cat_linear,
-        cat_type, &series, mag_step, mag_ch,
+        &mut scene, &ctx, chart, &marks, rows, plot, orient, mag_scale, mag_type, &band,
+        cat_linear, cat_type, &series, mag_step, mag_ch,
     );
 
     // The stacked top furniture: the magnitude title on the first line, the
@@ -1230,9 +1272,7 @@ fn draw_axes(
     axes: &Axes,
     plot: Frame,
     orient: Orient,
-    mag_ticks: &[f64],
-    mag_step: f64,
-    mag_log: bool,
+    mag_ticks: &[(f64, String)],
     mag_scale: LinearScale,
     mag_ch: &Channel,
     band: &BandScale,
@@ -1252,10 +1292,9 @@ fn draw_axes(
         .unwrap_or_else(|| vec!["left".into(), "bottom".into()]);
 
     // Grid + magnitude ticks.
-    for t in mag_ticks {
+    for (t, label) in mag_ticks {
         let p = mag_scale.map(*t);
-        let step = if mag_log { *t } else { mag_step };
-        let label = format_tick(*t, step, mag_ch.format.as_ref());
+        let label = label.clone();
         match orient {
             Orient::Vertical => {
                 if grid != "none" {
@@ -1436,6 +1475,7 @@ fn draw_marks(
     plot: Frame,
     orient: Orient,
     mag: LinearScale,
+    mag_type: ChannelType,
     band: &BandScale,
     cat_linear: Option<LinearScale>,
     cat_type: ChannelType,
@@ -1443,6 +1483,9 @@ fn draw_marks(
     mag_step: f64,
     mag_ch: &Channel,
 ) {
+    // Temporal magnitudes parse dates; everything else reads numbers.
+    let magv = |row: &Value, f: &str| coord(row, f, mag_type);
+    let mag_temporal = matches!(mag_type, ChannelType::Temporal);
     let (cat_field, chart_mag_field) = match orient {
         Orient::Vertical => (
             chart.x.as_ref().unwrap().field.clone(),
@@ -1519,14 +1562,14 @@ fn draw_marks(
                         let Some(cat) = category_of(row, &cat_field) else {
                             continue;
                         };
-                        let Some(v) = number(row, &mag_field) else {
+                        let Some(v) = magv(row, &mag_field) else {
                             continue;
                         };
                         let Some(center) = band.center(&cat) else {
                             continue;
                         };
                         let (base, top) = if let Some(ef) = interval.as_deref() {
-                            let Some(v2) = number(row, ef) else {
+                            let Some(v2) = magv(row, ef) else {
                                 continue;
                             };
                             (mag.map(v), mag.map(v2))
@@ -1583,6 +1626,7 @@ fn draw_marks(
                         if total_bars <= MAX_VALUE_LABELS
                             && bar_marks == 1
                             && interval.is_none()
+                            && !mag_temporal
                             && !marks.iter().any(|m| m.mark == MarkKind::Errorbar)
                         {
                             let text = format_tick(v, mag_step, mag_ch.format.as_ref());
@@ -1618,7 +1662,7 @@ fn draw_marks(
                         if !in_series(row, color_field.as_deref(), s) {
                             continue;
                         }
-                        let Some(v) = number(row, &mag_field) else {
+                        let Some(v) = magv(row, &mag_field) else {
                             continue;
                         };
                         let cat_pos = if !band.categories.is_empty() {
@@ -1692,7 +1736,7 @@ fn draw_marks(
                         if !in_series(row, color_field.as_deref(), s) {
                             continue;
                         }
-                        let Some(v) = number(row, &mag_field) else {
+                        let Some(v) = magv(row, &mag_field) else {
                             continue;
                         };
                         let cat_pos = if !band.categories.is_empty() {
@@ -1709,7 +1753,7 @@ fn draw_marks(
                             *acc += v;
                             (b, *acc)
                         } else if let Some(ef) = interval.as_deref() {
-                            let Some(v2) = number(row, ef) else {
+                            let Some(v2) = magv(row, ef) else {
                                 continue;
                             };
                             (v2, v)
@@ -1768,7 +1812,7 @@ fn draw_marks(
                         if !in_series(row, color_field.as_deref(), s) {
                             continue;
                         }
-                        let Some(v) = number(row, &mag_field) else {
+                        let Some(v) = magv(row, &mag_field) else {
                             continue;
                         };
                         let cat_pos = if !band.categories.is_empty() {
@@ -1828,13 +1872,13 @@ fn draw_marks(
                             continue;
                         }
                         let bounds = if let Some((lf, hf)) = &bound_fields {
-                            match (number(row, lf), number(row, hf)) {
+                            match (magv(row, lf), magv(row, hf)) {
                                 (Some(a), Some(b)) => Some((a, b)),
                                 _ => None,
                             }
                         } else {
                             match (
-                                number(row, &mag_field),
+                                magv(row, &mag_field),
                                 err_field.as_ref().and_then(|f| number(row, f)),
                             ) {
                                 (Some(v), Some(e)) => Some((v - e, v + e)),
@@ -1890,7 +1934,7 @@ fn draw_marks(
                     .cloned()
                     .unwrap_or_else(|| "label".to_string());
                 for row in &mark_rows {
-                    let Some(v) = number(row, &mag_field) else {
+                    let Some(v) = magv(row, &mag_field) else {
                         continue;
                     };
                     let Some(label) = row.get(&text_field).and_then(as_text) else {
@@ -3058,6 +3102,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(poly_pts, 4, "two mark-local rows, out and back");
+    }
+
+    #[test]
+    fn a_gantt_bar_over_temporal_dates_draws_calendar_bars() {
+        // The roadmap case: nominal phases down y, ISO dates across x, an
+        // interval bar from start to end. The temporal channel lands on the
+        // magnitude axis, which must parse dates and tick calendars.
+        let s = scene_for(
+            r#"{"id":"c","type":"chart","at":[0,0],"size":[480,320],
+                "data":{"origin":"command","values":[
+                  {"phase":"design","start":"2026-01-10","end":"2026-02-20"},
+                  {"phase":"build","start":"2026-02-15","end":"2026-05-01"},
+                  {"phase":"ship","start":"2026-04-20","end":"2026-06-30"}]},
+                "x":{"field":"start","type":"temporal"},
+                "y":{"field":"phase","type":"nominal"},
+                "marks":[{"mark":"bar","fields":{"x2":"end"}}]}"#,
+        );
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let rects = s
+            .items
+            .iter()
+            .filter(|i| matches!(i, ChartItem::Rect { .. }))
+            .count();
+        assert_eq!(rects, 3, "one bar per phase");
+        // Calendar labels, never epoch-day numbers.
+        let t = texts(&s);
+        assert!(
+            t.iter()
+                .any(|l| MONTHS.iter().any(|m| l.contains(m)) || l.contains("2026")),
+            "no calendar label in {t:?}"
+        );
+        assert!(
+            !t.iter()
+                .any(|l| l.parse::<f64>().map(|v| v > 10_000.0).unwrap_or(false)),
+            "epoch-day numbers leaked onto the axis: {t:?}"
+        );
     }
 
     // ---- Source binding ------------------------------------------------

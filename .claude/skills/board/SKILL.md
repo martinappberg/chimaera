@@ -85,6 +85,32 @@ the file, and clobbering a moved object with your remembered coordinates
 undoes their work. The file is canonical byte-stable JSON, so `git diff` shows
 gestures as clean per-line changes.
 
+## The full verb set
+
+Beyond show/new/render/describe/lint: `journal [--since N]` (read the human's
+gestures back — ALWAYS check before editing a board a human may have
+touched); `lint --target <preset>` (floors + tier census; presets:
+talk-16x9, design-review, exec-update, teaching, readme-image, poster-a0,
+pub-nature-single, pub-cell, pub-plos), `--style` (near-miss alignment etc.),
+`--fix` (mechanical repairs); `arrange --op align-left|distribute-h|grid
+--ids a,b,c`; `import <file.mmd|.svg|.png> --to board` (mermaid → native
+diagram; figures → assets/ with provenance); `adopt <shown-id> [--to board]`
+(promote a shown card); `export --format pptx|pdf|svg|svg-outlined`
+(PPTX is natively editable — text stays text); `theme-export --format
+mplstyle` (hand your matplotlib script the deck's exact style);
+`rescheme <svg> --theme id` (recolor an existing figure); `validate-theme`
+(CVD-safe series cap).
+
+Prefer **slots over coordinates**: give a page `intent.kind` (cover ·
+section · claim-evidence · comparison · data · quote · summary · backup ·
+agenda · demo · roadmap · metrics · architecture · acknowledgements) and put
+objects in slots (`title`, `body-left`, …) — the layout engine places them,
+and lint stops warning about free geometry. Charts can bind a CSV directly
+(`data: {origin: "file", source: "bench.csv", sha256: "..."}`) — a changed
+file goes loudly stale rather than silently wrong. Timelines/Gantt: temporal
+x + a bar mark with `fields: {"x2": "end"}`. Diagrams: write mermaid and
+import it.
+
 ## Footguns observed live
 
 - A board path must end in `.board.json` — `board.json` alone is refused.

@@ -1,82 +1,133 @@
 # Board
 
 Chimaera's visual composition surface: agents write ordinary `*.board.json`
-files (decks, cards, quick result charts), the daemon renders them
+files (decks, cards, figures, quick result charts), the daemon renders them
 server-side, the BoardView pane shows the pixels and lets the human move
-things, and the agent reads the gestures back. The full design — including
-everything not yet built — is [docs/board-plan.md](../board-plan.md); this page
-covers what is **implemented today** (slice 0 + the slice-1 spine).
+things, and the agent reads the gestures back through `describe` and the
+semantic journal. The design source of truth is
+[docs/board-plan.md](../board-plan.md); **all planned slices 0–5 are
+implemented** (slice 6 — native `c:chart`/OMML — is opportunistic by design
+and not built; in-place rich-text editing ships as a plain-text edit op, not
+cosmic-text-wasm; hayro PDF import was skipped).
 
-**Where it lives.** The engine is its own crate,
-`crates/chimaera-board/` (schema, `normalize`, themes, chart, layout/text
-measurement, SVG→PNG render, `show`, `describe`, `lint`, and the canonical
-byte-stable writer in `pretty.rs`). CLI verbs: `crates/chimaera/src/board.rs`.
-Daemon routes: `crates/chimaera-server/src/board.rs`. Pane:
-`web-ui/src/lib/previews/BoardView.svelte`, registered as the `board`
-`FileViewKind` in `previews/files.ts` (matched on the full `.board.json`
-suffix, since `extension()` only sees the last dot segment). Skill:
-`.claude/skills/board/SKILL.md` (+ the `.agents/skills/board/` bridge).
+**Where it lives.** Engine: `crates/chimaera-board/` — see its
+[map](../../crates/chimaera-board/AGENTS.md) for the module-by-module layout
+(schema, pretty, normalize, slots, theme, chart, colormap, diagram,
+composites, layout, render, show, describe, lint, arrange, cvd, presets,
+journal, imginfo, export/{pptx,svg,pdf}). CLI verbs:
+`crates/chimaera/src/board.rs`. Daemon routes:
+`crates/chimaera-server/src/board.rs`. Pane:
+`web-ui/src/lib/previews/BoardView.svelte` (+ `boardInteract.ts`,
+`BoardRail`, `BoardPresentChrome`), registered as the `board` `FileViewKind`
+on the full `.board.json` suffix. Chat card:
+`web-ui/src/lib/chat/ShownCard.svelte`. Skill:
+`.claude/skills/board/SKILL.md` (+ `.agents/skills/board/` bridge).
 
-## The format (implemented subset)
+## The format
 
-- `formatVersion: 1`; points only (960×540 for 16:9), origin top-left; ids are
-  slugs and double as the diff anchor, Edit anchor, and merge key.
-- Five primitives — `text`, `shape`, `connector`, `image` (placeholder box in
-  v0), `group` — plus `chart`. Unknown fields round-trip verbatim; an unknown
-  or malformed *object* is preserved-but-not-drawn, so a newer board opened by
-  an older daemon loses nothing.
-- **Byte-stable canonical serialization**: fixed key order, scalar arrays
-  inline, container-array elements one per line (z-order and data rows diff as
-  line moves), small objects inline under a 100-byte budget, root always
-  expanded. A semantically identical save is byte-identical.
-- `normalize()` snaps geometry to the 8 pt grid, collapses bare runs, infers
-  chart channel types from inline JSON only, and enforces the inline-data caps
-  (≤500 rows, ≤32 KiB).
-- Themes: bundled `talk-dark` / `talk-light` (`@token` palette, role-based
-  type scale with per-role `minPt`, Okabe–Ito categorical ramp, WCAG-checked
-  in unit tests). Workspace themes resolve from `.chimaera/board/themes/`.
-- Chart v0: marks `bar` (grouped/stacked) · `line` (incl. `step: "post"`) ·
-  `point` · `rule` · `errorbar` · `text`; linear/ordinal/temporal scales; d3
-  nice ticks with step-derived decimal places; measured gutters; direct labels
-  and a series row instead of a legend; a bar axis always includes zero; the
-  required `data.origin` chip is drawn on the render. Histogram/pie/second-y
-  are refused.
+- Points only (960×540 for 16:9), origin top-left; slug ids are the diff
+  anchor, Edit anchor, journal subject, and merge key; byte-stable canonical
+  serialization (a semantically identical save is byte-identical); lenient
+  parsing — unknown fields round-trip, unknown/malformed objects are
+  preserved-but-not-drawn.
+- Five primitives (`text`, `shape`, `connector`, `image`, `group`) +
+  composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
+  `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
+  to primitives at render/export time.
+- **Slots**: 12 named layouts per canvas, selected by a pure function of
+  `page.intent.kind` + measured content; explicit geometry always wins;
+  resolution happens at render (files never churn). Anchors
+  (`above`/`below`/`left-of`/…/`center-of` + offset) resolve against slot
+  frames.
+- **Charts**: marks `bar` (grouped/stacked/interval via `x2`/`y2`), `line`
+  (+KM step), `point`, `area` (+`y2` ribbons, stacking), `rect` heatmaps
+  through bundled matplotlib colormaps, `errorbar` (+asymmetric `lo`/`hi`),
+  `rule`, `tick`, `text`, and `box` sugar over five-number summaries; linear
+  / log (decade ticks) / ordinal / temporal scales (calendar tick labels);
+  inline values or CSV/TSV(.gz) `source` binding with sha256 staleness
+  (stale is loud and draws no marks); the required `data.origin` chip;
+  histogram/pie/second-y refused.
+- **Diagrams**: nodes/edges/lanes with deterministic Sugiyama-lite layout and
+  connector-bound edge labels; mermaid flowcharts import converted-once
+  (`board import`, `show --mermaid`) with the source kept in provenance.
+- **Images**: PNG/JPEG placed with `srcRect` crops; SVG sanitized through a
+  usvg round-trip then inlined; `tint` for monochrome sources; effective-DPI
+  reporting against preset floors.
+- Themes: `talk-dark` / `talk-light` / `figure-light` bundled (`@token`
+  palettes, role type scale with per-role `minPt`, Okabe–Ito ramp,
+  WCAG-checked in tests); workspace themes under `.chimaera/board/themes/`.
+- **Presets carry four axes** (geometry / floors / page furniture / rules):
+  `talk-16x9`, `design-review`, `exec-update`, `teaching`, `readme-image`,
+  `poster-a0`, `pub-nature-single`, `pub-cell`, `pub-plos`. Furniture (page
+  number/footer/logo) renders from the preset, suppressed on covers.
 
 ## CLI
 
-`chimaera board show` (spec on stdin → one-page board + PNG under the
-self-ignoring `.chimaera/board/shown/`), `new`, `render` (content-addressed
-PNGs under `.chimaera/board/renders/`), `describe` (the agent read-back),
-`lint`. All verbs are thin wrappers over crate functions; the daemon wraps the
-same functions, so the pane and the CLI cannot disagree.
+`chimaera board show` (stdin spec → card under the self-ignoring
+`.chimaera/board/shown/`; `--table`, `--mermaid`, `--id` update handle) ·
+`new` · `render` · `describe` (positions + slot resolutions + journal
+summary) · `journal [--since N]` · `lint [--target PRESET] [--style]
+[--strict] [--fix]` (tier census; near-miss alignment and the narrow §3.5
+set; mechanical fixes) · `arrange --op align-*|distribute-*|grid` (journals
+as actor `agent`) · `import` (mermaid / SVG / PNG figures into
+`.chimaera/board/assets/` with provenance) · `adopt` (promote a shown card)
+· `export --format pptx|pdf|svg|svg-outlined` · `theme-export --format
+mplstyle|json` · `rescheme` (recolor an existing SVG onto a theme) ·
+`validate-theme` (WCAG + OKLCH + Machado-2009 CVD all-pairs ΔE with the
+computed safe series cap).
+
+## Exports
+
+Pure-Rust PPTX (native editable text/shapes/connectors, custGeom with
+arc→cubic flattening, charts/diagrams/composites as grouped shapes with real
+text, media embedding + svgBlip, notes, generated theme; deterministic bytes;
+python-pptx oracle-validated) · multi-page PDF (svg2pdf chunks in one
+pdf-writer document, embedded subsetted fonts) · SVG in text and outlined
+variants — all off the single `page_svg` emission. Per-object export tiers
+(`native`/`grouped`/`vector`/`raster`) with reason strings, gated by preset
+`exportFloor` in `lint --target`.
 
 ## Daemon routes
 
-All bearer-authed: `POST /api/v1/board/render` (renders content-addressed,
-answers with a `/raw` ticket — no image bytes on the JSON wire),
-`POST /api/v1/board/describe`, and `POST /api/v1/board/edit` (one semantic
-move/resize gesture by object id; normalizes and saves canonically, returns
-the new `X-Mtime` token). Render/describe/edit run under the shared
-filesystem blocking semaphore. `.chimaera/board/{renders,exports,journal,shown}`
-are excluded from the quick-open walker **by parent path** so a user's real
-`exports/` elsewhere stays indexed.
+Bearer-authed `POST /api/v1/board/render` (content-addressed cache +
+diagnostics sidecar → `/raw` ticket), `/board/describe`, `/board/edit`
+(move/resize/text ops by object id; canonical save; appends actor-`human`
+journal events; returns `X-Mtime` + `journalSeq`). Blocking work under the
+shared fs semaphore; render cache capped at 256, atomic writes;
+`.chimaera/board/{renders,exports,journal,shown}` excluded from quick-open
+by parent path.
 
-## The pane
+## The pane and chat
 
-Opening any `*.board.json` shows the stage (server-rendered raster — layout
-truth is never re-derived in the DOM), the outline rail, a numeric inspector
-(pt, 8 pt steps), and the page navigator. Click selects; drag moves; both the
-inspector and drags commit through `/board/edit`. Agent edits to the file
-arrive via the fileStore's 2 s disk watch and re-render **in place** with no
-flash. Boards past the 256 KB first chunk view fine but lose client-side
-selection.
+BoardView: server-rendered raster stage, outline rail, numeric inspector,
+page navigator, click-select, drag-move, corner resize handles, **actor-aware
+undo** (⌘Z never reverts agent work — mismatched entries drop with a toast),
+**present mode** (fullscreen, keyboard nav, `n` presenter notes, auto-hiding
+chrome), and **agent-edit attribution** (external changes flash an accent
+outline; own writes don't). Gestures commit through `/board/edit`; agent
+edits arrive via the 2 s disk watch and re-render in place. Chat renders a
+**ShownCard** under completed tool calls whose output carries the
+`board show` signature line (client-detected v1; the daemon `shown` event can
+replace the detection later).
 
-## Not built yet (see the plan)
+## The journal
 
-The journal event stream (gestures currently land only as file changes),
-slots/layouts and `brief`/`intent` resolution (parsed and preserved, not
-resolved), anchors resolution, image/SVG placement, exports (PPTX/PDF/SVG),
-`board adopt`, `lint --style`, and the figures pack.
+Seq-first append-only JSONL per board under `.chimaera/board/journal/`
+(path-derived key), kebab-case §6.3/6.3b vocabulary (`move`, `resize`,
+`text-edited`, `object-added/removed`, `page-*`, `intent-changed`,
+`brief-changed`), actor `human`/`agent`/`daemon`, no wall clock, size-capped
+seq-preserving compaction. Human gestures append from `/board/edit`; agent
+`arrange` appends as `agent`; `board journal --since N` is the read-back.
+
+## Not built (deliberately)
+
+Slice 6's native `c:chart` and OMML equations (opportunistic, gated on the
+fidelity matrix); cosmic-text-wasm in-place editing (the `/board/edit` text
+op covers plain-text edits); hayro PDF-panel import (feature-flagged
+optional); the daemon-injected `shown` journal event (the ShownCard detects
+client-side for now); server-side per-path edit serialization (client
+commits are chained; concurrent multi-client edits are last-writer-wins like
+`PUT /fs/file`).
 
 ## Intent
 

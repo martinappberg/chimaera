@@ -1123,7 +1123,7 @@ mod tests {
 
         // Exports to a pptx whose report covers every composite as Grouped.
         let mut bytes = Vec::new();
-        let report = crate::export::write_pptx(&b, &theme, &fonts, &mut bytes).unwrap();
+        let report = crate::export::write_pptx(&b, &theme, &fonts, None, &mut bytes).unwrap();
         assert_eq!(&bytes[..2], b"PK");
         for id in ["pl", "sb", "sig", "lg", "cb", "note", "zoom"] {
             let fate = report

@@ -614,7 +614,7 @@ fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) 
             let single = pages.len() == 1;
             let count = pages.len();
             for p in pages {
-                let svg = export_svg(&board, p, &theme, &fonts, variant)?;
+                let svg = export_svg(&board, p, &theme, &fonts, Some(&ws), variant)?;
                 let dest = match (&out, single) {
                     (Some(o), true) => o.clone(),
                     (Some(o), false) => o.join(format!("{base}-{}.svg", board.pages[p].id)),
@@ -637,7 +637,7 @@ fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) 
             if page.is_some() {
                 bail!("--page does not apply to pdf: the whole deck exports as one document");
             }
-            let pdf = export_pdf(&board, &theme, &fonts)?;
+            let pdf = export_pdf(&board, &theme, &fonts, Some(&ws))?;
             let dest = match out {
                 Some(o) => o,
                 None => exports_dir()?.join(format!("{stem}.pdf")),
@@ -655,7 +655,8 @@ fn export(path: &Path, format: &str, page: Option<usize>, out: Option<PathBuf>) 
                 bail!("--page does not apply to pptx: the whole deck exports as one file");
             }
             let mut bytes = Vec::new();
-            let report = chimaera_board::export::write_pptx(&board, &theme, &fonts, &mut bytes)?;
+            let report =
+                chimaera_board::export::write_pptx(&board, &theme, &fonts, Some(&ws), &mut bytes)?;
             let dest = match out {
                 Some(o) => o,
                 None => exports_dir()?.join(format!("{stem}.pptx")),

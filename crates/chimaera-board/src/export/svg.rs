@@ -23,12 +23,14 @@ pub enum SvgVariant {
     Outlined,
 }
 
-/// Export one page as SVG.
+/// Export one page as SVG. `workspace` resolves source-bound chart data and
+/// image files, exactly as the render path does.
 pub fn export_svg(
     board: &Board,
     page_index: usize,
     theme: &Theme,
     fonts: &FontStack,
+    workspace: Option<&std::path::Path>,
     variant: SvgVariant,
 ) -> Result<String> {
     let page = board
@@ -38,7 +40,7 @@ pub fn export_svg(
     // Render-path diagnostics (off-canvas, overfull) belong to `render` and
     // `lint`; the export is the same emission and does not re-report them.
     let mut diags = Vec::new();
-    let svg = crate::render::page_svg(board, page, theme, fonts, None, &mut diags)?;
+    let svg = crate::render::page_svg(board, page, theme, fonts, workspace, &mut diags)?;
     match variant {
         SvgVariant::Text => Ok(svg),
         SvgVariant::Outlined => {
@@ -90,7 +92,7 @@ mod tests {
         let b = board();
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let svg = export_svg(&b, 0, &theme, &fonts, SvgVariant::Text).unwrap();
+        let svg = export_svg(&b, 0, &theme, &fonts, None, SvgVariant::Text).unwrap();
         assert!(svg.contains("<text"), "real <text> elements survive: {svg}");
         // The export must round-trip through the same parser that would
         // rasterize it.
@@ -106,7 +108,7 @@ mod tests {
         let b = board();
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let svg = export_svg(&b, 0, &theme, &fonts, SvgVariant::Outlined).unwrap();
+        let svg = export_svg(&b, 0, &theme, &fonts, None, SvgVariant::Outlined).unwrap();
         assert!(!svg.contains("<text"), "no <text> may survive: {svg}");
         assert!(svg.contains("<path"), "glyphs become paths: {svg}");
     }
@@ -117,8 +119,8 @@ mod tests {
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
         for variant in [SvgVariant::Text, SvgVariant::Outlined] {
-            let a = export_svg(&b, 0, &theme, &fonts, variant).unwrap();
-            let c = export_svg(&b, 0, &theme, &fonts, variant).unwrap();
+            let a = export_svg(&b, 0, &theme, &fonts, None, variant).unwrap();
+            let c = export_svg(&b, 0, &theme, &fonts, None, variant).unwrap();
             assert_eq!(a, c, "same board, same bytes ({variant:?})");
         }
     }
@@ -128,7 +130,7 @@ mod tests {
         let b = board();
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let err = export_svg(&b, 7, &theme, &fonts, SvgVariant::Text).unwrap_err();
+        let err = export_svg(&b, 7, &theme, &fonts, None, SvgVariant::Text).unwrap_err();
         assert!(err.to_string().contains("no page 7"), "{err}");
     }
 }

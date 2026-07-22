@@ -27,8 +27,14 @@ use crate::layout::FontStack;
 use crate::schema::Board;
 use crate::theme::Theme;
 
-/// Export the whole board as one multi-page PDF.
-pub fn export_pdf(board: &Board, theme: &Theme, fonts: &FontStack) -> Result<Vec<u8>> {
+/// Export the whole board as one multi-page PDF. `workspace` resolves
+/// source-bound chart data and image files, exactly as the render path does.
+pub fn export_pdf(
+    board: &Board,
+    theme: &Theme,
+    fonts: &FontStack,
+    workspace: Option<&std::path::Path>,
+) -> Result<Vec<u8>> {
     if board.pages.is_empty() {
         bail!("board has no pages to export");
     }
@@ -49,7 +55,7 @@ pub fn export_pdf(board: &Board, theme: &Theme, fonts: &FontStack) -> Result<Vec
     let mut pages = Vec::with_capacity(board.pages.len());
     for (i, page) in board.pages.iter().enumerate() {
         let mut diags = Vec::new();
-        let svg = crate::render::page_svg(board, page, theme, fonts, None, &mut diags)?;
+        let svg = crate::render::page_svg(board, page, theme, fonts, workspace, &mut diags)?;
         let opt = usvg::Options {
             fontdb: fonts.db(),
             ..Default::default()
@@ -152,7 +158,7 @@ mod tests {
         let b = board(TWO_PAGE_DECK);
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let pdf = export_pdf(&b, &theme, &fonts).unwrap();
+        let pdf = export_pdf(&b, &theme, &fonts, None).unwrap();
         assert_eq!(&pdf[..5], b"%PDF-", "PDF header");
         assert!(
             pdf.len() > 2048,
@@ -180,8 +186,13 @@ mod tests {
             r#"{"format":"chimaera.board","formatVersion":1,
                 "canvas":{"size":[400,200]},"pages":[]}"#,
         );
-        let err =
-            export_pdf(&b, &crate::theme::default_for(true), &FontStack::new(&[])).unwrap_err();
+        let err = export_pdf(
+            &b,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no pages"), "{err}");
     }
 
@@ -199,8 +210,8 @@ mod tests {
         );
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
-        let a = export_pdf(&b, &theme, &fonts).unwrap();
-        let c = export_pdf(&b, &theme, &fonts).unwrap();
+        let a = export_pdf(&b, &theme, &fonts, None).unwrap();
+        let c = export_pdf(&b, &theme, &fonts, None).unwrap();
         assert_eq!(a, c, "same board, same bytes");
     }
 }

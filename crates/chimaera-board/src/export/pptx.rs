@@ -716,6 +716,9 @@ struct SlideWriter<'a> {
     /// The page being emitted — composite expansions (an inset's target
     /// image) look their subjects up here.
     page: &'a Page,
+    /// Workspace root for source-bound chart data and image files. Without
+    /// it, bound sources export as loud problems rather than silently empty.
+    workspace: Option<std::path::PathBuf>,
     /// Page-space frames by object id, for connector endpoint resolution.
     index: BTreeMap<String, Frame>,
     xml: String,
@@ -941,14 +944,20 @@ fn run_xml(w: &mut SlideWriter, run: &Run, role: &TypeRole) -> String {
 // ---------------------------------------------------------------------------
 
 fn emit_object(w: &mut SlideWriter, obj: &Object) {
+    // The object's page frame as slot/anchor resolution decided it: the
+    // resolved map is the single geometry truth (render.rs draws from the
+    // same lookup), so a slot-placed object exports exactly where the pane
+    // shows it. The fallback covers composite-generated children, which are
+    // never on the page and so never in the map.
+    let frame = w.index.get(obj.id()).copied().or_else(|| obj.frame());
     match obj {
-        Object::Text(t) => emit_text(w, t, obj.frame()),
-        Object::Shape(sh) => emit_shape(w, sh, obj.frame()),
+        Object::Text(t) => emit_text(w, t, frame),
+        Object::Shape(sh) => emit_shape(w, sh, frame),
         Object::Connector(c) => emit_connector(w, c),
-        Object::Image(img) => emit_image(w, img),
-        Object::Group(g) => emit_group(w, g, obj.frame()),
-        Object::Chart(c) => emit_chart(w, c, obj.frame()),
-        Object::Diagram(d) => emit_diagram(w, d, obj.frame()),
+        Object::Image(img) => emit_image(w, img, frame),
+        Object::Group(g) => emit_group(w, g, frame),
+        Object::Chart(c) => emit_chart(w, c, frame),
+        Object::Diagram(d) => emit_diagram(w, d, frame),
         Object::PanelLabel(o) => {
             let (children, problems) = o.expand(w.theme, w.fonts);
             emit_composite(w, &o.id, children, problems);
@@ -999,7 +1008,11 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
 /// not board objects and would only be report noise.
 fn emit_diagram(w: &mut SlideWriter, d: &crate::schema::DiagramObject, frame: Option<Frame>) {
     let Some(f) = frame else {
-        w.fate(&d.id, ExportTier::Raster, "skipped: no resolved position");
+        w.fate(
+            &d.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
         return;
     };
     let (children, problems) = crate::diagram::expand(d, w.theme, w.fonts);
@@ -1100,7 +1113,11 @@ fn role_of<'a>(theme: &'a Theme, name: Option<&str>) -> &'a TypeRole {
 
 fn emit_text(w: &mut SlideWriter, t: &TextObject, frame: Option<Frame>) {
     let Some(f) = frame else {
-        w.fate(&t.id, ExportTier::Raster, "skipped: no resolved position");
+        w.fate(
+            &t.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
         return;
     };
     let role = role_of(w.theme, t.role.as_deref()).clone();
@@ -1133,7 +1150,11 @@ fn emit_text(w: &mut SlideWriter, t: &TextObject, frame: Option<Frame>) {
 
 fn emit_shape(w: &mut SlideWriter, sh: &ShapeObject, frame: Option<Frame>) {
     let Some(f) = frame else {
-        w.fate(&sh.id, ExportTier::Raster, "skipped: no resolved position");
+        w.fate(
+            &sh.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
         return;
     };
     let mut tier = ExportTier::Native;
@@ -1390,9 +1411,18 @@ fn placeholder_sp(w: &mut SlideWriter, name: &str, alt: Option<&str>, f: Frame) 
     );
 }
 
-fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
-    let Some(at) = img.at else {
-        w.fate(&img.id, ExportTier::Raster, "skipped: no resolved position");
+fn emit_image(w: &mut SlideWriter, img: &ImageObject, frame: Option<Frame>) {
+    // Geometry precedence: the resolved frame (slot- or anchor-placed, or
+    // explicit at+size — the map encodes it) wins; a bare `at` without a
+    // `size` is not in the map and keeps the intrinsic-dimension fallback.
+    let at = frame.map(|f| [f.x, f.y]).or(img.at);
+    let size_hint = frame.map(|f| [f.w, f.h]).or(img.size);
+    let Some(at) = at else {
+        w.fate(
+            &img.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
         return;
     };
     let fallback_frame = |size: Option<[f64; 2]>| Frame {
@@ -1401,10 +1431,16 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
         w: size.map(|s| s[0]).unwrap_or(100.0),
         h: size.map(|s| s[1]).unwrap_or(75.0),
     };
-    let bytes = match std::fs::read(&img.src) {
+    // Relative srcs resolve against the workspace root, matching the
+    // renderer; absolute paths and workspace-less callers read as given.
+    let src_path = match (&w.workspace, std::path::Path::new(&img.src).is_relative()) {
+        (Some(ws), true) => ws.join(&img.src),
+        _ => std::path::PathBuf::from(&img.src),
+    };
+    let bytes = match std::fs::read(&src_path) {
         Ok(b) => b,
         Err(_) => {
-            placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(img.size));
+            placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(size_hint));
             w.fate(
                 &img.id,
                 ExportTier::Raster,
@@ -1417,11 +1453,11 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
         ImgKind::Png => (png_dimensions(&bytes), "png"),
         ImgKind::Jpeg => (jpeg_dimensions(&bytes), "jpeg"),
         ImgKind::Svg => {
-            emit_image_svg(w, img, at, &bytes);
+            emit_image_svg(w, img, at, size_hint, &bytes);
             return;
         }
         ImgKind::Unknown => {
-            placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(img.size));
+            placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(size_hint));
             w.fate(
                 &img.id,
                 ExportTier::Raster,
@@ -1432,9 +1468,7 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
     };
     // Missing size falls back to the intrinsic pixel size at 96 dpi (px ×
     // 0.75 pt), the CSS convention the rest of the world already assumes.
-    let size = img
-        .size
-        .or_else(|| dims.map(|(pw, ph)| [pw as f64 * 0.75, ph as f64 * 0.75]));
+    let size = size_hint.or_else(|| dims.map(|(pw, ph)| [pw as f64 * 0.75, ph as f64 * 0.75]));
     let Some(size) = size else {
         placeholder_sp(w, &img.id, img.alt.as_deref(), fallback_frame(None));
         w.fate(
@@ -1482,12 +1516,18 @@ fn emit_image(w: &mut SlideWriter, img: &ImageObject) {
 /// the progressive enhancement from the plan. The SVG that lands in the
 /// package is the usvg round-trip, never the raw file: an imported figure is
 /// untrusted markup and the sanitize pass is what strips anything script-ish.
-fn emit_image_svg(w: &mut SlideWriter, img: &ImageObject, at: [f64; 2], bytes: &[u8]) {
+fn emit_image_svg(
+    w: &mut SlideWriter,
+    img: &ImageObject,
+    at: [f64; 2],
+    size_hint: Option<[f64; 2]>,
+    bytes: &[u8],
+) {
     let fallback = Frame {
         x: at[0],
         y: at[1],
-        w: img.size.map(|s| s[0]).unwrap_or(100.0),
-        h: img.size.map(|s| s[1]).unwrap_or(75.0),
+        w: size_hint.map(|s| s[0]).unwrap_or(100.0),
+        h: size_hint.map(|s| s[1]).unwrap_or(75.0),
     };
     let degrade = |w: &mut SlideWriter, reason: String| {
         placeholder_sp(w, &img.id, img.alt.as_deref(), fallback);
@@ -1518,7 +1558,7 @@ fn emit_image_svg(w: &mut SlideWriter, img: &ImageObject, at: [f64; 2], bytes: &
     };
     // Missing size falls back to the document's own units at 96 dpi (unit ×
     // 0.75 pt), matching the raster path's convention.
-    let size = img.size.unwrap_or([san.width * 0.75, san.height * 0.75]);
+    let size = size_hint.unwrap_or([san.width * 0.75, san.height * 0.75]);
     let f = Frame {
         x: at[0],
         y: at[1],
@@ -1619,14 +1659,29 @@ fn emit_group(w: &mut SlideWriter, g: &GroupObject, frame: Option<Frame>) {
 /// later, deterministic optimization (§11).
 fn emit_chart(w: &mut SlideWriter, c: &ChartObject, frame: Option<Frame>) {
     let Some(f) = frame else {
-        w.fate(&c.id, ExportTier::Raster, "skipped: no resolved position");
+        w.fate(
+            &c.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
         return;
     };
-    let scene = crate::chart::build(c, f, w.theme, w.fonts);
+    // Source-bound rows resolve against the same workspace the renderer
+    // uses — without this, a CSV-bound chart exports as empty axes with a
+    // fate line that reads like success.
+    let (loaded, src_problems) = crate::chart::resolve_rows(c, w.workspace.as_deref());
+    let scene = match loaded.as_deref() {
+        Some(rows) => crate::chart::build_with_rows(c, Some(rows), f, w.theme, w.fonts),
+        None => crate::chart::build(c, f, w.theme, w.fonts),
+    };
     let mut reason =
         String::from("chart exports as grouped shapes; native c:chart is a later optimization");
-    if !scene.problems.is_empty() {
-        let _ = write!(reason, " ({})", scene.problems.join("; "));
+    let problems: Vec<String> = src_problems
+        .into_iter()
+        .chain(scene.problems.iter().cloned())
+        .collect();
+    if !problems.is_empty() {
+        let _ = write!(reason, " ({})", problems.join("; "));
     }
     if scene.items.is_empty() {
         w.fate(&c.id, ExportTier::Grouped, reason);
@@ -2082,6 +2137,7 @@ pub fn write_pptx(
     board: &Board,
     theme: &Theme,
     fonts: &FontStack,
+    workspace: Option<&std::path::Path>,
     out: &mut impl std::io::Write,
 ) -> Result<ExportReport> {
     let mut shared = Shared {
@@ -2094,7 +2150,15 @@ pub fn write_pptx(
     // Build every slide first: media, fates and content types accumulate.
     let mut slides: Vec<(String, Vec<Rel>)> = Vec::new();
     for (i, page) in board.pages.iter().enumerate() {
-        slides.push(build_slide(page, i + 1, theme, fonts, &mut shared));
+        slides.push(build_slide(
+            board,
+            page,
+            i + 1,
+            theme,
+            fonts,
+            workspace,
+            &mut shared,
+        ));
     }
     let notes: Vec<Option<&str>> = board.pages.iter().map(|p| p.notes.as_deref()).collect();
     let any_notes = notes.iter().any(Option::is_some);
@@ -2394,17 +2458,23 @@ pub fn write_pptx(
 }
 
 fn build_slide(
+    board: &Board,
     page: &Page,
     slide_no: usize,
     theme: &Theme,
     fonts: &FontStack,
+    workspace: Option<&std::path::Path>,
     shared: &mut Shared,
 ) -> (String, Vec<Rel>) {
-    let index = crate::normalize::index_page(page);
+    // Slot and anchor resolution — the same single geometry truth the
+    // renderer draws from. Slot-placed objects live only in this map (they
+    // carry no at/size of their own), and connector endpoints bind to it.
+    let index = crate::slots::resolve_page_frames(board, page, theme, Some(fonts));
     let mut w = SlideWriter {
         theme,
         fonts,
         page,
+        workspace: workspace.map(|p| p.to_path_buf()),
         index,
         xml: String::new(),
         rels: Vec::new(),
@@ -2471,7 +2541,7 @@ mod tests {
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
         let mut out = Vec::new();
-        let report = write_pptx(b, &theme, &fonts, &mut out).unwrap();
+        let report = write_pptx(b, &theme, &fonts, None, &mut out).unwrap();
         (out, report)
     }
 
@@ -2765,6 +2835,68 @@ mod tests {
         assert!(fate("missing-figure").reason.contains("not found"));
         assert!(fate("mystery").reason.starts_with("skipped:"));
         assert!(fate("deck-title").reason.contains("placeholder"));
+    }
+
+    #[test]
+    fn slot_placed_objects_export_at_their_resolved_frames() {
+        // No explicit at/size anywhere: every frame comes from the "two-up"
+        // layout through slots::resolve_page_frames — the regression here is
+        // a slide that opens with zero shapes while the report says native.
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","layout":"two-up","objects":[
+                  {"id":"slot-title","type":"text","role":"title","slot":"title",
+                   "text":["Slots place this title"]},
+                  {"id":"bench","type":"chart","slot":"body-left",
+                   "data":{"origin":"command","values":[{"f":"a","v":1},{"f":"b","v":2}]},
+                   "x":{"field":"f","type":"nominal"},
+                   "y":{"field":"v","type":"quantitative"},
+                   "marks":[{"mark":"bar"}]},
+                  {"id":"panel","type":"shape","geo":"rect","slot":"body-right","fill":"@surface"},
+                  {"id":"tie","type":"connector","geo":"straight",
+                   "from":{"object":"panel","side":"left"},
+                   "to":{"object":"bench","side":"right"}},
+                  {"id":"lost","type":"text","slot":"left-rail","text":["never lands"]}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        // The title round-trips as real text, and the slide has real shapes.
+        assert!(slide.contains("Slots place this title"), "{slide}");
+        assert!(slide.matches("<p:sp>").count() >= 2, "{slide}");
+        // Talk-dark spacing (margin [64,72,64,72], gap 24) puts two-up's
+        // title band at (72, 64) and body-left at (72, 152): the exported
+        // xfrms sit exactly on the resolved frames.
+        assert!(
+            slide.contains(r#"<a:off x="914400" y="812800"/>"#),
+            "title frame: {slide}"
+        );
+        assert!(
+            slide.contains(r#"<a:chOff x="914400" y="1930400"/>"#),
+            "chart frame: {slide}"
+        );
+        // The connector binds to the resolved frame edges: panel's left edge
+        // (492, 314) to the chart's right edge (468, 314), so its own xfrm
+        // is off=(468, 314) EMU with flipH (and the honest 1-EMU height).
+        assert!(slide.contains("<p:cxnSp>"), "{slide}");
+        assert!(
+            slide.contains(r#"<a:xfrm flipH="1"><a:off x="5943600" y="3987800"/><a:ext cx="304800" cy="1"/></a:xfrm>"#),
+            "connector xfrm: {slide}"
+        );
+        // Fates: placed objects are native/grouped; the dangling slot is
+        // honest about why nothing landed.
+        let fate = |id: &str| report.objects.iter().find(|f| f.id == id).unwrap();
+        assert_eq!(fate("slot-title").tier, ExportTier::Native);
+        assert_eq!(fate("bench").tier, ExportTier::Grouped);
+        assert_eq!(fate("tie").tier, ExportTier::Native);
+        assert!(
+            fate("lost")
+                .reason
+                .contains("no geometry (slot unresolved)"),
+            "{:?}",
+            fate("lost").reason
+        );
+        assert!(!slide.contains("never lands"), "{slide}");
     }
 
     #[test]
