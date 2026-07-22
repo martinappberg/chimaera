@@ -19,9 +19,8 @@
  * right-click menu every link surface shares.
  */
 
-import { openExternal } from "../net/native";
+import { openExternal, writeClipboard } from "../net/native";
 import type { ContextMenuEntry } from "./contextMenu.svelte";
-import { writeClipboard } from "../net/native";
 
 /** A proxyable target: what the browser pane needs to open it. */
 export interface UrlTarget {

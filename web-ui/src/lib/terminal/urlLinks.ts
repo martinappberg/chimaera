@@ -55,6 +55,17 @@ export function extractUrls(text: string): UrlCandidate[] {
 }
 
 class UrlLinkProvider implements ILinkProvider {
+  /**
+   * The URL under the pointer, so the element-level contextmenu listener knows
+   * which link was right-clicked (xterm exposes no contextmenu hook on a link).
+   * PER PROVIDER — one instance per pooled terminal, and up to POOL_CAP of them
+   * are alive at once; module-level state here would let a hover in one
+   * terminal answer a right-click in another.
+   */
+  hovered: string | null = null;
+  /** Identity of the candidate that set `hovered` (see the hover/leave pair). */
+  private hoverToken: UrlCandidate | null = null;
+
   constructor(
     private readonly term: Terminal,
     private readonly sessionId: string,
@@ -82,12 +93,20 @@ class UrlLinkProvider implements ILinkProvider {
         },
         // xterm exposes no contextmenu hook on a link, but right-clicking one
         // means the pointer is already over it — so remember what's hovered
-        // and let the element-level listener below use it.
+        // and let the element-level listener below use it. The guard keys on
+        // the CANDIDATE OBJECT, not its text: the same URL can appear twice on
+        // screen, and xterm may fire the next link's `hover` before the
+        // previous one's `leave` — matching on text would then clear the live
+        // hover and leave the menu pointing at nothing.
         hover: () => {
-          hovered = c.raw;
+          this.hovered = c.raw;
+          this.hoverToken = c;
         },
         leave: () => {
-          if (hovered === c.raw) hovered = null;
+          if (this.hoverToken === c) {
+            this.hovered = null;
+            this.hoverToken = null;
+          }
         },
       });
     }
@@ -95,20 +114,21 @@ class UrlLinkProvider implements ILinkProvider {
   }
 }
 
-/** The URL under the pointer, tracked via the provider's hover/leave. */
-let hovered: string | null = null;
-
 /** Wire proxyable-URL links into a pooled terminal. Returns dispose. */
 export function registerUrlLinks(term: Terminal, sessionId: string, host: UrlLinkHost): () => void {
-  const provider = term.registerLinkProvider(new UrlLinkProvider(term, sessionId, host));
+  const linkProvider = new UrlLinkProvider(term, sessionId, host);
+  const provider = term.registerLinkProvider(linkProvider);
   const onContextMenu = (e: MouseEvent) => {
-    const url = hovered;
+    const url = linkProvider.hovered;
     if (url === null) return; // not on a link: leave the terminal's own menu
     host.menu(e, url);
   };
-  term.element?.addEventListener("contextmenu", onContextMenu);
+  // Hold the element we attached to: dispose must detach from the SAME node
+  // even if the terminal is re-parented between panes.
+  const el = term.element ?? null;
+  el?.addEventListener("contextmenu", onContextMenu);
   return () => {
-    term.element?.removeEventListener("contextmenu", onContextMenu);
+    el?.removeEventListener("contextmenu", onContextMenu);
     provider.dispose();
   };
 }

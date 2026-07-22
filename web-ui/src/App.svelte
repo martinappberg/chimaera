@@ -891,15 +891,9 @@
     // Every rendered link surface (chat prose, markdown previews, terminal
     // output) resolves a proxyable URL to a browser pane through here; App is
     // the only owner of the layout.
-    setUrlPaneOpener((target, newSplit) => {
-      const fromPane = layout.focusedPaneId;
-      if (newSplit) {
-        layout = splitPane(layout, fromPane, "row");
-        layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
-      } else {
-        layout = openBrowser(layout, target.host, target.port, target.path);
-      }
-    });
+    setUrlPaneOpener((target, newSplit) =>
+      openBrowserFromPane(layout.focusedPaneId, target, newSplit),
+    );
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
@@ -1418,18 +1412,29 @@
    * Jupyter's printed URL twice lands where you already are — while Cmd/Ctrl
    * forces a fresh split beside the terminal.
    */
-  function onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void {
-    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
-    const fromPane = loc?.paneId ?? layout.focusedPaneId;
+  /**
+   * Open a proxyable URL as a browser pane FROM `fromPane`: reuse an existing
+   * pane on the same host:port (clicking Jupyter's printed URL twice lands
+   * where you already are), or split beside when Cmd/Ctrl is held — the same
+   * grammar file links follow. Every link surface routes through here.
+   */
+  function openBrowserFromPane(paneId: string, target: UrlTarget, newSplit: boolean): void {
     if (newSplit) {
-      layout = splitPane(layout, fromPane, "row");
+      layout = splitPane(layout, paneId, "row");
       layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
     } else {
-      layout = openBrowser(focusPane(layout, fromPane), target.host, target.port, target.path);
+      layout = openBrowser(focusPane(layout, paneId), target.host, target.port, target.path);
     }
-    // The browser surface took focus: pull DOM focus off the terminal so
+    // The browser surface took focus: pull DOM focus off whatever had it so
     // plain keys stop reaching a PTY that is no longer the focused view.
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** A proxyable URL link activated from a TERMINAL: anchor the open on the
+   *  pane showing that session, not merely the focused one. */
+  function onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void {
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    openBrowserFromPane(loc?.paneId ?? layout.focusedPaneId, target, newSplit);
   }
 
   /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */

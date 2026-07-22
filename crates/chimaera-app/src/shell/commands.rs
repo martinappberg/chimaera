@@ -890,6 +890,12 @@ pub(super) fn write_clipboard(app: AppHandle, text: String) -> Result<(), String
 /// where the rule is enforced once for every caller.
 #[tauri::command]
 pub(super) fn open_external(url: String) -> Result<(), String> {
+    // The href is agent-authored; cap it before it becomes a process argument
+    // (an oversized argv fails with E2BIG deep in the platform opener).
+    const MAX_URL_BYTES: usize = 8 * 1024;
+    if url.len() > MAX_URL_BYTES {
+        return Err("URL is too long to open".to_string());
+    }
     let parsed = tauri::Url::parse(&url).map_err(|_| "not a URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("refusing to open a {} URL", parsed.scheme()));

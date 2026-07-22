@@ -117,6 +117,10 @@
     if (anchor === null || anchor === undefined) return;
     // Same-document anchors (a heading TOC) keep their native behavior.
     if (href.startsWith("#")) return;
+    // `mailto:`/`tel:` are the browser's to handle — the OS knows what to do
+    // with them and swallowing the click would just make the link look dead.
+    // They cannot navigate the workbench away, so letting them through is safe.
+    if (/^(mailto|tel):/i.test(href)) return;
     e.preventDefault();
     if (isWebUrl(href)) activateUrl(href, e.metaKey || e.ctrlKey);
     // A relative/in-repo href resolves against no meaningful base here, so it
