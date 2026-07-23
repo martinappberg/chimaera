@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, assets, chat, compute, compute_jobs, download, environment, fs, git, launcher,
-    links, mcp, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    agents, api, chat, compute, compute_jobs, download, environment, fs, git, launcher, links, mcp,
+    proxy, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -121,6 +121,11 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
                 .delete(git::remove_worktree),
         )
         .route("/fs/ticket", post(fs::create_ticket))
+        // Browser-pane proxy sessions: mint/list/revoke (+ the pane's
+        // keep-alive health probe). The data plane rides /proxy below.
+        .route("/proxy", get(proxy::list_proxies).post(proxy::create_proxy))
+        .route("/proxy/{id}", delete(proxy::delete_proxy))
+        .route("/proxy/{id}/health", get(proxy::proxy_health))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random
@@ -138,17 +143,29 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
     // the bearer-authed POST /api/v1/fs/ticket) authorizes each fetch instead.
     // /download/{ticket} rides the same ticket story: an <a href> download
     // navigation cannot send headers either.
+    // /proxy/{id} is unauthenticated like /raw: iframes cannot send bearer
+    // headers, so the unguessable minted id (pinned to one host:port) is the
+    // capability. `any()` — a proxied app uses every method.
     let ws = Router::new()
         .route("/ws/sessions/{id}", get(ws::session_ws))
         .route("/ws/chat/{id}", get(ws::chat_ws))
         .route("/ws/events", get(ws::events_ws))
         .route("/raw/{ticket}", get(fs::raw))
         .route("/download/{ticket}", get(download::download))
-        .with_state(state);
+        // Three spellings because `{*path}` refuses an EMPTY tail: the bare
+        // form redirects to the slashed form, the slashed form IS the app's
+        // root document, and the wildcard carries everything deeper.
+        .route("/proxy/{id}", axum::routing::any(proxy::data_plane))
+        .route("/proxy/{id}/", axum::routing::any(proxy::data_plane))
+        .route("/proxy/{id}/{*path}", axum::routing::any(proxy::data_plane))
+        .with_state(state.clone());
 
     Router::new()
         .nest("/api/v1", api)
         .merge(ws)
-        .fallback(assets::static_handler)
+        // The fallback serves embedded UI assets, rescues absolute-path
+        // requests from proxied apps (cookie/Referer), and applies the SPA
+        // index.html rules — see proxy::fallback.
+        .fallback_service(axum::routing::any(proxy::fallback).with_state(state))
         .layer(TraceLayer::new_for_http())
 }

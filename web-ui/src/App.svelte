@@ -118,6 +118,11 @@
     findFinder,
     freshFinderTab,
     setFinderPath,
+    openBrowser,
+    openTab,
+    freshBrowserTab,
+    setBrowserPath,
+    setBrowserTarget,
     openDashboard,
     openGit,
     openSession,
@@ -142,6 +147,8 @@
     type Tab,
   } from "./lib/layout/layout";
   import type { PathKind } from "./lib/terminal/links";
+  import type { UrlTarget } from "./lib/terminal/urlLinks";
+  import { setUrlPaneOpener, urlMenuEntries } from "./lib/shared/urlOpen";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
   import { dirtyFiles } from "./lib/shared/editing";
   import {
@@ -855,6 +862,12 @@
     chatPool.syncChatSessions(new Set(ids));
   });
 
+  // Proxy sessions are NOT revoked on tab close: mint is idempotent per
+  // host:port, so a second window onto the same app shares the id, and a
+  // client-side sweep would DELETE it out from under that window (its iframe
+  // then gets expired responses until it re-mints). The daemon's idle TTL is
+  // the reaper — a mounted pane's health ping keeps its own session alive; a
+  // closed one just stops refreshing. See browser/proxy.ts::revokeProxy.
   onMount(() => {
     pool.initPool({
       onTitle,
@@ -864,7 +877,15 @@
       onPaste: onTermPaste,
       linkContext,
       onOpenPath,
+      onOpenUrl,
+      onUrlMenu: (event, url) => contextMenu.openAt(event, urlMenuEntries(url)),
     });
+    // Every rendered link surface (chat prose, markdown previews, terminal
+    // output) resolves a proxyable URL to a browser pane through here; App is
+    // the only owner of the layout.
+    setUrlPaneOpener((target, newSplit) =>
+      openBrowserFromPane(layout.focusedPaneId, target, newSplit),
+    );
     setReferenceHandler(referenceSelection);
     setUploadPathInserter(insertUploadedPath);
     // OS-desktop file drags: window-level so the navigate-away default is
@@ -1377,6 +1398,42 @@
     };
   }
 
+  /**
+   * A proxyable URL link was activated (the browser pane's front door). An
+   * existing pane on the same host:port target is focused — clicking
+   * Jupyter's printed URL twice lands where you already are — while Cmd/Ctrl
+   * forces a fresh split beside the terminal.
+   */
+  /**
+   * Open a proxyable URL as a browser pane FROM `fromPane`: reuse an existing
+   * pane on the same host:port (clicking Jupyter's printed URL twice lands
+   * where you already are), or split beside when Cmd/Ctrl is held — the same
+   * grammar file links follow. Every link surface routes through here.
+   */
+  function openBrowserFromPane(paneId: string, target: UrlTarget, newSplit: boolean): void {
+    if (newSplit) {
+      layout = splitPane(layout, paneId, "row");
+      layout = openTab(layout, freshBrowserTab(target.host, target.port, target.path));
+    } else {
+      layout = openBrowser(focusPane(layout, paneId), target.host, target.port, target.path);
+    }
+    // The browser surface took focus: pull DOM focus off whatever had it so
+    // plain keys stop reaching a PTY that is no longer the focused view.
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** A proxyable URL link activated from a TERMINAL: anchor the open on the
+   *  pane showing that session, not merely the focused one. */
+  function onOpenUrl(id: string, target: UrlTarget, newSplit: boolean): void {
+    const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
+    openBrowserFromPane(loc?.paneId ?? layout.focusedPaneId, target, newSplit);
+  }
+
+  /** The Mod2+B chord / a manual open: a blank browser pane (address entry). */
+  function newBrowserSurface(): void {
+    layout = openTab(layout, freshBrowserTab("", 0, "/"));
+  }
+
   /** A confirmed terminal path link was activated. */
   function onOpenPath(id: string, path: string, kind: PathKind, newSplit: boolean): void {
     const loc = paneForTab(layout.root, { surface: "terminal", sessionId: id });
@@ -1711,6 +1768,10 @@
         // persisted default agent, or install it when it's missing.
         intercept();
         newAgentPrimary();
+        return;
+      case "newBrowser":
+        intercept();
+        newBrowserSurface();
         return;
       case "splitRight":
         intercept();
@@ -2628,6 +2689,12 @@
     },
     navigateFinder(id, path) {
       layout = setFinderPath(layout, id, path);
+    },
+    navigateBrowser(id, path) {
+      layout = setBrowserPath(layout, id, path);
+    },
+    retargetBrowser(id, host, port, path) {
+      layout = setBrowserTarget(layout, id, host, port, path);
     },
     openDiffFrom(paneId, path, mode, newSplit) {
       openDiffFromPane(paneId, path, mode, newSplit);

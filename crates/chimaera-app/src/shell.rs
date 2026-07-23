@@ -555,6 +555,7 @@ pub fn run() {
             commands::begin_update,
             commands::shell_build,
             commands::write_clipboard,
+            commands::open_external,
             commands::set_caffeinate,
             commands::caffeinate_state,
             commands::answer_askpass,

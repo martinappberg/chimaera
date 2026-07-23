@@ -77,7 +77,11 @@ pipe), `POST /api/v1/sessions` (spawn), `POST /api/v1/sessions/{id}/exec`,
   the terminal. Cmd/Ctrl+click forces a new split. A trailing `:42` line suffix is carried.
 - **Where it lives.** `web-ui/src/lib/terminal/links.ts` (`PathLinkProvider`), validation via
   `POST /api/v1/fs/validate` (`fsValidate` in `web-ui/src/lib/previews/files.ts`).
-- **Key behaviors.** **URLs are deliberately *not* linkified** (no `web-links` addon loaded).
+- **Key behaviors.** **Arbitrary web URLs are still deliberately *not* linkified** (no
+  `web-links` addon loaded) — only *proxyable* ones are, by a separate provider
+  (`urlLinks.ts`): loopback hosts, or any host with an explicit port, i.e. the address a
+  local web app prints. `https://github.com/…` stays plain text. See
+  [browser-pane.md](browser-pane.md).
   Bare single-segment names (`crates`, `justfile`) link only on hover and only on a line shape
   prose never has (a full `ls`/`ls -l` line) — because the daemon runs on shared login nodes and
   prose must never be mass-validated. Verdicts cached 15s; requests batched + deduped; a

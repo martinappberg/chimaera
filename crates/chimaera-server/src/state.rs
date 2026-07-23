@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
-    agent_updates, agents, chat, compute, environment, fs, git, launcher, ledger, quickopen,
+    agent_updates, agents, chat, compute, environment, fs, git, launcher, ledger, proxy, quickopen,
     recents, settings, update, view_state, workspaces,
 };
 
@@ -100,6 +100,9 @@ pub(crate) struct AppState {
     pub(crate) links: Mutex<HashMap<String, String>>,
     /// Short-lived raw-access tickets for /raw/{ticket} (in-memory only).
     pub(crate) tickets: Mutex<fs::TicketStore>,
+    /// Browser-pane proxy sessions (/proxy/{id} targets; in-memory only —
+    /// panes re-mint transparently after a restart). See `proxy`.
+    pub(crate) proxies: Mutex<proxy::ProxyStore>,
     /// Quick-open walk cache (short TTL, per workspace).
     pub(crate) quickopen: Mutex<quickopen::QuickOpenCache>,
     /// Read-only git service (status/diff): discovery cache, per-workspace nudge
@@ -215,6 +218,7 @@ impl AppState {
             exec_status: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             tickets: Mutex::new(fs::TicketStore::default()),
+            proxies: Mutex::new(proxy::ProxyStore::default()),
             quickopen: Mutex::new(quickopen::QuickOpenCache::default()),
             git: git::GitService::new(),
             compute: compute::ComputeService::new(),

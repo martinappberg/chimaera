@@ -305,7 +305,7 @@ async function validateAll(candidates: Candidate[], ctx: LinkContext): Promise<v
 
 // --- buffer text mapping --------------------------------------------------------
 
-interface GroupText {
+export interface GroupText {
   text: string;
   /** cell x (0-based) for each string index. */
   cellOf: number[];
@@ -317,8 +317,12 @@ interface GroupText {
  * Join the wrapped-line group containing 0-based buffer row `row` into one
  * string, with an exact string-index → (row, cell) mapping (wide chars and
  * combined graphemes shift string indexes; the map absorbs that).
+ * Shared with the URL link provider (`urlLinks.ts`).
  */
-function groupText(term: Terminal, row: number): { start: number; end: number; g: GroupText } | null {
+export function groupText(
+  term: Terminal,
+  row: number,
+): { start: number; end: number; g: GroupText } | null {
   const buf = term.buffer.active;
   if (row < 0 || row >= buf.length) return null;
   let start = row;

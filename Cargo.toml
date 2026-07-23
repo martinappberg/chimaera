@@ -21,6 +21,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
+# The browser-pane reverse proxy's client half (both already in axum's own
+# dependency graph — no new packages, just direct edges for the client API).
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tower-http = { version = "0.7", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

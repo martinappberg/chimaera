@@ -19,6 +19,7 @@ mod links;
 mod mcp;
 mod naming;
 mod persist;
+mod proxy;
 mod quickopen;
 mod recents;
 mod router;

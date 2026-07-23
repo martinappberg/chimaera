@@ -112,6 +112,11 @@ export interface LayoutCtrl {
   openChangesFrom(paneId: string, sessionId: string, newSplit: boolean): void;
   /** Persist a Finder instance's current directory (its navigation state). */
   navigateFinder(id: string, path: string): void;
+  /** Persist a browser instance's current in-app path (navigation state). */
+  navigateBrowser(id: string, path: string): void;
+  /** Re-point a browser instance at a different host:port target (the
+   *  address bar named one, or the blank tab got its first address). */
+  retargetBrowser(id: string, host: string, port: number, path: string): void;
   /**
    * Open a side-by-side diff surfaced FROM `paneId` (a changes-panel row):
    * lands in the adjacent pane, or a fresh split when the window has one pane /

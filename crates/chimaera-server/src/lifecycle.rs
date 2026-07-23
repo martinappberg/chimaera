@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use tokio::net::TcpListener;
 
-use crate::{agent_updates, git, ledger, recents, runtimes, update};
+use crate::{agent_updates, git, ledger, proxy, recents, runtimes, update};
 use crate::{app, lock, AppState, ServerConfig};
 
 /// Bind on 127.0.0.1, write the manifest, and serve until SIGINT/SIGTERM.
@@ -106,6 +106,9 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(update::run_checker(state.clone()));
     tokio::spawn(agent_updates::run_checker(state.clone()));
 
+    // Idle sweep for browser-pane proxy sessions (kills their relay children).
+    tokio::spawn(proxy::sweeper(state.clone()));
+
     // Uploads left by sessions that ended while no daemon was watching
     // (crashes, unclean stops) — swept once restore has decided which
     // sessions still exist.
@@ -128,6 +131,10 @@ pub async fn run(cfg: ServerConfig) -> anyhow::Result<()> {
     // the reconciler's next snapshot would drop them and they'd never resurrect.
     let (entries, links) = ledger::snapshot(&state);
     lock(&state.ledger).write_if_changed(&entries, &links);
+
+    // A relay child (`ssh -N -L`) outlives its parent unless killed — never
+    // strand one on a login node.
+    proxy::shutdown_relays(&state);
 
     // Dead-but-visible chats (a ProtocolError entry the ChatManager keeps in
     // the registry with alive=false) are excluded from the snapshot above, so

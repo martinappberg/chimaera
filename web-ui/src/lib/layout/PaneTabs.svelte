@@ -31,6 +31,7 @@
   import { dismiss } from "../shared/dismiss";
   import FileIcon from "../shared/FileIcon.svelte";
   import FolderIcon from "../shared/FolderIcon.svelte";
+  import { browserTitles, targetLabel } from "../browser/proxy";
 
   interface Props {
     node: PaneNode;
@@ -192,6 +193,10 @@
       const n = names.get(tab.sessionId) ?? sessions.get(tab.sessionId)?.name;
       return n !== undefined ? `Changes · ${n}` : "Changes";
     }
+    if (tab.surface === "browser") {
+      // The live page title (Jupyter renames it per notebook), else the target.
+      return $browserTitles.get(tab.id) ?? targetLabel(tab.host, tab.port);
+    }
     return fileNames.get(tab.path) ?? basename(tab.path);
   }
 
@@ -340,6 +345,21 @@
     if (tab.surface === "terminal") {
       return [{ label: "Rename…", onSelect: () => beginTabRename(tab) }, "separator", close];
     }
+    if (tab.surface === "browser") {
+      return [
+        ...(tab.host !== ""
+          ? [
+              {
+                label: "Copy Address",
+                onSelect: () =>
+                  void copyPath(`http://${targetLabel(tab.host, tab.port)}${tab.path}`),
+              } as ContextMenuEntry,
+              "separator" as const,
+            ]
+          : []),
+        close,
+      ];
+    }
     if (tab.surface === "file") {
       const dirty = $dirtyFiles.has(tab.path);
       return [
@@ -404,7 +424,9 @@
         data-tab-index={i}
         title={tab.surface === "file" || tab.surface === "finder" || tab.surface === "diff"
           ? tab.path
-          : label(tab)}
+          : tab.surface === "browser" && tab.host !== ""
+            ? `${targetLabel(tab.host, tab.port)}${tab.path}`
+            : label(tab)}
         onpointerdowncapture={(e) => {
           // Capture-phase (directly attached, not delegated); ignore presses
           // on the close button and the rename input so they stay plain
@@ -507,6 +529,13 @@
               stroke-width="1.4"
               stroke-linejoin="round"
             />
+          </svg>
+        {:else if tab.surface === "browser"}
+          <svg class="glyph" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <title>browser</title>
+            <circle cx="8" cy="8" r="5.7" fill="none" stroke="currentColor" stroke-width="1.3" />
+            <ellipse cx="8" cy="8" rx="2.5" ry="5.7" fill="none" stroke="currentColor" stroke-width="1.1" />
+            <path d="M2.6 6h10.8M2.6 10h10.8" fill="none" stroke="currentColor" stroke-width="1.1" />
           </svg>
         {:else if $dirtyFiles.has(tab.path)}
           <!-- Dirty dot replaces the type glyph in its slot (unsaved edits). -->

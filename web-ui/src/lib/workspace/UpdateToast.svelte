@@ -16,6 +16,7 @@
   import type { UpdateOffer } from "./update.svelte";
   import { snoozeUpdate, skipUpdateVersion } from "./update.svelte";
   import { beginUpdate, connectHost, updateLocalDaemon } from "../net/native";
+  import { openInSystemBrowser } from "../shared/urlOpen";
 
   let { offer }: { offer: UpdateOffer } = $props();
 
@@ -113,7 +114,18 @@
       </button>
     {/if}
     {#if offer.kind === "release" && offer.url !== null}
-      <a class="notes" href={offer.url} target="_blank" rel="noreferrer">release notes</a>
+      <!-- Through the shell: in the app a _blank navigation is swallowed by
+           the window's origin guard. -->
+      <a
+        class="notes"
+        href={offer.url}
+        target="_blank"
+        rel="noreferrer"
+        onclick={(e) => {
+          e.preventDefault();
+          openInSystemBrowser(offer.url ?? "");
+        }}>release notes</a
+      >
     {/if}
     <button class="quiet" disabled={busy} onclick={snoozeUpdate}>later</button>
     {#if skippable}

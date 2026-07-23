@@ -69,6 +69,12 @@ export default defineConfig({
       },
       // Ticketed raw file bytes (iframes/images) live outside /api.
       "/raw": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      // Ticketed downloads and the browser pane's reverse proxy (WS-capable).
+      "/download": process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+      "/proxy": {
+        target: process.env.CHIMAERA_DEV_TARGET ?? "http://127.0.0.1:9700",
+        ws: true,
+      },
     },
   },
 });

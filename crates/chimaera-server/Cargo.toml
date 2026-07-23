@@ -11,6 +11,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 axum.workspace = true
+# The browser-pane reverse proxy (`proxy.rs`) drives hyper's HTTP/1.1 client
+# half directly: per-request handshakes, streamed bodies, WS upgrades.
+hyper.workspace = true
+hyper-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 rust-embed.workspace = true

@@ -204,6 +204,28 @@ export async function writeClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * Hand a web URL to the user's real browser through the native shell.
+ *
+ * In the app there is no other route: the window's navigation guard admits
+ * only the daemon origin, and a `target="_blank"` new-window request has
+ * nothing wired to receive it — so an external link was silently swallowed
+ * (found live). Returns true when the shell took it; false in a plain browser
+ * (or on shell error, e.g. a refused non-http scheme) so the caller can fall
+ * back to `window.open`. The shell re-validates the scheme regardless of what
+ * we send.
+ */
+export async function openExternal(url: string): Promise<boolean> {
+  const t = tauri();
+  if (t === null) return false;
+  try {
+    await t.core.invoke<void>("open_external", { url });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Arm/disarm the "caffeinate" power assertion on the local app host — while on,
  * the machine won't idle/display/system-sleep (incl. lid-closed on macOS, but
  * only on AC power). Global to the app; the change broadcasts (see

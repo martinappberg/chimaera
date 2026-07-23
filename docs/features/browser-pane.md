@@ -1,0 +1,200 @@
+# Browser pane (reverse-proxied web apps)
+
+Live web apps — Jupyter, marimo, Streamlit, RStudio — as first-class workbench panes.
+The daemon carries a ticketed reverse proxy, so an app listening on `localhost` **on the
+daemon's host** (a laptop, a dev server, an HPC login node) renders in an iframe pane
+through the same origin and tunnel as the rest of the workbench: remote-transparent by
+construction, with a second hop to Slurm compute nodes. Click the URL Jupyter prints in
+any terminal and it opens beside your shell.
+
+**Where it lives (shared):** daemon `crates/chimaera-server/src/proxy.rs` (the whole
+proxy: registry, policy, data plane, relay hop; router rows in `router.rs`, sweeper +
+relay teardown in `lifecycle.rs`). UI `web-ui/src/lib/browser/` (`BrowserView.svelte`
+the pane, `proxy.ts` the mint/health client + title store) +
+`web-ui/src/lib/terminal/urlLinks.ts` (URL detection) + the `BrowserTab` kind in
+`layout/layout.ts`. Wire: `POST/GET /api/v1/proxy`, `DELETE /api/v1/proxy/{id}`,
+`GET /api/v1/proxy/{id}/health` (bearer-authed) and the unauthenticated ticketed data
+plane `ANY /proxy/{id}[/{*path}]`.
+
+## Proxy sessions (the ticket model)
+
+- **What & when.** A *proxy session* pins an unguessable 128-bit id to exactly one
+  `host:port` target. Minting requires the bearer token; the data plane is authorized by
+  the id alone (iframes cannot send Authorization headers — the `/raw/{ticket}` story).
+- **How it's used.** The UI mints on pane mount and re-mints whenever a session expires
+  or the daemon restarts — a `BrowserTab` persists only its TARGET, never a ticket, so
+  restarts heal invisibly. Mint is idempotent per target.
+- **Key behaviors / never-an-open-relay.**
+  - Targets are allowlisted at mint: loopback and the daemon's own hostname always
+    qualify; a node named in the user's own Slurm queue (the compute snapshot,
+    nodelists expanded) qualifies; anything else needs `confirm: true`, which the UI
+    sends only after an explicit in-pane dialog.
+  - Nothing a data-plane request carries can change where it forwards; `Host`, `Origin`,
+    and `Referer` are rewritten to the target's own authority (Jupyter rejects WS
+    handshakes whose Origin mismatches its Host, and the ticket must never leak
+    upstream in a URL). CONNECT is refused; an `x-chimaera-proxied` loop guard stops a
+    target that forwards back to the daemon.
+  - The registry is capped (32) with a 24h idle TTL; mounted panes keep-alive via the
+    health route; the UI revokes a target's session when its last tab closes.
+  - The daemon's own port is refused as a target (a same-origin loop).
+
+## The data plane (HTTP + WebSocket pass-through)
+
+- **How it works.** Per request: dial the target, `hyper` HTTP/1.1 client handshake,
+  request and response bodies **streamed both directions** (never buffered — login-node
+  RSS discipline). Hop-by-hop headers are stripped both ways. A 101 response relays
+  verbatim and both sides become a raw `copy_bidirectional` byte tunnel (fixed buffers,
+  global cap 256) — Jupyter kernels, Streamlit's `_stcore/stream`, marimo's `/ws` all
+  ride this.
+- **The absolute-path rescue.** Apps with `base_url /` (Jupyter) emit absolute
+  `/static/…`, `/api/…` URLs that escape any path prefix. Serving a proxied *document*
+  sets an HttpOnly `chimaera_proxy` cookie; requests that would otherwise fall to the
+  SPA index.html and carry a live ticket in that cookie **or** a `/proxy/{id}/` Referer
+  forward to that ticket's target with their original path. Real daemon routes always
+  match first, reserved namespaces (`/api/v1`, `/ws/`, `/raw/`, …) are never rescued,
+  the workbench shell is protected (`/` and top-level `Sec-Fetch-Dest: document`
+  navigations are never rescued — rescuing one would hand the whole UI to the app), and
+  chimaera's own embedded assets win before an app's `/assets/…` is tried. Two
+  simultaneous absolute-path apps contend only on the cookie half (WS + redirects); the
+  last document navigation owns it — reloading a pane re-claims it.
+- **Header fixups** (headers only, bodies are opaque): absolute-path `Location`
+  responses re-prefix under `/proxy/{id}`; `Referrer-Policy: same-origin` is injected
+  when absent so app pages don't leak ticket URLs to external links.
+- **Honest failure pages.** Expired sessions 404 and unreachable targets 502 with a
+  quiet theme-neutral page + an `x-chimaera-proxy` header the client reads — never a raw
+  browser error inside a pane.
+- **Routing gotcha (pinned by test):** axum's `{*path}` refuses an empty tail, so
+  `/proxy/{id}/` — the app's root document — is its own route row; without it the SPA
+  fallback serves the workbench recursively inside the pane.
+
+## The second hop (Slurm compute nodes)
+
+- **How it works.** A non-loopback target dials direct TCP first (~3s — covers
+  `--ip=$(hostname)` binds, the common cluster guidance). On failure the daemon stands
+  up its own `ssh -N -L` relay child to the node's loopback (`BatchMode` — login→node
+  ssh is hostbased on clusters like Sherlock; anything interactive fails honestly),
+  connects through it, and caches the proven route per session. Relay children are
+  owned by their registry entry: killed on revoke, idle expiry, and graceful daemon
+  shutdown (never strand an `ssh -N` on a login node). Failures surface as the pane's
+  "can't reach" state — probe-and-degrade-honestly, the compute posture.
+
+## The pane (UI)
+
+- **How it's used.** Click a proxyable URL printed in any terminal (Jupyter's
+  `?token=` URL included — path + query ride along); or `Mod2+B` opens a blank pane
+  with an address field (`localhost:8888`, `host:port/path`, a pasted URL, or a bare
+  port). The chrome is quiet: back/forward/reload, the address (editable — a different
+  `host:port` re-points the same pane), open-in-real-tab (the proxied URL, so it works
+  for remote localhost too). The tab wears the live page title (Jupyter renames per
+  notebook) over a globe glyph; states are honest overlays — connecting, confirm (for
+  non-allowlisted hosts), can't-reach with quiet auto-retry, and a non-destructive
+  "unreachable" chip when a running app stops answering.
+- **The compute-node hunt.** An app started inside an allocation prints `localhost`
+  URLs whose loopback is the *compute node's* — the daemon's own has nothing there. So
+  when a loopback target is unreachable on a Slurm host, the pane probes the same port
+  on the user's RUNNING jobs' nodes (single-node jobs, capped at 4 — already
+  allowlisted, and a hit's proven route, relay included, stays cached). Exactly one
+  answer moves the pane there with a dismissable "moved from localhost:PORT" chip in
+  the chrome; several answers become one-click node choices in the can't-reach state;
+  none stays honest silence.
+- **Key behaviors.** The pane keeps its iframe alive across tab switches (the keep-alive
+  layer model — a notebook never reloads because you glanced at a terminal); mounted
+  panes ping health every 60s (doubles as the proxy keep-alive); navigation inside the
+  app is tracked (same-origin iframe) and persisted onto the tab so reloads land where
+  you were; `openBrowser` dedupes on target so clicking Jupyter's URL twice focuses the
+  pane you already have (Cmd/Ctrl+click forces a fresh split).
+- **URL detection** (`urlLinks.ts`): pure client-side regex over rendered terminal
+  lines — zero daemon validation calls. Only proxyable URLs underline: loopback hosts,
+  or any host with an explicit port. Ordinary web URLs (`https://github.com/…`) stay
+  deliberately unlinkified — the standing terminals decision.
+
+## Links everywhere else (and the real browser)
+
+- **What & when.** One policy for every link chimaera renders — terminal output, chat
+  prose, markdown previews (both the authoritative render and the live split), the
+  launcher's docs links, the update toast. A **proxyable** URL opens in a browser pane;
+  anything else opens in the user's **real browser**.
+- **Why it needs a native command.** In the app the window's navigation guard admits
+  only the daemon origin, and nothing receives a `target="_blank"` new-window request —
+  so an external link was silently swallowed (found live). Markdown previews were worse:
+  their anchors carried no `target` at all, so a click was a *top-level* navigation that
+  would replace the whole workbench in a browser. `open_external(url)`
+  (`chimaera-app/src/shell/commands.rs`) hands the URL to the platform opener;
+  `window.open` remains the plain-browser fallback.
+- **Only http/https.** Hrefs are agent-authored and therefore untrusted, and the
+  platform opener would act on `file:`, a `.desktop`, or an application scheme — so the
+  scheme is checked client-side (`shared/urlOpen.ts`) *and* re-checked in the shell,
+  where the rule is enforced once for every caller.
+- **Where it lives.** `web-ui/src/lib/shared/urlOpen.ts` (the classifier + policy + the
+  shared right-click menu; App registers the pane opener, the same module-handler
+  pattern the reference/upload inserters use), `net/native.ts` (`openExternal`), and the
+  command + its IPC lockstep in `chimaera-app`.
+- **Key behaviors.** Click follows the default above; **Cmd/Ctrl+click** puts the pane in
+  a fresh split (matching file links); **right-click** any rendered link for *Open in
+  Chimaera* / *Open Beside* / *Open in Browser* / *Copy Link* — "Open in Chimaera"
+  appears only when the URL is actually proxyable, so the menu never offers a pane that
+  would just show "can't reach".
+
+## Key constraints
+
+- **Same-origin is deliberate, and for the real cases it costs nothing.** The proxied app
+  is served from the workbench's own origin — that is what makes Jupyter's
+  `frame-ancestors 'self'`, its cookies, and the absolute-path rescue work. It does mean
+  script in a proxied page can reach `window.parent` (the daemon token in
+  `sessionStorage`, the parent DOM). Weigh that against **what the app could already
+  do**, because the token grants code execution *as the user, on the daemon's host*:
+  - **loopback / self-host** — the app runs as the user on that same host and can read
+    the manifest token off disk. Grants nothing new.
+  - **remote workspace** (daemon on a login node, app on that login node — the common
+    HPC case) — same identity, same host. Grants nothing new, and reaches nothing on the
+    user's laptop.
+  - **compute node** — app on the node, daemon on the login node: both the user, sharing
+    `$HOME`. Negligible.
+  - The one non-equivalent case is a **confirmed remote** target *in the native app*,
+    where `window.parent` also reaches granted Tauri commands (`connect_host` et al) —
+    a remote-app -> local-machine hop. It takes deliberately confirming a hostile app.
+  - **If we ever want to close that**, the answer is a separate origin (the data plane on
+    its own port), which keeps a *real* origin so cookies, `Referer`, and the rescue all
+    still work. Sandboxing is NOT a substitute: `sandbox` without `allow-same-origin`
+    yields an opaque origin whose requests count as cross-site, so the app's own
+    `SameSite` cookies are withheld (`SameSite=None` needs `Secure`, impossible on http)
+    and the rescue loses both its cookie and its `Referer`. It would touch every tunnel
+    path (`connect`, the Mode 2 ladder), each forwarding a single port — not worth it for
+    the residual risk above unless the threat model changes.
+- **http upstream only.** The data plane opens a plain `TcpStream` and speaks clear-text
+  HTTP/1.1, so a TLS-enabled app (`https://localhost:8443`) is deliberately **not**
+  proxyable: `proxyableUrl` and the address bar refuse it and hand it to the user's real
+  browser rather than showing a pane that could only fail.
+- **Streaming, bounded, capped** — no response buffering, fixed tunnel buffers, capped
+  registry/tunnels/relay children. Same review bar as previews.
+- **The Vite dev loop can't exercise the rescue** (unknown root paths aren't proxied to
+  the daemon); use the isolated daemon (`chimaerad-isolated`) to verify Jupyter-class
+  apps live.
+
+---
+
+## Intent — human-authored ground truth
+
+> Captured from the people who built these features via the **capture-feature-intent**
+> skill when a `feat:` ships in this area. **Never** inferred from code. Everything above
+> this line is derived and may be regenerated; everything below is deliberate and must not
+> be "helpfully" changed without asking.
+
+### Why the browser pane exists
+_Captured 2026-07-21 (from the maintainer, on the shipping PR)._
+
+- **Problem it solves (maintainer's words):** "a native browser within the workflow
+  so that you can see everything from developing web apps to jupyter notebook to
+  marimo etc. — it is a crucial part of an agent workbench and very helpful for the
+  user." Not a bolt-on preview: the live-app surface belongs *inside* the workbench,
+  beside the terminals and agents that produce those apps.
+- **How settled:** "a crucial part of an agent workbench" — treat the capability
+  itself (live web apps as first-class panes, remote-transparent through the daemon)
+  as core to the workbench vision. The mechanics (rescue cookie, relay rungs, chrome
+  layout) are how it works for now, improvable freely.
+- **Constraints stated in the build request:** never an open relay (ticket-gated,
+  target allowlisted to detected/user-confirmed addresses); bounded memory
+  (streaming, no buffering); the daemon↔UI wire stays stable.
+- **Follow-up he flagged immediately:** compute-node apps printing `localhost` URLs
+  must not dead-end ("this we need to fix") — the compute-node hunt above is that
+  fix, shipped in the same PR.
