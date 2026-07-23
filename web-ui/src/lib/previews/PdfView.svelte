@@ -41,12 +41,16 @@
     h: number;
   }
 
+  type PdfTextContent = Awaited<ReturnType<PDFPageProxy["getTextContent"]>>;
+  type PdfTextReader = ReadableStreamDefaultReader<PdfTextContent>;
+
   let scroller = $state<HTMLDivElement | null>(null);
   let containerWidth = $state(0);
   let pages = $state<PageInfo[]>([]);
   let numPages = $state(0);
   let error = $state<string | null>(null);
   let loading = $state(true);
+  let selectionLimited = $state(false);
   /** "fit" (fit width) or an explicit CSS scale factor. */
   let zoom = $state<"fit" | number>("fit");
   let restored = false;
@@ -61,6 +65,11 @@
    *  UI thread after its pane is gone. */
   const renderTasks = new Map<number, ReturnType<PDFPageProxy["render"]>>();
   const textLayers = new Map<number, InstanceType<typeof pdfjs.TextLayer>>();
+  const textReaders = new Map<number, PdfTextReader>();
+  /** Completed text layers reserve from one viewer-wide DOM budget. */
+  const textItemCounts = new Map<number, number>();
+  /** Pages over the per-page ceiling stay canvas-only across zoom rerenders. */
+  const complexTextPages = new Set<number>();
   let observer: IntersectionObserver | null = null;
   let disposed = false;
   let restoreFrame: number | null = null;
@@ -71,6 +80,12 @@
   const MAX_CANVAS_PIXELS = 12_000_000;
   /** Canvases outside the viewport margin are an LRU, not a document-long leak. */
   const MAX_RENDERED_PAGES = 8;
+  /** pdf.js creates roughly one selectable DOM run per item. Scientific plots
+   * can encode every point as text: the Sherlock UMAP repro has 36k items and
+   * produced 60k DOM nodes on one page. Keep selection a bounded enhancement;
+   * the canvas remains the authoritative preview. */
+  const MAX_TEXT_ITEMS_PER_PAGE = 5_000;
+  const MAX_TEXT_ITEMS_TOTAL = 12_000;
   const PAGE_INFO_BATCH = 24;
 
   // Effective CSS scale: fit-width divides the container by the widest page,
@@ -126,7 +141,14 @@
         }
       } catch (e) {
         if (!disposed) {
-          error = e instanceof Error ? e.message : "failed to open pdf";
+          error =
+            e instanceof Error
+              ? e.message
+              : typeof e === "object" && e !== null && "message" in e
+                ? String(e.message)
+                : e === undefined
+                  ? "failed to open pdf"
+                  : String(e);
           loading = false;
         }
       }
@@ -143,8 +165,14 @@
       reRenderTimer = null;
       for (const renderTask of renderTasks.values()) renderTask.cancel();
       for (const textLayer of textLayers.values()) textLayer.cancel();
+      for (const reader of textReaders.values()) {
+        void reader.cancel(new Error("PDF view closed")).catch(() => {});
+      }
       renderTasks.clear();
       textLayers.clear();
+      textReaders.clear();
+      textItemCounts.clear();
+      complexTextPages.clear();
       rendered.clear();
       renderingPages.clear();
       renderedScale.clear();
@@ -325,13 +353,81 @@
       scroller?.querySelector<HTMLElement>(`[data-page="${old}"] .textLayer`)?.remove();
       rendered.delete(old);
       renderedScale.delete(old);
+      textItemCounts.delete(old);
     }
   }
 
+  /** Read only enough streamed text to decide whether a selectable layer is
+   * safe. Cancelling at the ceiling prevents a tiny, highly-compressed vector
+   * PDF from expanding into an unbounded main-thread object graph. */
+  async function readBoundedTextContent(page: PDFPageProxy): Promise<PdfTextContent | null | undefined> {
+    const stream = page.streamTextContent({
+      includeMarkedContent: true,
+      disableNormalization: true,
+    }) as ReadableStream<PdfTextContent>;
+    const reader = stream.getReader();
+    textReaders.set(page.pageNumber, reader);
+    const items: PdfTextContent["items"] = [];
+    const styles: PdfTextContent["styles"] = {};
+    let lang: string | null = null;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) return { items, styles, lang };
+        if (disposed) {
+          await reader.cancel(new Error("PDF view closed"));
+          return undefined;
+        }
+        if (items.length + value.items.length > MAX_TEXT_ITEMS_PER_PAGE) {
+          await reader.cancel(new Error("PDF text-layer item limit"));
+          return null;
+        }
+        items.push(...value.items);
+        Object.assign(styles, value.styles);
+        lang ??= value.lang;
+      }
+    } catch {
+      // Cancellation and malformed text content do not affect the canvas.
+      return undefined;
+    } finally {
+      if (textReaders.get(page.pageNumber) === reader) textReaders.delete(page.pageNumber);
+      reader.releaseLock();
+    }
+  }
+
+  function omitTextLayer(pageNumber: number, slot: HTMLElement, remember: boolean): void {
+    textLayers.get(pageNumber)?.cancel();
+    textLayers.delete(pageNumber);
+    slot.querySelector(".textLayer")?.remove();
+    textItemCounts.delete(pageNumber);
+    if (remember) complexTextPages.add(pageNumber);
+    selectionLimited = true;
+  }
+
   async function renderTextLayer(page: PDFPageProxy, slot: HTMLElement, s: number): Promise<void> {
+    let layer: HTMLDivElement | null = null;
     try {
       if (disposed || !slot.isConnected) return;
-      let layer = slot.querySelector<HTMLDivElement>(".textLayer");
+      if (complexTextPages.has(page.pageNumber)) {
+        omitTextLayer(page.pageNumber, slot, true);
+        return;
+      }
+      const source = await readBoundedTextContent(page);
+      if (source === undefined || disposed || !slot.isConnected) return;
+      if (source === null) {
+        omitTextLayer(page.pageNumber, slot, true);
+        return;
+      }
+      const reservedElsewhere = [...textItemCounts.entries()].reduce(
+        (total, [n, count]) => total + (n === page.pageNumber ? 0 : count),
+        0,
+      );
+      if (reservedElsewhere + source.items.length > MAX_TEXT_ITEMS_TOTAL) {
+        omitTextLayer(page.pageNumber, slot, false);
+        return;
+      }
+      textItemCounts.set(page.pageNumber, source.items.length);
+      layer = slot.querySelector<HTMLDivElement>(".textLayer");
       if (layer === null) {
         layer = document.createElement("div");
         layer.className = "textLayer";
@@ -342,12 +438,13 @@
       layer.style.setProperty("--scale-round-x", "1px");
       layer.style.setProperty("--scale-round-y", "1px");
       const viewport = page.getViewport({ scale: s });
-      const source = page.streamTextContent({ includeMarkedContent: true, disableNormalization: true });
       const tl = new pdfjs.TextLayer({ textContentSource: source, container: layer, viewport });
       textLayers.set(page.pageNumber, tl);
       await tl.render();
     } catch {
       // text layer is a progressive enhancement; ignore failures
+      layer?.remove();
+      textItemCounts.delete(page.pageNumber);
     } finally {
       textLayers.delete(page.pageNumber);
     }
@@ -403,6 +500,13 @@
     <span class="pages" class:dim={numPages === 0}>
       {#if numPages > 0}{numPages} page{numPages === 1 ? "" : "s"}{:else}—{/if}
     </span>
+    {#if selectionLimited}
+      <span
+        class="selection-note"
+        title="selectable text was disabled on a complex page to keep this preview responsive"
+        >selection limited</span
+      >
+    {/if}
     <span class="spacer"></span>
     <div class="zoom">
       <button class="zbtn" class:on={zoom === "fit"} onclick={() => (zoom = "fit")} title="fit width">fit</button>
@@ -457,6 +561,12 @@
 
   .pages.dim {
     opacity: 0.6;
+  }
+
+  .selection-note {
+    padding-left: 0.55rem;
+    border-left: 1px solid var(--edge);
+    color: var(--muted);
   }
 
   .spacer {
