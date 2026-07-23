@@ -99,6 +99,12 @@ pub(crate) struct RenderRequest {
     /// Theme id or path, overriding the board's own.
     #[serde(default)]
     pub theme: Option<String>,
+    /// The viewer's appearance, `"light"` or `"dark"` — what a board whose
+    /// theme is `auto` (or absent) resolves to, so the pane and a shown card
+    /// match the app around them. A pinned theme ignores it. Absent (an older
+    /// client) keeps the pre-auto behavior: auto resolves dark.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -117,8 +123,11 @@ pub(crate) struct DescribeRequest {
 pub(crate) struct EditRequest {
     pub path: String,
     /// The object's id — the same id that is the diff anchor, the journal
-    /// subject, and the merge key.
-    pub object: String,
+    /// subject, and the merge key. Optional (additively) because the one
+    /// board-level gesture, `canvasBackground`, has no object; every
+    /// object-scoped op still requires it.
+    #[serde(default)]
+    pub object: Option<String>,
     #[serde(default)]
     pub at: Option<[f64; 2]>,
     #[serde(default)]
@@ -141,6 +150,27 @@ pub(crate) struct EditRequest {
     /// deterministic.
     #[serde(default)]
     pub set: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The one board-level field edit: set (a string — an `@token` or
+    /// `#rrggbb`) or clear (JSON null) `canvas.background`, the ground painted
+    /// under every page. Double-optional so "absent" and "null" stay distinct
+    /// on the wire: absent = not this gesture, null = back to the theme's
+    /// ground. Journaled as `canvas-changed`.
+    #[serde(
+        default,
+        rename = "canvasBackground",
+        deserialize_with = "double_option"
+    )]
+    pub canvas_background: Option<Option<String>>,
+}
+
+/// Deserialize a present-but-maybe-null field into `Some(inner)` — serde's
+/// stock `Option` folds JSON null into "absent", which would make "clear the
+/// field" indistinguishable from "don't touch it".
+fn double_option<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(de)?))
 }
 
 /// A `set` refusal: the request was well-formed but the mutation is not
@@ -176,12 +206,14 @@ pub(crate) async fn render(
         let mut diagnostics = chimaera_board::normalize(&mut board);
         let page_count = board.pages.len();
 
-        let theme_name = req
-            .theme
-            .clone()
-            .or_else(|| board.theme.clone())
-            .unwrap_or_else(|| "talk-dark".to_string());
-        let theme = Theme::resolve(&theme_name, Some(&ws))?;
+        // `auto` (and an absent theme) follows the viewer's mode; a pinned
+        // theme wins regardless. The cache key hashes the RESOLVED theme (its
+        // whole serialized form), so an auto board's light and dark renders
+        // are distinct entries by construction — "auto" itself never keys.
+        let dark = req.mode.as_deref() != Some("light");
+        let theme_name = req.theme.clone().or_else(|| board.theme.clone());
+        let theme =
+            chimaera_board::theme::resolve_for_mode(theme_name.as_deref(), dark, Some(&ws))?;
         let params = RasterParams {
             scale: req.scale.unwrap_or(2.0).clamp(0.25, 4.0),
             workspace: Some(ws.clone()),
@@ -244,6 +276,14 @@ pub(crate) async fn render(
                 .filter(|t| t.starts_with('@'))
                 .filter_map(|t| theme.color(t).map(|rgb| json!({"token": t, "hex": rgb.hex()})))
                 .collect::<Vec<_>>(),
+            // The theme's ground tones as @token → resolved hex, for the
+            // pane's canvas-background swatch row. Same contract as
+            // catSwatches: the control commits the token, the hex only shows
+            // what it resolves to under the theme THIS render used. Additive.
+            "bgSwatches": (["@bg", "@surface", "@edge", "@grid"]
+                .iter()
+                .filter_map(|t| theme.color(t).map(|rgb| json!({"token": t, "hex": rgb.hex()})))
+                .collect::<Vec<_>>()),
             // Every composite's derived children (`<id>/<part>`) and where
             // the layout put them, in page points — the pane's hit-test map
             // for selecting/dragging/discussing a diagram node instead of
@@ -357,47 +397,70 @@ pub(crate) async fn edit(
 fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Value> {
     let mut board = chimaera_board::load(path)?;
 
-    let mut found = false;
-    let mut prior = None;
-    for page in &mut board.pages {
-        // Top-level objects only: group children are page-absolute too,
-        // but moving one without its siblings is a different gesture
-        // (enter-the-group), which the pane does not offer yet.
-        for obj in &mut page.objects {
-            if obj.id() != req.object {
-                continue;
-            }
-            found = true;
-            prior = obj.frame();
-            if let Some(at) = req.at {
-                obj.set_at(at);
-            }
-            if let Some(size) = req.size {
-                obj.set_size(size);
-            }
-            if let Some(text) = &req.text {
-                let paras = || {
-                    text.iter()
-                        .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
-                        .collect()
-                };
-                match obj {
-                    chimaera_board::Object::Text(t) => t.text = paras(),
-                    chimaera_board::Object::Shape(sh) => sh.text = paras(),
-                    other => anyhow::bail!(
-                        "text applies to text and shape objects; {:?} is a {}",
-                        req.object,
-                        other.kind()
-                    ),
-                }
-            }
-            if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
-                apply_set(obj, &req.object, set)?;
+    // The board-level gesture: set or clear `canvas.background`. Validated
+    // by FORM here (an @token or a #hex literal — which token exists is the
+    // render-time theme's business) so the write can never land a value
+    // normalize would immediately drop; refusal is a 422, nothing written.
+    if let Some(bg) = req.canvas_background.as_ref() {
+        if let Some(value) = bg {
+            let token = value
+                .strip_prefix('@')
+                .map(|t| !t.is_empty())
+                .unwrap_or(false);
+            if !token && chimaera_board::theme::parse_hex(value).is_none() {
+                anyhow::bail!(SetRejected(format!(
+                    "canvasBackground {value:?} is neither an @token nor a #rrggbb literal \
+                     (nothing written)"
+                )));
             }
         }
+        board.canvas.background = bg.clone();
     }
-    if !found {
-        anyhow::bail!("no object {:?} in {}", req.object, path.display());
+
+    let mut prior = None;
+    if let Some(object) = req.object.as_deref() {
+        let mut found = false;
+        for page in &mut board.pages {
+            // Top-level objects only: group children are page-absolute too,
+            // but moving one without its siblings is a different gesture
+            // (enter-the-group), which the pane does not offer yet.
+            for obj in &mut page.objects {
+                if obj.id() != object {
+                    continue;
+                }
+                found = true;
+                prior = obj.frame();
+                if let Some(at) = req.at {
+                    obj.set_at(at);
+                }
+                if let Some(size) = req.size {
+                    obj.set_size(size);
+                }
+                if let Some(text) = &req.text {
+                    let paras = || {
+                        text.iter()
+                            .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
+                            .collect()
+                    };
+                    match obj {
+                        chimaera_board::Object::Text(t) => t.text = paras(),
+                        chimaera_board::Object::Shape(sh) => sh.text = paras(),
+                        other => anyhow::bail!(
+                            "text applies to text and shape objects; {object:?} is a {}",
+                            other.kind()
+                        ),
+                    }
+                }
+                if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
+                    apply_set(obj, object, set)?;
+                }
+            }
+        }
+        if !found {
+            anyhow::bail!("no object {object:?} in {}", path.display());
+        }
+    } else if req.canvas_background.is_none() {
+        anyhow::bail!("an edit names an object or a board-level field");
     }
 
     // Normalize (grid snap, group re-union) before the canonical save —
@@ -760,11 +823,10 @@ fn perform_export(req: &ExportRequest) -> anyhow::Result<serde_json::Value> {
     let ws = chimaera_board::workspace_root(&path);
     let mut board = chimaera_board::load(&path)?;
     chimaera_board::normalize(&mut board);
-    let theme_name = board
-        .theme
-        .clone()
-        .unwrap_or_else(|| "talk-dark".to_string());
-    let theme = Theme::resolve(&theme_name, Some(&ws))?;
+    // Exports resolve `auto` (and an absent theme) dark — the pre-auto
+    // default; the artifact is leaving the app, so there is no viewer mode
+    // for it to follow.
+    let theme = chimaera_board::theme::resolve_for_mode(board.theme.as_deref(), true, Some(&ws))?;
     let fonts = FontStack::for_workspace(&ws);
     let stem = path
         .file_name()
@@ -878,62 +940,84 @@ fn journal_edit(
 ) -> Option<u64> {
     use chimaera_board::journal::{Actor, Event, EventKind};
 
-    // The journaled `to` is the *saved* geometry (post-normalize grid snap),
-    // not the requested one — the journal narrates the file, never the wire.
-    // A text edit carries no geometry, so the frame lookup gates only the
-    // move/resize events, never the text-edited one.
-    let saved_obj = board
-        .objects()
-        .find(|(_, o)| o.id() == req.object)
-        .map(|(_, o)| o);
-    let saved = saved_obj.and_then(|o| o.frame());
     let mut events = Vec::new();
-    if let Some(saved) = saved {
-        if req.at.is_some() {
-            events.push(Event::new(
-                Actor::Human,
-                EventKind::Move {
-                    object: req.object.clone(),
-                    from: prior.map(|f| [f.x, f.y]).unwrap_or([saved.x, saved.y]),
-                    to: [saved.x, saved.y],
-                },
-            ));
-        }
-        if req.size.is_some() {
-            events.push(Event::new(
-                Actor::Human,
-                EventKind::Resize {
-                    object: req.object.clone(),
-                    from: prior.map(|f| [f.w, f.h]).unwrap_or([saved.w, saved.h]),
-                    to: [saved.w, saved.h],
-                },
-            ));
-        }
-    }
-    if req.text.is_some() {
+    // The board-level gesture journals the SAVED value (null = cleared),
+    // like every object event: the journal narrates the file, not the wire.
+    if req.canvas_background.is_some() {
+        let changed = [(
+            "canvas.background".to_string(),
+            board
+                .canvas
+                .background
+                .as_deref()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        )]
+        .into_iter()
+        .collect();
         events.push(Event::new(
             Actor::Human,
-            EventKind::TextEdited {
-                object: req.object.clone(),
-            },
+            EventKind::CanvasChanged { changed },
         ));
     }
-    if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
-        // The journaled values are the SAVED object's, read back per path
-        // (post-normalize) — the journal narrates the file, never the wire.
-        // Null means the field was cleared.
-        if let Some(raw) = saved_obj.and_then(|o| serde_json::to_value(o).ok()) {
-            let changed = set
-                .keys()
-                .map(|p| (p.clone(), field_path_value(&raw, p)))
-                .collect();
+
+    if let Some(object) = req.object.as_deref() {
+        // The journaled `to` is the *saved* geometry (post-normalize grid
+        // snap), not the requested one — the journal narrates the file, never
+        // the wire. A text edit carries no geometry, so the frame lookup gates
+        // only the move/resize events, never the text-edited one.
+        let saved_obj = board
+            .objects()
+            .find(|(_, o)| o.id() == object)
+            .map(|(_, o)| o);
+        let saved = saved_obj.and_then(|o| o.frame());
+        if let Some(saved) = saved {
+            if req.at.is_some() {
+                events.push(Event::new(
+                    Actor::Human,
+                    EventKind::Move {
+                        object: object.to_string(),
+                        from: prior.map(|f| [f.x, f.y]).unwrap_or([saved.x, saved.y]),
+                        to: [saved.x, saved.y],
+                    },
+                ));
+            }
+            if req.size.is_some() {
+                events.push(Event::new(
+                    Actor::Human,
+                    EventKind::Resize {
+                        object: object.to_string(),
+                        from: prior.map(|f| [f.w, f.h]).unwrap_or([saved.w, saved.h]),
+                        to: [saved.w, saved.h],
+                    },
+                ));
+            }
+        }
+        if req.text.is_some() {
             events.push(Event::new(
                 Actor::Human,
-                EventKind::Restyle {
-                    object: req.object.clone(),
-                    changed,
+                EventKind::TextEdited {
+                    object: object.to_string(),
                 },
             ));
+        }
+        if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
+            // The journaled values are the SAVED object's, read back per path
+            // (post-normalize) — the journal narrates the file, never the
+            // wire. Null means the field was cleared.
+            if let Some(raw) = saved_obj.and_then(|o| serde_json::to_value(o).ok()) {
+                let changed = set
+                    .keys()
+                    .map(|p| (p.clone(), field_path_value(&raw, p)))
+                    .collect();
+                events.push(Event::new(
+                    Actor::Human,
+                    EventKind::Restyle {
+                        object: object.to_string(),
+                        changed,
+                    },
+                ));
+            }
         }
     }
     if events.is_empty() {
@@ -1184,12 +1268,85 @@ mod tests {
     fn edit_req(path: &Path, object: &str, set: serde_json::Value) -> EditRequest {
         EditRequest {
             path: path.to_string_lossy().into_owned(),
-            object: object.to_string(),
+            object: Some(object.to_string()),
             at: None,
             size: None,
             text: None,
             set: Some(serde_json::from_value(set).unwrap()),
+            canvas_background: None,
         }
+    }
+
+    /// The board-level gesture: set/clear `canvas.background` with no object,
+    /// wire-distinguishing null (clear) from absent (not this gesture), the
+    /// saved file byte-canonical, the journal carrying `canvas-changed` with
+    /// the SAVED value, and a malformed reference refused with nothing
+    /// written.
+    #[test]
+    fn canvas_background_edits_set_clear_and_refuse() {
+        let (ws, path) = chart_board("canvas-bg");
+
+        // Wire shapes: absent vs null vs value.
+        let parsed: EditRequest =
+            serde_json::from_str(r#"{"path":"/w/f.board.json","object":"bench"}"#).unwrap();
+        assert!(
+            parsed.canvas_background.is_none(),
+            "absent = not this gesture"
+        );
+        let parsed: EditRequest =
+            serde_json::from_str(r#"{"path":"/w/f.board.json","canvasBackground":null}"#).unwrap();
+        assert_eq!(parsed.canvas_background, Some(None), "null = clear");
+        let parsed: EditRequest =
+            serde_json::from_str(r#"{"path":"/w/f.board.json","canvasBackground":"@surface"}"#)
+                .unwrap();
+        assert_eq!(parsed.canvas_background, Some(Some("@surface".to_string())));
+
+        let canvas_req = |bg: Option<&str>| EditRequest {
+            path: path.to_string_lossy().into_owned(),
+            object: None,
+            at: None,
+            size: None,
+            text: None,
+            set: None,
+            canvas_background: Some(bg.map(String::from)),
+        };
+
+        // Set: the file gets the field, byte-canonical, journaled.
+        let out = perform_edit(&path, &canvas_req(Some("@surface"))).unwrap();
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(board.canvas.background.as_deref(), Some("@surface"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            chimaera_board::to_string(&board).unwrap()
+        );
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        let ev = events.iter().find(|e| e.seq == seq).unwrap();
+        match &ev.kind {
+            chimaera_board::journal::EventKind::CanvasChanged { changed } => {
+                assert_eq!(changed.get("canvas.background").unwrap(), "@surface");
+            }
+            other => panic!("expected canvas-changed, got {other:?}"),
+        }
+
+        // Clear: null drops the field back to the theme's ground.
+        perform_edit(&path, &canvas_req(None)).unwrap();
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(board.canvas.background, None);
+
+        // A malformed reference is a 422 with nothing written.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = perform_edit(&path, &canvas_req(Some("cornflower"))).unwrap_err();
+        assert!(err.downcast_ref::<SetRejected>().is_some(), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // No object and no board-level field is a request error, not a write.
+        let mut empty = canvas_req(None);
+        empty.canvas_background = None;
+        assert!(perform_edit(&path, &empty).is_err());
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// The happy path: a chart's sort and axis label land as sparse field

@@ -14,7 +14,9 @@
    * canonical byte-stable writer stays the one authority on bytes.
    */
   import { untrack } from "svelte";
+  import { activeTheme } from "../settings/store.svelte";
   import {
+    fsBoardCanvasBackground,
     fsBoardEdit,
     fsBoardExport,
     fsBoardJournalAll,
@@ -113,19 +115,27 @@
   let imgUrl = $state<string | null>(null);
   let rendering = $state(false);
 
-  // Re-render whenever the path, page, present mode, or on-disk content
-  // changes. `mtime` is the fileStore's invalidation token — the daemon's 2s
-  // watcher moves it when an agent writes the file, so agent edits appear
-  // without a reload. Present mode doubles the scale for the fullscreen pixels;
-  // the route clamps to [0.25, 4] identically.
+  /** The app's current appearance — what an `auto`-themed board resolves to.
+   *  `activeTheme()` is swapped wholesale on every appearance change
+   *  (including the system-mode listener), so this tracks reactively. */
+  const appMode = $derived(activeTheme().kind);
+
+  // Re-render whenever the path, page, present mode, app light/dark mode, or
+  // on-disk content changes. `mtime` is the fileStore's invalidation token —
+  // the daemon's 2s watcher moves it when an agent writes the file, so agent
+  // edits appear without a reload. A mode flip re-renders the same way an
+  // edit does: the stage keeps the old pixels until the new render lands (no
+  // flash). Present mode doubles the scale for the fullscreen pixels; the
+  // route clamps to [0.25, 4] identically.
   $effect(() => {
     const p = path;
     const pg = page;
+    const mode = appMode;
     const scale = Math.min(4, Math.max(1, (window.devicePixelRatio || 1) * (presenting ? 2 : 1)));
     void entry?.mtime;
     let cancelled = false;
     rendering = true;
-    fsBoardRender(p, pg, scale).then(
+    fsBoardRender(p, pg, scale, undefined, mode).then(
       (r) => {
         if (cancelled) return;
         render = r;
@@ -684,6 +694,37 @@
     void commit(o.id, { set }, expectedSig);
   }
 
+  /** The board-level gesture: set (an @token) or clear (null — match the
+   *  theme) `canvas.background`, on the same serialized commit chain as
+   *  object edits so it cannot interleave with a drag's read-modify-write.
+   *  No object, so no undo-stack entry and no per-object expectation — the
+   *  ground repaint doesn't move any frame, so the attribution differ stays
+   *  quiet, and the journal's `canvas-changed` is the audit trail. */
+  function commitCanvasBackground(background: string | null): void {
+    if (board !== null && background === board.canvasBackground) return;
+    commitChain = commitChain.then(async () => {
+      saving = true;
+      saveError = null;
+      try {
+        const mtime = await fsBoardCanvasBackground(path, background);
+        if (mtime !== null) {
+          ownWrites.add(mtime);
+          if (ownWrites.size > 64) {
+            const oldest = ownWrites.values().next().value;
+            if (oldest !== undefined) ownWrites.delete(oldest);
+          }
+        }
+        // Adopt our own write: the published token re-keys the render effect
+        // so the repainted ground follows the click immediately.
+        noteWrite(path, mtime);
+      } catch (err) {
+        saveError = err instanceof Error ? err.message : String(err);
+      } finally {
+        saving = false;
+      }
+    });
+  }
+
   // --- in-place text editing ----------------------------------------------
   /** The open inline editor: which object, the live textarea value, and the
    *  seed paragraphs (the no-change gate + the font approximation's line
@@ -930,7 +971,7 @@
    */
   async function snapshotCanvas(region: Frame): Promise<HTMLCanvasElement | null> {
     const scale = Math.min(4, Math.max(1, window.devicePixelRatio || 1));
-    const r = await fsBoardRender(path, page, scale);
+    const r = await fsBoardRender(path, page, scale, undefined, appMode);
     const resp = await fetch(`/raw/${r.ticket}`);
     if (!resp.ok) throw new Error(`snapshot fetch failed (${resp.status})`);
     const bitmap = await createImageBitmap(await resp.blob());
@@ -1725,6 +1766,9 @@
       childFrames={pageChildFrames}
       {selectedChild}
       catSwatches={render?.catSwatches ?? []}
+      bgSwatches={render?.bgSwatches ?? []}
+      canvasBackground={board?.canvasBackground ?? null}
+      oncommitcanvas={commitCanvasBackground}
       onselect={(id) => {
         selected = id;
         selectedChild = null;

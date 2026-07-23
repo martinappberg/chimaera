@@ -1,5 +1,6 @@
 <script lang="ts">
   import { basename, fsBoardRender, fsFile, fsList, joinPath } from "../previews/files";
+  import { activeTheme } from "../settings/store.svelte";
   import { ApiError } from "../net/api";
   import { fsCopyOp } from "../workspace/fsEvents";
   import { fsMkdir } from "../workspace/sessions";
@@ -52,15 +53,21 @@
   let provenance = $state<ChartProvenance | null>(null);
   let dataOpen = $state(false);
 
+  /** The app's current appearance: an `auto`-themed shown board renders on
+   *  the ground the transcript around it uses, and re-renders (in place, no
+   *  flash — the previous image holds) when the app's mode flips. */
+  const appMode = $derived(activeTheme().kind);
+
   $effect(() => {
     const p = path;
+    const mode = appMode;
     void revision; // a re-show re-renders the same path in place
     if (compact) return;
     let cancelled = false;
     error = null;
     // Keep the previous image up while a re-show refetches — swapping in
     // place must not flash a spinner over an already-presented figure.
-    fsBoardRender(p, 0).then(
+    fsBoardRender(p, 0, 2.0, undefined, mode).then(
       (r) => {
         if (cancelled) return;
         imgUrl = `/raw/${r.ticket}`;

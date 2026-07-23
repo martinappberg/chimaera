@@ -292,6 +292,15 @@ fn describe_object(
                 truncate(&eq.tex, 80)
             );
         }
+        Object::Icon(ic) => {
+            // Name + position, and the recolor token when it is not the
+            // default — the agent reads back what it placed and how it tinted.
+            let _ = write!(s, "{indent}{} icon {:?}{geo}", ic.id, ic.name);
+            if let Some(c) = &ic.color {
+                let _ = write!(s, " {c}");
+            }
+            let _ = writeln!(s);
+        }
         Object::PanelLabel(pl) => {
             let _ = writeln!(s, "{indent}{} panelLabel{geo}: {:?}", pl.id, pl.label);
         }

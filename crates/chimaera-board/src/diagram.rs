@@ -35,8 +35,8 @@ use anyhow::{bail, Result};
 use crate::layout::FontStack;
 use crate::schema::{
     Align, DiagramDirection, DiagramEdge, DiagramLane, DiagramNode, DiagramObject, EdgeStyle,
-    Extra, Frame, NodeShape, Object, Paragraph, RichParagraph, Run, ShapeObject, Stroke,
-    TextObject, VAlign,
+    Extra, Frame, IconObject, NodeShape, Object, Paragraph, RichParagraph, Run, ShapeObject,
+    Stroke, TextObject, VAlign,
 };
 use crate::theme::{Rgb, Theme};
 
@@ -68,6 +68,10 @@ const ARROW_GAP: f64 = 1.5;
 /// Padding inside an edge-label chip.
 const CHIP_PAD_X: f64 = 5.0;
 const CHIP_PAD_Y: f64 = 2.5;
+/// Inset of a node's leading icon within its square cell (the cell is as wide
+/// as the node is tall), and the gap between that cell and the label.
+const NODE_ICON_INSET: f64 = 6.0;
+const NODE_ICON_GAP: f64 = 6.0;
 
 /// Node id → node index, first declaration winning on a duplicate.
 type NodeIndex<'a> = BTreeMap<&'a str, usize>;
@@ -396,7 +400,14 @@ fn measure(
                 NodeShape::Ellipse => (1.3, 48.0),
                 NodeShape::Rect | NodeShape::RoundRect => (1.0, MIN_NODE_H),
             };
-            let w = ((label_w + NODE_PAD_X * 2.0) * factor).max(MIN_NODE_W);
+            // A leading icon claims a square cell as wide as the node is tall,
+            // plus a gap — the label keeps its measured room to its right.
+            let icon_col = if nd.icon.is_some() {
+                min_h + NODE_ICON_GAP
+            } else {
+                0.0
+            };
+            let w = ((label_w + NODE_PAD_X * 2.0) * factor + icon_col).max(MIN_NODE_W);
             if down {
                 (w, min_h)
             } else {
@@ -1201,9 +1212,54 @@ fn emit_nodes(
         sh.size = Some([f.w, f.h]);
         sh.fill = Some(fill);
         sh.stroke = Some(stroke(stroke_color, stroke_w));
-        sh.text = vec![Paragraph::Rich(rich(run))];
         sh.role = Some("label".to_string());
-        out.push(Object::Shape(sh));
+
+        match n.icon.as_deref() {
+            Some(icon_name) if !icon_name.trim().is_empty() => {
+                // A leading icon rides in its own square cell (as wide as the
+                // node is tall) with the label centered in the room to its
+                // right — the box was widened for exactly this in `measure`.
+                // Bare shape first, icon + label on top.
+                out.push(Object::Shape(sh));
+                let inset = NODE_ICON_INSET * scale;
+                let cell = f.h;
+                let icon_size = (f.h - inset * 2.0).max(8.0);
+                out.push(Object::Icon(IconObject {
+                    id: format!("{}/{}.icon", d.id, n.id),
+                    kind: Default::default(),
+                    slot: None,
+                    at: Some([f.x + inset, f.y + (f.h - icon_size) / 2.0]),
+                    size: Some([icon_size, icon_size]),
+                    name: icon_name.to_string(),
+                    color: Some("@fg".to_string()),
+                    stroke_width: None,
+                    alt: None,
+                    extra: Extra::new(),
+                }));
+                let lx = f.x + cell + NODE_ICON_GAP * scale;
+                let lw = (f.right() - lx - NODE_PAD_X * scale).max(1.0);
+                out.push(Object::Text(TextObject {
+                    id: format!("{}/{}.label", d.id, n.id),
+                    kind: Default::default(),
+                    role: Some("label".to_string()),
+                    slot: None,
+                    at: Some([lx, f.y]),
+                    size: Some([lw, f.h]),
+                    text: vec![Paragraph::Rich(rich(run))],
+                    align: Some(Align::Center),
+                    valign: Some(VAlign::Middle),
+                    anchor: None,
+                    alt: None,
+                    link: None,
+                    rotation: None,
+                    extra: Extra::new(),
+                }));
+            }
+            _ => {
+                sh.text = vec![Paragraph::Rich(rich(run))];
+                out.push(Object::Shape(sh));
+            }
+        }
     }
 }
 
@@ -1724,6 +1780,10 @@ impl MermaidState {
                     id: r.id.clone(),
                     label: r.label.unwrap_or_else(|| r.id.clone()),
                     shape: r.shape,
+                    // Mermaid's flowchart subset has no clean, universal icon
+                    // slot, so imported nodes stay iconless (add `icon` to the
+                    // node afterward) rather than overreaching the parser.
+                    icon: None,
                     at: None,
                     fill: None,
                     lane: self.lane_stack.last().cloned(),
@@ -2492,5 +2552,56 @@ mod tests {
         };
         assert_eq!(rd.nodes.len(), 3);
         assert_eq!(rd.edges.len(), 2);
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn a_node_icon_leads_the_label_and_widens_the_box() {
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let with = diagram(
+            r#"{"id":"d","type":"diagram","at":[0,0],"size":[400,200],
+                "nodes":[{"id":"a","label":"Train","icon":"flask"}]}"#,
+        );
+        let plain = diagram(
+            r#"{"id":"d","type":"diagram","at":[0,0],"size":[400,200],
+                "nodes":[{"id":"a","label":"Train"}]}"#,
+        );
+        let (cw, _) = expand(&with, &theme, &fonts);
+        let (co, _) = expand(&plain, &theme, &fonts);
+
+        let node_w = |children: &[Object]| {
+            children
+                .iter()
+                .find_map(|o| match o {
+                    Object::Shape(s) if s.id == "d/a" => o.frame().map(|f| f.w),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(
+            node_w(&cw) > node_w(&co),
+            "the leading icon widens the node box"
+        );
+
+        // The iconed node emits a separate icon child and label, icon leading.
+        let icon = cw
+            .iter()
+            .find_map(|o| match o {
+                Object::Icon(ic) if ic.id == "d/a.icon" => o.frame().map(|f| (ic.name.clone(), f)),
+                _ => None,
+            })
+            .expect("a leading icon child");
+        assert_eq!(icon.0, "flask");
+        let label = cw
+            .iter()
+            .find_map(|o| match o {
+                Object::Text(t) if t.id == "d/a.label" => o.frame(),
+                _ => None,
+            })
+            .expect("a separate label object");
+        assert!(icon.1.right() <= label.x + 0.5, "the icon leads the label");
+        // A plain node keeps bound text on its shape — no separate label.
+        assert!(!co.iter().any(|o| o.id() == "d/a.label"));
     }
 }

@@ -62,7 +62,9 @@ pub enum BoardCmd {
         /// Explicit size WxH in points, overriding --preset.
         #[arg(long)]
         size: Option<String>,
-        /// Theme id or path; defaults to talk-dark.
+        /// Theme id or path; defaults to `auto`, which follows the viewer's
+        /// light/dark mode wherever the card is rendered (the PNG written
+        /// here resolves auto to the dark theme).
         #[arg(long)]
         theme: Option<String>,
         /// Write the PNG here instead of .chimaera/board/shown/.
@@ -86,8 +88,10 @@ pub enum BoardCmd {
         path: PathBuf,
         #[arg(long)]
         title: Option<String>,
-        /// Theme id recorded in the board.
-        #[arg(long, default_value = "talk-dark")]
+        /// Theme id recorded in the board. The `auto` default follows the
+        /// viewer's light/dark mode at render time; pin a bundled theme
+        /// (talk-dark, talk-light, figure-light) for a fixed ground.
+        #[arg(long, default_value = "auto")]
         theme: String,
     },
     /// Render a board's pages to PNG.
@@ -282,6 +286,20 @@ pub enum BoardCmd {
         #[arg(long)]
         check: bool,
     },
+    /// Find bundled icons by name (and synonyms/categories) so an icon is
+    /// discovered and placed in one call — `chimaera board icons flask`,
+    /// `chimaera board icons arrow`. Prints capped matches with the total;
+    /// place `{"type":"icon","name":"…","at":[x,y],"size":[w,h]}` recolored
+    /// with a theme `@token`. Icons compose with imported SVG/PNG and shapes
+    /// into real figures, all editable after a `export --format pptx`.
+    Icons {
+        /// Substring / synonym query over icon names; omit it with `--list`
+        /// to print just the total.
+        query: Option<String>,
+        /// Print the total number of bundled icons and exit.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 pub fn run(cmd: BoardCmd) -> Result<()> {
@@ -376,7 +394,57 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             out,
             check,
         } => merge(&base, &ours, &theirs, out, check),
+        BoardCmd::Icons { query, list } => icons(query, list),
     }
+}
+
+/// Icon discovery: one call takes a query to a placeable name. Ranks
+/// name matches above synonym/category matches (see [`crate::icons::search`]),
+/// caps the printed list, and always states the total so the agent knows
+/// whether to refine.
+fn icons(query: Option<String>, list: bool) -> Result<()> {
+    if !crate::icons::enabled() {
+        println!("{}", crate::icons::MISSING_FEATURE);
+        return Ok(());
+    }
+    let total = crate::icons::count();
+    if list {
+        println!("{total} bundled icons (Tabler outline).");
+        return Ok(());
+    }
+    let Some(q) = query.filter(|q| !q.trim().is_empty()) else {
+        println!(
+            "{total} bundled icons (Tabler outline). Search by name or synonym: \
+             `chimaera board icons <query>` (e.g. flask, arrow, dna, chart, user)."
+        );
+        return Ok(());
+    };
+
+    let hits = crate::icons::search(&q);
+    if hits.is_empty() {
+        println!("no icons match {q:?} — try a broader term (arrow, chart, flask, user, brain).");
+        return Ok(());
+    }
+    // Cap the printout so a broad query stays one screen; the count tells the
+    // agent whether a narrower term is worth it.
+    const CAP: usize = 60;
+    let shown = hits.len().min(CAP);
+    println!("{} icon(s) match {q:?}:", hits.len());
+    for m in &hits[..shown] {
+        if m.category.is_empty() {
+            println!("  {}", m.name);
+        } else {
+            println!("  {}  ({})", m.name, m.category);
+        }
+    }
+    if hits.len() > shown {
+        println!("  … and {} more — refine the query.", hits.len() - shown);
+    }
+    println!(
+        "place one: {{\"type\":\"icon\",\"name\":\"{}\",\"at\":[x,y],\"size\":[48,48],\"color\":\"@accent1\"}}",
+        hits[0].name
+    );
+    Ok(())
 }
 
 /// Load, normalize, and report — the shared front half of every verb.
@@ -415,11 +483,11 @@ fn journal(path: &Path, since: Option<u64>) -> Result<()> {
 }
 
 fn resolve_theme(reference: Option<&str>, board: &crate::Board, ws: &Path) -> Result<Theme> {
-    let name = reference
-        .map(String::from)
-        .or_else(|| board.theme.clone())
-        .unwrap_or_else(|| "talk-dark".to_string());
-    Theme::resolve(&name, Some(ws))
+    let name = reference.map(String::from).or_else(|| board.theme.clone());
+    // The CLI has no viewer to follow, so `auto` (and an absent theme)
+    // resolves dark here — the pre-auto default; a mode-aware render is the
+    // daemon route's job.
+    crate::theme::resolve_for_mode(name.as_deref(), true, Some(ws))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,8 +552,10 @@ fn show(
 
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let ws = crate::workspace_root(&cwd);
-    let theme_id = theme_ref.unwrap_or_else(|| "talk-dark".to_string());
-    let theme = Theme::resolve(&theme_id, Some(&ws))?;
+    // `auto` rides into the emitted board so the card follows the viewer's
+    // mode wherever it is rendered; the PNG written beside it resolves dark.
+    let theme_id = theme_ref.unwrap_or_else(|| crate::theme::AUTO_ID.to_string());
+    let theme = crate::theme::resolve_for_mode(Some(&theme_id), true, Some(&ws))?;
     let fonts = FontStack::for_workspace(&ws);
 
     let size = match size {
@@ -584,8 +654,8 @@ fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> 
     let ws = crate::workspace_root(&abs);
     let theme_id = theme_ref
         .or_else(|| board.theme.clone())
-        .unwrap_or_else(|| "talk-dark".to_string());
-    let theme = Theme::resolve(&theme_id, Some(&ws))?;
+        .unwrap_or_else(|| crate::theme::AUTO_ID.to_string());
+    let theme = crate::theme::resolve_for_mode(Some(&theme_id), true, Some(&ws))?;
     let fonts = FontStack::for_workspace(&ws);
     let params = RasterParams {
         scale: 2.0,
@@ -1631,6 +1701,7 @@ fn merge_pages(target: &mut crate::Board, src: crate::Board) -> (Vec<String>, Ve
                 O::Colorbar(x) => fix(&mut x.id),
                 O::Table(x) => fix(&mut x.id),
                 O::Equation(x) => fix(&mut x.id),
+                O::Icon(x) => fix(&mut x.id),
                 O::Callout(x) => {
                     fix(&mut x.id);
                     if let Some(t) = &mut x.tail {

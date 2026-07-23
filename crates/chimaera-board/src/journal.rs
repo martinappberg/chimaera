@@ -114,6 +114,14 @@ impl Event {
                     .join(", ");
                 format!("restyled {object} ({fields})")
             }
+            EventKind::CanvasChanged { changed } => {
+                let fields = changed
+                    .iter()
+                    .map(|(path, value)| format!("{path} → {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("changed the canvas ({fields})")
+            }
             EventKind::PageAdded { page } => format!("added page {page}"),
             EventKind::PageRemoved { page } => format!("removed page {page}"),
             EventKind::PageReordered { page, from, to } => {
@@ -194,6 +202,14 @@ pub enum EventKind {
     /// order, like every serialized map in the format.
     Restyle {
         object: String,
+        changed: std::collections::BTreeMap<String, serde_json::Value>,
+    },
+    /// Board-level configuration change (`canvas.background`, and whatever
+    /// board-scoped fields later edits grow): the [`Restyle`] shape without an
+    /// object, because the canvas is not an object and borrowing an id-shaped
+    /// name for it would collide with the sacred-id contract. Values are the
+    /// file's saved ones; null = the field was cleared.
+    CanvasChanged {
         changed: std::collections::BTreeMap<String, serde_json::Value>,
     },
     PageAdded {

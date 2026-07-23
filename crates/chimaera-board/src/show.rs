@@ -93,6 +93,7 @@ pub fn build_board(spec: &ShowSpec, size: [f64; 2], theme_id: &str) -> Result<Bo
         preset: None,
         target: None,
         size,
+        background: None,
         extra: Extra::new(),
     };
     let mut board = Board::new(spec.title.clone().unwrap_or_default(), canvas);
@@ -439,9 +440,13 @@ mod tests {
 
     #[test]
     fn a_minimal_spec_becomes_a_board_that_renders() {
+        // "auto" is the show default: the board records it verbatim so the
+        // card follows the viewer's mode; the CLI's own PNG resolves it dark.
         let spec: ShowSpec = serde_json::from_str(SPEC).unwrap();
-        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
-        let theme = crate::theme::default_for(true);
+        let board = build_board(&spec, [720.0, 450.0], "auto").unwrap();
+        assert_eq!(board.theme.as_deref(), Some("auto"));
+        let theme = crate::theme::resolve_for_mode(board.theme.as_deref(), true, None).unwrap();
+        assert_eq!(theme.id, "talk-dark");
         let fonts = FontStack::new(&[]);
         let out = render_page(&board, 0, &theme, &fonts, RasterParams::default()).unwrap();
         assert!(out.png.len() > 1000);
@@ -452,9 +457,10 @@ mod tests {
         // THE test: --emit-board must yield a file whose render equals show's
         // own render, or `show` has become a second format.
         let spec: ShowSpec = serde_json::from_str(SPEC).unwrap();
-        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "auto").unwrap();
         let emitted = crate::to_string(&board).unwrap();
         let reparsed = crate::parse(&emitted).unwrap();
+        assert_eq!(reparsed.theme.as_deref(), Some("auto"));
         let theme = crate::theme::default_for(true);
         let fonts = FontStack::new(&[]);
         let a = render_page(&board, 0, &theme, &fonts, RasterParams::default()).unwrap();

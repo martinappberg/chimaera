@@ -299,6 +299,30 @@ impl Theme {
 
 pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light", "figure-light"];
 
+/// The sentinel theme reference that follows the *viewer's* appearance: it is
+/// resolved at render time to a concrete bundled theme (talk-dark on a dark
+/// ground, talk-light on a light one), never stored as a theme of its own.
+/// An absent `Board.theme` means the same thing — a board only ships a fixed
+/// ground when it *pins* a concrete theme.
+pub const AUTO_ID: &str = "auto";
+
+/// Resolve a board's theme reference for a render. `auto` — and an absent
+/// reference — follows the appearance the render was asked for; anything else
+/// is an explicit choice and wins regardless of mode. Every render path
+/// (daemon route, CLI, export) funnels through here so "auto" can never leak
+/// into [`Theme::resolve`] as an unknown id.
+pub fn resolve_for_mode(
+    reference: Option<&str>,
+    dark: bool,
+    workspace: Option<&Path>,
+) -> Result<Theme> {
+    match reference {
+        None => Ok(default_for(dark)),
+        Some(AUTO_ID) => Ok(default_for(dark)),
+        Some(r) => Theme::resolve(r, workspace),
+    }
+}
+
 /// The bundled themes, as the very `.theme.json` documents `board init`
 /// writes out. Keeping them as source text rather than Rust literals means
 /// the shipped defaults are exercised through the same parser a user's theme
@@ -416,6 +440,36 @@ mod tests {
         assert_eq!(t.color("#ff0000").unwrap().hex(), "#ff0000");
         assert_eq!(t.color("#f00").unwrap().hex(), "#ff0000");
         assert!(t.color("@nope").is_none());
+    }
+
+    #[test]
+    fn auto_and_absent_follow_the_mode_but_a_pinned_theme_wins() {
+        // "auto" is not a bundled theme — it resolves per render to the mode.
+        assert!(bundled(AUTO_ID).is_none());
+        assert_eq!(
+            resolve_for_mode(Some("auto"), true, None).unwrap().id,
+            "talk-dark"
+        );
+        assert_eq!(
+            resolve_for_mode(Some("auto"), false, None).unwrap().id,
+            "talk-light"
+        );
+        assert_eq!(resolve_for_mode(None, true, None).unwrap().id, "talk-dark");
+        assert_eq!(
+            resolve_for_mode(None, false, None).unwrap().id,
+            "talk-light"
+        );
+        // An explicit choice is unchanged by the viewer's mode.
+        assert_eq!(
+            resolve_for_mode(Some("talk-dark"), false, None).unwrap().id,
+            "talk-dark"
+        );
+        assert_eq!(
+            resolve_for_mode(Some("figure-light"), true, None)
+                .unwrap()
+                .id,
+            "figure-light"
+        );
     }
 
     #[test]

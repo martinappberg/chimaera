@@ -438,6 +438,10 @@ pub fn tier_of(object: &Object) -> (ExportTier, &'static str) {
             ExportTier::Grouped,
             "diagram expands to editable primitives",
         ),
+        Object::Icon(_) => (
+            ExportTier::Grouped,
+            "icon exports as editable vector shapes",
+        ),
         Object::PanelLabel(_)
         | Object::Scalebar(_)
         | Object::SigBracket(_)

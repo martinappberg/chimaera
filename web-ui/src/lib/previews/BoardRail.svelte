@@ -24,6 +24,16 @@
     /** The board theme's categorical ramp (@token + resolved hex), from the
      *  render response — the series-color swatches. */
     catSwatches: { token: string; hex: string }[];
+    /** The theme's ground tones (@bg, @surface, …) + resolved hex, from the
+     *  render response — the canvas-background swatches. Empty on an older
+     *  daemon → the control hides. */
+    bgSwatches: { token: string; hex: string }[];
+    /** The file's own `canvas.background` (@token or #hex), null when the
+     *  board follows the theme's ground. */
+    canvasBackground: string | null;
+    /** Board-level commit: set `canvas.background` to a token, or null to
+     *  match the theme again. */
+    oncommitcanvas: (background: string | null) => void;
     onselect: (id: string | null) => void;
     /** A child row's click: select the derived child under its composite
      *  (null collapses back to the composite itself). */
@@ -40,6 +50,9 @@
     childFrames,
     selectedChild,
     catSwatches,
+    bgSwatches,
+    canvasBackground,
+    oncommitcanvas,
     onselect,
     onselectchild,
     oncommitfield,
@@ -236,6 +249,36 @@
       {/if}
     </div>
   {/if}
+
+  {#if bgSwatches.length > 0}
+    <!-- Board-level: the canvas ground. "match theme" (the default) lets an
+         auto-themed board follow the app's light/dark mode; a token pins one
+         of THIS theme's ground tones; the file's literal value is what marks
+         the active swatch. -->
+    <div class="canvas-sect">
+      <div class="insp-sect">canvas</div>
+      <div class="insp-row swatch-row" role="group" aria-label="canvas background (theme tokens)">
+        <span class="swatch-label">ground</span>
+        <button
+          class="swatch auto"
+          class:on={canvasBackground === null}
+          title="match theme"
+          aria-label="canvas background: match theme"
+          onclick={() => oncommitcanvas(null)}
+        >–</button>
+        {#each bgSwatches as s (s.token)}
+          <button
+            class="swatch"
+            class:on={canvasBackground === s.token}
+            style:background={s.hex}
+            title={s.token}
+            aria-label={`canvas background ${s.token}`}
+            onclick={() => oncommitcanvas(s.token)}
+          ></button>
+        {/each}
+      </div>
+    </div>
+  {/if}
 </aside>
 
 <style>
@@ -333,6 +376,13 @@
   .inspector {
     border-top: 1px solid var(--edge);
     padding: 8px 12px 10px;
+  }
+  .canvas-sect {
+    border-top: 1px solid var(--edge);
+    padding: 0 12px 10px;
+  }
+  .canvas-sect .insp-sect {
+    margin-top: 8px;
   }
   .insp-head {
     font-size: var(--text-xs);

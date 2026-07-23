@@ -132,6 +132,28 @@ pub fn normalize(board: &mut Board) -> Vec<Diagnostic> {
         board.canvas.size = [960.0, 540.0];
     }
 
+    // `canvas.background` is a color *reference* — an `@token` or a `#rrggbb`
+    // literal. Only the form is checkable here (which token exists is the
+    // resolved theme's business, and normalize is a pure function of the
+    // board alone); anything that is neither form is dropped so the ground
+    // falls back to the theme rather than silently painting nothing.
+    if let Some(bg) = &board.canvas.background {
+        let token = bg.strip_prefix('@').map(|t| !t.is_empty()).unwrap_or(false);
+        if !token && crate::theme::parse_hex(bg).is_none() {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!(
+                        "canvas.background {bg:?} is neither an @token nor a #rrggbb literal; \
+                         using the theme's ground"
+                    ),
+                )
+                .field("canvas.background"),
+            );
+            board.canvas.background = None;
+        }
+    }
+
     for (pi, page) in board.pages.iter_mut().enumerate() {
         if page.id.is_empty() {
             page.id = format!("page-{}", pi + 1);
@@ -188,6 +210,7 @@ fn normalize_objects(objects: &mut [Object], page: &str, diags: &mut Vec<Diagnos
             Object::Image(_)
             | Object::Diagram(_)
             | Object::Equation(_)
+            | Object::Icon(_)
             | Object::PanelLabel(_)
             | Object::Scalebar(_)
             | Object::SigBracket(_)
@@ -215,6 +238,7 @@ fn ensure_id(obj: &mut Object, page: &str, index: usize) {
         Object::Chart(o) => o.id = generated,
         Object::Diagram(o) => o.id = generated,
         Object::Equation(o) => o.id = generated,
+        Object::Icon(o) => o.id = generated,
         Object::PanelLabel(o) => o.id = generated,
         Object::Scalebar(o) => o.id = generated,
         Object::SigBracket(o) => o.id = generated,
@@ -564,6 +588,39 @@ mod tests {
         let mut ok = chart("quartiles via numpy, seed 42");
         let diags = normalize(&mut ok);
         assert!(!diags.iter().any(|d| d.message.contains("clamped")));
+    }
+
+    #[test]
+    fn a_canvas_background_round_trips_byte_stably_in_canonical_position() {
+        // The field sits between `size` and any preserved extras — canonical
+        // key order is part of the format, and a save must not move a byte.
+        let src = "{\n  \"format\": \"chimaera.board\",\n  \"formatVersion\": 1,\n  \
+                   \"canvas\": { \"size\": [960, 540], \"background\": \"@surface\" },\n  \
+                   \"pages\": [\n    { \"id\": \"p1\", \"objects\": [] }\n  ]\n}\n";
+        let mut b = parse(src).unwrap();
+        let diags = normalize(&mut b);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(b.canvas.background.as_deref(), Some("@surface"));
+        assert_eq!(crate::to_string(&b).unwrap(), src);
+        // A literal is as valid as a token.
+        b.canvas.background = Some("#20242c".to_string());
+        assert!(normalize(&mut b).is_empty());
+        assert_eq!(b.canvas.background.as_deref(), Some("#20242c"));
+    }
+
+    #[test]
+    fn a_malformed_canvas_background_is_dropped_with_a_diagnostic() {
+        let mut b = board_with(r#"{"id":"t","type":"text","text":["hi"]}"#);
+        b.canvas.background = Some("cornflower blue".to_string());
+        let diags = normalize(&mut b);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.field.as_deref() == Some("canvas.background")),
+            "{diags:?}"
+        );
+        assert_eq!(b.canvas.background, None, "invalid reference must drop");
+        // Idempotent: the dropped field re-normalizes without a finding.
+        assert!(normalize(&mut b).is_empty());
     }
 
     #[test]

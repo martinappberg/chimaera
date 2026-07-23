@@ -82,7 +82,7 @@ impl Default for RasterParams {
 /// Released upgrades are already covered by the crate version in the
 /// fingerprint; the epoch exists for changes within one version, i.e. the
 /// dev loop, where the version is pinned at the 0.0.1 sentinel.
-pub const RENDER_EPOCH: u32 = 2; // 2: routed diagram edges + themed node paint
+pub const RENDER_EPOCH: u32 = 3; // 3: icon objects + node icons
 
 /// The engine identity folded into every render key and prefixed onto it —
 /// the visible prefix is what lets [`crate::prune_renders`] recognize, by
@@ -259,10 +259,15 @@ pub(crate) fn page_svg(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#
     );
 
+    // Ground precedence: the page's own `background.fill`, else the board's
+    // `canvas.background`, else the resolved theme's ground. Specific beats
+    // general; an unresolvable reference falls back to the theme rather than
+    // painting nothing (same leniency as every other color reference).
     let bg = page
         .background
         .as_ref()
         .and_then(|b| b.fill.as_deref())
+        .or(board.canvas.background.as_deref())
         .and_then(|f| theme.color(f))
         .unwrap_or_else(|| theme.bg());
     let _ = write!(
@@ -507,6 +512,16 @@ fn emit_object(
                 return;
             };
             emit_equation(s, eq, f, theme, &page.id, diags);
+        }
+        Object::Icon(ic) => {
+            let Some(f) = frame else {
+                diags.push(
+                    Diagnostic::new(Severity::Warning, "icon has no position; skipped")
+                        .at(&page.id, obj.id()),
+                );
+                return;
+            };
+            emit_icon(s, ic, f, theme, &page.id, diags);
         }
         Object::Diagram(d) => {
             let Some(f) = frame else {
@@ -1232,6 +1247,81 @@ fn emit_equation(
     }
 }
 
+/// Draw a bundled icon: its 24×24 outline paths fitted into the frame
+/// (aspect-preserving, centered — a nested `<svg>` viewBox does the fit
+/// exactly as the PPTX transform will), stroked with the resolved color token
+/// and round caps/joins, the rare filled path painted. An unknown name — or a
+/// build without the `icons` feature — degrades to the standard
+/// placeholder-with-reason, never a silent blank.
+fn emit_icon(
+    s: &mut String,
+    ic: &crate::schema::IconObject,
+    f: Frame,
+    theme: &Theme,
+    page_id: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if !crate::icons::enabled() {
+        diags.push(
+            Diagnostic::new(
+                Severity::Warning,
+                format!(
+                    "{}; a placeholder marks its box",
+                    crate::icons::MISSING_FEATURE
+                ),
+            )
+            .at(page_id, &ic.id),
+        );
+        image_placeholder(s, f, theme);
+        return;
+    }
+    let Some(icon) = crate::icons::lookup(&ic.name) else {
+        diags.push(
+            Diagnostic::new(
+                Severity::Warning,
+                format!(
+                    "unknown icon {:?} (try `chimaera board icons {}`); a placeholder marks its box",
+                    ic.name, ic.name
+                ),
+            )
+            .at(page_id, &ic.id)
+            .field("name"),
+        );
+        image_placeholder(s, f, theme);
+        return;
+    };
+
+    let color = theme.color_or_fg(ic.color.as_deref()).hex();
+    let sw = crate::icons::stroke_width(ic.stroke_width);
+    let _ = write!(
+        s,
+        r#"<svg x="{}" y="{}" width="{}" height="{}" viewBox="0 0 {vb} {vb}" preserveAspectRatio="xMidYMid meet">"#,
+        f.x,
+        f.y,
+        f.w,
+        f.h,
+        vb = crate::icons::VIEW_BOX
+    );
+    // Stroked outlines share one group; filled regions (a minority) paint
+    // after so they sit on top, exactly as the source SVG orders them.
+    let _ = write!(
+        s,
+        r#"<g fill="none" stroke="{color}" stroke-width="{sw}" stroke-linecap="round" stroke-linejoin="round">"#
+    );
+    for p in icon.paths.iter().filter(|p| !p.filled) {
+        let _ = write!(s, r#"<path d="{}"/>"#, escape(p.d));
+    }
+    s.push_str("</g>");
+    for p in icon.paths.iter().filter(|p| p.filled) {
+        let _ = write!(
+            s,
+            r#"<path d="{}" fill="{color}" stroke="none"/>"#,
+            escape(p.d)
+        );
+    }
+    s.push_str("</svg>");
+}
+
 /// The dashed box that marks an image which could not be placed — the same
 /// visual the PPTX writer degrades to, so the pane and the deck agree about
 /// what "missing" looks like.
@@ -1904,6 +1994,49 @@ mod tests {
     }
 
     #[test]
+    fn the_canvas_background_overrides_the_theme_ground_but_a_page_fill_wins() {
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let svg_for = |b: &Board| {
+            let mut diags = Vec::new();
+            page_svg(b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap()
+        };
+        let ground = |svg: &str| {
+            // The first rect page_svg emits is the ground.
+            let i = svg.find("fill=\"").unwrap() + 6;
+            svg[i..i + 7].to_string()
+        };
+
+        let mut b = board(DECK);
+        assert_eq!(
+            ground(&svg_for(&b)),
+            theme.bg().hex(),
+            "default: the theme ground"
+        );
+
+        b.canvas.background = Some("@surface".to_string());
+        assert_eq!(
+            ground(&svg_for(&b)),
+            theme.color("@surface").unwrap().hex(),
+            "canvas.background repaints the ground"
+        );
+        b.canvas.background = Some("#a1b2c3".to_string());
+        assert_eq!(ground(&svg_for(&b)), "#a1b2c3", "a literal passes through");
+
+        // A page's own fill is the more specific statement and wins.
+        b.pages[0].background = Some(crate::schema::Background {
+            fill: Some("@edge".to_string()),
+            extra: crate::schema::Extra::new(),
+        });
+        assert_eq!(ground(&svg_for(&b)), theme.color("@edge").unwrap().hex());
+
+        // An unresolvable reference falls back to the theme, never to nothing.
+        b.pages[0].background = None;
+        b.canvas.background = Some("@nope".to_string());
+        assert_eq!(ground(&svg_for(&b)), theme.bg().hex());
+    }
+
+    #[test]
     fn the_origin_chip_is_not_painted() {
         // `data.origin` is required in the schema and surfaced by lint /
         // describe / the chat card's disclosure — but never on the pixels.
@@ -2423,5 +2556,63 @@ mod tests {
             ..Default::default()
         };
         usvg::Tree::from_str(&svg, &opt).expect("page with an inlined figure parses");
+    }
+
+    fn icon_board(fields: &str) -> Board {
+        board(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[240,240]}},
+                "pages":[{{"id":"p","objects":[
+                  {{"id":"ic","type":"icon","at":[40,40],"size":[80,80],{fields}}}]}}]}}"#
+        ))
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn a_known_icon_draws_recolored_vector_paths() {
+        let b = icon_board(r#""name":"flask","color":"@accent1""#);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        // The fit is a nested viewBox; the outline strokes the resolved token
+        // with round caps, and no placeholder appears.
+        assert!(
+            svg.contains(r#"viewBox="0 0 24 24""#),
+            "icon viewBox: {svg}"
+        );
+        assert!(
+            svg.contains("stroke-linecap=\"round\""),
+            "round caps: {svg}"
+        );
+        assert!(!svg.contains("stroke-dasharray"), "no placeholder: {svg}");
+        let accent = theme.color("@accent1").unwrap().hex();
+        assert!(svg.contains(&accent), "recolored to the token: {svg}");
+        assert!(
+            diags.iter().all(|d| d.severity != Severity::Warning),
+            "no warnings for a known icon: {diags:?}"
+        );
+        let opt = usvg::Options {
+            fontdb: fonts.db(),
+            ..Default::default()
+        };
+        usvg::Tree::from_str(&svg, &opt).expect("a page with an icon parses");
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn an_unknown_icon_draws_the_placeholder_and_names_it() {
+        let b = icon_board(r#""name":"no-such-icon-xyz""#);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(svg.contains("stroke-dasharray"), "placeholder box: {svg}");
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Warning
+                && d.object.as_deref() == Some("ic")
+                && d.message.contains("unknown icon")),
+            "{diags:?}"
+        );
     }
 }

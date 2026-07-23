@@ -51,6 +51,10 @@ export interface PageInfo {
 export interface BoardInfo {
   title: string | null;
   canvas: [number, number];
+  /** The board's own ground override (`canvas.background`, an @token or #hex
+   *  literal), null when it follows the theme — the file's literal value, for
+   *  the canvas swatch row's "which one is on" state. */
+  canvasBackground: string | null;
   pages: PageInfo[];
 }
 
@@ -59,7 +63,7 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
   try {
     const raw = JSON.parse(new TextDecoder().decode(bytes)) as {
       title?: string;
-      canvas?: { size?: [number, number] };
+      canvas?: { size?: [number, number]; background?: string };
       pages?: {
         id?: string;
         notes?: string;
@@ -75,6 +79,8 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
     return {
       title: raw.title ?? null,
       canvas: raw.canvas?.size ?? [960, 540],
+      canvasBackground:
+        typeof raw.canvas?.background === "string" ? raw.canvas.background : null,
       pages: (raw.pages ?? []).map((p, i) => ({
         id: p.id ?? `page-${i + 1}`,
         notes: typeof p.notes === "string" ? p.notes : null,

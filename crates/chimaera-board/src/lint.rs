@@ -177,6 +177,25 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
                             let field = format!("nodes[{:?}].fill", node.id);
                             check_color(fill, theme, &page.id, &d.id, &field, &mut diags);
                         }
+                        // A node icon must name a real glyph — the leading icon
+                        // renders a placeholder otherwise, exactly like a bare
+                        // `icon` object, so lint names it as an Error too.
+                        if let Some(name) = node.icon.as_deref() {
+                            if crate::icons::enabled() && crate::icons::lookup(name).is_none() {
+                                diags.push(
+                                    Diagnostic::new(
+                                        Severity::Error,
+                                        format!(
+                                            "node {:?} names unknown icon {name:?}; run \
+                                             `chimaera board icons {name}` to find one",
+                                            node.id
+                                        ),
+                                    )
+                                    .at(&page.id, &d.id)
+                                    .field(&format!("nodes[{:?}].icon", node.id)),
+                                );
+                            }
+                        }
                     }
                 }
                 Object::PanelLabel(pl) => {
@@ -396,6 +415,32 @@ pub fn lint(board: &Board, theme: &Theme) -> Vec<Diagnostic> {
                         .field("of.object"),
                     ),
                 },
+                // A bundled icon must name a real glyph, or it renders a
+                // placeholder — an Error so an export is never quietly broken.
+                // A build without the feature cannot check the name; the
+                // renderer's own placeholder-with-reason covers that case.
+                Object::Icon(ic) => {
+                    if ic.name.trim().is_empty() {
+                        diags.push(
+                            Diagnostic::new(Severity::Error, "icon name is empty")
+                                .at(&page.id, &ic.id)
+                                .field("name"),
+                        );
+                    } else if crate::icons::enabled() && crate::icons::lookup(&ic.name).is_none() {
+                        diags.push(
+                            Diagnostic::new(
+                                Severity::Error,
+                                format!(
+                                    "unknown icon {:?}; run `chimaera board icons {}` to find a \
+                                     name (it renders as a placeholder)",
+                                    ic.name, ic.name
+                                ),
+                            )
+                            .at(&page.id, &ic.id)
+                            .field("name"),
+                        );
+                    }
+                }
                 Object::Image(_) | Object::Group(_) => {}
             }
         }
@@ -561,6 +606,7 @@ pub fn lint_target(
                 Object::Group(_)
                 | Object::Diagram(_)
                 | Object::Equation(_)
+                | Object::Icon(_)
                 | Object::PanelLabel(_)
                 | Object::SigBracket(_)
                 | Object::Legend(_)
@@ -1453,6 +1499,7 @@ fn free_at(board: &Board, page: &Page, theme: &Theme, diags: &mut Vec<Diagnostic
                 | Object::Image(_)
                 | Object::Chart(_)
                 | Object::Diagram(_)
+                | Object::Icon(_)
         );
         if placeable && obj.slot().is_none() && obj.frame().is_some() {
             diags.push(
@@ -1710,6 +1757,22 @@ mod tests {
             diags.iter().all(|d| d.severity != Severity::Error),
             "{diags:?}"
         );
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn an_unknown_icon_name_is_an_error_and_a_known_one_is_clean() {
+        let diags =
+            linted(r#"{"id":"ic","type":"icon","at":[0,0],"size":[48,48],"name":"no-such-xyz"}"#);
+        let e = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.field.as_deref() == Some("name"))
+            .expect("an unknown-icon error");
+        assert!(e.message.contains("unknown icon"), "{}", e.message);
+        assert_eq!(e.object.as_deref(), Some("ic"));
+        // A real icon lints clean.
+        let ok = linted(r#"{"id":"ic","type":"icon","at":[0,0],"size":[48,48],"name":"flask"}"#);
+        assert!(ok.iter().all(|d| d.severity != Severity::Error), "{ok:?}");
     }
 
     #[test]

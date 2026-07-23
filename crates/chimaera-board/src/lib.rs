@@ -35,6 +35,10 @@ pub mod describe;
 pub mod diagram;
 pub mod equation;
 pub mod export;
+/// The bundled Tabler icon set (`icons` cargo feature — the manifest data is
+/// gated, the `icon` object and its refusal are not). Searched by name, placed
+/// recolorable, and exported as editable PPTX vector shapes.
+pub mod icons;
 pub mod imginfo;
 pub mod journal;
 pub mod layout;

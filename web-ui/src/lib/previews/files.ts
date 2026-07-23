@@ -287,6 +287,10 @@ export interface BoardRender {
    *  theme indirection); the hex only shows what it resolves to. Absent on
    *  an older daemon → no swatch row. */
   catSwatches?: { token: string; hex: string }[];
+  /** The theme's ground tones (@bg, @surface, …) → resolved hex, for the
+   *  canvas-background swatch row. Same contract as catSwatches: commit the
+   *  token, show the hex. Absent on an older daemon → no control. */
+  bgSwatches?: { token: string; hex: string }[];
   /** Every composite's derived children (`<id>/<part>`) and their laid-out
    *  `[x, y, w, h]` frames in page points, z-ordered within a composite —
    *  the hit-test map that makes a diagram's nodes selectable instead of the
@@ -297,18 +301,22 @@ export interface BoardRender {
 }
 
 /** Render one page of a board server-side. The daemon caches by content, so
- *  re-asking for an unchanged board is a file stat, not a re-render. */
+ *  re-asking for an unchanged board is a file stat, not a re-render. `mode`
+ *  is the app's current appearance ("light" | "dark") — what an `auto`-themed
+ *  board resolves to; a board that pins a theme ignores it. Omitted (older
+ *  daemon compatibility aside) auto resolves dark. */
 export async function fsBoardRender(
   path: string,
   page = 0,
   scale = 2.0,
   theme?: string,
+  mode?: "light" | "dark",
 ): Promise<BoardRender> {
   return json(
     await api("/board/render", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, page, scale, theme }),
+      body: JSON.stringify({ path, page, scale, theme, mode }),
     }),
   );
 }
@@ -339,6 +347,26 @@ export async function fsBoardEdit(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, object, ...change }),
+    }),
+  );
+  return body.mtime;
+}
+
+/**
+ * The one board-level edit: set (an @token / #hex reference) or clear (null —
+ * back to the theme's ground) `canvas.background`, through the same
+ * server-side canonical writer and journal as every object gesture. Resolves
+ * to the new X-Mtime token for own-write adoption.
+ */
+export async function fsBoardCanvasBackground(
+  path: string,
+  background: string | null,
+): Promise<string | null> {
+  const body = await json<{ mtime: string | null }>(
+    await api("/board/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, canvasBackground: background }),
     }),
   );
   return body.mtime;

@@ -245,7 +245,9 @@ pub fn page_metrics(page: &Page) -> ContentMetrics {
                     m.has_quote_role = true;
                 }
             }
-            Object::Shape(_) => m.object_count += 1,
+            // An icon is decorative geometry like a shape — it occupies a slot
+            // and counts, but does not claim a figure slot the way a chart does.
+            Object::Shape(_) | Object::Icon(_) => m.object_count += 1,
             // A table is panel-like content: it claims a body slot exactly as
             // a chart does, so it counts as a visual for layout selection —
             // and an equation is a placed picture, the same kind of claim.
@@ -338,6 +340,7 @@ pub fn anchor_of(obj: &Object) -> Option<&Anchor> {
         | Object::Table(_)
         | Object::Connector(_)
         | Object::Equation(_)
+        | Object::Icon(_)
         | Object::Scalebar(_)
         | Object::SigBracket(_)
         | Object::Legend(_)
@@ -359,6 +362,7 @@ fn explicit_size(obj: &Object) -> Option<[f64; 2]> {
         Object::Chart(o) => o.size,
         Object::Diagram(o) => o.size,
         Object::Equation(o) => o.size,
+        Object::Icon(o) => o.size,
         // An anchored letter needs *a* box before its glyph is measured; the
         // nominal keeps `inside-top-left` (the typical binding) exact.
         Object::PanelLabel(o) => o.size.or(Some(crate::composites::PANEL_LABEL_NOMINAL)),

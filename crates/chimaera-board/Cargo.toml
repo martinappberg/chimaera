@@ -59,13 +59,21 @@ hayro = { version = "0.7", optional = true }
 mathtex = { version = "0.1.0", optional = true }
 
 [features]
-default = ["math"]
+default = ["math", "icons"]
 # The `equation` object: LaTeX math typeset to glyph-outline SVG
 # (src/equation.rs). On by default — the plan treats equation as core
 # vocabulary — but skippable (`--no-default-features`) for a build that can
 # spare the engine + bundled STIX Two Math font (~2.4 MB of binary). The
 # schema, ceilings and the missing-feature refusal compile in every build.
 math = ["dep:mathtex"]
+# The bundled Tabler icon set (src/icons.rs + the committed manifest under
+# src/icons/): a discoverable, recolorable, PPTX-editable outline collection
+# the agent places by name. On by default — richer figures are core to the
+# board's "composition tool, not diagram builder" ambition — but skippable
+# (`--no-default-features`) for a build that can spare the ~1.4 MB manifest.
+# The `icon` object, its ceilings and the missing-feature refusal compile in
+# every build; only the manifest data is gated (mirrors `math`).
+icons = []
 # The `chimaera board` CLI layer (src/cli.rs): the clap Subcommand + verb
 # implementations both binaries mount. A library consumer (the daemon's
 # routes) never needs it, so clap stays out of default builds.

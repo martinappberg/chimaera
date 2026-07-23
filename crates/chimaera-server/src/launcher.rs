@@ -691,7 +691,10 @@ and `--spec FILE` reads the spec from a file instead of stdin. For anything \
 beyond this example — boxplots, multi-series, layers, tables, diagrams, \
 decks, saving persistent boards — run `chimaera board guide` once: it is the \
 complete manual, so never explore `--help`, the source, or the repo to learn \
-the tool. Favor binding real project files (`data.source`, \
+the tool. Richer figures need not be plain boxes: place bundled icons \
+(`chimaera board icons <query>` finds names — flask, arrow, dna, chart) and \
+imported SVG/PNG, recolored with theme tokens and editable after a PPTX \
+export. Favor binding real project files (`data.source`, \
 workspace-relative) over inlined values, and when you computed the values \
 yourself record how in `data.trace` plus the files read in `data.inputs`. \
 When telling the user what you are doing, \

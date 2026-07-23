@@ -99,6 +99,14 @@ pub struct Canvas {
     pub target: Option<String>,
     /// `[width, height]` in points.
     pub size: [f64; 2],
+    /// The board's own ground: a theme token (`@bg`, `@surface`, …) or a
+    /// `#rrggbb` literal painted under every page instead of the resolved
+    /// theme's ground. Absent — the default — means "the theme's ground",
+    /// which is what lets an `auto`-themed board follow the viewer's
+    /// light/dark mode. A page's `background.fill` still wins over this: the
+    /// more specific statement is the stronger one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -118,6 +126,7 @@ impl Default for Canvas {
             preset: Some("talk-16x9".to_string()),
             target: None,
             size: [960.0, 540.0],
+            background: None,
             extra: Extra::new(),
         }
     }
@@ -240,6 +249,7 @@ pub enum Object {
     Chart(ChartObject),
     Diagram(DiagramObject),
     Equation(EquationObject),
+    Icon(IconObject),
     PanelLabel(PanelLabelObject),
     Scalebar(ScalebarObject),
     SigBracket(SigBracketObject),
@@ -274,6 +284,7 @@ impl Object {
             Object::Chart(o) => &o.id,
             Object::Diagram(o) => &o.id,
             Object::Equation(o) => &o.id,
+            Object::Icon(o) => &o.id,
             Object::PanelLabel(o) => &o.id,
             Object::Scalebar(o) => &o.id,
             Object::SigBracket(o) => &o.id,
@@ -297,6 +308,7 @@ impl Object {
             Object::Chart(_) => "chart",
             Object::Diagram(_) => "diagram",
             Object::Equation(_) => "equation",
+            Object::Icon(_) => "icon",
             Object::PanelLabel(_) => "panelLabel",
             Object::Scalebar(_) => "scalebar",
             Object::SigBracket(_) => "sigBracket",
@@ -322,6 +334,7 @@ impl Object {
             Object::Chart(o) => (o.at, o.size),
             Object::Diagram(o) => (o.at, o.size),
             Object::Equation(o) => (o.at, o.size),
+            Object::Icon(o) => (o.at, o.size),
             Object::PanelLabel(o) => (o.at, o.size),
             Object::Legend(o) => (o.at, o.size),
             Object::Colorbar(o) => (o.at, o.size),
@@ -351,6 +364,7 @@ impl Object {
             Object::Chart(o) => o.at = Some(at),
             Object::Diagram(o) => o.at = Some(at),
             Object::Equation(o) => o.at = Some(at),
+            Object::Icon(o) => o.at = Some(at),
             Object::PanelLabel(o) => o.at = Some(at),
             Object::Scalebar(o) => o.at = Some(at),
             Object::Legend(o) => o.at = Some(at),
@@ -371,6 +385,7 @@ impl Object {
             Object::Chart(o) => o.size = Some(size),
             Object::Diagram(o) => o.size = Some(size),
             Object::Equation(o) => o.size = Some(size),
+            Object::Icon(o) => o.size = Some(size),
             Object::PanelLabel(o) => o.size = Some(size),
             Object::Legend(o) => o.size = Some(size),
             Object::Colorbar(o) => o.size = Some(size),
@@ -395,6 +410,7 @@ impl Object {
             Object::Chart(o) => o.slot.as_deref(),
             Object::Diagram(o) => o.slot.as_deref(),
             Object::Equation(o) => o.slot.as_deref(),
+            Object::Icon(o) => o.slot.as_deref(),
             Object::Group(_)
             | Object::Connector(_)
             | Object::PanelLabel(_)
@@ -449,6 +465,7 @@ impl Serialize for Object {
             Object::Chart(o) => o.serialize(s),
             Object::Diagram(o) => o.serialize(s),
             Object::Equation(o) => o.serialize(s),
+            Object::Icon(o) => o.serialize(s),
             Object::PanelLabel(o) => o.serialize(s),
             Object::Scalebar(o) => o.serialize(s),
             Object::SigBracket(o) => o.serialize(s),
@@ -504,6 +521,7 @@ impl<'de> Deserialize<'de> for Object {
             "chart" => try_variant!(ChartObject, Object::Chart),
             "diagram" => try_variant!(DiagramObject, Object::Diagram),
             "equation" => try_variant!(EquationObject, Object::Equation),
+            "icon" => try_variant!(IconObject, Object::Icon),
             "panelLabel" => try_variant!(PanelLabelObject, Object::PanelLabel),
             "scalebar" => try_variant!(ScalebarObject, Object::Scalebar),
             "sigBracket" => try_variant!(SigBracketObject, Object::SigBracket),
@@ -559,6 +577,7 @@ kind_field!(TableKind, "table");
 kind_field!(ChartKind, "chart");
 kind_field!(DiagramKind, "diagram");
 kind_field!(EquationKind, "equation");
+kind_field!(IconKind, "icon");
 kind_field!(PanelLabelKind, "panelLabel");
 kind_field!(ScalebarKind, "scalebar");
 kind_field!(SigBracketKind, "sigBracket");
@@ -1045,6 +1064,47 @@ pub struct EquationObject {
 }
 
 // ---------------------------------------------------------------------------
+// Icon
+// ---------------------------------------------------------------------------
+
+/// A named glyph from the bundled Tabler outline set ([`crate::icons`]) —
+/// close kin to a `shape` with `geo:"path"`, but the drawing lives in the
+/// engine keyed by `name`, not inline in the board. The renderer fits its
+/// 24×24 paths into the object box (aspect-preserving, centered) and strokes
+/// them with `color`; recoloring is just a different token, and a resize is
+/// free because the geometry is spec-only. An unknown `name` renders a visible
+/// placeholder and lints — never a silent blank. Icons compose with imported
+/// SVG/PNG and shapes into real figures, all editable after a PPTX export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IconObject {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: IconKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
+    /// The Tabler outline icon name, e.g. `"flask"`. Find one with
+    /// `chimaera board icons <query>`.
+    pub name: String,
+    /// A theme `@token` or literal for the stroke/fill; defaults to `@fg`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Stroke weight in the 24-unit viewBox space (Tabler's own scale, so
+    /// `2` is the designed look); scales with the placed size. Defaults to
+    /// [`crate::icons::DEFAULT_STROKE_WIDTH`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_width: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+// ---------------------------------------------------------------------------
 // Anchors
 // ---------------------------------------------------------------------------
 
@@ -1443,6 +1503,11 @@ pub struct DiagramNode {
     /// Defaults to `roundRect` when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<NodeShape>,
+    /// A bundled icon name ([`crate::icons`]) drawn leading the label, sized to
+    /// the node height — the cheap fix for a "too boring" flow. Layout widens
+    /// the node for it; an unknown name renders a placeholder and lints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Pinned top-left position in page points. Absent (the norm) means the
     /// layered layout places the node; present means the layout honors the
     /// pin — a human dragged this node and it stays where its diagram flows
@@ -1848,6 +1913,34 @@ mod tests {
             back,
             r#"{"id":"eq1","type":"equation","at":[80.0,80.0],"size":[240.0,80.0],"tex":"E = mc^2","emSize":14.0,"alt":"E = mc^2","futureKnob":7}"#
         );
+    }
+
+    #[test]
+    fn an_icon_round_trips_byte_stably_with_canonical_key_order() {
+        let raw = r#"{"id":"ic1","type":"icon","at":[80,80],"size":[48,48],"name":"flask","color":"@accent1","strokeWidth":1.5,"alt":"flask","futureKnob":7}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Icon(ic) = &obj else {
+            panic!("expected icon, got {obj:?}")
+        };
+        assert_eq!(ic.name, "flask");
+        assert_eq!(ic.color.as_deref(), Some("@accent1"));
+        assert_eq!(ic.stroke_width, Some(1.5));
+        assert_eq!(ic.extra.get("futureKnob").unwrap(), &Value::from(7));
+        // Canonical key order is declaration order — byte-stable round-trip.
+        let back = serde_json::to_string(&obj).unwrap();
+        assert_eq!(
+            back,
+            r#"{"id":"ic1","type":"icon","at":[80.0,80.0],"size":[48.0,48.0],"name":"flask","color":"@accent1","strokeWidth":1.5,"alt":"flask","futureKnob":7}"#
+        );
+    }
+
+    #[test]
+    fn an_icon_without_a_name_fails_parse_into_unknown() {
+        // `name` is required — a nameless icon is malformed and preserved as
+        // Unknown with a reason, exactly like any other broken known type.
+        let raw = r#"{"id":"ic1","type":"icon","at":[0,0],"size":[24,24]}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        assert!(matches!(&obj, Object::Unknown(u) if u.kind == "icon" && u.error.is_some()));
     }
 
     #[test]

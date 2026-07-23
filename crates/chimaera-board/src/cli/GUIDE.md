@@ -23,7 +23,8 @@ inline in chat. The spec is `title`, `note`, and exactly ONE of `chart`,
   `marks`.
 - `--id SLUG` is the update handle: re-running with the same id updates the
   same card in place (sweeps, progress). `--preset default|wide|square|tall`
-  or `--size WxH`; `--theme talk-dark|talk-light|figure-light`.
+  or `--size WxH`; `--theme auto|talk-dark|talk-light|figure-light` (`auto`,
+  the default, follows the viewer's light/dark mode).
 
 **The full chart vocabulary passes through** — state `marks` (or `mark`) and
 you own the chart: marks `bar line point area rect tick rule errorbar text
@@ -74,15 +75,37 @@ or editing a board; plain `render` does not surface a card.
 `pages[].objects[]`, each with a unique slug `id` (the Edit/diff/journal
 anchor — never rename casually). Positions in points (16:9 = 960×540,
 origin top-left, 8 pt grid snap on save). Object types: `text` `shape`
-`connector` `image` `group` `table` `chart` `diagram` `equation` (+
+`connector` `image` `group` `table` `chart` `diagram` `equation` `icon` (+
 annotations `panelLabel` `scalebar` `sigBracket` `legend` `colorbar`
 `callout` `inset`). Text carries roles, not font sizes (`"role":"title" |
 heading | subtitle | body | caption | label | code`); colors are theme
 `@tokens` (`@fg @body @muted @accent1 @surface @edge @bg @cat1..7`) or
 `#hex`. Prefer `page.intent.kind` + slots over coordinates — the layout
-engine places slotted objects. Themes: `talk-dark` (default), `talk-light`,
-`figure-light`. After writing: `lint` then `render` (or `show --file`), and
-LOOK at the PNG.
+engine places slotted objects. Themes: `auto` (default — resolves to the
+viewer's light/dark mode at render time), `talk-dark`, `talk-light`,
+`figure-light`; pin one for a fixed ground. `canvas.background` (an `@token`
+or `#hex`) repaints the ground under every page; a page's own
+`background.fill` wins over it. After writing: `lint` then `render` (or
+`show --file`), and LOOK at the PNG.
+
+## Icons & rich composition
+
+Board is a composition tool, not just a diagram builder: bundled **icons**,
+imported **SVG/PNG** figures, and native shapes combine into real artwork, all
+editable after a PPTX export. Find an icon name in one call —
+`chimaera board icons flask`, `chimaera board icons arrow` (fuzzy over names +
+synonyms; `--list` prints the total) — then place it:
+
+    {"type":"icon","name":"flask","at":[80,80],"size":[48,48],"color":"@accent1"}
+
+`color` is any `@token` or `#hex` (default `@fg`), so a recolor is a token
+swap; `strokeWidth` (default 2, Tabler's scale) thickens or thins the line; a
+resize is free. A **diagram node** takes a leading icon the same way —
+`{"id":"train","label":"Train","icon":"flask"}` — sized to the node and laid
+out beside the label; that alone lifts a plain flow out of "too boring". An
+unknown name renders a visible placeholder and lints, never a silent blank.
+Compose icons with `import`ed `.svg`/`.png` and shapes for figures you keep
+editing, then `export --format pptx` to hand off for polishing in PowerPoint.
 
 ## The other verbs, one line each
 
@@ -95,6 +118,7 @@ LOOK at the PNG.
   editable.
 - `adopt SHOWN_ID [--to board]` — promote a shown card into the workspace.
 - `import fig.svg|.png|.mmd --to FILE` — figures/mermaid into a board.
+- `icons [QUERY] [--list]` — find bundled icons by name/synonym in one call.
 - `journal FILE [--since N]` — what the human changed on the surface.
 - `arrange FILE --op align-left|distribute-h|grid --ids a,b,c` — tidy by id.
 - `theme-export ID --format mplstyle|json` — theme numbers for matplotlib.

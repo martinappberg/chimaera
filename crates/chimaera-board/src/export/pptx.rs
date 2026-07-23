@@ -979,6 +979,7 @@ fn emit_object(w: &mut SlideWriter, obj: &Object) {
         Object::Chart(c) => emit_chart(w, c, frame),
         Object::Diagram(d) => emit_diagram(w, d, frame),
         Object::Equation(eq) => emit_equation(w, eq, frame),
+        Object::Icon(ic) => emit_icon(w, ic, frame),
         Object::PanelLabel(o) => {
             let (children, problems) = o.expand(w.theme, w.fonts);
             emit_composite(w, &o.id, children, problems);
@@ -1188,6 +1189,152 @@ fn emit_diagram(w: &mut SlideWriter, d: &crate::schema::DiagramObject, frame: Op
     w.shared.fates.truncate(fates_before);
     w.index = saved_index;
     w.fate(&d.id, ExportTier::Grouped, reason);
+}
+
+/// Translate + uniform-scale one parsed segment (arcs already flattened) from
+/// the icon's 24×24 space into page space.
+fn map_seg(seg: Seg, scale: f64, ox: f64, oy: f64) -> Seg {
+    let m = |p: [f64; 2]| [ox + p[0] * scale, oy + p[1] * scale];
+    match seg {
+        Seg::Move(p) => Seg::Move(m(p)),
+        Seg::Line(p) => Seg::Line(m(p)),
+        Seg::Cubic(c1, c2, p) => Seg::Cubic(m(c1), m(c2), m(p)),
+        Seg::Close => Seg::Close,
+    }
+}
+
+/// The page-space bounding box over a path's points (control points included,
+/// so the custGeom path space never clips a Bézier); `None` for a path with
+/// no drawable points.
+fn segs_bbox(segs: &[Seg]) -> Option<Frame> {
+    let mut lo = [f64::MAX; 2];
+    let mut hi = [f64::MIN; 2];
+    let mut acc = |p: [f64; 2]| {
+        lo[0] = lo[0].min(p[0]);
+        lo[1] = lo[1].min(p[1]);
+        hi[0] = hi[0].max(p[0]);
+        hi[1] = hi[1].max(p[1]);
+    };
+    for seg in segs {
+        match *seg {
+            Seg::Move(p) | Seg::Line(p) => acc(p),
+            Seg::Cubic(c1, c2, p) => {
+                acc(c1);
+                acc(c2);
+                acc(p);
+            }
+            Seg::Close => {}
+        }
+    }
+    (lo[0] <= hi[0]).then_some(Frame {
+        x: lo[0],
+        y: lo[1],
+        w: (hi[0] - lo[0]).max(f64::EPSILON),
+        h: (hi[1] - lo[1]).max(f64::EPSILON),
+    })
+}
+
+/// A bundled icon as a group of editable `custGeom` shapes — the same fit the
+/// renderer draws (`icons::fit`), each outline path a stroked no-fill shape and
+/// each filled region a solid shape, so PowerPoint opens real vector geometry
+/// the user can recolor or "drag down and polish". Unknown names — and a build
+/// without the feature — degrade to a stated fate, never a phantom shape.
+fn emit_icon(w: &mut SlideWriter, ic: &crate::schema::IconObject, frame: Option<Frame>) {
+    let Some(f) = frame else {
+        w.fate(
+            &ic.id,
+            ExportTier::Raster,
+            "skipped: no geometry (slot unresolved)",
+        );
+        return;
+    };
+    if !crate::icons::enabled() {
+        w.fate(
+            &ic.id,
+            ExportTier::Raster,
+            format!("skipped: {}", crate::icons::MISSING_FEATURE),
+        );
+        return;
+    }
+    let Some(icon) = crate::icons::lookup(&ic.name) else {
+        w.fate(
+            &ic.id,
+            ExportTier::Raster,
+            format!("skipped: unknown icon {:?}", ic.name),
+        );
+        return;
+    };
+
+    let (scale, ox, oy) = crate::icons::fit(f);
+    let color_ref = ic.color.clone().unwrap_or_else(|| "@fg".to_string());
+    let sw_pt = crate::icons::stroke_width(ic.stroke_width) * scale;
+
+    // Parse + transform every path up front; a path that fails to parse (never
+    // expected from the committed manifest) is skipped rather than half-drawn.
+    let mut shapes: Vec<(Vec<Seg>, Frame, bool)> = Vec::new();
+    for p in &icon.paths {
+        let Ok(segs) = parse_svg_path(p.d) else {
+            continue;
+        };
+        let tsegs: Vec<Seg> = segs
+            .into_iter()
+            .map(|s| map_seg(s, scale, ox, oy))
+            .collect();
+        if let Some(bb) = segs_bbox(&tsegs) {
+            shapes.push((tsegs, bb, p.filled));
+        }
+    }
+    if shapes.is_empty() {
+        w.fate(
+            &ic.id,
+            ExportTier::Raster,
+            format!("skipped: icon {:?} produced no drawable paths", ic.name),
+        );
+        return;
+    }
+    let n = shapes.len();
+
+    let stroked = Stroke {
+        color: Some(color_ref.clone()),
+        width: Some(sw_pt),
+        dash: None,
+        opacity: None,
+        cap: Some("round".to_string()),
+        join: Some("round".to_string()),
+        extra: Default::default(),
+    };
+    let nv = w.cnvpr(&ic.id, ic.alt.as_deref(), None);
+    let _ = write!(
+        w.xml,
+        r#"<p:grpSp><p:nvGrpSpPr>{nv}<p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr>{}</p:grpSpPr>"#,
+        grp_xfrm(f)
+    );
+    for (i, (segs, bb, filled)) in shapes.iter().enumerate() {
+        let cnv = w.cnvpr(&format!("{}/path{i}", ic.id), None, None);
+        let geom = cust_geom(segs, *bb);
+        let (fill, ln) = if *filled {
+            (
+                solid_fill(w.theme, Some(&color_ref), None),
+                NO_LINE.to_string(),
+            )
+        } else {
+            (
+                "<a:noFill/>".to_string(),
+                line_xml(w.theme, &stroked, sw_pt, ""),
+            )
+        };
+        let _ = write!(
+            w.xml,
+            r#"<p:sp><p:nvSpPr>{cnv}<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}{geom}{fill}{ln}</p:spPr></p:sp>"#,
+            xfrm(*bb, None, false, false)
+        );
+    }
+    w.xml.push_str("</p:grpSp>");
+    w.fate(
+        &ic.id,
+        ExportTier::Grouped,
+        format!("icon {:?} as {n} editable vector shapes", ic.name),
+    );
 }
 
 /// An annotation composite as a group of the primitives its expansion
@@ -3453,6 +3600,46 @@ mod tests {
         let fate = report.objects.iter().find(|f| f.id == "panel").unwrap();
         assert_eq!(fate.tier, ExportTier::Vector);
         assert_eq!(fate.reason, "svg embedded with PNG fallback (svgBlip)");
+    }
+
+    #[cfg(feature = "icons")]
+    #[test]
+    fn an_icon_exports_as_a_group_of_editable_vector_shapes() {
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[240,240]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"ic","type":"icon","at":[40,40],"size":[80,80],
+                   "name":"flask","color":"@cat2"}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+
+        // A group wraps one editable custGeom shape per drawing path, and no
+        // consumer ever sees an a:arcTo (rule 1 — arcs flattened to cubics).
+        let paths = crate::icons::lookup("flask").unwrap().paths.len();
+        assert!(paths > 1, "flask has several paths");
+        assert!(slide.contains("<p:grpSp>"), "icon is a group: {slide}");
+        assert_eq!(
+            slide.matches("<a:custGeom>").count(),
+            paths,
+            "one editable custom-geometry shape per icon path: {slide}"
+        );
+        assert!(!slide.contains("<a:arcTo"), "arcs flattened: {slide}");
+        // A non-scheme token inks the strokes as a resolved srgb literal
+        // (@bg/@fg/@accent1 would re-theme as schemeClr instead).
+        let cat2 = crate::theme::default_for(true).color("@cat2").unwrap();
+        assert!(slide.contains(&hex6(cat2)), "recolored: {slide}");
+        assert_well_formed(&slide);
+
+        // One fate for the composite, naming the editable outcome.
+        let fate = report.objects.iter().find(|f| f.id == "ic").unwrap();
+        assert_eq!(fate.tier, ExportTier::Grouped);
+        assert!(
+            fate.reason.contains("editable vector shapes"),
+            "{}",
+            fate.reason
+        );
     }
 
     #[cfg(feature = "math")]
