@@ -190,6 +190,18 @@ fn relay_allowed(class: HostClass) -> bool {
     matches!(class, HostClass::ComputeNode)
 }
 
+/// Is a cached route still usable for the entry's CURRENT class? `Direct` always
+/// is (retrying a direct dial is harmless). A cached `Relay` is not once the
+/// class no longer permits one — a re-mint can flip a compute node to a
+/// confirmed `Other` when its allocation ends, and an ssh `-L` tunnel must
+/// never outlive the class that justified it (codex round 6).
+fn cached_route_usable(route: Route, class: HostClass) -> bool {
+    match route {
+        Route::Direct => true,
+        Route::Relay(_) => relay_allowed(class),
+    }
+}
+
 fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -374,7 +386,16 @@ pub(crate) async fn create_proxy(
             entry.last_used = Instant::now();
             // A re-mint is a fresh classification: refresh the stored class and
             // reset the revalidation clock (the confirm gate above already
-            // re-ran classify_host).
+            // re-ran classify_host). A CHANGED class invalidates the proven
+            // route — most importantly, a compute node whose allocation ended
+            // and is now a confirmed Other must not keep its ssh relay: drop
+            // the route and kill the orphaned child (outside the lock, below).
+            if entry.class != class {
+                entry.route = None;
+                if let Some(child) = entry.relay.take() {
+                    evicted.push(child);
+                }
+            }
             entry.class = class;
             entry.revalidated_at = Instant::now();
             (id.clone(), evicted)
@@ -569,12 +590,18 @@ async fn dial(state: &AppState, id: &str) -> Result<(TcpStream, Route), DialErro
         }
     }
 
-    // Fast path: a proven route, no locks held.
+    // Fast path: a proven route, no locks held. A cached route is honored only
+    // while the current class still permits it — an ssh relay must never
+    // outlive a drop to a non-relay class (codex round 6); an unusable one
+    // clears and re-probes below (direct-only for a non-relay class).
     if let Some(route) = p.route {
-        if let Ok(s) = connect_route(&p.host, p.port, route).await {
-            return Ok((s, route));
+        if cached_route_usable(route, p.class) {
+            if let Ok(s) = connect_route(&p.host, p.port, route).await {
+                return Ok((s, route));
+            }
         }
-        // Route went stale (server restarted, relay died): clear and reprobe.
+        // Route went stale (server restarted, relay died) or the class revoked
+        // it: clear and reprobe.
         let dead_relay = {
             let mut store = crate::lock(&state.proxies);
             store.entries.get_mut(id).and_then(|e| {
@@ -1383,6 +1410,25 @@ mod tests {
         // The security crux: a confirmed ordinary remote is dialed directly or
         // reported unreachable — the daemon never ssh-relays to it.
         assert!(!relay_allowed(HostClass::Other));
+    }
+
+    #[test]
+    fn cached_relay_dies_when_class_no_longer_allows_it() {
+        // Direct is always retryable.
+        assert!(cached_route_usable(Route::Direct, HostClass::Other));
+        assert!(cached_route_usable(Route::Direct, HostClass::Loopback));
+        // A relay is honored only while the class still permits one.
+        assert!(cached_route_usable(
+            Route::Relay(40000),
+            HostClass::ComputeNode
+        ));
+        // The crux: a relay proven while the node was allocated must NOT be
+        // reused once a re-mint flips the entry to a confirmed Other.
+        assert!(!cached_route_usable(Route::Relay(40000), HostClass::Other));
+        assert!(!cached_route_usable(
+            Route::Relay(40000),
+            HostClass::Loopback
+        ));
     }
 
     #[test]
