@@ -194,6 +194,21 @@ fn short_label(host: &str) -> String {
     host.split('.').next().unwrap_or(host).to_ascii_lowercase()
 }
 
+/// Does `host` name `trusted` closely enough to skip the user confirmation the
+/// proxy relies on? Either an exact, case-insensitive match, or a BARE short
+/// name (no dot) equal to `trusted`'s first label — the ordinary case where an
+/// app prints `sh03-09n14` but the daemon knows the node as `sh03-09n14.int`.
+///
+/// A DOTTED host is trusted ONLY by exact match. Matching on the short label
+/// alone would wave through `trusted.attacker.example`: an attacker can stand
+/// up a host whose first label coincides with the daemon's own name or an
+/// allocated node, and short-label matching would auto-open it as a
+/// same-origin pane without the confirmation gate (P1, codex round 4).
+fn host_matches(host: &str, trusted: &str) -> bool {
+    host.eq_ignore_ascii_case(trusted)
+        || (!host.contains('.') && short_label(host) == short_label(trusted))
+}
+
 /// Expand a Slurm nodelist expression conservatively: `a[1-3,7],b02` →
 /// a1 a2 a3 a7 b02. Zero-padding is preserved; anything unparseable is kept
 /// verbatim (it then only matches exactly). Capped — a giant allocation must
@@ -261,19 +276,20 @@ async fn classify_host(state: &AppState, host: &str) -> HostClass {
     if is_loopback_host(host) {
         return HostClass::Loopback;
     }
-    let short = short_label(host);
-    if host.eq_ignore_ascii_case(&state.hostname) || short == short_label(&state.hostname) {
+    if host_matches(host, &state.hostname) {
         return HostClass::SelfHost;
     }
     // A node one of the user's own Slurm jobs runs on is theirs to reach.
     // Only RUNNING jobs have a real nodelist in `nodes`; for a pending job
     // that field is Slurm's pending-reason text, not a nodelist (matches the
-    // UI's nodeCandidates filter).
+    // UI's nodeCandidates filter). The nodelist is short names — a probed
+    // target is too (nodeCandidates), so host_matches auto-allows only a bare
+    // node name, never `<node>.attacker.example`.
     let snapshot = state.compute.snapshot(false).await;
     if snapshot.scheduler == "slurm" {
         for job in snapshot.jobs.iter().filter(|j| j.state == "RUNNING") {
             for node in expand_nodelist(&job.nodes, 512) {
-                if short == node.to_ascii_lowercase() {
+                if host_matches(host, &node) {
                     return HostClass::ComputeNode;
                 }
             }
@@ -1266,6 +1282,27 @@ mod tests {
         );
         assert_eq!(expand_nodelist("n[1-100000]", 4).len(), 4, "cap holds");
         assert_eq!(expand_nodelist("", 4), Vec::<String>::new());
+    }
+
+    #[test]
+    fn host_match_requires_exact_or_bare_short() {
+        // Bare short name matching the trusted short label — the ordinary case
+        // (an app prints `login01`, the daemon knows itself as `login01.int`).
+        assert!(host_matches("login01", "login01.cluster.edu"));
+        assert!(host_matches("SH03-09N14", "sh03-09n14"), "case-insensitive");
+        // Exact canonical match, FQDN or bare.
+        assert!(host_matches("login01.cluster.edu", "login01.cluster.edu"));
+        assert!(host_matches("login01", "login01"));
+        // The exploit: a DOTTED attacker host whose first label coincides with
+        // a trusted short name must NOT auto-allow — it needs confirmation.
+        assert!(!host_matches("login01.attacker.example", "login01"));
+        assert!(!host_matches(
+            "login01.attacker.example",
+            "login01.cluster.edu"
+        ));
+        assert!(!host_matches("sh03-09n14.attacker.example", "sh03-09n14"));
+        // A different bare name is never a match.
+        assert!(!host_matches("login02", "login01"));
     }
 
     #[test]

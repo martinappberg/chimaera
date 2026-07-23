@@ -185,6 +185,14 @@
       nodeHits = [];
       probing = false;
       probedFor = null;
+      // Drop the OLD target's iframe immediately. Leaving base/iframeSrc live
+      // would keep the previous page mounted through the new `connecting`
+      // phase, and a late onload — or the 1s poll — could read it against the
+      // now-stale base and persist the wrong location onto the NEW target.
+      // connect() sets them fresh once the new session is minted (codex R4).
+      base = null;
+      proxyId = null;
+      iframeSrc = null;
       // `moved` is intentionally NOT reset here — an auto-move sets it right
       // before it re-points, and this reset runs as a consequence of that
       // very re-point; clearing it would erase the note we just set.
