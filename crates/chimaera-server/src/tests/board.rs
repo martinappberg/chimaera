@@ -797,4 +797,24 @@ async fn board_export_refuses_bad_format_and_page_misuse() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
         assert!(json["error"].as_str().unwrap().contains(needle), "{json}");
     }
+
+    // chartsNative off pptx is a 422 — "fix the parameters", distinct from
+    // the generic 400s above, with the CLI-parity message.
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/export",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(), "format": "svg", "chartsNative": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("applies to pptx only"),
+        "{json}"
+    );
 }

@@ -16,10 +16,14 @@
   import { untrack } from "svelte";
   import {
     fsBoardEdit,
+    fsBoardExport,
     fsBoardJournalAll,
     fsBoardJournalAppend,
     fsBoardRender,
     midTruncate,
+    navigateDownload,
+    type BoardExport,
+    type BoardExportFormat,
     type BoardJournalOp,
     type BoardRender,
   } from "./files";
@@ -38,6 +42,7 @@
     editorFontPx,
     editorTextToNodeLabel,
     editorTextToParagraphs,
+    fateCensus,
     GRID_PT,
     hitChild,
     MIN_RESIZE_PT,
@@ -155,6 +160,15 @@
     pinMode = false;
     selectedChild = null;
     childOverlay = null;
+    // The export popover is board-scoped: close it and drop the previous
+    // board's preflight (its key would miss anyway; the state must not
+    // flash the old board's fates over the new one).
+    exportOpen = false;
+    preflight = null;
+    preflightKey = "";
+    exportError = null;
+    exportSeq++;
+    exportBusy = false;
   });
   $effect(() => {
     const count = render?.pageCount ?? 1;
@@ -1137,6 +1151,125 @@
     untrack(() => addFlashes(changed));
   });
 
+  // --- export popover (§11: the fidelity preflight) ------------------------
+  /** The route's format vocabulary exactly; only the label softens the id. */
+  const EXPORT_FORMATS: { id: BoardExportFormat; label: string }[] = [
+    { id: "pptx", label: "pptx" },
+    { id: "pdf", label: "pdf" },
+    { id: "svg", label: "svg" },
+    { id: "svg-outlined", label: "svg outlined" },
+  ];
+  let exportOpen = $state(false);
+  let exportFormat = $state<BoardExportFormat>("pptx");
+  /** The CLI's `--charts native`: pptx-only, opt-in until the plan's
+   *  hand-verified "Edit Data opens" pass in desktop PowerPoint. */
+  let exportNative = $state(false);
+  let exportBusy = $state(false);
+  let exportError = $state<string | null>(null);
+  /** The one pptx export the open popover performed: its `objects` ARE the
+   *  preflight and its ticket IS what the download button consumes — the
+   *  fates are never bought with a second export of the same configuration. */
+  let preflight = $state<BoardExport | null>(null);
+  /** What the current `preflight` was exported from (path·native·mtime), so
+   *  switching formats away and back never re-exports unchanged input. */
+  let preflightKey = "";
+  /** When it landed: a download ticket lives ~10 min server-side, so a
+   *  preflight older than the memo window re-exports rather than handing the
+   *  download button a dead ticket (same margin as files.ts's ticket memo). */
+  let preflightAt = 0;
+  const PREFLIGHT_TTL_MS = 8 * 60 * 1000;
+  let exportSeq = 0;
+  let exportPopEl = $state<HTMLDivElement | null>(null);
+  let exportChipEl = $state<HTMLButtonElement | null>(null);
+
+  function closeExport(): void {
+    exportOpen = false;
+    exportError = null;
+    exportSeq++;
+    exportBusy = false;
+  }
+
+  // The pptx preflight: opening the popover on pptx (or toggling native
+  // charts, or the board changing on disk underneath) performs THE export,
+  // so the fates shown are the file the ticket downloads — §11's "stated
+  // before you export", with the statement costing no extra export.
+  $effect(() => {
+    if (!exportOpen || exportFormat !== "pptx") return;
+    const p = path;
+    const native = exportNative;
+    const key = `${p} ${native} ${entry?.mtime ?? ""}`;
+    if (preflight !== null && key === preflightKey && Date.now() - preflightAt < PREFLIGHT_TTL_MS)
+      return;
+    const seq = ++exportSeq;
+    exportBusy = true;
+    exportError = null;
+    fsBoardExport(p, "pptx", native).then(
+      (r) => {
+        if (seq !== exportSeq) return;
+        preflight = r;
+        preflightKey = key;
+        preflightAt = Date.now();
+        exportBusy = false;
+      },
+      (err: unknown) => {
+        if (seq !== exportSeq) return;
+        preflight = null;
+        exportError = err instanceof Error ? err.message : String(err);
+        exportBusy = false;
+      },
+    );
+  });
+
+  /** Download the selected format: pptx consumes the preflight's own ticket
+   *  (that export already happened); pdf/svg export now, then download. */
+  async function downloadExport(): Promise<void> {
+    if (exportBusy) return;
+    if (exportFormat === "pptx") {
+      const p = preflight;
+      if (p === null) return;
+      navigateDownload(p.ticket);
+      showToast(`downloading ${p.filename}`);
+      closeExport();
+      return;
+    }
+    exportBusy = true;
+    exportError = null;
+    try {
+      const r = await fsBoardExport(path, exportFormat);
+      navigateDownload(r.ticket);
+      showToast(`downloading ${r.filename}`);
+      closeExport();
+    } catch (err) {
+      exportError = err instanceof Error ? err.message : String(err);
+      exportBusy = false;
+    }
+  }
+
+  // The popover dismisses like the pin popover: Escape, or a press outside
+  // its own chrome (the chip toggles itself).
+  $effect(() => {
+    if (!exportOpen) return;
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeExport();
+        exportChipEl?.focus();
+      }
+    };
+    const onPress = (ev: PointerEvent): void => {
+      const t = ev.target;
+      if (!(t instanceof Node)) return;
+      if (exportPopEl?.contains(t) === true || exportChipEl?.contains(t) === true) return;
+      closeExport();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onPress);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerdown", onPress);
+    };
+  });
+
   // --- present mode --------------------------------------------------------
   let presenting = $state(false);
   let chromeVisible = $state(true);
@@ -1152,6 +1285,7 @@
     pinMode = false;
     pinDraft = null;
     openPin = null;
+    closeExport();
     const el = rootEl;
     // Full-bleed within the pane works regardless; browser fullscreen is a
     // progressive upgrade the browser may refuse. Exit is handled by the
@@ -1493,9 +1627,84 @@
               ? "copy snapshot path"
               : "chat"}</button
         >
+        <button
+          bind:this={exportChipEl}
+          class="nav wide"
+          class:armed={exportOpen}
+          onclick={() => (exportOpen ? closeExport() : (exportOpen = true))}
+          aria-expanded={exportOpen}
+          aria-haspopup="dialog"
+          aria-label="export board"
+          title="export: pptx / pdf / svg — pptx states every object's fidelity fate before you download"
+          >export</button
+        >
         <button class="nav wide" onclick={enterPresent} aria-label="present" title="present"
           >present</button
         >
+        {#if exportOpen}
+          <div
+            class="export-pop"
+            bind:this={exportPopEl}
+            role="dialog"
+            aria-label="export board"
+          >
+            <div class="export-formats" role="group" aria-label="export format">
+              {#each EXPORT_FORMATS as f (f.id)}
+                <button
+                  class="fmt"
+                  class:sel={exportFormat === f.id}
+                  aria-pressed={exportFormat === f.id}
+                  onclick={() => (exportFormat = f.id)}
+                  >{f.label}</button
+                >
+              {/each}
+            </div>
+            {#if exportFormat === "pptx"}
+              <label
+                class="native-toggle"
+                title="native charts (opt-in — Edit Data not yet hand-verified): real c:chart parts where a chart maps cleanly; the rest stay grouped shapes with the reason in their fate"
+              >
+                <input type="checkbox" bind:checked={exportNative} />
+                native charts
+              </label>
+              {#if exportError === null && preflight !== null}
+                {@const fates = preflight.objects ?? []}
+                <!-- §11: the fidelity preflight — the degradation contract
+                     stated before the deck is opened, from the very export
+                     the download button hands over. -->
+                <div class="census">
+                  {fates.length === 0 ? "no objects" : fateCensus(fates)}
+                </div>
+                <ul class="fates" aria-label="per-object export fates">
+                  {#each fates as f, i (`${i}:${f.id}`)}
+                    <li class="fate" title={f.reason}>
+                      <span class="fate-id">{f.id}</span>
+                      <span class="fate-tier {f.tier}">{f.tier}</span>
+                      <span class="fate-reason">{f.reason}</span>
+                    </li>
+                  {/each}
+                </ul>
+              {:else if exportBusy}
+                <div class="census">exporting…</div>
+              {/if}
+            {/if}
+            {#if exportError !== null}
+              <div class="export-err">{exportError}</div>
+            {/if}
+            <div class="export-bar">
+              <button
+                class="nav wide"
+                disabled={exportBusy || (exportFormat === "pptx" && preflight === null)}
+                onclick={() => void downloadExport()}
+                >{exportBusy
+                  ? "exporting…"
+                  : exportFormat === "pptx" && preflight !== null
+                    ? `download ${preflight.filename}`
+                    : "download"}</button
+              >
+            </div>
+          </div>
+        {/if}
       </div>
 
       {#if warnings.length > 0}
@@ -1758,6 +1967,9 @@
     text-align: center;
   }
   .pagebar {
+    /* Anchors the export popover just above the bar, wherever the bar sits
+       (the diagnostics strip below may shift the stage-wrap bottom). */
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1765,6 +1977,112 @@
     border-top: 1px solid var(--edge);
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .export-pop {
+    position: absolute;
+    z-index: 4;
+    right: 8px;
+    bottom: calc(100% + 6px);
+    width: 300px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px var(--scrim);
+    font-size: var(--text-xs);
+    color: var(--fg);
+  }
+  .export-formats {
+    display: flex;
+    gap: 4px;
+  }
+  .fmt {
+    flex: 1;
+    background: none;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    color: var(--fg);
+    padding: 3px 0;
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .fmt:hover {
+    background: var(--row-hover);
+  }
+  .fmt.sel {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--term-bg);
+  }
+  .native-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--fg);
+    cursor: pointer;
+    user-select: none;
+  }
+  .native-toggle input {
+    accent-color: var(--accent);
+    margin: 0;
+  }
+  .census {
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  .fates {
+    /* Compact rows; scrolls past ~8 of them. */
+    max-height: 176px;
+    overflow-y: auto;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border-top: 1px solid var(--edge);
+  }
+  .fate {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--edge);
+  }
+  .fate-id {
+    font-family: var(--mono);
+    flex-shrink: 0;
+    max-width: 96px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fate-tier {
+    font-family: var(--mono);
+    flex-shrink: 0;
+  }
+  .fate-tier.native {
+    color: var(--accent);
+  }
+  .fate-tier.vector,
+  .fate-tier.raster {
+    color: var(--warn);
+  }
+  .fate-reason {
+    flex: 1;
+    min-width: 0;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .export-err {
+    color: var(--err);
+    overflow-wrap: anywhere;
+  }
+  .export-bar {
+    display: flex;
+    justify-content: flex-end;
   }
   .nav {
     background: none;

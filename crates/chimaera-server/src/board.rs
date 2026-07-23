@@ -682,7 +682,29 @@ pub(crate) struct ExportRequest {
     /// apply to pdf/pptx, which take the whole deck.
     #[serde(default)]
     pub page: Option<usize>,
+    /// The CLI's `--charts native` as a wire flag: opt into real `c:chart`
+    /// parts for charts that map cleanly (the rest degrade per-chart with the
+    /// reason in their fate). pptx only — refused, like the CLI, on any other
+    /// format so a stray flag never silently no-ops. Defaults to grouped
+    /// (additive: an older client's request behaves exactly as before).
+    #[serde(default, rename = "chartsNative")]
+    pub charts_native: bool,
 }
+
+/// An export-request refusal: well-formed JSON whose parameter combination is
+/// not applicable (`chartsNative` off pptx). Mapped to 422 (vs. the routes'
+/// generic 400), mirroring [`SetRejected`]: "fix the parameters", not "fix
+/// the request". Nothing is exported on this path.
+#[derive(Debug)]
+struct ExportRefused(String);
+
+impl std::fmt::Display for ExportRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExportRefused {}
 
 /// POST /api/v1/board/export → `{ticket, filename, pageCount}` (+ `objects`,
 /// the per-object fidelity fates, for pptx). Bytes land in the same
@@ -696,113 +718,7 @@ pub(crate) async fn export(
     // Exporters share the render engine (text shaping, zip/pdf encode) and
     // the board read may cross NFS, so the work runs under the same blocking
     // semaphore as render.
-    let outcome = fs::blocking_value(move || {
-        let path = resolve_board_path(&req.path)?;
-        let ws = chimaera_board::workspace_root(&path);
-        let mut board = chimaera_board::load(&path)?;
-        chimaera_board::normalize(&mut board);
-        let theme_name = board
-            .theme
-            .clone()
-            .unwrap_or_else(|| "talk-dark".to_string());
-        let theme = Theme::resolve(&theme_name, Some(&ws))?;
-        let fonts = FontStack::for_workspace(&ws);
-        let stem = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".board.json").to_string())
-            .unwrap_or_else(|| "board".to_string());
-        let exports_dir = chimaera_board::ensure_board_dir(&ws)?.join("exports");
-        std::fs::create_dir_all(&exports_dir)?;
-        let page_count = board.pages.len();
-
-        let mut fates = None;
-        let dest: PathBuf = match req.format.as_str() {
-            "svg" | "svg-outlined" => {
-                use chimaera_board::export::svg::{export_svg, SvgVariant};
-                let (variant, base) = if req.format == "svg" {
-                    (SvgVariant::Text, stem.clone())
-                } else {
-                    (SvgVariant::Outlined, format!("{stem}-outlined"))
-                };
-                let pages: Vec<usize> = match req.page {
-                    Some(p) => vec![p],
-                    None => (0..board.pages.len()).collect(),
-                };
-                if pages.len() == 1 {
-                    let svg = export_svg(&board, pages[0], &theme, &fonts, Some(&ws), variant)?;
-                    let dest = exports_dir.join(format!("{base}.svg"));
-                    chimaera_board::write_atomic(&dest, svg.as_bytes())?;
-                    dest
-                } else {
-                    // All pages of a multi-page board: one file per page in a
-                    // per-export directory, ticketed whole (the download
-                    // route zips a directory on the fly). Cleared first so a
-                    // page deleted since the last export cannot ride along.
-                    let dir = exports_dir.join(format!("{base}-svg"));
-                    let _ = std::fs::remove_dir_all(&dir);
-                    std::fs::create_dir_all(&dir)?;
-                    for p in pages {
-                        let svg = export_svg(&board, p, &theme, &fonts, Some(&ws), variant)?;
-                        chimaera_board::write_atomic(
-                            &dir.join(format!("{base}-{}.svg", board.pages[p].id)),
-                            svg.as_bytes(),
-                        )?;
-                    }
-                    dir
-                }
-            }
-            "pdf" => {
-                if req.page.is_some() {
-                    anyhow::bail!(
-                        "page does not apply to pdf: the whole deck exports as one document"
-                    );
-                }
-                let pdf =
-                    chimaera_board::export::pdf::export_pdf(&board, &theme, &fonts, Some(&ws))?;
-                let dest = exports_dir.join(format!("{stem}.pdf"));
-                chimaera_board::write_atomic(&dest, &pdf)?;
-                dest
-            }
-            "pptx" => {
-                if req.page.is_some() {
-                    anyhow::bail!(
-                        "page does not apply to pptx: the whole deck exports as one file"
-                    );
-                }
-                let mut bytes = Vec::new();
-                let report = chimaera_board::export::write_pptx(
-                    &board,
-                    &theme,
-                    &fonts,
-                    Some(&ws),
-                    &mut bytes,
-                )?;
-                // The degradation contract as data — the same per-object
-                // fates the CLI prints, stated before the deck is opened.
-                fates = Some(serde_json::to_value(&report.objects)?);
-                let dest = exports_dir.join(format!("{stem}.pptx"));
-                chimaera_board::write_atomic(&dest, &bytes)?;
-                dest
-            }
-            other => anyhow::bail!("unknown format {other:?}: use svg | svg-outlined | pdf | pptx"),
-        };
-
-        let filename = dest
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "export".to_string());
-        let mut response = json!({
-            "exportPath": dest,
-            "filename": filename,
-            "pageCount": page_count,
-        });
-        if let Some(objects) = fates {
-            response["objects"] = objects;
-        }
-        Ok(response)
-    })
-    .await;
+    let outcome = fs::blocking_value(move || perform_export(&req)).await;
 
     match outcome {
         Ok(mut value) => {
@@ -821,8 +737,131 @@ pub(crate) async fn export(
             }
             Json(value).into_response()
         }
+        Err(err) if err.downcast_ref::<ExportRefused>().is_some() => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": format!("{err:#}")})),
+        )
+            .into_response(),
         Err(err) => board_error(&err),
     }
+}
+
+/// The whole export cycle (resolve → load → normalize → write into
+/// `.chimaera/board/exports/`), on the blocking pool. Split from the handler
+/// so tests exercise the exact export path — format dispatch, the
+/// `chartsNative` mapping, refusals — without standing up an `AppState`.
+fn perform_export(req: &ExportRequest) -> anyhow::Result<serde_json::Value> {
+    // Validated before any filesystem work, exactly like the CLI's up-front
+    // `--charts` check ("--charts applies to pptx only").
+    if req.charts_native && req.format != "pptx" {
+        anyhow::bail!(ExportRefused("chartsNative applies to pptx only".into()));
+    }
+    let path = resolve_board_path(&req.path)?;
+    let ws = chimaera_board::workspace_root(&path);
+    let mut board = chimaera_board::load(&path)?;
+    chimaera_board::normalize(&mut board);
+    let theme_name = board
+        .theme
+        .clone()
+        .unwrap_or_else(|| "talk-dark".to_string());
+    let theme = Theme::resolve(&theme_name, Some(&ws))?;
+    let fonts = FontStack::for_workspace(&ws);
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .unwrap_or_else(|| "board".to_string());
+    let exports_dir = chimaera_board::ensure_board_dir(&ws)?.join("exports");
+    std::fs::create_dir_all(&exports_dir)?;
+    let page_count = board.pages.len();
+
+    let mut fates = None;
+    let dest: PathBuf = match req.format.as_str() {
+        "svg" | "svg-outlined" => {
+            use chimaera_board::export::svg::{export_svg, SvgVariant};
+            let (variant, base) = if req.format == "svg" {
+                (SvgVariant::Text, stem.clone())
+            } else {
+                (SvgVariant::Outlined, format!("{stem}-outlined"))
+            };
+            let pages: Vec<usize> = match req.page {
+                Some(p) => vec![p],
+                None => (0..board.pages.len()).collect(),
+            };
+            if pages.len() == 1 {
+                let svg = export_svg(&board, pages[0], &theme, &fonts, Some(&ws), variant)?;
+                let dest = exports_dir.join(format!("{base}.svg"));
+                chimaera_board::write_atomic(&dest, svg.as_bytes())?;
+                dest
+            } else {
+                // All pages of a multi-page board: one file per page in a
+                // per-export directory, ticketed whole (the download
+                // route zips a directory on the fly). Cleared first so a
+                // page deleted since the last export cannot ride along.
+                let dir = exports_dir.join(format!("{base}-svg"));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir)?;
+                for p in pages {
+                    let svg = export_svg(&board, p, &theme, &fonts, Some(&ws), variant)?;
+                    chimaera_board::write_atomic(
+                        &dir.join(format!("{base}-{}.svg", board.pages[p].id)),
+                        svg.as_bytes(),
+                    )?;
+                }
+                dir
+            }
+        }
+        "pdf" => {
+            if req.page.is_some() {
+                anyhow::bail!("page does not apply to pdf: the whole deck exports as one document");
+            }
+            let pdf = chimaera_board::export::pdf::export_pdf(&board, &theme, &fonts, Some(&ws))?;
+            let dest = exports_dir.join(format!("{stem}.pdf"));
+            chimaera_board::write_atomic(&dest, &pdf)?;
+            dest
+        }
+        "pptx" => {
+            if req.page.is_some() {
+                anyhow::bail!("page does not apply to pptx: the whole deck exports as one file");
+            }
+            let mut bytes = Vec::new();
+            // The same PptxOptions construction as the CLI's --charts:
+            // default-then-set, so new knobs never break this route.
+            let mut opts = chimaera_board::export::PptxOptions::default();
+            if req.charts_native {
+                opts.chart_fidelity = chimaera_board::export::ChartFidelity::Native;
+            }
+            let report = chimaera_board::export::write_pptx_with(
+                &board,
+                &theme,
+                &fonts,
+                Some(&ws),
+                &opts,
+                &mut bytes,
+            )?;
+            // The degradation contract as data — the same per-object
+            // fates the CLI prints, stated before the deck is opened.
+            fates = Some(serde_json::to_value(&report.objects)?);
+            let dest = exports_dir.join(format!("{stem}.pptx"));
+            chimaera_board::write_atomic(&dest, &bytes)?;
+            dest
+        }
+        other => anyhow::bail!("unknown format {other:?}: use svg | svg-outlined | pdf | pptx"),
+    };
+
+    let filename = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "export".to_string());
+    let mut response = json!({
+        "exportPath": dest,
+        "filename": filename,
+        "pageCount": page_count,
+    });
+    if let Some(objects) = fates {
+        response["objects"] = objects;
+    }
+    Ok(response)
 }
 
 /// Append the gesture to the board's semantic edit journal, actor `human` —
@@ -1279,6 +1318,68 @@ mod tests {
             Some("Time (ms)")
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `chartsNative` rides the wire camelCase, defaults to grouped, and maps
+    /// to [`chimaera_board::export::ChartFidelity::Native`] through
+    /// `write_pptx_with` — observable as the chart's fate flipping from
+    /// `grouped` to `native` on the same board.
+    #[test]
+    fn export_charts_native_flips_the_chart_fate() {
+        let (ws, path) = chart_board("export-native");
+        let body = |native: bool| {
+            format!(
+                r#"{{"path":{:?},"format":"pptx","chartsNative":{native}}}"#,
+                path.to_string_lossy()
+            )
+        };
+
+        // The default (absent flag) stays the pre-flag behavior: grouped.
+        let req: ExportRequest = serde_json::from_str(&format!(
+            r#"{{"path":{:?},"format":"pptx"}}"#,
+            path.display()
+        ))
+        .unwrap();
+        assert!(!req.charts_native, "absent chartsNative means grouped");
+        let out = perform_export(&req).unwrap();
+        assert_eq!(out["filename"], "fig.pptx");
+        assert_eq!(out["pageCount"], 1);
+        let fate = |v: &serde_json::Value| {
+            v["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["id"] == "bench")
+                .map(|o| o["tier"].as_str().unwrap().to_string())
+                .unwrap()
+        };
+        assert_eq!(fate(&out), "grouped");
+
+        // Opt-in: the cleanly-mappable bar chart becomes a real c:chart part.
+        let req: ExportRequest = serde_json::from_str(&body(true)).unwrap();
+        assert!(req.charts_native);
+        let out = perform_export(&req).unwrap();
+        assert_eq!(fate(&out), "native");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `chartsNative` off pptx is refused with the CLI's up-front semantics
+    /// ("--charts applies to pptx only"): a 422-class [`ExportRefused`],
+    /// checked before any filesystem work — the path is deliberately bogus.
+    #[test]
+    fn charts_native_off_pptx_is_refused() {
+        for format in ["svg", "svg-outlined", "pdf"] {
+            let req: ExportRequest = serde_json::from_str(&format!(
+                r#"{{"path":"/nowhere/x.board.json","format":{format:?},"chartsNative":true}}"#
+            ))
+            .unwrap();
+            let err = perform_export(&req).unwrap_err();
+            assert!(
+                err.downcast_ref::<ExportRefused>().is_some(),
+                "422 class for {format}: {err:#}"
+            );
+            assert!(format!("{err:#}").contains("applies to pptx only"));
+        }
     }
 
     /// A fresh workspace with a two-node diagram board on disk — the child

@@ -647,6 +647,33 @@ export function attributeDiff(
   return external;
 }
 
+// --- export preflight (§11) -------------------------------------------------
+
+/** Fidelity order for the preflight census — best first, matching the plan's
+ *  tier table. Unknown tiers (a future daemon) sort last, never dropped. */
+export const EXPORT_TIERS = ["native", "grouped", "vector", "raster"] as const;
+
+/**
+ * The preflight census line — `"1 native · 3 grouped"` — from the per-object
+ * fates a pptx export declares. Tiers appear best-first, only when present;
+ * an unknown tier from a newer daemon is appended verbatim rather than
+ * hidden (the preflight's honesty is the feature).
+ */
+export function fateCensus(fates: { tier: string }[]): string {
+  const counts = new Map<string, number>();
+  for (const f of fates) counts.set(f.tier, (counts.get(f.tier) ?? 0) + 1);
+  const parts: string[] = [];
+  for (const tier of EXPORT_TIERS) {
+    const n = counts.get(tier);
+    if (n !== undefined) {
+      parts.push(`${n} ${tier}`);
+      counts.delete(tier);
+    }
+  }
+  for (const [tier, n] of counts) parts.push(`${n} ${tier}`);
+  return parts.join(" · ");
+}
+
 // --- actor-aware undo (§6.7) -----------------------------------------------
 
 /** One field of one gesture, recorded as prior/new values so overlap with a

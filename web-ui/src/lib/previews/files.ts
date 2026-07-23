@@ -418,6 +418,50 @@ export async function fsBoardJournalAppend(path: string, op: BoardJournalOp): Pr
   return body.seq;
 }
 
+/** The board export formats, the CLI's vocabulary exactly. */
+export type BoardExportFormat = "pptx" | "pdf" | "svg" | "svg-outlined";
+
+/** One object's declared export fate (pptx): which fidelity tier it landed
+ *  at — `native`/`grouped`/`vector`/`raster` — and why. The degradation
+ *  contract as data, stated before the deck is opened. */
+export interface BoardExportFate {
+  id: string;
+  tier: string;
+  reason: string;
+}
+
+/** One performed export: a `/download/{ticket}` to the written file (a
+ *  multi-page SVG export tickets a directory, which downloads as a zip), the
+ *  server's filename, and — pptx only — the per-object fates. */
+export interface BoardExport {
+  ticket: string;
+  filename: string;
+  pageCount: number;
+  objects?: BoardExportFate[];
+}
+
+/**
+ * Export a board server-side into `.chimaera/board/exports/` — the same
+ * exporter functions the CLI runs, so the two cannot disagree. `chartsNative`
+ * is the CLI's `--charts native` (real `c:chart` parts where a chart maps
+ * cleanly); pptx only — the daemon answers 422 otherwise. The response IS the
+ * export: consume its ticket to download; never re-export the same
+ * configuration just to fetch what this call already wrote.
+ */
+export async function fsBoardExport(
+  path: string,
+  format: BoardExportFormat,
+  chartsNative = false,
+): Promise<BoardExport> {
+  return json(
+    await api("/board/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, format, ...(chartsNative ? { chartsNative: true } : {}) }),
+    }),
+  );
+}
+
 /**
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
@@ -562,8 +606,15 @@ export async function fsDownload(path: string): Promise<void> {
       body: JSON.stringify({ path }),
     }),
   );
+  navigateDownload(body.ticket);
+}
+
+/** Consume a `/download/{ticket}` as a browser download via a transient
+ *  anchor. Shared by every ticket consumer (file/folder downloads, board
+ *  exports) so the WKWebView workaround below lives in one place. */
+export function navigateDownload(ticket: string): void {
   const a = document.createElement("a");
-  a.href = `/download/${body.ticket}`;
+  a.href = `/download/${ticket}`;
   a.rel = "noopener";
   // The `download` attribute forces a download even for a showable MIME (a
   // .md is text/*): without it the Tauri WKWebView navigates the main webview

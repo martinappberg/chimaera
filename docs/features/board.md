@@ -183,7 +183,12 @@ content *and* the render engine's version/epoch, so an upgraded daemon never
 serves the old engine's pixels — + diagnostics sidecar → `/raw` ticket),
 `/board/describe`, `/board/edit`
 (move/resize/text ops by object id; canonical save; appends actor-`human`
-journal events; returns `X-Mtime` + `journalSeq`). Blocking work under the
+journal events; returns `X-Mtime` + `journalSeq`), and `/board/export`
+(`{path, format, page?, chartsNative?}` → `{ticket, filename, pageCount}` +
+per-object `objects` fates for pptx; `chartsNative` is the CLI's
+`--charts native` and answers 422 off pptx; the ticket rides
+`GET /download/{ticket}`, a multi-page SVG export ticketing a directory that
+downloads as a zip). Blocking work under the
 shared fs semaphore; render cache capped at 256, atomic writes;
 `.chimaera/board/{renders,exports,journal,shown}` excluded from quick-open
 by parent path.
@@ -195,7 +200,11 @@ page navigator, click-select, drag-move, corner resize handles, **actor-aware
 undo** (⌘Z never reverts agent work — mismatched entries drop with a toast),
 **present mode** (fullscreen, keyboard nav, `n` presenter notes, auto-hiding
 chrome), and **agent-edit attribution** (external changes flash an accent
-outline; own writes don't). Gestures commit through `/board/edit`; agent
+outline; own writes don't). Export lives in the pane too: a pagebar chip
+opens a popover (pptx/pdf/svg/svg-outlined + the pptx-only native-charts
+toggle) whose pptx path shows the §11 fidelity preflight — the per-object
+fates from the very export the download button then hands over, never a
+second export. Gestures commit through `/board/edit`; agent
 edits arrive via the 2 s disk watch and re-render in place. Chat renders a
 **ShownCard** under completed tool calls whose output carries the
 `board show` signature line (client-detected v1; the daemon `shown` event can

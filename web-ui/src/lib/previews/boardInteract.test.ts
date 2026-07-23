@@ -12,6 +12,7 @@ import {
   editorFontPx,
   editorTextToNodeLabel,
   editorTextToParagraphs,
+  fateCensus,
   hitChild,
   MARK_SWAP_KINDS,
   nextPinId,
@@ -444,6 +445,29 @@ describe("sort options", () => {
   it("offers exactly the values chart.rs's category_order accepts", () => {
     expect(SORT_OPTIONS.map((o) => o.value)).toEqual(["", "x", "-x", "y", "-y"]);
     expect([...MARK_SWAP_KINDS]).toEqual(["bar", "line", "point"]);
+  });
+});
+
+describe("fateCensus (export preflight)", () => {
+  it("counts tiers best-first, present tiers only", () => {
+    expect(
+      fateCensus([
+        { tier: "grouped" },
+        { tier: "native" },
+        { tier: "grouped" },
+        { tier: "raster" },
+      ]),
+    ).toBe("1 native · 2 grouped · 1 raster");
+  });
+
+  it("is empty for no fates", () => {
+    expect(fateCensus([])).toBe("");
+  });
+
+  it("appends an unknown tier from a newer daemon rather than hiding it", () => {
+    expect(fateCensus([{ tier: "native" }, { tier: "holographic" }])).toBe(
+      "1 native · 1 holographic",
+    );
   });
 });
 
