@@ -287,6 +287,55 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    /// Chart `data.trace`/`data.inputs` are named fields with a pinned key
+    /// order (after `note`, before the lenient extras) — a provenance-carrying
+    /// board must be a canonical fixed point like any other.
+    #[test]
+    fn chart_provenance_fields_round_trip_byte_identically() {
+        let src = r#"{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "canvas": { "size": [960, 540] },
+  "pages": [
+    {
+      "id": "p1",
+      "objects": [
+        {
+          "id": "lat",
+          "type": "chart",
+          "at": [80, 80],
+          "size": [480, 320],
+          "data": {
+            "origin": "derived-by-agent",
+            "values": [
+              { "d": "Mon", "hi": 5, "lo": 1, "med": 3, "q1": 2, "q3": 4 }
+            ],
+            "trace": "five-number summary via numpy.percentile, seed 42",
+            "inputs": ["results/latency.csv"]
+          },
+          "x": { "field": "d", "type": "nominal" },
+          "y": { "field": "med", "type": "quantitative" },
+          "marks": [
+            { "mark": "box" }
+          ]
+        }
+      ]
+    }
+  ]
+}
+"#;
+        let board = parse(src).unwrap();
+        let chart = board.pages[0].objects.iter().find_map(|o| match o {
+            Object::Chart(c) => Some(c),
+            _ => None,
+        });
+        let data = &chart.expect("a chart").data;
+        assert!(data.trace.as_deref().unwrap().contains("seed 42"));
+        assert_eq!(data.inputs.as_deref().unwrap().len(), 1);
+        let out = to_string(&board).unwrap();
+        assert_eq!(out, src, "canonical form must be a fixed point");
+    }
+
     #[test]
     fn a_non_board_json_file_is_refused_by_name() {
         let err = parse(

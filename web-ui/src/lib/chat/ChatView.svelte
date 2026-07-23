@@ -46,6 +46,7 @@
     PendingSend,
     PlanEntry,
   } from "./store.svelte";
+  import { collectShownByGroup, type ShownBoard } from "./shownBoards";
   import {
     advanceTailWindow,
     pageEarlier,
@@ -1265,6 +1266,17 @@
     return items;
   });
 
+  /** Boards shown by `chimaera board show`, reduced transcript-level so each
+   *  board path renders exactly one first-class card — in the LATEST group
+   *  that showed it (update-in-place across turns). ToolGroup renders them. */
+  const NO_SHOWN: ShownBoard[] = [];
+  const shownByGroup = $derived.by(() =>
+    collectShownByGroup(
+      renderItems.flatMap((it) => (it.t === "group" ? [{ key: it.key, tools: it.tools }] : [])),
+      session.cwd,
+    ),
+  );
+
   /** Index of the last block (the streaming reveal keys off it). Queued sends
    *  render from their own pending tail, not `blocks`, so this is simply the
    *  delivered-block tail. */
@@ -1378,6 +1390,7 @@
           {visible}
           {onOpenFile}
           cwd={session.cwd}
+          shown={shownByGroup.get(item.key) ?? NO_SHOWN}
           onBackground={agentKind === "claude" ? backgroundTool : undefined}
           onStopTask={agentKind === "claude" ? stopTask : undefined}
         />

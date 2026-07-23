@@ -27,11 +27,21 @@ use crate::theme::Theme;
 #[derive(Subcommand)]
 pub enum BoardCmd {
     /// Show a result as a rendered card: spec on stdin (or --spec), a real
-    /// one-page board under .chimaera/board/shown/, PNG beside it.
+    /// one-page board under .chimaera/board/shown/, PNG beside it. With
+    /// --file, card an existing board where it lives instead.
     Show {
         /// Read the spec from a file instead of stdin.
         #[arg(long)]
         spec: Option<PathBuf>,
+        /// Card an existing .board.json in place: no spec, no copy — validate
+        /// it, render its first page to a PNG beside it, and print the shown
+        /// line pointing at that path (which is what mounts the inline chat
+        /// card).
+        #[arg(
+            long,
+            conflicts_with_all = ["spec", "mermaid", "title", "note", "id", "size", "out", "emit_board"]
+        )]
+        file: Option<PathBuf>,
         /// Treat the input as mermaid flowchart source instead of a JSON
         /// spec — `cat arch.mmd | chimaera board show --mermaid`.
         #[arg(long)]
@@ -65,6 +75,11 @@ pub enum BoardCmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// Print the complete board manual: the show spec (sugar and the full
+    /// chart passthrough), hand-written board essentials, themes, every verb,
+    /// and where boards live. Self-contained — read this once instead of
+    /// --help chains or the source.
+    Guide,
     /// Create a blank board.
     New {
         /// Where to write it, e.g. talks/lab-meeting.board.json.
@@ -273,6 +288,7 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
     match cmd {
         BoardCmd::Show {
             spec,
+            file,
             mermaid,
             title,
             note,
@@ -284,8 +300,12 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             emit_board,
             quiet,
         } => show(
-            spec, mermaid, title, note, id, &preset, size, theme, out, emit_board, quiet,
+            spec, file, mermaid, title, note, id, &preset, size, theme, out, emit_board, quiet,
         ),
+        BoardCmd::Guide => {
+            print!("{}", include_str!("cli/GUIDE.md"));
+            Ok(())
+        }
         BoardCmd::New { path, title, theme } => new(&path, title, &theme),
         BoardCmd::Render {
             path,
@@ -323,9 +343,12 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
         BoardCmd::Describe { path } => {
             let board = load_normalized(&path)?.0;
             let summary = crate::journal::summary(&journal_path_for(&path));
+            // The workspace lets chart `source` bindings print fresh/stale.
+            let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let ws = crate::workspace_root(&abs);
             print!(
                 "{}",
-                crate::describe::describe_with_journal(&board, summary)
+                crate::describe::describe_in(&board, summary, Some(&ws))
             );
             Ok(())
         }
@@ -402,6 +425,7 @@ fn resolve_theme(reference: Option<&str>, board: &crate::Board, ws: &Path) -> Re
 #[allow(clippy::too_many_arguments)]
 fn show(
     spec_path: Option<PathBuf>,
+    file: Option<PathBuf>,
     mermaid: bool,
     title: Option<String>,
     note: Option<String>,
@@ -413,6 +437,14 @@ fn show(
     emit_board: bool,
     quiet: bool,
 ) -> Result<()> {
+    // clap already refuses the flag combinations; this guards direct callers
+    // and keeps --file from ever touching stdin.
+    if let Some(path) = &file {
+        if spec_path.is_some() || mermaid {
+            bail!("--file cards an existing board; it takes no spec (--spec/--mermaid/stdin)");
+        }
+        return show_file(path, theme_ref, quiet);
+    }
     let raw = match &spec_path {
         Some(p) => {
             std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
@@ -508,6 +540,85 @@ fn show(
         }
     }
     Ok(())
+}
+
+/// `board show --file` — card an existing board where it lives: no spec, no
+/// copy into shown/. Validate + normalize, render page 1 to a PNG beside the
+/// file, print the shown line pointing at THAT path (the `shown … →
+/// *.board.json` grammar is what mounts the inline chat card), and journal
+/// the same `shown` surfacing event every show appends.
+fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> {
+    if !crate::is_board_path(path) {
+        bail!(
+            "not a board: {} does not end in .board.json",
+            path.display()
+        );
+    }
+    let (board, diags) = load_normalized(path)?;
+    let mut errors = 0;
+    for d in diags.iter().filter(|d| d.severity != crate::Severity::Info) {
+        eprintln!("{}", d.render());
+        if d.severity == crate::Severity::Error {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        bail!("{errors} error(s); nothing rendered");
+    }
+    if board.pages.is_empty() {
+        bail!("{} has no pages to render", path.display());
+    }
+
+    // Canonicalized like journal_path_for: the workspace and the printed
+    // relative path must agree with what the daemon resolves.
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let ws = crate::workspace_root(&abs);
+    let theme_id = theme_ref
+        .or_else(|| board.theme.clone())
+        .unwrap_or_else(|| "talk-dark".to_string());
+    let theme = Theme::resolve(&theme_id, Some(&ws))?;
+    let fonts = FontStack::for_workspace(&ws);
+    let params = RasterParams {
+        scale: 2.0,
+        workspace: Some(ws.clone()),
+    };
+    let rendered = render_page(&board, 0, &theme, &fonts, params)?;
+
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .unwrap_or_else(|| "board".to_string());
+    crate::write_atomic(&path.with_file_name(format!("{stem}.png")), &rendered.png)?;
+    append_shown_event(path);
+
+    if !quiet {
+        let rel = abs
+            .strip_prefix(&ws)
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        println!("{}", shown_file_line(&board, &theme_id, &rel));
+        for d in rendered
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity != crate::Severity::Info)
+        {
+            eprintln!("{}", d.render());
+        }
+    }
+    Ok(())
+}
+
+/// The one-line stdout of `show --file`, matching the ShownCard mount grammar
+/// exactly: `shown … → <path>.board.json`.
+fn shown_file_line(board: &crate::Board, theme_id: &str, rel: &str) -> String {
+    let n = board.pages.len();
+    format!(
+        "shown board · {n} page{} · {theme_id} · {}×{} → {rel}",
+        if n == 1 { "" } else { "s" },
+        board.canvas.width(),
+        board.canvas.height()
+    )
 }
 
 /// Journal the show: a `shown` event, actor `agent` (show is the agent's
@@ -2251,6 +2362,171 @@ mod tests {
         assert!(looks_like_mermaid(b"%% a comment\nflowchart LR\na-->b"));
         assert!(looks_like_mermaid(b"graph TD\na-->b"));
         assert!(!looks_like_mermaid(b"<svg xmlns='x'/>"));
+    }
+
+    #[test]
+    fn shown_file_line_matches_the_card_mount_grammar() {
+        let two = board_json(
+            r#"{"format":"chimaera.board","formatVersion":1,"canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","objects":[]},{"id":"p2","objects":[]}]}"#,
+        );
+        let line = shown_file_line(&two, "talk-dark", "boards/demo.board.json");
+        assert_eq!(
+            line,
+            "shown board · 2 pages · talk-dark · 960×540 → boards/demo.board.json"
+        );
+        // ShownCard mounts on /^shown .+ → (.+\.board\.json)$/m — the line
+        // must start with "shown " and end with the board path after " → ".
+        assert!(line.starts_with("shown "));
+        let (_, path) = line.rsplit_once(" → ").unwrap();
+        assert!(path.ends_with(".board.json"));
+
+        let one = board_json(
+            r#"{"format":"chimaera.board","formatVersion":1,"canvas":{"size":[720,450]},
+                "pages":[{"id":"p1","objects":[]}]}"#,
+        );
+        assert_eq!(
+            shown_file_line(&one, "talk-light", "a.board.json"),
+            "shown board · 1 page · talk-light · 720×450 → a.board.json"
+        );
+    }
+
+    #[test]
+    fn show_file_is_exclusive_with_spec_and_mermaid() {
+        // The runtime guard, for direct callers of `show`.
+        let call = |spec: Option<PathBuf>, mermaid: bool| {
+            show(
+                spec,
+                Some(PathBuf::from("b.board.json")),
+                mermaid,
+                None,
+                None,
+                None,
+                "default",
+                None,
+                None,
+                None,
+                false,
+                true,
+            )
+        };
+        for err in [
+            call(Some(PathBuf::from("s.json")), false).unwrap_err(),
+            call(None, true).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("takes no spec"), "{err:#}");
+        }
+
+        // The clap-level conflicts, as a user hits them.
+        use clap::Parser as _;
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(subcommand)]
+            cmd: BoardCmd,
+        }
+        for bad in [
+            vec!["t", "show", "--file", "b.board.json", "--spec", "s.json"],
+            vec!["t", "show", "--file", "b.board.json", "--mermaid"],
+            vec!["t", "show", "--file", "b.board.json", "--id", "x"],
+            vec!["t", "show", "--file", "b.board.json", "--emit-board"],
+        ] {
+            assert!(T::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+        assert!(T::try_parse_from(["t", "show", "--file", "b.board.json"]).is_ok());
+        assert!(T::try_parse_from(["t", "guide"]).is_ok());
+    }
+
+    #[test]
+    fn show_file_renders_beside_the_board_and_journals_the_show() {
+        let dir = std::env::temp_dir().join(format!("chimaera-show-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("boards")).unwrap();
+        let board_path = dir.join("boards/demo.board.json");
+        std::fs::write(
+            &board_path,
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Demo",
+                "canvas":{"size":[960,540]},
+                "pages":[
+                  {"id":"cover","objects":[
+                    {"id":"title","type":"text","role":"title","at":[72,64],
+                     "size":[816,80],"text":["A two-page deck"]}]},
+                  {"id":"body","objects":[
+                    {"id":"note","type":"text","at":[72,64],"size":[816,80],
+                     "text":["second page"]}]}]}"#,
+        )
+        .unwrap();
+
+        show_file(&board_path, None, false).unwrap();
+
+        // The PNG lands beside the board, stem-matched, and the file itself
+        // was not moved or copied.
+        let png = std::fs::read(dir.join("boards/demo.png")).unwrap();
+        assert!(png.len() > 1000);
+        assert!(board_path.exists());
+        // The surfacing signal: the same `shown` event every show appends.
+        let events = crate::journal::read_since(&journal_path_for(&board_path), 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].render(), "#1 agent showed this board");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_guide_is_the_complete_selfcontained_manual() {
+        let guide = include_str!("cli/GUIDE.md");
+        for fact in [
+            // The law, verbatim — the one sentence that prevents Board being
+            // asked to compute quartiles.
+            "Board computes scales and layout, never statistics",
+            "compute quartiles/CIs yourself and pass them",
+            "ONE of `chart`,\n`table`, `text`, or `mermaid`",
+            "\"mark\":\"box\"",
+            "lo q1 med q3 hi",
+            "--mermaid",
+            "show --file",
+            "--id",
+            "derived-by-agent",
+            "`data.trace`",
+            "`data.inputs`",
+            "Invented demo data must say so in the trace",
+            ".chimaera/board/shown/",
+            "boards/<name>.board.json",
+            "talk-dark",
+            "talk-light",
+            "figure-light",
+            "@cat1..7",
+            "describe",
+            "lint",
+            "render",
+            "export",
+            "adopt",
+            "import",
+            "journal",
+            "arrange",
+            "theme-export",
+        ] {
+            assert!(guide.contains(fact), "guide lost {fact:?}");
+        }
+        // Self-contained means never deflecting to --help or the source.
+        assert!(!guide.contains("see --help"), "{guide}");
+
+        // Every `echo '…'` example is a real ShowSpec that builds — the
+        // guide's examples are validated, not aspirational. (The JSON inside
+        // the shell single-quotes carries no quote of its own, so the next
+        // `'` ends it.)
+        let mut rest = guide;
+        let mut examples = 0;
+        while let Some(at) = rest.find("echo '") {
+            let json = &rest[at + 6..];
+            let end = json.find('\'').expect("unterminated example");
+            let spec: crate::show::ShowSpec =
+                serde_json::from_str(&json[..end]).expect("guide example parses");
+            crate::show::build_board(&spec, [720.0, 450.0], "talk-dark")
+                .expect("guide example builds");
+            examples += 1;
+            rest = &json[end..];
+        }
+        assert!(examples >= 2, "the sugar and boxplot examples are runnable");
     }
 
     #[test]

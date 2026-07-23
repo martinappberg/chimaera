@@ -191,7 +191,12 @@ pub fn build_board(spec: &ShowSpec, size: [f64; 2], theme_id: &str) -> Result<Bo
 
 /// Interpret the spec's `chart` value as a schema chart object, filling in
 /// what `show` owns: id, geometry, origin defaulting, and the two editorial
-/// sugars.
+/// sugars. The value is the WHOLE chart vocabulary, not an x/y/values subset:
+/// `marks` (including `box` over precomputed five-number rows), per-mark
+/// `fields`, a `color` channel, axes, sort, and scale types all pass through
+/// into the same normalize/render path a hand-placed chart takes. A spec that
+/// states `marks` is a deliberate composition, so the editorial sugars stand
+/// down for it.
 fn chart_object(chart: &Value, body: [f64; 4]) -> Result<Object> {
     let mut v = chart.clone();
     let obj = v.as_object_mut().context("`chart` must be an object")?;
@@ -207,22 +212,59 @@ fn chart_object(chart: &Value, body: [f64; 4]) -> Result<Object> {
             obj.insert(ch.into(), serde_json::json!({ "field": f }));
         }
     }
+    // Sugar: a singular `mark` means a one-layer `marks`. Without this the
+    // vega-familiar `"mark": "box"` fell into the lenient extras and the
+    // inferred bar drew instead — the silent-wrong outcome. A string names
+    // the kind; an object is the layer itself.
+    if !obj.contains_key("marks") {
+        if let Some(mark) = obj.remove("mark") {
+            let layer = match mark {
+                Value::String(kind) => serde_json::json!({ "mark": kind }),
+                other => other,
+            };
+            obj.insert("marks".into(), Value::Array(vec![layer]));
+        }
+    }
+    // Provenance sugar: top-level `trace`/`inputs` belong inside `data`,
+    // beside the top-level `values` they annotate.
+    let trace = obj.remove("trace");
+    let inputs = obj.remove("inputs");
     // A throwaway's numbers came from what the agent just ran, so `command`
     // is the honest default — but only a default; a stated origin wins.
+    let values = obj.remove("values");
     if let Some(data) = obj.get_mut("data").and_then(Value::as_object_mut) {
         data.entry("origin").or_insert(Value::from("command"));
-    } else if let Some(values) = obj.remove("values") {
+        // An explicit `data` object beside top-level `values` is a common
+        // agent spelling; folding beats silently rendering zero rows.
+        if let Some(values) = values {
+            data.entry("values").or_insert(values);
+        }
+    } else if let Some(values) = values {
         obj.insert(
             "data".into(),
             serde_json::json!({ "origin": "command", "values": values }),
         );
+    }
+    if let Some(data) = obj.get_mut("data").and_then(Value::as_object_mut) {
+        if let Some(t) = trace {
+            data.entry("trace").or_insert(t);
+        }
+        if let Some(i) = inputs {
+            data.entry("inputs").or_insert(i);
+        }
     }
 
     let mut chart: ChartObject =
         serde_json::from_value(v).context("the `chart` spec does not parse as a chart")?;
 
     // Editorial sugar, applied before normalize so inference sees the final
-    // shape. Descending by value on a nominal axis…
+    // shape — but only when the mark is OURS to infer. Stated `marks` mean a
+    // composed chart (a box, a layered line+area, an interval bar), where a
+    // silent reorder or transpose breaks stated geometry. Descending by value
+    // on a nominal axis…
+    if !chart.marks.is_empty() {
+        return Ok(Object::Chart(chart));
+    }
     let rows = chart.data.values.clone();
     if let (Some(x), Some(y)) = (chart.x.as_mut(), chart.y.as_ref()) {
         let x_nominal = x
@@ -512,5 +554,184 @@ mod tests {
         // empty chart.
         let r: Result<ShowSpec, _> = serde_json::from_str(r#"{"chrat": {}}"#);
         assert!(r.is_err());
+    }
+
+    /// One `board show` pipe with `marks: [{"mark": "box"}]` and precomputed
+    /// five-number rows — the transcript failure this passthrough exists for.
+    const BOX_SPEC: &str = r#"{
+      "title": "Latency by day",
+      "chart": {
+        "x": "day", "y": "med", "marks": [{"mark": "box"}],
+        "values": [
+          {"day": "Mon", "lo": 1, "q1": 2, "med": 3, "q3": 4, "hi": 5},
+          {"day": "Tue", "lo": 2, "q1": 3, "med": 4, "q3": 5, "hi": 6}
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn a_rich_spec_passes_marks_through_and_skips_the_editorial_sugars() {
+        let spec: ShowSpec = serde_json::from_str(BOX_SPEC).unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[1] else {
+            panic!()
+        };
+        assert_eq!(c.marks.len(), 1);
+        assert_eq!(c.marks[0].mark, crate::schema::MarkKind::Box);
+        // Stated marks are a composition: no injected sort, no transpose.
+        assert!(c.x.as_ref().unwrap().sort.is_none());
+        assert_eq!(c.x.as_ref().unwrap().field, "day");
+    }
+
+    #[test]
+    fn a_box_spec_draws_box_geometry_not_inferred_bars() {
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let render = |json: &str| {
+            let spec: ShowSpec = serde_json::from_str(json).unwrap();
+            let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+            let Object::Chart(c) = &board.pages[0].objects[1] else {
+                panic!()
+            };
+            let frame = crate::schema::Frame {
+                x: 0.0,
+                y: 0.0,
+                w: 640.0,
+                h: 312.0,
+            };
+            let scene = crate::chart::build(c, frame, &theme, &fonts);
+            let png = render_page(&board, 0, &theme, &fonts, RasterParams::default())
+                .unwrap()
+                .png;
+            (scene, png)
+        };
+        let (box_scene, box_png) = render(BOX_SPEC);
+        // The same rows with no marks infer a bar chart of `med` alone.
+        let bar_spec = BOX_SPEC.replace(r#""marks": [{"mark": "box"}],"#, "");
+        let (bar_scene, bar_png) = render(&bar_spec);
+
+        let rects = |s: &crate::chart::ChartScene| {
+            s.items
+                .iter()
+                .filter(|i| matches!(i, crate::chart::ChartItem::Rect { .. }))
+                .count()
+        };
+        let paths = |s: &crate::chart::ChartScene| {
+            s.items
+                .iter()
+                .filter(|i| matches!(i, crate::chart::ChartItem::Path { .. }))
+                .count()
+        };
+        // One IQR rect per category either way, but the box adds whisker
+        // spines, caps, and median ticks — visible extra path geometry.
+        assert_eq!(rects(&box_scene), 2, "{:?}", box_scene.problems);
+        assert!(
+            paths(&box_scene) > paths(&bar_scene),
+            "box whiskers/medians must draw: {} vs {}",
+            paths(&box_scene),
+            paths(&bar_scene)
+        );
+        // And the pixels differ — the mark was honored, not silently dropped.
+        assert_ne!(box_png, bar_png);
+    }
+
+    #[test]
+    fn a_singular_mark_key_is_sugar_for_one_layer() {
+        // The vega-familiar spelling: `"mark": "box"` used to fall into the
+        // lenient extras while an inferred bar drew — silent and wrong.
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"chart": {"x": "day", "y": "med", "mark": "box",
+                "values": [{"day":"Mon","lo":1,"q1":2,"med":3,"q3":4,"hi":5}]}}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[0] else {
+            panic!()
+        };
+        assert_eq!(c.marks.len(), 1);
+        assert_eq!(c.marks[0].mark, crate::schema::MarkKind::Box);
+        // An object form carries per-layer fields through.
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"chart": {"x": "d", "y": "v", "mark": {"mark": "line", "step": "post"},
+                "values": [{"d":1,"v":2},{"d":2,"v":3}]}}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[0] else {
+            panic!()
+        };
+        assert_eq!(c.marks[0].mark, crate::schema::MarkKind::Line);
+        assert_eq!(c.marks[0].step.as_deref(), Some("post"));
+    }
+
+    #[test]
+    fn sugar_specs_keep_the_editorial_sugars_byte_identically() {
+        // The plain x/y/values spec is untouched by the passthrough: sort and
+        // flip still apply exactly as before.
+        let spec: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[1] else {
+            panic!()
+        };
+        assert_eq!(c.x.as_ref().unwrap().sort.as_deref(), Some("-failures"));
+        assert_eq!(c.marks[0].mark, crate::schema::MarkKind::Bar);
+    }
+
+    #[test]
+    fn unknown_chart_keys_stay_lenient() {
+        // The chart value rides the schema's lenient Extra: an unknown key is
+        // preserved, never a parse refusal — same contract as a board file.
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"chart": {"x": "f", "y": "v", "legendPosition": "top",
+                "values": [{"f":"a","v":1}]}}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[0] else {
+            panic!()
+        };
+        assert!(c.extra.contains_key("legendPosition"));
+    }
+
+    #[test]
+    fn trace_and_inputs_ride_into_data_from_the_sugar_form() {
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"chart": {"x": "day", "y": "med", "mark": "box",
+                "trace": "quartiles via numpy.percentile over latency_ms, seed 42",
+                "inputs": ["results/latency.csv"],
+                "values": [{"day":"Mon","lo":1,"q1":2,"med":3,"q3":4,"hi":5}]}}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[0] else {
+            panic!()
+        };
+        assert_eq!(
+            c.data.trace.as_deref(),
+            Some("quartiles via numpy.percentile over latency_ms, seed 42")
+        );
+        assert_eq!(
+            c.data.inputs.as_deref(),
+            Some(&["results/latency.csv".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn top_level_values_fold_into_an_explicit_data_object() {
+        // The trap a live agent hit: stating `data` (for origin/trace) while
+        // keeping `values` top-level silently rendered zero rows.
+        let spec: ShowSpec = serde_json::from_str(
+            r#"{"chart": {"x": "f", "y": "v",
+                "data": {"origin": "derived-by-agent", "trace": "sums per file"},
+                "values": [{"f":"a","v":1},{"f":"b","v":2}]}}"#,
+        )
+        .unwrap();
+        let board = build_board(&spec, [720.0, 450.0], "talk-dark").unwrap();
+        let Object::Chart(c) = &board.pages[0].objects[0] else {
+            panic!()
+        };
+        assert_eq!(c.data.values.len(), 2, "values fold into the stated data");
+        assert_eq!(format!("{:?}", c.data.origin), "DerivedByAgent");
+        assert_eq!(c.data.trace.as_deref(), Some("sums per file"));
     }
 }

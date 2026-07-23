@@ -282,6 +282,11 @@ export interface BoardRender {
   pageCount: number;
   pages: string[];
   diagnostics: { severity: string; object: string | null; message: string; rendered: string }[];
+  /** The board theme's categorical ramp: @token → resolved hex, for the
+   *  inspector's series-color swatches. The swatch commits the token (the
+   *  theme indirection); the hex only shows what it resolves to. Absent on
+   *  an older daemon → no swatch row. */
+  catSwatches?: { token: string; hex: string }[];
 }
 
 /** Render one page of a board server-side. The daemon caches by content, so
@@ -302,17 +307,25 @@ export async function fsBoardRender(
 }
 
 /**
- * Apply one gesture (move/resize/replace-text by object id) to a board,
- * server-side. The pane never serializes a board itself — a client-side
- * stringify would destroy the canonical byte-stable form. `text` replaces a
- * text/shape object's paragraphs with plain strings (styled runs survive
- * only by not sending it). Resolves to the new X-Mtime token so the caller
- * can `noteWrite` and adopt its own edit.
+ * Apply one gesture (move/resize/replace-text/set-config by object id) to a
+ * board, server-side. The pane never serializes a board itself — a
+ * client-side stringify would destroy the canonical byte-stable form. `text`
+ * replaces a text/shape object's paragraphs with plain strings (styled runs
+ * survive only by not sending it). `set` is sparse dot-path config edits
+ * (`{"x.title": "Time (s)"}`; null clears a field) — the daemon re-parses
+ * the mutated object and answers 422 with nothing written when a value
+ * would corrupt it. Resolves to the new X-Mtime token so the caller can
+ * `noteWrite` and adopt its own edit.
  */
 export async function fsBoardEdit(
   path: string,
   object: string,
-  change: { at?: [number, number]; size?: [number, number]; text?: string[] },
+  change: {
+    at?: [number, number];
+    size?: [number, number];
+    text?: string[];
+    set?: Record<string, unknown>;
+  },
 ): Promise<string | null> {
   const body = await json<{ mtime: string | null }>(
     await api("/board/edit", {

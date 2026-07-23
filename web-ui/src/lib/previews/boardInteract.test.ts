@@ -1,20 +1,41 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyFieldSet,
+  attributeDiff,
+  chartConfig,
   composeBoardContext,
+  configSig,
   editableText,
   editorFontPx,
   editorTextToParagraphs,
+  MARK_SWAP_KINDS,
   nextPinId,
   paragraphsToEditorText,
   pinAnchor,
   sameParagraphs,
   snapshotRegion,
+  SORT_OPTIONS,
   unresolvedPins,
   SNAPSHOT_PAD_PT,
+  type ExpectedChange,
   type ObjInfo,
+  type ObjSnap,
   type PinInfo,
 } from "./boardInteract";
 import type { BoardJournalEvent } from "./files";
+
+/** An ObjInfo the way parseBoard builds one, from the object's raw JSON. */
+function obj(raw: Record<string, unknown>): ObjInfo {
+  return {
+    id: String(raw.id ?? ""),
+    kind: String(raw.type ?? "?"),
+    at: Array.isArray(raw.at) ? [raw.at[0] as number, raw.at[1] as number] : null,
+    size: Array.isArray(raw.size) ? [raw.size[0] as number, raw.size[1] as number] : null,
+    text: editableText(raw.type as string | undefined, raw.text),
+    raw,
+    sig: configSig(raw),
+  };
+}
 
 describe("editableText", () => {
   it("projects plain paragraphs for the text-op kinds only", () => {
@@ -159,8 +180,8 @@ describe("comment pins (journal → unresolved set)", () => {
 
 describe("pinAnchor", () => {
   const objects: ObjInfo[] = [
-    { id: "callout", kind: "shape", at: [520, 150], size: [200, 80], text: ["hi"] },
-    { id: "ghost", kind: "image", at: null, size: null, text: null },
+    obj({ id: "callout", type: "shape", geo: "rect", at: [520, 150], size: [200, 80], text: ["hi"] }),
+    obj({ id: "ghost", type: "image", src: "x.png" }),
   ];
   const pin = (object: string | null, at: [number, number] | null): PinInfo => ({
     pin: "c1",
@@ -223,5 +244,160 @@ describe("snapshotRegion", () => {
   it("is null with no frames or a degenerate region", () => {
     expect(snapshotRegion([], canvas)).toBeNull();
     expect(snapshotRegion([{ at: [2000, 2000], size: [10, 10] }], canvas)).toBeNull();
+  });
+});
+
+// --- the /board/edit set op's client half ------------------------------------
+
+const barChart = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: "bench",
+  type: "chart",
+  at: [80, 80],
+  size: [400, 300],
+  data: { origin: "stated-by-user", values: [{ tool: "a", ms: 4 }] },
+  x: { field: "tool", type: "nominal" },
+  y: { field: "ms", type: "quantitative" },
+  marks: [{ mark: "bar" }],
+  ...over,
+});
+
+describe("applyFieldSet", () => {
+  it("sets nested fields, indexes arrays, and creates missing objects", () => {
+    const out = applyFieldSet(barChart(), {
+      "x.sort": "-y",
+      "y.title": "Time (ms)",
+      "marks.0.fill": "@cat3",
+      "axes.grid": "y",
+    }) as Record<string, unknown>;
+    expect((out.x as Record<string, unknown>).sort).toBe("-y");
+    expect((out.y as Record<string, unknown>).title).toBe("Time (ms)");
+    expect((out.marks as Record<string, unknown>[])[0].fill).toBe("@cat3");
+    // The missing `axes` intermediate materializes as an object.
+    expect((out.axes as Record<string, unknown>).grid).toBe("y");
+  });
+
+  it("removes a field on null (the clear spelling)", () => {
+    const raw = barChart({ y: { field: "ms", type: "quantitative", title: "Time" } });
+    const out = applyFieldSet(raw, { "y.title": null }) as Record<string, unknown>;
+    expect("title" in (out.y as Record<string, unknown>)).toBe(false);
+  });
+
+  it("never mutates the input and skips unappliable paths", () => {
+    const raw = barChart();
+    const out = applyFieldSet(raw, { "marks.5.fill": "@cat1", "x.sort": "-y" }) as Record<
+      string,
+      unknown
+    >;
+    // Out-of-bounds index: skipped (the daemon rejects that whole request);
+    // the rest still applies, and the input is untouched.
+    expect((out.marks as unknown[]).length).toBe(1);
+    expect((out.x as Record<string, unknown>).sort).toBe("-y");
+    expect((raw.x as Record<string, unknown>).sort).toBeUndefined();
+  });
+});
+
+describe("configSig", () => {
+  it("ignores geometry and text, catches config", () => {
+    const a = barChart();
+    expect(configSig(a)).toBe(configSig({ ...a, at: [0, 0], size: [1, 1] }));
+    expect(configSig(a)).not.toBe(configSig(applyFieldSet(a, { "x.sort": "-y" })));
+  });
+
+  it("is key-order insensitive (canonical bytes vs client prediction)", () => {
+    expect(configSig({ id: "t", type: "chart", b: 1, a: [1, 2] })).toBe(
+      configSig({ a: [1, 2], b: 1, type: "chart", id: "t" }),
+    );
+  });
+});
+
+describe("chartConfig", () => {
+  it("projects a vertical bar chart: sort on x, swappable mark, fill color", () => {
+    const c = chartConfig(obj(barChart({ marks: [{ mark: "bar", fill: "@cat2" }] })));
+    expect(c).not.toBeNull();
+    expect(c?.x).toEqual({ field: "tool", title: "" });
+    expect(c?.y).toEqual({ field: "ms", title: "" });
+    expect(c?.sortChannel).toBe("x");
+    expect(c?.sort).toBe("");
+    expect(c?.markKind).toBe("bar");
+    expect(c?.markSwappable).toBe(true);
+    expect(c?.markColor).toBe("@cat2");
+  });
+
+  it("mirrors chart.rs's orient rule: horizontal charts sort on y", () => {
+    const c = chartConfig(
+      obj(
+        barChart({
+          x: { field: "ms", type: "quantitative" },
+          y: { field: "tool", type: "nominal", sort: "-y", title: "Tool" },
+        }),
+      ),
+    );
+    expect(c?.sortChannel).toBe("y");
+    expect(c?.sort).toBe("-y");
+    expect(c?.y).toEqual({ field: "tool", title: "Tool" });
+  });
+
+  it("defaults undeclared channel types like the engine (x nominal, y quantitative)", () => {
+    const c = chartConfig(obj(barChart({ x: { field: "tool" }, y: { field: "ms" } })));
+    expect(c?.sortChannel).toBe("x");
+  });
+
+  it("leaves box, interval bars, and multi-mark charts alone", () => {
+    expect(chartConfig(obj(barChart({ marks: [{ mark: "box" }] })))?.markSwappable).toBe(false);
+    expect(
+      chartConfig(obj(barChart({ marks: [{ mark: "bar", fields: { y2: "end" } }] })))
+        ?.markSwappable,
+    ).toBe(false);
+    const multi = chartConfig(obj(barChart({ marks: [{ mark: "bar" }, { mark: "rule", y: 3 }] })));
+    expect(multi?.markKind).toBeNull();
+    expect(multi?.markCount).toBe(2);
+  });
+
+  it("reads the stroke token when no fill is stated (series_color's order)", () => {
+    const c = chartConfig(obj(barChart({ marks: [{ mark: "line", stroke: "@cat5" }] })));
+    expect(c?.markColor).toBe("@cat5");
+  });
+
+  it("is null for non-charts", () => {
+    expect(chartConfig(obj({ id: "t", type: "text", text: ["hi"] }))).toBeNull();
+  });
+});
+
+describe("sort options", () => {
+  it("offers exactly the values chart.rs's category_order accepts", () => {
+    expect(SORT_OPTIONS.map((o) => o.value)).toEqual(["", "x", "-x", "y", "-y"]);
+    expect([...MARK_SWAP_KINDS]).toEqual(["bar", "line", "point"]);
+  });
+});
+
+describe("attributeDiff with config fingerprints", () => {
+  const snap = (raw: Record<string, unknown>): ObjSnap => ({
+    at: raw.at as [number, number],
+    size: raw.size as [number, number],
+    sig: configSig(raw),
+  });
+
+  it("flashes an external restyle even though no frame moved", () => {
+    const before = barChart();
+    const after = applyFieldSet(before, { "x.sort": "-y" }) as Record<string, unknown>;
+    const changed = attributeDiff(
+      new Map([["bench", snap(before)]]),
+      new Map([["bench", snap(after)]]),
+      new Map(),
+    );
+    expect(changed.map((c) => c.id)).toEqual(["bench"]);
+  });
+
+  it("consumes a matching own-set expectation without flashing", () => {
+    const before = barChart();
+    const after = applyFieldSet(before, { "x.sort": "-y" }) as Record<string, unknown>;
+    const expected = new Map<string, ExpectedChange>([["bench", { sig: configSig(after) }]]);
+    const changed = attributeDiff(
+      new Map([["bench", snap(before)]]),
+      new Map([["bench", snap(after)]]),
+      expected,
+    );
+    expect(changed).toEqual([]);
+    expect(expected.size).toBe(0);
   });
 });

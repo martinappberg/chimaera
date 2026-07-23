@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::schema::{Board, Frame, Object};
 
@@ -25,6 +26,14 @@ pub fn describe(board: &Board) -> String {
 /// sits right under the board summary so an agent reading positions also
 /// learns there is change history worth `--since`-ing.
 pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> String {
+    describe_in(board, journal, None)
+}
+
+/// [`describe_with_journal`], plus a workspace root, which is what lets a
+/// chart's `source` binding verify its pinned sha256 and print fresh/stale
+/// on the provenance line. Without a workspace the wrappers above stay pure
+/// (no filesystem) and byte-identical to what they always printed.
+pub fn describe_in(board: &Board, journal: Option<(u64, u64)>, workspace: Option<&Path>) -> String {
     let mut s = String::new();
     let title = board.title.as_deref().unwrap_or("(untitled)");
     let _ = writeln!(
@@ -76,7 +85,7 @@ pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> Stri
         let _ = writeln!(s);
         let resolved = crate::slots::resolve_page_frames(board, page, &theme, None);
         for obj in &page.objects {
-            describe_object(&mut s, obj, 1, &resolved);
+            describe_object(&mut s, obj, 1, &resolved, workspace);
         }
         if let Some(notes) = &page.notes {
             let _ = writeln!(s, "  notes: {notes}");
@@ -85,7 +94,13 @@ pub fn describe_with_journal(board: &Board, journal: Option<(u64, u64)>) -> Stri
     s
 }
 
-fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeMap<String, Frame>) {
+fn describe_object(
+    s: &mut String,
+    obj: &Object,
+    depth: usize,
+    resolved: &BTreeMap<String, Frame>,
+    workspace: Option<&Path>,
+) {
     let indent = "  ".repeat(depth);
     // Slot- and anchor-placed objects print BOTH the source and the
     // resolution — `slot=title → at [72, 64] size [816, 64]` — so the agent
@@ -174,7 +189,7 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeM
                 g.objects.len()
             );
             for child in &g.objects {
-                describe_object(s, child, depth + 1, resolved);
+                describe_object(s, child, depth + 1, resolved, workspace);
             }
         }
         Object::Table(t) => {
@@ -220,6 +235,23 @@ fn describe_object(s: &mut String, obj: &Object, depth: usize, resolved: &BTreeM
                 let _ = write!(s, " · {} × {}", x.field, y.field);
             }
             let _ = writeln!(s);
+            // Provenance under the chart line — how an agent (a later
+            // session included) answers "how did you calculate this" from
+            // the file alone. Absent fields print nothing, so a plain chart
+            // reads exactly as it always did.
+            if let Some(src) = &c.data.source {
+                let _ = writeln!(
+                    s,
+                    "{indent}  source: {src}{}",
+                    source_status(&c.data, workspace)
+                );
+            }
+            if let Some(inputs) = &c.data.inputs {
+                let _ = writeln!(s, "{indent}  inputs: {}", inputs.join(", "));
+            }
+            if let Some(trace) = &c.data.trace {
+                let _ = writeln!(s, "{indent}  trace: {}", truncate(trace, 160));
+            }
         }
         Object::Diagram(d) => {
             let _ = writeln!(
@@ -339,6 +371,42 @@ fn placement_source(obj: &Object) -> Option<String> {
         "anchor={target}.{}",
         a.rel.as_deref().unwrap_or("center-of")
     ))
+}
+
+/// The parenthesized verdict after a chart's `source`: digest-verified fresh
+/// or stale when a workspace is in hand, quiet otherwise (the pure wrappers
+/// must not read the filesystem).
+fn source_status(data: &crate::schema::ChartData, workspace: Option<&Path>) -> &'static str {
+    let (Some(ws), Some(src)) = (workspace, data.source.as_deref()) else {
+        return "";
+    };
+    let rel = Path::new(src);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        // load_source refuses this shape; say so rather than "missing".
+        return " (invalid path — must be workspace-relative, no `..`)";
+    }
+    let Ok(bytes) = std::fs::read(ws.join(rel)) else {
+        return " (missing)";
+    };
+    let Some(declared) = data.sha256.as_deref() else {
+        return " (no sha256 pinned)";
+    };
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let actual = h.finalize().iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    if declared.eq_ignore_ascii_case(&actual) {
+        " (fresh)"
+    } else {
+        " (stale — bytes differ from the pinned sha256)"
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -487,6 +555,76 @@ mod tests {
         assert_eq!(head[1], "thesis: ship it", "{out}");
         assert_eq!(head[2], "audience: the team", "{out}");
         assert_eq!(head[3], "minutes: 10", "{out}");
+    }
+
+    #[test]
+    fn describe_prints_chart_provenance_lines() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Prov",
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"lat","type":"chart","at":[72,72],"size":[480,320],
+                   "data":{"origin":"derived-by-agent",
+                     "trace":"five-number summary via numpy.percentile, seed 42",
+                     "inputs":["results/latency.csv","results/runs.tsv"],
+                     "values":[{"d":"Mon","lo":1,"q1":2,"med":3,"q3":4,"hi":5}]},
+                   "x":{"field":"d"},"y":{"field":"med"},
+                   "marks":[{"mark":"box"}]}]}]}"#,
+        )
+        .unwrap();
+        crate::normalize(&mut b);
+        let out = describe(&b);
+        assert!(
+            out.contains("    inputs: results/latency.csv, results/runs.tsv"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    trace: five-number summary via numpy.percentile, seed 42"),
+            "{out}"
+        );
+        // No source binding → no source line; no workspace → no fs reads.
+        assert!(!out.contains("source:"), "{out}");
+    }
+
+    #[test]
+    fn describe_in_verifies_a_source_digest_when_given_a_workspace() {
+        let ws = std::env::temp_dir().join(format!("chimaera-describe-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("bench.csv"), "f,v\na,1\n").unwrap();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(std::fs::read(ws.join("bench.csv")).unwrap());
+            h.finalize().iter().fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+        };
+        let board = |sha: &str| {
+            let mut b = crate::parse(&format!(
+                r#"{{"format":"chimaera.board","formatVersion":1,"canvas":{{"size":[960,540]}},
+                    "pages":[{{"id":"p","objects":[
+                      {{"id":"c","type":"chart","at":[72,72],"size":[480,320],
+                       "data":{{"origin":"file","source":"bench.csv","sha256":"{sha}"}},
+                       "x":{{"field":"f","type":"nominal"}},
+                       "y":{{"field":"v","type":"quantitative"}}}}]}}]}}"#
+            ))
+            .unwrap();
+            crate::normalize(&mut b);
+            b
+        };
+        let fresh = describe_in(&board(&sha), None, Some(&ws));
+        assert!(fresh.contains("source: bench.csv (fresh)"), "{fresh}");
+        let stale = describe_in(&board(&"0".repeat(64)), None, Some(&ws));
+        assert!(
+            stale.contains("source: bench.csv (stale — bytes differ from the pinned sha256)"),
+            "{stale}"
+        );
+        // The pure wrapper prints the binding without a verdict.
+        let unverified = describe(&board(&sha));
+        assert!(unverified.contains("source: bench.csv\n"), "{unverified}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

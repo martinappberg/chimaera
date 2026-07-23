@@ -880,9 +880,41 @@ pub fn lint_style(
         page_budgets(page, theme, fonts, &mut diags);
         title_widows(page, &resolved, theme, fonts, &mut diags);
         free_at(board, page, theme, &mut diags);
+        untraceable_data(page, &mut diags);
     }
 
     diags
+}
+
+/// A chart whose inline values were produced by the agent (`command` /
+/// `derived-by-agent`) with nothing that says HOW — no `source` binding and
+/// no `trace`. A gentle nudge, never an error (even under --strict): the
+/// chart is legal, but a later session cannot answer "how was this
+/// calculated" from the file alone.
+fn untraceable_data(page: &Page, diags: &mut Vec<Diagnostic>) {
+    use crate::schema::DataOrigin;
+    for obj in page.walk() {
+        let Object::Chart(c) = obj else { continue };
+        let produced = matches!(
+            c.data.origin,
+            DataOrigin::Command | DataOrigin::DerivedByAgent
+        );
+        if produced
+            && !c.data.values.is_empty()
+            && c.data.source.is_none()
+            && c.data.trace.is_none()
+        {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "untraceable data: state how these values were produced (`trace`) or bind \
+                     the source file (`source`)",
+                )
+                .at(&page.id, obj.id())
+                .field("data"),
+            );
+        }
+    }
 }
 
 const ALIGN_TOLERANCE_PT: f64 = 3.0;
@@ -2334,6 +2366,60 @@ mod tests {
             .expect("a free-at finding");
         assert_eq!(f.object.as_deref(), Some("hand"));
         assert!(f.message.contains("body"), "names the slot: {}", f.message);
+    }
+
+    #[test]
+    fn untraceable_produced_values_get_a_gentle_nudge() {
+        let chart = |data: &str| {
+            crate::parse(&format!(
+                r#"{{"format":"chimaera.board","formatVersion":1,
+                    "canvas":{{"size":[960,540]}},
+                    "pages":[{{"id":"p1","objects":[
+                      {{"id":"c","type":"chart","at":[80,80],"size":[480,320],
+                       "data":{data},
+                       "x":{{"field":"f","type":"nominal"}},
+                       "y":{{"field":"v","type":"quantitative"}}}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        let style = |b: &Board, strict: bool| {
+            lint_style(
+                b,
+                &crate::theme::default_for(true),
+                &FontStack::new(&[]),
+                strict,
+            )
+        };
+        let nudged = |diags: &[Diagnostic]| {
+            diags
+                .iter()
+                .find(|d| d.message.contains("untraceable data"))
+                .cloned()
+        };
+
+        // command + inline values + neither source nor trace → the nudge…
+        let bare = chart(r#"{"origin":"command","values":[{"f":"a","v":1}]}"#);
+        let d = nudged(&style(&bare, false)).expect("a nudge");
+        assert_eq!(d.object.as_deref(), Some("c"));
+        assert_eq!(d.field.as_deref(), Some("data"));
+        // …which stays a warning even under --strict: a nudge, never a block.
+        assert_eq!(
+            nudged(&style(&bare, true)).unwrap().severity,
+            Severity::Warning
+        );
+
+        // A trace, a source binding, or a human/file origin all satisfy it.
+        for ok in [
+            chart(r#"{"origin":"command","values":[{"f":"a","v":1}],"trace":"wc -l per file"}"#),
+            chart(r#"{"origin":"file","source":"bench.csv","sha256":"00"}"#),
+            chart(r#"{"origin":"stated-by-user","values":[{"f":"a","v":1}]}"#),
+        ] {
+            assert!(
+                nudged(&style(&ok, false)).is_none(),
+                "{:?}",
+                style(&ok, false)
+            );
+        }
     }
 
     // --- lint --fix ----------------------------------------------------------

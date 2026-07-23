@@ -1,6 +1,8 @@
 <script lang="ts">
   import Chevron from "../shared/Chevron.svelte";
   import type { ChatBlock } from "./store.svelte";
+  import ShownCard from "./ShownCard.svelte";
+  import { collectShownBoards, type ShownBoard } from "./shownBoards";
   import ToolCallCard from "./ToolCallCard.svelte";
 
   /**
@@ -8,7 +10,9 @@
    * summary row ("6 commands · 2 files"); expanded it is a light list of
    * rows, each openable for its output. Groups start collapsed even while
    * running: the summary badge carries live status without turning the
-   * transcript into a wall of command rows.
+   * transcript into a wall of command rows. Boards this run `board show`ed
+   * render as FULL first-class cards after the group — the agent presenting
+   * a figure, visible while the command mechanics stay collapsed.
    */
   interface Props {
     tools: Extract<ChatBlock, { kind: "tool" }>[];
@@ -16,6 +20,10 @@
     /** Session working directory, forwarded to the rows so `board show`
      *  ShownCards can resolve workspace-relative paths. */
     cwd?: string;
+    /** The boards to render first-class after this group — ChatView's
+     *  transcript-level reduction (shownBoards.ts), so a same-`--id` re-show
+     *  in a later turn moves the ONE card there instead of duplicating. */
+    shown?: ShownBoard[];
     /** Background/stop a running row (claude only — the host omits these
      *  for agents without the capability). Called with the tool row id. */
     onBackground?: (id: string) => void;
@@ -33,6 +41,7 @@
     tools,
     onOpenFile,
     cwd,
+    shown = [],
     onBackground,
     onStopTask,
     visible = true,
@@ -71,6 +80,10 @@
    *  stream into this keyed group. */
   let open = $state(false);
 
+  /** Boards this run showed, regardless of where the transcript-level
+   *  reduction renders the card — the collapsed summary's small reference. */
+  const shownCount = $derived(collectShownBoards(tools, cwd).length);
+
   /** "6 commands · 2 files · 1 step" — only the non-zero parts, so a pure
    *  command run reads cleanly. Edits are counted by distinct file. */
   const summary = $derived.by(() => {
@@ -92,6 +105,7 @@
     if (commands > 0) parts.push(plural(commands, "command"));
     if (files.size > 0) parts.push(plural(files.size, "file"));
     if (steps > 0) parts.push(plural(steps, "step"));
+    if (shownCount > 0) parts.push(plural(shownCount, "board"));
     return parts.length > 0 ? parts.join(" · ") : plural(tools.length, "tool");
   });
 </script>
@@ -135,6 +149,12 @@
     </div>
   {/if}
 </div>
+<!-- The figure itself, first-class in the conversation flow: outside the
+     group container so it stays visible while the mechanics are collapsed.
+     Keyed on path — a same-path re-show swaps content in place. -->
+{#each shown as s (s.path)}
+  <ShownCard path={s.path} revision={s.revision} {cwd} {visible} onOpen={onOpenFile} />
+{/each}
 
 <style>
   .group {

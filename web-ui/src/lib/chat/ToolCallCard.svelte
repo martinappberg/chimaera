@@ -1,7 +1,7 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
-  import { joinPath } from "../previews/files";
   import ShownCard from "./ShownCard.svelte";
+  import { collectShownBoards } from "./shownBoards";
   import type { ChatBlock, ToolContent } from "./store.svelte";
 
   interface Props {
@@ -67,30 +67,10 @@
   );
 
   /** Boards this completed command "showed" (`chimaera board show` — plan
-   *  §10.1): the result text's `shown … → <path>.board.json` signature,
-   *  detected client-side so no wire change is needed. The daemon-injected
-   *  `shown` journal event can replace this detection later; the card itself
-   *  won't change. Relative paths (board prints workspace-relative) resolve
-   *  against the session cwd; absolute paths pass through. */
-  const shownPaths = $derived.by(() => {
-    if (block.status !== "completed" || block.denied) return [];
-    if (block.content?.kind !== "output") return [];
-    const text = block.content.text ?? "";
-    const out: string[] = [];
-    const seen = new Set<string>();
-    for (const m of text.matchAll(/^shown .+ → (.+\.board\.json)$/gm)) {
-      const raw = m[1].trim();
-      const p = raw.startsWith("/")
-        ? raw
-        : cwd !== undefined
-          ? joinPath(cwd, raw.replace(/^\.\//, ""))
-          : raw;
-      if (seen.has(p)) continue;
-      seen.add(p);
-      out.push(p);
-    }
-    return out;
-  });
+   *  §10.1, detection in shownBoards.ts). The FULL card renders first-class
+   *  in the transcript (ToolGroup); this row keeps only a compact reference
+   *  under the producing command — where the picture came from. */
+  const shownRefs = $derived(collectShownBoards([block], cwd));
 
   // Live output follows its own tail (terminal-style) while streaming.
   let bodyEl = $state<HTMLElement | null>(null);
@@ -295,10 +275,10 @@
       {/if}
     </div>
   {/if}
-  <!-- The agent showed a board mid-work: the card renders under the producing
-       command even while the row's output stays collapsed. -->
-  {#each shownPaths as p (p)}
-    <ShownCard path={p} onOpen={onOpenFile} />
+  <!-- This command showed a board: a compact reference here (the full card is
+       first-class in the transcript, outside the collapsed group). -->
+  {#each shownRefs as s (s.path)}
+    <ShownCard path={s.path} compact onOpen={onOpenFile} />
   {/each}
 </div>
 

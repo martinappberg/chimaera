@@ -16,8 +16,8 @@ in the app deployment is the GUI binary. Design source of truth:
 | File | What it is |
 |---|---|
 | `src/lib.rs` | parse/save, `is_board_path`, the workspace surround (`.chimaera/board/`, the self-ignoring `shown/`) |
-| `src/cli.rs` | the `chimaera board` verbs (`cli` feature): the clap `BoardCmd` Subcommand + `run` both binaries mount — help text and behavior are shared, never duplicated |
-| `src/schema.rs` | the format: 5 primitives + `table` + `chart` + `diagram` + `equation` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`); table cells reuse the `Paragraph` text model; `equation` requires `alt` (the C6 carve-out) so an alt-less one parse-fails into `Unknown` |
+| `src/cli.rs` | the `chimaera board` verbs (`cli` feature): the clap `BoardCmd` Subcommand + `run` both binaries mount — help text and behavior are shared, never duplicated. `guide` prints the embedded manual (`src/cli/GUIDE.md`, include_str — the complete zero-exploration reference; its examples are pinned runnable by test); `show --file` cards an existing board in place (render beside it + the `shown … → path` line the chat card mounts on) |
+| `src/schema.rs` | the format: 5 primitives + `table` + `chart` + `diagram` + `equation` + 7 annotation composites, lenient `Object` deserialize (unknown/malformed → preserved `Unknown`); table cells reuse the `Paragraph` text model; `equation` requires `alt` (the C6 carve-out) so an alt-less one parse-fails into `Unknown`; chart `data` carries the provenance set — required `origin`, the first-class `source` binding, plus `trace`/`inputs` for computed values (trace clamped in normalize) |
 | `src/pretty.rs` | the canonical byte-stable JSON layout — the exact bytes are part of the format |
 | `src/normalize.rs` | sugar expansion + the constraints that make ugly unrepresentable; pure and idempotent |
 | `src/merge.rs` | the per-object three-way merge on slug ids (git-merge-driver semantics: ours-wins on true conflicts + a `Conflict` report; page membership follows the mover; canonical byte-stable output; never journals) |
@@ -28,8 +28,8 @@ in the app deployment is the GUI binary. Design source of truth:
 | `src/composites.rs` | the annotation layer: `panelLabel`, `scalebar`, `sigBracket`, `legend`, `colorbar`, `callout`, `inset` — each expands to primitives at render exactly like `diagram`, children id'd `<composite-id>/<part>` |
 | `src/layout.rs` | text measurement/wrapping over usvg's own `fontdb` + rustybuzz |
 | `src/render.rs` | scene graph → SVG (self-emitted, always escaped) → PNG/JPEG via resvg |
-| `src/show.rs` | the one-shot `board show` spec → one-page board (never a second schema) |
-| `src/describe.rs` | the agent-facing read-back (+ the one-line journal summary) |
+| `src/show.rs` | the one-shot `board show` spec → one-page board (never a second schema): the `chart` value takes the FULL chart vocabulary (stated `marks` — incl. `box` over precomputed five-number rows — skip the editorial sort/flip sugars; a singular `mark` is one-layer sugar; top-level `trace`/`inputs` land in `data`) |
+| `src/describe.rs` | the agent-facing read-back (+ the one-line journal summary); chart lines carry provenance — `source` (digest-verified fresh/stale when a workspace is passed via `describe_in`), `inputs`, a `trace` excerpt |
 | `src/journal.rs` | the semantic edit journal: seq-first append-only JSONL per board under `.chimaera/board/journal/`, no wall clock, size-capped with seq-preserving compaction (unresolved `comment` pins survive the cap; `comment`/`comment-resolved` are the §6.4 pin vocabulary — journal-only, never the board file) |
 | `src/lint.rs` | the legality, target and style profiles + `lint_fix`; findings always name object, field, and the numbers |
 | `src/arrange.rs` | align/distribute/grid over named objects, one pure function; refuses slot-placed targets (their geometry is derived) |

@@ -34,6 +34,14 @@ export interface ObjInfo {
    *  flattening the edit op applies by design, so what the editor seeds is
    *  exactly what an unchanged commit would write. */
   text: string[] | null;
+  /** The object's own parsed JSON, verbatim — the inspector's config
+   *  projection ([`chartConfig`]) and the expected-fingerprint math for
+   *  `set` commits read from it. Still never layout truth. */
+  raw: unknown;
+  /** Configuration fingerprint ([`configSig`]) — what the §6.5 attribution
+   *  diff compares so an external restyle (which moves no frame) still
+   *  flashes. */
+  sig: string;
 }
 export interface PageInfo {
   id: string;
@@ -76,6 +84,8 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
           at: Array.isArray(o.at) ? [o.at[0], o.at[1]] : null,
           size: Array.isArray(o.size) ? [o.size[0], o.size[1]] : null,
           text: editableText(o.type, o.text),
+          raw: o,
+          sig: configSig(o),
         })),
       })),
     };
@@ -141,6 +151,179 @@ export function editorFontPx(sizePt: [number, number], ptScale: number, lineCoun
   const linePt = sizePt[1] / Math.max(1, lineCount);
   const fontPt = Math.min(44, Math.max(9, linePt * 0.62));
   return Math.max(11, Math.round(fontPt * ptScale));
+}
+
+// --- object configuration (the /board/edit set op's client half) -------------
+
+/** Deterministic sorted-key serialization, so two JSON values compare equal
+ *  iff they are structurally equal regardless of key order. */
+function stableStringify(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  if (typeof v === "object" && v !== null) {
+    const rec = v as Record<string, unknown>;
+    const keys = Object.keys(rec).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(rec[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/**
+ * An object's configuration fingerprint: everything but `at`/`size` (geometry
+ * attribution is value-checked separately) and `text` (text edits predate the
+ * config diff and deliberately stay flash-free — the inline editor commits
+ * no fingerprint expectation). Sorted keys, so the client's own applied-set
+ * prediction and a reparse of the daemon's canonical bytes agree.
+ */
+export function configSig(raw: unknown): string {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return stableStringify(raw);
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (k === "at" || k === "size" || k === "text") continue;
+    rest[k] = v;
+  }
+  return stableStringify(rest);
+}
+
+/**
+ * Client mirror of the daemon's dot-path `set` application, used ONLY to
+ * predict the post-write fingerprint for own-edit attribution (the daemon
+ * remains the sole authority on bytes). Same semantics: numeric segments
+ * index arrays in bounds, missing intermediate keys materialize as objects,
+ * null removes the field; paths applied in sorted order like the daemon's
+ * BTreeMap. A path that cannot be applied is skipped — the daemon rejects
+ * that request with nothing written, so there is no fingerprint to predict.
+ */
+export function applyFieldSet(raw: unknown, set: Record<string, unknown>): unknown {
+  const clone = JSON.parse(JSON.stringify(raw)) as unknown;
+  for (const path of Object.keys(set).sort()) {
+    const value = set[path];
+    const segs = path.split(".");
+    if (segs.some((s) => s === "")) continue;
+    let cur: unknown = clone;
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      const last = i === segs.length - 1;
+      if (/^\d+$/.test(seg)) {
+        if (!Array.isArray(cur)) break;
+        const idx = Number(seg);
+        if (idx >= cur.length) break;
+        if (last) cur[idx] = value;
+        else cur = cur[idx];
+      } else {
+        if (typeof cur !== "object" || cur === null || Array.isArray(cur)) break;
+        const rec = cur as Record<string, unknown>;
+        if (last) {
+          if (value === null) delete rec[seg];
+          else rec[seg] = value;
+        } else {
+          if (typeof rec[seg] !== "object" || rec[seg] === null) rec[seg] = {};
+          cur = rec[seg];
+        }
+      }
+    }
+  }
+  return clone;
+}
+
+/**
+ * The `sort` values chart.rs's `category_order` actually accepts, labeled by
+ * what each does: `x`/`-x` hit its label-sort branch (the literal `"x"` key,
+ * either orientation), any other key — canonically `y` — sorts by the summed
+ * magnitude, `-` descending. The literal token stays visible (canonical
+ * vocabulary); absent (`""`) is data order.
+ */
+export const SORT_OPTIONS: { value: string; label: string }[] = [
+  { value: "", label: "data order" },
+  { value: "x", label: "x · label A→Z" },
+  { value: "-x", label: "-x · label Z→A" },
+  { value: "y", label: "y · value low→high" },
+  { value: "-y", label: "-y · value high→low" },
+];
+
+/** The interchangeable single-mark kinds. `box`/`rect` are different
+ *  geometries and an interval bar (x2/y2) states a span — none swap. */
+export const MARK_SWAP_KINDS = ["bar", "line", "point"] as const;
+
+/** The chart inspector's projection of one chart object's config. */
+export interface ChartConfig {
+  /** Per-channel field + current axis label (`title`); null = the channel is
+   *  absent, so there is nothing to label (a channel needs `field`). */
+  x: { field: string; title: string } | null;
+  y: { field: string; title: string } | null;
+  /** The channel whose `sort` orders the categories — chart.rs's orient rule
+   *  (x quantitative/temporal × y nominal/ordinal reads horizontal, category
+   *  on y; otherwise category on x). Null = sort does not apply (missing
+   *  channels or a continuous category axis). */
+  sortChannel: "x" | "y" | null;
+  /** Current `sort` on that channel; "" = data order. */
+  sort: string;
+  markCount: number;
+  /** The single mark's kind when the chart has exactly one; null otherwise. */
+  markKind: string | null;
+  /** Single mark of an interchangeable kind and not an interval. */
+  markSwappable: boolean;
+  /** The single mark's stated color token (`fill` ?? `stroke`, the same
+   *  precedence series_color resolves); "" = the theme's default. */
+  markColor: string;
+}
+
+/** Project a chart object's raw JSON for the inspector; null for non-charts.
+ *  Reads the file's own literal values — never derived layout. */
+export function chartConfig(o: ObjInfo): ChartConfig | null {
+  if (o.kind !== "chart" || typeof o.raw !== "object" || o.raw === null) return null;
+  const raw = o.raw as Record<string, unknown>;
+  const channel = (v: unknown): Record<string, unknown> | null =>
+    typeof v === "object" && v !== null && typeof (v as { field?: unknown }).field === "string"
+      ? (v as Record<string, unknown>)
+      : null;
+  const x = channel(raw.x);
+  const y = channel(raw.y);
+  // Undeclared channel types default exactly as chart.rs's build does.
+  const xKind = typeof x?.type === "string" ? (x.type as string) : "nominal";
+  const yKind = typeof y?.type === "string" ? (y.type as string) : "quantitative";
+  const horizontal =
+    (xKind === "quantitative" || xKind === "temporal") &&
+    (yKind === "nominal" || yKind === "ordinal");
+  const cat = horizontal ? y : x;
+  const catKind = horizontal ? yKind : xKind;
+  const sortChannel =
+    x !== null && y !== null && (catKind === "nominal" || catKind === "ordinal")
+      ? horizontal
+        ? "y"
+        : "x"
+      : null;
+  const marks = Array.isArray(raw.marks) ? raw.marks : [];
+  const mark =
+    marks.length === 1 && typeof marks[0] === "object" && marks[0] !== null
+      ? (marks[0] as Record<string, unknown>)
+      : null;
+  const markKind = typeof mark?.mark === "string" ? (mark.mark as string) : null;
+  const fields = mark?.fields;
+  const interval =
+    typeof fields === "object" &&
+    fields !== null &&
+    ("x2" in (fields as Record<string, unknown>) || "y2" in (fields as Record<string, unknown>));
+  const color =
+    typeof mark?.fill === "string"
+      ? (mark.fill as string)
+      : typeof mark?.stroke === "string"
+        ? (mark.stroke as string)
+        : "";
+  const proj = (ch: Record<string, unknown> | null): { field: string; title: string } | null =>
+    ch === null
+      ? null
+      : { field: ch.field as string, title: typeof ch.title === "string" ? ch.title : "" };
+  return {
+    x: proj(x),
+    y: proj(y),
+    sortChannel,
+    sort: typeof cat?.sort === "string" ? (cat.sort as string) : "",
+    markCount: marks.length,
+    markKind,
+    markSwappable:
+      markKind !== null && !interval && (MARK_SWAP_KINDS as readonly string[]).includes(markKind),
+    markColor: color,
+  };
 }
 
 // --- selection-as-deixis (§6.4) ---------------------------------------------
@@ -278,11 +461,18 @@ export function samePair(a: [number, number], b: [number, number]): boolean {
   return Math.abs(a[0] - b[0]) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6;
 }
 
-/** id → frame for the objects that have full geometry. */
-export function pageFrames(objects: ObjInfo[]): Map<string, Frame> {
-  const m = new Map<string, Frame>();
+/** A frame plus the object's config fingerprint — what the attribution diff
+ *  snapshots per object. Objects without full geometry are absent (an
+ *  external restyle of one has no frame to outline, like a removed object). */
+export interface ObjSnap extends Frame {
+  sig: string;
+}
+
+/** id → frame + config fingerprint for the objects that have full geometry. */
+export function pageFrames(objects: ObjInfo[]): Map<string, ObjSnap> {
+  const m = new Map<string, ObjSnap>();
   for (const o of objects) {
-    if (o.at !== null && o.size !== null) m.set(o.id, { at: o.at, size: o.size });
+    if (o.at !== null && o.size !== null) m.set(o.id, { at: o.at, size: o.size, sig: o.sig });
   }
   return m;
 }
@@ -336,43 +526,52 @@ export function resizeFrame(
  *  "our own write landing" from "an agent's write" by value, because the
  *  fileStore publishes chunk and mtime in separate microtasks (external edits
  *  refresh geometry *before* the mtime token moves, own writes the reverse),
- *  so a token check alone misattributes at geometry-change time. */
+ *  so a token check alone misattributes at geometry-change time. Geometry is
+ *  compared by value; a `set` commit's config lands as a predicted
+ *  fingerprint ([`configSig`] over [`applyFieldSet`]). */
 export interface ExpectedChange {
   at?: [number, number];
   size?: [number, number];
+  sig?: string;
 }
 
 /**
- * Diff two frame maps and attribute the changes. Frames that match a pending
- * own-committed value are consumed from `expected` and not returned; every
- * other changed or added frame is an external (agent) edit to flash. Removed
- * objects are deliberately ignored (nothing to outline).
+ * Diff two snapshot maps and attribute the changes — frame moves AND config
+ * restyles (fingerprint). Changes that match a pending own-committed value
+ * are consumed from `expected` and not returned; every other changed or
+ * added snapshot is an external (agent) edit to flash at its current frame.
+ * Removed objects are deliberately ignored (nothing to outline).
  */
 export function attributeDiff(
-  baseline: Map<string, Frame>,
-  next: Map<string, Frame>,
+  baseline: Map<string, ObjSnap>,
+  next: Map<string, ObjSnap>,
   expected: Map<string, ExpectedChange>,
 ): { id: string; frame: Frame }[] {
   const external: { id: string; frame: Frame }[] = [];
-  for (const [id, frame] of next) {
+  for (const [id, snap] of next) {
     const prev = baseline.get(id);
-    if (prev !== undefined && samePair(prev.at, frame.at) && samePair(prev.size, frame.size)) {
-      continue;
-    }
+    const frameSame =
+      prev !== undefined && samePair(prev.at, snap.at) && samePair(prev.size, snap.size);
+    const sigSame = prev !== undefined && prev.sig === snap.sig;
+    if (frameSame && sigSame) continue;
     const exp = expected.get(id);
-    const ownAt = exp?.at === undefined ? prev !== undefined && samePair(prev.at, frame.at) : samePair(exp.at, frame.at);
+    const ownAt =
+      exp?.at === undefined
+        ? prev !== undefined && samePair(prev.at, snap.at)
+        : samePair(exp.at, snap.at);
     const ownSize =
       exp?.size === undefined
-        ? prev !== undefined && samePair(prev.size, frame.size)
-        : samePair(exp.size, frame.size);
+        ? prev !== undefined && samePair(prev.size, snap.size)
+        : samePair(exp.size, snap.size);
+    const ownSig = exp?.sig === undefined ? sigSame : exp.sig === snap.sig;
     if (exp !== undefined) {
       // Consumed on match; also dropped on mismatch — every refresh reads the
       // live file, so a mismatch means our write was superseded and its value
       // can only return via a fresh commit (which re-arms `expected`).
       expected.delete(id);
-      if (ownAt && ownSize) continue;
+      if (ownAt && ownSize && ownSig) continue;
     }
-    external.push({ id, frame });
+    external.push({ id, frame: { at: snap.at, size: snap.size } });
   }
   return external;
 }

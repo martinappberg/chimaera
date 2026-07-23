@@ -1130,7 +1130,8 @@ pub struct ChartObject {
 /// The skill says *"a confident chart of numbers you inferred is the one way
 /// this feature does harm"* and then left it to prose, while a merely *stale*
 /// digest got a badge, a lint, an export block and a describe line. That
-/// asymmetry was backwards. `origin` is rendered as a visible chip.
+/// asymmetry was backwards. `origin` surfaces in `describe`, lint, and the
+/// chat card's data disclosure — never painted on the canvas itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartData {
@@ -1150,6 +1151,17 @@ pub struct ChartData {
     /// Free text: where the command/file came from, for the card's chip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// How the plotted values were produced — command/script, method, seed —
+    /// so a later session can answer "how did you calculate this" from the
+    /// file alone. Covers computed-from-files cases (quartiles, aggregations)
+    /// where `source` cannot bind the derived rows. Clamped to 2 KiB in
+    /// `normalize()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
+    /// Workspace-relative paths the computation read. The trace's evidence:
+    /// `source` remains the first-class binding for rows plotted verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: Extra,
 }

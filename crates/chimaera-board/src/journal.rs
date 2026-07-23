@@ -106,6 +106,14 @@ impl Event {
                 format!("removed {kind} {object} from {page}")
             }
             EventKind::TextEdited { object } => format!("edited text of {object}"),
+            EventKind::Restyle { object, changed } => {
+                let fields = changed
+                    .iter()
+                    .map(|(path, value)| format!("{path} → {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("restyled {object} ({fields})")
+            }
             EventKind::PageAdded { page } => format!("added page {page}"),
             EventKind::PageRemoved { page } => format!("removed page {page}"),
             EventKind::PageReordered { page, from, to } => {
@@ -177,6 +185,16 @@ pub enum EventKind {
     },
     TextEdited {
         object: String,
+    },
+    /// Sparse configuration change (the plan §6.3's `restyle`): dot-paths
+    /// over the object's canonical JSON with the values the file now holds
+    /// (`{"x.title": "Time (s)"}`; null = the field was cleared). The one
+    /// object event that names *fields* — a reader sees what about the object
+    /// changed without diffing the file. `BTreeMap` for deterministic key
+    /// order, like every serialized map in the format.
+    Restyle {
+        object: String,
+        changed: std::collections::BTreeMap<String, serde_json::Value>,
     },
     PageAdded {
         page: String,

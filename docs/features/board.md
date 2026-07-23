@@ -51,8 +51,10 @@ on the full `.board.json` suffix. Chat card:
   `rule`, `tick`, `text`, and `box` sugar over five-number summaries; linear
   / log (decade ticks) / ordinal / temporal scales (calendar tick labels);
   inline values or CSV/TSV(.gz) `source` binding with sha256 staleness
-  (stale is loud and draws no marks); the required `data.origin` chip;
-  histogram/pie/second-y refused.
+  (stale is loud and draws no marks); the required `data.origin` chip, plus
+  optional `data.trace` (how computed values were produced — clamped 2 KiB)
+  and `data.inputs` (the files read) so provenance survives into later
+  sessions; histogram/pie/second-y refused.
 - **Diagrams**: nodes/edges/lanes with deterministic Sugiyama-lite layout and
   connector-bound edge labels; mermaid flowcharts import converted-once
   (`board import`, `show --mermaid`) with the source kept in provenance.
@@ -83,11 +85,23 @@ on the full `.board.json` suffix. Chat card:
 ## CLI
 
 `chimaera board show` (stdin spec → card under the self-ignoring
-`.chimaera/board/shown/`; `--table`, `--mermaid`, `--id` update handle) ·
+`.chimaera/board/shown/`; `--table`, `--mermaid`, `--id` update handle; the
+spec's `chart` value takes the **full chart vocabulary** — stated `marks`
+incl. `box` over precomputed five-number rows pass through untouched by the
+sort/flip sugars, a singular `mark` is one-layer sugar, and top-level
+`trace`/`inputs` land in `data`; `--file PATH` cards an **existing** board in
+place: validate, render page 1 beside it, print the `shown … → path` line the
+chat card mounts on) · `guide` (the complete embedded manual —
+`src/cli/GUIDE.md`, printed to stdout so an agent in any workspace learns the
+whole tool in one call instead of exploring `--help`/the source; its examples
+are test-pinned runnable) ·
 `new` · `render` · `describe` (positions + slot resolutions + journal
-summary) · `journal [--since N]` · `lint [--target PRESET] [--style]
+summary + chart provenance: `source` digest-verified fresh/stale, `inputs`,
+a `trace` excerpt) · `journal [--since N]` · `lint [--target PRESET] [--style]
 [--strict] [--fix]` (tier census; near-miss alignment and the narrow §3.5
-set; mechanical fixes) · `arrange --op align-*|distribute-*|grid` (journals
+set; mechanical fixes; `--style` also nudges — warning, never an error —
+when command/agent-produced inline values carry neither `source` nor
+`trace`) · `arrange --op align-*|distribute-*|grid` (journals
 as actor `agent`) · `import` (mermaid / SVG / PNG figures into
 `.chimaera/board/assets/` with provenance) · `adopt` (promote a shown card)
 · `export --format pptx|pdf|svg|svg-outlined` · `theme-export --format
@@ -182,7 +196,9 @@ with a workspace get an injected board note (`launcher::BOARD_SYSTEM_PROMPT`
 — claude `--append-system-prompt`, codex `developer_instructions`) that is
 zero-shot: it carries a complete runnable example, so the agent's first board
 action is the `chimaera board show` pipe itself, with no `--help` or source
-exploration. The daemon writes a `chimaera` shim (an exec of its own binary)
+exploration — and it routes everything richer (boxplots, decks, persistent
+boards, provenance) to `chimaera board guide`, the manual embedded in the
+binary. The daemon writes a `chimaera` shim (an exec of its own binary)
 into the shims dir on every session's PATH, so agents in arbitrary workspaces
 can run it without a user install — and that holds in the native app too,
 where the daemon IS the GUI binary: it answers `board` argv before any Tauri

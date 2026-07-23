@@ -26,9 +26,11 @@
   import { retain, release, noteWrite, type FileEntry } from "./fileStore.svelte";
   import { boardNudge } from "./boardEvents";
   import {
+    applyFieldSet,
     attributeDiff,
     boardFrames,
     composeBoardContext,
+    configSig,
     CORNERS,
     editorFontPx,
     editorTextToParagraphs,
@@ -52,6 +54,7 @@
     type FieldChange,
     type Frame,
     type ObjInfo,
+    type ObjSnap,
     type PinInfo,
   } from "./boardInteract";
   import { referenceTarget, workspaceRelative } from "../shared/reference";
@@ -486,20 +489,31 @@
 
   function commit(
     id: string,
-    change: { at?: [number, number]; size?: [number, number]; text?: string[] },
+    change: {
+      at?: [number, number];
+      size?: [number, number];
+      text?: string[];
+      set?: Record<string, unknown>;
+    },
+    /** Predicted post-write config fingerprint, for `set` commits only —
+     *  computed by the caller from the object's raw JSON before the write. */
+    expectedSig?: string,
   ): Promise<void> {
     commitChain = commitChain.then(async () => {
       saving = true;
       saveError = null;
       try {
         const mtime = await fsBoardEdit(path, id, change);
-        // Only geometry participates in the attribution diff (a text change
-        // moves no frame), so a text-only commit must not clobber a still-
-        // pending geometry expectation for the same object.
-        const expected: ExpectedChange = {};
+        // Geometry is expected by value, config by fingerprint; text edits
+        // deliberately carry no expectation (configSig excludes text). Merge
+        // with any still-pending expectation for the object so a config
+        // commit never clobbers a pending geometry one, or vice versa.
+        const expected: ExpectedChange = { ...(ownExpected.get(id) ?? {}) };
         if (change.at !== undefined) expected.at = change.at;
         if (change.size !== undefined) expected.size = change.size;
-        if (expected.at !== undefined || expected.size !== undefined) ownExpected.set(id, expected);
+        if (expectedSig !== undefined) expected.sig = expectedSig;
+        if (expected.at !== undefined || expected.size !== undefined || expected.sig !== undefined)
+          ownExpected.set(id, expected);
         if (mtime !== null) {
           ownWrites.add(mtime);
           if (ownWrites.size > 64) {
@@ -540,6 +554,19 @@
       undoStack.push({ object: o.id, fields: [{ field: "size", from: o.size, to: size }] });
       void commit(o.id, { size });
     }
+  }
+
+  /** Inspector config commit (the chart section): one sparse `set` on the
+   *  selected object, riding the same commit chain. The expected fingerprint
+   *  is the client's own prediction of the saved config, so the refresh this
+   *  write causes attributes as ours — no flash. Config edits stay off the
+   *  §6.7 undo stack (its staleness rule is frame-based, like text edits);
+   *  the journal's restyle event remains the audit trail. */
+  function commitSet(set: Record<string, unknown>): void {
+    const o = selectedObj;
+    if (o === null) return;
+    const expectedSig = configSig(applyFieldSet(o.raw, set));
+    void commit(o.id, { set }, expectedSig);
   }
 
   // --- in-place text editing ----------------------------------------------
@@ -888,7 +915,7 @@
     /** False while the board was unloaded/unparseable — a parse appearing is
      *  not an agent adding every object, so it must not flash. */
     hadBoard: boolean;
-    frames: Map<string, Frame>;
+    frames: Map<string, ObjSnap>;
   } | null = null;
 
   function addFlashes(items: { id: string; frame: Frame }[]): void {
@@ -1250,7 +1277,7 @@
             ? "sending…"
             : chatTarget === null && termTarget !== null
               ? "copy snapshot path"
-              : "send to chat"}</button
+              : "chat"}</button
         >
         <button class="nav wide" onclick={enterPresent} aria-label="present" title="present"
           >present</button
@@ -1272,8 +1299,10 @@
       title={board?.title ?? "board"}
       objects={pageObjects}
       {selected}
+      catSwatches={render?.catSwatches ?? []}
       onselect={(id) => (selected = id)}
       oncommitfield={commitField}
+      oncommitset={commitSet}
     />
   {/if}
 </div>

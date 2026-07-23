@@ -100,8 +100,8 @@ pub(crate) struct DescribeRequest {
     pub path: String,
 }
 
-/// One semantic gesture from the pane: move/resize an object by id, or
-/// replace a text/shape object's text.
+/// One semantic gesture from the pane: move/resize an object by id, replace
+/// a text/shape object's text, or `set` sparse configuration fields.
 ///
 /// The pane never serializes a board itself — a client-side
 /// `JSON.stringify` would destroy the canonical byte-stable form and churn
@@ -123,7 +123,35 @@ pub(crate) struct EditRequest {
     /// the pane's inline editor edits words, not runs.
     #[serde(default)]
     pub text: Option<Vec<String>>,
+    /// Sparse configuration updates: dot-paths over the object's canonical
+    /// JSON → new values (`{"x.title": "Time (s)", "marks.0.fill": "@cat3"}`;
+    /// null clears the field). Generic on purpose — a chart's axes, sort and
+    /// mark config are exactly config, not a special object. The mutation is
+    /// applied to the object's serialized form and the result must re-parse
+    /// as a valid object, so this route can never write a board it could not
+    /// read back. `id`/`type` are immutable and `at`/`size` are refused —
+    /// move/resize own geometry, which keeps the undo stack's frame-based
+    /// staleness rules honest. `BTreeMap` so application order is
+    /// deterministic.
+    #[serde(default)]
+    pub set: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
+
+/// A `set` refusal: the request was well-formed but the mutation is not
+/// applicable — an immutable/geometry field, a path that doesn't traverse,
+/// or a value whose result fails to parse back into a valid object. Mapped
+/// to 422 (vs. the routes' generic 400) so a caller can tell "fix the value"
+/// from "fix the request". Nothing is written on this path.
+#[derive(Debug)]
+struct SetRejected(String);
+
+impl std::fmt::Display for SetRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SetRejected {}
 
 /// POST /api/v1/board/render → `{ticket, width, height, pageCount, pages,
 /// diagnostics}`. The PNG is fetched as `/raw/{ticket}`.
@@ -188,6 +216,19 @@ pub(crate) async fn render(
             "height": height,
             "pageCount": page_count,
             "pages": board.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            // The theme's categorical ramp as @token → resolved hex, for the
+            // inspector's series-color swatches. Tokens only — the swatch row
+            // commits the @-ref (the theme indirection), never a literal, and
+            // the hex exists purely so the swatch can *show* what the token
+            // resolves to under this board's theme. Additive; cheap enough to
+            // ride the cached-render path (no sidecar participation).
+            "catSwatches": theme
+                .chart
+                .categorical
+                .iter()
+                .filter(|t| t.starts_with('@'))
+                .filter_map(|t| theme.color(t).map(|rgb| json!({"token": t, "hex": rgb.hex()})))
+                .collect::<Vec<_>>(),
             "diagnostics": diagnostics
                 .iter()
                 .map(|d| json!({
@@ -265,66 +306,7 @@ pub(crate) async fn edit(
     let _guard = edit_shard(&path).lock().await;
     let outcome = fs::blocking_value({
         let path = path.clone();
-        move || {
-            let mut board = chimaera_board::load(&path)?;
-
-            let mut found = false;
-            let mut prior = None;
-            for page in &mut board.pages {
-                // Top-level objects only: group children are page-absolute too,
-                // but moving one without its siblings is a different gesture
-                // (enter-the-group), which the pane does not offer yet.
-                for obj in &mut page.objects {
-                    if obj.id() != req.object {
-                        continue;
-                    }
-                    found = true;
-                    prior = obj.frame();
-                    if let Some(at) = req.at {
-                        obj.set_at(at);
-                    }
-                    if let Some(size) = req.size {
-                        obj.set_size(size);
-                    }
-                    if let Some(text) = &req.text {
-                        let paras = || {
-                            text.iter()
-                                .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
-                                .collect()
-                        };
-                        match obj {
-                            chimaera_board::Object::Text(t) => t.text = paras(),
-                            chimaera_board::Object::Shape(sh) => sh.text = paras(),
-                            other => anyhow::bail!(
-                                "text applies to text and shape objects; {:?} is a {}",
-                                req.object,
-                                other.kind()
-                            ),
-                        }
-                    }
-                }
-            }
-            if !found {
-                anyhow::bail!("no object {:?} in {}", req.object, path.display());
-            }
-
-            // Normalize (grid snap, group re-union) before the canonical save —
-            // the same pipeline an agent edit goes through, so a human drag and
-            // an agent Edit produce bytes of identical shape.
-            chimaera_board::normalize(&mut board);
-            chimaera_board::save(&path, &board)?;
-
-            let journal_seq = journal_edit(&path, &board, &req, prior);
-
-            let meta = std::fs::metadata(&path)?;
-            let mut response = json!({
-                "mtime": fs::mtime_token(&meta),
-            });
-            if let Some(seq) = journal_seq {
-                response["journalSeq"] = json!(seq);
-            }
-            Ok(response)
-        }
+        move || perform_edit(&path, &req)
     })
     .await;
 
@@ -338,8 +320,184 @@ pub(crate) async fn edit(
             schedule_git_settle(state.clone(), path.to_string_lossy().into_owned());
             Json(value).into_response()
         }
+        Err(err) if err.downcast_ref::<SetRejected>().is_some() => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": format!("{err:#}")})),
+        )
+            .into_response(),
         Err(err) => board_error(&err),
     }
+}
+
+/// The edit gesture's whole read→mutate→normalize→save→journal cycle, on the
+/// blocking pool under the caller's shard guard. Split from the handler so
+/// tests exercise the exact mutation path (atomicity, canonical bytes,
+/// refusals) without standing up an `AppState`.
+fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Value> {
+    let mut board = chimaera_board::load(path)?;
+
+    let mut found = false;
+    let mut prior = None;
+    for page in &mut board.pages {
+        // Top-level objects only: group children are page-absolute too,
+        // but moving one without its siblings is a different gesture
+        // (enter-the-group), which the pane does not offer yet.
+        for obj in &mut page.objects {
+            if obj.id() != req.object {
+                continue;
+            }
+            found = true;
+            prior = obj.frame();
+            if let Some(at) = req.at {
+                obj.set_at(at);
+            }
+            if let Some(size) = req.size {
+                obj.set_size(size);
+            }
+            if let Some(text) = &req.text {
+                let paras = || {
+                    text.iter()
+                        .map(|s| chimaera_board::schema::Paragraph::Plain(s.clone()))
+                        .collect()
+                };
+                match obj {
+                    chimaera_board::Object::Text(t) => t.text = paras(),
+                    chimaera_board::Object::Shape(sh) => sh.text = paras(),
+                    other => anyhow::bail!(
+                        "text applies to text and shape objects; {:?} is a {}",
+                        req.object,
+                        other.kind()
+                    ),
+                }
+            }
+            if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
+                apply_set(obj, &req.object, set)?;
+            }
+        }
+    }
+    if !found {
+        anyhow::bail!("no object {:?} in {}", req.object, path.display());
+    }
+
+    // Normalize (grid snap, group re-union) before the canonical save —
+    // the same pipeline an agent edit goes through, so a human drag and
+    // an agent Edit produce bytes of identical shape.
+    chimaera_board::normalize(&mut board);
+    chimaera_board::save(path, &board)?;
+
+    let journal_seq = journal_edit(path, &board, req, prior);
+
+    let meta = std::fs::metadata(path)?;
+    let mut response = json!({
+        "mtime": fs::mtime_token(&meta),
+    });
+    if let Some(seq) = journal_seq {
+        response["journalSeq"] = json!(seq);
+    }
+    Ok(response)
+}
+
+/// Apply a `set` map to one object by editing its serialized form and
+/// re-parsing the result — the whole-object round trip is the validity
+/// gate: a value that turns a known type unparseable comes back as
+/// [`chimaera_board::Object::Unknown`] with the parse reason, and the edit
+/// is rejected before anything is written. Every refusal is a
+/// [`SetRejected`] (422).
+fn apply_set(
+    obj: &mut chimaera_board::Object,
+    id: &str,
+    set: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    let mut raw = serde_json::to_value(&*obj)?;
+    for (fpath, value) in set {
+        apply_field_path(&mut raw, fpath, value).map_err(|e| {
+            anyhow::Error::new(SetRejected(format!("set {fpath:?} on {id:?}: {e}")))
+        })?;
+    }
+    let new_obj: chimaera_board::Object = serde_json::from_value(raw)?;
+    if let chimaera_board::Object::Unknown(u) = &new_obj {
+        if let Some(reason) = &u.error {
+            anyhow::bail!(SetRejected(format!(
+                "set leaves {id:?} an invalid {} object (nothing written): {reason}",
+                u.kind
+            )));
+        }
+    }
+    *obj = new_obj;
+    Ok(())
+}
+
+/// One dot-path assignment into an object's serialized JSON. Numeric
+/// segments index arrays (in bounds only — `set` edits config, it does not
+/// grow collections); missing intermediate keys materialize as objects; a
+/// null value removes the field (canonical serialization omits absent
+/// options, so null-as-removal is what round-trips). `id`/`type` are
+/// immutable and `at`/`size` belong to move/resize.
+fn apply_field_path(
+    root: &mut serde_json::Value,
+    path: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let segments: Vec<&str> = path.split('.').collect();
+    if path.is_empty() || segments.iter().any(|s| s.is_empty()) {
+        anyhow::bail!("empty field path segment");
+    }
+    match segments[0] {
+        "id" | "type" => anyhow::bail!("the field is immutable (it anchors identity)"),
+        "at" | "size" => anyhow::bail!("geometry is owned by the move/resize ops"),
+        _ => {}
+    }
+    let mut cur = root;
+    for (i, seg) in segments.iter().enumerate() {
+        let last = i + 1 == segments.len();
+        if let Ok(idx) = seg.parse::<usize>() {
+            let arr = cur
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("segment {seg:?} indexes a non-array"))?;
+            let len = arr.len();
+            let slot = arr
+                .get_mut(idx)
+                .ok_or_else(|| anyhow::anyhow!("index {idx} out of bounds (len {len})"))?;
+            if last {
+                *slot = value.clone();
+                return Ok(());
+            }
+            cur = slot;
+        } else {
+            let map = cur
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("segment {seg:?} crosses a non-object"))?;
+            if last {
+                if value.is_null() {
+                    map.remove(*seg);
+                } else {
+                    map.insert((*seg).to_string(), value.clone());
+                }
+                return Ok(());
+            }
+            cur = map
+                .entry((*seg).to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
+    }
+    unreachable!("the last segment returns");
+}
+
+/// Read a dot-path back out of a serialized object; `Null` when absent —
+/// which is exactly how a cleared field journals.
+fn field_path_value(root: &serde_json::Value, path: &str) -> serde_json::Value {
+    let mut cur = root;
+    for seg in path.split('.') {
+        let next = match seg.parse::<usize>() {
+            Ok(idx) => cur.get(idx),
+            Err(_) => cur.get(seg),
+        };
+        match next {
+            Some(v) => cur = v,
+            None => return serde_json::Value::Null,
+        }
+    }
+    cur.clone()
 }
 
 /// Bump the board epoch of every workspace whose root contains `path`, then
@@ -664,10 +822,11 @@ fn journal_edit(
     // not the requested one — the journal narrates the file, never the wire.
     // A text edit carries no geometry, so the frame lookup gates only the
     // move/resize events, never the text-edited one.
-    let saved = board
+    let saved_obj = board
         .objects()
         .find(|(_, o)| o.id() == req.object)
-        .and_then(|(_, o)| o.frame());
+        .map(|(_, o)| o);
+    let saved = saved_obj.and_then(|o| o.frame());
     let mut events = Vec::new();
     if let Some(saved) = saved {
         if req.at.is_some() {
@@ -698,6 +857,24 @@ fn journal_edit(
                 object: req.object.clone(),
             },
         ));
+    }
+    if let Some(set) = req.set.as_ref().filter(|s| !s.is_empty()) {
+        // The journaled values are the SAVED object's, read back per path
+        // (post-normalize) — the journal narrates the file, never the wire.
+        // Null means the field was cleared.
+        if let Some(raw) = saved_obj.and_then(|o| serde_json::to_value(o).ok()) {
+            let changed = set
+                .keys()
+                .map(|p| (p.clone(), field_path_value(&raw, p)))
+                .collect();
+            events.push(Event::new(
+                Actor::Human,
+                EventKind::Restyle {
+                    object: req.object.clone(),
+                    changed,
+                },
+            ));
+        }
     }
     if events.is_empty() {
         return None;
@@ -846,5 +1023,169 @@ mod tests {
             .is_err(),
             "an unknown op never reaches the journal file"
         );
+    }
+
+    /// A fresh workspace with one bar-chart board on disk. The `.git` marker
+    /// pins `workspace_root` inside the temp dir, so the journal lands where
+    /// the assertions look.
+    fn chart_board(label: &str) -> (PathBuf, PathBuf) {
+        let ws =
+            std::env::temp_dir().join(format!("chimaera-board-set-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let path = ws.join("fig.board.json");
+        let board: chimaera_board::Board = serde_json::from_str(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","objects":[
+                  {"id":"bench","type":"chart","at":[80,80],"size":[400,300],
+                   "data":{"origin":"stated-by-user",
+                           "values":[{"tool":"a","ms":4},{"tool":"b","ms":2}]},
+                   "x":{"field":"tool","type":"nominal"},
+                   "y":{"field":"ms","type":"quantitative"},
+                   "marks":[{"mark":"bar"}]}]}]}"#,
+        )
+        .unwrap();
+        chimaera_board::save(&path, &board).unwrap();
+        (ws, path)
+    }
+
+    fn edit_req(path: &Path, object: &str, set: serde_json::Value) -> EditRequest {
+        EditRequest {
+            path: path.to_string_lossy().into_owned(),
+            object: object.to_string(),
+            at: None,
+            size: None,
+            text: None,
+            set: Some(serde_json::from_value(set).unwrap()),
+        }
+    }
+
+    /// The happy path: a chart's sort and axis label land as sparse field
+    /// edits, the saved file is byte-canonical, and the journal carries one
+    /// human `restyle` naming exactly the changed fields with saved values.
+    #[test]
+    fn set_edits_chart_sort_and_axis_label_canonically() {
+        let (ws, path) = chart_board("happy");
+        let req = edit_req(
+            &path,
+            "bench",
+            serde_json::json!({"x.sort": "-y", "y.title": "Time (ms)"}),
+        );
+        let out = perform_edit(&path, &req).unwrap();
+        assert!(out.get("mtime").is_some());
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+
+        let board = chimaera_board::load(&path).unwrap();
+        let (_, obj) = board.objects().find(|(_, o)| o.id() == "bench").unwrap();
+        let chimaera_board::Object::Chart(chart) = obj else {
+            panic!("bench stayed a chart");
+        };
+        assert_eq!(chart.x.as_ref().unwrap().sort.as_deref(), Some("-y"));
+        assert_eq!(
+            chart.y.as_ref().unwrap().title.as_deref(),
+            Some("Time (ms)")
+        );
+        // Byte-canonical: the file is exactly the crate writer's output.
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(bytes, chimaera_board::to_string(&board).unwrap());
+
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        let restyle = events.iter().find(|e| e.seq == seq).unwrap();
+        assert_eq!(restyle.actor, chimaera_board::journal::Actor::Human);
+        match &restyle.kind {
+            chimaera_board::journal::EventKind::Restyle { object, changed } => {
+                assert_eq!(object, "bench");
+                assert_eq!(changed.get("x.sort").unwrap(), "-y");
+                assert_eq!(changed.get("y.title").unwrap(), "Time (ms)");
+                assert_eq!(changed.len(), 2, "exactly the set fields are named");
+            }
+            other => panic!("expected restyle, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A value that turns the object unparseable is rejected with the parse
+    /// reason and NOTHING is written — neither the board nor the journal.
+    #[test]
+    fn invalid_set_value_is_rejected_atomically() {
+        let (ws, path) = chart_board("invalid");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let req = edit_req(&path, "bench", serde_json::json!({"x.type": "bogus"}));
+        let err = perform_edit(&path, &req).unwrap_err();
+        assert!(
+            err.downcast_ref::<SetRejected>().is_some(),
+            "422 class: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("nothing written"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the file is untouched"
+        );
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        assert!(
+            !journal_path.exists(),
+            "no journal event for a refused edit"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// `id`/`type` are immutable and geometry belongs to move/resize — each
+    /// refusal is a [`SetRejected`], file untouched.
+    #[test]
+    fn immutable_and_geometry_fields_are_refused() {
+        let (ws, path) = chart_board("immutable");
+        let before = std::fs::read_to_string(&path).unwrap();
+        for set in [
+            serde_json::json!({"id": "other"}),
+            serde_json::json!({"type": "text"}),
+            serde_json::json!({"at": [0.0, 0.0]}),
+            serde_json::json!({"size.0": 100.0}),
+        ] {
+            let err = perform_edit(&path, &edit_req(&path, "bench", set)).unwrap_err();
+            assert!(err.downcast_ref::<SetRejected>().is_some(), "{err:#}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Two concurrent set edits on one board serialize on the shard lock the
+    /// handler takes — both land, neither read-modify-write is lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_set_edits_serialize_on_the_shard_lock() {
+        let (ws, path) = chart_board("concurrent");
+        let mut tasks = Vec::new();
+        for set in [
+            serde_json::json!({"x.sort": "-y"}),
+            serde_json::json!({"y.title": "Time (ms)"}),
+        ] {
+            let path = path.clone();
+            tasks.push(tokio::spawn(async move {
+                // The handler's exact discipline: shard guard held across the
+                // whole blocking read→mutate→write.
+                let _guard = edit_shard(&path).lock().await;
+                let req = edit_req(&path, "bench", set);
+                tokio::task::spawn_blocking(move || perform_edit(&path, &req))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let board = chimaera_board::load(&path).unwrap();
+        let (_, obj) = board.objects().find(|(_, o)| o.id() == "bench").unwrap();
+        let chimaera_board::Object::Chart(chart) = obj else {
+            panic!("bench stayed a chart");
+        };
+        assert_eq!(chart.x.as_ref().unwrap().sort.as_deref(), Some("-y"));
+        assert_eq!(
+            chart.y.as_ref().unwrap().title.as_deref(),
+            Some("Time (ms)")
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

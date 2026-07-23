@@ -36,6 +36,10 @@ pub const MIN_EXTENT_PT: f64 = 8.0;
 pub const MAX_INLINE_ROWS: usize = 500;
 pub const MAX_INLINE_BYTES: usize = 32 * 1024;
 
+/// `data.trace` cap: how the values were produced fits in a paragraph; a
+/// pipeline log does not belong in a board file.
+pub const MAX_TRACE_BYTES: usize = 2 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Info,
@@ -386,6 +390,31 @@ fn normalize_chart(c: &mut ChartObject, page: &str, id: &str, diags: &mut Vec<Di
             .field("data.values"),
         );
     }
+
+    // `trace` is a provenance note, not a document: clamp to the cap on a
+    // char boundary (truncation, not rejection — losing the tail of a trace
+    // beats losing the trace). Idempotent, so normalize stays a fixed point.
+    if let Some(trace) = &mut c.data.trace {
+        if trace.len() > MAX_TRACE_BYTES {
+            let mut cut = MAX_TRACE_BYTES;
+            while !trace.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let full = trace.len();
+            trace.truncate(cut);
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!(
+                        "trace is {full} bytes; clamped to {MAX_TRACE_BYTES} — keep it a summary \
+                         (method, command, seed), not a transcript"
+                    ),
+                )
+                .at(page, id)
+                .field("data.trace"),
+            );
+        }
+    }
 }
 
 /// Number → quantitative, ISO-8601 → temporal, anything else → nominal.
@@ -496,6 +525,45 @@ mod tests {
         normalize(&mut b);
         let twice = crate::to_string(&b).unwrap();
         assert_eq!(once, twice, "normalize must be a fixed point");
+    }
+
+    #[test]
+    fn an_oversized_trace_clamps_on_a_char_boundary_and_warns() {
+        let chart = |trace: &str| {
+            board_with(&format!(
+                r#"{{"id":"c","type":"chart","at":[80,80],"size":[480,320],
+                    "data":{{"origin":"command","trace":"{trace}",
+                             "values":[{{"f":"a","v":1}}]}},
+                    "x":{{"field":"f"}},"y":{{"field":"v"}}}}"#
+            ))
+        };
+        // Multi-byte tail so a naive byte truncate would split a char.
+        let mut long = "x".repeat(MAX_TRACE_BYTES - 1);
+        long.push_str("ééé");
+        let mut b = chart(&long);
+        let diags = normalize(&mut b);
+        let crate::Object::Chart(c) = &b.pages[0].objects[0] else {
+            panic!()
+        };
+        let clamped = c.data.trace.as_deref().unwrap();
+        assert!(clamped.len() <= MAX_TRACE_BYTES);
+        assert!(clamped.is_char_boundary(clamped.len()));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("clamped")),
+            "{diags:?}"
+        );
+        // Idempotent: the clamped board re-normalizes without motion.
+        let once = crate::to_string(&b).unwrap();
+        let diags = normalize(&mut b);
+        assert!(!diags.iter().any(|d| d.message.contains("clamped")));
+        assert_eq!(once, crate::to_string(&b).unwrap());
+
+        // Under the cap: untouched, no warning.
+        let mut ok = chart("quartiles via numpy, seed 42");
+        let diags = normalize(&mut ok);
+        assert!(!diags.iter().any(|d| d.message.contains("clamped")));
     }
 
     #[test]

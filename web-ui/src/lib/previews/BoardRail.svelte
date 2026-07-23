@@ -1,21 +1,71 @@
 <script lang="ts">
   /**
-   * BoardView's outline rail + numeric inspector. Purely presentational —
-   * plain parsed data and callbacks only, no shared state; every mutation
-   * goes back through the parent's commit path.
+   * BoardView's outline rail + numeric inspector (geometry + chart config).
+   * Purely presentational — plain parsed data and callbacks only, no shared
+   * state; every mutation goes back through the parent's commit path.
    */
-  import type { ObjInfo } from "./boardInteract";
+  import { chartConfig, MARK_SWAP_KINDS, SORT_OPTIONS, type ObjInfo } from "./boardInteract";
 
   interface Props {
     title: string;
     objects: ObjInfo[];
     selected: string | null;
+    /** The board theme's categorical ramp (@token + resolved hex), from the
+     *  render response — the series-color swatches. */
+    catSwatches: { token: string; hex: string }[];
     onselect: (id: string | null) => void;
     oncommitfield: (field: "x" | "y" | "w" | "h", raw: string) => void;
+    /** Sparse config edit on the selected object (the /board/edit set op):
+     *  dot-path → value, null clears. */
+    oncommitset: (set: Record<string, unknown>) => void;
   }
-  let { title, objects, selected, onselect, oncommitfield }: Props = $props();
+  let { title, objects, selected, catSwatches, onselect, oncommitfield, oncommitset }: Props =
+    $props();
 
   const selectedObj = $derived(objects.find((o) => o.id === selected) ?? null);
+
+  // The chart config projection of the selected object (null for non-charts):
+  // current values are the file's own literals, refreshed by the same reparse
+  // that moves the geometry fields.
+  const chart = $derived(selectedObj !== null ? chartConfig(selectedObj) : null);
+
+  // A sort value outside the canonical set (e.g. a field name) stays visible
+  // and selectable — the select must never silently rewrite what the file
+  // says just by rendering it.
+  const sortOptions = $derived.by(() => {
+    const c = chart;
+    if (c === null || SORT_OPTIONS.some((o) => o.value === c.sort)) return SORT_OPTIONS;
+    return [{ value: c.sort, label: c.sort }, ...SORT_OPTIONS];
+  });
+
+  function commitTitle(channel: "x" | "y", raw: string): void {
+    const c = chart;
+    const cur = channel === "x" ? c?.x?.title : c?.y?.title;
+    if (c === null || cur === undefined) return;
+    const v = raw.trim();
+    if (v === cur) return;
+    oncommitset({ [`${channel}.title`]: v === "" ? null : v });
+  }
+
+  function commitSort(value: string): void {
+    const c = chart;
+    if (c === null || c.sortChannel === null || value === c.sort) return;
+    oncommitset({ [`${c.sortChannel}.sort`]: value === "" ? null : value });
+  }
+
+  function commitMarkKind(value: string): void {
+    const c = chart;
+    if (c === null || value === c.markKind) return;
+    oncommitset({ "marks.0.mark": value });
+  }
+
+  /** Sets the single mark's `fill` — the token series_color resolves first —
+   *  or clears it back to the theme's default series color. */
+  function commitMarkColor(token: string | null): void {
+    const c = chart;
+    if (c === null || (token ?? "") === c.markColor) return;
+    oncommitset({ "marks.0.fill": token });
+  }
 </script>
 
 <aside class="rail">
@@ -50,6 +100,62 @@
           onchange={(e) => oncommitfield("h", (e.currentTarget as HTMLInputElement).value)} /></label>
       </div>
       <div class="insp-unit">pt · snaps to the 8 pt grid</div>
+      {#if chart !== null}
+        <!-- Chart configuration: a chart is one declarative object; its
+             axes/sort/marks are config the engine lays out, edited here as
+             sparse fields via the /board/edit set op — never client layout. -->
+        <div class="insp-sect">chart</div>
+        {#if chart.x !== null}
+          <label class="insp-row">x label
+            <input type="text" value={chart.x.title} placeholder="none" spellcheck="false"
+              onchange={(e) => commitTitle("x", (e.currentTarget as HTMLInputElement).value)} /></label>
+        {/if}
+        {#if chart.y !== null}
+          <label class="insp-row">y label
+            <input type="text" value={chart.y.title} placeholder="none" spellcheck="false"
+              onchange={(e) => commitTitle("y", (e.currentTarget as HTMLInputElement).value)} /></label>
+        {/if}
+        {#if chart.sortChannel !== null}
+          <label class="insp-row">sort
+            <select value={chart.sort}
+              onchange={(e) => commitSort((e.currentTarget as HTMLSelectElement).value)}>
+              {#each sortOptions as s (s.value)}
+                <option value={s.value}>{s.label}</option>
+              {/each}
+            </select></label>
+        {/if}
+        {#if chart.markSwappable}
+          <label class="insp-row">mark
+            <select value={chart.markKind}
+              onchange={(e) => commitMarkKind((e.currentTarget as HTMLSelectElement).value)}>
+              {#each MARK_SWAP_KINDS as k (k)}
+                <option value={k}>{k}</option>
+              {/each}
+            </select></label>
+        {/if}
+        {#if chart.markCount === 1 && catSwatches.length > 0}
+          <div class="insp-row swatch-row" role="group" aria-label="series color (theme tokens)">
+            <span class="swatch-label">color</span>
+            <button
+              class="swatch auto"
+              class:on={chart.markColor === ""}
+              title="theme default"
+              aria-label="series color: theme default"
+              onclick={() => commitMarkColor(null)}
+            >–</button>
+            {#each catSwatches as s (s.token)}
+              <button
+                class="swatch"
+                class:on={chart.markColor === s.token}
+                style:background={s.hex}
+                title={s.token}
+                aria-label={`series color ${s.token}`}
+                onclick={() => commitMarkColor(s.token)}
+              ></button>
+            {/each}
+          </div>
+        {/if}
+      {/if}
     </div>
   {/if}
 </aside>
@@ -153,5 +259,65 @@
     margin-top: 6px;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .insp-sect {
+    margin-top: 10px;
+    margin-bottom: 4px;
+    font-size: var(--text-xs);
+    font-family: var(--mono);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .insp-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: var(--text-xs);
+    color: var(--muted);
+    font-family: var(--mono);
+    white-space: nowrap;
+  }
+  .insp-row input,
+  .insp-row select {
+    flex: 1;
+    width: 100%;
+    min-width: 0;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 3px;
+    color: var(--fg);
+    font-size: var(--text-xs);
+    font-family: var(--mono);
+    padding: 2px 4px;
+  }
+  .swatch-row {
+    flex-wrap: wrap;
+  }
+  .swatch-label {
+    flex-shrink: 0;
+  }
+  .swatch {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    flex: none;
+    border: 1px solid var(--edge);
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .swatch.auto {
+    background: var(--term-bg);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    line-height: 1;
+  }
+  .swatch.on {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 60%, transparent);
+    border-color: var(--accent);
+  }
+  .swatch:hover {
+    border-color: var(--accent);
   }
 </style>

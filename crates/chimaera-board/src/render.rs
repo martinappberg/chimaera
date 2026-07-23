@@ -494,22 +494,9 @@ fn emit_object(
             for item in &scene.items {
                 emit_chart_item(s, item, theme, &page.id, obj.id(), diags);
             }
-            // The origin chip: where the numbers came from, visibly, on the
-            // render itself. The one chart-integrity mechanism that cannot be
-            // ignored because it cannot be unsubscribed from.
-            let label = theme.role("label").unwrap_or_else(|| theme.body());
-            let chip = c.data.origin.label();
-            let chip_size = (label.size * 0.85).max(8.0);
-            let muted = theme.color_or_fg(Some("@muted"));
-            let _ = write!(
-                s,
-                r#"<text x="{}" y="{}" font-family="{}" font-size="{chip_size}" fill="{}" text-anchor="end">{}</text>"#,
-                frame.right(),
-                frame.bottom() + chip_size * 1.2,
-                escape(&css_font_family(&label.family)),
-                muted.hex(),
-                escape(chip)
-            );
+            // Deliberately NO painted origin chip: `data.origin` stays a
+            // required field surfaced through lint/describe and the chat
+            // card's provenance disclosure — on the pixels it read as noise.
         }
         Object::Equation(eq) => {
             let Some(f) = frame else {
@@ -1914,6 +1901,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("ceiling"), "{err}");
+    }
+
+    #[test]
+    fn the_origin_chip_is_not_painted() {
+        // `data.origin` is required in the schema and surfaced by lint /
+        // describe / the chat card's disclosure — but never on the pixels.
+        let b = board(DECK);
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        assert!(!svg.contains("from command"), "origin chip leaked: {svg}");
     }
 
     #[test]
