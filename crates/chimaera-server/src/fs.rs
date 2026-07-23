@@ -1554,19 +1554,11 @@ fn unique_dest(to: &Path) -> PathBuf {
         return to.to_path_buf();
     }
     let parent = to.parent().unwrap_or(Path::new("."));
-    let stem = to
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
+    let full = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // Keep a compound extension whole (foo.tar.gz -> foo copy.tar.gz) by
-    // splitting on the FIRST dot after the stem, not file_stem/extension.
-    let full = to.file_name().map(|n| n.to_string_lossy().into_owned());
-    let ext = full
-        .as_deref()
-        .and_then(|n| n.strip_prefix(&stem))
-        .filter(|s| s.starts_with('.'))
-        .map(str::to_string)
-        .unwrap_or_default();
+    let (stem, ext) = split_copy_name(&full);
     for n in 1..10_000 {
         let name = if n == 1 {
             format!("{stem} copy{ext}")
@@ -1579,6 +1571,106 @@ fn unique_dest(to: &Path) -> PathBuf {
         }
     }
     to.to_path_buf() // give up after 10k — the copy then fails loudly
+}
+
+/// Split a file name at the FIRST dot (a leading dot counts as part of the
+/// stem), so " copy" lands before the whole extension chain: suffix-keyed
+/// types like `steps.board.json` and `foo.tar.gz` still match after the
+/// rename — `file_stem`/`extension` would split at the LAST dot and break
+/// them (`steps.board copy.json`).
+fn split_copy_name(name: &str) -> (&str, &str) {
+    match name.char_indices().find(|&(i, c)| i > 0 && c == '.') {
+        Some((i, _)) => name.split_at(i),
+        None => (name, ""),
+    }
+}
+
+#[cfg(test)]
+mod unique_dest_tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "chimaera-unique-dest-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn touch(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"").unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn split_copy_name_splits_at_first_dot() {
+        assert_eq!(split_copy_name("notes.txt"), ("notes", ".txt"));
+        assert_eq!(
+            split_copy_name("steps.board.json"),
+            ("steps", ".board.json")
+        );
+        assert_eq!(split_copy_name("archive.tar.gz"), ("archive", ".tar.gz"));
+        assert_eq!(split_copy_name("types.d.ts"), ("types", ".d.ts"));
+        assert_eq!(split_copy_name("README"), ("README", ""));
+        assert_eq!(split_copy_name(".gitignore"), (".gitignore", ""));
+        assert_eq!(split_copy_name(".env.local"), (".env", ".local"));
+        assert_eq!(split_copy_name(""), ("", ""));
+    }
+
+    #[test]
+    fn free_target_is_returned_untouched() {
+        let dir = TempDir::new("free");
+        let target = dir.0.join("notes.txt");
+        assert_eq!(unique_dest(&target), target);
+    }
+
+    #[test]
+    fn plain_extension_gets_copy_before_it() {
+        let dir = TempDir::new("plain");
+        let target = dir.touch("notes.txt");
+        assert_eq!(unique_dest(&target), dir.0.join("notes copy.txt"));
+    }
+
+    #[test]
+    fn compound_extension_stays_whole() {
+        let dir = TempDir::new("compound");
+        let board = dir.touch("steps.board.json");
+        assert_eq!(unique_dest(&board), dir.0.join("steps copy.board.json"));
+        let tarball = dir.touch("archive.tar.gz");
+        assert_eq!(unique_dest(&tarball), dir.0.join("archive copy.tar.gz"));
+    }
+
+    #[test]
+    fn dotless_name_gets_copy_appended() {
+        let dir = TempDir::new("dotless");
+        let target = dir.touch("README");
+        assert_eq!(unique_dest(&target), dir.0.join("README copy"));
+    }
+
+    #[test]
+    fn collisions_count_up_past_taken_copies() {
+        let dir = TempDir::new("counter");
+        let target = dir.touch("steps.board.json");
+        dir.touch("steps copy.board.json");
+        dir.touch("steps copy 2.board.json");
+        assert_eq!(unique_dest(&target), dir.0.join("steps copy 3.board.json"));
+    }
 }
 
 /// Recursively copy `src` to `dst` (which must not yet exist). Symlinks are
