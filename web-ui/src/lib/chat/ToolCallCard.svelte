@@ -1,11 +1,16 @@
 <script lang="ts">
   import { copyText } from "../shared/clipboard";
+  import ShownCard from "./ShownCard.svelte";
+  import { collectShownBoards } from "./shownBoards";
   import type { ChatBlock, ToolContent } from "./store.svelte";
 
   interface Props {
     block: Extract<ChatBlock, { kind: "tool" }>;
     /** Open a touched file in an adjacent pane (existing path-click flow). */
     onOpenFile?: (path: string) => void;
+    /** Session working directory — resolves the workspace-relative paths
+     *  `chimaera board show` prints (the prose-path base, `session.cwd`). */
+    cwd?: string;
     /** Move this running tool to the background (claude background_tasks —
      *  the TUI's Ctrl-B). Provided only when the agent supports it. */
     onBackground?: () => void;
@@ -15,7 +20,7 @@
     visible?: boolean;
   }
 
-  let { block, onOpenFile, onBackground, onStop, visible = true }: Props = $props();
+  let { block, onOpenFile, cwd, onBackground, onStop, visible = true }: Props = $props();
 
   const running = $derived(block.status === "in_progress" || block.status === "pending");
 
@@ -60,6 +65,12 @@
   const statusTitle = $derived(
     block.denied ? "denied" : allowed ? "allowed" : block.status.replace("_", " "),
   );
+
+  /** Boards this completed command "showed" (`chimaera board show` — plan
+   *  §10.1, detection in shownBoards.ts). The FULL card renders first-class
+   *  in the transcript (ToolGroup); this row keeps only a compact reference
+   *  under the producing command — where the picture came from. */
+  const shownRefs = $derived(collectShownBoards([block], cwd));
 
   // Live output follows its own tail (terminal-style) while streaming.
   let bodyEl = $state<HTMLElement | null>(null);
@@ -264,6 +275,11 @@
       {/if}
     </div>
   {/if}
+  <!-- This command showed a board: a compact reference here (the full card is
+       first-class in the transcript, outside the collapsed group). -->
+  {#each shownRefs as s (s.path)}
+    <ShownCard path={s.path} compact onOpen={onOpenFile} />
+  {/each}
 </div>
 
 <style>

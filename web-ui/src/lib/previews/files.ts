@@ -272,6 +272,224 @@ export async function fsXlsx(
   return json(await api(`/fs/xlsx?${q.toString()}`));
 }
 
+/** One board-page render: a /raw ticket to the cached PNG plus what the
+ *  renderer had to say. Diagnostics are pre-rendered strings — the pane shows
+ *  them verbatim, it never re-derives layout truth client-side. */
+export interface BoardRender {
+  ticket: string;
+  width: number;
+  height: number;
+  pageCount: number;
+  pages: string[];
+  diagnostics: { severity: string; object: string | null; message: string; rendered: string }[];
+  /** The board theme's categorical ramp: @token → resolved hex, for the
+   *  inspector's series-color swatches. The swatch commits the token (the
+   *  theme indirection); the hex only shows what it resolves to. Absent on
+   *  an older daemon → no swatch row. */
+  catSwatches?: { token: string; hex: string }[];
+  /** The theme's ground tones (@bg, @surface, …) → resolved hex, for the
+   *  canvas-background swatch row. Same contract as catSwatches: commit the
+   *  token, show the hex. Absent on an older daemon → no control. */
+  bgSwatches?: { token: string; hex: string }[];
+  /** Every composite's derived children (`<id>/<part>`) and their laid-out
+   *  `[x, y, w, h]` frames in page points, z-ordered within a composite —
+   *  the hit-test map that makes a diagram's nodes selectable instead of the
+   *  composite being one opaque rectangle. The engine's own layout, never a
+   *  client re-derivation. Absent on an older daemon → children stay
+   *  unselectable. */
+  childFrames?: Record<string, { id: string; frame: [number, number, number, number] }[]>;
+}
+
+/** Render one page of a board server-side. The daemon caches by content, so
+ *  re-asking for an unchanged board is a file stat, not a re-render. `mode`
+ *  is the app's current appearance ("light" | "dark") — what an `auto`-themed
+ *  board resolves to; a board that pins a theme ignores it. Omitted (older
+ *  daemon compatibility aside) auto resolves dark. */
+export async function fsBoardRender(
+  path: string,
+  page = 0,
+  scale = 2.0,
+  theme?: string,
+  mode?: "light" | "dark",
+): Promise<BoardRender> {
+  return json(
+    await api("/board/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, page, scale, theme, mode }),
+    }),
+  );
+}
+
+/**
+ * Apply one gesture (move/resize/replace-text/set-config by object id) to a
+ * board, server-side. The pane never serializes a board itself — a
+ * client-side stringify would destroy the canonical byte-stable form. `text`
+ * replaces a text/shape object's paragraphs with plain strings (styled runs
+ * survive only by not sending it). `set` is sparse dot-path config edits
+ * (`{"x.title": "Time (s)"}`; null clears a field) — the daemon re-parses
+ * the mutated object and answers 422 with nothing written when a value
+ * would corrupt it. Resolves to the new X-Mtime token so the caller can
+ * `noteWrite` and adopt its own edit.
+ */
+export async function fsBoardEdit(
+  path: string,
+  object: string,
+  change: {
+    at?: [number, number];
+    size?: [number, number];
+    text?: string[];
+    set?: Record<string, unknown>;
+  },
+): Promise<string | null> {
+  const body = await json<{ mtime: string | null }>(
+    await api("/board/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, object, ...change }),
+    }),
+  );
+  return body.mtime;
+}
+
+/**
+ * The one board-level edit: set (an @token / #hex reference) or clear (null —
+ * back to the theme's ground) `canvas.background`, through the same
+ * server-side canonical writer and journal as every object gesture. Resolves
+ * to the new X-Mtime token for own-write adoption.
+ */
+export async function fsBoardCanvasBackground(
+  path: string,
+  background: string | null,
+): Promise<string | null> {
+  const body = await json<{ mtime: string | null }>(
+    await api("/board/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, canvasBackground: background }),
+    }),
+  );
+  return body.mtime;
+}
+
+/** One event as GET /board/journal returns it: seq-first, the kebab-case
+ *  `event` tag, then the op's own fields flattened beside it. Only the pin
+ *  fields are named here — the pane's overlay reads those; everything else
+ *  passes through untyped. */
+export interface BoardJournalEvent {
+  seq: number;
+  actor: string;
+  event: string;
+  page?: string;
+  object?: string;
+  pin?: string;
+  text?: string;
+  at?: [number, number];
+  [key: string]: unknown;
+}
+
+/** Server page cap for GET /board/journal (its JOURNAL_PAGE_CAP). */
+const BOARD_JOURNAL_PAGE = 500;
+/** Ceiling on pages fetched per read. The journal file is size-capped, so
+ *  this is generous headroom; it exists so a confused server can never loop
+ *  the client. */
+const BOARD_JOURNAL_MAX_PAGES = 16;
+
+/** One page of the board's semantic edit journal, oldest first after `since`. */
+export async function fsBoardJournal(
+  path: string,
+  since = 0,
+): Promise<{ events: BoardJournalEvent[]; latestSeq: number }> {
+  const q = new URLSearchParams({ path, since: String(since) });
+  return json(await api(`/board/journal?${q.toString()}`));
+}
+
+/** Every event the size-capped journal still holds, oldest first — paging
+ *  forward with the last seq seen until `latestSeq` says we're caught up. */
+export async function fsBoardJournalAll(path: string): Promise<BoardJournalEvent[]> {
+  const all: BoardJournalEvent[] = [];
+  let since = 0;
+  for (let i = 0; i < BOARD_JOURNAL_MAX_PAGES; i++) {
+    const page = await fsBoardJournal(path, since);
+    all.push(...page.events);
+    const last = page.events[page.events.length - 1];
+    if (last === undefined || page.events.length < BOARD_JOURNAL_PAGE || last.seq >= page.latestSeq)
+      break;
+    since = last.seq;
+  }
+  return all;
+}
+
+/** The ops the pane appends — §6.4 comment pins. Pins live in the journal
+ *  only, never the board file, so this is a journal POST, not a board edit. */
+export type BoardJournalOp =
+  | {
+      event: "comment";
+      page: string;
+      object?: string;
+      at?: [number, number];
+      pin: string;
+      text: string;
+    }
+  | { event: "comment-resolved"; pin: string };
+
+/** Append one journal event as actor `human` (the pane is the human's hand).
+ *  The daemon validates the op and assigns the seq. */
+export async function fsBoardJournalAppend(path: string, op: BoardJournalOp): Promise<number> {
+  const body = await json<{ seq: number }>(
+    await api("/board/journal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, actor: "human", ...op }),
+    }),
+  );
+  return body.seq;
+}
+
+/** The board export formats, the CLI's vocabulary exactly. */
+export type BoardExportFormat = "pptx" | "pdf" | "svg" | "svg-outlined";
+
+/** One object's declared export fate (pptx): which fidelity tier it landed
+ *  at — `native`/`grouped`/`vector`/`raster` — and why. The degradation
+ *  contract as data, stated before the deck is opened. */
+export interface BoardExportFate {
+  id: string;
+  tier: string;
+  reason: string;
+}
+
+/** One performed export: a `/download/{ticket}` to the written file (a
+ *  multi-page SVG export tickets a directory, which downloads as a zip), the
+ *  server's filename, and — pptx only — the per-object fates. */
+export interface BoardExport {
+  ticket: string;
+  filename: string;
+  pageCount: number;
+  objects?: BoardExportFate[];
+}
+
+/**
+ * Export a board server-side into `.chimaera/board/exports/` — the same
+ * exporter functions the CLI runs, so the two cannot disagree. `chartsNative`
+ * is the CLI's `--charts native` (real `c:chart` parts where a chart maps
+ * cleanly); pptx only — the daemon answers 422 otherwise. The response IS the
+ * export: consume its ticket to download; never re-export the same
+ * configuration just to fetch what this call already wrote.
+ */
+export async function fsBoardExport(
+  path: string,
+  format: BoardExportFormat,
+  chartsNative = false,
+): Promise<BoardExport> {
+  return json(
+    await api("/board/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, format, ...(chartsNative ? { chartsNative: true } : {}) }),
+    }),
+  );
+}
+
 /**
  * Mint a single-path ticket and return the unauthenticated /raw/ URL for it
  * (iframes and <img> cannot send Authorization headers; the bearer token must
@@ -416,8 +634,15 @@ export async function fsDownload(path: string): Promise<void> {
       body: JSON.stringify({ path }),
     }),
   );
+  navigateDownload(body.ticket);
+}
+
+/** Consume a `/download/{ticket}` as a browser download via a transient
+ *  anchor. Shared by every ticket consumer (file/folder downloads, board
+ *  exports) so the WKWebView workaround below lives in one place. */
+export function navigateDownload(ticket: string): void {
   const a = document.createElement("a");
-  a.href = `/download/${body.ticket}`;
+  a.href = `/download/${ticket}`;
   a.rel = "noopener";
   // The `download` attribute forces a download even for a showable MIME (a
   // .md is text/*): without it the Tauri WKWebView navigates the main webview
@@ -518,6 +743,7 @@ export type FileViewKind =
   | "table"
   | "xlsx"
   | "pdf"
+  | "board"
   | "binary"
   | "text";
 
@@ -564,6 +790,10 @@ export function viewKindFor(path: string): FileViewKind {
   // every other gzip goes down the text path (fs/file decompresses, then the
   // NUL sniff falls back to the binary card for gzipped binaries).
   if (isGzipped(path)) return TABLE_EXTS.has(ext) ? "table" : "text";
+  // Boards match on the full compound suffix — `extension()` only ever sees
+  // the last dot segment, so a plain `.json` never lands here, and an older
+  // build (or a failed parse) falls back to the ordinary text view.
+  if (basename(path).toLowerCase().endsWith(".board.json")) return "board";
   if (IMAGE_EXTS.has(ext)) return "image";
   if (MARKDOWN_EXTS.has(ext)) return "markdown";
   if (HTML_EXTS.has(ext)) return "html";

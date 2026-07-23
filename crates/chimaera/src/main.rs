@@ -7,6 +7,10 @@ mod status;
 
 use std::path::PathBuf;
 
+// The board CLI lives in the engine crate (`cli` feature) so the native app
+// binary can mount the identical verb set; this alias keeps the command tree
+// (and its parse tests) reading as before.
+use chimaera_board::cli as board;
 use clap::{Parser, Subcommand};
 
 #[global_allocator]
@@ -83,6 +87,11 @@ enum Command {
     Compute {
         #[command(subcommand)]
         cmd: ComputeCmd,
+    },
+    /// Boards: compose, render, and read back .board.json visual surfaces.
+    Board {
+        #[command(subcommand)]
+        cmd: board::BoardCmd,
     },
 }
 
@@ -193,6 +202,7 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
             update_daemon,
         } => connect::run(&host, local_port, binary.as_deref(), no_open, update_daemon).await,
         Command::Doctor => doctor::run(),
+        Command::Board { cmd } => board::run(cmd),
         Command::ShellIntegration => {
             print!("{}", chimaera_core::shellint::snippet());
             Ok(())
@@ -267,6 +277,145 @@ mod tests {
     fn dev_flags_no_longer_parse() {
         assert!(Cli::try_parse_from(["chimaera", "connect", "cluster", "--dev"]).is_err());
         assert!(Cli::try_parse_from(["chimaera", "status", "cluster", "--dev"]).is_err());
+    }
+
+    #[test]
+    fn board_journal_parses_the_since_cursor() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "journal",
+            "talks/review.board.json",
+            "--since",
+            "40",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Journal { path, since },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("talks/review.board.json"));
+                assert_eq!(since, Some(40));
+            }
+            _ => panic!("expected board journal"),
+        }
+    }
+
+    #[test]
+    fn board_import_parses_the_mermaid_flags() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "import",
+            "arch.mmd",
+            "--to",
+            "talks/review.board.json",
+            "--page",
+            "arch",
+            "--id",
+            "backend",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd:
+                    board::BoardCmd::Import {
+                        path,
+                        to,
+                        page,
+                        id,
+                        regen,
+                        pdf_page,
+                        dpi,
+                    },
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("arch.mmd"));
+                assert_eq!(to, std::path::PathBuf::from("talks/review.board.json"));
+                assert_eq!(page.as_deref(), Some("arch"));
+                assert_eq!(id.as_deref(), Some("backend"));
+                assert_eq!(regen, None);
+                assert_eq!(pdf_page, None);
+                assert_eq!(dpi, None);
+            }
+            _ => panic!("expected board import"),
+        }
+        // `--to` is how import knows the destination; without it the parse
+        // must refuse rather than guess.
+        assert!(Cli::try_parse_from(["chimaera", "board", "import", "arch.mmd"]).is_err());
+    }
+
+    #[test]
+    fn board_import_parses_the_pdf_flags() {
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "import",
+            "fig.pdf",
+            "--to",
+            "deck.board.json",
+            "--pdf-page",
+            "2",
+            "--dpi",
+            "150",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Import { pdf_page, dpi, .. },
+            } => {
+                assert_eq!(pdf_page, Some(2));
+                assert_eq!(dpi, Some(150.0));
+            }
+            _ => panic!("expected board import"),
+        }
+    }
+
+    #[test]
+    fn board_merge_parses_the_git_driver_shape() {
+        // Exactly `%O %A %B` positional — the .gitattributes driver line must
+        // keep parsing forever.
+        let cli = Cli::try_parse_from([
+            "chimaera",
+            "board",
+            "merge",
+            "base.board.json",
+            "ours.board.json",
+            "theirs.board.json",
+            "--check",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Board {
+                cmd:
+                    board::BoardCmd::Merge {
+                        base,
+                        ours,
+                        theirs,
+                        out,
+                        check,
+                    },
+            } => {
+                assert_eq!(base, std::path::PathBuf::from("base.board.json"));
+                assert_eq!(ours, std::path::PathBuf::from("ours.board.json"));
+                assert_eq!(theirs, std::path::PathBuf::from("theirs.board.json"));
+                assert_eq!(out, None);
+                assert!(check);
+            }
+            _ => panic!("expected board merge"),
+        }
+        // All three inputs are required.
+        assert!(Cli::try_parse_from(["chimaera", "board", "merge", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn board_show_parses_the_mermaid_switch() {
+        let cli = Cli::try_parse_from(["chimaera", "board", "show", "--mermaid"]).unwrap();
+        match cli.command {
+            Command::Board {
+                cmd: board::BoardCmd::Show { mermaid, .. },
+            } => assert!(mermaid),
+            _ => panic!("expected board show"),
+        }
     }
 
     #[test]

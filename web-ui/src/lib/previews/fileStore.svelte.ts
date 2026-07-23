@@ -340,6 +340,24 @@ export function noteWrite(path: string, mtime: string | null): void {
   cache.get(path)?.noteWrite(mtime);
 }
 
+/**
+ * A board-epoch nudge arrived on /ws/events (invalidate-and-pull): re-probe
+ * every cached board entry through the same coalesced revalidation path disk
+ * changes take, so an external board mutation lands in the pane immediately
+ * instead of trailing the ~2s disk watcher (which stays as the fallback).
+ * The frame names workspaces, not paths, so every board re-probes — each
+ * probe is a 1-byte mtime read, and board mutations are rare. The debounce
+ * also keeps a pane's OWN /board/edit quiet: its response adopts the new
+ * mtime via noteWrite before the coalesced probe runs, which then no-ops.
+ */
+export function revalidateBoardPaths(): void {
+  const boards: string[] = [];
+  for (const path of cache.keys()) {
+    if (path.toLowerCase().endsWith(".board.json")) boards.push(path);
+  }
+  if (boards.length > 0) scheduleRevalidate(boards);
+}
+
 /** Forget a path entirely (deleted/renamed away — nothing left to cache). */
 function forget(path: string): void {
   const e = cache.get(path);

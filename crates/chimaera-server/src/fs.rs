@@ -70,7 +70,7 @@ const MAX_VALIDATE_CANDIDATES: usize = 50;
 /// honestly `truncated`.
 pub(crate) const MAX_DIR_ENTRIES: usize = 1000;
 /// How long a raw-access ticket stays valid.
-const TICKET_TTL: Duration = Duration::from_secs(600);
+pub(crate) const TICKET_TTL: Duration = Duration::from_secs(600);
 /// In-memory capability ceiling. A buggy or hostile bearer-authenticated
 /// client must not grow the ticket map without bound during that TTL.
 const MAX_TICKETS: usize = 4096;
@@ -126,7 +126,7 @@ fn canonical_parent_join(raw: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Canonicalize `raw` and require a regular file (not a directory).
-fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn canonical_file(raw: &str) -> anyhow::Result<PathBuf> {
     let path = canonical(raw)?;
     if !path.is_file() {
         anyhow::bail!("{} is not a file", path.display());
@@ -178,7 +178,9 @@ fn gz_mime(path: &Path) -> mime_guess::Mime {
 /// header and PUT `expect_mtime` conflict check. mtime remains the primary
 /// signal, but length plus Unix inode/ctime identity catch a same-size rewrite
 /// whose timestamp was preserved or rounded by a coarse shared filesystem.
-fn mtime_token(meta: &std::fs::Metadata) -> String {
+/// `pub(crate)` so the board edit route hands the client the same token a
+/// PUT /fs/file would, keeping the fileStore's invalidation uniform.
+pub(crate) fn mtime_token(meta: &std::fs::Metadata) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     meta.modified()
         .ok()
@@ -242,7 +244,7 @@ pub(crate) async fn dirs(Query(query): Query<DirsQuery>) -> Response {
 /// Run JSON-producing filesystem/preview work on a blocking thread. NFS and
 /// Lustre can stall even a metadata lookup, while gzip/markdown parsing is
 /// CPU-heavy; neither belongs on a Tokio worker.
-async fn blocking_json<F>(work: F) -> Response
+pub(crate) async fn blocking_json<F>(work: F) -> Response
 where
     F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
 {
@@ -263,6 +265,28 @@ where
             Json(json!({"error": format!("filesystem task failed: {join}")})),
         )
             .into_response(),
+    }
+}
+
+/// Value-shaped companion to [`blocking_json`], for routes that must
+/// post-process the result (e.g. mint a `/raw` ticket, which takes the state
+/// lock) after the blocking work but before responding.
+pub(crate) async fn blocking_value<F>(work: F) -> anyhow::Result<serde_json::Value>
+where
+    F: FnOnce() -> anyhow::Result<serde_json::Value> + Send + 'static,
+{
+    let permit = FILESYSTEM_WORK
+        .acquire()
+        .await
+        .expect("filesystem work semaphore is never closed");
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join) => Err(anyhow::anyhow!("filesystem task failed: {join}")),
     }
 }
 
@@ -1750,7 +1774,7 @@ struct Ticket {
 
 impl TicketStore {
     /// Mint a ticket for `path`, valid for `ttl`.
-    fn create(&mut self, path: PathBuf, ttl: Duration) -> String {
+    pub(crate) fn create(&mut self, path: PathBuf, ttl: Duration) -> String {
         self.purge();
         if self.tickets.len() >= MAX_TICKETS {
             // Expiries preserve creation order for a common TTL. Evicting the

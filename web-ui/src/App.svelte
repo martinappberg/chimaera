@@ -143,6 +143,7 @@
   } from "./lib/layout/layout";
   import type { PathKind } from "./lib/terminal/links";
   import { basename, fileTabTitles, fsProbe, viewKindFor } from "./lib/previews/files";
+  import { onBoardNudge } from "./lib/previews/boardEvents";
   import { dirtyFiles } from "./lib/shared/editing";
   import {
     activateGitWorkspace,
@@ -707,7 +708,7 @@
   $effect(() => {
     const t = refTargetSession;
     referenceTarget.set(
-      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t) },
+      t === null ? null : { id: t.id, name: displayNames.get(t.id) ?? displayName(t), ui: t.ui ?? null },
     );
   });
 
@@ -880,6 +881,7 @@
       },
       onSettings: applyRemoteSettings,
       onGit: onGitNudge,
+      onBoard: onBoardNudge,
       onUpdate: (status) => (updateState.daemon = status),
       onRecents: (epoch) => {
         // Invalidate-and-pull, like git: a conversation retired somewhere;

@@ -1,0 +1,84 @@
+[package]
+name = "chimaera-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# The `chimaera board` verb layer (src/cli.rs, `cli` feature): both the
+# standalone binary and the native app mount it, so the two never drift.
+clap = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+# Chart `data.source` binding reads CSV/TSV(.gz); same pin as chimaera-server.
+flate2 = "1.1"
+
+# The render stack. usvg parses and resolves (including text-to-path via
+# fontdb + rustybuzz), resvg rasterizes onto a tiny-skia pixmap. Board emits
+# the SVG itself, so nothing here parses untrusted markup from the network —
+# only strings this crate generated.
+usvg = "0.45"
+resvg = "0.45"
+tiny-skia = "0.11"
+# Text measurement. Board shapes with the same rustybuzz/ttf-parser pair usvg
+# resolves through — and shares usvg's own `fontdb` rather than depending on
+# it directly, so the database Board measures against and the one resvg draws
+# with are provably the same type and the same fonts. A second text stack
+# would drift from the renderer and break layout in ways no unit test sees.
+rustybuzz = "0.20"
+ttf-parser = "0.25"
+# The fast preview encoder. PNG is the durable render (content-addressed,
+# lossless); JPEG is what the agent looks at, where decode speed over a
+# `connect` tunnel matters more than the last few dB.
+jpeg-encoder = "0.6"
+# The PPTX exporter's container. Same pin as chimaera-server's zip; deflate
+# only — no time crate, no encryption, nothing that could smuggle a timestamp
+# into what must be deterministic output.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# PDF export. svg2pdf pins usvg ^0.45 (the same tree Board already builds)
+# and embeds subsetted fonts from that tree's fontdb; only the `text`
+# feature is needed — Board's SVG has no filters and no raster images yet.
+# pdf-writer is svg2pdf's own document layer, used directly to assemble the
+# multi-page document its high-level `to_pdf` cannot produce.
+svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
+pdf-writer = "0.12"
+# PDF-panel *import* (`pdf-import` feature only): hayro is LaurenzV's
+# pure-Rust PDF rasterizer. Its default features embed the 14 standard PDF
+# fonts + CMaps, so text in plotting-tool PDFs renders without a resolver.
+hayro = { version = "0.7", optional = true }
+# The `equation` object (`math` feature, on by default): mathtex is a pure-Rust
+# TeX layout engine (the real xetex core through Web2C/C2Rust) whose SVG
+# backend emits glyph outlines through the same rustybuzz/ttf-parser pair
+# pinned above — no second text stack, no system TeX. src/equation.rs drives
+# it formatless (ini-xetex + a curated math prelude + one bundled OpenType
+# MATH font under fonts/), so the daemon stays one static binary.
+mathtex = { version = "0.1.0", optional = true }
+
+[features]
+default = ["math", "icons"]
+# The `equation` object: LaTeX math typeset to glyph-outline SVG
+# (src/equation.rs). On by default — the plan treats equation as core
+# vocabulary — but skippable (`--no-default-features`) for a build that can
+# spare the engine + bundled STIX Two Math font (~2.4 MB of binary). The
+# schema, ceilings and the missing-feature refusal compile in every build.
+math = ["dep:mathtex"]
+# The bundled Tabler icon set (src/icons.rs + the committed manifest under
+# src/icons/): a discoverable, recolorable, PPTX-editable outline collection
+# the agent places by name. On by default — richer figures are core to the
+# board's "composition tool, not diagram builder" ambition — but skippable
+# (`--no-default-features`) for a build that can spare the ~1.4 MB manifest.
+# The `icon` object, its ceilings and the missing-feature refusal compile in
+# every build; only the manifest data is gated (mirrors `math`).
+icons = []
+# The `chimaera board` CLI layer (src/cli.rs): the clap Subcommand + verb
+# implementations both binaries mount. A library consumer (the daemon's
+# routes) never needs it, so clap stays out of default builds.
+cli = ["dep:clap"]
+# `board import fig.pdf`: rasterize one PDF page into an image asset
+# (src/pdfimport.rs). Off by default — hayro's interpreter stack is real
+# weight on the static musl binary, and most figure flows export SVG/PNG.
+pdf-import = ["dep:hayro"]

@@ -25,6 +25,13 @@ export interface EventsSocketHandlers {
    */
   onGit?(epochs: Record<string, number>): void;
   /**
+   * Per-workspace board epoch map (invalidate-and-pull), fired after auth
+   * and whenever any workspace's board state changed — a /board/edit or a
+   * journal append, from any client. No payload rides the bus; consumers
+   * re-probe mounted boards and refetch pin overlays.
+   */
+  onBoard?(epochs: Record<string, number>): void;
+  /**
    * The daemon's release knowledge (same shape as GET /api/v1/update),
    * pushed after auth and whenever it changes.
    */
@@ -167,6 +174,13 @@ export class EventsSocket {
       ) {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onGit?.(msg.epochs);
+      } else if (
+        msg.type === "board" &&
+        typeof msg.epochs === "object" &&
+        msg.epochs !== null
+      ) {
+        this.backoffMs = INITIAL_BACKOFF_MS;
+        this.handlers.onBoard?.(msg.epochs);
       } else if (msg.type === "update" && typeof msg.available === "boolean") {
         this.backoffMs = INITIAL_BACKOFF_MS;
         this.handlers.onUpdate?.({

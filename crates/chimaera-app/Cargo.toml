@@ -58,6 +58,13 @@ chimaera-remote = { path = "../chimaera-remote" }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal"] }
 chimaera-server = { path = "../chimaera-server" }
+# `chimaera board …` argv dispatch (main.rs): the daemon's `chimaera` shim
+# execs current_exe(), which in the native app IS this GUI binary — so it must
+# answer the board CLI itself, byte-identical to the standalone `chimaera`.
+# Unix-only like the server: on Windows the shim target is the musl binary
+# inside WSL2, never this exe.
+chimaera-board = { path = "../chimaera-board", features = ["cli"] }
+clap = { version = "4", features = ["derive"] }
 
 # Windows-only: registry-first WSL detection (never poke wsl.exe blind — the
 # 24H2 stub can block 60s interactively when WSL is absent).

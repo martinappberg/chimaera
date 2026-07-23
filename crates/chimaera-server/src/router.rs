@@ -6,8 +6,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::{
-    agents, api, assets, chat, compute, compute_jobs, download, environment, fs, git, launcher,
-    links, mcp, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
+    agents, api, assets, board, chat, compute, compute_jobs, download, environment, fs, git,
+    launcher, links, mcp, quickopen, recents, runtimes, settings, update, upload, view_state, ws,
 };
 
 /// Build the axum router (factored out so tests can drive it with `oneshot`).
@@ -121,6 +121,19 @@ pub(crate) fn app(state: Arc<AppState>) -> Router {
                 .delete(git::remove_worktree),
         )
         .route("/fs/ticket", post(fs::create_ticket))
+        // Boards: the pane's pixel source (a /raw ticket to a cached PNG) and
+        // the agent-facing read-back. Same crate functions as the CLI.
+        .route("/board/render", post(board::render))
+        .route("/board/describe", post(board::describe))
+        .route("/board/edit", post(board::edit))
+        // The semantic edit journal (GET reads since a seq, POST appends one
+        // validated event) and exports (a /download ticket, same exporter
+        // functions as `chimaera board export`).
+        .route(
+            "/board/journal",
+            get(board::journal).post(board::journal_append),
+        )
+        .route("/board/export", post(board::export))
         .route_layer(middleware::from_fn_with_state(state.clone(), api::auth))
         // Registered after route_layer, so hook ingestion is NOT behind bearer
         // auth: claude's hooks cannot know the daemon token, so the random

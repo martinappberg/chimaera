@@ -14,10 +14,16 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
    crates compile **twice** (once per workspace) — an intentional cost. Do NOT
    "fix" it by folding the app into the root workspace. Root `cargo` never builds
    this; use `just app-dev` / `just app-check` / `just app-build`.
-2. **One binary, three roles, selected by argv in `main.rs`** (before any init):
+2. **One binary, four roles, selected by argv in `main.rs`** (before any init):
    default = the Tauri shell; `--daemon` = a headless `chimaera_server::run` (the
    .app is self-contained — the daemon IS the app binary); `--askpass <prompt>` =
-   the tiny `SSH_ASKPASS` relay (must stay lightweight — never spawn a daemon/window).
+   the tiny `SSH_ASKPASS` relay (must stay lightweight — never spawn a daemon/window);
+   first-arg `board` = the board CLI (`chimaera_board::cli` behind its `cli`
+   feature, byte-identical to the standalone binary's `board` subcommand). The
+   board arm exists because the daemon's `chimaera` shim execs `current_exe()` —
+   this GUI binary — and falling through to Tauri would swallow the args and
+   front the running window via the single-instance plugin. It must never init
+   Tauri (it runs while another instance is open).
 3. **Windows is different by design: the daemon is NEVER this exe there** — it is
    the Linux musl release binary inside the user's WSL2 distro (`wsl.rs` owns
    detect/provision/spawn/adopt; `--daemon` and `chimaera-server` are cfg'd out of
@@ -32,7 +38,7 @@ in-app SSH askpass, a signed auto-updater). Parent map: repo-root
 
 | File | What it owns |
 |---|---|
-| `main.rs` | The 3-role argv dispatch (order is load-bearing). |
+| `main.rs` | The 4-role argv dispatch (order is load-bearing) + the `board` CLI arm (a clap mirror of the standalone spine, unix-only like `--daemon`). |
 | `command_manifest.rs` | Shared daemon/wizard command vocabulary for build-time permission generation and exact runtime daemon grants. |
 | `shell.rs` | Module root: app-global `Shell` state, `WindowScope`, `lock`, and the Tauri `Builder` assembly (`run`). Re-exports `open_ui_window`. |
 | `shell/commands.rs` | The IPC command surface (`#[tauri::command]` fns wired into `generate_handler!`) — thin delegators. |

@@ -8,8 +8,8 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 ## What lives here (and what does NOT)
 
 - **IS**: argument parsing, the global allocator + tracing init, and per-command
-  orchestration/output. ~350 LoC of straight-line dispatch. Keep it that way — do
-  not grow a command-abstraction layer for six flat subcommands.
+  orchestration/output. Straight-line dispatch. Keep it that way — do not grow a
+  command-abstraction layer for a handful of flat subcommands.
 - **IS NOT**: the daemon. `serve` is a 3-line delegation to
   `chimaera_server::run`. The **daemon lifecycle you're probably looking for**
   (manifest write/remove, SIGINT/SIGTERM, graceful shutdown, restart handoff,
@@ -25,6 +25,7 @@ is a thin delegation to a sibling library crate. Parent map: repo-root
 | `status.rs` | `status [host]`: local reads `chimaera_core::Manifest`; remote goes through `chimaera_remote`. |
 | `kill.rs` | `kill`: SIGTERM the manifest pid, poll `is_alive()` ~5s, remove the manifest. |
 | `doctor.rs` | `doctor`: probe write access to data/runtime dirs + ssh/claude on PATH. |
+| *(board)* | The `board` subcommand tree is NOT here: `main.rs` mounts `chimaera_board::cli::{BoardCmd, run}` (the engine crate's `cli` feature). It moved so the native app binary — which IS the daemon (and therefore the `chimaera` shim's exec target) in that deployment — mounts the identical verbs; edit the verbs in `chimaera-board/src/cli.rs`. `import *.pdf` still needs this crate's non-default `pdf-import` feature (pass-through to `chimaera-board/pdf-import`). |
 
 (`shell-integration` prints `chimaera_core::shellint::snippet()` — handled inline in `main.rs`.)
 

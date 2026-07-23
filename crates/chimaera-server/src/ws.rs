@@ -619,6 +619,7 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
     let mut last_sent: Option<String> = None;
     let mut last_settings_gen: Option<u64> = None;
     let mut last_git: Option<String> = None;
+    let mut last_board: Option<String> = None;
     let mut last_update_epoch: Option<u64> = None;
     let mut last_recents_epoch: Option<u64> = None;
     if send_settings_snapshot(&mut socket, &state, &mut last_settings_gen)
@@ -638,6 +639,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
         return;
     }
     if send_git_snapshot(&mut socket, &state, &mut last_git)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if send_board_snapshot(&mut socket, &state, &mut last_board)
         .await
         .is_err()
     {
@@ -697,6 +704,12 @@ async fn handle_events(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
         if send_git_snapshot(&mut socket, &state, &mut last_git)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if send_board_snapshot(&mut socket, &state, &mut last_board)
             .await
             .is_err()
         {
@@ -817,6 +830,29 @@ async fn send_git_snapshot(
     let epochs: std::collections::BTreeMap<String, u64> =
         state.git.epochs_snapshot().into_iter().collect();
     let frame = json!({"type": "git", "epochs": epochs}).to_string();
+    if last.as_deref() == Some(frame.as_str()) {
+        return Ok(());
+    }
+    socket.send(Message::Text(frame.clone().into())).await?;
+    *last = Some(frame);
+    Ok(())
+}
+
+/// Send a `{"type":"board","epochs":{workspace_id:epoch}}` invalidate frame
+/// when any workspace's board epoch moved (a /board/edit or journal append —
+/// see `board::bump_board_epoch`). Same contract as the git frame: no payload
+/// rides the bus, the pane refetches `/board/render`; the ordered map keeps
+/// an unchanged snapshot comparing equal.
+async fn send_board_snapshot(
+    socket: &mut WebSocket,
+    state: &AppState,
+    last: &mut Option<String>,
+) -> Result<(), axum::Error> {
+    let epochs: std::collections::BTreeMap<String, u64> = crate::lock(&state.board_epochs)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let frame = json!({"type": "board", "epochs": epochs}).to_string();
     if last.as_deref() == Some(frame.as_str()) {
         return Ok(());
     }

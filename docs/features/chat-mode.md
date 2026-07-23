@@ -340,6 +340,12 @@ TUI (see [view switch, rewind, and branch](#view-switch-rewind-and-branch)).
   scanning back to the turn boundary (only *written* previewable files + touched images; a merely
   *read* CSV isn't an artifact; capped at 8). Uses `POST /api/v1/fs/ticket` → `GET /raw/{ticket}` and
   `GET /api/v1/fs/table`.
+- **Board `show` cards.** A completed command whose result carries `chimaera board show`'s
+  `shown … → <path>.board.json` line grows a `ShownCard` under the producing tool row: the board's
+  server-rendered PNG (`POST /board/render`, content-addressed) in a bordered card; click opens the
+  board pane. Detection is client-side in `ToolCallCard.svelte` (relative paths resolve against the
+  session cwd) — the planned daemon `shown` journal event (board-plan §10.1) can replace it without
+  changing `ShownCard.svelte`.
 
 ## Reconnect & gap-replay
 

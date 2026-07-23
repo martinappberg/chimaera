@@ -19,6 +19,17 @@ tracing-subscriber.workspace = true
 nix.workspace = true
 open.workspace = true
 mimalloc.workspace = true
+# `cli` mounts chimaera_board::cli::BoardCmd as the `board` subcommand (the
+# verb layer lives in the engine crate so the native app binary can mount the
+# identical set).
+chimaera-board = { workspace = true, features = ["cli"] }
 chimaera-core.workspace = true
 chimaera-remote.workspace = true
 chimaera-server.workspace = true
+
+[features]
+# `board import fig.pdf` (hayro rasterization). Off by default — and off in
+# CI and the release matrix — because the PDF interpreter stack is real
+# weight on the static musl binary; see chimaera-board's feature of the
+# same name.
+pdf-import = ["chimaera-board/pdf-import"]

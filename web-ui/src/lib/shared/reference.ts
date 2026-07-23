@@ -44,9 +44,16 @@ export const activeSelection = writable<SelectionSource | null>(null);
 /**
  * The agent session references would land in right now (focused agent, else
  * the workspace's most recently active agent), resolved by the app. Null
- * means no agent session exists — affordances render disabled.
+ * means no agent session exists — affordances render disabled. `ui` carries
+ * the target's surface: only a "chat" target has a composer that
+ * composerBus can insert into (board deixis needs this; a TUI never gets
+ * typed into).
  */
-export const referenceTarget = writable<{ id: string; name: string } | null>(null);
+export const referenceTarget = writable<{
+  id: string;
+  name: string;
+  ui: "chat" | "term" | null;
+} | null>(null);
 
 let selectionOwner: unknown = null;
 

@@ -29,11 +29,13 @@ the module you need and read its header doc.
 | `spawn.rs` | PTY session spawn (the Tier-A TUI path), theme injection. |
 | `git/` | Read-only git, split into `resolve`/`parse`/`service`/`worktree`/`http`: porcelain-v2 status, side-by-side diff, worktree orchestration (confined to a managed root), login-shell git resolution gated at >=2.15. |
 | `fs.rs` | The filesystem service AND the file previews (markdown, CSV/TSV incl. a gzip tier, streamed ranged raw reads, bounded archive/table parsing, atomic writes, create/rename/delete for the file-manager menus, `/raw` tickets — tickets may name directories for downloads). There is no separate `previews` module — previews live here. |
+| `board.rs` | Board routes (`/board/render` → content-addressed PNG + diagnostics sidecar + `/raw` ticket, `/board/describe`, `/board/edit` — one semantic gesture (move/resize/replace-text/`set`, or the board-level `canvasBackground` op — no object, journaled `canvas-changed`), saved through the crate's canonical writer, then journaled best-effort as actor `human` with the seq echoed as `journalSeq`; render takes an optional `mode: "light"|"dark"` that an `auto`/absent board theme resolves to (absent = dark; a pinned theme ignores it); `/board/journal` GET (events after a seq, ≤500 + `latestSeq`) / POST (one validated event, seq assigned server-side); `/board/export` → pptx/pdf/svg into `.chimaera/board/exports/` behind a `/download` ticket, a multi-page SVG export ticketing a directory). Mutating routes serialize per canonical path on a bounded 16-shard lock; a mutation bumps the per-workspace **board epoch** (`{"type":"board","epochs":…}` on `/ws/events`, invalidate-and-pull) immediately while the git bump defers behind a ~1s per-path settle so a layout session costs one `git status`. Thin wrappers over `chimaera-board`; blocking work rides `fs.rs`'s semaphore. |
 | `fs_watch.rs` | Bounded `/ws/events`-client-scoped disk monitor: stats mounted files + visible directories, with a slow capped directory-name scan for NFS/Lustre metadata-cache misses. Never recursively watches a workspace. |
 | `download.rs` | `GET /download/{ticket}` — browser downloads via the ticket pattern: files stream as attachments, folders stream a zip built on the fly (bounded memory, symlinks never followed). |
 | `upload.rs` | `POST /sessions/{id}/upload?name=` — the landing pad for OS-desktop drops + pasted screenshots. STREAMS the body to `uploads_root/<session-id>/` (hidden-tmp-then-rename), capped 32 MB/file + 256 MB/session + 256 files, strict basename sanitize (no traversal), bearer-authed; the per-session dir is pruned on session delete/retire/shutdown/boot-sweep. |
 | `update.rs` | The self-update reporter (`GET /update`; test knobs `CHIMAERA_RELEASES_API`/`UPDATE_CURRENT`). |
 | `agent_updates.rs` | Agent-CLI release awareness: bounded per-agent latest probes (same official endpoints as `runtimes`' install scripts), the 6h checker, and the `latest_version`/`update_available` fields on `GET /agents` (+ `?check=true` inline probe). |
+| `runtimes.rs` | Managed agent installs/updates/uninstalls (curated official-artifact scripts run as visible shell sessions) + the shims dir every session's PATH carries: per-agent theming shims, and an unconditional `chimaera` shim exec'ing the daemon's own binary (`current_exe()` at write time) so `chimaera board show` resolves in any workspace, local or remote. |
 | `environment.rs` | Environment preludes: the `env-profiles.json` store + `GET/PUT /environment`, per-session prelude materialization (host ⊕ workspace ⊕ launch → `CHIMAERA_PRELUDE`). Injection rides `api::session_env`/`spawn_env_remove` — keep those two lists disjoint (the PTY and chat transports apply env/env_remove in opposite orders). |
 | `compute.rs` | Slurm awareness: login-shell detection (cached; `CHIMAERA_SLURM_BINDIR` test knob) + `GET /compute` — the user's queue + partitions via capped/timeout-fenced `squeue`/`sinfo`, 30s single-flight snapshot cache. Never a 500: a failed `squeue` CALL carries the previous jobs forward tagged `degraded` (distinct from an empty queue); everything else degrades to an empty snapshot. Also `agent_context` — the compute-session context a compute-node daemon (`SLURM_JOB_ID` at boot) injects into its claude sessions via the hook response (`agents::ingest`); baked once per daemon lifetime with an absolute walltime end. |
 | `compute_jobs.rs` | Mode 2 — chimaera daemons AS Slurm jobs: `POST/GET/DELETE /compute/sessions` (DETACHED-srun launch — setsid/nohup, tmux-grade persistence, works on interactive-only partitions; charset-gated argv; job id via queue adoption; refusals surfaced from the srun log tail; stateless squeue⋈manifest⋈record listing + dismissable "ended" tombstones from orphaned records, scancel + record marking). Launch seeds the job home's `workspaces.json` with the host's whole registry over the shared FS. |
@@ -134,6 +136,16 @@ Codex chat sessions (workers) get the per-session chimaera MCP injected at
 spawn via `-c mcp_servers.chimaera.url=…` (`launcher::build_codex_chat_command`,
 verified codex 0.144.2) — the same key-in-URL endpoint claude's
 `--mcp-config` points at.
+
+Every chat spawn with a workspace also carries the **board capability note**
+(`launcher::BOARD_SYSTEM_PROMPT` — zero-shot: a complete runnable `board show`
+example plus "run it directly, narrate outcomes not CLI mechanics"; the
+`chimaera` shim in `runtimes` is what makes it resolvable, in the native app
+via the GUI binary's pre-Tauri `board` dispatch): claude
+concatenates it with the Mastermind role prompt into the single
+`--append-system-prompt` (the flag is accepted once), codex rides the same
+`-c developer_instructions` the role prompt uses. TUI spawns get no note —
+they keep the pinned argv and rely on the shim + board skill.
 
 ## The chat-mode seam (`chat.rs`) — the part this doc exists for
 
