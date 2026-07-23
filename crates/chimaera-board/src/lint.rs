@@ -910,7 +910,8 @@ fn check_color(
 /// non-neutral accent among literal colors) · override budget (>4 run-level
 /// size/family/color overrides per page; objects with role `"code"` exempt) ·
 /// title widow · a free `at` where the page's layout still has unclaimed
-/// slots.
+/// slots · a flat pile (a busy designed figure of many loose top-level objects
+/// with no `group` — nudge to layer it).
 ///
 /// **Refused at any severity, deliberately unimplemented** (§3.5): general
 /// object overlap (callouts over panels are the entire point of the
@@ -957,10 +958,73 @@ pub fn lint_style(
         title_widows(page, &resolved, theme, fonts, &mut diags);
         free_at(board, page, theme, &mut diags);
         untraceable_data(page, &mut diags);
+        flat_pile(board, page, &mut diags);
     }
 
     diags
 }
+
+/// A busy designed figure emitted as a **flat pile** — many hand-placed region
+/// objects at the top level with no `group` among them. A gentle nudge (a
+/// Warning, never an Error even under --strict) to wrap each region in a
+/// `group` so it moves and reads as one layer, the way a designer would layer
+/// it. Deliberately conservative so it never annoys: it fires only past
+/// [`FLAT_PILE_MIN`] loose objects, stays silent the moment any top-level
+/// group already exists, counts only the loose region primitives an agent
+/// hand-places (text/shape/icon/image/annotations — never a connector, which
+/// legitimately stays top-level to span regions, nor a self-contained
+/// chart/table/diagram/equation card), and skips a full-canvas backdrop shape.
+/// So a shown chart/table/single-diagram card and a simple titled slide never
+/// trip it.
+fn flat_pile(board: &Board, page: &Page, diags: &mut Vec<Diagnostic>) {
+    // Any top-level group means the author is already layering — say nothing.
+    if page.objects.iter().any(|o| matches!(o, Object::Group(_))) {
+        return;
+    }
+    let canvas_area = board.canvas.width() * board.canvas.height();
+    let region_like = |obj: &Object| -> bool {
+        match obj {
+            // A full-canvas backdrop is chrome, not a region to group.
+            Object::Shape(_) => obj.frame().is_none_or(|f| f.w * f.h < 0.9 * canvas_area),
+            Object::Text(_)
+            | Object::Icon(_)
+            | Object::Image(_)
+            | Object::PanelLabel(_)
+            | Object::Scalebar(_)
+            | Object::SigBracket(_)
+            | Object::Legend(_)
+            | Object::Colorbar(_)
+            | Object::Callout(_)
+            | Object::Inset(_) => true,
+            // A connector spans regions (it stays top-level even in a
+            // well-grouped figure); a chart/table/diagram/equation is a
+            // self-contained card, not a loose piece.
+            Object::Connector(_)
+            | Object::Chart(_)
+            | Object::Table(_)
+            | Object::Diagram(_)
+            | Object::Equation(_)
+            | Object::Group(_)
+            | Object::Unknown(_) => false,
+        }
+    };
+    let loose = page.objects.iter().filter(|o| region_like(o)).count();
+    if loose >= FLAT_PILE_MIN {
+        let mut d = Diagnostic::new(
+            Severity::Warning,
+            format!(
+                "{loose} loose top-level objects and no groups: consider grouping related \
+                 objects into layers (`type:\"group\"`) so regions move and read as units"
+            ),
+        );
+        d.page = Some(page.id.clone());
+        diags.push(d);
+    }
+}
+
+/// The loose-object floor the flat-pile nudge fires at: a busy designed figure,
+/// never a chart card or a simple slide.
+const FLAT_PILE_MIN: usize = 8;
 
 /// A chart whose inline values were produced by the agent (`command` /
 /// `derived-by-agent`) with nothing that says HOW — no `source` binding and
@@ -2793,6 +2857,65 @@ mod tests {
                 style(&ok, false)
             );
         }
+    }
+
+    #[test]
+    fn a_flat_busy_figure_gets_a_gentle_grouping_nudge() {
+        let nudge = |diags: &[Diagnostic]| {
+            diags
+                .iter()
+                .find(|d| d.message.contains("consider grouping related objects"))
+                .cloned()
+        };
+
+        // Eight loose top-level shapes and no group → the layer nudge, a
+        // page-level Warning that names the count.
+        let flat: String = (0..8)
+            .map(|i| {
+                rect(
+                    &format!("s{i}"),
+                    [80.0, 64.0 + i as f64 * 48.0],
+                    [64.0, 40.0],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let d = nudge(&style_linted(&flat, false)).expect("a grouping nudge");
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.page.as_deref(), Some("p1"));
+        assert!(d.message.contains("8 loose"), "{}", d.message);
+        assert!(d.message.contains("type:\"group\""), "{}", d.message);
+        // A nudge, never a block: it stays a Warning even under --strict.
+        assert_eq!(
+            nudge(&style_linted(&flat, true)).unwrap().severity,
+            Severity::Warning
+        );
+
+        // Wrapping the same eight in one group silences it — already layered.
+        let grouped = format!(r#"{{"id":"g","type":"group","objects":[{flat}]}}"#);
+        assert!(
+            nudge(&style_linted(&grouped, false)).is_none(),
+            "{:?}",
+            style_linted(&grouped, false)
+        );
+
+        // A shown chart card (one self-contained composite, well under the
+        // floor) never trips it.
+        let card = r#"{"id":"c","type":"chart","at":[80,80],"size":[480,320],
+            "data":{"origin":"stated-by-user","values":[{"f":"a","v":1}]},
+            "x":{"field":"f","type":"nominal"},
+            "y":{"field":"v","type":"quantitative"}}"#;
+        assert!(nudge(&style_linted(card, false)).is_none(), "{card}");
+
+        // A simple titled slide (a handful of loose objects) stays silent.
+        let simple = [
+            r#"{"id":"t","type":"text","role":"title","at":[80,64],"size":[800,48],"text":["Hi"]}"#
+                .to_string(),
+            rect("a", [80.0, 160.0], [360.0, 240.0]),
+            rect("b", [480.0, 160.0], [360.0, 240.0]),
+        ]
+        .join(",");
+        assert!(nudge(&style_linted(&simple, false)).is_none(), "{simple}");
     }
 
     // --- lint --fix ----------------------------------------------------------

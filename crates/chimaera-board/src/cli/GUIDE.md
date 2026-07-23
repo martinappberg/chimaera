@@ -175,10 +175,41 @@ Which tool for the picture in front of you:
   `import` it when the user may want to edit the figure — compose native
   objects instead; every one stays movable and re-colorable.
 
-Complete example — a two-lane architecture figure. Copy it, rename the ids,
-change the text/positions; `chimaera board show --file
-boards/chrombpnet.board` cards it (write it under `boards/` only for a
-deliverable the user asked to keep — otherwise any path works):
+### Structure with layers (groups)
+
+Compose a designed figure the way a designer layers it: **wrap each logical
+region in a `group`** — a swimlane and the boxes on it, a panel and its parts,
+a node's own box + icon + label, a legend cluster — so the region is ONE
+navigable, movable layer, not a scatter of loose objects.
+
+    {"id":"bias-lane","type":"group","objects":[ …the lane background shape,
+      its accent bar, its title, its node boxes + icons… ]}
+
+A group is a **z-order and selection envelope, not a coordinate system**: its
+children keep their page-absolute `at`/`size` (ids, `describe`, journal moves,
+off-canvas lint and per-object merge stay identical whether or not an object is
+grouped), and the group's own box is just the union of what it holds — so
+`{type:"group", id:…, objects:[…]}` is all a group needs; no `at`/`size` of its
+own. What you gain: the human selects, moves, hides or restyles the whole
+region at once; the pane's outline rail shows the group as a collapsible layer
+with its children nested under it; and dragging the region moves everything
+together — instead of pulling a lane background out from under the boxes
+sitting on it. Connectors and shared input/output nodes that span two regions
+stay at the top level and bind to child ids by name — a `connector` reaches a
+node inside a group fine, because ids are global.
+
+**Prefer a few well-named groups over a flat list of many objects — structure
+the board the way a designer would layer it.** A designed figure emitted as one
+long flat pile of shapes, text and icons is the tell that it was built object
+by object rather than region by region; group it.
+
+Complete example — a two-lane architecture figure, built **in layers**: two
+lane groups (each holding its background, accent, title and node boxes/icons),
+the shared input and merge nodes as their own small groups, and the connectors
+between node ids at the top level. Copy it, rename the ids, change the
+text/positions; `chimaera board show --file boards/chrombpnet.board` cards it
+(write it under `boards/` only for a deliverable the user asked to keep —
+otherwise any path works):
 
 ```json
 {
@@ -195,49 +226,54 @@ deliverable the user asked to keep — otherwise any path works):
         { "id": "subtitle", "type": "text", "role": "subtitle", "at": [56, 92], "size": [848, 34],
           "text": "Two branches predict profile shape and total accessibility, then recombine." },
 
-        { "id": "lane-bias", "type": "shape", "geo": "roundRect", "at": [212, 140], "size": [560, 120],
-          "radius": 14, "fill": "@surface" },
-        { "id": "lane-bias-accent", "type": "shape", "geo": "rect", "at": [212, 140], "size": [5, 120],
-          "fill": "@cat2" },
-        { "id": "lane-bias-label", "type": "text", "role": "label", "at": [230, 150], "size": [520, 16],
-          "align": "left", "text": "ASSAY BIAS · FROZEN" },
+        { "id": "input", "type": "group", "objects": [
+          { "id": "dna", "type": "shape", "geo": "roundRect", "at": [56, 258], "size": [140, 44],
+            "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+          { "id": "dna-icon", "type": "icon", "name": "dna", "at": [66, 267], "size": [24, 24], "color": "@fg" },
+          { "id": "dna-label", "type": "text", "role": "label", "at": [98, 258], "size": [92, 44],
+            "valign": "middle", "align": "left", "text": "DNA · 2,114 bp" }
+        ] },
 
-        { "id": "lane-signal", "type": "shape", "geo": "roundRect", "at": [212, 290], "size": [560, 168],
-          "radius": 14, "fill": "@surface" },
-        { "id": "lane-signal-accent", "type": "shape", "geo": "rect", "at": [212, 290], "size": [5, 168],
-          "fill": "@cat1" },
-        { "id": "lane-signal-label", "type": "text", "role": "label", "at": [230, 300], "size": [520, 16],
-          "align": "left", "text": "REGULATORY SIGNAL · TRAINABLE" },
+        { "id": "bias-lane", "type": "group", "objects": [
+          { "id": "lane-bias", "type": "shape", "geo": "roundRect", "at": [212, 140], "size": [560, 120],
+            "radius": 14, "fill": "@surface" },
+          { "id": "lane-bias-accent", "type": "shape", "geo": "rect", "at": [212, 140], "size": [5, 120],
+            "fill": "@cat2" },
+          { "id": "lane-bias-label", "type": "text", "role": "label", "at": [230, 150], "size": [520, 16],
+            "align": "left", "text": "ASSAY BIAS · FROZEN" },
+          { "id": "frozen", "type": "shape", "geo": "roundRect", "at": [238, 186], "size": [150, 44],
+            "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+          { "id": "frozen-icon", "type": "icon", "name": "snowflake", "at": [248, 195], "size": [24, 24], "color": "@fg" },
+          { "id": "frozen-label", "type": "text", "role": "label", "at": [280, 186], "size": [100, 44],
+            "valign": "middle", "align": "left", "text": "Frozen bias" }
+        ] },
 
-        { "id": "dna", "type": "shape", "geo": "roundRect", "at": [56, 258], "size": [140, 44],
-          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-        { "id": "dna-icon", "type": "icon", "name": "dna", "at": [66, 267], "size": [24, 24], "color": "@fg" },
-        { "id": "dna-label", "type": "text", "role": "label", "at": [98, 258], "size": [92, 44],
-          "valign": "middle", "align": "left", "text": "DNA · 2,114 bp" },
+        { "id": "signal-lane", "type": "group", "objects": [
+          { "id": "lane-signal", "type": "shape", "geo": "roundRect", "at": [212, 290], "size": [560, 168],
+            "radius": 14, "fill": "@surface" },
+          { "id": "lane-signal-accent", "type": "shape", "geo": "rect", "at": [212, 290], "size": [5, 168],
+            "fill": "@cat1" },
+          { "id": "lane-signal-label", "type": "text", "role": "label", "at": [230, 300], "size": [520, 16],
+            "align": "left", "text": "REGULATORY SIGNAL · TRAINABLE" },
+          { "id": "conv", "type": "shape", "geo": "roundRect", "at": [238, 330], "size": [150, 44],
+            "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+          { "id": "conv-icon", "type": "icon", "name": "filter", "at": [248, 339], "size": [24, 24], "color": "@fg" },
+          { "id": "conv-label", "type": "text", "role": "label", "at": [280, 330], "size": [100, 44],
+            "valign": "middle", "align": "left", "text": "Conv1D · k=21" },
+          { "id": "dilated", "type": "shape", "geo": "roundRect", "at": [238, 392], "size": [150, 44],
+            "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+          { "id": "dilated-icon", "type": "icon", "name": "stack-2", "at": [248, 401], "size": [24, 24], "color": "@fg" },
+          { "id": "dilated-label", "type": "text", "role": "label", "at": [280, 392], "size": [100, 44],
+            "valign": "middle", "align": "left", "text": "Dilated stack" }
+        ] },
 
-        { "id": "frozen", "type": "shape", "geo": "roundRect", "at": [238, 186], "size": [150, 44],
-          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-        { "id": "frozen-icon", "type": "icon", "name": "snowflake", "at": [248, 195], "size": [24, 24], "color": "@fg" },
-        { "id": "frozen-label", "type": "text", "role": "label", "at": [280, 186], "size": [100, 44],
-          "valign": "middle", "align": "left", "text": "Frozen bias" },
-
-        { "id": "conv", "type": "shape", "geo": "roundRect", "at": [238, 330], "size": [150, 44],
-          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-        { "id": "conv-icon", "type": "icon", "name": "filter", "at": [248, 339], "size": [24, 24], "color": "@fg" },
-        { "id": "conv-label", "type": "text", "role": "label", "at": [280, 330], "size": [100, 44],
-          "valign": "middle", "align": "left", "text": "Conv1D · k=21" },
-
-        { "id": "dilated", "type": "shape", "geo": "roundRect", "at": [238, 392], "size": [150, 44],
-          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-        { "id": "dilated-icon", "type": "icon", "name": "stack-2", "at": [248, 401], "size": [24, 24], "color": "@fg" },
-        { "id": "dilated-label", "type": "text", "role": "label", "at": [280, 392], "size": [100, 44],
-          "valign": "middle", "align": "left", "text": "Dilated stack" },
-
-        { "id": "fuse", "type": "shape", "geo": "ellipse", "at": [582, 254], "size": [172, 64],
-          "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
-        { "id": "fuse-icon", "type": "icon", "name": "math-function", "at": [600, 270], "size": [28, 28], "color": "@fg" },
-        { "id": "fuse-label", "type": "text", "role": "label", "at": [632, 254], "size": [112, 64],
-          "valign": "middle", "align": "left", "text": "Merge heads" },
+        { "id": "merge", "type": "group", "objects": [
+          { "id": "fuse", "type": "shape", "geo": "ellipse", "at": [582, 254], "size": [172, 64],
+            "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+          { "id": "fuse-icon", "type": "icon", "name": "math-function", "at": [600, 270], "size": [28, 28], "color": "@fg" },
+          { "id": "fuse-label", "type": "text", "role": "label", "at": [632, 254], "size": [112, 64],
+            "valign": "middle", "align": "left", "text": "Merge heads" }
+        ] },
 
         { "id": "c-dna-frozen", "type": "connector", "geo": "bent",
           "from": { "object": "dna", "side": "right" }, "to": { "object": "frozen", "side": "left" },
@@ -269,8 +305,11 @@ The controls that example uses — the ones worth knowing before you compose:
   `fill:"@surface"`) as the background, a thin full-height `rect` in an accent
   token (`@cat1`/`@cat2`) laid over its left edge, and a `label`-role `text` at
   the top-left. Members are ordinary nodes positioned inside; the lane is just
-  drawn behind them (objects earlier in the list paint first). Reads cleaner
-  than a mermaid swimlane, and every piece stays movable.
+  drawn behind them (objects earlier in the list paint first). **Wrap the
+  background, accent, title and member nodes in one `group`** (as the example
+  does) so the whole lane is a single layer that moves and restyles as a unit —
+  see "Structure with layers (groups)" above. Reads cleaner than a mermaid
+  swimlane, and every piece stays movable.
 - **Icon-in-box nodes**: three objects sharing a spot — a `shape` box, an
   `icon` (`{"type":"icon","name":"snowflake"}`; find a name with `chimaera
   board icons <query>`), and a `text` with `valign:"middle"`. `text` accepts a

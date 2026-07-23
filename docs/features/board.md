@@ -42,6 +42,17 @@ on the full `.board` (or legacy `.board.json`) suffix. Chat card:
   composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
   `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
   to primitives at render/export time.
+- **Groups are layers.** `{type:"group", objects:[…]}` is a z-order and
+  selection envelope — its children keep page-absolute `at`/`size` (ids,
+  `describe`, journal moves, lint and merge stay identical whether grouped or
+  not), and the group box is just the union of what it holds. When authoring a
+  designed figure, wrap each logical region — a swimlane and its boxes, a panel
+  and its parts, a node's box + icon + label — in a group instead of emitting a
+  flat pile of loose objects: the pane's outline rail then shows it as a
+  collapsible layer, a `move` on the group translates all its children as a
+  unit, and the human can restyle the region at once. The guide's
+  designed-figures section carries a fully-layered worked example, and
+  `lint --style` nudges a busy figure with no groups toward layering.
 - **Connectors** bind endpoints to object box edges (`from`/`to`
   `{object, side}`, `side` = `top|right|bottom|left|center`) and route
   `straight` or `bent` (a rounded orthogonal path — the architecture-figure

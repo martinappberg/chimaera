@@ -702,7 +702,11 @@ export. For a designed architecture or flow figure (not a quick chart), \
 compose native shapes, bent connectors, and icons by hand — the guide's \
 designed-figures section has a complete example — so it stays editable and \
 PPTX-editable; do not author an SVG externally and import it when the user \
-may want to edit the figure. Favor binding real project files (`data.source`, \
+may want to edit the figure. When the figure has distinct regions — lanes, \
+panels, clusters — wrap each region's objects in a `group` \
+(`{\"type\":\"group\",\"objects\":[…]}`) so it is one navigable, movable layer \
+the human can move and restyle as a unit; do not emit a flat pile of loose \
+objects. Favor binding real project files (`data.source`, \
 workspace-relative) over inlined values, and when you computed the values \
 yourself record how in `data.trace` plus the files read in `data.inputs`. \
 When telling the user what you are doing, \
@@ -1710,6 +1714,10 @@ mod tests {
             // SVG when the user may want to edit the figure.
             "compose native shapes, bent connectors, and icons by hand",
             "do not author an SVG externally and import it",
+            // The layering steer: distinct regions become groups, not a flat
+            // pile — the direct fix for figures built object-by-object.
+            "wrap each region's objects in a `group`",
+            "do not emit a flat pile of loose objects",
             // One sentence of the provenance doctrine, not the full guide.
             "Favor binding real project files (`data.source`",
             "record how in `data.trace` plus the files read in `data.inputs`",

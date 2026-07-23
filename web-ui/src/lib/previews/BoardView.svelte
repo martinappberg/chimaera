@@ -562,7 +562,13 @@
   let dragVisual = $state<{
     at: [number, number];
     size: [number, number];
-    src: { sx: number; sy: number; sw: number; sh: number };
+    // `crop` = the object's own pixels lifted from the raster (clean when
+    // nothing overlaps it). `fill` = a translucent placeholder used when
+    // another object overlaps this one's box: the raster crop would drag the
+    // overlapping pixels too (a background carrying the boxes on top of it),
+    // so we show its footprint instead of a lie. `src` is null in fill mode.
+    mode: "crop" | "fill";
+    src: { sx: number; sy: number; sw: number; sh: number } | null;
     frozen: string | null;
   } | null>(null);
   let ghostCanvas = $state<HTMLCanvasElement | null>(null);
@@ -730,7 +736,16 @@
     // node, a lane box) — and a node child arms a drag whose release pins
     // `nodes.<i>.at`. A press on the composite's background clears the child
     // and falls through to the normal whole-object selection/drag.
-    if (target !== null && target.id === selected) {
+    // Drill into children ONLY for a composite that actually has them; the
+    // early return here must not swallow a re-grab of an already-selected
+    // plain object (that would make a selected object undraggable — press it
+    // again and nothing moves). A press on a childless object, or on a
+    // composite's own background, falls through to the whole-object move below.
+    if (
+      target !== null &&
+      target.id === selected &&
+      (pageChildFrames[target.id]?.length ?? 0) > 0
+    ) {
       const kid = hitChild(pageChildFrames[target.id] ?? [], pt);
       if (kid !== null) {
         selectedChild = kid.id;
@@ -749,8 +764,8 @@
             dy: 0,
             moved: false,
           };
+          return;
         }
-        return;
       }
     }
     selected = target?.id ?? null;
@@ -760,7 +775,7 @@
     arrangeExtra = [];
     if (target === null || target.at === null) return;
     (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
-    if (target.size !== null) startGhost({ at: target.at, size: target.size });
+    if (target.size !== null) startGhost({ at: target.at, size: target.size }, target.id);
     drag = { mode: "move", id: target.id, startPt: pt, origAt: target.at, dx: 0, dy: 0, moved: false };
   }
 
@@ -769,19 +784,42 @@
    *  fetch and no server round-trip. The ghost is then translated under the
    *  cursor by CSS transform; drawing happens in the effect that watches
    *  `dragVisual` + `ghostCanvas`. */
-  function startGhost(frame: Frame): void {
+  function startGhost(frame: Frame, selfId?: string): void {
     dragVisual = null;
     clearTimeout(dragVisualTimer);
     const img = imgEl;
     const b = board;
     if (img === null || b === null || img.naturalWidth === 0) return;
+    // A raster crop lifts the object's box out of the flattened page, so it is
+    // only honest when nothing is painted ON TOP of that box. z-order is array
+    // order, so an object is contaminated only by objects AFTER it: a
+    // background dragged out from under its boxes (fill mode), while a
+    // foreground box over that background still gets its own clean pixels
+    // (crop). Objects behind the dragged one are occluded by it in the crop.
+    const selfIndex = selfId === undefined ? -1 : pageObjects.findIndex((x) => x.id === selfId);
+    const coveredAbove =
+      selfIndex >= 0 &&
+      pageObjects.some(
+        (x, i) =>
+          i > selfIndex &&
+          x.at !== null &&
+          x.size !== null &&
+          x.at[0] < frame.at[0] + frame.size[0] &&
+          x.at[0] + x.size[0] > frame.at[0] &&
+          x.at[1] < frame.at[1] + frame.size[1] &&
+          x.at[1] + x.size[1] > frame.at[1],
+      );
+    if (coveredAbove) {
+      dragVisual = { at: frame.at, size: frame.size, mode: "fill", src: null, frozen: null };
+      return;
+    }
     const pxPerPt = img.naturalWidth / b.canvas[0];
     const sx = Math.max(0, Math.floor(frame.at[0] * pxPerPt));
     const sy = Math.max(0, Math.floor(frame.at[1] * pxPerPt));
     const sw = Math.min(img.naturalWidth - sx, Math.ceil(frame.size[0] * pxPerPt));
     const sh = Math.min(img.naturalHeight - sy, Math.ceil(frame.size[1] * pxPerPt));
     if (sw < 1 || sh < 1) return;
-    dragVisual = { at: frame.at, size: frame.size, src: { sx, sy, sw, sh }, frozen: null };
+    dragVisual = { at: frame.at, size: frame.size, mode: "crop", src: { sx, sy, sw, sh }, frozen: null };
   }
 
   function onPointerMove(ev: PointerEvent): void {
@@ -920,7 +958,7 @@
     const dv = dragVisual;
     const cv = ghostCanvas;
     const img = imgEl;
-    if (dv === null || cv === null || img === null) return;
+    if (dv === null || dv.src === null || cv === null || img === null) return;
     const { sx, sy, sw, sh } = dv.src;
     cv.width = sw;
     cv.height = sh;
@@ -2070,7 +2108,7 @@
           <!-- The live drag crop: the dragged object's own pixels, translated
                under the cursor at 60fps with no server round-trip. Held frozen
                at the drop until the fresh render swaps the real pixels in. -->
-          {#if dragVisual !== null && ghostBox !== null}
+          {#if dragVisual !== null && ghostBox !== null && dragVisual.mode === "crop"}
             <canvas
               bind:this={ghostCanvas}
               class="board-drag-ghost"
@@ -2081,6 +2119,19 @@
               style:height={`${ghostBox.height}px`}
               style:transform={ghostTransform}
             ></canvas>
+          {/if}
+          {#if dragVisual !== null && ghostBox !== null && dragVisual.mode === "fill"}
+            <!-- Overlapped object: a translucent footprint, not a raster crop
+                 that would carry the pixels stacked on top of it. -->
+            <div
+              class="board-drag-fill"
+              class:frozen={drag === null}
+              style:left={`${ghostBox.left}px`}
+              style:top={`${ghostBox.top}px`}
+              style:width={`${ghostBox.width}px`}
+              style:height={`${ghostBox.height}px`}
+              style:transform={ghostTransform}
+            ></div>
             {#if drag !== null}
               <div
                 class="drag-origin"
@@ -2583,6 +2634,21 @@
   }
   .board-drag-ghost.frozen {
     /* Held at the drop until the fresh render lands — no shadow flicker. */
+    box-shadow: none;
+  }
+  /* The overlapped-object footprint: a clean translucent box, never a raster
+     crop that would drag the pixels stacked on top of the object. */
+  .board-drag-fill {
+    position: absolute;
+    pointer-events: none;
+    transform-origin: 0 0;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border: 1.5px solid var(--accent);
+    box-shadow: 0 6px 20px var(--scrim);
+    will-change: transform;
+  }
+  .board-drag-fill.frozen {
     box-shadow: none;
   }
   /* A faint marker of where the drag started. */
