@@ -675,12 +675,19 @@ fn set_route(state: &AppState, id: &str, route: Route, relay: Option<tokio::proc
     let orphan = {
         let mut store = crate::lock(&state.proxies);
         match store.entries.get_mut(id) {
-            Some(e) => {
+            // The class can change while a probe runs (a re-mint after the
+            // allocation ended). Only store a route the CURRENT class still
+            // permits — otherwise a stale compute-node probe would write its
+            // relay back onto a now-Other entry, and a waiter reading
+            // `fresh.route` could use it before the next dial clears it (codex
+            // round 7). Orphan the incoming child in that case.
+            Some(e) if cached_route_usable(route, e.class) => {
                 e.route = Some(route);
                 std::mem::replace(&mut e.relay, relay)
             }
-            // Entry revoked mid-probe: don't leak the child.
-            None => relay,
+            // Class no longer permits this route, or the entry was revoked
+            // mid-probe: don't store it, and don't leak the child.
+            _ => relay,
         }
     };
     if let Some(child) = orphan {
