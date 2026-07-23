@@ -600,15 +600,10 @@ fn show(
     append_shown_event(&board_path);
 
     if !quiet {
-        let rel = |p: &Path| {
-            p.strip_prefix(&ws)
-                .map(|r| r.display().to_string())
-                .unwrap_or_else(|_| p.display().to_string())
-        };
         println!(
             "{} → {}",
             crate::show::summary(&board, &theme_id),
-            rel(&board_path)
+            shown_path(&board_path)
         );
         for d in rendered
             .diagnostics
@@ -672,11 +667,7 @@ fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> 
     append_shown_event(path);
 
     if !quiet {
-        let rel = abs
-            .strip_prefix(&ws)
-            .map(|r| r.display().to_string())
-            .unwrap_or_else(|_| path.display().to_string());
-        println!("{}", shown_file_line(&board, &theme_id, &rel));
+        println!("{}", shown_file_line(&board, &theme_id, &shown_path(&abs)));
         for d in rendered
             .diagnostics
             .iter()
@@ -688,12 +679,37 @@ fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> 
     Ok(())
 }
 
+/// The absolute path the `shown … → <path>` line carries — the anchor the
+/// chat card mounts on. The card joins a RELATIVE path to the *session* cwd,
+/// but the CLI only knows the board's own workspace root; those are two
+/// different anchors, so any relative emit 404s the instant they disagree (a
+/// board saved in a subdir, a session started elsewhere — the exact bug this
+/// exists to kill). An absolute path removes the anchor entirely: the card
+/// passes it through verbatim and `/board/render` canonicalizes it like every
+/// other file path (the same canonicalization `journal_path_for` does, so the
+/// render path and the journal key stay in lockstep). The fallbacks only
+/// matter if the just-written file has already vanished.
+fn shown_path(board_path: &Path) -> String {
+    board_path
+        .canonicalize()
+        .or_else(|_| {
+            if board_path.is_absolute() {
+                Ok(board_path.to_path_buf())
+            } else {
+                std::env::current_dir().map(|cwd| cwd.join(board_path))
+            }
+        })
+        .unwrap_or_else(|_| board_path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// The one-line stdout of `show --file`, matching the ShownCard mount grammar
 /// exactly: `shown … → <path>.board.json`.
-fn shown_file_line(board: &crate::Board, theme_id: &str, rel: &str) -> String {
+fn shown_file_line(board: &crate::Board, theme_id: &str, path: &str) -> String {
     let n = board.pages.len();
     format!(
-        "shown board · {n} page{} · {theme_id} · {}×{} → {rel}",
+        "shown board · {n} page{} · {theme_id} · {}×{} → {path}",
         if n == 1 { "" } else { "s" },
         board.canvas.width(),
         board.canvas.height()
@@ -2469,6 +2485,38 @@ mod tests {
             shown_file_line(&one, "talk-light", "a.board.json"),
             "shown board · 1 page · talk-light · 720×450 → a.board.json"
         );
+    }
+
+    /// The shown line must carry an ABSOLUTE path: the chat card joins a
+    /// relative path to the session cwd, a different anchor than the board's
+    /// own workspace root, so a board in a subdir (or a session started
+    /// elsewhere) 404s. `shown_path` returns the canonical absolute path the
+    /// card mounts verbatim — no cwd guesswork, and the subdir survives.
+    #[test]
+    fn shown_path_is_absolute_and_keeps_the_subdir() {
+        let dir = std::env::temp_dir().join(format!("chimaera-shown-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A board one directory deeper than any plausible session cwd, and no
+        // `.git` — the exact shape where workspace_root would strip the subdir.
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let board = sub.join("chrombpnet-architecture-polished.board.json");
+        std::fs::write(&board, b"{}").unwrap();
+
+        let emitted = shown_path(&board);
+        assert!(Path::new(&emitted).is_absolute(), "{emitted}");
+        assert!(
+            emitted.ends_with("chrombpnet-architecture-polished.board.json"),
+            "{emitted}"
+        );
+        assert!(
+            Path::new(&emitted)
+                .components()
+                .any(|c| c.as_os_str() == "sub"),
+            "the subdir must survive so the card resolves the real file: {emitted}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1540,9 +1540,9 @@ fn resolve_endpoint(
     ep: &EndPoint,
     other: Option<(f64, f64)>,
     index: &BTreeMap<String, Frame>,
-) -> Option<(f64, f64)> {
+) -> Option<((f64, f64), (f64, f64))> {
     if let Some(at) = ep.at {
-        return Some((at[0], at[1]));
+        return Some(((at[0], at[1]), (0.0, 0.0)));
     }
     let id = ep.object.as_deref()?;
     let f = index.get(id)?;
@@ -1553,38 +1553,32 @@ fn resolve_endpoint(
         Some(_) => Side::Bottom,
         None => Side::Center,
     });
-    Some(match side {
+    let p = match side {
         Side::Top => (f.cx(), f.y),
         Side::Right => (f.right(), f.cy()),
         Side::Bottom => (f.cx(), f.bottom()),
         Side::Left => (f.x, f.cy()),
         Side::Center => (f.cx(), f.cy()),
-    })
+    };
+    let n = side.outward_normal();
+    Some((p, (n[0], n[1])))
 }
 
-fn emit_connector(w: &mut SlideWriter, c: &ConnectorObject) {
-    let to_rough = resolve_endpoint(&c.to, None, &w.index);
-    let Some(from) = resolve_endpoint(&c.from, to_rough, &w.index) else {
-        w.fate(
-            &c.id,
-            ExportTier::Raster,
-            "skipped: `from` endpoint does not resolve",
-        );
-        return;
-    };
-    let Some(to) = resolve_endpoint(&c.to, Some(from), &w.index) else {
-        w.fate(
-            &c.id,
-            ExportTier::Raster,
-            "skipped: `to` endpoint does not resolve",
-        );
-        return;
-    };
-
-    // The cxnSp's OWN xfrm, from the two resolved points: off at the top-left
-    // of the segment box, flips orienting local (0,0)→(cx,cy) as from→to.
-    // Never omitted, never zero-extent — PowerPoint renders the *stored*
-    // geometry on open, and Keynote and Google Slides never reroute.
+/// A native straight connector (`straightConnector1` cxnSp) between two resolved
+/// points — the fate for a `straight` connector, and the fallback when a bent
+/// route's path cannot be parsed. Its OWN xfrm, from the two points: off at the
+/// segment box's top-left, flips orienting local (0,0)→(cx,cy) as from→to. Never
+/// omitted, never zero-extent — PowerPoint renders the stored geometry on open,
+/// and Keynote and Google Slides never reroute.
+fn emit_straight_connector(
+    w: &mut SlideWriter,
+    id: &str,
+    alt: Option<&str>,
+    from: (f64, f64),
+    to: (f64, f64),
+    stroke: &Stroke,
+    ends: &str,
+) {
     let f = Frame {
         x: from.0.min(to.0),
         y: from.1.min(to.1),
@@ -1593,11 +1587,51 @@ fn emit_connector(w: &mut SlideWriter, c: &ConnectorObject) {
     };
     let flip_h = to.0 < from.0;
     let flip_v = to.1 < from.1;
+    let ln = line_xml(w.theme, stroke, 1.5, ends);
+    let nv = w.cnvpr(id, alt, None);
+    let _ = write!(
+        w.xml,
+        r#"<p:cxnSp><p:nvCxnSpPr>{nv}<p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr><p:spPr>{}{}{ln}</p:spPr></p:cxnSp>"#,
+        xfrm(f, None, flip_h, flip_v),
+        prst_geom("straightConnector1", "")
+    );
+}
 
-    let prst = match c.geo.as_deref() {
-        Some("bent") => "bentConnector3",
-        _ => "straightConnector1",
+fn emit_connector(w: &mut SlideWriter, c: &ConnectorObject) {
+    let to_rough = resolve_endpoint(&c.to, None, &w.index).map(|(p, _)| p);
+    let Some((from, from_n)) = resolve_endpoint(&c.from, to_rough, &w.index) else {
+        w.fate(
+            &c.id,
+            ExportTier::Raster,
+            "skipped: `from` endpoint does not resolve",
+        );
+        return;
     };
+    let Some((to, to_n)) = resolve_endpoint(&c.to, Some(from), &w.index) else {
+        w.fate(
+            &c.id,
+            ExportTier::Raster,
+            "skipped: `to` endpoint does not resolve",
+        );
+        return;
+    };
+
+    // Same bent decision the renderer makes, so pane and deck route identically:
+    // two object-anchored ends default to a rounded orthogonal route, a free
+    // `at` end stays a straight connector, waypoints imply a bent route.
+    let waypoints: Vec<(f64, f64)> = c
+        .waypoints
+        .as_ref()
+        .map(|wp| wp.iter().map(|p| (p[0], p[1])).collect())
+        .unwrap_or_default();
+    let from_anchored = c.from.at.is_none() && c.from.object.is_some();
+    let to_anchored = c.to.at.is_none() && c.to.object.is_some();
+    let bent = match c.geo.as_deref() {
+        Some("straight") => false,
+        Some("bent") => true,
+        _ => !waypoints.is_empty() || (from_anchored && to_anchored),
+    };
+
     let mut ends = String::new();
     if c.head_end.as_deref() == Some("arrow") {
         ends.push_str(r#"<a:headEnd type="triangle"/>"#);
@@ -1614,28 +1648,71 @@ fn emit_connector(w: &mut SlideWriter, c: &ConnectorObject) {
         join: None,
         extra: Default::default(),
     };
-    let ln = line_xml(
-        w.theme,
-        c.stroke.as_ref().unwrap_or(&default_stroke),
-        1.5,
-        &ends,
-    );
+    let stroke_ref = c.stroke.as_ref().unwrap_or(&default_stroke);
+    let ln = line_xml(w.theme, stroke_ref, 1.5, &ends);
 
-    let nv = w.cnvpr(&c.id, c.alt.as_deref(), None);
-    let _ = write!(
-        w.xml,
-        r#"<p:cxnSp><p:nvCxnSpPr>{nv}<p:cNvCxnSpPr/><p:nvPr/></p:nvCxnSpPr><p:spPr>{}{}{ln}</p:spPr></p:cxnSp>"#,
-        xfrm(f, None, flip_h, flip_v),
-        prst_geom(prst, "")
-    );
+    // A bent connector is the renderer's exact rounded-orthogonal polyline as
+    // an editable open custom-geometry shape (not a preset cxnSp): PowerPoint
+    // opens real vector geometry the user can reshape and drag, and it matches
+    // the pane pixel-for-pixel — a `bentConnectorN` preset would reroute to its
+    // own single-elbow shape and lose the rounded corners and any waypoints.
+    // A straight connector stays a native `straightConnector1` cxnSp.
+    let route = bent.then(|| {
+        crate::diagram::orthogonal_route(
+            from,
+            from_n,
+            to,
+            to_n,
+            &waypoints,
+            crate::render::CONNECTOR_STUB,
+        )
+    });
 
     let mut reason = String::from("native connector");
+    match &route {
+        Some(pts) => {
+            let d = crate::diagram::rounded_path(pts, crate::render::CONNECTOR_CORNER_R);
+            match parse_svg_path(&d) {
+                Ok(segs) => {
+                    let bb = crate::diagram::bbox_of(pts);
+                    let geom = cust_geom(&segs, bb);
+                    let nv = w.cnvpr(&c.id, c.alt.as_deref(), None);
+                    let _ = write!(
+                        w.xml,
+                        r#"<p:sp><p:nvSpPr>{nv}<p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{}{geom}<a:noFill/>{ln}</p:spPr></p:sp>"#,
+                        xfrm(bb, None, false, false)
+                    );
+                    reason = "native connector (editable rounded-orthogonal custom geometry)"
+                        .to_string();
+                }
+                Err(e) => {
+                    // Malformed route path: fall back to a straight connector
+                    // rather than dropping the edge.
+                    emit_straight_connector(
+                        w,
+                        &c.id,
+                        c.alt.as_deref(),
+                        from,
+                        to,
+                        stroke_ref,
+                        &ends,
+                    );
+                    reason = format!("degraded to a straight connector: {e}");
+                }
+            }
+        }
+        None => emit_straight_connector(w, &c.id, c.alt.as_deref(), from, to, stroke_ref, &ends),
+    }
+
     if !c.text.is_empty() {
         // The bound edge label: a separate small text shape at `label_at`
         // along the segment, haloed with the page ground exactly as the
         // renderer draws it.
         let t = c.label_at.unwrap_or(0.5).clamp(0.0, 1.0);
-        let (lx, ly) = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+        let (lx, ly) = match &route {
+            Some(pts) => crate::diagram::point_along(pts, t),
+            None => (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t),
+        };
         let role = c
             .role
             .as_deref()
@@ -3445,6 +3522,55 @@ mod tests {
             fate("lost").reason
         );
         assert!(!slide.contains("never lands"), "{slide}");
+    }
+
+    #[test]
+    fn a_bent_connector_exports_as_an_editable_custom_geometry_shape() {
+        // Object-anchored ends with no `geo` default to a bent route; it must
+        // land as an editable open custGeom shape (a `p:sp` the user can
+        // reshape and drag in PowerPoint), never a flattened picture, and
+        // carry its arrowhead so the head is editable too.
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"a","type":"shape","geo":"roundRect","at":[80,80],"size":[160,60],"fill":"@surface"},
+                  {"id":"b","type":"shape","geo":"roundRect","at":[520,300],"size":[160,60],"fill":"@surface"},
+                  {"id":"link","type":"connector",
+                   "from":{"object":"a","side":"right"},
+                   "to":{"object":"b","side":"left"},
+                   "tailEnd":"arrow"}]}]}"#,
+        );
+        let (bytes, report) = write(&b);
+        let slide = read_part(&bytes, "ppt/slides/slide1.xml");
+        assert!(slide.contains("<a:custGeom>"), "editable geometry: {slide}");
+        assert!(
+            slide.contains("<a:cubicBezTo>"),
+            "rounded elbows survive as editable cubics: {slide}"
+        );
+        assert!(
+            slide.contains(r#"<a:tailEnd type="triangle"/>"#),
+            "the arrowhead stays editable on the shape outline: {slide}"
+        );
+        let fate = report.objects.iter().find(|f| f.id == "link").unwrap();
+        assert_eq!(fate.tier, ExportTier::Native);
+        assert!(fate.reason.contains("custom geometry"), "{:?}", fate.reason);
+
+        // A free `at` end stays a native straight preset connector.
+        let b2 = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"a","type":"shape","geo":"rect","at":[80,80],"size":[80,80]},
+                  {"id":"c","type":"connector",
+                   "from":{"object":"a","side":"right"},"to":{"at":[400,300]}}]}]}"#,
+        );
+        let (bytes2, _) = write(&b2);
+        let slide2 = read_part(&bytes2, "ppt/slides/slide1.xml");
+        assert!(
+            slide2.contains("straightConnector1"),
+            "a free `at` end stays straight: {slide2}"
+        );
     }
 
     #[test]

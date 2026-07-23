@@ -604,6 +604,7 @@ pub struct TextObject {
     pub at: Option<[f64; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<[f64; 2]>,
+    #[serde(deserialize_with = "de_paragraphs")]
     pub text: Vec<Paragraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub align: Option<Align>,
@@ -656,6 +657,30 @@ impl Paragraph {
             Paragraph::Rich(p) => p.runs.iter().map(|r| r.t.as_str()).collect(),
         }
     }
+}
+
+/// Accept a paragraph list written three ways, so every `text` field reads
+/// leniently: a bare `"hi"` string, a single rich `{ "runs": [...] }` object,
+/// or the array form (`["a", "b"]` / `[{...}]`). Canonical serialization is
+/// unchanged — the field always writes as an array and [`crate::normalize`]
+/// collapses single-run rich paragraphs back to bare strings — so this is
+/// purely lenient input with no diff churn.
+fn de_paragraphs<'de, D>(d: D) -> Result<Vec<Paragraph>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        // A single paragraph — a bare string or one rich object. Tried first,
+        // so `["a"]` (an array) falls through to `Many`, never matching `One`.
+        One(Paragraph),
+        Many(Vec<Paragraph>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(p) => vec![p],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,7 +775,11 @@ pub struct ShapeObject {
     pub stroke: Option<Stroke>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub radius: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_paragraphs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub text: Vec<Paragraph>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -803,18 +832,29 @@ pub struct ConnectorObject {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: ConnectorKind,
-    /// `straight` or `bent`.
+    /// `straight` or `bent`. Absent resolves at render: two object-anchored
+    /// ends default to `bent` (a rounded orthogonal route — what makes an
+    /// architecture figure read cleanly), a free `at` end stays `straight`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geo: Option<String>,
     pub from: EndPoint,
     pub to: EndPoint,
+    /// Explicit turn points a `bent` route threads, in page points. The route
+    /// orthogonalizes and rounds through them exactly as an auto-route does;
+    /// absent means auto-route between the two endpoints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waypoints: Option<Vec<[f64; 2]>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stroke: Option<Stroke>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_end: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_end: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_paragraphs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub text: Vec<Paragraph>,
     /// Where bound text sits along the path, 0..=1. Defaults to the midpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -854,6 +894,20 @@ pub enum Side {
     Bottom,
     Left,
     Center,
+}
+
+impl Side {
+    /// The outward unit normal of this box side — the direction a bent
+    /// connector leaves the border perpendicular. `Center` has no direction.
+    pub fn outward_normal(self) -> [f64; 2] {
+        match self {
+            Side::Top => [0.0, -1.0],
+            Side::Right => [1.0, 0.0],
+            Side::Bottom => [0.0, 1.0],
+            Side::Left => [-1.0, 0.0],
+            Side::Center => [0.0, 0.0],
+        }
+    }
 }
 
 /// Placed pixels or SVG. Absorbs the former `plot` type: `provenance`,
@@ -1511,9 +1565,16 @@ pub struct DiagramNode {
     /// Pinned top-left position in page points. Absent (the norm) means the
     /// layered layout places the node; present means the layout honors the
     /// pin — a human dragged this node and it stays where its diagram flows
-    /// around it. Size stays layout-derived either way (it follows the label).
+    /// around it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<[f64; 2]>,
+    /// Explicit `[w, h]` in page points. Absent (the norm) means the layout
+    /// measures the node from its label; present pins the node's size, so an
+    /// author can make uniform boxes. The layout reserves and draws the stated
+    /// box (scaling with the diagram to fit, exactly as everything else does),
+    /// and still measures every unsized node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f64; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill: Option<String>,
     /// Names a lane this node belongs to; the lane's container rect is drawn
@@ -1745,7 +1806,11 @@ pub struct CalloutObject {
     pub at: Option<[f64; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<[f64; 2]>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "de_paragraphs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub text: Vec<Paragraph>,
     /// `{ object, side? }` — where the tail points.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1840,6 +1905,97 @@ mod tests {
         assert_eq!(p.plain_text(), "hello");
         let p: Paragraph = serde_json::from_str(r#"{"runs":[{"t":"a"},{"t":"b"}]}"#).unwrap();
         assert_eq!(p.plain_text(), "ab");
+    }
+
+    #[test]
+    fn text_field_accepts_string_array_and_rich_forms() {
+        // A whole `text` field — not just one paragraph — reads leniently: a
+        // bare string, the array form, a single rich object, and a mixed
+        // array all parse. Serialization always writes the canonical array.
+        let bare: TextObject =
+            serde_json::from_str(r#"{"id":"t","type":"text","text":"hi"}"#).unwrap();
+        assert_eq!(bare.text.len(), 1);
+        assert_eq!(bare.text[0].plain_text(), "hi");
+
+        let arr: TextObject =
+            serde_json::from_str(r#"{"id":"t","type":"text","text":["a","b"]}"#).unwrap();
+        assert_eq!(arr.text.len(), 2);
+        assert_eq!(arr.text[1].plain_text(), "b");
+
+        let rich: TextObject = serde_json::from_str(
+            r#"{"id":"t","type":"text","text":{"runs":[{"t":"x","b":true}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(rich.text.len(), 1);
+        assert!(matches!(rich.text[0], Paragraph::Rich(_)));
+
+        let mixed: TextObject = serde_json::from_str(
+            r#"{"id":"t","type":"text","text":["plain",{"runs":[{"t":"styled","i":true}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.text.len(), 2);
+        assert!(matches!(mixed.text[0], Paragraph::Plain(_)));
+        assert!(matches!(mixed.text[1], Paragraph::Rich(_)));
+
+        // The bare string round-trips to the canonical array form (`["hi"]`) —
+        // input sugar only, byte-stable output.
+        let obj: Object = serde_json::from_str(r#"{"id":"t","type":"text","text":"hi"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&obj).unwrap(),
+            r#"{"id":"t","type":"text","text":["hi"]}"#
+        );
+    }
+
+    #[test]
+    fn shape_connector_callout_text_accept_bare_strings() {
+        // Every bound-text field shares the one lenient helper.
+        let sh: ShapeObject = serde_json::from_str(
+            r#"{"id":"s","type":"shape","geo":"roundRect","at":[0,0],"size":[80,40],"text":"box"}"#,
+        )
+        .unwrap();
+        assert_eq!(sh.text[0].plain_text(), "box");
+
+        let c: ConnectorObject = serde_json::from_str(
+            r#"{"id":"c","type":"connector","from":{"object":"a"},"to":{"object":"b"},"text":"edge"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.text[0].plain_text(), "edge");
+
+        let co: CalloutObject = serde_json::from_str(
+            r#"{"id":"co","type":"callout","at":[0,0],"size":[80,40],"text":"note"}"#,
+        )
+        .unwrap();
+        assert_eq!(co.text[0].plain_text(), "note");
+    }
+
+    #[test]
+    fn a_connector_with_waypoints_round_trips_byte_stably() {
+        // Canonical key order is declaration order — `waypoints` sits between
+        // `to` and `stroke`, and a plain object-anchored connector writes none.
+        let raw = r#"{"id":"c","type":"connector","geo":"bent","from":{"object":"a","side":"right"},"to":{"object":"b","side":"left"},"waypoints":[[100.0,120.0],[100.0,200.0]]}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Connector(c) = &obj else {
+            panic!("expected connector, got {obj:?}")
+        };
+        assert_eq!(
+            c.waypoints.as_deref(),
+            Some(&[[100.0, 120.0], [100.0, 200.0]][..])
+        );
+        assert_eq!(serde_json::to_string(&obj).unwrap(), raw);
+    }
+
+    #[test]
+    fn a_sized_diagram_node_round_trips_byte_stably() {
+        // Canonical key order is declaration order — `size` sits between the
+        // node's `at` pin and its styling, and an unsized node writes nothing.
+        let raw = r#"{"id":"d1","type":"diagram","at":[48.0,48.0],"size":[400.0,300.0],"nodes":[{"id":"a","label":"Start","at":[64.0,80.0],"size":[160.0,64.0]},{"id":"b","label":"End"}],"edges":[{"from":"a","to":"b"}]}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Diagram(d) = &obj else {
+            panic!("expected diagram, got {obj:?}")
+        };
+        assert_eq!(d.nodes[0].size, Some([160.0, 64.0]));
+        assert_eq!(d.nodes[1].size, None);
+        assert_eq!(serde_json::to_string(&obj).unwrap(), raw);
     }
 
     #[test]

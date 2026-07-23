@@ -491,6 +491,7 @@ impl CalloutObject {
                         at: None,
                         extra: Extra::new(),
                     },
+                    waypoints: None,
                     stroke: Some(stroke("@accent1", 1.5)),
                     head_end: None,
                     tail_end: Some("arrow".to_string()),

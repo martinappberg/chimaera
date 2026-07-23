@@ -82,7 +82,13 @@ impl Default for RasterParams {
 /// Released upgrades are already covered by the crate version in the
 /// fingerprint; the epoch exists for changes within one version, i.e. the
 /// dev loop, where the version is pinned at the 0.0.1 sentinel.
-pub const RENDER_EPOCH: u32 = 3; // 3: icon objects + node icons
+pub const RENDER_EPOCH: u32 = 4; // 4: object-anchored connectors default to bent routing
+
+/// A bent connector's perpendicular exit stub off each box border, and the
+/// radius of its rounded elbows — sized to read like the layered diagram edges.
+/// `pub(crate)` so the PPTX exporter routes bent connectors identically.
+pub(crate) const CONNECTOR_STUB: f64 = 18.0;
+pub(crate) const CONNECTOR_CORNER_R: f64 = 8.0;
 
 /// The engine identity folded into every render key and prefixed onto it —
 /// the visible prefix is what lets [`crate::prune_renders`] recognize, by
@@ -1610,9 +1616,13 @@ fn emit_connector(
     diags: &mut Vec<Diagnostic>,
     page_id: &str,
 ) {
-    let resolve = |ep: &crate::schema::EndPoint, other: Option<(f64, f64)>| -> Option<(f64, f64)> {
+    // Resolve to a point plus the box-side outward normal (the zero vector for
+    // a free `at` point), so a bent route can leave each border perpendicular.
+    let resolve = |ep: &crate::schema::EndPoint,
+                   other: Option<(f64, f64)>|
+     -> Option<((f64, f64), (f64, f64))> {
         if let Some(at) = ep.at {
-            return Some((at[0], at[1]));
+            return Some(((at[0], at[1]), (0.0, 0.0)));
         }
         let id = ep.object.as_deref()?;
         let f = index.get(id)?;
@@ -1627,18 +1637,20 @@ fn emit_connector(
                 None => Side::Center,
             }
         });
-        Some(match side {
+        let p = match side {
             Side::Top => (f.cx(), f.y),
             Side::Right => (f.right(), f.cy()),
             Side::Bottom => (f.cx(), f.bottom()),
             Side::Left => (f.x, f.cy()),
             Side::Center => (f.cx(), f.cy()),
-        })
+        };
+        let n = side.outward_normal();
+        Some((p, (n[0], n[1])))
     };
 
     // Two passes so an unstated side can face the other end.
-    let to_rough = resolve(&c.to, None);
-    let Some(from) = resolve(&c.from, to_rough) else {
+    let to_rough = resolve(&c.to, None).map(|(p, _)| p);
+    let Some((from, from_n)) = resolve(&c.from, to_rough) else {
         diags.push(
             Diagnostic::new(
                 Severity::Warning,
@@ -1651,7 +1663,7 @@ fn emit_connector(
         );
         return;
     };
-    let Some(to) = resolve(&c.to, Some(from)) else {
+    let Some((to, to_n)) = resolve(&c.to, Some(from)) else {
         diags.push(
             Diagnostic::new(
                 Severity::Warning,
@@ -1673,15 +1685,48 @@ fn emit_connector(
         .unwrap_or_else(|| theme.color_or_fg(None));
     let width = c.stroke.as_ref().and_then(|st| st.width).unwrap_or(1.5);
 
-    let _ = write!(
-        s,
-        r#"<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="{}" stroke-width="{width}""#,
-        from.0,
-        from.1,
-        to.0,
-        to.1,
-        stroke.hex()
-    );
+    // Both ends object-anchored (and no explicit `straight`) default to a
+    // rounded orthogonal route — the pretty default for architecture figures;
+    // a free `at` end stays a single line. Waypoints imply a bent route.
+    let waypoints: Vec<(f64, f64)> = c
+        .waypoints
+        .as_ref()
+        .map(|w| w.iter().map(|p| (p[0], p[1])).collect())
+        .unwrap_or_default();
+    let from_anchored = c.from.at.is_none() && c.from.object.is_some();
+    let to_anchored = c.to.at.is_none() && c.to.object.is_some();
+    let bent = match c.geo.as_deref() {
+        Some("straight") => false,
+        Some("bent") => true,
+        _ => !waypoints.is_empty() || (from_anchored && to_anchored),
+    };
+
+    // The polyline the line, arrows and label all read from: two points for a
+    // straight connector, a rounded Manhattan route for a bent one.
+    let pts: Vec<(f64, f64)> = if bent {
+        crate::diagram::orthogonal_route(from, from_n, to, to_n, &waypoints, CONNECTOR_STUB)
+    } else {
+        vec![from, to]
+    };
+
+    if bent {
+        let d = crate::diagram::rounded_path(&pts, CONNECTOR_CORNER_R);
+        let _ = write!(
+            s,
+            r#"<path d="{d}" fill="none" stroke="{}" stroke-width="{width}""#,
+            stroke.hex()
+        );
+    } else {
+        let _ = write!(
+            s,
+            r#"<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="{}" stroke-width="{width}""#,
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            stroke.hex()
+        );
+    }
     if let Some(dash) = c.stroke.as_ref().and_then(|st| st.dash.as_ref()) {
         let _ = write!(
             s,
@@ -1696,42 +1741,49 @@ fn emit_connector(
 
     // Arrowheads as explicit polygons, not <marker> defs: markers scale with
     // stroke width differently across renderers, and an explicit triangle is
-    // exactly what the PPTX writer will emit later anyway.
-    let angle = (to.1 - from.1).atan2(to.0 - from.0);
-    let mut head = |tip: (f64, f64), ang: f64| {
-        let len = (width * 4.0).max(6.0);
-        let spread = 0.46_f64;
-        let a = (
-            tip.0 - len * (ang - spread).cos(),
-            tip.1 - len * (ang - spread).sin(),
-        );
-        let b = (
-            tip.0 - len * (ang + spread).cos(),
-            tip.1 - len * (ang + spread).sin(),
-        );
-        let _ = write!(
-            s,
-            r#"<polygon points="{},{} {},{} {},{}" fill="{}"/>"#,
-            tip.0,
-            tip.1,
-            a.0,
-            a.1,
-            b.0,
-            b.1,
-            stroke.hex()
-        );
-    };
-    if c.tail_end.as_deref() == Some("arrow") {
-        head(to, angle);
-    }
-    if c.head_end.as_deref() == Some("arrow") {
-        head(from, angle + std::f64::consts::PI);
+    // exactly what the PPTX writer will emit later anyway. The angle follows
+    // the polyline's end segments, so a bent arrow lands square on the border.
+    let n = pts.len();
+    if n >= 2 {
+        let last = (pts[n - 1].0 - pts[n - 2].0, pts[n - 1].1 - pts[n - 2].1);
+        let first = (pts[0].0 - pts[1].0, pts[0].1 - pts[1].1);
+        let tail_angle = last.1.atan2(last.0);
+        let head_angle = first.1.atan2(first.0);
+        let mut head = |tip: (f64, f64), ang: f64| {
+            let len = (width * 4.0).max(6.0);
+            let spread = 0.46_f64;
+            let a = (
+                tip.0 - len * (ang - spread).cos(),
+                tip.1 - len * (ang - spread).sin(),
+            );
+            let b = (
+                tip.0 - len * (ang + spread).cos(),
+                tip.1 - len * (ang + spread).sin(),
+            );
+            let _ = write!(
+                s,
+                r#"<polygon points="{},{} {},{} {},{}" fill="{}"/>"#,
+                tip.0,
+                tip.1,
+                a.0,
+                a.1,
+                b.0,
+                b.1,
+                stroke.hex()
+            );
+        };
+        if c.tail_end.as_deref() == Some("arrow") {
+            head(to, tail_angle);
+        }
+        if c.head_end.as_deref() == Some("arrow") {
+            head(from, head_angle);
+        }
     }
 
     // The bound edge label, at label_at along the path.
     if !c.text.is_empty() {
         let t = c.label_at.unwrap_or(0.5).clamp(0.0, 1.0);
-        let (lx, ly) = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+        let (lx, ly) = crate::diagram::point_along(&pts, t);
         let role = c
             .role
             .as_deref()
@@ -2063,6 +2115,42 @@ mod tests {
         let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
         assert!(!svg.contains("<script"), "unescaped markup: {svg}");
         assert!(svg.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn object_anchored_connectors_default_to_bent_free_ends_stay_straight() {
+        // Smart default: two object-anchored ends route as a rounded
+        // orthogonal <path> (Q bends), while any free `at` end stays a single
+        // straight <line>. `text: "…"` bare strings parse throughout.
+        let b = board(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p","objects":[
+                  {"id":"a","type":"shape","geo":"rect","at":[80,80],"size":[120,60],"text":"A"},
+                  {"id":"b","type":"shape","geo":"rect","at":[520,300],"size":[120,60],"text":"B"},
+                  {"id":"bent","type":"connector",
+                   "from":{"object":"a","side":"right"},"to":{"object":"b","side":"left"},
+                   "tailEnd":"arrow"},
+                  {"id":"free","type":"connector",
+                   "from":{"object":"a","side":"bottom"},"to":{"at":[140,420]}}]}]}"#,
+        );
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let mut diags = Vec::new();
+        let svg = page_svg(&b, &b.pages[0], &theme, &fonts, None, &mut diags).unwrap();
+        // The object-to-object connector is a rounded path with a quadratic
+        // elbow; no <line> is emitted for it.
+        assert!(svg.contains(r#"<path d="M"#), "bent route is a path: {svg}");
+        assert!(svg.contains('Q'), "bent route has rounded elbows: {svg}");
+        // The free-ended connector stays a straight <line>.
+        assert!(
+            svg.contains("<line "),
+            "free `at` end stays straight: {svg}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("does not resolve")),
+            "{diags:?}"
+        );
     }
 
     #[test]

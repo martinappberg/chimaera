@@ -392,6 +392,11 @@ fn measure(
         .nodes
         .iter()
         .map(|nd| {
+            // An explicit size wins verbatim (as `(cross, main)` in working
+            // space) — the author's uniform box, not a label-derived guess.
+            if let Some(sz) = nd.size {
+                return if down { (sz[0], sz[1]) } else { (sz[1], sz[0]) };
+            }
             let label_w = fonts.measure(&nd.label, &role.family, role.size, role.weight);
             // Ellipses and diamonds inscribe less of their box, so the label
             // needs more room to stay inside the geometry.
@@ -1482,8 +1487,9 @@ fn rich(run: Run) -> RichParagraph {
 }
 
 /// A polyline as SVG path data with quadratic-rounded corners — the one bend
-/// idiom every edge uses. Corner radius shrinks to fit short segments.
-fn rounded_path(pts: &[(f64, f64)], r: f64) -> String {
+/// idiom every edge uses, shared with the free connector router in `render`.
+/// Corner radius shrinks to fit short segments.
+pub(crate) fn rounded_path(pts: &[(f64, f64)], r: f64) -> String {
     let mut out = String::new();
     let _ = write!(out, "M{} {}", fx(pts[0].0), fx(pts[0].1));
     for i in 1..pts.len().saturating_sub(1) {
@@ -1518,7 +1524,7 @@ fn rounded_path(pts: &[(f64, f64)], r: f64) -> String {
     out
 }
 
-fn bbox_of(pts: &[(f64, f64)]) -> Frame {
+pub(crate) fn bbox_of(pts: &[(f64, f64)]) -> Frame {
     let mut x0 = f64::MAX;
     let mut y0 = f64::MAX;
     let mut x1 = f64::MIN;
@@ -1537,6 +1543,175 @@ fn bbox_of(pts: &[(f64, f64)]) -> Frame {
     }
 }
 
+/// Axis of a unit direction: `Some(true)` horizontal, `Some(false)` vertical,
+/// `None` for a zero (free) direction.
+fn axis(d: (f64, f64)) -> Option<bool> {
+    if d.0.abs() > d.1.abs() {
+        Some(true)
+    } else if d.1 != 0.0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Axis of the segment `p → q`, `None` when the two coincide.
+fn seg_axis(p: (f64, f64), q: (f64, f64)) -> Option<bool> {
+    axis((q.0 - p.0, q.1 - p.1))
+}
+
+/// Interior elbow points routing `p → q` orthogonally, leaving `p` along
+/// `dout` (its axis) and arriving at `q` along `din`. Empty when the two
+/// already share a row or column (a single straight segment). Unknown `din`
+/// falls to a perpendicular single-corner L; two same-axis ends make a Z with
+/// a mid-split channel — the same idiom the layered edge router draws.
+fn elbow(p: (f64, f64), dout: Option<bool>, q: (f64, f64), din: Option<bool>) -> Vec<(f64, f64)> {
+    const EPS: f64 = 0.5;
+    let dx = q.0 - p.0;
+    let dy = q.1 - p.1;
+    if dx.abs() < EPS || dy.abs() < EPS {
+        return Vec::new();
+    }
+    let ax_out = dout.unwrap_or(dx.abs() >= dy.abs());
+    let ax_in = din.unwrap_or(!ax_out);
+    match (ax_out, ax_in) {
+        (true, false) => vec![(q.0, p.1)],
+        (false, true) => vec![(p.0, q.1)],
+        (true, true) => {
+            let mx = (p.0 + q.0) / 2.0;
+            vec![(mx, p.1), (mx, q.1)]
+        }
+        (false, false) => {
+            let my = (p.1 + q.1) / 2.0;
+            vec![(p.0, my), (q.0, my)]
+        }
+    }
+}
+
+/// Drop consecutive duplicate points and collinear interior points, so the
+/// polyline carries one vertex per real corner (clean rounding, clean tests).
+fn dedup_ortho(pts: &mut Vec<(f64, f64)>) {
+    const EPS: f64 = 0.05;
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() < EPS && (a.1 - b.1).abs() < EPS);
+    let mut i = 1;
+    while pts.len() >= 3 && i < pts.len() - 1 {
+        let (a, b, c) = (pts[i - 1], pts[i], pts[i + 1]);
+        let vertical = (b.0 - a.0).abs() < EPS && (c.0 - b.0).abs() < EPS;
+        let horizontal = (b.1 - a.1).abs() < EPS && (c.1 - b.1).abs() < EPS;
+        if vertical || horizontal {
+            pts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// A rounded orthogonal (Manhattan) polyline between two endpoints, each with
+/// an outward normal (perpendicular box-side exit; the zero vector for a free
+/// point). The path leaves and enters along the normals via a short stub, then
+/// connects with axis-aligned elbows, threading `waypoints` in order when
+/// given. Returns the raw vertex polyline (≥ 2 points); the caller rounds it
+/// with [`rounded_path`]. Shared by the free `connector` router in `render`
+/// and the PPTX exporter so pane and deck route identically.
+pub(crate) fn orthogonal_route(
+    a: (f64, f64),
+    a_norm: (f64, f64),
+    b: (f64, f64),
+    b_norm: (f64, f64),
+    waypoints: &[(f64, f64)],
+    stub: f64,
+) -> Vec<(f64, f64)> {
+    let has_a = a_norm != (0.0, 0.0);
+    let has_b = b_norm != (0.0, 0.0);
+    // Never overshoot a close box: cap the stub at half the Manhattan span.
+    let span = (b.0 - a.0).abs() + (b.1 - a.1).abs();
+    let stub = stub.clamp(0.0, (span * 0.5).max(2.0));
+
+    let start = if has_a {
+        (a.0 + a_norm.0 * stub, a.1 + a_norm.1 * stub)
+    } else {
+        a
+    };
+    let end = if has_b {
+        (b.0 + b_norm.0 * stub, b.1 + b_norm.1 * stub)
+    } else {
+        b
+    };
+
+    let mut anchors: Vec<(f64, f64)> = Vec::with_capacity(waypoints.len() + 2);
+    anchors.push(start);
+    anchors.extend_from_slice(waypoints);
+    anchors.push(end);
+
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    if has_a {
+        pts.push(a);
+    }
+    pts.push(start);
+
+    let mut cur_axis = if has_a { axis(a_norm) } else { None };
+    let in_axis_last = if has_b {
+        axis((-b_norm.0, -b_norm.1))
+    } else {
+        None
+    };
+    for i in 0..anchors.len() - 1 {
+        let p = anchors[i];
+        let q = anchors[i + 1];
+        let din = if i + 1 == anchors.len() - 1 {
+            in_axis_last
+        } else {
+            None
+        };
+        for m in elbow(p, cur_axis, q, din) {
+            pts.push(m);
+        }
+        pts.push(q);
+        cur_axis = seg_axis(pts[pts.len() - 2], q).or(cur_axis);
+    }
+    if has_b {
+        pts.push(b);
+    }
+    dedup_ortho(&mut pts);
+    pts
+}
+
+/// The point at fraction `t` (0..=1) of a polyline's arc length — where a bent
+/// connector's bound label sits, the polyline analogue of a straight lerp.
+pub(crate) fn point_along(pts: &[(f64, f64)], t: f64) -> (f64, f64) {
+    if pts.is_empty() {
+        return (0.0, 0.0);
+    }
+    if pts.len() == 1 {
+        return pts[0];
+    }
+    let total: f64 = pts
+        .windows(2)
+        .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+        .sum();
+    if total < 1e-6 {
+        return pts[0];
+    }
+    let target = t.clamp(0.0, 1.0) * total;
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let seg = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+        if acc + seg >= target {
+            let f = if seg > 1e-6 {
+                (target - acc) / seg
+            } else {
+                0.0
+            };
+            return (
+                w[0].0 + (w[1].0 - w[0].0) * f,
+                w[0].1 + (w[1].1 - w[0].1) * f,
+            );
+        }
+        acc += seg;
+    }
+    *pts.last().unwrap()
+}
+
 /// Per-channel mix of two theme colors — how the diamond tint and the raised
 /// node tone derive from tokens without the theme growing new entries.
 fn blend(a: Rgb, b: Rgb, t: f64) -> Rgb {
@@ -1550,7 +1725,7 @@ fn blend(a: Rgb, b: Rgb, t: f64) -> Rgb {
 
 /// Path coordinates rounded to 0.01 pt — compact `d` strings, unchanged
 /// geometry at any raster scale.
-fn fx(v: f64) -> f64 {
+pub(crate) fn fx(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
@@ -1785,6 +1960,7 @@ impl MermaidState {
                     // node afterward) rather than overreaching the parser.
                     icon: None,
                     at: None,
+                    size: None,
                     fill: None,
                     lane: self.lane_stack.last().cloned(),
                     extra: Extra::new(),
@@ -2603,5 +2779,130 @@ mod tests {
         assert!(icon.1.right() <= label.x + 0.5, "the icon leads the label");
         // A plain node keeps bound text on its shape — no separate label.
         assert!(!co.iter().any(|o| o.id() == "d/a.label"));
+    }
+
+    /// Every segment of a routed polyline is axis-aligned (no diagonals) —
+    /// the orthogonality invariant the connector router must preserve.
+    fn assert_orthogonal(pts: &[(f64, f64)]) {
+        const EPS: f64 = 0.05;
+        for w in pts.windows(2) {
+            let dx = (w[1].0 - w[0].0).abs();
+            let dy = (w[1].1 - w[0].1).abs();
+            assert!(
+                dx < EPS || dy < EPS,
+                "segment {:?}→{:?} is diagonal (dx={dx}, dy={dy})",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn orthogonal_route_is_axis_aligned_and_leaves_along_the_normals() {
+        // A left→right route: box A right edge → box B left edge, lanes apart.
+        let pts = orthogonal_route(
+            (100.0, 100.0),
+            (1.0, 0.0),
+            (300.0, 200.0),
+            (-1.0, 0.0),
+            &[],
+            16.0,
+        );
+        assert_orthogonal(&pts);
+        assert!(pts.len() >= 4, "an offset route bends: {pts:?}");
+        // The first segment leaves perpendicular to A's right side (moves +x,
+        // constant y) and the last enters perpendicular to B's left side.
+        assert!((pts[1].1 - pts[0].1).abs() < 0.05 && pts[1].0 > pts[0].0);
+        let n = pts.len();
+        assert!((pts[n - 1].1 - pts[n - 2].1).abs() < 0.05 && pts[n - 1].0 > pts[n - 2].0);
+        assert_eq!(pts[0], (100.0, 100.0));
+        assert_eq!(pts[n - 1], (300.0, 200.0));
+
+        // Aligned endpoints collapse to a straight two-point run.
+        let flat = orthogonal_route(
+            (0.0, 50.0),
+            (1.0, 0.0),
+            (200.0, 50.0),
+            (-1.0, 0.0),
+            &[],
+            16.0,
+        );
+        assert_eq!(flat, vec![(0.0, 50.0), (200.0, 50.0)]);
+    }
+
+    #[test]
+    fn orthogonal_route_threads_waypoints_in_order() {
+        let wps = [(150.0, 100.0), (150.0, 300.0)];
+        let pts = orthogonal_route(
+            (100.0, 100.0),
+            (1.0, 0.0),
+            (400.0, 300.0),
+            (-1.0, 0.0),
+            &wps,
+            16.0,
+        );
+        assert_orthogonal(&pts);
+        // Both waypoints appear as vertices, in order.
+        let iw1 = pts
+            .iter()
+            .position(|p| (p.0 - 150.0).abs() < 0.5 && (p.1 - 100.0).abs() < 0.5);
+        let iw2 = pts
+            .iter()
+            .position(|p| (p.0 - 150.0).abs() < 0.5 && (p.1 - 300.0).abs() < 0.5);
+        assert!(
+            iw1.is_some() && iw2.is_some(),
+            "waypoints threaded: {pts:?}"
+        );
+        assert!(iw1.unwrap() < iw2.unwrap(), "waypoints kept their order");
+    }
+
+    #[test]
+    fn rounded_path_of_a_bent_route_has_curved_elbows() {
+        let pts = orthogonal_route(
+            (100.0, 100.0),
+            (1.0, 0.0),
+            (300.0, 200.0),
+            (-1.0, 0.0),
+            &[],
+            16.0,
+        );
+        let d = rounded_path(&pts, 7.0);
+        assert!(d.contains('Q'), "rounded elbows emit quadratic bends: {d}");
+    }
+
+    #[test]
+    fn an_explicit_node_size_is_honored_verbatim() {
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        // A frame large enough that the fit-scale is 1.0, so the stated size
+        // lands verbatim rather than shrunk to fit.
+        let d = diagram(
+            r#"{"id":"d","type":"diagram","at":[0,0],"size":[1200,600],
+                "nodes":[{"id":"a","label":"x","size":[220,72]},{"id":"b","label":"y"}],
+                "edges":[{"from":"a","to":"b"}]}"#,
+        );
+        let (children, _) = expand(&d, &theme, &fonts);
+        let sized = children
+            .iter()
+            .find_map(|o| match o {
+                Object::Shape(s) if s.id == "d/a" => o.frame(),
+                _ => None,
+            })
+            .expect("the sized node's shape");
+        assert!((sized.w - 220.0).abs() < 0.5, "width honored: {}", sized.w);
+        assert!((sized.h - 72.0).abs() < 0.5, "height honored: {}", sized.h);
+        // The unsized node still measures from its label (narrower than 220).
+        let plain = children
+            .iter()
+            .find_map(|o| match o {
+                Object::Shape(s) if s.id == "d/b" => o.frame(),
+                _ => None,
+            })
+            .expect("the unsized node's shape");
+        assert!(
+            plain.w < 220.0,
+            "an unsized node is label-measured: {}",
+            plain.w
+        );
     }
 }

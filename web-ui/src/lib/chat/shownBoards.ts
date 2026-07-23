@@ -35,8 +35,11 @@ export interface ShownGroupInput<T extends ShownToolLike = ShownToolLike> {
  *  clones the regex, so the shared global literal is safe. */
 const SHOWN_RE = /^shown .+ → (.+\.board\.json)$/gm;
 
-/** `board show` prints workspace-relative paths; resolve against the session
- *  cwd. Absolute paths pass through. */
+/** `board show` prints ABSOLUTE paths (so a board mounts regardless of where
+ *  the agent's cwd sits versus the board's own workspace root — the two are
+ *  different anchors, and a relative emit 404s the moment they diverge), which
+ *  pass straight through. A bare/relative path is a legacy transcript or an
+ *  older CLI: best-effort resolve it against the session cwd. */
 function resolveShownPath(raw: string, cwd?: string): string {
   if (raw.startsWith("/")) return raw;
   if (cwd === undefined) return raw;
