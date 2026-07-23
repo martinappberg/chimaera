@@ -2073,7 +2073,7 @@
           {#if dragVisual !== null && ghostBox !== null}
             <canvas
               bind:this={ghostCanvas}
-              class="drag-ghost"
+              class="board-drag-ghost"
               class:frozen={drag === null}
               style:left={`${ghostBox.left}px`}
               style:top={`${ghostBox.top}px`}
@@ -2570,7 +2570,10 @@
     height: 1px;
   }
   /* The live drag crop — the object's own pixels lifted under the cursor. */
-  .drag-ghost {
+  /* Named to NOT collide with the global `.drag-ghost` in app.css (the
+     workspace file/tab drag preview), whose `max-width: 240px` would clamp and
+     squish this canvas for any object wider than 240 display px. */
+  .board-drag-ghost {
     position: absolute;
     pointer-events: none;
     transform-origin: 0 0;
@@ -2578,7 +2581,7 @@
     box-shadow: 0 6px 20px var(--scrim);
     will-change: transform;
   }
-  .drag-ghost.frozen {
+  .board-drag-ghost.frozen {
     /* Held at the drop until the fresh render lands — no shadow flicker. */
     box-shadow: none;
   }
