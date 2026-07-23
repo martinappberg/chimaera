@@ -23,8 +23,10 @@ inline in chat. The spec is `title`, `note`, and exactly ONE of `chart`,
   `marks`.
 - `--id SLUG` is the update handle: re-running with the same id updates the
   same card in place (sweeps, progress). `--preset default|wide|square|tall`
-  or `--size WxH`; `--theme auto|talk-dark|talk-light|figure-light` (`auto`,
-  the default, follows the viewer's light/dark mode).
+  or `--size WxH`; `--theme auto|talk|figure|talk-dark|talk-light|figure-light|figure-dark`
+  (`auto`, the default, matches the app's light/dark automatically; override
+  with a scheme `talk`/`figure` — still mode-following — or a concrete variant
+  like `talk-dark` to pin the ground).
 
 **The full chart vocabulary passes through** — state `marks` (or `mark`) and
 you own the chart: marks `bar line point area rect tick rule errorbar text
@@ -45,6 +47,33 @@ Tables and text: `"table":{"columns":["file","n"],"rows":[{"file":"a","n":1}]}`
 · `"text":["line one","line two"]`. Diagrams: pipe mermaid flowchart source to
 `chimaera board show --mermaid` (converted to a native diagram object; the
 card auto-sizes to the flowchart unless `--size`/`--preset` says otherwise).
+
+## Choosing the inline format
+
+Don't default to prose or one fixed shape — pick the format that communicates
+best and let `--as <format>` render it inline. `chimaera board show --as
+auto|chart|table|figure|slide|diagram` chooses the card SHAPE; the body
+(`chart`/`table`/`text`/`mermaid`) is what you already pass. Decide by what you
+are showing:
+
+- **A quick number comparison** → `--as chart` (the compact 720×450 card; also
+  the default for a chart body).
+- **Tabular results** (a matrix, a config diff, test rows) → `--as table` — a
+  card sized to its rows.
+- **A process, architecture, or flow** → `--as diagram` (pipe `--mermaid`
+  source for auto-layout, or hand-compose a designed figure — see below).
+- **A titled, composed explanation the user might present** → `--as slide` — a
+  16:9 (960×540) card; give it a `title` so it reads like a presentation slide.
+- **A tall or multi-panel scientific figure** → `--as figure` — a portrait
+  560×720 canvas.
+- **Not sure / a one-off** → `--as auto` (the default): today's inference — a
+  mermaid card fits its flowchart, everything else gets the compact card.
+
+`--as` picks the shape; `board show` renders the card inline. Size for the
+inline chat column (~600–700 px wide) so it reads cleanly. Precedence: an
+explicit `--size WxH` wins over everything, then a named `--preset`
+(`wide`/`square`/`tall`), then `--as`; with all defaults you get today's
+inference.
 
 ## Data provenance — favor real files, leave a trace
 
@@ -81,12 +110,27 @@ annotations `panelLabel` `scalebar` `sigBracket` `legend` `colorbar`
 heading | subtitle | body | caption | label | code`); colors are theme
 `@tokens` (`@fg @body @muted @accent1 @surface @edge @bg @cat1..7`) or
 `#hex`. Prefer `page.intent.kind` + slots over coordinates — the layout
-engine places slotted objects. Themes: `auto` (default — resolves to the
-viewer's light/dark mode at render time), `talk-dark`, `talk-light`,
-`figure-light`; pin one for a fixed ground. `canvas.background` (an `@token`
-or `#hex`) repaints the ground under every page; a page's own
-`background.fill` wins over it. After writing: `lint` then `render` (or
+engine places slotted objects. Themes: **by default a board matches the
+Chimaera app you're viewing it in — light or dark — automatically** (`auto`,
+what `new`/`show` write; an absent `theme` means the same, and needs no
+config). You only set something else to *override* that: name a **scheme**
+(`talk`, `figure`) to choose a family that still follows the app's mode, pin a
+concrete variant (`talk-dark`, `talk-light`, `figure-light`, `figure-dark`)
+for a fixed ground the mode no longer moves, or set `canvas.background` to
+another ground — any `@token` or `#hex`, plain white `#ffffff` or plain black
+`#000000` included — which repaints the ground under every page (a page's own
+`background.fill` wins over it). After writing: `lint` then `render` (or
 `show --file`), and LOOK at the PNG.
+
+**Fonts** are bundled into the binary (no install, deterministic on a fontless
+compute node): themes lead with **Geist** (the brand sans), with **IBM Plex
+Sans** (a neutral alternate) and **JetBrains Mono** (the `code` role) also
+baked in. You don't set a font on an object — font lives on the *theme*. To
+change it: `theme-export <id> --format json > .chimaera/board/themes/mine.theme.json`,
+edit each role's `family` array (first name that resolves wins — put your face
+first, keep the rest as fallbacks), and set the board's `theme` to `mine`. Any
+other face works too: drop it in `.chimaera/board/fonts/` (vendored fonts win
+over the bundled ones) and name it first in the stack.
 
 ## Icons & rich composition
 
@@ -246,6 +290,39 @@ The controls that example uses — the ones worth knowing before you compose:
   `"size":[w,h]` in points with `"at":[x,y]` as the top-left — pin it to make
   uniform boxes and reserve exact space instead of letting content measure the
   box. After writing: `lint`, then `show --file`, and LOOK at the PNG.
+
+## Alignment & the layout grid
+
+When placement matters — a row of cards, a two-column split, aligned panels —
+give the canvas a **layout grid** and place objects on its cells instead of
+eyeballing coordinates. It is advisory geometry: objects still carry their own
+`at`/`size`; the grid is a shared coordinate system the pane draws and snaps to
+and you compute against.
+
+Declare it on the canvas: `"grid": { "cols": 12 }` (optionally `"rows"`,
+`"margin"`, `"gutter"` in points). The cell rect is deterministic math — for a
+canvas `W×H`, `cols` columns, margin `m`, gutter `g`:
+
+- column width `cw = (W − 2m − g·(cols−1)) / cols`
+- cell `(col, row)` top-left `x = m + col·(cw + g)`; a `colSpan` of `s` is
+  `w = s·cw + (s−1)·g`
+- row height `rh = (H − 2m − g·(rows−1)) / rows` when `rows` is set, else `cw`
+  (a square module); `y = m + row·(rh + g)`
+
+Pick 8 pt-friendly parameters so cells land on the 8 pt grid and survive the
+save byte-for-byte: a **960×540 canvas, 12 columns, no margin/gutter → 80 pt
+columns**. Then a full-width title is `"at":[0,0],"size":[960,64]`; a card in
+columns 3–5 (0-based col 2, span 3) is `"at":[160,y],"size":[240,h]`; three
+cards across sit at x `0`, `240`, `480`. Same row → same `y`; you get true
+alignment because you computed it, not because you nudged it.
+
+After placing, tidy a selection by id with **`arrange`** (`align-left`,
+`align-right`, `align-top`, `align-bottom`, `align-center-h`,
+`align-center-v`, `distribute-h`, `distribute-v`, `grid`) — the first id is the
+anchor everything else snaps to. In the pane a selection can also **snap to the
+grid** and a group **moves as one unit**. Run `lint --style` to catch
+near-misses (an edge 1–2 pt off a peer or a grid column) and off-grid drift;
+`lint --style --fix` snaps them.
 
 ## The other verbs, one line each
 

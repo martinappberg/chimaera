@@ -118,6 +118,68 @@ async fn board_render_mints_a_ticket_that_serves_the_png() {
     );
 }
 
+/// The render response carries the theme picker's data: `themeSelection`
+/// (`"auto"` = match the app, the zero-config default; a scheme id; or
+/// `"pinned"`) and `schemes` (the override choices with the variant each
+/// resolves to under THIS render's mode). The fixture board pins no theme, so
+/// it matches the app by default.
+#[tokio::test]
+async fn board_render_lists_schemes_for_the_picker() {
+    let state = test_state();
+    let path = write_board("board-render-schemes");
+
+    // Light mode, no theme: the default is "match app" — NOT an explicit
+    // scheme pick — and schemes resolve to their light variants.
+    let (status, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/render",
+        Some(serde_json::json!({"path": path.to_string_lossy(), "scale": 1.0, "mode": "light"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["themeSelection"], "auto");
+    let schemes = json["schemes"].as_array().unwrap();
+    let talk = schemes.iter().find(|s| s["id"] == "talk").unwrap();
+    assert_eq!(talk["label"], "Talk");
+    assert_eq!(talk["variant"], "talk-light");
+    let figure = schemes.iter().find(|s| s["id"] == "figure").unwrap();
+    assert_eq!(figure["variant"], "figure-light");
+
+    // A scheme override (`figure`) in dark mode → the figure scheme's dark
+    // variant, and the selection reports that explicit scheme.
+    let (_, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/render",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(), "scale": 1.0, "mode": "dark", "theme": "figure"
+        })),
+    )
+    .await;
+    assert_eq!(json["themeSelection"], "figure");
+    let figure = json["schemes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "figure")
+        .unwrap()
+        .clone();
+    assert_eq!(figure["variant"], "figure-dark");
+
+    // A pinned concrete variant is a fixed ground — the picker shows "pinned".
+    let (_, json) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/render",
+        Some(serde_json::json!({
+            "path": path.to_string_lossy(), "scale": 1.0, "mode": "light", "theme": "talk-dark"
+        })),
+    )
+    .await;
+    assert_eq!(json["themeSelection"], "pinned", "{json}");
+}
+
 #[tokio::test]
 async fn board_render_is_content_addressed_across_requests() {
     let state = test_state();

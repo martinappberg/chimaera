@@ -40,6 +40,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// A whole board: the file at `*.board.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,9 +52,16 @@ pub struct Board {
     pub format_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Workspace-relative path to a `.theme.json`. Referenced, never inlined —
-    /// the theme is git-tracked in the same repo, so determinism is already
-    /// guaranteed and inlining would churn every board diff.
+    /// The board's theme reference. Absent — and `auto` — is the zero-config
+    /// default: the board **matches the viewing app's light/dark mode**, the
+    /// mode picking a concrete variant at render time. The overrides are a
+    /// **scheme** (`talk`, `figure` — a family that still follows the mode), a
+    /// pinned variant (`talk-dark`) that ignores the mode, or a
+    /// workspace-relative `.theme.json` path. A file theme is referenced,
+    /// never inlined — it is git-tracked in the same repo, so determinism is
+    /// already guaranteed and inlining would churn every board diff. Stored
+    /// verbatim: resolution (see [`crate::theme::resolve_for_mode`]) happens at
+    /// render and never rewrites this string (`auto` stays `auto`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     pub canvas: Canvas,
@@ -107,6 +118,18 @@ pub struct Canvas {
     /// more specific statement is the stronger one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
+    /// The advisory layout grid the author places objects against (columns,
+    /// optional rows, margin, gutter). NOT a per-object constraint — objects
+    /// still carry their own `at`/`size`; the grid is a shared coordinate
+    /// system the agent computes cell rects in (see [`grid_cell`]) and the
+    /// pane draws + snaps to. Lenient: a structurally malformed grid drops to
+    /// `None` rather than bricking the board, and `normalize` clamps the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_lenient_grid"
+    )]
+    pub grid: Option<Grid>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -120,6 +143,133 @@ impl Canvas {
     }
 }
 
+/// A structurally-broken `grid` (wrong types) must not fail the whole board
+/// parse — leniency #3. Anything that does not deserialize into a [`Grid`]
+/// drops to `None`; semantic issues (a zero `cols`, a negative `margin`) DO
+/// parse and are caught by `normalize` so they can warn instead of vanish.
+fn de_lenient_grid<'de, D>(de: D) -> Result<Option<Grid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(de)?;
+    Ok(raw.and_then(|v| serde_json::from_value::<Grid>(v).ok()))
+}
+
+/// The advisory layout grid: `cols` columns and optional `rows` rows, inset
+/// from the canvas by `margin` and separated by `gutter` (all in points). It
+/// carries no object geometry of its own — [`grid_cell`] turns a
+/// `(col, row, span)` address into a page-space rect the author writes into an
+/// object's `at`/`size`, so the grid is a coordinate system, not a constraint.
+///
+/// For pixel-crisp results, pick parameters whose columns land on the 8 pt
+/// design grid (e.g. a 960 pt canvas with 12 columns, no margin/gutter → 80 pt
+/// columns): `normalize` snaps every object to 8 pt, so a cell rect that is
+/// already 8 pt-aligned survives the save byte-for-byte, and [`grid_lines`]
+/// (the snap targets lint and `snap-grid` use) is the 8 pt-quantized grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Grid {
+    /// Column count (≥ 1; `normalize` clamps a 0).
+    pub cols: u32,
+    /// Row count. Absent = a column-only grid: [`grid_cell`] uses the column
+    /// width as the row height (a square module), so vertical addresses stay
+    /// deterministic and the grid extends down the canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u32>,
+    /// Outer inset from every canvas edge, in points (default 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub margin: f64,
+    /// Gap between adjacent cells, in points (default 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gutter: f64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// The page-space rect `[x, y, w, h]` of a grid cell (or a span of cells),
+/// deterministic pure math over the canvas + its `grid`. `None` when the
+/// canvas has no grid. `col`/`row` are 0-based and clamped into range;
+/// `col_span`/`row_span` default to 1 (a single cell) and are clamped so a
+/// span never runs past the last column/row (unbounded downward for a
+/// column-only grid). Extents floor at 1 pt so a pathological grid can't
+/// produce a zero-size rect.
+///
+/// This is the authoring math — it does NOT 8 pt-snap; author to it and let
+/// `normalize` snap, or choose 8 pt-friendly parameters. [`grid_lines`] is the
+/// snapped view lint and `snap-grid` measure against.
+pub fn grid_cell(
+    canvas: &Canvas,
+    col: u32,
+    row: u32,
+    col_span: Option<u32>,
+    row_span: Option<u32>,
+) -> Option<[f64; 4]> {
+    let g = canvas.grid.as_ref()?;
+    let cols = g.cols.max(1);
+    let margin = g.margin.max(0.0);
+    let gutter = g.gutter.max(0.0);
+
+    let col = col.min(cols - 1);
+    let col_span = col_span.unwrap_or(1).max(1).min(cols - col);
+    let content_w = (canvas.width() - 2.0 * margin).max(1.0);
+    let cw = ((content_w - gutter * (cols - 1) as f64) / cols as f64).max(1.0);
+    let x = margin + col as f64 * (cw + gutter);
+    let w = (col_span as f64 * cw + (col_span - 1) as f64 * gutter).max(1.0);
+
+    let (rh, row, row_span) = match g.rows {
+        Some(rows) => {
+            let rows = rows.max(1);
+            let content_h = (canvas.height() - 2.0 * margin).max(1.0);
+            let rh = ((content_h - gutter * (rows - 1) as f64) / rows as f64).max(1.0);
+            let row = row.min(rows - 1);
+            (rh, row, row_span.unwrap_or(1).max(1).min(rows - row))
+        }
+        // Column-only grid: square module, unbounded down the canvas.
+        None => (cw, row, row_span.unwrap_or(1).max(1)),
+    };
+    let y = margin + row as f64 * (rh + gutter);
+    let h = (row_span as f64 * rh + (row_span - 1) as f64 * gutter).max(1.0);
+    Some([x, y, w, h])
+}
+
+/// The grid's column-start x coordinates and row-start y coordinates — the
+/// natural snap targets for an object's top-left `at` — each rounded to the
+/// 8 pt design grid so a snapped object survives `normalize` byte-for-byte.
+/// `None` when the canvas has no grid; the y vector is empty for a column-only
+/// grid (`rows` absent), which snaps x only.
+pub fn grid_lines(canvas: &Canvas) -> Option<(Vec<f64>, Vec<f64>)> {
+    let g = canvas.grid.as_ref()?;
+    let snap8 = |v: f64| (v / crate::normalize::GRID_PT).round() * crate::normalize::GRID_PT;
+    let xs = (0..g.cols.max(1))
+        .filter_map(|c| grid_cell(canvas, c, 0, None, None).map(|[x, ..]| snap8(x)))
+        .collect();
+    let ys = match g.rows {
+        Some(rows) => (0..rows.max(1))
+            .filter_map(|r| grid_cell(canvas, 0, r, None, None).map(|[_, y, ..]| snap8(y)))
+            .collect(),
+        None => Vec::new(),
+    };
+    Some((xs, ys))
+}
+
+/// Translate an object's page-space geometry by `(dx, dy)`, recursing into
+/// group children so a group moves as a rigid unit — group children carry
+/// page-absolute `at`, so moving the envelope without them would tear the
+/// group apart. Objects whose position derives from anchors (a `connector`,
+/// an endpoint-bound `sigBracket`) have no `at` and are left to follow the
+/// objects they bind. Reused by the move op, the arrange verbs and
+/// `snap-grid` — every "move as a unit" gesture.
+pub fn translate_object(obj: &mut Object, dx: f64, dy: f64) {
+    if let Some(at) = obj.at() {
+        obj.set_at([at[0] + dx, at[1] + dy]);
+    }
+    if let Object::Group(g) = obj {
+        for child in &mut g.objects {
+            translate_object(child, dx, dy);
+        }
+    }
+}
+
 impl Default for Canvas {
     fn default() -> Self {
         Canvas {
@@ -127,6 +277,7 @@ impl Default for Canvas {
             target: None,
             size: [960.0, 540.0],
             background: None,
+            grid: None,
             extra: Extra::new(),
         }
     }
@@ -351,6 +502,32 @@ impl Object {
                 h: size[1],
             }),
             _ => None,
+        }
+    }
+
+    /// The object's stored top-left `at`, where it has one. Unlike
+    /// [`Object::frame`] this does not require a `size`, so a `scalebar`
+    /// (positioned but extent-derived) reports its origin; endpoint-anchored
+    /// objects (`connector`, `sigBracket`) and `Unknown` have none. Powers
+    /// [`translate_object`]'s rigid-move.
+    pub fn at(&self) -> Option<[f64; 2]> {
+        match self {
+            Object::Text(o) => o.at,
+            Object::Shape(o) => o.at,
+            Object::Image(o) => o.at,
+            Object::Group(o) => o.at,
+            Object::Table(o) => o.at,
+            Object::Chart(o) => o.at,
+            Object::Diagram(o) => o.at,
+            Object::Equation(o) => o.at,
+            Object::Icon(o) => o.at,
+            Object::PanelLabel(o) => o.at,
+            Object::Scalebar(o) => o.at,
+            Object::Legend(o) => o.at,
+            Object::Colorbar(o) => o.at,
+            Object::Callout(o) => o.at,
+            Object::Inset(o) => o.at,
+            Object::Connector(_) | Object::SigBracket(_) | Object::Unknown(_) => None,
         }
     }
 
@@ -1852,6 +2029,126 @@ pub struct InsetSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grid_board(grid: &str) -> crate::Board {
+        crate::parse(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[960,540],"grid":{grid}}},
+                "pages":[{{"id":"p","objects":[]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn grid_round_trips_byte_stably() {
+        let b = grid_board(r#"{"cols":12,"rows":6,"margin":48,"gutter":24}"#);
+        let g = b.canvas.grid.as_ref().expect("grid parsed");
+        assert_eq!(
+            (g.cols, g.rows, g.margin, g.gutter),
+            (12, Some(6), 48.0, 24.0)
+        );
+        // A semantically identical save is byte-identical, and re-parsing the
+        // canonical bytes is a fixed point.
+        let once = crate::to_string(&b).unwrap();
+        let twice = crate::to_string(&crate::parse(&once).unwrap()).unwrap();
+        assert_eq!(once, twice);
+        assert!(once.contains("\"grid\""), "grid survives the round trip");
+    }
+
+    #[test]
+    fn a_bare_column_grid_omits_its_zero_fields() {
+        // margin/gutter default 0 and skip; rows absent stays absent — the
+        // minimal expressive form serializes minimally.
+        let b = grid_board(r#"{"cols":12}"#);
+        let s = crate::to_string(&b).unwrap();
+        assert!(s.contains("\"cols\": 12"));
+        assert!(!s.contains("margin") && !s.contains("gutter") && !s.contains("rows"));
+    }
+
+    #[test]
+    fn a_structurally_broken_grid_drops_to_none_not_a_parse_error() {
+        // `cols` as a string cannot become a `Grid`; leniency #3 keeps the
+        // board rather than bricking it.
+        let b = grid_board(r#"{"cols":"lots"}"#);
+        assert!(b.canvas.grid.is_none(), "malformed grid drops to None");
+    }
+
+    #[test]
+    fn grid_cell_computes_deterministic_rects() {
+        // 960 × 540, 12 columns, no margin/gutter → 80 pt columns; a
+        // column-only grid uses the column width as a square row module.
+        let b = grid_board(r#"{"cols":12}"#);
+        assert_eq!(
+            grid_cell(&b.canvas, 0, 0, None, None),
+            Some([0.0, 0.0, 80.0, 80.0])
+        );
+        assert_eq!(
+            grid_cell(&b.canvas, 2, 0, Some(3), None),
+            Some([160.0, 0.0, 240.0, 80.0]),
+            "a 3-column span from column 2"
+        );
+        assert_eq!(
+            grid_cell(&b.canvas, 0, 1, None, None),
+            Some([0.0, 80.0, 80.0, 80.0])
+        );
+        // Out-of-range addresses clamp rather than panic or return junk.
+        assert_eq!(
+            grid_cell(&b.canvas, 99, 0, Some(99), None),
+            Some([880.0, 0.0, 80.0, 80.0]),
+            "the last column, span clamped to 1"
+        );
+
+        // Explicit rows split the height; margin + gutter inset and space.
+        let b = grid_board(r#"{"cols":12,"rows":6}"#);
+        assert_eq!(
+            grid_cell(&b.canvas, 1, 2, None, None),
+            Some([80.0, 180.0, 80.0, 90.0])
+        );
+        let b = grid_board(r#"{"cols":12,"margin":48,"gutter":24}"#);
+        // content 864, cw = (864 − 24·11)/12 = 50.
+        assert_eq!(grid_cell(&b.canvas, 0, 0, None, None).unwrap()[0], 48.0);
+        assert_eq!(grid_cell(&b.canvas, 1, 0, None, None).unwrap()[0], 122.0);
+        assert_eq!(grid_cell(&b.canvas, 0, 0, None, None).unwrap()[2], 50.0);
+        // No grid → no cell.
+        assert_eq!(grid_cell(&Canvas::default(), 0, 0, None, None), None);
+    }
+
+    #[test]
+    fn grid_lines_are_8pt_quantized_snap_targets() {
+        let b = grid_board(r#"{"cols":12,"rows":6}"#);
+        let (xs, ys) = grid_lines(&b.canvas).unwrap();
+        assert_eq!(xs.first(), Some(&0.0));
+        assert_eq!(xs.get(1), Some(&80.0));
+        assert_eq!(ys.get(1), Some(&88.0), "90 → nearest 8 pt is 88");
+        // A column-only grid snaps x only.
+        let b = grid_board(r#"{"cols":12}"#);
+        assert!(grid_lines(&b.canvas).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn translate_object_moves_a_group_as_a_unit() {
+        let mut obj: Object = serde_json::from_str(
+            r#"{"id":"g","type":"group","at":[100,100],"size":[200,80],"objects":[
+                {"id":"a","type":"shape","geo":"rect","at":[100,100],"size":[80,80]},
+                {"id":"b","type":"shape","geo":"rect","at":[220,100],"size":[80,80]}]}"#,
+        )
+        .unwrap();
+        translate_object(&mut obj, 40.0, -16.0);
+        assert_eq!(obj.at(), Some([140.0, 84.0]), "the envelope moves");
+        let Object::Group(g) = &obj else {
+            panic!("group")
+        };
+        assert_eq!(
+            g.objects[0].at(),
+            Some([140.0, 84.0]),
+            "child a shifts by the delta"
+        );
+        assert_eq!(
+            g.objects[1].at(),
+            Some([260.0, 84.0]),
+            "child b shifts by the delta"
+        );
+    }
 
     #[test]
     fn unknown_object_type_is_preserved_not_dropped() {

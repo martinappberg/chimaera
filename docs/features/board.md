@@ -48,6 +48,14 @@ on the full `.board.json` suffix. Chat card:
   an object, `straight` for a free `at` end. Optional `waypoints` thread a
   hand-chosen route; arrowheads are `tailEnd`/`headEnd`; a bound edge `text` at
   `labelAt` (0..1) rides the line when a node moves.
+- **Layout grid** (`canvas.grid`): an optional advisory grid
+  (`{cols, rows?, margin, gutter}`) the author places objects against for true
+  alignment — a shared coordinate system, NOT a per-object constraint (objects
+  keep their own `at`/`size`). `grid_cell(col, row, colSpan?, rowSpan?)` is the
+  deterministic cell→rect math the agent computes with (and the pane overlay
+  draws + snaps to); `lint --style` measures near-misses and off-grid drift
+  against it. Normalize validates the fields and a malformed grid drops rather
+  than bricking the board.
 - **Text sugar**: every `text`/label field accepts a bare string
   (`"text":"hi"`), an array of lines (`["a","b"]`), or rich runs — the
   canonical save always writes the array form (normalize collapses a single-run
@@ -96,20 +104,42 @@ on the full `.board.json` suffix. Chat card:
   `p:cNvPr/@descr`; the native OMML arm is deliberately not built (slice 6
   opportunistic). A `--no-default-features` build refuses with the exact
   flag to rebuild with.
-- Themes: `talk-dark` / `talk-light` / `figure-light` bundled (`@token`
-  palettes, role type scale with per-role `minPt`, Okabe–Ito ramp,
-  WCAG-checked in tests); workspace themes under `.chimaera/board/themes/`.
-  A board's `theme` may also be **`auto`** (the `show`/`new` default; absent
-  means the same): not a theme file but a render-time resolution to the
-  *viewer's* light/dark mode — `/board/render` takes an optional
-  `mode: "light"|"dark"` (the pane and shown cards send the app's current
-  appearance; absent resolves dark, and the cache keys on the *resolved*
-  theme so light and dark are distinct entries). A pinned theme ignores the
-  mode. `canvas.background` (an `@token` or `#hex`, normalize-validated by
+- Themes **match the app by default**: with no `theme` — or `auto`, what
+  `show`/`new` emit — a board follows the *viewer's* Chimaera light/dark mode
+  automatically, no config (light app → light ground + palette, dark app →
+  dark). You override only if you want to. The overrides ride a **scheme
+  model**: name a **scheme** (`talk`, `figure`) to choose a family that *still*
+  follows the app's mode (the mode picks the concrete variant at render:
+  `talk` + dark → `talk-dark`); each scheme carries both a light and a dark
+  variant — bundled variants `talk-dark` / `talk-light` / `figure-light` /
+  `figure-dark` (`@token` palettes, role type scale with per-role `minPt`,
+  Okabe–Ito ramp, WCAG-checked in tests) — or pin a concrete variant for a
+  fixed ground the mode no longer moves, or set `canvas.background` to another
+  ground (any `@token`/`#hex`, plain white `#ffffff` or plain black `#000000`
+  included). Workspace themes live under `.chimaera/board/themes/`.
+  `/board/render` takes an optional `mode: "light"|"dark"` (the pane and shown
+  cards send the app's current appearance; absent resolves dark, and the cache
+  keys on the *resolved* variant so light and dark are distinct entries); the
+  response also carries the picker's data — `themeSelection` (`"auto"` = match
+  app, the default + selected state; a scheme id; or `"pinned"`) and the
+  available `schemes` (id + label + the variant resolved for this render's
+  mode) — so the pane shows "Match app (default)" out of the box with schemes
+  (and grounds, via `canvas.background`) as overrides. `canvas.background` (an `@token` or `#hex`, normalize-validated by
   form) repaints the ground under every page — the pane's rail has a
   ground-token swatch row (+ "match theme" reset) writing it through the
   board-level `canvasBackground` edit op, journaled as `canvas-changed`; a
   page's own `background.fill` still wins.
+- **Fonts are bundled and brand-owned.** Three SIL OFL 1.1 families are baked
+  into the binary (`include_bytes!`, registered into the render `fontdb` on
+  every stack) so a board draws the same face on a laptop and on a fontless HPC
+  login node — deterministic, and on-brand rather than a generic fallback:
+  **Geist** (the default sans every bundled theme leads with), **IBM Plex Sans**
+  (a clean neutral alternate), and **JetBrains Mono** (the `code` role, matching
+  the app's terminal). Font is a *theme* property, not a per-board field: to
+  change it, `theme-export <id> --format json`, edit the roles' `family` stacks
+  (first that resolves wins), save under `.chimaera/board/themes/`, and
+  reference it — or vendor any face into `.chimaera/board/fonts/`, which wins
+  over the bundled set. Provenance/licenses: `crates/chimaera-board/fonts/text/`.
 - **Presets carry four axes** (geometry / floors / page furniture / rules):
   `talk-16x9`, `design-review`, `exec-update`, `teaching`, `readme-image`,
   `poster-a0`, `pub-nature-single`, `pub-cell`, `pub-plos`. Furniture (page
@@ -122,7 +152,13 @@ on the full `.board.json` suffix. Chat card:
 spec's `chart` value takes the **full chart vocabulary** — stated `marks`
 incl. `box` over precomputed five-number rows pass through untouched by the
 sort/flip sugars, a singular `mark` is one-layer sugar, and top-level
-`trace`/`inputs` land in `data`; `--file PATH` cards an **existing** board in
+`trace`/`inputs` land in `data`; **`--as auto|chart|table|figure|slide|diagram`**
+picks the card SHAPE by what is being communicated — `chart` the compact
+720×450 comparison card, `table` a card sized to its rows, `figure` a portrait
+560×720, `slide` a 16:9 960×540 titled canvas, `diagram` a wide flow/architecture
+canvas (a mermaid body auto-fits), `auto` (the default) today's inference so a
+bare `show` is unchanged; precedence is explicit `--size` > named `--preset` >
+`--as`; `--file PATH` cards an **existing** board in
 place: validate, render page 1 beside it, print the `shown … → path` line the
 chat card mounts on) · `guide` (the complete embedded manual —
 `src/cli/GUIDE.md`, printed to stdout so an agent in any workspace learns the
@@ -134,10 +170,12 @@ connectors + icons rather than hand-authoring a non-editable SVG) ·
 `new` · `render` · `describe` (positions + slot resolutions + journal
 summary + chart provenance: `source` digest-verified fresh/stale, `inputs`,
 a `trace` excerpt) · `journal [--since N]` · `lint [--target PRESET] [--style]
-[--strict] [--fix]` (tier census; near-miss alignment and the narrow §3.5
-set; mechanical fixes; `--style` also nudges — warning, never an error —
-when command/agent-produced inline values carry neither `source` nor
-`trace`) · `arrange --op align-*|distribute-*|grid` (journals
+[--strict] [--fix]` (tier census; near-miss alignment — to a peer AND, when a
+`canvas.grid` is set, to a grid column/row line — plus off-layout-grid gentle
+nudges and the narrow §3.5 set; mechanical fixes snap near-misses to the peer
+or the grid; `--style` also nudges — warning, never an error — when
+command/agent-produced inline values carry neither `source` nor `trace`) ·
+`arrange --op align-*|distribute-*|grid` (journals
 as actor `agent`) · `import` (mermaid / SVG / PNG figures into
 `.chimaera/board/assets/` with provenance) · `adopt` (promote a shown card)
 · `icons [QUERY] [--list]` (find a bundled icon by name/synonym in one call —
@@ -243,7 +281,10 @@ Bearer-authed `POST /api/v1/board/render` (content-addressed cache — keyed by
 content *and* the render engine's version/epoch, so an upgraded daemon never
 serves the old engine's pixels — + diagnostics sidecar → `/raw` ticket),
 `/board/describe`, `/board/edit`
-(move/resize/text ops by object id; canonical save; appends actor-`human`
+(move/resize/text/`set`/`canvasBackground` ops by object id, plus an
+`arrange` op — `{op, objects}` for align/distribute/`snap-grid` over a
+selection; a `move` on a `group` translates all its page-absolute children so
+the group moves as one unit; canonical save; appends actor-`human`
 journal events; returns `X-Mtime` + `journalSeq`), and `/board/export`
 (`{path, format, page?, chartsNative?}` → `{ticket, filename, pageCount}` +
 per-object `objects` fates for pptx; `chartsNative` is the CLI's

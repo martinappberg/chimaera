@@ -59,7 +59,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 pub use normalize::{normalize, Diagnostic, Severity};
-pub use schema::{Board, Canvas, Object, Page, FORMAT, FORMAT_VERSION};
+pub use schema::{
+    grid_cell, grid_lines, translate_object, Board, Canvas, Grid, Object, Page, FORMAT,
+    FORMAT_VERSION,
+};
 
 /// The workspace-relative home for everything *around* a board.
 ///

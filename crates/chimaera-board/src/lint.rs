@@ -907,6 +907,9 @@ pub fn lint_style(
         Severity::Warning
     };
     let mut diags = Vec::new();
+    // The layout grid's 8 pt-quantized snap targets, computed once — advisory
+    // geometry that only bites when the author declared a `canvas.grid`.
+    let grid_lines = crate::schema::grid_lines(&board.canvas);
 
     for page in &board.pages {
         let resolved = crate::slots::resolve_page_frames(board, page, theme, Some(fonts));
@@ -921,6 +924,9 @@ pub fn lint_style(
         near_miss_alignment(&framed, &page.id, base, &mut diags);
         near_miss_spacing(&framed, &page.id, base, &mut diags);
         off_grid(page, base, &mut diags);
+        if let Some((xs, ys)) = &grid_lines {
+            near_miss_grid(page, xs, ys, base, &mut diags);
+        }
         text_boxes(page, &resolved, theme, fonts, base, &mut diags);
         margin_violations(board, page, &resolved, theme, base, &mut diags);
         page_budgets(page, theme, fonts, &mut diags);
@@ -1116,6 +1122,91 @@ fn off_grid(page: &Page, base: Severity, diags: &mut Vec<Diagnostic>) {
                 )
                 .at(&page.id, obj.id())
                 .field("size"),
+            );
+        }
+    }
+}
+
+/// The layout-grid profile (only when the board declares a `canvas.grid`): an
+/// object's top-left `at` almost on a column/row line — the same 1.5-pt-is-a-
+/// mistake logic as peer near-miss — is a base-severity finding `lint_fix`
+/// snaps; an object entirely off the grid gets a gentle **Info** nudge, never
+/// a warning, because floating an accent off the grid can be a deliberate
+/// choice. Group envelopes are skipped: their geometry is their children's
+/// union, so the actionable subject is a child, not the derived box.
+fn near_miss_grid(
+    page: &Page,
+    xs: &[f64],
+    ys: &[f64],
+    base: Severity,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let nearest = |lines: &[f64], v: f64| -> Option<f64> {
+        lines.iter().copied().min_by(|a, b| {
+            (a - v)
+                .abs()
+                .partial_cmp(&(b - v).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
+    for obj in page.walk() {
+        if matches!(obj, Object::Group(_)) {
+            continue;
+        }
+        let Some(f) = obj.frame() else { continue };
+        let mut present = 0u8;
+        let mut aligned_or_near = false;
+        for (unit, edge, v, lines) in [("column", "left", f.x, xs), ("row", "top", f.y, ys)] {
+            if lines.is_empty() {
+                continue;
+            }
+            present += 1;
+            let Some(line) = nearest(lines, v) else {
+                continue;
+            };
+            let d = (v - line).abs();
+            if d <= EPS {
+                aligned_or_near = true;
+            } else if d < ALIGN_TOLERANCE_PT {
+                aligned_or_near = true;
+                diags.push(
+                    Diagnostic::new(
+                        base,
+                        format!(
+                            "near-miss grid alignment: {edge} edge at {} is {} pt off the layout \
+                             grid {unit} at {} (aligned is 0 or ≥ {ALIGN_TOLERANCE_PT})",
+                            pt(v),
+                            pt(d),
+                            pt(line)
+                        ),
+                    )
+                    .at(&page.id, obj.id())
+                    .field("at"),
+                );
+            }
+        }
+        if present > 0 && !aligned_or_near {
+            let nx = nearest(xs, f.x).unwrap_or(f.x);
+            let ny = if ys.is_empty() {
+                f.y
+            } else {
+                nearest(ys, f.y).unwrap_or(f.y)
+            };
+            diags.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    format!(
+                        "off the layout grid: at [{}, {}] sits on no cell of the {}-column grid \
+                         (nearest corner [{}, {}])",
+                        pt(f.x),
+                        pt(f.y),
+                        xs.len(),
+                        pt(nx),
+                        pt(ny)
+                    ),
+                )
+                .at(&page.id, obj.id())
+                .field("at"),
             );
         }
     }
@@ -1537,6 +1628,9 @@ fn free_at(board: &Board, page: &Page, theme: &Theme, diags: &mut Vec<Diagnostic
 pub fn lint_fix(board: &mut Board, theme: &Theme) -> Vec<String> {
     let mut fixes = Vec::new();
     let (cw, ch) = (board.canvas.width(), board.canvas.height());
+    // The 8 pt-quantized layout-grid snap targets, resolved before the pages
+    // are borrowed mutably (and `None` unless a `canvas.grid` is declared).
+    let grid_lines = crate::schema::grid_lines(&board.canvas);
 
     for page in &mut board.pages {
         // 1 — clamp off-canvas objects back in.
@@ -1617,6 +1711,48 @@ pub fn lint_fix(board: &mut Board, theme: &Theme) -> Vec<String> {
                     frames[j].1 = nf;
                     snapped.insert((jj, axis));
                 }
+            }
+        }
+
+        // 3b — snap near-grid `at` edges to the layout grid, when one is
+        // declared. Targets are 8 pt-quantized, so pass 4 preserves them.
+        // Groups are skipped (normalize re-unions their envelope, so a snap
+        // here would be undone); only near-misses move, never a far object.
+        if let Some((xs, ys)) = &grid_lines {
+            let snap_axis = |lines: &[f64], v: f64| -> Option<f64> {
+                let line = lines.iter().copied().min_by(|a, b| {
+                    (a - v)
+                        .abs()
+                        .partial_cmp(&(b - v).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })?;
+                let d = (v - line).abs();
+                (d > EPS && d < ALIGN_TOLERANCE_PT).then_some(line)
+            };
+            for obj in &mut page.objects {
+                if obj.slot().is_some() || matches!(obj, Object::Group(_)) {
+                    continue;
+                }
+                let Some(f) = obj.frame() else { continue };
+                let nx = snap_axis(xs, f.x);
+                let ny = if ys.is_empty() {
+                    None
+                } else {
+                    snap_axis(ys, f.y)
+                };
+                if nx.is_none() && ny.is_none() {
+                    continue;
+                }
+                let (tx, ty) = (nx.unwrap_or(f.x), ny.unwrap_or(f.y));
+                obj.set_at([tx, ty]);
+                fixes.push(format!(
+                    "snapped {} to the layout grid: at [{}, {}] → [{}, {}]",
+                    obj.id(),
+                    pt(f.x),
+                    pt(f.y),
+                    pt(tx),
+                    pt(ty)
+                ));
             }
         }
 
@@ -2307,6 +2443,96 @@ mod tests {
             .find(|d| d.message.contains("off-grid") && d.field.as_deref() == Some("size"))
             .expect("an off-grid size finding");
         assert!(size.message.contains("[304, 48]"), "{}", size.message);
+    }
+
+    /// A styled board carrying a 12-column layout grid (80 pt columns).
+    fn grid_style_linted(objects: &str, strict: bool) -> Vec<Diagnostic> {
+        let b = crate::parse(&format!(
+            r#"{{"format":"chimaera.board","formatVersion":1,
+                "canvas":{{"size":[960,540],"grid":{{"cols":12}}}},
+                "pages":[{{"id":"p1","objects":[{objects}]}}]}}"#
+        ))
+        .unwrap();
+        lint_style(
+            &b,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            strict,
+        )
+    }
+
+    #[test]
+    fn a_near_grid_edge_is_flagged_but_an_exact_one_is_not() {
+        // Left edge at 83 is 3 pt off the 80 pt column line — a warning that
+        // names the line; the same box at 80 is silent.
+        let near = grid_style_linted(&rect("box", [82.0, 88.0], [160.0, 80.0]), false);
+        let f = near
+            .iter()
+            .find(|d| d.message.contains("near-miss grid alignment"))
+            .expect("a grid near-miss");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.object.as_deref(), Some("box"));
+        assert!(f.message.contains("column at 80"), "{}", f.message);
+
+        let exact = grid_style_linted(&rect("box", [80.0, 88.0], [160.0, 80.0]), false);
+        assert!(
+            exact
+                .iter()
+                .all(|d| !d.message.contains("near-miss grid alignment")),
+            "on the line is silent: {exact:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_off_grid_object_gets_a_gentle_info_nudge() {
+        // 200 is far from every 80 pt column line → an Info nudge, never a
+        // warning (floating an accent off the grid can be a choice).
+        let diags = grid_style_linted(&rect("accent", [200.0, 88.0], [120.0, 40.0]), false);
+        let f = diags
+            .iter()
+            .find(|d| d.message.contains("off the layout grid"))
+            .expect("a gentle nudge");
+        assert_eq!(f.severity, Severity::Info, "info, not a warning");
+        assert!(f.message.contains("12-column"), "{}", f.message);
+        // And a board with NO grid never speaks about the layout grid.
+        let none = style_linted(&rect("accent", [200.0, 88.0], [120.0, 40.0]), false);
+        assert!(
+            none.iter().all(
+                |d| !d.message.contains("layout grid") && !d.message.contains("grid alignment")
+            ),
+            "no grid, no grid findings: {none:?}"
+        );
+    }
+
+    #[test]
+    fn lint_fix_snaps_a_near_grid_edge_to_the_layout_grid() {
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540],"grid":{"cols":12}},
+                "pages":[{"id":"p1","objects":[
+                  {"id":"box","type":"shape","geo":"rect","at":[82,88],"size":[160,80]}]}]}"#,
+        )
+        .unwrap();
+        let fixes = lint_fix(&mut b, &crate::theme::default_for(true));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("snapped box to the layout grid")),
+            "{fixes:?}"
+        );
+        assert_eq!(b.pages[0].objects[0].frame().unwrap().x, 80.0);
+        // The repaired board re-normalizes and re-lints clean of grid findings.
+        crate::normalize(&mut b);
+        let after = lint_style(
+            &b,
+            &crate::theme::default_for(true),
+            &FontStack::new(&[]),
+            false,
+        );
+        assert!(
+            after.iter().all(|d| !d.message.contains("grid alignment")),
+            "{after:?}"
+        );
     }
 
     #[test]

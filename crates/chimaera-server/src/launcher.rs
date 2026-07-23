@@ -687,7 +687,11 @@ and re-running with the same `--id` updates it in place. Complete example:\n\
 echo '{\"title\":\"Failures by file\",\"chart\":{\"x\":\"file\",\"y\":\"failures\",\"values\":[{\"file\":\"parser.rs\",\"failures\":12},{\"file\":\"lexer.rs\",\"failures\":3}]}}' | chimaera board show --id failures\n\
 A spec carries exactly one of `chart`, `table` (columns + rows), `text`, or \
 `mermaid`; `--mermaid` takes mermaid flowchart source on stdin for diagrams, \
-and `--spec FILE` reads the spec from a file instead of stdin. For anything \
+and `--spec FILE` reads the spec from a file instead of stdin. Choose the \
+format that communicates best — a chart, table, diagram, a titled slide, or a \
+figure — with `chimaera board show --as <format>`; pick the shape that fits \
+what you're showing and reads well inline, rather than defaulting to prose or \
+one fixed size. For anything \
 beyond this example — boxplots, multi-series, layers, tables, diagrams, \
 decks, saving persistent boards — run `chimaera board guide` once: it is the \
 complete manual, so never explore `--help`, the source, or the repo to learn \
@@ -1693,6 +1697,10 @@ mod tests {
         for fact in [
             "`--mermaid` takes mermaid flowchart source",
             "`--spec FILE` reads the spec from a file",
+            // Teach the format choice: pick the shape that fits, via `--as`.
+            "Choose the \
+             format that communicates best",
+            "`chimaera board show --as <format>`",
             // The deep path: one guide read instead of exploration — the
             // transcript failure mode was 29 calls of reverse-engineering.
             "boxplots, multi-series, layers, tables, diagrams, decks, saving persistent boards",

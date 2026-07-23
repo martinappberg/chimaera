@@ -82,7 +82,7 @@ impl Default for RasterParams {
 /// Released upgrades are already covered by the crate version in the
 /// fingerprint; the epoch exists for changes within one version, i.e. the
 /// dev loop, where the version is pinned at the 0.0.1 sentinel.
-pub const RENDER_EPOCH: u32 = 4; // 4: object-anchored connectors default to bent routing
+pub const RENDER_EPOCH: u32 = 5; // 5: bundled brand fonts (Geist) lead the theme stacks
 
 /// A bent connector's perpendicular exit stub off each box border, and the
 /// radius of its rounded elbows — sized to read like the layered diagram edges.

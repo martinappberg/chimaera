@@ -291,35 +291,129 @@ impl Theme {
             }
         }
         anyhow::bail!(
-            "unknown theme {reference:?}; bundled themes are {}",
-            BUNDLED_IDS.join(", ")
+            "unknown theme {reference:?}; bundled variants are {} (or name a scheme: {})",
+            BUNDLED_IDS.join(", "),
+            SCHEMES.iter().map(|s| s.id).collect::<Vec<_>>().join(", ")
         )
     }
 }
 
-pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light", "figure-light"];
+pub const BUNDLED_IDS: &[&str] = &["talk-dark", "talk-light", "figure-light", "figure-dark"];
+
+/// A **scheme**: a named theme family that carries a light *and* a dark
+/// variant. Naming a scheme (`talk`, `figure`) is what lets a board follow the
+/// viewer's appearance — the concrete variant is chosen at render time by mode
+/// — while still committing to an identity (type scale, chart chrome, font
+/// families) the way a flat list of variant ids never could. Every scheme MUST
+/// define both variants; a one-mode scheme is a hole a user falls through when
+/// the app flips appearance.
+#[derive(Debug, Clone, Copy)]
+pub struct Scheme {
+    pub id: &'static str,
+    /// Human label for the pane's theme picker.
+    pub label: &'static str,
+    pub light: &'static str,
+    pub dark: &'static str,
+}
+
+impl Scheme {
+    /// The concrete variant id this scheme resolves to under `dark`.
+    pub fn variant(&self, dark: bool) -> &'static str {
+        if dark {
+            self.dark
+        } else {
+            self.light
+        }
+    }
+}
+
+/// The bundled schemes — small and static; the pane's picker lists exactly
+/// these. Each variant id MUST also appear in [`BUNDLED_IDS`] and [`bundled`],
+/// so a scheme always resolves to a real theme in either mode (the invariant
+/// the tests audit).
+pub const SCHEMES: &[Scheme] = &[
+    Scheme {
+        id: "talk",
+        label: "Talk",
+        light: "talk-light",
+        dark: "talk-dark",
+    },
+    Scheme {
+        id: "figure",
+        label: "Figure",
+        light: "figure-light",
+        dark: "figure-dark",
+    },
+];
+
+/// The scheme that `auto` — and an absent theme — follows.
+pub const DEFAULT_SCHEME: &str = "talk";
+
+/// The bundled scheme with this id, if any.
+pub fn scheme(id: &str) -> Option<&'static Scheme> {
+    SCHEMES.iter().find(|s| s.id == id)
+}
+
+/// The picker's tag for the "pinned" case — a concrete variant or a workspace
+/// theme file: a fixed ground that ignores the app's mode.
+pub const PINNED_SELECTION: &str = "pinned";
+
+/// What a board's theme reference *selects*, for the pane's OPTIONAL override
+/// picker. The zero-config default is to **match the app**:
+/// - `auto` — and an absent theme — returns [`AUTO_ID`] (`"auto"`): the board
+///   follows the viewing app's light/dark automatically, no user action. The
+///   picker shows this as "Match app (default)", selected out of the box.
+/// - a scheme id (`talk`, `figure`) returns itself: an explicitly chosen
+///   family that *still* follows the app's mode (an override of *which* family,
+///   not of the match-the-app behavior).
+/// - a pinned concrete variant, or a workspace `.theme.json`, returns
+///   [`PINNED_SELECTION`]: a fixed ground the app's mode no longer moves.
+///
+/// The three cases are disjoint strings (no scheme is named `auto` or
+/// `pinned`), so the UI can switch on this one field.
+pub fn theme_selection(reference: Option<&str>) -> &'static str {
+    match reference {
+        None | Some(AUTO_ID) => AUTO_ID,
+        Some(r) => match scheme(r) {
+            Some(s) => s.id,
+            None => PINNED_SELECTION,
+        },
+    }
+}
 
 /// The sentinel theme reference that follows the *viewer's* appearance: it is
-/// resolved at render time to a concrete bundled theme (talk-dark on a dark
-/// ground, talk-light on a light one), never stored as a theme of its own.
-/// An absent `Board.theme` means the same thing — a board only ships a fixed
-/// ground when it *pins* a concrete theme.
+/// resolved at render time to the default scheme's concrete variant (talk-dark
+/// on a dark ground, talk-light on a light one), never stored as a theme of
+/// its own. An absent `Board.theme` means the same thing — a board only ships
+/// a fixed ground when it *pins* a concrete variant.
 pub const AUTO_ID: &str = "auto";
 
-/// Resolve a board's theme reference for a render. `auto` — and an absent
-/// reference — follows the appearance the render was asked for; anything else
-/// is an explicit choice and wins regardless of mode. Every render path
-/// (daemon route, CLI, export) funnels through here so "auto" can never leak
-/// into [`Theme::resolve`] as an unknown id.
+/// Resolve a board's theme reference for a render. Three tiers, explicit-wins
+/// throughout:
+/// - `auto` — and an absent reference — follows the render's appearance via
+///   the default scheme ([`DEFAULT_SCHEME`]).
+/// - a **scheme** id (`talk`, `figure`) resolves to that scheme's variant for
+///   the requested mode, so the card tracks the viewer's light/dark.
+/// - anything else (a concrete variant id, or a workspace `.theme.json`) pins
+///   regardless of mode — an explicit choice is never overridden.
+///
+/// Nothing here rewrites the stored reference: what the author wrote
+/// (`"talk"`, `"auto"`, or a pinned `"talk-dark"`) stays in the file
+/// byte-for-byte; resolution is render-time only. Every render path (daemon
+/// route, CLI, export) funnels through here so a scheme id or "auto" can never
+/// leak into [`Theme::resolve`] as an unknown id.
 pub fn resolve_for_mode(
     reference: Option<&str>,
     dark: bool,
     workspace: Option<&Path>,
 ) -> Result<Theme> {
     match reference {
-        None => Ok(default_for(dark)),
-        Some(AUTO_ID) => Ok(default_for(dark)),
-        Some(r) => Theme::resolve(r, workspace),
+        None | Some(AUTO_ID) => Ok(default_for(dark)),
+        Some(r) => match scheme(r) {
+            Some(s) => bundled(s.variant(dark))
+                .with_context(|| format!("scheme {r:?} variant failed to parse")),
+            None => Theme::resolve(r, workspace),
+        },
     }
 }
 
@@ -331,24 +425,37 @@ pub fn resolve_for_mode(
 pub const TALK_DARK: &str = include_str!("themes/talk-dark.theme.json");
 pub const TALK_LIGHT: &str = include_str!("themes/talk-light.theme.json");
 /// The publication-leaning figure theme: a small type scale (9 pt body) with
-/// Nature-compatible per-role floors (5 pt), Arial-first families (PLOS
-/// requires Arial, not Helvetica — the trap that bounces submissions), the
-/// Okabe–Ito ramp, and thin 0.5 pt chart chrome.
+/// Nature-compatible per-role floors (5 pt), the [bundled brand sans][brand]
+/// leading the family stack (deterministic on a fontless render node), the
+/// Okabe–Ito ramp, and thin 0.5 pt chart chrome. **Arial is retained next in
+/// the stack** — a strict PLOS submission (which requires Arial, not Helvetica,
+/// the trap that bounces submissions) pins Arial by editing the theme's family
+/// stack (`theme-export … --format json`), since the bundled brand face now
+/// resolves first everywhere.
+///
+/// [brand]: crate::layout::bundled::BRAND_SANS
 pub const FIGURE_LIGHT: &str = include_str!("themes/figure-light.theme.json");
+/// The dark counterpart to [`FIGURE_LIGHT`]: the same tight publication type
+/// scale, the same brand-first family stack (Arial retained after it) and thin
+/// 0.5 pt chart chrome, on a dark ground — so the `figure` scheme has a variant
+/// for either appearance.
+pub const FIGURE_DARK: &str = include_str!("themes/figure-dark.theme.json");
 
 pub fn bundled(id: &str) -> Option<Theme> {
     let src = match id {
         "talk-dark" => TALK_DARK,
         "talk-light" => TALK_LIGHT,
         "figure-light" => FIGURE_LIGHT,
+        "figure-dark" => FIGURE_DARK,
         _ => return None,
     };
     Theme::parse(src).ok()
 }
 
-/// The default theme for a given appearance.
+/// The default theme for a given appearance: the default scheme's variant.
 pub fn default_for(dark: bool) -> Theme {
-    bundled(if dark { "talk-dark" } else { "talk-light" }).expect("bundled themes parse")
+    let s = scheme(DEFAULT_SCHEME).expect("the default scheme exists");
+    bundled(s.variant(dark)).expect("bundled themes parse")
 }
 
 #[cfg(test)]
@@ -434,6 +541,41 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_theme_leads_text_roles_with_the_brand_sans() {
+        // Brand + determinism as an acceptance criterion: every text (non-mono)
+        // role leads with the bundled brand family, and that family really
+        // resolves through a bare FontStack — so a fontless render node draws
+        // the brand face, not a system fallback. `code` is exempt: it is the
+        // bundled monospace, which also resolves.
+        use crate::layout::{bundled, FontStack};
+        let fonts = FontStack::new(&[]);
+        for id in BUNDLED_IDS {
+            let t = bundled(id).unwrap();
+            for (name, role) in &t.type_scale {
+                let want = if name == "code" {
+                    bundled::MONO
+                } else {
+                    bundled::BRAND_SANS
+                };
+                assert_eq!(
+                    role.family.first().map(String::as_str),
+                    Some(want),
+                    "{id}: role {name:?} must lead with {want:?}"
+                );
+                assert!(
+                    fonts.resolve(&role.family, role.weight, false).is_some(),
+                    "{id}: role {name:?} family did not resolve"
+                );
+            }
+        }
+        assert!(
+            fonts.missing_families().is_empty(),
+            "a bundled role family went missing: {:?}",
+            fonts.missing_families()
+        );
+    }
+
+    #[test]
     fn tokens_resolve_and_literals_pass_through() {
         let t = bundled("talk-dark").unwrap();
         assert!(t.color("@accent1").is_some());
@@ -459,7 +601,8 @@ mod tests {
             resolve_for_mode(None, false, None).unwrap().id,
             "talk-light"
         );
-        // An explicit choice is unchanged by the viewer's mode.
+        // An explicit choice is unchanged by the viewer's mode — a pinned
+        // variant stays put whichever way the app is flipped.
         assert_eq!(
             resolve_for_mode(Some("talk-dark"), false, None).unwrap().id,
             "talk-dark"
@@ -470,6 +613,82 @@ mod tests {
                 .id,
             "figure-light"
         );
+        assert_eq!(
+            resolve_for_mode(Some("figure-dark"), false, None)
+                .unwrap()
+                .id,
+            "figure-dark"
+        );
+    }
+
+    #[test]
+    fn every_scheme_resolves_to_both_variants() {
+        // The audit: a scheme is never a one-mode hole. Both variants exist,
+        // parse, and carry the `dark` flag that matches the mode they serve.
+        for s in SCHEMES {
+            for dark in [true, false] {
+                let variant = s.variant(dark);
+                let t = bundled(variant)
+                    .unwrap_or_else(|| panic!("scheme {} variant {variant} missing", s.id));
+                assert_eq!(t.id, variant);
+                assert_eq!(t.dark, dark, "{variant} sits on the mode's ground");
+                // The variant is a real bundled id, listed for direct pinning.
+                assert!(
+                    BUNDLED_IDS.contains(&variant),
+                    "{variant} not in BUNDLED_IDS"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scheme_id_resolves_to_the_modes_variant() {
+        // Naming the family lets the viewer's appearance pick the variant —
+        // the whole point of the scheme model. The full table, both modes.
+        let table = [
+            ("talk", true, "talk-dark"),
+            ("talk", false, "talk-light"),
+            ("figure", true, "figure-dark"),
+            ("figure", false, "figure-light"),
+        ];
+        for (id, dark, expected) in table {
+            assert_eq!(
+                resolve_for_mode(Some(id), dark, None).unwrap().id,
+                expected,
+                "scheme {id:?} in {} mode",
+                if dark { "dark" } else { "light" }
+            );
+        }
+    }
+
+    #[test]
+    fn theme_selection_tags_references_for_the_override_picker() {
+        // The default is "match the app": auto/absent → "auto" (shown as
+        // "Match app (default)"), NOT the default scheme's id — the picker
+        // must not conflate the zero-config default with an explicit talk pick.
+        assert_eq!(theme_selection(None), AUTO_ID);
+        assert_eq!(theme_selection(Some(AUTO_ID)), "auto");
+        // An explicitly chosen scheme is an override of which family.
+        assert_eq!(theme_selection(Some("figure")), "figure");
+        assert_eq!(theme_selection(Some("talk")), "talk");
+        // A pinned variant or a workspace file is a fixed ground.
+        assert_eq!(theme_selection(Some("talk-dark")), PINNED_SELECTION);
+        assert_eq!(
+            theme_selection(Some("my-workspace-theme")),
+            PINNED_SELECTION
+        );
+    }
+
+    #[test]
+    fn a_stored_scheme_name_round_trips_unchanged() {
+        // Byte stability: what the author wrote is what is stored. Resolution
+        // is render-time only — "figure" never rewrites to a concrete variant.
+        let mut board = crate::Board::new("t", crate::Canvas::default());
+        board.theme = Some("figure".to_string());
+        let bytes = crate::to_string(&board).unwrap();
+        let reparsed = crate::parse(&bytes).unwrap();
+        assert_eq!(reparsed.theme.as_deref(), Some("figure"));
+        assert_eq!(crate::to_string(&reparsed).unwrap(), bytes);
     }
 
     #[test]

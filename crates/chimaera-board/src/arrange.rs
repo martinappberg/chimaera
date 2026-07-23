@@ -161,12 +161,82 @@ pub fn arrange(
             continue; // already in place — no move, no journal noise
         }
         let obj = find_object_mut(board, ids[i]).expect("resolved above");
-        obj.set_at([x, y]);
+        // Translate by the delta rather than writing `at` directly: a group's
+        // frame is its children's union, so aligning a group must carry its
+        // children (page-absolute) with it. For a leaf object this is exactly
+        // `set_at([x, y])` (old at + delta = the new at).
+        crate::schema::translate_object(obj, x - f.x, y - f.y);
         lines.push(match (f.x != x, f.y != y) {
             (true, false) => format!("moved {} to x={x}", ids[i]),
             (false, true) => format!("moved {} to y={y}", ids[i]),
             _ => format!("moved {} to [{x}, {y}]", ids[i]),
         });
+    }
+    Ok(lines)
+}
+
+/// The server-facing verb dispatch: one op over an id-set, no gap/cols knobs
+/// (the daemon's arrange gesture is a selection align/distribute or a grid
+/// snap, never the reflow's column count). `snap-grid` snaps each object's
+/// `at` to the board's `canvas.grid`; every other verb is [`arrange`] with the
+/// pane's defaults. Returns one moved-object line per object, like `arrange`.
+pub fn arrange_ids(board: &mut Board, op: &str, ids: &[&str]) -> Result<Vec<String>> {
+    match op {
+        "snap-grid" => snap_to_grid(board, ids),
+        op if OPS.contains(&op) => arrange(board, op, ids, None, None),
+        other => bail!(
+            "unknown arrange op {other:?}; ops are {}, snap-grid",
+            OPS.join(", ")
+        ),
+    }
+}
+
+/// Snap each object's top-left `at` to the nearest [`crate::schema::grid_lines`]
+/// column-start (and row-start, when the grid has rows). Groups snap as a unit
+/// (their children ride the delta). Refuses a board with no `canvas.grid` and,
+/// like [`arrange`], a slot-placed target whose geometry is derived. Unlike the
+/// alignment verbs it takes any number of ids (snapping one object is a valid
+/// gesture) and moves nothing already on a line.
+fn snap_to_grid(board: &mut Board, ids: &[&str]) -> Result<Vec<String>> {
+    if board.canvas.grid.is_none() {
+        bail!("snap-grid needs a canvas.grid; this board declares none");
+    }
+    let (xs, ys) = crate::schema::grid_lines(&board.canvas).expect("grid present");
+    let nearest = |lines: &[f64], v: f64| -> Option<f64> {
+        lines.iter().copied().min_by(|a, b| {
+            (a - v)
+                .abs()
+                .partial_cmp(&(b - v).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
+
+    let mut lines = Vec::new();
+    for id in ids {
+        let Some(obj) = find_object(board, id) else {
+            bail!("no object {id:?} in this board");
+        };
+        if obj.slot().is_some() && obj.frame().is_none() {
+            bail!(
+                "{id:?} is slot-placed; its geometry is derived, so snapping it would silently \
+                 convert it to hand-placed — give it an explicit at/size first"
+            );
+        }
+        let Some(f) = obj.frame() else {
+            bail!("{id:?} has no explicit at/size to snap");
+        };
+        let nx = nearest(&xs, f.x).unwrap_or(f.x);
+        let ny = if ys.is_empty() {
+            f.y
+        } else {
+            nearest(&ys, f.y).unwrap_or(f.y)
+        };
+        if (nx - f.x).abs() < 1e-9 && (ny - f.y).abs() < 1e-9 {
+            continue;
+        }
+        let obj = find_object_mut(board, id).expect("resolved above");
+        crate::schema::translate_object(obj, nx - f.x, ny - f.y);
+        lines.push(format!("snapped {id} to [{nx}, {ny}]"));
     }
     Ok(lines)
 }
@@ -365,5 +435,58 @@ mod tests {
         );
         let err = arrange(&mut b, "tidy-up", &["a", "b"], None, None).unwrap_err();
         assert!(err.to_string().contains("distribute-h"), "{err}");
+    }
+
+    #[test]
+    fn aligning_a_group_carries_its_children() {
+        // The group's frame is its children's union [100,100]..[300,180];
+        // align-left to `anchor` (x=0) slides the whole group by −100 x.
+        let mut b = board(
+            &[
+                rect("anchor", [0.0, 64.0], [80.0, 80.0]),
+                r#"{"id":"g","type":"group","at":[100,100],"size":[200,80],"objects":[
+                    {"id":"c1","type":"shape","geo":"rect","at":[100,100],"size":[80,80]},
+                    {"id":"c2","type":"shape","geo":"rect","at":[220,100],"size":[80,80]}]}"#
+                    .to_string(),
+            ]
+            .join(","),
+        );
+        let lines = arrange(&mut b, "align-left", &["anchor", "g"], None, None).unwrap();
+        assert_eq!(lines, ["moved g to x=0"]);
+        assert_eq!(frame_of(&b, "g").x, 0.0, "the envelope moved");
+        assert_eq!(find_object(&b, "c1").unwrap().at(), Some([0.0, 100.0]));
+        assert_eq!(find_object(&b, "c2").unwrap().at(), Some([120.0, 100.0]));
+    }
+
+    #[test]
+    fn snap_grid_snaps_at_to_the_nearest_cell() {
+        // 960 × 540, 12 columns → 80 pt column starts. `box` sits at x=83 (a
+        // near-miss of the 80 line) and y=205 (nearest row start is 240 in a
+        // 6-row grid? no rows here → y untouched).
+        let mut b = crate::parse(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540],"grid":{"cols":12}},
+                "pages":[{"id":"p","objects":[
+                  {"id":"box","type":"shape","geo":"rect","at":[83,205],"size":[80,80]}]}]}"#,
+        )
+        .unwrap();
+        let lines = arrange_ids(&mut b, "snap-grid", &["box"]).unwrap();
+        assert_eq!(frame_of(&b, "box").x, 80.0, "left edge snaps to the column");
+        assert_eq!(frame_of(&b, "box").y, 205.0, "a column-only grid leaves y");
+        assert_eq!(lines, ["snapped box to [80, 205]"]);
+    }
+
+    #[test]
+    fn snap_grid_needs_a_grid() {
+        let mut b = board(&rect("a", [3.0, 3.0], [80.0, 80.0]));
+        let err = arrange_ids(&mut b, "snap-grid", &["a"]).unwrap_err();
+        assert!(err.to_string().contains("canvas.grid"), "{err}");
+    }
+
+    #[test]
+    fn arrange_ids_reports_the_unknown_op() {
+        let mut b = board(&rect("a", [0.0, 0.0], [8.0, 8.0]));
+        let err = arrange_ids(&mut b, "tidy-up", &["a"]).unwrap_err();
+        assert!(err.to_string().contains("snap-grid"), "{err}");
     }
 }

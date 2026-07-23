@@ -161,6 +161,24 @@ pub(crate) struct EditRequest {
         deserialize_with = "double_option"
     )]
     pub canvas_background: Option<Option<String>>,
+    /// The multi-object arrange gesture: a verb over an id-set (align a
+    /// selection, distribute it, or snap it to the layout grid). Present =
+    /// this is an arrange edit; the singular `object` fields are unused. Runs
+    /// the crate's pure `arrange_ids` server-side, then the same
+    /// normalize→canonical-save→journal pipeline every gesture takes, so an
+    /// alignment lands with the same atomicity and byte-stability as a `set`.
+    #[serde(default)]
+    pub arrange: Option<ArrangeRequest>,
+}
+
+/// The arrange gesture's payload: the verb and the ids it applies to, in the
+/// order given (the first id is the alignment anchor). The vocabulary is
+/// `chimaera_board::arrange::OPS` plus `snap-grid`.
+#[derive(Deserialize)]
+pub(crate) struct ArrangeRequest {
+    pub op: String,
+    #[serde(default)]
+    pub objects: Vec<String>,
 }
 
 /// Deserialize a present-but-maybe-null field into `Some(inner)` — serde's
@@ -284,6 +302,28 @@ pub(crate) async fn render(
                 .iter()
                 .filter_map(|t| theme.color(t).map(|rgb| json!({"token": t, "hex": rgb.hex()})))
                 .collect::<Vec<_>>()),
+            // The theme picker's data. A board matches the viewing app's
+            // light/dark by DEFAULT (no config) — `themeSelection` is `"auto"`
+            // then, which the UI shows as "Match app (default)", selected out
+            // of the box. Everything else is an OPTIONAL override: a scheme id
+            // (`talk`/`figure` — a family that still follows the app's mode) or
+            // `"pinned"` (a fixed concrete variant / workspace theme file).
+            // `schemes` are the override choices: each scheme's id, human
+            // label, and the concrete variant it resolves to under THIS
+            // render's mode — schemes, not raw variant ids. (Ground overrides —
+            // any `@token` or `#hex`, plain white `#ffffff` / black `#000000`
+            // included — ride the separate `canvas.background` control.)
+            // Additive; a small static list, so it rides the cached-render path
+            // without a sidecar.
+            "schemes": chimaera_board::theme::SCHEMES
+                .iter()
+                .map(|s| json!({
+                    "id": s.id,
+                    "label": s.label,
+                    "variant": s.variant(dark),
+                }))
+                .collect::<Vec<_>>(),
+            "themeSelection": chimaera_board::theme::theme_selection(theme_name.as_deref()),
             // Every composite's derived children (`<id>/<part>`) and where
             // the layout put them, in page points — the pane's hit-test map
             // for selecting/dragging/discussing a diagram node instead of
@@ -431,10 +471,26 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
                 found = true;
                 prior = obj.frame();
                 if let Some(at) = req.at {
-                    obj.set_at(at);
+                    // Translate by the delta so a group carries its
+                    // (page-absolute) children as a rigid unit; for a leaf
+                    // object this is exactly `set_at(at)`. A group with no
+                    // stored `at` yet (never normalized) falls back to
+                    // set_at — normalize re-unions its envelope regardless.
+                    match obj.at() {
+                        Some(cur) => {
+                            chimaera_board::translate_object(obj, at[0] - cur[0], at[1] - cur[1])
+                        }
+                        None => obj.set_at(at),
+                    }
                 }
                 if let Some(size) = req.size {
-                    obj.set_size(size);
+                    // Group resize is out of scope: a group is a selection
+                    // envelope normalize() re-unions from its children, so a
+                    // size on it is a no-op by construction — only leaf
+                    // objects take an explicit size.
+                    if !matches!(obj, chimaera_board::Object::Group(_)) {
+                        obj.set_size(size);
+                    }
                 }
                 if let Some(text) = &req.text {
                     let paras = || {
@@ -459,8 +515,27 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
         if !found {
             anyhow::bail!("no object {object:?} in {}", path.display());
         }
-    } else if req.canvas_background.is_none() {
-        anyhow::bail!("an edit names an object or a board-level field");
+    } else if req.canvas_background.is_none() && req.arrange.is_none() {
+        anyhow::bail!("an edit names an object, a board-level field, or an arrange gesture");
+    }
+
+    // The arrange gesture: align/distribute a selection or snap it to the
+    // layout grid. `arrange_ids` refuses (unknown op, slot-placed target,
+    // too few ids) before any mutation, so a bad request writes nothing —
+    // the same atomicity `set` gives. Prior frames are captured here for the
+    // journal's per-object move events.
+    let mut arrange_priors: std::collections::BTreeMap<String, chimaera_board::schema::Frame> =
+        std::collections::BTreeMap::new();
+    if let Some(arr) = &req.arrange {
+        for id in &arr.objects {
+            if let Some((_, o)) = board.objects().find(|(_, o)| o.id() == id) {
+                if let Some(f) = o.frame() {
+                    arrange_priors.insert(id.clone(), f);
+                }
+            }
+        }
+        let ids: Vec<&str> = arr.objects.iter().map(String::as_str).collect();
+        chimaera_board::arrange::arrange_ids(&mut board, &arr.op, &ids)?;
     }
 
     // Normalize (grid snap, group re-union) before the canonical save —
@@ -469,7 +544,7 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
     chimaera_board::normalize(&mut board);
     chimaera_board::save(path, &board)?;
 
-    let journal_seq = journal_edit(path, &board, req, prior);
+    let journal_seq = journal_edit(path, &board, req, prior, &arrange_priors);
 
     let meta = std::fs::metadata(path)?;
     let mut response = json!({
@@ -937,10 +1012,35 @@ fn journal_edit(
     board: &chimaera_board::Board,
     req: &EditRequest,
     prior: Option<chimaera_board::schema::Frame>,
+    arrange_priors: &std::collections::BTreeMap<String, chimaera_board::schema::Frame>,
 ) -> Option<u64> {
     use chimaera_board::journal::{Actor, Event, EventKind};
 
     let mut events = Vec::new();
+
+    // The arrange gesture narrates as one `move` per object that actually
+    // moved (from the captured prior to the SAVED, post-normalize position) —
+    // the closest existing event, reused rather than a new kind.
+    if let Some(arr) = &req.arrange {
+        for id in &arr.objects {
+            let saved = board
+                .objects()
+                .find(|(_, o)| o.id() == id)
+                .and_then(|(_, o)| o.frame());
+            if let (Some(from), Some(to)) = (arrange_priors.get(id), saved) {
+                if (from.x, from.y) != (to.x, to.y) {
+                    events.push(Event::new(
+                        Actor::Human,
+                        EventKind::Move {
+                            object: id.clone(),
+                            from: [from.x, from.y],
+                            to: [to.x, to.y],
+                        },
+                    ));
+                }
+            }
+        }
+    }
     // The board-level gesture journals the SAVED value (null = cleared),
     // like every object event: the journal narrates the file, not the wire.
     if req.canvas_background.is_some() {
@@ -1274,6 +1374,7 @@ mod tests {
             text: None,
             set: Some(serde_json::from_value(set).unwrap()),
             canvas_background: None,
+            arrange: None,
         }
     }
 
@@ -1309,6 +1410,7 @@ mod tests {
             text: None,
             set: None,
             canvas_background: Some(bg.map(String::from)),
+            arrange: None,
         };
 
         // Set: the file gets the field, byte-canonical, journaled.
@@ -1625,6 +1727,176 @@ mod tests {
             before,
             "the file is untouched"
         );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A workspace with a layout board: three loose rects (b is 8 pt right of
+    /// a's left edge) plus a group of three page-absolute children, on a
+    /// 12-column grid. The fixture for the arrange op and group-move.
+    fn layout_board(label: &str) -> (PathBuf, PathBuf) {
+        let ws = std::env::temp_dir().join(format!(
+            "chimaera-board-layout-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let path = ws.join("layout.board.json");
+        let board: chimaera_board::Board = serde_json::from_str(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540],"grid":{"cols":12}},
+                "pages":[{"id":"p1","objects":[
+                  {"id":"a","type":"shape","geo":"rect","at":[80,64],"size":[160,80]},
+                  {"id":"b","type":"shape","geo":"rect","at":[88,200],"size":[160,80]},
+                  {"id":"c","type":"shape","geo":"rect","at":[400,320],"size":[160,80]},
+                  {"id":"g","type":"group","at":[80,400],"size":[320,80],"objects":[
+                    {"id":"g1","type":"shape","geo":"rect","at":[80,400],"size":[80,80]},
+                    {"id":"g2","type":"shape","geo":"rect","at":[200,400],"size":[80,80]},
+                    {"id":"g3","type":"shape","geo":"rect","at":[320,400],"size":[80,80]}]}]}]}"#,
+        )
+        .unwrap();
+        chimaera_board::save(&path, &board).unwrap();
+        (ws, path)
+    }
+
+    fn arrange_req(path: &Path, op: &str, objects: &[&str]) -> EditRequest {
+        EditRequest {
+            path: path.to_string_lossy().into_owned(),
+            object: None,
+            at: None,
+            size: None,
+            text: None,
+            set: None,
+            canvas_background: None,
+            arrange: Some(ArrangeRequest {
+                op: op.to_string(),
+                objects: objects.iter().map(|s| s.to_string()).collect(),
+            }),
+        }
+    }
+
+    fn at_of(board: &chimaera_board::Board, id: &str) -> [f64; 2] {
+        board
+            .objects()
+            .find(|(_, o)| o.id() == id)
+            .and_then(|(_, o)| o.at())
+            .unwrap()
+    }
+
+    /// The arrange op aligns exactly the named objects (b snaps to a's left
+    /// edge), leaves the rest, saves byte-canonically, and journals one human
+    /// `move` per object that moved.
+    #[test]
+    fn arrange_op_aligns_the_named_objects_canonically() {
+        let (ws, path) = layout_board("arrange");
+        let out = perform_edit(&path, &arrange_req(&path, "align-left", &["a", "b"])).unwrap();
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(at_of(&board, "b"), [80.0, 200.0], "b took a's left edge");
+        assert_eq!(at_of(&board, "a"), [80.0, 64.0], "the anchor stays put");
+        assert_eq!(
+            at_of(&board, "c"),
+            [400.0, 320.0],
+            "an unnamed object is untouched"
+        );
+        // Byte-canonical: the file is exactly the crate writer's output.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            chimaera_board::to_string(&board).unwrap()
+        );
+        // Exactly one move journaled (b), from prior to saved.
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        let moves: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.kind, chimaera_board::journal::EventKind::Move { .. }))
+            .collect();
+        assert_eq!(moves.len(), 1);
+        let ev = moves.iter().find(|e| e.seq == seq).unwrap();
+        match &ev.kind {
+            chimaera_board::journal::EventKind::Move { object, from, to } => {
+                assert_eq!(object, "b");
+                assert_eq!((*from, *to), ([88.0, 200.0], [80.0, 200.0]));
+            }
+            other => panic!("expected move, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The `snap-grid` verb snaps a selection's `at` to the nearest column
+    /// line of the board's `canvas.grid`.
+    #[test]
+    fn arrange_op_snap_grid_lands_on_the_column() {
+        let (ws, path) = layout_board("snapgrid");
+        // b at x=88 → nearest 12-column line is 80.
+        perform_edit(&path, &arrange_req(&path, "snap-grid", &["b"])).unwrap();
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(at_of(&board, "b")[0], 80.0);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A bad arrange verb is refused before any mutation — nothing written,
+    /// no journal.
+    #[test]
+    fn arrange_op_with_an_unknown_verb_writes_nothing() {
+        let (ws, path) = layout_board("badop");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = perform_edit(&path, &arrange_req(&path, "tidy-up", &["a", "b"])).unwrap_err();
+        assert!(err.to_string().contains("snap-grid"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        assert!(!journal_path.exists(), "no journal for a refused arrange");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Moving a group translates ALL its page-absolute children by the same
+    /// delta, so group + 3 children shift together and stay internally
+    /// consistent; the saved file is byte-canonical.
+    #[test]
+    fn moving_a_group_translates_its_children() {
+        let (ws, path) = layout_board("groupmove");
+        let mut req = edit_req(&path, "g", serde_json::json!({}));
+        req.set = None;
+        req.at = Some([160.0, 400.0]); // delta [80, 0] from the group's [80, 400]
+        perform_edit(&path, &req).unwrap();
+
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(at_of(&board, "g"), [160.0, 400.0], "the envelope");
+        assert_eq!(
+            at_of(&board, "g1"),
+            [160.0, 400.0],
+            "child 1 rides the delta"
+        );
+        assert_eq!(
+            at_of(&board, "g2"),
+            [280.0, 400.0],
+            "child 2 rides the delta"
+        );
+        assert_eq!(
+            at_of(&board, "g3"),
+            [400.0, 400.0],
+            "child 3 rides the delta"
+        );
+        // A loose object under the same edit shard is unaffected.
+        assert_eq!(at_of(&board, "a"), [80.0, 64.0]);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            chimaera_board::to_string(&board).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Moving a NON-group object stays a plain single-object move — the
+    /// translate path collapses to `set_at` for a leaf.
+    #[test]
+    fn moving_a_leaf_object_is_unchanged() {
+        let (ws, path) = layout_board("leafmove");
+        let mut req = edit_req(&path, "c", serde_json::json!({}));
+        req.set = None;
+        req.at = Some([320.0, 240.0]);
+        perform_edit(&path, &req).unwrap();
+        let board = chimaera_board::load(&path).unwrap();
+        assert_eq!(at_of(&board, "c"), [320.0, 240.0]);
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

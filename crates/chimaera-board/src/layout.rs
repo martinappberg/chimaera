@@ -37,9 +37,12 @@ pub struct FontStack {
 }
 
 impl FontStack {
-    /// Build a stack. Workspace-vendored fonts win over system fonts, which is
-    /// what makes `.chimaera/board/fonts/` meaningful: vendor a family and the
-    /// render stops depending on what happens to be installed.
+    /// Build a stack. Precedence, first match wins: workspace-vendored fonts
+    /// (`.chimaera/board/fonts/`) → the [`bundled`] brand faces baked into the
+    /// binary → the system scan. Vendoring or bundling a family is what stops a
+    /// render from depending on what happens to be installed — the bundled set
+    /// is why a board renders in the brand face on a fontless HPC login node,
+    /// not a generic `sans-serif`.
     pub fn new(font_dirs: &[PathBuf]) -> Self {
         let mut db = fontdb::Database::new();
         for dir in font_dirs {
@@ -47,6 +50,9 @@ impl FontStack {
                 db.load_fonts_dir(dir);
             }
         }
+        // Between vendored and system, so a workspace can still override a
+        // brand face by vendoring its own, while a bare host still resolves it.
+        bundled::register(&mut db);
         db.load_system_fonts();
         FontStack {
             db: Arc::new(db),
@@ -245,6 +251,54 @@ pub fn css_font_family(families: &[String]) -> String {
         .join(", ")
 }
 
+/// The brand faces baked into the binary and registered into every render's
+/// `fontdb`, so a board renders in the same face on a laptop and on a fontless
+/// compute node — the fix for the HPC fallback, and how the app carries a
+/// typographic identity instead of a system default.
+///
+/// Only static weight instances are committed (never variable fonts), so weight
+/// selection is exact and reproducible; the weights are exactly those the
+/// bundled themes reference (400 body, 600 talk headings, 700 figure headings).
+/// Provenance, versions, sha256 and licenses: `fonts/text/README.md`. Every
+/// family is SIL OFL 1.1, which permits this bundling. This mirrors how the
+/// `equation` feature commits STIX Two Math under `fonts/`.
+pub mod bundled {
+    use usvg::fontdb;
+
+    /// The default text face across every bundled theme — the app's brand sans.
+    pub const BRAND_SANS: &str = "Geist";
+    /// A clean, neutral alternate a user can select in place of the brand face.
+    pub const NEUTRAL_SANS: &str = "IBM Plex Sans";
+    /// The monospace the `code` role uses — the same face the app's terminal
+    /// and web UI use, so code on a board and code in a terminal share DNA.
+    pub const MONO: &str = "JetBrains Mono";
+
+    /// Every family name a bare [`super::FontStack`] resolves without a system
+    /// or vendored font present. Tests assert the render `fontdb` carries these.
+    pub const FAMILIES: &[&str] = &[BRAND_SANS, NEUTRAL_SANS, MONO];
+
+    // Geist 1.800 · IBM Plex Sans 3.005 · JetBrains Mono 2.305 — see the
+    // asset README for sources and hashes. `../../fonts` is crate-relative
+    // from `src/layout.rs`.
+    const FACES: &[&[u8]] = &[
+        include_bytes!("../fonts/text/Geist-Regular.otf"),
+        include_bytes!("../fonts/text/Geist-SemiBold.otf"),
+        include_bytes!("../fonts/text/Geist-Bold.otf"),
+        include_bytes!("../fonts/text/IBMPlexSans-Regular.otf"),
+        include_bytes!("../fonts/text/IBMPlexSans-SemiBold.otf"),
+        include_bytes!("../fonts/text/IBMPlexSans-Bold.otf"),
+        include_bytes!("../fonts/text/JetBrainsMono-Regular.ttf"),
+    ];
+
+    /// Load every bundled face into `db`. Cheap: `load_font_data` parses the
+    /// face table once; the static bytes are already resident in the binary.
+    pub fn register(db: &mut fontdb::Database) {
+        for face in FACES {
+            db.load_font_data(face.to_vec());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +369,54 @@ mod tests {
     fn family_stacks_quote_only_what_needs_it() {
         let out = css_font_family(&["Helvetica Neue".into(), "Arial".into()]);
         assert_eq!(out, "'Helvetica Neue', Arial");
+    }
+
+    #[test]
+    fn bundled_families_resolve_with_no_system_or_vendored_fonts() {
+        // The HPC-determinism contract: a bare stack (no vendored dir) still
+        // finds every brand face, so a fontless login node renders the same
+        // face a laptop does rather than falling through to a generic.
+        let s = stack();
+        for fam in bundled::FAMILIES {
+            let r = s.resolve(&[(*fam).to_string()], 400, false);
+            assert!(r.is_some(), "bundled family {fam:?} did not resolve");
+            assert!(
+                !s.missing_families().iter().any(|m| m == fam),
+                "bundled family {fam:?} was recorded missing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_brand_sans_resolves_at_every_theme_weight() {
+        // The bundled themes ask for 400 (body), 600 (talk headings) and 700
+        // (figure headings). All three static weights are present, so a heading
+        // never silently borrows a wrong-weight face on a bare host.
+        let s = stack();
+        for w in [400u16, 600, 700] {
+            let r = s.resolve(&[bundled::BRAND_SANS.to_string()], w, false);
+            let r = r.unwrap_or_else(|| panic!("{} at {w} did not resolve", bundled::BRAND_SANS));
+            assert!(
+                r.family.eq_ignore_ascii_case(bundled::BRAND_SANS),
+                "{w} resolved to {:?}, not the brand family",
+                r.family
+            );
+        }
+        assert!(
+            s.missing_families().is_empty(),
+            "brand weights went missing"
+        );
+    }
+
+    #[test]
+    fn the_brand_sans_measures_wider_when_bolder() {
+        // A weak proxy that the distinct weight faces are really registered and
+        // shaping against them, not one face reused for every weight.
+        let s = stack();
+        let fam = vec![bundled::BRAND_SANS.to_string()];
+        let regular = s.measure("Chimaera", &fam, 40.0, 400);
+        let bold = s.measure("Chimaera", &fam, 40.0, 700);
+        assert!(regular > 0.0 && bold > 0.0);
+        assert!(bold > regular, "bold {bold} !> regular {regular}");
     }
 }

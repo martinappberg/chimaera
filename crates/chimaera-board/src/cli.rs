@@ -56,15 +56,25 @@ pub enum BoardCmd {
         /// card instead of minting forty of them across a sweep.
         #[arg(long)]
         id: Option<String>,
+        /// Semantic format — pick the card SHAPE by what you are
+        /// communicating: `auto` (the default: today's inference), `chart` (a
+        /// compact number-comparison card), `table` (sized to its rows),
+        /// `figure` (a tall/portrait canvas), `slide` (a 16:9 titled canvas),
+        /// or `diagram` (a wide flow/architecture canvas). An explicit
+        /// `--size`, then a named `--preset`, wins over it.
+        #[arg(long = "as", default_value = "auto")]
+        as_format: String,
         /// Card geometry: default (720×450), wide, square, or tall.
         #[arg(long, default_value = "default")]
         preset: String,
         /// Explicit size WxH in points, overriding --preset.
         #[arg(long)]
         size: Option<String>,
-        /// Theme id or path; defaults to `auto`, which follows the viewer's
-        /// light/dark mode wherever the card is rendered (the PNG written
-        /// here resolves auto to the dark theme).
+        /// A scheme (`talk`, `figure`), a pinned variant (`talk-dark`,
+        /// `talk-light`, `figure-light`, `figure-dark`), a `.theme.json`
+        /// path, or `auto` (the default). A scheme — and `auto` — follows
+        /// the viewer's light/dark mode wherever the card is rendered; a
+        /// pinned variant ignores it (the PNG written here resolves to dark).
         #[arg(long)]
         theme: Option<String>,
         /// Write the PNG here instead of .chimaera/board/shown/.
@@ -88,9 +98,11 @@ pub enum BoardCmd {
         path: PathBuf,
         #[arg(long)]
         title: Option<String>,
-        /// Theme id recorded in the board. The `auto` default follows the
-        /// viewer's light/dark mode at render time; pin a bundled theme
-        /// (talk-dark, talk-light, figure-light) for a fixed ground.
+        /// Theme recorded in the board: a scheme (`talk`, `figure`) or
+        /// `auto` (the default), both of which follow the viewer's
+        /// light/dark mode at render time; pin a concrete variant
+        /// (talk-dark, talk-light, figure-light, figure-dark) for a fixed
+        /// ground.
         #[arg(long, default_value = "auto")]
         theme: String,
     },
@@ -311,6 +323,7 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             title,
             note,
             id,
+            as_format,
             preset,
             size,
             theme,
@@ -318,7 +331,8 @@ pub fn run(cmd: BoardCmd) -> Result<()> {
             emit_board,
             quiet,
         } => show(
-            spec, file, mermaid, title, note, id, &preset, size, theme, out, emit_board, quiet,
+            spec, file, mermaid, title, note, id, &as_format, &preset, size, theme, out,
+            emit_board, quiet,
         ),
         BoardCmd::Guide => {
             print!("{}", include_str!("cli/GUIDE.md"));
@@ -498,6 +512,7 @@ fn show(
     title: Option<String>,
     note: Option<String>,
     id: Option<String>,
+    as_format: &str,
     preset: &str,
     size: Option<String>,
     theme_ref: Option<String>,
@@ -558,19 +573,31 @@ fn show(
     let theme = crate::theme::resolve_for_mode(Some(&theme_id), true, Some(&ws))?;
     let fonts = FontStack::for_workspace(&ws);
 
-    let size = match size {
-        Some(s) => parse_size(&s)?,
-        // A mermaid card fits its flowchart: measured natural layout + card
-        // chrome, unless the caller stated a size or a non-default preset.
-        None if spec.mermaid.is_some() && preset == "default" => crate::show::mermaid_card_size(
+    // `--as` picks the card shape by what is being communicated; an explicit
+    // `--size` (then a named `--preset`) wins over it, and `auto` keeps today's
+    // inference — so a bare `board show` is byte-identical. The theme/fonts and
+    // row count for the two content-fit shapes live here, not in the pure
+    // mapping (`resolve_card_size`).
+    let explicit_size = match &size {
+        Some(s) => Some(parse_size(s)?),
+        None => None,
+    };
+    let size = match crate::show::resolve_card_size(&spec, as_format, preset, explicit_size)? {
+        crate::show::CardSize::Fixed(sz) => sz,
+        crate::show::CardSize::MermaidFit => crate::show::mermaid_card_size(
             spec.mermaid.as_deref().unwrap_or_default(),
             spec.title.is_some(),
             spec.note.is_some(),
             &theme,
             &fonts,
         )?,
-        None => crate::show::preset_size(preset)
-            .with_context(|| format!("unknown preset {preset:?}; use default|wide|square|tall"))?,
+        crate::show::CardSize::TableFit => crate::show::table_card_size(
+            spec.table
+                .as_ref()
+                .expect("TableFit implies a table body in the spec"),
+            spec.title.is_some(),
+            spec.note.is_some(),
+        ),
     };
 
     let board = crate::show::build_board(&spec, size, &theme_id)?;
@@ -2405,7 +2432,9 @@ mod tests {
         assert!(a.contains("axes.spines.right: False"), "{a}");
         assert!(a.contains("grid.color: "), "{a}");
         assert!(a.contains("lines.linewidth: 2"), "{a}");
-        assert!(a.contains("font.family: Inter"), "{a}");
+        // The theme's family stack leads with the bundled brand sans, so the
+        // mplstyle export offers it first (matplotlib falls through the rest).
+        assert!(a.contains("font.family: Geist"), "{a}");
     }
 
     #[test]
@@ -2530,6 +2559,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "auto",
                 "default",
                 None,
                 None,
@@ -2642,6 +2672,10 @@ mod tests {
             "`labelAt`",
             "bare string",
             "hand-author an SVG",
+            // The format-choice guide: pick the shape by what is communicated.
+            "## Choosing the inline format",
+            "auto|chart|table|figure|slide|diagram",
+            "`--as slide`",
         ] {
             assert!(guide.contains(fact), "guide lost {fact:?}");
         }

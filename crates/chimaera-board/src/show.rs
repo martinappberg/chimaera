@@ -66,6 +66,79 @@ pub fn preset_size(preset: &str) -> Option<[f64; 2]> {
     }
 }
 
+/// What canvas a resolved `board show` sizing wants. An enum so the
+/// `--as`/`--preset` mapping stays pure and unit-testable, while the caller —
+/// which owns the theme/fonts (mermaid) and the row count (table) — computes
+/// the two content-fit variants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CardSize {
+    /// A fixed WxH in points.
+    Fixed([f64; 2]),
+    /// Fit a mermaid card to its flowchart ([`mermaid_card_size`]).
+    MermaidFit,
+    /// Fit a table card to its rows ([`table_card_size`]).
+    TableFit,
+}
+
+/// Resolve the card shape from `--as <format>`, an already-parsed explicit
+/// `--size`, and `--preset`. Precedence, most-specific first: an explicit size
+/// wins over everything; a named (non-default) `--preset` wins over `--as`;
+/// then `--as` picks the shape. `auto` (the default) is today's inference — a
+/// mermaid body fits its flowchart, everything else gets the compact default
+/// card — so a bare `board show` is byte-identical to before `--as` existed.
+/// Every named format is sized for the ~600–700 px inline chat column.
+pub fn resolve_card_size(
+    spec: &ShowSpec,
+    format: &str,
+    preset: &str,
+    explicit_size: Option<[f64; 2]>,
+) -> Result<CardSize> {
+    if let Some(size) = explicit_size {
+        return Ok(CardSize::Fixed(size));
+    }
+    // A named preset is an explicit shape and outranks the semantic `--as`.
+    if preset != "default" {
+        return Ok(CardSize::Fixed(preset_size(preset).with_context(|| {
+            format!("unknown preset {preset:?}; use default|wide|square|tall")
+        })?));
+    }
+    Ok(match format {
+        // Today's inference, unchanged: the byte-stable default.
+        "auto" => {
+            if spec.mermaid.is_some() {
+                CardSize::MermaidFit
+            } else {
+                CardSize::Fixed([720.0, 450.0])
+            }
+        }
+        // A quick number comparison — the compact card.
+        "chart" => CardSize::Fixed([720.0, 450.0]),
+        // Tabular results — sized to the rows; a non-table body falls back to
+        // the compact card rather than an empty fit.
+        "table" => {
+            if spec.table.is_some() {
+                CardSize::TableFit
+            } else {
+                CardSize::Fixed([720.0, 450.0])
+            }
+        }
+        // A tall/portrait multi-panel figure.
+        "figure" => CardSize::Fixed([560.0, 720.0]),
+        // A titled, composed explanation that reads like a presentation slide.
+        "slide" => CardSize::Fixed([960.0, 540.0]),
+        // A process/architecture/flow: fit the mermaid flowchart when that is
+        // the body, else a wide canvas for a hand-composed designed figure.
+        "diagram" => {
+            if spec.mermaid.is_some() {
+                CardSize::MermaidFit
+            } else {
+                CardSize::Fixed([960.0, 540.0])
+            }
+        }
+        other => bail!("unknown --as {other:?}; use auto|chart|table|figure|slide|diagram"),
+    })
+}
+
 /// Margins inside a shown card, in points.
 const M: f64 = 40.0;
 const TITLE_H: f64 = 48.0;
@@ -94,6 +167,7 @@ pub fn build_board(spec: &ShowSpec, size: [f64; 2], theme_id: &str) -> Result<Bo
         target: None,
         size,
         background: None,
+        grid: None,
         extra: Extra::new(),
     };
     let mut board = Board::new(spec.title.clone().unwrap_or_default(), canvas);
@@ -332,6 +406,25 @@ pub fn mermaid_card_size(
         (nat[0] + M * 2.0).clamp(420.0, 1440.0).ceil(),
         h.clamp(280.0, 1100.0).ceil(),
     ])
+}
+
+/// The card size a `--as table` selection fits to its rows: a readable row
+/// height per header + data row, plus the card chrome, clamped to a sane range.
+/// Width stays the compact column width — a table reads fine at 720 pt, and a
+/// wider card would overrun the inline chat column. `ROW_H` lands inside
+/// `table_objects`' own per-row clamp, so the rows draw at that height until
+/// the total-height clamp compresses a very tall table.
+pub fn table_card_size(table: &TableSpec, has_title: bool, has_note: bool) -> [f64; 2] {
+    const ROW_H: f64 = 40.0;
+    let n_rows = (table.rows.len() + 1) as f64; // header row + data rows
+    let mut h = M * 2.0 + n_rows * ROW_H;
+    if has_title {
+        h += TITLE_H + 8.0;
+    }
+    if has_note {
+        h += NOTE_H + 8.0;
+    }
+    [720.0, h.clamp(200.0, 1100.0).ceil()]
 }
 
 /// Lay a table out as text rows. A real `table` composite arrives in slice 3;
@@ -817,5 +910,123 @@ mod tests {
         assert_eq!(c.data.values.len(), 2, "values fold into the stated data");
         assert_eq!(format!("{:?}", c.data.origin), "DerivedByAgent");
         assert_eq!(c.data.trace.as_deref(), Some("sums per file"));
+    }
+
+    #[test]
+    fn as_format_maps_to_the_intended_canvas() {
+        let chart: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        // A slide is a 16:9 titled canvas; a figure is portrait; a chart the
+        // compact card; a diagram with no mermaid body a wide canvas.
+        assert_eq!(
+            resolve_card_size(&chart, "slide", "default", None).unwrap(),
+            CardSize::Fixed([960.0, 540.0])
+        );
+        assert_eq!(
+            resolve_card_size(&chart, "figure", "default", None).unwrap(),
+            CardSize::Fixed([560.0, 720.0])
+        );
+        assert_eq!(
+            resolve_card_size(&chart, "chart", "default", None).unwrap(),
+            CardSize::Fixed([720.0, 450.0])
+        );
+        assert_eq!(
+            resolve_card_size(&chart, "diagram", "default", None).unwrap(),
+            CardSize::Fixed([960.0, 540.0])
+        );
+    }
+
+    #[test]
+    fn as_table_and_diagram_defer_to_their_bodies() {
+        let table: ShowSpec =
+            serde_json::from_str(r#"{"table": {"columns": ["a"], "rows": [{"a": 1}, {"a": 2}]}}"#)
+                .unwrap();
+        assert_eq!(
+            resolve_card_size(&table, "table", "default", None).unwrap(),
+            CardSize::TableFit
+        );
+        let mermaid: ShowSpec =
+            serde_json::from_str(r#"{"mermaid": "flowchart TD\nA --> B"}"#).unwrap();
+        assert_eq!(
+            resolve_card_size(&mermaid, "diagram", "default", None).unwrap(),
+            CardSize::MermaidFit
+        );
+        // A format whose body is absent falls back to a fixed card rather than
+        // panicking on the missing content.
+        assert_eq!(
+            resolve_card_size(&table, "diagram", "default", None).unwrap(),
+            CardSize::Fixed([960.0, 540.0])
+        );
+        let chart: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        assert_eq!(
+            resolve_card_size(&chart, "table", "default", None).unwrap(),
+            CardSize::Fixed([720.0, 450.0])
+        );
+    }
+
+    #[test]
+    fn as_auto_is_todays_inference_byte_stable() {
+        // The default `--as auto` reproduces the pre-`--as` sizing exactly: a
+        // chart body gets the compact card, a mermaid body auto-fits.
+        let chart: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        assert_eq!(
+            resolve_card_size(&chart, "auto", "default", None).unwrap(),
+            CardSize::Fixed([720.0, 450.0])
+        );
+        let mermaid: ShowSpec =
+            serde_json::from_str(r#"{"mermaid": "flowchart TD\nA --> B"}"#).unwrap();
+        assert_eq!(
+            resolve_card_size(&mermaid, "auto", "default", None).unwrap(),
+            CardSize::MermaidFit
+        );
+    }
+
+    #[test]
+    fn explicit_size_and_preset_outrank_as() {
+        let chart: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        // An explicit --size wins over the format.
+        assert_eq!(
+            resolve_card_size(&chart, "slide", "default", Some([300.0, 200.0])).unwrap(),
+            CardSize::Fixed([300.0, 200.0])
+        );
+        // A named preset wins over the format too.
+        assert_eq!(
+            resolve_card_size(&chart, "slide", "tall", None).unwrap(),
+            CardSize::Fixed([560.0, 720.0])
+        );
+    }
+
+    #[test]
+    fn an_unknown_as_format_is_refused() {
+        let chart: ShowSpec = serde_json::from_str(SPEC).unwrap();
+        assert!(resolve_card_size(&chart, "poster", "default", None).is_err());
+    }
+
+    #[test]
+    fn table_card_fits_its_rows() {
+        // A 5-row table: header + 5 rows at ROW_H (40) + top/bottom margins
+        // (40 each) = 320, above the readability floor.
+        let mid = TableSpec {
+            columns: vec!["file".into(), "n".into()],
+            rows: (0..5)
+                .map(|i| serde_json::json!({ "file": "a", "n": i }))
+                .collect(),
+        };
+        assert_eq!(table_card_size(&mid, false, false), [720.0, 320.0]);
+        // A tiny table is floored to a readable card, not a stamp.
+        let tiny = TableSpec {
+            columns: vec!["a".into()],
+            rows: vec![serde_json::json!({ "a": 1 })],
+        };
+        assert_eq!(table_card_size(&tiny, false, false)[1], 200.0);
+        // Title and note buy their chrome back on top of the row height.
+        let titled = table_card_size(&mid, true, true);
+        assert!(titled[1] > 320.0, "{titled:?}");
+        // Many rows grow the card, bounded by the clamp cap.
+        let many = TableSpec {
+            columns: vec!["a".into()],
+            rows: (0..80).map(|i| serde_json::json!({ "a": i })).collect(),
+        };
+        let big = table_card_size(&many, false, false);
+        assert!(big[1] > 320.0 && big[1] <= 1100.0, "{big:?}");
     }
 }

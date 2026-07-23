@@ -285,7 +285,9 @@ fn build() -> Vec<Preset> {
         // PLOS: max figure width 19.05 cm (7.5 in = 540 pt), minimum text
         // size 8 pt (a 1.6 scale over the theme's 5 pt floors) — and PLOS
         // requires **Arial, not Helvetica**, the specific trap that bounces
-        // submissions; the figure-light family stack puts Arial first.
+        // submissions. The figure family stack keeps Arial ahead of the other
+        // system faces, but the bundled brand sans now leads it; a strict PLOS
+        // export pins Arial by editing the theme's family stack.
         Preset {
             id: "pub-plos",
             geometry: PresetGeometry {

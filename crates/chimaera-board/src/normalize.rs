@@ -154,6 +154,41 @@ pub fn normalize(board: &mut Board) -> Vec<Diagnostic> {
         }
     }
 
+    // The advisory layout grid is validated, never dropped for a semantic
+    // slip: `cols`/`rows` floor at 1 (a zero-column grid divides by zero in
+    // `grid_cell`) and `margin`/`gutter` floor at a finite 0 (a negative or
+    // NaN inset makes cell math meaningless). The grid carries no object
+    // geometry, so nothing here moves an object — it only keeps the
+    // coordinate system usable.
+    if let Some(grid) = &mut board.canvas.grid {
+        if grid.cols == 0 {
+            diags.push(
+                Diagnostic::new(Severity::Warning, "canvas.grid.cols is 0; using 1")
+                    .field("canvas.grid"),
+            );
+            grid.cols = 1;
+        }
+        if grid.rows == Some(0) {
+            diags.push(
+                Diagnostic::new(Severity::Warning, "canvas.grid.rows is 0; using 1")
+                    .field("canvas.grid"),
+            );
+            grid.rows = Some(1);
+        }
+        for (val, name) in [(&mut grid.margin, "margin"), (&mut grid.gutter, "gutter")] {
+            if !val.is_finite() || *val < 0.0 {
+                diags.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        format!("canvas.grid.{name} is {val}; using 0"),
+                    )
+                    .field("canvas.grid"),
+                );
+                *val = 0.0;
+            }
+        }
+    }
+
     for (pi, page) in board.pages.iter_mut().enumerate() {
         if page.id.is_empty() {
             page.id = format!("page-{}", pi + 1);
@@ -621,6 +656,33 @@ mod tests {
         assert_eq!(b.canvas.background, None, "invalid reference must drop");
         // Idempotent: the dropped field re-normalizes without a finding.
         assert!(normalize(&mut b).is_empty());
+    }
+
+    #[test]
+    fn a_degenerate_grid_clamps_with_diagnostics_and_is_idempotent() {
+        let mut b = board_with(r#"{"id":"t","type":"text","text":["hi"]}"#);
+        b.canvas.grid = Some(crate::schema::Grid {
+            cols: 0,
+            rows: Some(0),
+            margin: -8.0,
+            gutter: f64::NAN,
+            extra: Default::default(),
+        });
+        let diags = normalize(&mut b);
+        assert!(
+            diags
+                .iter()
+                .filter(|d| d.field.as_deref() == Some("canvas.grid"))
+                .count()
+                >= 3,
+            "cols, rows, and each bad inset warn: {diags:?}"
+        );
+        let g = b.canvas.grid.as_ref().unwrap();
+        assert_eq!((g.cols, g.rows, g.margin, g.gutter), (1, Some(1), 0.0, 0.0));
+        // Idempotent: the clamped grid re-normalizes without a finding.
+        assert!(normalize(&mut b)
+            .iter()
+            .all(|d| d.field.as_deref() != Some("canvas.grid")));
     }
 
     #[test]
