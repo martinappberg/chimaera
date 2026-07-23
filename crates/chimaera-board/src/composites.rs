@@ -596,6 +596,112 @@ impl InsetObject {
 }
 
 // ---------------------------------------------------------------------------
+// Child frames — where every derived child landed
+// ---------------------------------------------------------------------------
+
+/// The laid-out frames of every composite's derived children on one page:
+/// composite id → `(derived child id, frame)` pairs in expansion order
+/// (which is z-order, so a hit-test walks the list backwards).
+///
+/// This is the pane's hit-test map for making composite children first-class
+/// — selectable, draggable, addressable by their derived ids. It mirrors
+/// `render.rs`'s composite dispatch exactly: the same slot/anchor frame
+/// resolution, the same "hand a slot-placed composite the frame the
+/// resolution decided" clone — so these rects agree with the pixels by
+/// construction. Children without full geometry (connectors) are absent,
+/// like everywhere else a frame map is built; expansion problems are the
+/// renderer's to report, not repeated here. Pure and deterministic: same
+/// board, theme and fonts → identical frames.
+pub fn page_child_frames(
+    board: &crate::schema::Board,
+    page: &crate::schema::Page,
+    theme: &Theme,
+    fonts: &FontStack,
+) -> BTreeMap<String, Vec<(String, Frame)>> {
+    let index = crate::slots::resolve_page_frames(board, page, theme, Some(fonts));
+
+    // The render dispatch's "placed" clone: a slot- or anchor-placed
+    // composite carries no at/size of its own, so it inherits the frame the
+    // resolution decided. `None` = nothing to place against, skip.
+    fn placed<T: Clone>(
+        o: &T,
+        has_geometry: bool,
+        frame: Option<Frame>,
+        set: impl FnOnce(&mut T, Frame),
+    ) -> Option<T> {
+        if has_geometry {
+            return Some(o.clone());
+        }
+        let f = frame?;
+        let mut c = o.clone();
+        set(&mut c, f);
+        Some(c)
+    }
+
+    let mut out = BTreeMap::new();
+    for obj in &page.objects {
+        let frame = index.get(obj.id()).copied().or_else(|| obj.frame());
+        let children: Vec<Object> = match obj {
+            Object::Diagram(d) => {
+                let Some(d) = placed(d, d.at.is_some() && d.size.is_some(), frame, |c, f| {
+                    c.at = Some([f.x, f.y]);
+                    c.size = Some([f.w, f.h]);
+                }) else {
+                    continue;
+                };
+                crate::diagram::expand(&d, theme, fonts).0
+            }
+            Object::PanelLabel(o) => {
+                let Some(o) = placed(o, o.at.is_some(), frame, |c, f| {
+                    c.at = Some([f.x, f.y]);
+                }) else {
+                    continue;
+                };
+                o.expand(theme, fonts).0
+            }
+            Object::Scalebar(o) => o.expand(theme, fonts).0,
+            Object::SigBracket(o) => o.expand(theme, fonts, &index).0,
+            Object::Legend(o) => o.expand(theme, fonts).0,
+            Object::Colorbar(o) => {
+                let Some(o) = placed(o, o.at.is_some() && o.size.is_some(), frame, |c, f| {
+                    c.at = Some([f.x, f.y]);
+                    c.size = Some([f.w, f.h]);
+                }) else {
+                    continue;
+                };
+                o.expand(theme, fonts).0
+            }
+            Object::Callout(o) => {
+                let Some(o) = placed(o, o.at.is_some() && o.size.is_some(), frame, |c, f| {
+                    c.at = Some([f.x, f.y]);
+                    c.size = Some([f.w, f.h]);
+                }) else {
+                    continue;
+                };
+                o.expand(theme, fonts).0
+            }
+            Object::Inset(o) => {
+                let target = page.walk().find_map(|t| match t {
+                    Object::Image(i) if i.id == o.of.object => Some(i),
+                    _ => None,
+                });
+                let target_frame = index.get(o.of.object.as_str()).copied();
+                o.expand(theme, fonts, target, target_frame).0
+            }
+            _ => continue,
+        };
+        let frames: Vec<(String, Frame)> = children
+            .iter()
+            .filter_map(|c| c.frame().map(|f| (c.id().to_string(), f)))
+            .collect();
+        if !frames.is_empty() {
+            out.insert(obj.id().to_string(), frames);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -619,6 +725,52 @@ mod tests {
 
     fn kinds(children: &[Object]) -> Vec<&str> {
         children.iter().map(|c| c.kind()).collect()
+    }
+
+    #[test]
+    fn page_child_frames_agrees_with_the_expansion() {
+        let board: Board = serde_json::from_str(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","objects":[
+                  {"id":"note","type":"text","at":[48,24],"size":[300,32],"text":["hi"]},
+                  {"id":"flow","type":"diagram","at":[48,80],"size":[500,400],
+                   "nodes":[{"id":"a","label":"Start"},{"id":"b","label":"End"}],
+                   "edges":[{"from":"a","to":"b"}]},
+                  {"id":"pl","type":"panelLabel","at":[80,80],"label":"a"}]}]}"#,
+        )
+        .unwrap();
+        let (theme, fonts) = (theme(), fonts());
+        let map = page_child_frames(&board, &board.pages[0], &theme, &fonts);
+        // Composites only: the text object contributes nothing.
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["flow", "pl"]);
+
+        // The diagram's entries are exactly its expansion's framed children,
+        // in expansion (z) order — routed edge geometry (path + arrowhead)
+        // draws under the nodes, so the node shapes come last and win a
+        // backwards hit-test walk.
+        let Object::Diagram(d) = &board.pages[0].objects[1] else {
+            panic!()
+        };
+        let (children, _) = crate::diagram::expand(d, &theme, &fonts);
+        let expect: Vec<(String, Frame)> = children
+            .iter()
+            .filter_map(|c| c.frame().map(|f| (c.id().to_string(), f)))
+            .collect();
+        assert_eq!(
+            expect.len(),
+            4,
+            "edge path + arrowhead + two node shapes: {expect:?}"
+        );
+        let got = &map["flow"];
+        assert_eq!(
+            got.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["flow/edge[0]", "flow/edge[0].arrow", "flow/a", "flow/b"]
+        );
+        for ((gid, gf), (eid, ef)) in got.iter().zip(&expect) {
+            assert_eq!(gid, eid);
+            assert_eq!((gf.x, gf.y, gf.w, gf.h), (ef.x, ef.y, ef.w, ef.h));
+        }
     }
 
     #[test]

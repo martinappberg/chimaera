@@ -55,9 +55,17 @@ on the full `.board.json` suffix. Chat card:
   optional `data.trace` (how computed values were produced — clamped 2 KiB)
   and `data.inputs` (the files read) so provenance survives into later
   sessions; histogram/pie/second-y refused.
-- **Diagrams**: nodes/edges/lanes with deterministic Sugiyama-lite layout and
-  connector-bound edge labels; mermaid flowcharts import converted-once
-  (`board import`, `show --mermaid`) with the source kept in provenance.
+- **Diagrams**: nodes/edges/lanes under a deterministic Sugiyama-lite layout
+  (neighbor-mean refinement straightens chains; an optional per-node `at` pin
+  wins verbatim and the rest flows around it) with rounded **orthogonal edge
+  routing** — per-edge border ports, one horizontal track per inter-layer
+  channel, loop-backs/rank-skips around the columns on stacked side lanes, so
+  edges never share a segment or cut through a node; edge labels ride
+  surface-colored chips nudged clear of nodes and each other; themed node
+  paint (raised process boxes, accent-tinted decision diamonds, `@axis`
+  lines/arrowheads) holds contrast on all three bundled themes. Mermaid
+  flowcharts import converted-once (`board import`, `show --mermaid` — the
+  shown card auto-sizes to the flowchart) with the source kept in provenance.
 - **Images**: PNG/JPEG placed with `srcRect` crops; SVG sanitized through a
   usvg round-trip then inlined; `tint` for monochrome sources; effective-DPI
   reporting against preset floors.

@@ -287,6 +287,13 @@ export interface BoardRender {
    *  theme indirection); the hex only shows what it resolves to. Absent on
    *  an older daemon → no swatch row. */
   catSwatches?: { token: string; hex: string }[];
+  /** Every composite's derived children (`<id>/<part>`) and their laid-out
+   *  `[x, y, w, h]` frames in page points, z-ordered within a composite —
+   *  the hit-test map that makes a diagram's nodes selectable instead of the
+   *  composite being one opaque rectangle. The engine's own layout, never a
+   *  client re-derivation. Absent on an older daemon → children stay
+   *  unselectable. */
+  childFrames?: Record<string, { id: string; frame: [number, number, number, number] }[]>;
 }
 
 /** Render one page of a board server-side. The daemon caches by content, so

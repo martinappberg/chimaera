@@ -42,7 +42,8 @@ takes ONE call — pass a precomputed five-number summary per row
 
 Tables and text: `"table":{"columns":["file","n"],"rows":[{"file":"a","n":1}]}`
 · `"text":["line one","line two"]`. Diagrams: pipe mermaid flowchart source to
-`chimaera board show --mermaid` (converted to a native diagram object).
+`chimaera board show --mermaid` (converted to a native diagram object; the
+card auto-sizes to the flowchart unless `--size`/`--preset` says otherwise).
 
 ## Data provenance — favor real files, leave a trace
 

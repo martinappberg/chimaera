@@ -482,23 +482,32 @@ fn show(
         spec.note = note;
     }
 
-    let size = match size {
-        Some(s) => parse_size(&s)?,
-        None => crate::show::preset_size(preset)
-            .with_context(|| format!("unknown preset {preset:?}; use default|wide|square|tall"))?,
-    };
-
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let ws = crate::workspace_root(&cwd);
     let theme_id = theme_ref.unwrap_or_else(|| "talk-dark".to_string());
     let theme = Theme::resolve(&theme_id, Some(&ws))?;
+    let fonts = FontStack::for_workspace(&ws);
+
+    let size = match size {
+        Some(s) => parse_size(&s)?,
+        // A mermaid card fits its flowchart: measured natural layout + card
+        // chrome, unless the caller stated a size or a non-default preset.
+        None if spec.mermaid.is_some() && preset == "default" => crate::show::mermaid_card_size(
+            spec.mermaid.as_deref().unwrap_or_default(),
+            spec.title.is_some(),
+            spec.note.is_some(),
+            &theme,
+            &fonts,
+        )?,
+        None => crate::show::preset_size(preset)
+            .with_context(|| format!("unknown preset {preset:?}; use default|wide|square|tall"))?,
+    };
 
     let board = crate::show::build_board(&spec, size, &theme_id)?;
     if emit_board {
         print!("{}", crate::to_string(&board)?);
     }
 
-    let fonts = FontStack::for_workspace(&ws);
     let rendered = render_page(&board, 0, &theme, &fonts, RasterParams::default())?;
 
     // Content-derived id unless the caller supplied an update handle.

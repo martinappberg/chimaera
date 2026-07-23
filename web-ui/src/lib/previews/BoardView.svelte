@@ -29,12 +29,17 @@
     applyFieldSet,
     attributeDiff,
     boardFrames,
+    childFrameRect,
     composeBoardContext,
     configSig,
     CORNERS,
+    diagramNodeIndex,
+    diagramNodeLabel,
     editorFontPx,
+    editorTextToNodeLabel,
     editorTextToParagraphs,
     GRID_PT,
+    hitChild,
     MIN_RESIZE_PT,
     nextPinId,
     pageFrames,
@@ -49,6 +54,7 @@
     UndoStack,
     unresolvedPins,
     type BoardInfo,
+    type ChildFrame,
     type Corner,
     type ExpectedChange,
     type FieldChange,
@@ -121,6 +127,10 @@
         renderError = null;
         imgUrl = `/raw/${r.ticket}`;
         rendering = false;
+        // The landed render carries fresh childFrames — the committed-pin
+        // overlay's job is done (a child drag's outline holds its dropped
+        // spot only until the engine's own frame arrives).
+        childOverlay = null;
       },
       (err: unknown) => {
         if (cancelled) return;
@@ -143,6 +153,8 @@
     openPin = null;
     pinDraft = null;
     pinMode = false;
+    selectedChild = null;
+    childOverlay = null;
   });
   $effect(() => {
     const count = render?.pageCount ?? 1;
@@ -158,6 +170,33 @@
   // --- selection + drag ---------------------------------------------------
   let selected = $state<string | null>(null);
   const selectedObj = $derived(pageObjects.find((o) => o.id === selected) ?? null);
+
+  // --- composite children (click-through selection) -----------------------
+  /** The selected composite's drilled-into child (a derived id like
+   *  `flow/too-hot`), or null when the selection is the object itself. The
+   *  click-through idiom: the first press selects the composite, a second
+   *  press inside it selects the child under the pointer. */
+  let selectedChild = $state<string | null>(null);
+  /** A committed child pin's optimistic frame — holds the outline at the
+   *  dropped spot for the beat between pointer-up and the re-render whose
+   *  childFrames carry the engine's own placement. */
+  let childOverlay = $state<{ id: string; frame: Frame } | null>(null);
+
+  /** The render's hit-test map: composite id → derived children + frames. */
+  const pageChildFrames = $derived.by<Record<string, ChildFrame[]>>(
+    () => render?.childFrames ?? {},
+  );
+  const selectedChildren = $derived(selected !== null ? (pageChildFrames[selected] ?? []) : []);
+
+  /** The selected child's current frame (overlay first, then the render's). */
+  const selectedChildFrame = $derived.by<Frame | null>(() => {
+    const id = selectedChild;
+    if (id === null) return null;
+    const ov = childOverlay;
+    if (ov !== null && ov.id === id) return ov.frame;
+    const kid = selectedChildren.find((c) => c.id === id);
+    return kid !== undefined ? childFrameRect(kid) : null;
+  });
 
   // --- comment pins (§6.4: journal-only, never the board file) ------------
   /** Unresolved pins reduced from GET /board/journal. */
@@ -333,6 +372,19 @@
         origSize: [number, number];
         cur: Frame;
         moved: boolean;
+      }
+    | {
+        // A drilled-into diagram node: commits `nodes.<i>.at` on the PARENT
+        // (the pin the layout honors), never a frame of its own.
+        mode: "child-move";
+        parent: string;
+        childId: string;
+        startPt: [number, number];
+        origAt: [number, number];
+        origSize: [number, number];
+        dx: number;
+        dy: number;
+        moved: boolean;
       };
   let drag = $state<DragState | null>(null);
   let saving = $state(false);
@@ -357,6 +409,10 @@
   /** Visual size of a corner handle; hit zone is 2px more forgiving. */
   const HANDLE_PX = 8;
   const handleBoxes = $derived.by(() => {
+    // A drilled-into child owns the selection: children are not resizable
+    // (their size is layout-derived), and parent handles would read as the
+    // child's.
+    if (selectedChild !== null) return [];
     const box = selectionBox;
     if (box === null) return [];
     return CORNERS.map((corner) => ({
@@ -421,7 +477,36 @@
       }
     }
     const target = hit(pt);
+    // Click-through into a composite's children: a press inside the ALREADY
+    // selected composite selects the derived child under the pointer (a
+    // node, a lane box) — and a node child arms a drag whose release pins
+    // `nodes.<i>.at`. A press on the composite's background clears the child
+    // and falls through to the normal whole-object selection/drag.
+    if (target !== null && target.id === selected) {
+      const kid = hitChild(pageChildFrames[target.id] ?? [], pt);
+      if (kid !== null) {
+        selectedChild = kid.id;
+        childOverlay = null;
+        if (diagramNodeIndex(target, kid.id) !== null) {
+          (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+          drag = {
+            mode: "child-move",
+            parent: target.id,
+            childId: kid.id,
+            startPt: pt,
+            origAt: [kid.frame[0], kid.frame[1]],
+            origSize: [kid.frame[2], kid.frame[3]],
+            dx: 0,
+            dy: 0,
+            moved: false,
+          };
+        }
+        return;
+      }
+    }
     selected = target?.id ?? null;
+    selectedChild = null;
+    childOverlay = null;
     if (target === null || target.at === null) return;
     (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
     drag = { mode: "move", id: target.id, startPt: pt, origAt: target.at, dx: 0, dy: 0, moved: false };
@@ -434,7 +519,7 @@
     const dx = pt[0] - d.startPt[0];
     const dy = pt[1] - d.startPt[1];
     if (Math.abs(dx) > 2 || Math.abs(dy) > 2) d.moved = true;
-    if (d.mode === "move") {
+    if (d.mode === "move" || d.mode === "child-move") {
       d.dx = dx;
       d.dy = dy;
     } else {
@@ -454,6 +539,22 @@
       if (samePair(at, d.origAt)) return;
       undoStack.push({ object: d.id, fields: [{ field: "at", from: d.origAt, to: at }] });
       void commit(d.id, { at });
+    } else if (d.mode === "child-move") {
+      const at: [number, number] = [snap8(d.origAt[0] + d.dx), snap8(d.origAt[1] + d.dy)];
+      if (samePair(at, d.origAt)) return;
+      const parent = pageObjects.find((o) => o.id === d.parent);
+      if (parent === undefined) return;
+      // Resolve the node index from the child id at RELEASE time against the
+      // parent's current nodes array — the id is the stable anchor, the
+      // index is not (an agent may have edited the diagram mid-drag).
+      const idx = diagramNodeIndex(parent, d.childId);
+      if (idx === null) return;
+      const set = { [`nodes.${idx}.at`]: at };
+      childOverlay = { id: d.childId, frame: { at, size: d.origSize } };
+      // Child pins stay OFF the §6.7 undo stack, like every set-based edit:
+      // its actor-rule staleness check is frame-based, and the journal's
+      // restyle event is the audit trail.
+      void commit(d.parent, { set }, configSig(applyFieldSet(parent.raw, set)));
     } else {
       const at: [number, number] = [snap8(d.cur.at[0]), snap8(d.cur.at[1])];
       const size: [number, number] = [
@@ -573,15 +674,37 @@
   /** The open inline editor: which object, the live textarea value, and the
    *  seed paragraphs (the no-change gate + the font approximation's line
    *  count). Editing is offered only where `ObjInfo.text` is non-null — the
-   *  kinds the /board/edit text op accepts. */
-  let textEdit = $state<{ id: string; value: string; seed: string[] } | null>(null);
+   *  kinds the /board/edit text op accepts — plus diagram NODE children,
+   *  where `child` names the derived id and the commit rewrites the parent's
+   *  `nodes.<i>.label` via the set op. */
+  let textEdit = $state<{
+    id: string;
+    value: string;
+    seed: string[];
+    child?: { id: string };
+  } | null>(null);
   let editorEl = $state<HTMLTextAreaElement | null>(null);
 
   function beginTextEdit(o: ObjInfo): void {
     if (presenting || o.text === null || o.at === null || o.size === null) return;
     selected = o.id;
+    selectedChild = null;
     drag = null;
     textEdit = { id: o.id, value: paragraphsToEditorText(o.text), seed: o.text };
+  }
+
+  /** The overlay editor over a diagram node's frame, seeded with its stored
+   *  label — same chrome, same Esc/⌘Enter semantics as the object editor. */
+  function beginChildLabelEdit(parent: ObjInfo, childId: string): void {
+    if (presenting) return;
+    const idx = diagramNodeIndex(parent, childId);
+    if (idx === null) return;
+    const label = diagramNodeLabel(parent, idx);
+    if (label === null) return;
+    selected = parent.id;
+    selectedChild = childId;
+    drag = null;
+    textEdit = { id: parent.id, value: label, seed: [label], child: { id: childId } };
   }
 
   /**
@@ -597,6 +720,21 @@
     textEdit = null;
     if (refocus) rootEl?.focus({ preventScroll: true });
     if (!commitValue) return;
+    if (ed.child !== undefined) {
+      // A node label commit: `nodes.<i>.label` on the parent via the set op,
+      // index re-resolved from the stable child id at commit time. The
+      // predicted fingerprint makes the refresh attribute as ours (no
+      // flash); like text edits, it stays off the frame-based undo stack.
+      const parent = pageObjects.find((o) => o.id === ed.id);
+      if (parent === undefined) return;
+      const idx = diagramNodeIndex(parent, ed.child.id);
+      if (idx === null) return;
+      const label = editorTextToNodeLabel(ed.value);
+      if (label === ed.seed[0]) return;
+      const set = { [`nodes.${idx}.label`]: label };
+      void commit(ed.id, { set }, configSig(applyFieldSet(parent.raw, set)));
+      return;
+    }
     const paras = editorTextToParagraphs(ed.value);
     if (sameParagraphs(paras, ed.seed)) return;
     // Text edits stay off the undo stack: its actor-rule staleness check is
@@ -620,16 +758,42 @@
 
   function onDblClick(ev: MouseEvent): void {
     if (presenting || textEdit !== null) return;
-    const target = hit(toPt(ev));
+    const pt = toPt(ev);
+    const target = hit(pt);
+    // A node child takes the double-click when it's under the pointer of the
+    // already-selected composite (the two presses before dblclick did the
+    // drill-in) — the overlay editor opens over the node's frame.
+    if (target !== null && target.id === selected) {
+      const kid = hitChild(pageChildFrames[target.id] ?? [], pt);
+      if (kid !== null && diagramNodeIndex(target, kid.id) !== null) {
+        beginChildLabelEdit(target, kid.id);
+        return;
+      }
+    }
     if (target === null || target.text === null) return;
     beginTextEdit(target);
   }
 
   // The editor's overlay frame in stage pixels, tracking the object's own
   // literal geometry (an agent moving it mid-edit moves the editor with it).
+  // A node child's editor tracks the render's child frame instead — the
+  // engine's own layout, the only geometry a derived child has.
   const editorBox = $derived.by(() => {
     const ed = textEdit;
     if (ed === null) return null;
+    if (ed.child !== undefined) {
+      const childId = ed.child.id;
+      const kid = (pageChildFrames[ed.id] ?? []).find((c) => c.id === childId);
+      if (kid === undefined) return null;
+      const f = childFrameRect(kid);
+      return {
+        left: stageOrigin[0] + f.at[0] * ptScale,
+        top: stageOrigin[1] + f.at[1] * ptScale,
+        width: Math.max(48, f.size[0] * ptScale),
+        height: Math.max(28, f.size[1] * ptScale),
+        font: editorFontPx(f.size, ptScale, 1),
+      };
+    }
     const o = pageObjects.find((x) => x.id === ed.id);
     if (o === undefined || o.at === null || o.size === null) return null;
     return {
@@ -714,9 +878,20 @@
   const termTarget = $derived(
     $referenceTarget !== null && $referenceTarget.ui === "term" ? $referenceTarget : null,
   );
-  const sendableFrame = $derived(
-    selectedObj !== null && selectedObj.at !== null && selectedObj.size !== null,
-  );
+  /** What the deixis affordances point at: the drilled-into child (its
+   *  derived id + engine frame) when one is selected, else the object itself
+   *  — so "chat" carries `[board: … › flow/too-hot]` and the snapshot crops
+   *  to the node, not the whole diagram. */
+  const deixisTarget = $derived.by<{ id: string; frame: Frame } | null>(() => {
+    const o = selectedObj;
+    if (o === null) return null;
+    if (selectedChild !== null) {
+      const f = selectedChildFrame;
+      return f !== null ? { id: selectedChild, frame: f } : null;
+    }
+    return o.at !== null && o.size !== null ? { id: o.id, frame: { at: o.at, size: o.size } } : null;
+  });
+  const sendableFrame = $derived(deixisTarget !== null);
   let snapshotBusy = $state(false);
   const canSendToChat = $derived(
     chatTarget !== null && sendableFrame && board !== null && !snapshotBusy,
@@ -779,19 +954,19 @@
    */
   async function sendSelectionToChat(): Promise<void> {
     const b = board;
-    const o = selectedObj;
+    const d = deixisTarget;
     const target = chatTarget;
-    if (b === null || o === null || o.at === null || o.size === null || target === null) return;
+    if (b === null || d === null || target === null) return;
     if (snapshotBusy) return;
     const pageId = b.pages[page]?.id ?? `page-${page + 1}`;
     const rel = wsRoot !== null ? workspaceRelative(path, wsRoot) : path;
-    const context = composeBoardContext(rel, pageId, [o.id]);
-    const region = snapshotRegion([{ at: o.at, size: o.size }], b.canvas);
+    const context = composeBoardContext(rel, pageId, [d.id]);
+    const region = snapshotRegion([d.frame], b.canvas);
     snapshotBusy = true;
     let attachment: ImageAttachment | null = null;
     let failed = false;
     try {
-      if (region !== null) attachment = await snapshotAttachment(region, `board ${o.id}`);
+      if (region !== null) attachment = await snapshotAttachment(region, `board ${d.id}`);
     } catch {
       failed = true;
     } finally {
@@ -801,8 +976,8 @@
     if (attachment !== null) attachImageToComposer(target.id, attachment);
     showToast(
       attachment !== null
-        ? `sent ${o.id} to ${target.name}`
-        : `sent ${o.id} to ${target.name}${failed ? " — snapshot failed" : " (no snapshot)"}`,
+        ? `sent ${d.id} to ${target.name}`
+        : `sent ${d.id} to ${target.name}${failed ? " — snapshot failed" : " (no snapshot)"}`,
     );
   }
 
@@ -814,14 +989,14 @@
    */
   async function copySnapshotPathForTerm(): Promise<void> {
     const b = board;
-    const o = selectedObj;
+    const d = deixisTarget;
     const target = termTarget;
-    if (b === null || o === null || o.at === null || o.size === null || target === null) return;
+    if (b === null || d === null || target === null) return;
     if (snapshotBusy) return;
     const pageId = b.pages[page]?.id ?? `page-${page + 1}`;
     const rel = wsRoot !== null ? workspaceRelative(path, wsRoot) : path;
-    const context = composeBoardContext(rel, pageId, [o.id]);
-    const region = snapshotRegion([{ at: o.at, size: o.size }], b.canvas);
+    const context = composeBoardContext(rel, pageId, [d.id]);
+    const region = snapshotRegion([d.frame], b.canvas);
     if (region === null) return;
     snapshotBusy = true;
     try {
@@ -839,7 +1014,10 @@
         .replace(/[-:]/g, "")
         .replace(/\..+$/, "")
         .replace("T", "-");
-      const upload = await uploadToSession(target.id, blob, `board-${o.id}-${stamp}.png`);
+      // A derived id carries its parent's `/` — flattened for the upload's
+      // strict basename sanitize.
+      const safe = d.id.replace(/[/\\]/g, "-");
+      const upload = await uploadToSession(target.id, blob, `board-${safe}-${stamp}.png`);
       const copied = await copyText(`${context}@${upload.path}`);
       showToast(
         copied
@@ -881,6 +1059,13 @@
         return;
       if (ev.key === "Enter" && !ev.metaKey && !ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
         const o = selectedObj;
+        // A drilled-into node child takes Enter first — its label opens in
+        // the same overlay editor a double-click would.
+        if (o !== null && selectedChild !== null && diagramNodeIndex(o, selectedChild) !== null) {
+          ev.preventDefault();
+          beginChildLabelEdit(o, selectedChild);
+          return;
+        }
         if (o !== null && o.text !== null && o.at !== null && o.size !== null) {
           ev.preventDefault();
           beginTextEdit(o);
@@ -1050,18 +1235,35 @@
     const d = drag;
     let at = o.at;
     let size = o.size;
-    if (d !== null && d.id === o.id) {
-      if (d.mode === "move") at = [o.at[0] + d.dx, o.at[1] + d.dy];
-      else {
-        at = d.cur.at;
-        size = d.cur.size;
-      }
+    if (d !== null && d.mode === "move" && d.id === o.id) {
+      at = [o.at[0] + d.dx, o.at[1] + d.dy];
+    } else if (d !== null && d.mode === "resize" && d.id === o.id) {
+      at = d.cur.at;
+      size = d.cur.size;
     }
     return {
       left: stageOrigin[0] + at[0] * ptScale,
       top: stageOrigin[1] + at[1] * ptScale,
       width: size[0] * ptScale,
       height: size[1] * ptScale,
+    };
+  });
+
+  /** The drilled-into child's outline in stage pixels, tracking an in-flight
+   *  child drag exactly like the parent box tracks a move. */
+  const childBox = $derived.by(() => {
+    const f = selectedChildFrame;
+    if (f === null) return null;
+    const d = drag;
+    let at = f.at;
+    if (d !== null && d.mode === "child-move" && d.childId === selectedChild) {
+      at = [f.at[0] + d.dx, f.at[1] + d.dy];
+    }
+    return {
+      left: stageOrigin[0] + at[0] * ptScale,
+      top: stageOrigin[1] + at[1] * ptScale,
+      width: f.size[0] * ptScale,
+      height: f.size[1] * ptScale,
     };
   });
 </script>
@@ -1096,8 +1298,11 @@
         />
         {#if !presenting}
           {#if selectionBox !== null}
+            <!-- With a child drilled into, the parent demotes to a dashed
+                 containment hint and the child wears the selection. -->
             <div
               class="selection"
+              class:parent={selectedChild !== null}
               style:left={`${selectionBox.left}px`}
               style:top={`${selectionBox.top}px`}
               style:width={`${selectionBox.width}px`}
@@ -1111,6 +1316,15 @@
                 style:top={`${h.y - HANDLE_PX / 2}px`}
               ></div>
             {/each}
+            {#if childBox !== null}
+              <div
+                class="selection"
+                style:left={`${childBox.left}px`}
+                style:top={`${childBox.top}px`}
+                style:width={`${childBox.width}px`}
+                style:height={`${childBox.height}px`}
+              ></div>
+            {/if}
           {/if}
           {#each flashes as f (f.key)}
             <div
@@ -1299,8 +1513,19 @@
       title={board?.title ?? "board"}
       objects={pageObjects}
       {selected}
+      childFrames={pageChildFrames}
+      {selectedChild}
       catSwatches={render?.catSwatches ?? []}
-      onselect={(id) => (selected = id)}
+      onselect={(id) => {
+        selected = id;
+        selectedChild = null;
+        childOverlay = null;
+      }}
+      onselectchild={(parentId, childId) => {
+        selected = parentId;
+        selectedChild = childId;
+        childOverlay = null;
+      }}
       oncommitfield={commitField}
       oncommitset={commitSet}
     />
@@ -1361,6 +1586,11 @@
     border-radius: 2px;
     pointer-events: none;
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  .selection.parent {
+    border-style: dashed;
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow: none;
   }
   .handle {
     position: absolute;

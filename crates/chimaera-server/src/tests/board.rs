@@ -158,6 +158,66 @@ async fn board_render_is_content_addressed_across_requests() {
     );
 }
 
+/// A diagram composite — its derived children must ride the render response
+/// as `childFrames`, on the miss AND the cached-hit path (the sidecar carries
+/// them like diagnostics).
+const BOARD_DIAGRAM: &str = r#"{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "title": "Flow",
+  "canvas": { "size": [400, 300] },
+  "pages": [
+    {
+      "id": "p1",
+      "objects": [
+        { "id": "flow", "type": "diagram", "at": [24, 24], "size": [352, 252],
+          "nodes": [ { "id": "a", "label": "Start" }, { "id": "b", "label": "End" } ],
+          "edges": [ { "from": "a", "to": "b" } ] }
+      ]
+    }
+  ]
+}
+"#;
+
+#[tokio::test]
+async fn board_render_carries_child_frames_on_miss_and_hit() {
+    let state = test_state();
+    let path = write_board_src("board-render-children", BOARD_DIAGRAM);
+    let body = serde_json::json!({"path": path.to_string_lossy(), "scale": 1.0});
+
+    let (status, first) = request(
+        &state,
+        Method::POST,
+        "/api/v1/board/render",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let kids = first["childFrames"]["flow"].as_array().unwrap();
+    let ids: Vec<&str> = kids.iter().map(|k| k["id"].as_str().unwrap()).collect();
+    // The exact child set follows the engine's expansion (edge underlays come
+    // and go with routing work); the contract is: derived ids under the
+    // composite, node shapes present, nodes AFTER edge children so a
+    // backwards hit-test walk picks the node.
+    assert!(ids.iter().all(|i| i.starts_with("flow/")), "{ids:?}");
+    let pos = |id: &str| {
+        ids.iter()
+            .position(|i| *i == id)
+            .unwrap_or_else(|| panic!("{id} in {ids:?}"))
+    };
+    let (a, b) = (pos("flow/a"), pos("flow/b"));
+    if let Some(edge) = ids.iter().position(|i| i.starts_with("flow/edge")) {
+        assert!(a > edge && b > edge, "nodes above edges (z-order): {ids:?}");
+    }
+    let frame = kids[a]["frame"].as_array().unwrap();
+    assert_eq!(frame.len(), 4, "[x, y, w, h] in page points");
+    assert!(frame[2].as_f64().unwrap() > 0.0, "a laid-out width");
+
+    // The cached hit serves the same frames from the sidecar.
+    let (_, second) = request(&state, Method::POST, "/api/v1/board/render", Some(body)).await;
+    assert_eq!(first["childFrames"], second["childFrames"]);
+}
+
 #[tokio::test]
 async fn board_describe_returns_the_read_back() {
     let state = test_state();

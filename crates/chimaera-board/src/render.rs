@@ -82,7 +82,7 @@ impl Default for RasterParams {
 /// Released upgrades are already covered by the crate version in the
 /// fingerprint; the epoch exists for changes within one version, i.e. the
 /// dev loop, where the version is pinned at the 0.0.1 sentinel.
-pub const RENDER_EPOCH: u32 = 1;
+pub const RENDER_EPOCH: u32 = 2; // 2: routed diagram edges + themed node paint
 
 /// The engine identity folded into every render key and prefixed onto it —
 /// the visible prefix is what lets [`crate::prune_renders`] recognize, by

@@ -3,11 +3,16 @@ import {
   applyFieldSet,
   attributeDiff,
   chartConfig,
+  childFrameRect,
   composeBoardContext,
   configSig,
+  diagramNodeIndex,
+  diagramNodeLabel,
   editableText,
   editorFontPx,
+  editorTextToNodeLabel,
   editorTextToParagraphs,
+  hitChild,
   MARK_SWAP_KINDS,
   nextPinId,
   paragraphsToEditorText,
@@ -17,6 +22,7 @@ import {
   SORT_OPTIONS,
   unresolvedPins,
   SNAPSHOT_PAD_PT,
+  type ChildFrame,
   type ExpectedChange,
   type ObjInfo,
   type ObjSnap,
@@ -111,6 +117,77 @@ describe("composeBoardContext", () => {
     expect(composeBoardContext("deck.board.json", "page-1", ["title"])).toBe(
       "[board: deck.board.json › page-1 › title] ",
     );
+  });
+
+  it("carries a derived child id verbatim — the deixis the daemon's describe speaks", () => {
+    expect(composeBoardContext("coffee.board.json", "p1", ["flow/too-hot"])).toBe(
+      "[board: coffee.board.json › p1 › flow/too-hot] ",
+    );
+  });
+});
+
+describe("composite children (childFrames hit-testing + node mapping)", () => {
+  const kids: ChildFrame[] = [
+    { id: "flow/lane.prep", frame: [40, 40, 300, 200] },
+    { id: "flow/lane.prep.label", frame: [52, 44, 100, 16] },
+    { id: "flow/pour", frame: [80, 80, 120, 40] },
+    { id: "flow/too-hot", frame: [80, 160, 120, 40] },
+  ];
+
+  it("hitChild picks the topmost child (z = array order), like the stage hit-test", () => {
+    // Inside both the lane hull and the node — the node wins (drawn later).
+    expect(hitChild(kids, [100, 100])?.id).toBe("flow/pour");
+    expect(hitChild(kids, [100, 180])?.id).toBe("flow/too-hot");
+    // Lane-only territory falls back to the lane rect.
+    expect(hitChild(kids, [300, 200])?.id).toBe("flow/lane.prep");
+    expect(hitChild(kids, [10, 10])).toBeNull();
+  });
+
+  it("childFrameRect projects the wire tuple to the pane's Frame shape", () => {
+    expect(childFrameRect({ id: "x", frame: [1, 2, 3, 4] })).toEqual({
+      at: [1, 2],
+      size: [3, 4],
+    });
+  });
+
+  const diagram = obj({
+    id: "flow",
+    type: "diagram",
+    at: [40, 40],
+    size: [400, 300],
+    nodes: [
+      { id: "pour", label: "Pour water" },
+      { id: "too-hot", label: "Too hot?" },
+      // A duplicate declaration: the engine only ever emits the FIRST, so
+      // the mapping must resolve to it too.
+      { id: "pour", label: "shadowed" },
+    ],
+    edges: [{ from: "pour", to: "too-hot" }],
+  });
+
+  it("maps a derived child id to its node index, first declaration winning", () => {
+    expect(diagramNodeIndex(diagram, "flow/pour")).toBe(0);
+    expect(diagramNodeIndex(diagram, "flow/too-hot")).toBe(1);
+  });
+
+  it("refuses non-node children and foreign ids", () => {
+    // Lane rects/labels expand under `<id>/lane.…` and are not draggable.
+    expect(diagramNodeIndex(diagram, "flow/lane.prep")).toBeNull();
+    expect(diagramNodeIndex(diagram, "other/pour")).toBeNull();
+    expect(diagramNodeIndex(diagram, "flow/ghost")).toBeNull();
+    // Only diagrams have node entries to anchor a set edit on.
+    expect(diagramNodeIndex(obj({ id: "cb", type: "colorbar" }), "cb/slice[0]")).toBeNull();
+  });
+
+  it("reads the stored node label as the editor seed", () => {
+    expect(diagramNodeLabel(diagram, 1)).toBe("Too hot?");
+    expect(diagramNodeLabel(diagram, 9)).toBeNull();
+  });
+
+  it("collapses editor newlines into a single-line label", () => {
+    expect(editorTextToNodeLabel("Blow and\r\nwait")).toBe("Blow and wait");
+    expect(editorTextToNodeLabel("one\n\ntwo")).toBe("one two");
+    expect(editorTextToNodeLabel("plain")).toBe("plain");
   });
 });
 

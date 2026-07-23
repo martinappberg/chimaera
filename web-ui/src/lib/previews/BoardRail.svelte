@@ -4,25 +4,64 @@
    * Purely presentational — plain parsed data and callbacks only, no shared
    * state; every mutation goes back through the parent's commit path.
    */
-  import { chartConfig, MARK_SWAP_KINDS, SORT_OPTIONS, type ObjInfo } from "./boardInteract";
+  import {
+    chartConfig,
+    MARK_SWAP_KINDS,
+    SORT_OPTIONS,
+    type ChildFrame,
+    type ObjInfo,
+  } from "./boardInteract";
 
   interface Props {
     title: string;
     objects: ObjInfo[];
     selected: string | null;
+    /** Composite id → derived children + laid-out frames (the render
+     *  response's childFrames) — what the expandable sublists list. */
+    childFrames: Record<string, ChildFrame[]>;
+    /** The drilled-into child's derived id, highlighted in its sublist. */
+    selectedChild: string | null;
     /** The board theme's categorical ramp (@token + resolved hex), from the
      *  render response — the series-color swatches. */
     catSwatches: { token: string; hex: string }[];
     onselect: (id: string | null) => void;
+    /** A child row's click: select the derived child under its composite
+     *  (null collapses back to the composite itself). */
+    onselectchild: (parentId: string, childId: string | null) => void;
     oncommitfield: (field: "x" | "y" | "w" | "h", raw: string) => void;
     /** Sparse config edit on the selected object (the /board/edit set op):
      *  dot-path → value, null clears. */
     oncommitset: (set: Record<string, unknown>) => void;
   }
-  let { title, objects, selected, catSwatches, onselect, oncommitfield, oncommitset }: Props =
-    $props();
+  let {
+    title,
+    objects,
+    selected,
+    childFrames,
+    selectedChild,
+    catSwatches,
+    onselect,
+    onselectchild,
+    oncommitfield,
+    oncommitset,
+  }: Props = $props();
 
   const selectedObj = $derived(objects.find((o) => o.id === selected) ?? null);
+
+  /** Manually toggled disclosures; absent = follow the selection (a
+   *  composite whose child is selected auto-expands). */
+  let expanded = $state<Record<string, boolean>>({});
+  function isOpen(id: string): boolean {
+    return expanded[id] ?? (selected === id && selectedChild !== null);
+  }
+
+  /** The selected child's live frame, for the read-only inspector line. */
+  const selectedChildFrame = $derived.by<ChildFrame | null>(() => {
+    if (selected === null || selectedChild === null) return null;
+    return (childFrames[selected] ?? []).find((c) => c.id === selectedChild) ?? null;
+  });
+
+  const fmt = (n: number): string => String(Math.round(n * 10) / 10);
 
   // The chart config projection of the selected object (null for non-charts):
   // current values are the file's own literals, refreshed by the same reparse
@@ -72,21 +111,60 @@
   <div class="rail-title">{title}</div>
   <div class="outline">
     {#each objects as o (o.id)}
-      <button
-        class="obj"
-        class:on={o.id === selected}
-        onclick={() => onselect(o.id === selected ? null : o.id)}
-      >
-        <span class="obj-kind">{o.kind}</span>
-        <span class="obj-id">{o.id}</span>
-      </button>
+      {@const kids = childFrames[o.id] ?? []}
+      <div class="obj-row">
+        <button
+          class="obj"
+          class:on={o.id === selected && selectedChild === null}
+          onclick={() => onselect(o.id === selected ? null : o.id)}
+        >
+          <span class="obj-kind">{o.kind}</span>
+          <span class="obj-id">{o.id}</span>
+        </button>
+        {#if kids.length > 0}
+          <button
+            class="twist"
+            aria-expanded={isOpen(o.id)}
+            aria-label={`${isOpen(o.id) ? "collapse" : "expand"} ${o.id} children`}
+            onclick={() => (expanded[o.id] = !isOpen(o.id))}
+          >{isOpen(o.id) ? "▾" : "▸"}</button>
+        {/if}
+      </div>
+      {#if kids.length > 0 && isOpen(o.id)}
+        <!-- Derived children (`<id>/<part>`): the engine's expansion, listed
+             under the composite that generates them. Selecting one drills
+             the stage selection into it. -->
+        {#each kids as k (k.id)}
+          <button
+            class="obj child"
+            class:on={k.id === selectedChild}
+            onclick={() => onselectchild(o.id, k.id === selectedChild ? null : k.id)}
+          >
+            <span class="obj-id">{k.id.slice(o.id.length + 1)}</span>
+          </button>
+        {/each}
+      {/if}
     {/each}
     {#if objects.length === 0}
       <div class="empty">no objects on this page</div>
     {/if}
   </div>
 
-  {#if selectedObj !== null && selectedObj.at !== null && selectedObj.size !== null}
+  {#if selectedChild !== null}
+    <!-- A derived child: geometry is the layout's, not the file's, so the
+         numbers are read-only — a node drag pins `nodes.<i>.at` instead. -->
+    <div class="inspector">
+      <div class="insp-head">{selectedChild}</div>
+      {#if selectedChildFrame !== null}
+        <div class="insp-unit mono">
+          at [{fmt(selectedChildFrame.frame[0])}, {fmt(selectedChildFrame.frame[1])}] · size [{fmt(
+            selectedChildFrame.frame[2],
+          )}, {fmt(selectedChildFrame.frame[3])}]
+        </div>
+      {/if}
+      <div class="insp-unit">layout-derived · drag a node to pin it</div>
+    </div>
+  {:else if selectedObj !== null && selectedObj.at !== null && selectedObj.size !== null}
     <div class="inspector">
       <div class="insp-head">{selectedObj.id}</div>
       <div class="insp-grid">
@@ -203,6 +281,39 @@
   .obj.on {
     background: var(--row-active);
   }
+  .obj-row {
+    display: flex;
+    align-items: center;
+  }
+  .obj-row .obj {
+    flex: 1;
+    min-width: 0;
+  }
+  .twist {
+    flex-shrink: 0;
+    width: 18px;
+    padding: 2px 0;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--muted);
+    font-size: var(--text-xs);
+    line-height: 1;
+    cursor: pointer;
+  }
+  .twist:hover {
+    background: var(--row-hover);
+    color: var(--fg);
+  }
+  .obj.child {
+    padding-left: 22px;
+  }
+  .obj.child .obj-id {
+    color: var(--muted);
+  }
+  .obj.child.on .obj-id {
+    color: var(--fg);
+  }
   .obj-kind {
     color: var(--muted);
     font-family: var(--mono);
@@ -259,6 +370,10 @@
     margin-top: 6px;
     font-size: var(--text-xs);
     color: var(--muted);
+  }
+  .insp-unit.mono {
+    font-family: var(--mono);
+    color: var(--fg);
   }
   .insp-sect {
     margin-top: 10px;

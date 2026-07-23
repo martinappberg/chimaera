@@ -261,6 +261,26 @@ fn describe_object(
                 d.nodes.len(),
                 d.edges.len()
             );
+            // The derived children the pane and journal address (`<id>/<node>`
+            // — stable ids the file never stores), so an agent can Edit or
+            // discuss one node without reading the JSON. Laid-out geometry is
+            // font-dependent and lives in the render path; only a pinned
+            // node's stated position prints, which is exactly the field a
+            // `set nodes.<i>.at` edit would clobber.
+            let child_indent = "  ".repeat(depth + 1);
+            for n in &d.nodes {
+                let _ = write!(s, "{child_indent}{}/{} node: {:?}", d.id, n.id, n.label);
+                if let Some(shape) = n.shape {
+                    let _ = write!(s, " {}", shape.geo());
+                }
+                if let Some(lane) = &n.lane {
+                    let _ = write!(s, " · lane {lane}");
+                }
+                if let Some(at) = n.at {
+                    let _ = write!(s, " · pinned at [{}, {}]", at[0], at[1]);
+                }
+                let _ = writeln!(s);
+            }
         }
         Object::Equation(eq) => {
             // The TeX source is the content — print it, truncated, so the

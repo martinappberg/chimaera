@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::schema::{
     Board, Canvas, ChannelType, ChartObject, Extra, Object, Page, Paragraph, TextObject,
 };
+use crate::theme::Theme;
 
 /// The `show` spec: `title`, `note`, and exactly one of `chart` / `table` /
 /// `text` / `mermaid`.
@@ -306,6 +307,32 @@ fn diagram_object(src: &str, body: [f64; 4]) -> Result<Object> {
     Ok(Object::Diagram(d))
 }
 
+/// The card size a `show --mermaid` auto-fits to its flowchart: the layout's
+/// natural size plus the card chrome, clamped to a sane card range — a
+/// 7-node flow gets a card its shape fills instead of floating in a preset.
+/// Only the default preset auto-sizes; an explicit `--size`/`--preset` wins.
+pub fn mermaid_card_size(
+    src: &str,
+    has_title: bool,
+    has_note: bool,
+    theme: &Theme,
+    fonts: &crate::layout::FontStack,
+) -> Result<[f64; 2]> {
+    let d = crate::diagram::from_mermaid(src)?;
+    let nat = crate::diagram::natural_size(&d, theme, fonts);
+    let mut h = nat[1] + M * 2.0;
+    if has_title {
+        h += TITLE_H + 8.0;
+    }
+    if has_note {
+        h += NOTE_H + 8.0;
+    }
+    Ok([
+        (nat[0] + M * 2.0).clamp(420.0, 1440.0).ceil(),
+        h.clamp(280.0, 1100.0).ceil(),
+    ])
+}
+
 /// Lay a table out as text rows. A real `table` composite arrives in slice 3;
 /// this is the honest slice-0 rendering — monospace-free, role-driven, and
 /// readable — not a second table implementation to migrate away from.
@@ -525,6 +552,57 @@ mod tests {
         let fonts = FontStack::new(&[]);
         let out = render_page(&board, 0, &theme, &fonts, RasterParams::default()).unwrap();
         assert!(out.png.len() > 1000);
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.severity == crate::Severity::Error),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_mermaid_card_auto_sizes_to_its_flowchart() {
+        let theme = crate::theme::default_for(true);
+        let fonts = FontStack::new(&[]);
+        let src = "flowchart TD\nA[Lift cup] --> B[Bring to lips]\nB --> C{Too hot?}\n\
+                   C -->|Yes| D[Blow and wait]\nD --> B\nC -->|No| E[Sip and swallow]\n\
+                   E --> F{Coffee left?}\nF -->|Yes| A\nF -->|No| G[Set cup down]\n";
+        let size = mermaid_card_size(src, false, false, &theme, &fonts).unwrap();
+        // The card wraps the natural layout plus margins, inside the clamp.
+        let d = crate::diagram::from_mermaid(src).unwrap();
+        let nat = crate::diagram::natural_size(&d, &theme, &fonts);
+        assert!(
+            size[0] >= nat[0] && size[1] >= nat[1],
+            "{size:?} vs {nat:?}"
+        );
+        assert!((280.0..=1100.0).contains(&size[1]), "{size:?}");
+        assert!((420.0..=1440.0).contains(&size[0]), "{size:?}");
+        // Title and note buy their chrome back.
+        let titled = mermaid_card_size(src, true, true, &theme, &fonts).unwrap();
+        assert!(titled[1] > size[1], "{titled:?} vs {size:?}");
+        // A tiny graph still gets a readable card, not a stamp.
+        let tiny =
+            mermaid_card_size("flowchart TD\nA --> B\n", false, false, &theme, &fonts).unwrap();
+        assert_eq!(tiny, [420.0, 280.0]);
+        // And the sized board renders without errors.
+        let spec = ShowSpec {
+            title: None,
+            note: None,
+            chart: None,
+            table: None,
+            text: None,
+            mermaid: Some(src.to_string()),
+        };
+        let board = build_board(&spec, size, "talk-dark").unwrap();
+        let out = render_page(
+            &board,
+            0,
+            &theme,
+            &FontStack::new(&[]),
+            RasterParams::default(),
+        )
+        .unwrap();
         assert!(
             !out.diagnostics
                 .iter()

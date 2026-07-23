@@ -44,6 +44,12 @@ const GIT_SETTLE: Duration = Duration::from_millis(1000);
 /// map — bounded memory beats coalescing under a pathological client.
 const GIT_SETTLE_MAX_PENDING: usize = 128;
 
+/// Ceiling on `childFrames` entries per render response. A page holds a few
+/// composites of a few dozen children each; the cap only exists so a
+/// pathological board (hundreds of colorbars) cannot grow the response —
+/// bounded wire beats complete hit-testing on a board nobody can read anyway.
+const CHILD_FRAMES_CAP: usize = 512;
+
 /// Per-path write serialization for the mutating board routes: two concurrent
 /// read-modify-write cycles on one file (edit vs. edit, or an edit's journal
 /// append racing a POSTed journal event's seq stamp) would lose an update.
@@ -191,10 +197,10 @@ pub(crate) async fn render(
         // sub-floor errors would make warnings vanish on every reload.
         let sidecar = png_path.with_extension("json");
 
-        let (width, height) = match read_sidecar(&sidecar, &png_path) {
-            Some((w, h, cached)) => {
+        let (width, height, child_frames) = match read_sidecar(&sidecar, &png_path) {
+            Some((w, h, cached, children)) => {
                 diagnostics.extend(cached);
-                (w, h)
+                (w, h, children)
             }
             None => {
                 // Only a miss pays for the font stack — building one walks
@@ -202,11 +208,20 @@ pub(crate) async fn render(
                 // a shared login node.
                 let fonts = FontStack::for_workspace(&ws);
                 let out = render_page(&board, req.page, &theme, &fonts, params)?;
+                // Child frames are part of the same pure function as the
+                // pixels (board bytes × theme × page), so they persist in the
+                // sidecar exactly like diagnostics: a cache hit must not make
+                // composite children silently unselectable.
+                let children = board
+                    .pages
+                    .get(req.page)
+                    .map(|p| sidecar_child_frames(&board, p, &theme, &fonts))
+                    .unwrap_or_default();
                 chimaera_board::write_atomic(&png_path, &out.png)?;
-                write_sidecar(&sidecar, out.width, out.height, &out.diagnostics);
+                write_sidecar(&sidecar, out.width, out.height, &out.diagnostics, &children);
                 chimaera_board::prune_renders(&dir, chimaera_board::RENDER_CACHE_CAP);
                 diagnostics.extend(out.diagnostics);
-                (out.width, out.height)
+                (out.width, out.height, children)
             }
         };
 
@@ -229,6 +244,12 @@ pub(crate) async fn render(
                 .filter(|t| t.starts_with('@'))
                 .filter_map(|t| theme.color(t).map(|rgb| json!({"token": t, "hex": rgb.hex()})))
                 .collect::<Vec<_>>(),
+            // Every composite's derived children (`<id>/<part>`) and where
+            // the layout put them, in page points — the pane's hit-test map
+            // for selecting/dragging/discussing a diagram node instead of
+            // treating the composite as one opaque rectangle. Additive;
+            // ordered within a composite by z (expansion order).
+            "childFrames": child_frames,
             "diagnostics": diagnostics
                 .iter()
                 .map(|d| json!({
@@ -909,13 +930,20 @@ fn resolve_board_path(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// The persisted half of a render's output: dimensions plus diagnostics,
-/// written beside the PNG under the same content-addressed key.
+/// The persisted half of a render's output: dimensions, diagnostics, and the
+/// composites' child frames, written beside the PNG under the same
+/// content-addressed key.
 #[derive(serde::Serialize, Deserialize)]
 struct RenderSidecar {
     width: u32,
     height: u32,
     diagnostics: Vec<SidecarDiag>,
+    /// Composite id → its derived children's laid-out frames. `None` marks a
+    /// sidecar from before the field existed — treated as a cache miss, so an
+    /// upgrade re-renders once rather than serving a board whose composite
+    /// children silently stopped hit-testing.
+    #[serde(default)]
+    child_frames: Option<std::collections::BTreeMap<String, Vec<SidecarChild>>>,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -930,17 +958,64 @@ struct SidecarDiag {
     message: String,
 }
 
+/// One derived child on the wire: its stable derived id (`<composite>/<part>`)
+/// and `[x, y, w, h]` in page points — the same shape the pane's own frame
+/// math speaks.
+#[derive(serde::Serialize, Deserialize)]
+struct SidecarChild {
+    id: String,
+    frame: [f64; 4],
+}
+
+/// The page's composite child frames in wire/sidecar form, capped at
+/// [`CHILD_FRAMES_CAP`] total entries (truncation is deterministic: id order,
+/// z-order within a composite — the same order the map itself carries).
+fn sidecar_child_frames(
+    board: &chimaera_board::Board,
+    page: &chimaera_board::Page,
+    theme: &Theme,
+    fonts: &FontStack,
+) -> std::collections::BTreeMap<String, Vec<SidecarChild>> {
+    let mut budget = CHILD_FRAMES_CAP;
+    let mut out = std::collections::BTreeMap::new();
+    for (parent, children) in
+        chimaera_board::composites::page_child_frames(board, page, theme, fonts)
+    {
+        if budget == 0 {
+            break;
+        }
+        let take: Vec<SidecarChild> = children
+            .into_iter()
+            .take(budget)
+            .map(|(id, f)| SidecarChild {
+                id,
+                frame: [f.x, f.y, f.w, f.h],
+            })
+            .collect();
+        budget -= take.len();
+        out.insert(parent, take);
+    }
+    out
+}
+
+/// What a cache hit yields: dimensions, diagnostics, and the child frames.
+type SidecarHit = (
+    u32,
+    u32,
+    Vec<chimaera_board::Diagnostic>,
+    std::collections::BTreeMap<String, Vec<SidecarChild>>,
+);
+
 /// A cache hit needs both halves intact; a missing or unreadable sidecar (or
-/// PNG) degrades to a re-render, never to serving broken state.
-fn read_sidecar(
-    sidecar: &std::path::Path,
-    png_path: &std::path::Path,
-) -> Option<(u32, u32, Vec<chimaera_board::Diagnostic>)> {
+/// PNG, or a pre-`child_frames` sidecar) degrades to a re-render, never to
+/// serving broken state.
+fn read_sidecar(sidecar: &std::path::Path, png_path: &std::path::Path) -> Option<SidecarHit> {
     if !png_path.exists() {
         return None;
     }
     let raw = std::fs::read_to_string(sidecar).ok()?;
     let parsed: RenderSidecar = serde_json::from_str(&raw).ok()?;
+    let children = parsed.child_frames?;
     let diags = parsed
         .diagnostics
         .into_iter()
@@ -957,7 +1032,7 @@ fn read_sidecar(
             diag
         })
         .collect();
-    Some((parsed.width, parsed.height, diags))
+    Some((parsed.width, parsed.height, diags, children))
 }
 
 /// Best-effort: a failed sidecar write costs a re-render on the next hit,
@@ -967,6 +1042,7 @@ fn write_sidecar(
     width: u32,
     height: u32,
     diagnostics: &[chimaera_board::Diagnostic],
+    child_frames: &std::collections::BTreeMap<String, Vec<SidecarChild>>,
 ) {
     let payload = RenderSidecar {
         width,
@@ -981,6 +1057,22 @@ fn write_sidecar(
                 message: d.message.clone(),
             })
             .collect(),
+        child_frames: Some(
+            child_frames
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.iter()
+                            .map(|c| SidecarChild {
+                                id: c.id.clone(),
+                                frame: c.frame,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
     };
     if let Ok(bytes) = serde_json::to_vec(&payload) {
         let _ = chimaera_board::write_atomic(sidecar, &bytes);
@@ -1185,6 +1277,95 @@ mod tests {
         assert_eq!(
             chart.y.as_ref().unwrap().title.as_deref(),
             Some("Time (ms)")
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A fresh workspace with a two-node diagram board on disk — the child
+    /// gestures' fixture (drag a node → `nodes.<i>.at`, rename it →
+    /// `nodes.<i>.label`).
+    fn diagram_board(label: &str) -> (PathBuf, PathBuf) {
+        let ws = std::env::temp_dir().join(format!(
+            "chimaera-board-diag-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let path = ws.join("flow.board.json");
+        let board: chimaera_board::Board = serde_json::from_str(
+            r#"{"format":"chimaera.board","formatVersion":1,
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"p1","objects":[
+                  {"id":"flow","type":"diagram","at":[48,48],"size":[500,400],
+                   "nodes":[{"id":"start","label":"Start"},{"id":"end","label":"End"}],
+                   "edges":[{"from":"start","to":"end"}]}]}]}"#,
+        )
+        .unwrap();
+        chimaera_board::save(&path, &board).unwrap();
+        (ws, path)
+    }
+
+    /// The pane's child gestures land as sparse `set` edits on the parent
+    /// diagram's node entry: a drag pins `nodes.<i>.at`, the overlay editor
+    /// rewrites `nodes.<i>.label` — geometry refusal guards only the OBJECT's
+    /// own at/size, and the journal's restyle names the node paths.
+    #[test]
+    fn set_pins_a_diagram_node_and_edits_its_label() {
+        let (ws, path) = diagram_board("pin");
+        let req = edit_req(
+            &path,
+            "flow",
+            serde_json::json!({"nodes.0.at": [64.0, 80.0], "nodes.1.label": "Done"}),
+        );
+        let out = perform_edit(&path, &req).unwrap();
+        let seq = out.get("journalSeq").and_then(|s| s.as_u64()).unwrap();
+
+        let board = chimaera_board::load(&path).unwrap();
+        let (_, obj) = board.objects().find(|(_, o)| o.id() == "flow").unwrap();
+        let chimaera_board::Object::Diagram(d) = obj else {
+            panic!("flow stayed a diagram");
+        };
+        assert_eq!(d.nodes[0].at, Some([64.0, 80.0]));
+        assert_eq!(d.nodes[1].label, "Done");
+        // Byte-canonical: the file is exactly the crate writer's output.
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(bytes, chimaera_board::to_string(&board).unwrap());
+
+        let journal_path = chimaera_board::journal::journal_path(&ws, &path);
+        let events = chimaera_board::journal::read_since(&journal_path, 0).unwrap();
+        let restyle = events.iter().find(|e| e.seq == seq).unwrap();
+        match &restyle.kind {
+            chimaera_board::journal::EventKind::Restyle { object, changed } => {
+                assert_eq!(object, "flow");
+                assert_eq!(
+                    changed.get("nodes.0.at").unwrap(),
+                    &serde_json::json!([64.0, 80.0])
+                );
+                assert_eq!(changed.get("nodes.1.label").unwrap(), "Done");
+            }
+            other => panic!("expected restyle, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// An invalid pin (wrong arity) turns the diagram unparseable, so the
+    /// whole-object re-parse gate refuses it atomically — nothing written.
+    #[test]
+    fn an_invalid_node_pin_is_rejected_atomically() {
+        let (ws, path) = diagram_board("badpin");
+        let before = std::fs::read_to_string(&path).unwrap();
+        for set in [
+            serde_json::json!({"nodes.0.at": [1.0, 2.0, 3.0]}),
+            serde_json::json!({"nodes.0.label": 42}),
+            serde_json::json!({"nodes.9.at": [0.0, 0.0]}),
+        ] {
+            let err = perform_edit(&path, &edit_req(&path, "flow", set)).unwrap_err();
+            assert!(err.downcast_ref::<SetRejected>().is_some(), "{err:#}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the file is untouched"
         );
         let _ = std::fs::remove_dir_all(&ws);
     }

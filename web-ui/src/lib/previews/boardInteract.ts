@@ -326,6 +326,77 @@ export function chartConfig(o: ObjInfo): ChartConfig | null {
   };
 }
 
+// --- composite children (the render's childFrames map) ----------------------
+
+/**
+ * One derived child from /board/render's `childFrames`: the stable derived id
+ * (`<composite>/<part>` — the same id the journal and describe speak) and its
+ * laid-out `[x, y, w, h]` frame in page points. Layout truth stays
+ * server-side: these rects are the engine's own expansion, so child
+ * hit-testing agrees with the pixels by construction.
+ */
+export interface ChildFrame {
+  id: string;
+  frame: [number, number, number, number];
+}
+
+/** Topmost child under the point — expansion order is z-order, so walk
+ *  backwards, exactly like the stage's own object hit-test. */
+export function hitChild(children: ChildFrame[], pt: [number, number]): ChildFrame | null {
+  for (let i = children.length - 1; i >= 0; i--) {
+    const [x, y, w, h] = children[i].frame;
+    if (pt[0] >= x && pt[0] <= x + w && pt[1] >= y && pt[1] <= y + h) return children[i];
+  }
+  return null;
+}
+
+/** A ChildFrame's rect as the pane's `Frame` shape. */
+export function childFrameRect(c: ChildFrame): Frame {
+  return { at: [c.frame[0], c.frame[1]], size: [c.frame[2], c.frame[3]] };
+}
+
+/**
+ * Resolve a derived child id to its node INDEX in the parent diagram's own
+ * `nodes` array — the anchor a `set` edit needs (`nodes.<i>.at` /
+ * `nodes.<i>.label`). Resolved from the child id at commit time, never cached:
+ * the id is stable, the index is not. First declaration wins on a duplicate,
+ * mirroring the engine's expansion (later duplicates are never emitted). Null
+ * = not a diagram node child (a lane box/label, another composite kind, a
+ * foreign id).
+ */
+export function diagramNodeIndex(parent: ObjInfo, childId: string): number | null {
+  if (parent.kind !== "diagram") return null;
+  const prefix = `${parent.id}/`;
+  if (!childId.startsWith(prefix)) return null;
+  const nodeId = childId.slice(prefix.length);
+  const raw = parent.raw as { nodes?: unknown } | null;
+  const nodes = Array.isArray(raw?.nodes) ? raw.nodes : [];
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i] as { id?: unknown } | null;
+    if (typeof n?.id === "string" && n.id === nodeId) return i;
+  }
+  return null;
+}
+
+/** The node's stored label at `index` — the overlay editor's seed. Null when
+ *  the index does not name a labeled node (the file changed under us). */
+export function diagramNodeLabel(parent: ObjInfo, index: number): string | null {
+  const raw = parent.raw as { nodes?: unknown } | null;
+  const nodes = Array.isArray(raw?.nodes) ? raw.nodes : [];
+  const n = nodes[index] as { label?: unknown } | null | undefined;
+  return typeof n?.label === "string" ? n.label : null;
+}
+
+/**
+ * The overlay editor's commit projection for a node label: one string, CR
+ * forms normalized and newlines collapsed to spaces — a diagram node lays
+ * out as a single measured line, so a stored newline would be invisible
+ * intent.
+ */
+export function editorTextToNodeLabel(text: string): string {
+  return text.replace(/\r\n?/g, "\n").replace(/\n+/g, " ");
+}
+
 // --- selection-as-deixis (§6.4) ---------------------------------------------
 
 /**

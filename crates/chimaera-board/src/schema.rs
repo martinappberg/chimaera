@@ -1443,6 +1443,12 @@ pub struct DiagramNode {
     /// Defaults to `roundRect` when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shape: Option<NodeShape>,
+    /// Pinned top-left position in page points. Absent (the norm) means the
+    /// layered layout places the node; present means the layout honors the
+    /// pin — a human dragged this node and it stays where its diagram flows
+    /// around it. Size stays layout-derived either way (it follows the label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<[f64; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill: Option<String>,
     /// Names a lane this node belongs to; the lane's container rect is drawn
@@ -1842,6 +1848,37 @@ mod tests {
             back,
             r#"{"id":"eq1","type":"equation","at":[80.0,80.0],"size":[240.0,80.0],"tex":"E = mc^2","emSize":14.0,"alt":"E = mc^2","futureKnob":7}"#
         );
+    }
+
+    #[test]
+    fn a_pinned_diagram_node_round_trips_byte_stably() {
+        // Canonical key order is declaration order — `at` sits between the
+        // node's shape and its styling, and an unpinned node writes nothing.
+        let raw = r#"{"id":"d1","type":"diagram","at":[48.0,48.0],"size":[400.0,300.0],"nodes":[{"id":"a","label":"Start","shape":"rect","at":[64.0,80.0],"fill":"@cat1"},{"id":"b","label":"End"}],"edges":[{"from":"a","to":"b"}]}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        let Object::Diagram(d) = &obj else {
+            panic!("expected diagram, got {obj:?}")
+        };
+        assert_eq!(d.nodes[0].at, Some([64.0, 80.0]));
+        assert_eq!(d.nodes[1].at, None);
+        assert_eq!(serde_json::to_string(&obj).unwrap(), raw);
+    }
+
+    #[test]
+    fn a_malformed_node_pin_fails_parse_into_unknown_with_a_reason() {
+        // The lenient Object deserialize preserves the diagram rather than
+        // dropping it — and the reason is what the edit route's `set` op
+        // reports when refusing an invalid pin atomically.
+        let raw = r#"{"id":"d1","type":"diagram",
+            "nodes":[{"id":"a","label":"A","at":[1,2,3]}]}"#;
+        let obj: Object = serde_json::from_str(raw).unwrap();
+        match &obj {
+            Object::Unknown(u) => {
+                assert_eq!(u.kind, "diagram");
+                assert!(u.error.is_some(), "a malformed pin carries a reason");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     #[test]
