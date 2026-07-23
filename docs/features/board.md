@@ -36,10 +36,23 @@ on the full `.board.json` suffix. Chat card:
 - Five primitives (`text`, `shape`, `connector`, `image`, `group`) + `table`
   (cells are the same `Paragraph` text model; header row, relative column
   widths, equal row split; exports as a native editable `a:tbl`) +
-  `equation` (LaTeX math — see below) +
+  `equation` (LaTeX math — see below) + `icon` (bundled Tabler outline — see
+  Icons) +
   composites: `chart`, `diagram`, `panelLabel`, `scalebar`, `sigBracket`,
   `legend`, `colorbar`, `callout`, `inset` — each expands deterministically
   to primitives at render/export time.
+- **Connectors** bind endpoints to object box edges (`from`/`to`
+  `{object, side}`, `side` = `top|right|bottom|left|center`) and route
+  `straight` or `bent` (a rounded orthogonal path — the architecture-figure
+  look). `geo` is optional: it smart-defaults to `bent` when both ends anchor
+  an object, `straight` for a free `at` end. Optional `waypoints` thread a
+  hand-chosen route; arrowheads are `tailEnd`/`headEnd`; a bound edge `text` at
+  `labelAt` (0..1) rides the line when a node moves.
+- **Text sugar**: every `text`/label field accepts a bare string
+  (`"text":"hi"`), an array of lines (`["a","b"]`), or rich runs — the
+  canonical save always writes the array form (normalize collapses a single-run
+  rich paragraph back to a bare string), so the input shape never churns diffs.
+  `shape`, `text`, `icon`, and diagram `node` all take explicit `size:[w,h]`.
 - **Slots**: 12 named layouts per canvas, selected by a pure function of
   `page.intent.kind` + measured content; explicit geometry always wins;
   resolution happens at render (files never churn). Anchors
@@ -56,8 +69,9 @@ on the full `.board.json` suffix. Chat card:
   and `data.inputs` (the files read) so provenance survives into later
   sessions; histogram/pie/second-y refused.
 - **Diagrams**: nodes/edges/lanes under a deterministic Sugiyama-lite layout
-  (neighbor-mean refinement straightens chains; an optional per-node `at` pin
-  wins verbatim and the rest flows around it) with rounded **orthogonal edge
+  (neighbor-mean refinement straightens chains; optional per-node `at`/`size`
+  pins win verbatim — `size` makes uniform boxes — and the rest flows around
+  them) with rounded **orthogonal edge
   routing** — per-edge border ports, one horizontal track per inter-layer
   channel, loop-backs/rank-skips around the columns on stacked side lanes, so
   edges never share a segment or cut through a node; edge labels ride
@@ -113,7 +127,10 @@ place: validate, render page 1 beside it, print the `shown … → path` line th
 chat card mounts on) · `guide` (the complete embedded manual —
 `src/cli/GUIDE.md`, printed to stdout so an agent in any workspace learns the
 whole tool in one call instead of exploring `--help`/the source; its examples
-are test-pinned runnable) ·
+are test-pinned runnable, including a **designed-figures** section — a complete,
+copy-worthy two-lane architecture board plus the routing/`size`/lane controls —
+so an agent composing an architecture diagram uses native shapes + bent
+connectors + icons rather than hand-authoring a non-editable SVG) ·
 `new` · `render` · `describe` (positions + slot resolutions + journal
 summary + chart provenance: `source` digest-verified fresh/stale, `inputs`,
 a `trace` excerpt) · `journal [--since N]` · `lint [--target PRESET] [--style]

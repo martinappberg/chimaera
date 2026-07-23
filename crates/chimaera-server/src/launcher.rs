@@ -694,7 +694,11 @@ complete manual, so never explore `--help`, the source, or the repo to learn \
 the tool. Richer figures need not be plain boxes: place bundled icons \
 (`chimaera board icons <query>` finds names — flask, arrow, dna, chart) and \
 imported SVG/PNG, recolored with theme tokens and editable after a PPTX \
-export. Favor binding real project files (`data.source`, \
+export. For a designed architecture or flow figure (not a quick chart), \
+compose native shapes, bent connectors, and icons by hand — the guide's \
+designed-figures section has a complete example — so it stays editable and \
+PPTX-editable; do not author an SVG externally and import it when the user \
+may want to edit the figure. Favor binding real project files (`data.source`, \
 workspace-relative) over inlined values, and when you computed the values \
 yourself record how in `data.trace` plus the files read in `data.inputs`. \
 When telling the user what you are doing, \
@@ -1694,6 +1698,10 @@ mod tests {
             "boxplots, multi-series, layers, tables, diagrams, decks, saving persistent boards",
             "run `chimaera board guide` once: it is the complete manual",
             "never explore `--help`, the source, or the repo",
+            // The designed-figure steer: native composition over an imported
+            // SVG when the user may want to edit the figure.
+            "compose native shapes, bent connectors, and icons by hand",
+            "do not author an SVG externally and import it",
             // One sentence of the provenance doctrine, not the full guide.
             "Favor binding real project files (`data.source`",
             "record how in `data.trace` plus the files read in `data.inputs`",

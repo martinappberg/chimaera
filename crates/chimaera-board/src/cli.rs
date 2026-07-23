@@ -2632,6 +2632,16 @@ mod tests {
             "journal",
             "arrange",
             "theme-export",
+            // The designed-figures section: the worked architecture example
+            // and the routing/size/lane controls an agent asked for by name.
+            "## Designed figures",
+            "A **designed figure**",
+            "smart default",
+            "auto-route `bent`",
+            "`waypoints`",
+            "`labelAt`",
+            "bare string",
+            "hand-author an SVG",
         ] {
             assert!(guide.contains(fact), "guide lost {fact:?}");
         }
@@ -2655,6 +2665,29 @@ mod tests {
             rest = &json[end..];
         }
         assert!(examples >= 2, "the sugar and boxplot examples are runnable");
+
+        // The designed-figures section embeds a COMPLETE board (not a
+        // ShowSpec) in a fenced block. It must parse, normalize, and render —
+        // the worked architecture example is validated, not aspirational, so
+        // an agent that copies it gets a figure, not a schema error.
+        let fence = guide
+            .split_once("```json")
+            .expect("guide has a fenced board example")
+            .1;
+        let board_json = fence.split_once("```").expect("closed fence").0;
+        let mut board = crate::parse(board_json).expect("guide board parses");
+        crate::normalize::normalize(&mut board);
+        let theme =
+            crate::theme::resolve_for_mode(Some("talk-dark"), true, None).expect("theme resolves");
+        let fonts = crate::layout::FontStack::for_workspace(std::path::Path::new("."));
+        crate::render::render_page(
+            &board,
+            0,
+            &theme,
+            &fonts,
+            crate::render::RasterParams::default(),
+        )
+        .expect("guide board renders");
     }
 
     #[test]

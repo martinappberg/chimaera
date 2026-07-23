@@ -107,6 +107,146 @@ unknown name renders a visible placeholder and lints, never a silent blank.
 Compose icons with `import`ed `.svg`/`.png` and shapes for figures you keep
 editing, then `export --format pptx` to hand off for polishing in PowerPoint.
 
+## Designed figures — architecture & flow diagrams
+
+A **designed figure** is native objects you place by hand — background shapes,
+icon-in-box nodes, connectors — to compose an architecture or pipeline diagram
+that looks deliberate and stays editable (every object survives a PPTX export
+for polishing in PowerPoint). It is a different move from `board show`'s
+auto-charts and from `--mermaid`'s auto-layout: here YOU own the positions.
+Which tool for the picture in front of you:
+
+- **A quick result** (numbers, a comparison) → `board show` chart/table/text
+  sugar — auto-mark, auto-layout, one pipe.
+- **A quick flowchart** you don't need to hand-place → `--mermaid` (auto-laid).
+- **A designed figure** (architecture, model, pipeline) → native shapes +
+  icons + connectors, composed by hand. This is the editable, PPTX-editable
+  path — the "drop it into PowerPoint and polish" hand-off.
+- **Finished external art** → `import` an `.svg`/`.png`. It rides along as a
+  picture, NOT as editable objects. So do **not** hand-author an SVG and
+  `import` it when the user may want to edit the figure — compose native
+  objects instead; every one stays movable and re-colorable.
+
+Complete example — a two-lane architecture figure. Copy it, rename the ids,
+change the text/positions; `chimaera board show --file
+boards/chrombpnet.board.json` cards it (write it under `boards/` only for a
+deliverable the user asked to keep — otherwise any path works):
+
+```json
+{
+  "format": "chimaera.board",
+  "formatVersion": 1,
+  "title": "ChromBPNet architecture",
+  "canvas": { "size": [960, 540] },
+  "pages": [
+    {
+      "id": "page-1",
+      "objects": [
+        { "id": "title", "type": "text", "role": "title", "at": [56, 40], "size": [848, 48],
+          "text": "ChromBPNet separates bias from signal" },
+        { "id": "subtitle", "type": "text", "role": "subtitle", "at": [56, 92], "size": [848, 34],
+          "text": "Two branches predict profile shape and total accessibility, then recombine." },
+
+        { "id": "lane-bias", "type": "shape", "geo": "roundRect", "at": [212, 140], "size": [560, 120],
+          "radius": 14, "fill": "@surface" },
+        { "id": "lane-bias-accent", "type": "shape", "geo": "rect", "at": [212, 140], "size": [5, 120],
+          "fill": "@cat2" },
+        { "id": "lane-bias-label", "type": "text", "role": "label", "at": [230, 150], "size": [520, 16],
+          "align": "left", "text": "ASSAY BIAS · FROZEN" },
+
+        { "id": "lane-signal", "type": "shape", "geo": "roundRect", "at": [212, 290], "size": [560, 168],
+          "radius": 14, "fill": "@surface" },
+        { "id": "lane-signal-accent", "type": "shape", "geo": "rect", "at": [212, 290], "size": [5, 168],
+          "fill": "@cat1" },
+        { "id": "lane-signal-label", "type": "text", "role": "label", "at": [230, 300], "size": [520, 16],
+          "align": "left", "text": "REGULATORY SIGNAL · TRAINABLE" },
+
+        { "id": "dna", "type": "shape", "geo": "roundRect", "at": [56, 258], "size": [140, 44],
+          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+        { "id": "dna-icon", "type": "icon", "name": "dna", "at": [66, 267], "size": [24, 24], "color": "@fg" },
+        { "id": "dna-label", "type": "text", "role": "label", "at": [98, 258], "size": [92, 44],
+          "valign": "middle", "align": "left", "text": "DNA · 2,114 bp" },
+
+        { "id": "frozen", "type": "shape", "geo": "roundRect", "at": [238, 186], "size": [150, 44],
+          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+        { "id": "frozen-icon", "type": "icon", "name": "snowflake", "at": [248, 195], "size": [24, 24], "color": "@fg" },
+        { "id": "frozen-label", "type": "text", "role": "label", "at": [280, 186], "size": [100, 44],
+          "valign": "middle", "align": "left", "text": "Frozen bias" },
+
+        { "id": "conv", "type": "shape", "geo": "roundRect", "at": [238, 330], "size": [150, 44],
+          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+        { "id": "conv-icon", "type": "icon", "name": "filter", "at": [248, 339], "size": [24, 24], "color": "@fg" },
+        { "id": "conv-label", "type": "text", "role": "label", "at": [280, 330], "size": [100, 44],
+          "valign": "middle", "align": "left", "text": "Conv1D · k=21" },
+
+        { "id": "dilated", "type": "shape", "geo": "roundRect", "at": [238, 392], "size": [150, 44],
+          "radius": 8, "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+        { "id": "dilated-icon", "type": "icon", "name": "stack-2", "at": [248, 401], "size": [24, 24], "color": "@fg" },
+        { "id": "dilated-label", "type": "text", "role": "label", "at": [280, 392], "size": [100, 44],
+          "valign": "middle", "align": "left", "text": "Dilated stack" },
+
+        { "id": "fuse", "type": "shape", "geo": "ellipse", "at": [582, 254], "size": [172, 64],
+          "fill": "@edge", "stroke": { "color": "@axis", "width": 1 } },
+        { "id": "fuse-icon", "type": "icon", "name": "math-function", "at": [600, 270], "size": [28, 28], "color": "@fg" },
+        { "id": "fuse-label", "type": "text", "role": "label", "at": [632, 254], "size": [112, 64],
+          "valign": "middle", "align": "left", "text": "Merge heads" },
+
+        { "id": "c-dna-frozen", "type": "connector", "geo": "bent",
+          "from": { "object": "dna", "side": "right" }, "to": { "object": "frozen", "side": "left" },
+          "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
+        { "id": "c-dna-conv", "type": "connector", "geo": "bent",
+          "from": { "object": "dna", "side": "right" }, "to": { "object": "conv", "side": "left" },
+          "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
+        { "id": "c-frozen-fuse", "type": "connector", "geo": "bent",
+          "from": { "object": "frozen", "side": "right" }, "to": { "object": "fuse", "side": "left" },
+          "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
+        { "id": "c-conv-dilated", "type": "connector", "geo": "bent",
+          "from": { "object": "conv", "side": "bottom" }, "to": { "object": "dilated", "side": "top" },
+          "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
+        { "id": "c-dilated-fuse", "type": "connector", "geo": "bent",
+          "from": { "object": "dilated", "side": "right" }, "to": { "object": "fuse", "side": "left" },
+          "stroke": { "color": "@axis", "width": 1.5 }, "tailEnd": "arrow" },
+
+        { "id": "caption", "type": "text", "role": "caption", "at": [56, 500], "size": [848, 24],
+          "text": "Profile merge: add logits · Count merge: LogSumExp · Output: central 1,000 bp" }
+      ]
+    }
+  ]
+}
+```
+
+The controls that example uses — the ones worth knowing before you compose:
+
+- **Lanes** (the swimlane pattern): a rounded-rect `shape` (`geo:"roundRect"`,
+  `fill:"@surface"`) as the background, a thin full-height `rect` in an accent
+  token (`@cat1`/`@cat2`) laid over its left edge, and a `label`-role `text` at
+  the top-left. Members are ordinary nodes positioned inside; the lane is just
+  drawn behind them (objects earlier in the list paint first). Reads cleaner
+  than a mermaid swimlane, and every piece stays movable.
+- **Icon-in-box nodes**: three objects sharing a spot — a `shape` box, an
+  `icon` (`{"type":"icon","name":"snowflake"}`; find a name with `chimaera
+  board icons <query>`), and a `text` with `valign:"middle"`. `text` accepts a
+  **bare string** (`"text":"Conv1D"`), an **array** of lines
+  (`"text":["a","b"]`), OR **rich runs** (`"text":{"runs":[{"t":"x","b":true}]}`)
+  — all three are valid anywhere text appears (labels, shape text, connector
+  labels).
+- **Connectors** bind endpoints by box edge — `"from":{"object":"conv",
+  "side":"bottom"}`, `"to":{"object":"dilated","side":"top"}` — so the line
+  re-routes when a node moves. Routing lives in `geo`: `"bent"` is a rounded
+  orthogonal route (the architecture look), `"straight"` a direct line. Omit
+  `geo` for the **smart default** — two object-anchored ends auto-route `bent`
+  while a free `at` endpoint stays `straight`. `side` is
+  `top|right|bottom|left|center`
+  and chooses which edge the line leaves and enters. When the auto-route isn't
+  the path you want, list explicit `waypoints` (`[[x,y],…]` in page points) it
+  threads. Arrowheads: `"tailEnd":"arrow"` marks the `to` end (the usual
+  direction), `"headEnd":"arrow"` the `from` end. An edge label is bound `text`
+  on the connector, positioned by `labelAt` (0..1 along the path, default 0.5).
+- **Explicit `size`**: `shape`, `text`, `icon`, and a diagram `node` all take
+  `"size":[w,h]` in points with `"at":[x,y]` as the top-left — pin it to make
+  uniform boxes and reserve exact space instead of letting content measure the
+  box. After writing: `lint`, then `show --file`, and LOOK at the PNG.
+
 ## The other verbs, one line each
 
 - `describe FILE` — read back every object, position, and chart provenance;
