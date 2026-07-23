@@ -1,8 +1,11 @@
 //! Board — Chimaera's visual composition surface.
 //!
-//! A board is an ordinary `*.board.json` file anywhere in the workspace: a
-//! scene graph of pages and objects in points, rendered by this crate to PNG
-//! or JPEG, and eventually exported to native PowerPoint, PDF and SVG.
+//! A board is an ordinary `*.board` file anywhere in the workspace: a scene
+//! graph of pages and objects in points, rendered by this crate to PNG or
+//! JPEG, and eventually exported to native PowerPoint, PDF and SVG. `.board`
+//! is JSON content under a branded extension; the legacy `*.board.json`
+//! spelling still opens and renders, so existing figures keep working with no
+//! migration.
 //!
 //! The crate is deliberately layered so the CLI, the daemon and the exporter
 //! all drive the *same* functions — a second render path is how the pane and
@@ -66,20 +69,39 @@ pub use schema::{
 
 /// The workspace-relative home for everything *around* a board.
 ///
-/// Boards themselves live wherever they belong — `figures/fig2.board.json`
+/// Boards themselves live wherever they belong — `figures/fig2.board`
 /// next to the manuscript — because files-as-truth means the figure travels
 /// with the paper and git-diffability is a hard requirement. What lands here
 /// is the managed surround: tracked themes, fonts and imported assets;
 /// gitignored renders, exports and journals.
 pub const BOARD_DIR: &str = ".chimaera/board";
 
-/// Does this path name a board? Matched on the full `.board.json` suffix, not
-/// an extension: a plain `.json` file is not a board, and `Path::extension`
-/// only ever sees the last dot segment.
+/// Does this path name a board? Matched on the canonical `.board` suffix or
+/// the legacy compound `.board.json` — both are boards (JSON content, either
+/// extension). Matched on the whole suffix, not `Path::extension`, so a plain
+/// `.json` is not a board and `.board.json` is recognized whole (extension
+/// only ever sees the last dot segment).
 pub fn is_board_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".board.json"))
+        .map(|n| n.to_ascii_lowercase())
+        .is_some_and(|n| n.ends_with(".board") || n.ends_with(".board.json"))
+}
+
+/// A board file name without its extension: strips the legacy `.board.json`
+/// (checked first — it is the longer suffix) or the canonical `.board`,
+/// case-insensitively; a name that is neither is returned whole. The shared
+/// stem for derived artifact names (renders, exports) and human labels, so
+/// `deck.board` and the legacy `deck.board.json` both stem to `deck`.
+pub fn board_stem(name: &str) -> &str {
+    for suffix in [".board.json", ".board"] {
+        if name.len() > suffix.len()
+            && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            return &name[..name.len() - suffix.len()];
+        }
+    }
+    name
 }
 
 /// Parse a board, leniently.
@@ -384,9 +406,26 @@ mod tests {
 
     #[test]
     fn board_paths_need_the_full_suffix() {
+        // Canonical `.board`.
+        assert!(is_board_path(Path::new("talks/lab.board")));
+        assert!(is_board_path(Path::new("A.BOARD")));
+        // Legacy `.board.json` still opens.
         assert!(is_board_path(Path::new("talks/lab.board.json")));
         assert!(is_board_path(Path::new("A.BOARD.JSON")));
         assert!(!is_board_path(Path::new("package.json")));
         assert!(!is_board_path(Path::new("board.json.bak")));
+        assert!(!is_board_path(Path::new("board.bak")));
+        // A bare word is not a board — the suffix carries the leading dot.
+        assert!(!is_board_path(Path::new("keyboard")));
+    }
+
+    #[test]
+    fn board_stem_strips_either_extension() {
+        assert_eq!(board_stem("deck.board"), "deck");
+        assert_eq!(board_stem("deck.board.json"), "deck");
+        assert_eq!(board_stem("Deck.BOARD.JSON"), "Deck");
+        // Not a board name: returned whole.
+        assert_eq!(board_stem("notes.txt"), "notes.txt");
+        assert_eq!(board_stem(".board"), ".board");
     }
 }

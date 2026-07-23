@@ -1306,14 +1306,16 @@ render-every-turn cheap.
 First-class, because on a login node this is where naive tools fall over. Order:
 **vendored** `.chimaera/board/fonts/` (git-tracked, so a figure renders
 byte-identically on your laptop and on a fontless compute node) → **bundled**
-OFL defaults baked into the binary via `include_bytes!` — **Geist** (the brand
-sans every bundled theme leads with), **IBM Plex Sans** (a selectable neutral
-alternate) and **JetBrains Mono** (the `code` role), all SIL OFL 1.1, static
-weights only, registered into the render `fontdb` on every stack
-(`layout::bundled`; provenance in `crates/chimaera-board/fonts/text/`) →
-**system** scan via `fontdb` (pure-Rust fontconfig parsing, no C linkage, works
-headless). Because the brand sans is bundled, a board's default text is
-deterministic and on-brand on any host, not a generic fallback.
+OFL defaults baked into the binary via `include_bytes!` — **Arimo** (the default
+sans every bundled theme leads with, a Helvetica/Arial-class face metric-compatible
+with Arial so figures are submission-safe — this resolves the PLOS-Arial trap),
+with **Geist** (a selectable brand/slides sans), **IBM Plex Sans** (a neutral
+alternate) and **JetBrains Mono** (the `code` role) also bundled as alternates,
+all SIL OFL 1.1, static weights only, registered into the render `fontdb` on
+every stack (`layout::bundled`; provenance in `crates/chimaera-board/fonts/text/`)
+→ **system** scan via `fontdb` (pure-Rust fontconfig parsing, no C linkage, works
+headless). Because the default sans is bundled, a board's default text is
+deterministic and in Arial metrics on any host, not a generic fallback.
 
 A missing font **never fails and is never silent — for Board's own text**: the
 nearest family substitutes, and the substitution is surfaced in the status strip

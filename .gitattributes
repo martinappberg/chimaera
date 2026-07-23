@@ -1,0 +1,9 @@
+# Boards are JSON content under a branded extension. `.board` is the canonical
+# name; the legacy `.board.json` still opens. Treat both as JSON so editors,
+# syntax highlighting, and GitHub diffs behave, and route both through the
+# per-object merge driver where a repo configures it (see
+# docs/features/board.md — `git config merge.board.driver "chimaera board
+# merge %O %A %B"`). Without that config git falls back to the default merge.
+*.board          linguist-language=JSON
+*.board          merge=board
+*.board.json     merge=board

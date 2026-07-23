@@ -24,7 +24,15 @@
  */
 
 import { get } from "svelte/store";
-import { fsFile, fsMarkdown, fsRawUrl, fsTable, type FileChunk, type TablePage } from "./files";
+import {
+  fsFile,
+  fsMarkdown,
+  fsRawUrl,
+  fsTable,
+  isBoardPath,
+  type FileChunk,
+  type TablePage,
+} from "./files";
 import { fsEpoch, lastFsMutation, type FsMutation } from "../workspace/fsEvents";
 import {
   lastDiskChange,
@@ -341,7 +349,7 @@ export function noteWrite(path: string, mtime: string | null): void {
 export function revalidateBoardPaths(): void {
   const boards: string[] = [];
   for (const path of cache.keys()) {
-    if (path.toLowerCase().endsWith(".board.json")) boards.push(path);
+    if (isBoardPath(path)) boards.push(path);
   }
   if (boards.length > 0) scheduleRevalidate(boards);
 }

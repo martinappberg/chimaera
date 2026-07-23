@@ -88,7 +88,8 @@ async fn resolve_board_path_blocking(raw: String) -> anyhow::Result<PathBuf> {
 
 #[derive(Deserialize)]
 pub(crate) struct RenderRequest {
-    /// Absolute path (or `~/…`) of the `.board.json`.
+    /// Absolute path (or `~/…`) of the board file (`.board`, or the legacy
+    /// `.board.json`).
     pub path: String,
     /// 0-based page index; defaults to the first page.
     #[serde(default)]
@@ -169,6 +170,13 @@ pub(crate) struct EditRequest {
     /// alignment lands with the same atomicity and byte-stability as a `set`.
     #[serde(default)]
     pub arrange: Option<ArrangeRequest>,
+    /// The other board-level field edit: pin a scheme (`talk`/`figure`), a
+    /// concrete variant (`talk-dark`), or `auto`; clear (JSON null) drops back
+    /// to `auto` (match the app). Double-optional so absent (not this gesture)
+    /// and null (back to auto) stay distinct. Journaled as `canvas-changed`
+    /// with a `theme` key — both are board-level appearance.
+    #[serde(default, deserialize_with = "double_option")]
+    pub theme: Option<Option<String>>,
 }
 
 /// The arrange gesture's payload: the verb and the ids it applies to, in the
@@ -457,6 +465,24 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
         board.canvas.background = bg.clone();
     }
 
+    // The other board-level gesture: pin a scheme/variant/`auto` or clear to
+    // auto. Validated by NAME here (a known scheme, a bundled variant, or
+    // `auto`) so the write can never land a theme resolve would reject.
+    if let Some(theme) = req.theme.as_ref() {
+        if let Some(value) = theme {
+            let known = value == chimaera_board::theme::AUTO_ID
+                || chimaera_board::theme::scheme(value).is_some()
+                || chimaera_board::theme::BUNDLED_IDS.contains(&value.as_str());
+            if !known {
+                anyhow::bail!(SetRejected(format!(
+                    "theme {value:?} is not a known scheme (talk/figure), a bundled variant, \
+                     or \"auto\" (nothing written)"
+                )));
+            }
+        }
+        board.theme = theme.clone();
+    }
+
     let mut prior = None;
     if let Some(object) = req.object.as_deref() {
         let mut found = false;
@@ -515,7 +541,7 @@ fn perform_edit(path: &Path, req: &EditRequest) -> anyhow::Result<serde_json::Va
         if !found {
             anyhow::bail!("no object {object:?} in {}", path.display());
         }
-    } else if req.canvas_background.is_none() && req.arrange.is_none() {
+    } else if req.canvas_background.is_none() && req.theme.is_none() && req.arrange.is_none() {
         anyhow::bail!("an edit names an object, a board-level field, or an arrange gesture");
     }
 
@@ -906,7 +932,7 @@ fn perform_export(req: &ExportRequest) -> anyhow::Result<serde_json::Value> {
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .map(|n| chimaera_board::board_stem(n).to_string())
         .unwrap_or_else(|| "board".to_string());
     let exports_dir = chimaera_board::ensure_board_dir(&ws)?.join("exports");
     std::fs::create_dir_all(&exports_dir)?;
@@ -1060,6 +1086,22 @@ fn journal_edit(
             EventKind::CanvasChanged { changed },
         ));
     }
+    if req.theme.is_some() {
+        let changed = [(
+            "theme".to_string(),
+            board
+                .theme
+                .as_deref()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        )]
+        .into_iter()
+        .collect();
+        events.push(Event::new(
+            Actor::Human,
+            EventKind::CanvasChanged { changed },
+        ));
+    }
 
     if let Some(object) = req.object.as_deref() {
         // The journaled `to` is the *saved* geometry (post-normalize grid
@@ -1146,7 +1188,7 @@ fn resolve_board_path(raw: &str) -> anyhow::Result<PathBuf> {
     let path = fs::canonical_file(raw)?;
     if !chimaera_board::is_board_path(&path) {
         anyhow::bail!(
-            "not a board: {} does not end in .board.json",
+            "not a board: {} does not end in .board (or the legacy .board.json)",
             path.display()
         );
     }
@@ -1375,6 +1417,7 @@ mod tests {
             set: Some(serde_json::from_value(set).unwrap()),
             canvas_background: None,
             arrange: None,
+            theme: None,
         }
     }
 
@@ -1411,6 +1454,7 @@ mod tests {
             set: None,
             canvas_background: Some(bg.map(String::from)),
             arrange: None,
+            theme: None,
         };
 
         // Set: the file gets the field, byte-canonical, journaled.
@@ -1771,6 +1815,7 @@ mod tests {
                 op: op.to_string(),
                 objects: objects.iter().map(|s| s.to_string()).collect(),
             }),
+            theme: None,
         }
     }
 

@@ -425,20 +425,20 @@ pub fn resolve_for_mode(
 pub const TALK_DARK: &str = include_str!("themes/talk-dark.theme.json");
 pub const TALK_LIGHT: &str = include_str!("themes/talk-light.theme.json");
 /// The publication-leaning figure theme: a small type scale (9 pt body) with
-/// Nature-compatible per-role floors (5 pt), the [bundled brand sans][brand]
+/// Nature-compatible per-role floors (5 pt), the [bundled default sans][default]
 /// leading the family stack (deterministic on a fontless render node), the
-/// Okabe–Ito ramp, and thin 0.5 pt chart chrome. **Arial is retained next in
-/// the stack** — a strict PLOS submission (which requires Arial, not Helvetica,
-/// the trap that bounces submissions) pins Arial by editing the theme's family
-/// stack (`theme-export … --format json`), since the bundled brand face now
-/// resolves first everywhere.
+/// Okabe–Ito ramp, and thin 0.5 pt chart chrome. The default is **Arimo, an
+/// Arial-metric-compatible standard sans**, which resolves the PLOS-Arial trap:
+/// PLOS requires *Arial, not Helvetica* — the trap that bounces submissions —
+/// and a figure now renders in Arial-identical metrics by default, on any host,
+/// with the real `Arial` kept next in the stack for hosts that carry it.
 ///
-/// [brand]: crate::layout::bundled::BRAND_SANS
+/// [default]: crate::layout::bundled::DEFAULT_SANS
 pub const FIGURE_LIGHT: &str = include_str!("themes/figure-light.theme.json");
 /// The dark counterpart to [`FIGURE_LIGHT`]: the same tight publication type
-/// scale, the same brand-first family stack (Arial retained after it) and thin
-/// 0.5 pt chart chrome, on a dark ground — so the `figure` scheme has a variant
-/// for either appearance.
+/// scale, the same Arial-metric default-first family stack (real Arial retained
+/// after it) and thin 0.5 pt chart chrome, on a dark ground — so the `figure`
+/// scheme has a variant for either appearance.
 pub const FIGURE_DARK: &str = include_str!("themes/figure-dark.theme.json");
 
 pub fn bundled(id: &str) -> Option<Theme> {
@@ -541,12 +541,12 @@ mod tests {
     }
 
     #[test]
-    fn every_bundled_theme_leads_text_roles_with_the_brand_sans() {
-        // Brand + determinism as an acceptance criterion: every text (non-mono)
-        // role leads with the bundled brand family, and that family really
-        // resolves through a bare FontStack — so a fontless render node draws
-        // the brand face, not a system fallback. `code` is exempt: it is the
-        // bundled monospace, which also resolves.
+    fn every_bundled_theme_leads_text_roles_with_the_default_sans() {
+        // Determinism + a submission-safe default as an acceptance criterion:
+        // every text (non-mono) role leads with the bundled Arial-class default
+        // family, and that family really resolves through a bare FontStack — so a
+        // fontless render node draws the default face, not a system fallback.
+        // `code` is exempt: it is the bundled monospace, which also resolves.
         use crate::layout::{bundled, FontStack};
         let fonts = FontStack::new(&[]);
         for id in BUNDLED_IDS {
@@ -555,7 +555,7 @@ mod tests {
                 let want = if name == "code" {
                     bundled::MONO
                 } else {
-                    bundled::BRAND_SANS
+                    bundled::DEFAULT_SANS
                 };
                 assert_eq!(
                     role.family.first().map(String::as_str),

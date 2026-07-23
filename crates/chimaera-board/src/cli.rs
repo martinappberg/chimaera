@@ -33,10 +33,10 @@ pub enum BoardCmd {
         /// Read the spec from a file instead of stdin.
         #[arg(long)]
         spec: Option<PathBuf>,
-        /// Card an existing .board.json in place: no spec, no copy — validate
-        /// it, render its first page to a PNG beside it, and print the shown
-        /// line pointing at that path (which is what mounts the inline chat
-        /// card).
+        /// Card an existing .board (or legacy .board.json) in place: no spec,
+        /// no copy — validate it, render its first page to a PNG beside it,
+        /// and print the shown line pointing at that path (which is what
+        /// mounts the inline chat card).
         #[arg(
             long,
             conflicts_with_all = ["spec", "mermaid", "title", "note", "id", "size", "out", "emit_board"]
@@ -94,7 +94,7 @@ pub enum BoardCmd {
     Guide,
     /// Create a blank board.
     New {
-        /// Where to write it, e.g. talks/lab-meeting.board.json.
+        /// Where to write it, e.g. talks/lab-meeting.board.
         path: PathBuf,
         #[arg(long)]
         title: Option<String>,
@@ -176,11 +176,11 @@ pub enum BoardCmd {
         dpi: Option<f64>,
     },
     /// Adopt a shown card into the workspace: move it to
-    /// boards/<id>.board.json (git-visible — that is the point), or append
+    /// boards/<id>.board (git-visible — that is the point), or append
     /// its pages to an existing board with --to.
     Adopt {
-        /// A shown card id (resolves .chimaera/board/shown/<id>.board.json)
-        /// or a path to a board file.
+        /// A shown card id (resolves .chimaera/board/shown/<id>.board, or the
+        /// legacy .board.json) or a path to a board file.
         shown_id_or_path: String,
         /// An existing board to append the adopted pages to, instead of
         /// moving the file.
@@ -481,7 +481,7 @@ fn journal_path_for(path: &Path) -> PathBuf {
 fn journal(path: &Path, since: Option<u64>) -> Result<()> {
     if !crate::is_board_path(path) {
         bail!(
-            "not a board: {} does not end in .board.json",
+            "not a board: {} does not end in .board (or the legacy .board.json)",
             path.display()
         );
     }
@@ -611,13 +611,13 @@ fn show(
     let card_id = id.unwrap_or_else(|| crate::show::spec_id(&raw));
     let (board_path, png_path) = match out {
         Some(p) => {
-            let board_path = p.with_extension("board.json");
+            let board_path = p.with_extension("board");
             (board_path, p)
         }
         None => {
             let shown = crate::ensure_shown_dir(&ws)?;
             (
-                shown.join(format!("{card_id}.board.json")),
+                shown.join(format!("{card_id}.board")),
                 shown.join(format!("{card_id}.png")),
             )
         }
@@ -645,13 +645,13 @@ fn show(
 
 /// `board show --file` — card an existing board where it lives: no spec, no
 /// copy into shown/. Validate + normalize, render page 1 to a PNG beside the
-/// file, print the shown line pointing at THAT path (the `shown … →
-/// *.board.json` grammar is what mounts the inline chat card), and journal
-/// the same `shown` surfacing event every show appends.
+/// file, print the shown line pointing at THAT path (the `shown … → *.board`
+/// grammar is what mounts the inline chat card), and journal the same `shown`
+/// surfacing event every show appends.
 fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> {
     if !crate::is_board_path(path) {
         bail!(
-            "not a board: {} does not end in .board.json",
+            "not a board: {} does not end in .board (or the legacy .board.json)",
             path.display()
         );
     }
@@ -688,7 +688,7 @@ fn show_file(path: &Path, theme_ref: Option<String>, quiet: bool) -> Result<()> 
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .map(|n| crate::board_stem(n).to_string())
         .unwrap_or_else(|| "board".to_string());
     crate::write_atomic(&path.with_file_name(format!("{stem}.png")), &rendered.png)?;
     append_shown_event(path);
@@ -732,7 +732,8 @@ fn shown_path(board_path: &Path) -> String {
 }
 
 /// The one-line stdout of `show --file`, matching the ShownCard mount grammar
-/// exactly: `shown … → <path>.board.json`.
+/// exactly: `shown … → <path>.board` (the widened grammar still accepts a
+/// legacy `.board.json` path).
 fn shown_file_line(board: &crate::Board, theme_id: &str, path: &str) -> String {
     let n = board.pages.len();
     format!(
@@ -777,14 +778,14 @@ fn new(path: &Path, title: Option<String>, theme: &str) -> Result<()> {
     }
     if !crate::is_board_path(path) {
         bail!(
-            "a board path ends in .board.json — try {}",
-            path.with_extension("board.json").display()
+            "a board path ends in .board — try {}",
+            path.with_extension("board").display()
         );
     }
     let title = title.unwrap_or_else(|| {
         path.file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
+            .map(|n| crate::board_stem(n).replace(['-', '_'], " "))
             .unwrap_or_else(|| "Untitled".to_string())
     });
     let mut board = crate::Board::new(title, crate::Canvas::default());
@@ -895,7 +896,7 @@ fn export(
     let stem = path
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.trim_end_matches(".board.json").to_string())
+        .map(|n| crate::board_stem(n).to_string())
         .unwrap_or_else(|| "board".to_string());
     let exports_dir = || -> Result<PathBuf> { Ok(crate::ensure_board_dir(&ws)?.join("exports")) };
 
@@ -1070,8 +1071,8 @@ fn import_mermaid(path: &Path, to: &Path, page: Option<String>, id: Option<Strin
 fn load_or_create_board(to: &Path) -> Result<crate::Board> {
     if !crate::is_board_path(to) {
         bail!(
-            "a board path ends in .board.json — try {}",
-            to.with_extension("board.json").display()
+            "a board path ends in .board — try {}",
+            to.with_extension("board").display()
         );
     }
     if to.exists() {
@@ -1080,7 +1081,7 @@ fn load_or_create_board(to: &Path) -> Result<crate::Board> {
         let title = to
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".board.json").replace(['-', '_'], " "))
+            .map(|n| crate::board_stem(n).replace(['-', '_'], " "))
             .unwrap_or_else(|| "Untitled".to_string());
         Ok(crate::Board::new(title, crate::Canvas::default()))
     }
@@ -1220,8 +1221,8 @@ fn import_figure(
     }
     if !crate::is_board_path(to) {
         bail!(
-            "a board path ends in .board.json — try {}",
-            to.with_extension("board.json").display()
+            "a board path ends in .board — try {}",
+            to.with_extension("board").display()
         );
     }
     let cwd = std::env::current_dir().context("resolving the working directory")?;
@@ -1396,8 +1397,8 @@ fn import_pdf(
 
     if !crate::is_board_path(to) {
         bail!(
-            "a board path ends in .board.json — try {}",
-            to.with_extension("board.json").display()
+            "a board path ends in .board — try {}",
+            to.with_extension("board").display()
         );
     }
     let cwd = std::env::current_dir().context("resolving the working directory")?;
@@ -1519,25 +1520,30 @@ fn import_pdf(
 }
 
 /// `board adopt` — a shown throwaway becomes real work. Without --to the file
-/// moves to boards/<id>.board.json at the workspace root, which is what makes
+/// moves to boards/<id>.board at the workspace root, which is what makes
 /// it git-visible; with --to its pages append to an existing board, re-id'ing
 /// collisions with a numeric suffix and saying so.
 fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let ws = crate::workspace_root(&cwd);
     let direct = PathBuf::from(shown);
-    let shown_candidate = crate::board_dir(&ws)
-        .join("shown")
-        .join(format!("{shown}.board.json"));
+    let shown_dir = crate::board_dir(&ws).join("shown");
+    // Canonical `.board` first, then the legacy `.board.json` a pre-rename
+    // card may still carry in the pen.
+    let shown_board = shown_dir.join(format!("{shown}.board"));
+    let shown_legacy = shown_dir.join(format!("{shown}.board.json"));
     let src = if direct.exists() && crate::is_board_path(&direct) {
         direct
-    } else if shown_candidate.exists() {
-        shown_candidate.clone()
+    } else if shown_board.exists() {
+        shown_board.clone()
+    } else if shown_legacy.exists() {
+        shown_legacy.clone()
     } else {
         bail!(
-            "no board named {shown:?}: tried {} and {}",
+            "no board named {shown:?}: tried {}, {} and {}",
             direct.display(),
-            shown_candidate.display()
+            shown_board.display(),
+            shown_legacy.display()
         );
     };
     let src_board = crate::load(&src)?;
@@ -1545,10 +1551,7 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
     match to {
         Some(target) => {
             if !crate::is_board_path(&target) {
-                bail!(
-                    "a board path ends in .board.json — got {}",
-                    target.display()
-                );
+                bail!("a board path ends in .board — got {}", target.display());
             }
             if !target.exists() {
                 bail!(
@@ -1595,9 +1598,9 @@ fn adopt(shown: &str, to: Option<PathBuf>) -> Result<()> {
             let stem = src
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.trim_end_matches(".board.json").to_string())
+                .map(|n| crate::board_stem(n).to_string())
                 .unwrap_or_else(|| "adopted".to_string());
-            let dest = ws.join("boards").join(format!("{stem}.board.json"));
+            let dest = ws.join("boards").join(format!("{stem}.board"));
             if dest.exists() {
                 bail!(
                     "{} already exists; adopt into it with --to, or pick another home by hand",
@@ -2432,9 +2435,9 @@ mod tests {
         assert!(a.contains("axes.spines.right: False"), "{a}");
         assert!(a.contains("grid.color: "), "{a}");
         assert!(a.contains("lines.linewidth: 2"), "{a}");
-        // The theme's family stack leads with the bundled brand sans, so the
-        // mplstyle export offers it first (matplotlib falls through the rest).
-        assert!(a.contains("font.family: Geist"), "{a}");
+        // The theme's family stack leads with the bundled Arial-metric sans, so
+        // the mplstyle export offers it first (matplotlib falls through the rest).
+        assert!(a.contains("font.family: Arimo"), "{a}");
     }
 
     #[test]
@@ -2495,16 +2498,26 @@ mod tests {
             r#"{"format":"chimaera.board","formatVersion":1,"canvas":{"size":[960,540]},
                 "pages":[{"id":"p1","objects":[]},{"id":"p2","objects":[]}]}"#,
         );
-        let line = shown_file_line(&two, "talk-dark", "boards/demo.board.json");
+        // The canonical extension the CLI now emits.
+        let line = shown_file_line(&two, "talk-dark", "boards/demo.board");
         assert_eq!(
             line,
-            "shown board · 2 pages · talk-dark · 960×540 → boards/demo.board.json"
+            "shown board · 2 pages · talk-dark · 960×540 → boards/demo.board"
         );
-        // ShownCard mounts on /^shown .+ → (.+\.board\.json)$/m — the line
-        // must start with "shown " and end with the board path after " → ".
+        // ShownCard mounts on /^shown .+ → (.+\.board(?:\.json)?)$/m — the
+        // line must start with "shown " and end with the board path after
+        // " → ".
         assert!(line.starts_with("shown "));
         let (_, path) = line.rsplit_once(" → ").unwrap();
-        assert!(path.ends_with(".board.json"));
+        assert!(path.ends_with(".board"));
+
+        // A legacy `.board.json` path still forms a valid shown line.
+        let legacy = shown_file_line(&two, "talk-dark", "boards/demo.board.json");
+        assert!(legacy
+            .rsplit_once(" → ")
+            .unwrap()
+            .1
+            .ends_with(".board.json"));
 
         let one = board_json(
             r#"{"format":"chimaera.board","formatVersion":1,"canvas":{"size":[720,450]},
@@ -2594,6 +2607,8 @@ mod tests {
         assert!(T::try_parse_from(["t", "guide"]).is_ok());
     }
 
+    // Uses a legacy `.board.json` path on purpose: existing files keep
+    // opening, rendering, and journaling with no migration.
     #[test]
     fn show_file_renders_beside_the_board_and_journals_the_show() {
         let dir = std::env::temp_dir().join(format!("chimaera-show-file-{}", std::process::id()));
@@ -2629,6 +2644,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The canonical extension: a `.board` file cards in place, the PNG is
+    // named from the stripped stem, and the shown line carries the `.board`
+    // path the widened ShownCard grammar mounts on.
+    #[test]
+    fn show_file_cards_a_canonical_dot_board() {
+        let dir =
+            std::env::temp_dir().join(format!("chimaera-show-dotboard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let board_path = dir.join("demo.board");
+        std::fs::write(
+            &board_path,
+            r#"{"format":"chimaera.board","formatVersion":1,"title":"Demo",
+                "canvas":{"size":[960,540]},
+                "pages":[{"id":"cover","objects":[
+                  {"id":"title","type":"text","role":"title","at":[72,64],
+                   "size":[816,80],"text":["A one-page deck"]}]}]}"#,
+        )
+        .unwrap();
+
+        show_file(&board_path, None, false).unwrap();
+
+        // The PNG lands beside the board, named from the `.board`-stripped
+        // stem (not `demo.board.png`).
+        let png = std::fs::read(dir.join("demo.png")).unwrap();
+        assert!(png.len() > 1000);
+        assert!(board_path.exists());
+        // The shown line the card mounts on carries the `.board` path.
+        let abs = board_path.canonicalize().unwrap();
+        let board = crate::load(&abs).unwrap();
+        let line = shown_file_line(&board, "auto", &shown_path(&abs));
+        assert!(
+            line.rsplit_once(" → ").unwrap().1.ends_with("demo.board"),
+            "{line}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_guide_is_the_complete_selfcontained_manual() {
         let guide = include_str!("cli/GUIDE.md");
@@ -2648,7 +2701,7 @@ mod tests {
             "`data.inputs`",
             "Invented demo data must say so in the trace",
             ".chimaera/board/shown/",
-            "boards/<name>.board.json",
+            "boards/<name>.board",
             "talk-dark",
             "talk-light",
             "figure-light",

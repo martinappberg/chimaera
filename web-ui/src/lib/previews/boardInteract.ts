@@ -55,7 +55,38 @@ export interface BoardInfo {
    *  literal), null when it follows the theme — the file's literal value, for
    *  the canvas swatch row's "which one is on" state. */
   canvasBackground: string | null;
+  /** The advisory layout grid (`canvas.grid`), null when absent — the file's
+   *  own literal values, for the overlay + drag snap. Never layout truth. */
+  grid: GridInfo | null;
   pages: PageInfo[];
+}
+
+/** The parsed `canvas.grid`: columns, optional rows, and the margin/gutter
+ *  insets (all board points). Mirrors the daemon's `Grid` schema; the client
+ *  derives grid lines from it exactly like the engine's `grid_lines`. */
+export interface GridInfo {
+  cols: number;
+  rows: number | null;
+  margin: number;
+  gutter: number;
+}
+
+/** Lenient parse of `canvas.grid` — a structurally broken grid drops to null
+ *  (leniency #3, matching the daemon's `de_lenient_grid`). A `cols` < 1 is
+ *  treated as absent here (the daemon clamps it to 1, but an overlay of one
+ *  column is noise). */
+function parseGrid(raw: unknown): GridInfo | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const g = raw as Record<string, unknown>;
+  if (typeof g.cols !== "number" || !Number.isFinite(g.cols) || g.cols < 1) return null;
+  const num = (v: unknown, min: number): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v >= min ? v : null;
+  return {
+    cols: Math.floor(g.cols),
+    rows: num(g.rows, 1) !== null ? Math.floor(g.rows as number) : null,
+    margin: num(g.margin, 0) ?? 0,
+    gutter: num(g.gutter, 0) ?? 0,
+  };
 }
 
 /** Parse a board chunk for identity and geometry only (plus presenter notes). */
@@ -63,7 +94,7 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
   try {
     const raw = JSON.parse(new TextDecoder().decode(bytes)) as {
       title?: string;
-      canvas?: { size?: [number, number]; background?: string };
+      canvas?: { size?: [number, number]; background?: string; grid?: unknown };
       pages?: {
         id?: string;
         notes?: string;
@@ -81,6 +112,7 @@ export function parseBoard(bytes: Uint8Array): BoardInfo | null {
       canvas: raw.canvas?.size ?? [960, 540],
       canvasBackground:
         typeof raw.canvas?.background === "string" ? raw.canvas.background : null,
+      grid: parseGrid(raw.canvas?.grid),
       pages: (raw.pages ?? []).map((p, i) => ({
         id: p.id ?? `page-${i + 1}`,
         notes: typeof p.notes === "string" ? p.notes : null,
@@ -450,6 +482,142 @@ export function snapshotRegion(
 export interface Frame {
   at: [number, number];
   size: [number, number];
+}
+
+// --- the layout grid + drag snapping (canvas.grid) --------------------------
+
+/**
+ * The grid's column-start x's and row-start y's in board points — the client
+ * mirror of the engine's `grid_lines` (schema.rs): each 8pt-quantized so a
+ * snapped `at` survives normalize byte-for-byte, and an empty `ys` for a
+ * column-only grid (`rows` absent snaps x only, exactly like `snap-grid`).
+ * The overlay draws these lines and the drag snap targets them. Pure math over
+ * the file's own literal grid — never layout truth.
+ */
+export function gridLines(canvas: [number, number], grid: GridInfo): { xs: number[]; ys: number[] } {
+  const cols = Math.max(1, Math.floor(grid.cols));
+  const margin = Math.max(0, grid.margin);
+  const gutter = Math.max(0, grid.gutter);
+  const contentW = Math.max(1, canvas[0] - 2 * margin);
+  const cw = Math.max(1, (contentW - gutter * (cols - 1)) / cols);
+  const xs: number[] = [];
+  for (let c = 0; c < cols; c++) xs.push(snap8(margin + c * (cw + gutter)));
+  const ys: number[] = [];
+  if (grid.rows !== null) {
+    const rows = Math.max(1, Math.floor(grid.rows));
+    const contentH = Math.max(1, canvas[1] - 2 * margin);
+    const rh = Math.max(1, (contentH - gutter * (rows - 1)) / rows);
+    for (let r = 0; r < rows; r++) ys.push(snap8(margin + r * (rh + gutter)));
+  }
+  return { xs, ys };
+}
+
+/** One alignment guide to draw while dragging: a line on `axis` at `pos`,
+ *  spanning `[from, to]` on the other axis. `grid` distinguishes a grid-line
+ *  snap (spans the canvas) from an object-edge alignment (spans the aligned
+ *  objects). Board-point coordinates; the pane scales them to stage pixels. */
+export interface SnapGuide {
+  axis: "x" | "y";
+  pos: number;
+  from: number;
+  to: number;
+  grid: boolean;
+}
+
+export interface SnapResult {
+  dx: number;
+  dy: number;
+  guides: SnapGuide[];
+}
+
+/** How close two edges must be (board pt) before an alignment guide extends to
+ *  connect them, past the exact snap target. */
+const GUIDE_EPS = 0.5;
+
+/**
+ * Snap a dragged frame to other objects' edges/centers and to grid lines,
+ * within `thresholdPt`, returning the position delta to add to the raw drag
+ * plus the guide segments to draw. Object-edge alignment wins over a grid line
+ * at equal distance (a grid snap only when nothing else lines up). The
+ * committed `at` still snaps 8pt server-side; this only lands the gesture where
+ * the eye expects and shows why. Pure — the pane owns the state.
+ */
+export function snapDrag(
+  dragged: Frame,
+  others: Frame[],
+  grid: { xs: number[]; ys: number[] } | null,
+  canvas: [number, number],
+  thresholdPt: number,
+): SnapResult {
+  const x = snapAxis(dragged, others, grid?.xs ?? [], canvas, thresholdPt, "x");
+  const y = snapAxis(dragged, others, grid?.ys ?? [], canvas, thresholdPt, "y");
+  return { dx: x.delta, dy: y.delta, guides: [...x.guides, ...y.guides] };
+}
+
+/** Snap one axis: the dragged frame's start/center/end anchors seek other
+ *  frames' start/center/end targets (any-to-any) and grid lines (start anchor
+ *  only, so the snap lands `at` on a column/row start like `snap-grid`). */
+function snapAxis(
+  dragged: Frame,
+  others: Frame[],
+  lines: number[],
+  canvas: [number, number],
+  threshold: number,
+  axis: "x" | "y",
+): { delta: number; guides: SnapGuide[] } {
+  const isX = axis === "x";
+  const dPos = isX ? dragged.at[0] : dragged.at[1];
+  const dExt = isX ? dragged.size[0] : dragged.size[1];
+  const anchors = [dPos, dPos + dExt / 2, dPos + dExt];
+
+  let best: { delta: number; abs: number; pos: number; grid: boolean } | null = null;
+  const consider = (anchorPos: number, target: number, grid: boolean): void => {
+    const abs = Math.abs(anchorPos - target);
+    if (abs > threshold) return;
+    // Prefer the closest; break a tie toward object-edge alignment over grid.
+    if (best === null || abs < best.abs - 1e-9 || (abs <= best.abs + 1e-9 && best.grid && !grid)) {
+      best = { delta: target - anchorPos, abs, pos: target, grid };
+    }
+  };
+  for (const o of others) {
+    const oPos = isX ? o.at[0] : o.at[1];
+    const oExt = isX ? o.size[0] : o.size[1];
+    const targets = [oPos, oPos + oExt / 2, oPos + oExt];
+    for (const a of anchors) for (const t of targets) consider(a, t, false);
+  }
+  for (const g of lines) consider(anchors[0], g, true);
+
+  if (best === null) return { delta: 0, guides: [] };
+  const chosen: { delta: number; abs: number; pos: number; grid: boolean } = best;
+
+  // The guide's cross-axis span: the whole canvas for a grid line, else the
+  // union of the dragged frame and every other frame that shares the snapped
+  // coordinate on any of its edges (after the snap lands the dragged edge on it).
+  const crossOf = (f: Frame): [number, number] =>
+    isX ? [f.at[1], f.at[1] + f.size[1]] : [f.at[0], f.at[0] + f.size[0]];
+  const snapped: Frame = {
+    at: isX ? [dragged.at[0] + chosen.delta, dragged.at[1]] : [dragged.at[0], dragged.at[1] + chosen.delta],
+    size: dragged.size,
+  };
+  let from: number;
+  let to: number;
+  if (chosen.grid) {
+    from = 0;
+    to = isX ? canvas[1] : canvas[0];
+  } else {
+    [from, to] = crossOf(snapped);
+    for (const o of others) {
+      const oPos = isX ? o.at[0] : o.at[1];
+      const oExt = isX ? o.size[0] : o.size[1];
+      const edges = [oPos, oPos + oExt / 2, oPos + oExt];
+      if (edges.some((e) => Math.abs(e - chosen.pos) <= GUIDE_EPS)) {
+        const [c0, c1] = crossOf(o);
+        from = Math.min(from, c0);
+        to = Math.max(to, c1);
+      }
+    }
+  }
+  return { delta: chosen.delta, guides: [{ axis, pos: chosen.pos, from, to, grid: chosen.grid }] };
 }
 
 // --- comment pins (§6.4: journal-only, never the board file) -----------------

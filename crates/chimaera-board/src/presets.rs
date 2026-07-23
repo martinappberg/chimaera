@@ -91,6 +91,12 @@ pub enum FurnitureKind {
 /// Axis 4 — rules and refusals: which content rules apply at this venue.
 #[derive(Debug, Clone)]
 pub struct Rules {
+    /// A titled board is expected here: a talk deck reads as unfinished
+    /// without a cover title, so a missing `board.title` warns. **Talk-family
+    /// only** — a figure, poster or README image legitimately carries no
+    /// title (its caption lives in the manuscript or the surrounding prose),
+    /// so this is off for figure/pub/poster/readme presets.
+    pub require_title: bool,
     /// Every chart axis title must carry a unit-ish parenthetical — `(s)`,
     /// `(a.u.)`. A publication rule; a talk axis titled "Signups" is fine.
     pub require_axis_units: bool,
@@ -126,14 +132,26 @@ fn publication_floors() -> Floors {
 
 fn permissive_rules() -> Rules {
     Rules {
+        require_title: false,
         require_axis_units: false,
         require_caption_integrity: false,
         refuses: Vec::new(),
     }
 }
 
+/// The permissive base plus the talk floor: a deck target expects a cover
+/// title. Everything else is unchanged from [`permissive_rules`].
+fn talk_rules() -> Rules {
+    Rules {
+        require_title: true,
+        ..permissive_rules()
+    }
+}
+
 fn publication_rules() -> Rules {
     Rules {
+        // A figure needs no title — its caption lives in the manuscript.
+        require_title: false,
         require_axis_units: true,
         require_caption_integrity: true,
         refuses: vec![
@@ -148,7 +166,8 @@ const TALK_MARGINS: [f64; 4] = [64.0, 72.0, 64.0, 72.0];
 
 fn build() -> Vec<Preset> {
     vec![
-        // The default: a 16:9 talk. No furniture, permissive everywhere.
+        // The default: a 16:9 talk. No furniture, permissive everywhere —
+        // except a deck expects a cover title.
         Preset {
             id: "talk-16x9",
             geometry: PresetGeometry {
@@ -158,7 +177,7 @@ fn build() -> Vec<Preset> {
             },
             floors: permissive_floors(),
             furniture: Vec::new(),
-            rules: permissive_rules(),
+            rules: talk_rules(),
         },
         // A working deck for a design review: footer (the board title) and a
         // page number, both so "as discussed on page 4" means something.
@@ -184,7 +203,7 @@ fn build() -> Vec<Preset> {
                     suppress_on_cover: true,
                 },
             ],
-            rules: permissive_rules(),
+            rules: talk_rules(),
         },
         // An executive update refuses nothing — a pie chart here is allowed,
         // which is the four-axis point: refusals are venue data, not dogma.
@@ -202,7 +221,7 @@ fn build() -> Vec<Preset> {
                 text: None,
                 suppress_on_cover: true,
             }],
-            rules: permissive_rules(),
+            rules: talk_rules(),
         },
         Preset {
             id: "teaching",
@@ -218,7 +237,7 @@ fn build() -> Vec<Preset> {
                 text: None,
                 suppress_on_cover: false,
             }],
-            rules: permissive_rules(),
+            rules: talk_rules(),
         },
         // A single image destined for a README: one page, no furniture.
         Preset {
@@ -285,9 +304,10 @@ fn build() -> Vec<Preset> {
         // PLOS: max figure width 19.05 cm (7.5 in = 540 pt), minimum text
         // size 8 pt (a 1.6 scale over the theme's 5 pt floors) — and PLOS
         // requires **Arial, not Helvetica**, the specific trap that bounces
-        // submissions. The figure family stack keeps Arial ahead of the other
-        // system faces, but the bundled brand sans now leads it; a strict PLOS
-        // export pins Arial by editing the theme's family stack.
+        // submissions. The figure family stack now leads with Arimo
+        // (Arial-metric-compatible), so a PLOS figure renders in Arial metrics
+        // by default — submission-safe with no manual pinning; real Arial is
+        // kept next for hosts that carry it.
         Preset {
             id: "pub-plos",
             geometry: PresetGeometry {
@@ -520,6 +540,20 @@ mod tests {
             assert!(nature.rules.refuses.iter().any(|r| r == refused));
         }
         assert_eq!(nature.floors.export_floor, ExportTier::Vector);
+        // A figure needs no title; the talk family does.
+        assert!(!nature.rules.require_title, "a figure needs no title");
+        for talk in ["talk-16x9", "design-review", "exec-update", "teaching"] {
+            assert!(
+                get(talk).unwrap().rules.require_title,
+                "{talk} is a deck target and expects a title"
+            );
+        }
+        for titleless in ["readme-image", "poster-a0", "pub-cell", "pub-plos"] {
+            assert!(
+                !get(titleless).unwrap().rules.require_title,
+                "{titleless} does not require a title"
+            );
+        }
         // exec-update refuses nothing — a pie chart is allowed there.
         assert!(get("exec-update").unwrap().rules.refuses.is_empty());
         // PLOS raises the theme's 5 pt floors to its 8 pt minimum.

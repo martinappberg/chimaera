@@ -17,6 +17,7 @@
   import { activeTheme } from "../settings/store.svelte";
   import {
     fsBoardCanvasBackground,
+    fsBoardTheme,
     fsBoardEdit,
     fsBoardExport,
     fsBoardJournalAll,
@@ -46,6 +47,7 @@
     editorTextToParagraphs,
     fateCensus,
     GRID_PT,
+    gridLines,
     hitChild,
     MIN_RESIZE_PT,
     nextPinId,
@@ -57,6 +59,7 @@
     samePair,
     sameParagraphs,
     snap8,
+    snapDrag,
     snapshotRegion,
     UndoStack,
     unresolvedPins,
@@ -69,7 +72,9 @@
     type ObjInfo,
     type ObjSnap,
     type PinInfo,
+    type SnapGuide,
   } from "./boardInteract";
+  import { api, ApiError } from "../net/api";
   import { referenceTarget, workspaceRelative } from "../shared/reference";
   import { matchChord, PINNED, REFERENCE_CHORD } from "../shared/keys";
   import { attachImageToComposer, insertIntoComposer } from "../chat/composerBus";
@@ -131,7 +136,12 @@
     const p = path;
     const pg = page;
     const mode = appMode;
-    const scale = Math.min(4, Math.max(1, (window.devicePixelRatio || 1) * (presenting ? 2 : 1)));
+    // Present doubles the scale; a settled zoom crisps the pixels the CSS
+    // transform is upscaling. The route clamps to [0.25, 4] identically.
+    const scale = Math.min(
+      4,
+      Math.max(1, (window.devicePixelRatio || 1) * (presenting ? 2 : 1) * hiScale),
+    );
     void entry?.mtime;
     let cancelled = false;
     rendering = true;
@@ -144,7 +154,10 @@
         rendering = false;
         // The landed render carries fresh childFrames — the committed-pin
         // overlay's job is done (a child drag's outline holds its dropped
-        // spot only until the engine's own frame arrives).
+        // spot only until the engine's own frame arrives). The drag ghost is
+        // retired later, on the new image's onload (below): the old <img> keeps
+        // showing the pre-move pixels until the new PNG actually decodes, so
+        // clearing the crop here would flash the object back to its origin.
         childOverlay = null;
       },
       (err: unknown) => {
@@ -170,6 +183,15 @@
     pinMode = false;
     selectedChild = null;
     childOverlay = null;
+    // Direct-manipulation view state is board-scoped: a new board opens at fit,
+    // nothing arrange-selected, no held drag crop or grid overlay.
+    zoom = 1;
+    pan = [0, 0];
+    hiScale = 1;
+    arrangeExtra = [];
+    dragVisual = null;
+    snapGuides = [];
+    arrangeOpen = false;
     // The export popover is board-scoped: close it and drop the previous
     // board's preflight (its key would miss anyway; the state must not
     // flash the old board's fates over the new one).
@@ -339,18 +361,134 @@
 
   let rootEl = $state<HTMLDivElement | null>(null);
   let stageEl = $state<HTMLDivElement | null>(null);
-  /** Stage-pixels-per-board-point, from the rendered image's on-screen size. */
-  let ptScale = $state(1);
-  let stageOrigin = $state<[number, number]>([0, 0]);
+  let imgEl = $state<HTMLImageElement | null>(null);
+
+  // --- zoom + pan ---------------------------------------------------------
+  // The raster is laid out at its FIT size (object-fit) and then given a CSS
+  // `translate(pan) scale(zoom)` about its top-left. `baseScale`/`baseOrigin`
+  // are the fit metrics (zoom 1, pan 0), measured from the image's box with
+  // the live transform divided back out; the on-screen `ptScale`/`stageOrigin`
+  // derive from them, so every overlay and hit-test tracks zoom+pan for free
+  // with no re-measure — the derived mapping is exactly the applied transform.
+  const MIN_ZOOM = 0.25;
+  const MAX_ZOOM = 4;
+  let zoom = $state(1);
+  let pan = $state<[number, number]>([0, 0]);
+  let baseScale = $state(1);
+  let baseOrigin = $state<[number, number]>([0, 0]);
+  /** Stage-pixels-per-board-point at the current zoom. */
+  const ptScale = $derived(baseScale * zoom);
+  const stageOrigin = $derived<[number, number]>([baseOrigin[0] + pan[0], baseOrigin[1] + pan[1]]);
+  const atFit = $derived(zoom === 1 && pan[0] === 0 && pan[1] === 0);
 
   function syncStageMetrics(img: HTMLImageElement): void {
     const b = board;
-    if (b === null) return;
-    const rect = img.getBoundingClientRect();
-    ptScale = rect.width / b.canvas[0];
     const host = stageEl?.getBoundingClientRect();
-    if (host !== undefined) stageOrigin = [rect.left - host.left, rect.top - host.top];
+    if (b === null || host === undefined) return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width === 0) return;
+    // Recover the untransformed fit metrics by dividing the live transform out
+    // of the measured (transformed) box, so the derived ptScale/stageOrigin
+    // stay exact whatever the current zoom/pan.
+    baseScale = rect.width / (zoom * b.canvas[0]);
+    baseOrigin = [rect.left - host.left - pan[0], rect.top - host.top - pan[1]];
   }
+
+  /** Clamp + apply a zoom, keeping the board point under (clientX, clientY)
+   *  fixed on screen (zoom about the cursor). Pan adjusts analytically from the
+   *  current metrics — no re-measure needed. */
+  function zoomAbout(clientX: number, clientY: number, nextZoom: number): void {
+    const host = stageEl?.getBoundingClientRect();
+    if (host === undefined || ptScale === 0) return;
+    const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, nextZoom));
+    if (z === zoom) return;
+    // Board point under the cursor, at the CURRENT metrics.
+    const bx = (clientX - host.left - stageOrigin[0]) / ptScale;
+    const by = (clientY - host.top - stageOrigin[1]) / ptScale;
+    const ptScaleNext = baseScale * z;
+    pan = [pan[0] - (ptScaleNext - ptScale) * bx, pan[1] - (ptScaleNext - ptScale) * by];
+    zoom = z;
+    scheduleHiScale();
+  }
+
+  function resetView(): void {
+    zoom = 1;
+    pan = [0, 0];
+    scheduleHiScale();
+  }
+
+  function zoomStep(factor: number): void {
+    const host = stageEl?.getBoundingClientRect();
+    if (host === undefined) return;
+    // Step about the stage centre, the natural focus for a button press.
+    zoomAbout(host.left + host.width / 2, host.top + host.height / 2, zoom * factor);
+  }
+
+  // Re-request the render at a crisper device scale once the zoom settles, so
+  // zoomed-in pixels are sharp (the CSS transform carries the smooth interim).
+  // Debounced: a zoom gesture is one settle, not one render per wheel tick.
+  let hiScale = $state(1);
+  let hiScaleTimer = 0;
+  function scheduleHiScale(): void {
+    clearTimeout(hiScaleTimer);
+    hiScaleTimer = window.setTimeout(() => {
+      hiScale = Math.min(4, Math.max(1, zoom));
+    }, 220);
+  }
+  $effect(() => () => clearTimeout(hiScaleTimer));
+
+  // Space-drag panning: while space is held the stage pans instead of
+  // selecting, like every canvas tool. Tracked on the window but gated to this
+  // pane's focus so a space in a sibling terminal never arms it here.
+  let spaceHeld = $state(false);
+  $effect(() => {
+    const down = (ev: KeyboardEvent): void => {
+      if (ev.code !== "Space" || presenting) return;
+      const root = rootEl;
+      if (root === null || !root.contains(document.activeElement)) return;
+      const t = ev.target;
+      if (t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      spaceHeld = true;
+      ev.preventDefault();
+    };
+    const up = (ev: KeyboardEvent): void => {
+      if (ev.code === "Space") spaceHeld = false;
+    };
+    const blur = (): void => {
+      spaceHeld = false;
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  });
+
+  // Ctrl/Cmd+wheel (and trackpad pinch, which browsers report as ctrl+wheel)
+  // zooms about the cursor; a plain wheel two-finger-scrolls the pan. Both
+  // preventDefault so the page never scrolls under the stage.
+  function onWheel(ev: WheelEvent): void {
+    if (presenting) return;
+    if (ev.ctrlKey || ev.metaKey) {
+      ev.preventDefault();
+      zoomAbout(ev.clientX, ev.clientY, zoom * Math.exp(-ev.deltaY / 300));
+    } else {
+      ev.preventDefault();
+      pan = [pan[0] - ev.deltaX, pan[1] - ev.deltaY];
+    }
+  }
+
+  // The wheel listener must be non-passive to preventDefault the page scroll
+  // under the stage, so it is attached explicitly rather than as an attribute.
+  $effect(() => {
+    const el = stageEl;
+    if (el === null) return;
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  });
 
   // The image's on-screen size also changes when the PANE does (split drag,
   // window resize, present mode) — with no load event fired. Without this,
@@ -414,6 +552,61 @@
   let saving = $state(false);
   let saveError = $state<string | null>(null);
 
+  // --- instant real-pixel drag (the live crop) ----------------------------
+  /** The dragged object's own pixels, cropped from the current raster at drag
+   *  start and translated live under the cursor at 60fps — so the pixels track
+   *  the gesture instead of trailing the pointer-up re-render. `at`/`size` are
+   *  the origin frame (pt); `src` is the natural-px crop rect drawn into the
+   *  ghost canvas; `frozen` holds the final transform from pointer-up until the
+   *  fresh render lands (no flash back to the origin). Null = no live drag. */
+  let dragVisual = $state<{
+    at: [number, number];
+    size: [number, number];
+    src: { sx: number; sy: number; sw: number; sh: number };
+    frozen: string | null;
+  } | null>(null);
+  let ghostCanvas = $state<HTMLCanvasElement | null>(null);
+  let dragVisualTimer = 0;
+  $effect(() => () => clearTimeout(dragVisualTimer));
+
+  /** An in-flight space/two-finger pan: the pointer's start client point and
+   *  the pan at that moment, so the move handler pans by the raw delta. */
+  let panStart = $state<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
+  // --- snap guides (grid + Figma-style alignment) -------------------------
+  let snapGuides = $state<SnapGuide[]>([]);
+  /** How close (screen px) an edge must be to snap; converted to pt per-frame
+   *  so the feel is constant across zoom levels. */
+  const SNAP_PX = 6;
+
+  // --- multi-select for arrange -------------------------------------------
+  /** Objects shift/⌘-clicked in ADDITION to the primary `selected` anchor —
+   *  the arrange gesture aligns `[selected, ...arrangeExtra]` in that order
+   *  (the anchor first, as the daemon's align verbs expect). A plain click
+   *  clears it back to single-select. */
+  let arrangeExtra = $state<string[]>([]);
+  const arrangeSel = $derived<string[]>(
+    selected !== null ? [selected, ...arrangeExtra.filter((id) => id !== selected)] : [],
+  );
+  let arrangeBusy = $state(false);
+  let arrangeOpen = $state(false);
+  let arrangeChipEl = $state<HTMLButtonElement | null>(null);
+  let arrangePopEl = $state<HTMLDivElement | null>(null);
+
+  // --- grid overlay -------------------------------------------------------
+  let showGrid = $state(false);
+  /** The board's grid lines in board points (null when the board has no grid),
+   *  mirrored from the engine so the overlay + snap agree with the file. */
+  const boardGridLines = $derived.by<{ xs: number[]; ys: number[] } | null>(() => {
+    const b = board;
+    return b !== null && b.grid !== null ? gridLines(b.canvas, b.grid) : null;
+  });
+
+  /** Skip the next §6.5 attribution diff: an arrange is OUR edit (the pane
+   *  can't cheaply predict the engine's new frames to arm `ownExpected`), so
+   *  its re-render must not flash as an agent's work. */
+  let skipAttribution = false;
+
   function hit(pt: [number, number]): ObjInfo | null {
     // Topmost wins: z-order is array order, so walk backwards.
     for (let i = pageObjects.length - 1; i >= 0; i--) {
@@ -463,10 +656,40 @@
     // Focus scoping for the undo keys: only the pane the user is working in
     // may answer ⌘Z (multiple board panes, terminals, editors coexist).
     rootEl?.focus({ preventScroll: true });
+    // Space-drag pans the view: no selection, no object drag — just move the
+    // whole stage under the cursor.
+    if (spaceHeld) {
+      (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+      panStart = { x: ev.clientX, y: ev.clientY, panX: pan[0], panY: pan[1] };
+      return;
+    }
     const pt = toPt(ev);
     // Any stage press dismisses an open pin popover (its own chrome stops
     // propagation, so this only fires for presses outside it).
     openPin = null;
+    // Shift/⌘-click builds the arrange multi-selection: toggle the hit object
+    // in the extra set, keeping the primary anchor. It never starts a drag —
+    // it is a selection gesture for the align/distribute verbs.
+    if ((ev.shiftKey || ev.metaKey) && !pinMode) {
+      const t = hit(pt);
+      if (t !== null) {
+        if (selected === null) {
+          selected = t.id;
+        } else if (t.id === selected) {
+          // Re-clicking the anchor promotes the next extra to anchor.
+          const next = arrangeExtra[0] ?? null;
+          arrangeExtra = arrangeExtra.slice(1);
+          selected = next;
+        } else if (arrangeExtra.includes(t.id)) {
+          arrangeExtra = arrangeExtra.filter((id) => id !== t.id);
+        } else {
+          arrangeExtra = [...arrangeExtra, t.id];
+        }
+        selectedChild = null;
+        childOverlay = null;
+      }
+      return;
+    }
     if (pinMode) {
       // An armed press drops the pin — object-bound when it lands on one —
       // and opens the text input; it never selects or starts a drag. A
@@ -487,6 +710,7 @@
       const corner = handleAt(ev.clientX - host.left, ev.clientY - host.top);
       if (corner !== null) {
         (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+        startGhost({ at: o.at, size: o.size });
         drag = {
           mode: "resize",
           id: o.id,
@@ -513,6 +737,7 @@
         childOverlay = null;
         if (diagramNodeIndex(target, kid.id) !== null) {
           (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+          startGhost({ at: [kid.frame[0], kid.frame[1]], size: [kid.frame[2], kid.frame[3]] });
           drag = {
             mode: "child-move",
             parent: target.id,
@@ -531,19 +756,67 @@
     selected = target?.id ?? null;
     selectedChild = null;
     childOverlay = null;
+    // A plain press collapses the arrange multi-selection to this one object.
+    arrangeExtra = [];
     if (target === null || target.at === null) return;
     (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+    if (target.size !== null) startGhost({ at: target.at, size: target.size });
     drag = { mode: "move", id: target.id, startPt: pt, origAt: target.at, dx: 0, dy: 0, moved: false };
   }
 
+  /** Crop the dragged object's own pixels out of the current raster into the
+   *  live drag ghost — a same-origin drawImage from the mounted <img>, so no
+   *  fetch and no server round-trip. The ghost is then translated under the
+   *  cursor by CSS transform; drawing happens in the effect that watches
+   *  `dragVisual` + `ghostCanvas`. */
+  function startGhost(frame: Frame): void {
+    dragVisual = null;
+    clearTimeout(dragVisualTimer);
+    const img = imgEl;
+    const b = board;
+    if (img === null || b === null || img.naturalWidth === 0) return;
+    const pxPerPt = img.naturalWidth / b.canvas[0];
+    const sx = Math.max(0, Math.floor(frame.at[0] * pxPerPt));
+    const sy = Math.max(0, Math.floor(frame.at[1] * pxPerPt));
+    const sw = Math.min(img.naturalWidth - sx, Math.ceil(frame.size[0] * pxPerPt));
+    const sh = Math.min(img.naturalHeight - sy, Math.ceil(frame.size[1] * pxPerPt));
+    if (sw < 1 || sh < 1) return;
+    dragVisual = { at: frame.at, size: frame.size, src: { sx, sy, sw, sh }, frozen: null };
+  }
+
   function onPointerMove(ev: PointerEvent): void {
+    const ps = panStart;
+    if (ps !== null) {
+      pan = [ps.panX + (ev.clientX - ps.x), ps.panY + (ev.clientY - ps.y)];
+      return;
+    }
     const d = drag;
     if (d === null) return;
     const pt = toPt(ev);
     const dx = pt[0] - d.startPt[0];
     const dy = pt[1] - d.startPt[1];
     if (Math.abs(dx) > 2 || Math.abs(dy) > 2) d.moved = true;
-    if (d.mode === "move" || d.mode === "child-move") {
+    if (d.mode === "move") {
+      // Grid + Figma-style alignment snap: the guides show why the object
+      // lands where it does; the snapped delta feeds the outline, the live
+      // crop, and the commit alike so all three agree.
+      const o = pageObjects.find((x) => x.id === d.id);
+      const size = o?.size ?? [0, 0];
+      const raw: Frame = { at: [d.origAt[0] + dx, d.origAt[1] + dy], size };
+      const others = pageObjects
+        .filter((x) => x.id !== d.id && x.at !== null && x.size !== null)
+        .map((x) => ({ at: x.at as [number, number], size: x.size as [number, number] }));
+      const b = board;
+      if (b !== null) {
+        const snap = snapDrag(raw, others, boardGridLines, b.canvas, SNAP_PX / (ptScale || 1));
+        d.dx = dx + snap.dx;
+        d.dy = dy + snap.dy;
+        snapGuides = snap.guides;
+      } else {
+        d.dx = dx;
+        d.dy = dy;
+      }
+    } else if (d.mode === "child-move") {
       d.dx = dx;
       d.dy = dy;
     } else {
@@ -551,30 +824,63 @@
     }
   }
 
+  /** Freeze the live crop at the dropped position (final snapped transform)
+   *  and hold it until the fresh render swaps the real pixels in — no flash
+   *  back to the origin. A safety timer retires it if the commit fails. */
+  function freezeGhost(transform: string): void {
+    if (dragVisual !== null) dragVisual = { ...dragVisual, frozen: transform };
+    clearTimeout(dragVisualTimer);
+    dragVisualTimer = window.setTimeout(() => {
+      if (drag === null) dragVisual = null;
+    }, 1500);
+  }
+
   function onPointerUp(): void {
+    snapGuides = [];
+    if (panStart !== null) {
+      panStart = null;
+      return;
+    }
     const d = drag;
     drag = null;
-    if (d === null || !d.moved) return;
+    if (d === null || !d.moved) {
+      dragVisual = null;
+      return;
+    }
     // Snap to the 8pt grid client-side purely for the optimistic number; the
     // daemon's normalize() is the authority and snaps identically — which is
     // also what lets the undo stack record the exact written values.
     if (d.mode === "move") {
       const at: [number, number] = [snap8(d.origAt[0] + d.dx), snap8(d.origAt[1] + d.dy)];
-      if (samePair(at, d.origAt)) return;
+      if (samePair(at, d.origAt)) {
+        dragVisual = null;
+        return;
+      }
+      freezeGhost(`translate(${(at[0] - d.origAt[0]) * ptScale}px, ${(at[1] - d.origAt[1]) * ptScale}px)`);
       undoStack.push({ object: d.id, fields: [{ field: "at", from: d.origAt, to: at }] });
       void commit(d.id, { at });
     } else if (d.mode === "child-move") {
       const at: [number, number] = [snap8(d.origAt[0] + d.dx), snap8(d.origAt[1] + d.dy)];
-      if (samePair(at, d.origAt)) return;
+      if (samePair(at, d.origAt)) {
+        dragVisual = null;
+        return;
+      }
       const parent = pageObjects.find((o) => o.id === d.parent);
-      if (parent === undefined) return;
+      if (parent === undefined) {
+        dragVisual = null;
+        return;
+      }
       // Resolve the node index from the child id at RELEASE time against the
       // parent's current nodes array — the id is the stable anchor, the
       // index is not (an agent may have edited the diagram mid-drag).
       const idx = diagramNodeIndex(parent, d.childId);
-      if (idx === null) return;
+      if (idx === null) {
+        dragVisual = null;
+        return;
+      }
       const set = { [`nodes.${idx}.at`]: at };
       childOverlay = { id: d.childId, frame: { at, size: d.origSize } };
+      freezeGhost(`translate(${(at[0] - d.origAt[0]) * ptScale}px, ${(at[1] - d.origAt[1]) * ptScale}px)`);
       // Child pins stay OFF the §6.7 undo stack, like every set-based edit:
       // its actor-rule staleness check is frame-based, and the journal's
       // restyle event is the audit trail.
@@ -587,7 +893,14 @@
       ];
       const atMoved = !samePair(at, d.origAt);
       const sizeChanged = !samePair(size, d.origSize);
-      if (!atMoved && !sizeChanged) return;
+      if (!atMoved && !sizeChanged) {
+        dragVisual = null;
+        return;
+      }
+      freezeGhost(
+        `translate(${(at[0] - d.origAt[0]) * ptScale}px, ${(at[1] - d.origAt[1]) * ptScale}px) ` +
+          `scale(${size[0] / d.origSize[0]}, ${size[1] / d.origSize[1]})`,
+      );
       const fields: FieldChange[] = [];
       if (sizeChanged) fields.push({ field: "size", from: d.origSize, to: size });
       if (atMoved) fields.push({ field: "at", from: d.origAt, to: at });
@@ -597,6 +910,182 @@
       if (atMoved) change.at = at;
       void commit(d.id, change);
     }
+  }
+
+  // Paint the dragged object's crop into the ghost canvas once it mounts —
+  // same-origin drawImage from the live <img>, so no fetch. A cross-origin or
+  // undecoded raster can't be cropped: drop the ghost and fall back to the
+  // outline-only drag (the write path is unchanged either way).
+  $effect(() => {
+    const dv = dragVisual;
+    const cv = ghostCanvas;
+    const img = imgEl;
+    if (dv === null || cv === null || img === null) return;
+    const { sx, sy, sw, sh } = dv.src;
+    cv.width = sw;
+    cv.height = sh;
+    const ctx = cv.getContext("2d");
+    if (ctx === null) return;
+    try {
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    } catch {
+      dragVisual = null;
+    }
+  });
+
+  /** The live crop's stage-pixel box (its origin frame); the transform below
+   *  translates/scales it under the cursor. */
+  const ghostBox = $derived.by(() => {
+    const dv = dragVisual;
+    if (dv === null) return null;
+    return {
+      left: stageOrigin[0] + dv.at[0] * ptScale,
+      top: stageOrigin[1] + dv.at[1] * ptScale,
+      width: dv.size[0] * ptScale,
+      height: dv.size[1] * ptScale,
+    };
+  });
+
+  /** The crop's live transform: a translate for a move, translate+scale for a
+   *  resize, or the frozen drop transform between pointer-up and re-render. */
+  const ghostTransform = $derived.by(() => {
+    const dv = dragVisual;
+    if (dv === null) return "none";
+    const d = drag;
+    if (d !== null) {
+      if (d.mode === "move" || d.mode === "child-move")
+        return `translate(${d.dx * ptScale}px, ${d.dy * ptScale}px)`;
+      if (d.mode === "resize") {
+        const tx = (d.cur.at[0] - d.origAt[0]) * ptScale;
+        const ty = (d.cur.at[1] - d.origAt[1]) * ptScale;
+        return `translate(${tx}px, ${ty}px) scale(${d.cur.size[0] / d.origSize[0]}, ${d.cur.size[1] / d.origSize[1]})`;
+      }
+    }
+    return dv.frozen ?? "none";
+  });
+
+  /** A live size readout during a resize (board points), positioned at the
+   *  gesture's frame — the numeric feedback the inspector can't give mid-drag. */
+  const resizeBadge = $derived.by(() => {
+    const d = drag;
+    if (d === null || d.mode !== "resize" || !d.moved) return null;
+    return {
+      left: stageOrigin[0] + d.cur.at[0] * ptScale,
+      top: stageOrigin[1] + d.cur.at[1] * ptScale,
+      text: `${Math.round(snap8(d.cur.size[0]))} × ${Math.round(snap8(d.cur.size[1]))}`,
+    };
+  });
+
+  // --- grid overlay + alignment guides (stage pixels) ---------------------
+  const gridOverlay = $derived.by(() => {
+    if (!showGrid) return null;
+    const g = boardGridLines;
+    const b = board;
+    if (g === null || b === null) return null;
+    return {
+      xs: g.xs.map((x) => stageOrigin[0] + x * ptScale),
+      ys: g.ys.map((y) => stageOrigin[1] + y * ptScale),
+      top: stageOrigin[1],
+      left: stageOrigin[0],
+      width: b.canvas[0] * ptScale,
+      height: b.canvas[1] * ptScale,
+    };
+  });
+
+  const guideLines = $derived.by(() =>
+    snapGuides.map((g, i) => ({
+      key: i,
+      grid: g.grid,
+      vertical: g.axis === "x",
+      left: g.axis === "x" ? stageOrigin[0] + g.pos * ptScale : stageOrigin[0] + g.from * ptScale,
+      top: g.axis === "x" ? stageOrigin[1] + g.from * ptScale : stageOrigin[1] + g.pos * ptScale,
+      length: (g.to - g.from) * ptScale,
+    })),
+  );
+
+  /** The arrange multi-selection's non-anchor boxes (the anchor keeps the
+   *  primary selection outline). */
+  const extraBoxes = $derived.by(() =>
+    arrangeExtra
+      .map((id) => pageObjects.find((o) => o.id === id))
+      .filter((o): o is ObjInfo => o !== undefined && o.at !== null && o.size !== null && o.id !== selected)
+      .map((o) => ({
+        id: o.id,
+        left: stageOrigin[0] + (o.at as [number, number])[0] * ptScale,
+        top: stageOrigin[1] + (o.at as [number, number])[1] * ptScale,
+        width: (o.size as [number, number])[0] * ptScale,
+        height: (o.size as [number, number])[1] * ptScale,
+      })),
+  );
+
+  // --- arrange (align / distribute / snap-grid) ---------------------------
+  /** The align/distribute vocabulary the popover exposes — exactly the
+   *  daemon's `arrange::OPS` plus `snap-grid`, with the minimum selection each
+   *  needs (a distribute wants three; snap-grid one and a grid). */
+  const ARRANGE_OPS: { op: string; label: string; title: string; min: number; grid?: boolean }[] = [
+    { op: "align-left", label: "Left", title: "align left edges", min: 2 },
+    { op: "align-center-h", label: "Center", title: "align horizontal centers", min: 2 },
+    { op: "align-right", label: "Right", title: "align right edges", min: 2 },
+    { op: "align-top", label: "Top", title: "align top edges", min: 2 },
+    { op: "align-center-v", label: "Middle", title: "align vertical centers", min: 2 },
+    { op: "align-bottom", label: "Bottom", title: "align bottom edges", min: 2 },
+    { op: "distribute-h", label: "Dist H", title: "even horizontal gaps", min: 3 },
+    { op: "distribute-v", label: "Dist V", title: "even vertical gaps", min: 3 },
+    { op: "snap-grid", label: "Snap grid", title: "snap to the layout grid", min: 1, grid: true },
+  ];
+
+  /**
+   * The multi-object arrange gesture: POST /board/edit `{arrange:{op, objects}}`
+   * on the same serialized commit chain as every edit, adopting the write so
+   * the pixels follow (files.ts owns the typed edit wrappers, but its `change`
+   * type can't carry `arrange`, so this rides the shared `api` helper). Our own
+   * edit — the §6.5 attribution differ skips its re-render.
+   */
+  async function runArrange(op: string): Promise<void> {
+    if (arrangeBusy) return;
+    const ids = arrangeSel.filter((id) => pageObjects.some((o) => o.id === id));
+    if (ids.length === 0) return;
+    arrangeOpen = false;
+    arrangeBusy = true;
+    commitChain = commitChain.then(async () => {
+      saving = true;
+      saveError = null;
+      try {
+        const res = await api("/board/edit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path, arrange: { op, objects: ids } }),
+        });
+        if (!res.ok) {
+          let message = `arrange failed (${res.status})`;
+          try {
+            const body = (await res.json()) as { error?: string };
+            if (typeof body.error === "string") message = body.error;
+          } catch {
+            // non-JSON error body; keep the generic message
+          }
+          throw new ApiError(res.status, message);
+        }
+        const body = (await res.json()) as { mtime?: string | null };
+        const mtime = body.mtime ?? null;
+        skipAttribution = true;
+        if (mtime !== null) {
+          ownWrites.add(mtime);
+          if (ownWrites.size > 64) {
+            const oldest = ownWrites.values().next().value;
+            if (oldest !== undefined) ownWrites.delete(oldest);
+          }
+        }
+        noteWrite(path, mtime);
+        showToast(`${op} · ${ids.length}`);
+      } catch (err) {
+        saveError = err instanceof Error ? err.message : String(err);
+        showToast(saveError);
+      } finally {
+        saving = false;
+        arrangeBusy = false;
+      }
+    });
   }
 
   // --- commits + own-write attribution bookkeeping ------------------------
@@ -716,6 +1205,31 @@
         }
         // Adopt our own write: the published token re-keys the render effect
         // so the repainted ground follows the click immediately.
+        noteWrite(path, mtime);
+      } catch (err) {
+        saveError = err instanceof Error ? err.message : String(err);
+      } finally {
+        saving = false;
+      }
+    });
+  }
+
+  /** Pin a scheme (talk/figure), a variant, or clear to auto (match the app).
+   *  Board-level like the ground: no frame moves, so the attribution differ
+   *  stays quiet; the journal's `canvas-changed` (theme key) is the trail. */
+  function commitTheme(theme: string | null): void {
+    commitChain = commitChain.then(async () => {
+      saving = true;
+      saveError = null;
+      try {
+        const mtime = await fsBoardTheme(path, theme);
+        if (mtime !== null) {
+          ownWrites.add(mtime);
+          if (ownWrites.size > 64) {
+            const oldest = ownWrites.values().next().value;
+            if (oldest !== undefined) ownWrites.delete(oldest);
+          }
+        }
         noteWrite(path, mtime);
       } catch (err) {
         saveError = err instanceof Error ? err.message : String(err);
@@ -1187,6 +1701,13 @@
     flashBaseline = { path: p, page: pg, hadBoard: hasBoard, frames };
     if (prev === null || prev.path !== p || prev.page !== pg) return;
     if (!prev.hadBoard || !hasBoard) return;
+    // An arrange we just committed re-renders with moved frames the pane can't
+    // predict into `ownExpected`; consume that one diff so our own edit does
+    // not flash as an agent's. Baseline is already the arranged frames.
+    if (skipAttribution) {
+      skipAttribution = false;
+      return;
+    }
     const changed = attributeDiff(prev.frames, frames, ownExpected);
     if (changed.length === 0) return;
     untrack(() => addFlashes(changed));
@@ -1311,6 +1832,34 @@
     };
   });
 
+  // The arrange popover dismisses the same way — Escape or a press outside its
+  // own chrome (the chip toggles itself). A press on a stage object still
+  // reaches onPointerDown, so shift-clicking to grow the selection while the
+  // popover is open keeps it open.
+  $effect(() => {
+    if (!arrangeOpen) return;
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        arrangeOpen = false;
+        arrangeChipEl?.focus();
+      }
+    };
+    const onPress = (ev: PointerEvent): void => {
+      const t = ev.target;
+      if (!(t instanceof Node)) return;
+      if (arrangePopEl?.contains(t) === true || arrangeChipEl?.contains(t) === true) return;
+      if (stageEl?.contains(t) === true) return;
+      arrangeOpen = false;
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("pointerdown", onPress);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("pointerdown", onPress);
+    };
+  });
+
   // --- present mode --------------------------------------------------------
   let presenting = $state(false);
   let chromeVisible = $state(true);
@@ -1326,6 +1875,15 @@
     pinMode = false;
     pinDraft = null;
     openPin = null;
+    // Present shows the page at fit with no editing chrome.
+    zoom = 1;
+    pan = [0, 0];
+    hiScale = 1;
+    panStart = null;
+    arrangeExtra = [];
+    arrangeOpen = false;
+    dragVisual = null;
+    snapGuides = [];
     closeExport();
     const el = rootEl;
     // Full-bleed within the pane works regardless; browser fullscreen is a
@@ -1401,7 +1959,6 @@
     };
   });
 
-  const warnings = $derived((render?.diagnostics ?? []).filter((d) => d.severity !== "info"));
 
   /** The selection box in stage pixels, tracking an in-flight drag/resize. */
   const selectionBox = $derived.by(() => {
@@ -1456,22 +2013,84 @@
     <div
       class="stage"
       class:pinning={pinMode && !presenting}
+      class:panning={panStart !== null}
+      class:pan-ready={spaceHeld && panStart === null}
       role="presentation"
       bind:this={stageEl}
       onpointerdown={onPointerDown}
       onpointermove={onPointerMove}
       onpointerup={onPointerUp}
-      onpointercancel={() => (drag = null)}
+      onpointercancel={() => {
+        drag = null;
+        panStart = null;
+        snapGuides = [];
+        dragVisual = null;
+      }}
       ondblclick={onDblClick}
     >
       {#if imgUrl !== null}
         <img
+          bind:this={imgEl}
           src={imgUrl}
           alt={board?.title ?? "board page"}
           draggable="false"
-          onload={(ev) => syncStageMetrics(ev.currentTarget as HTMLImageElement)}
+          style:transform={`translate(${pan[0]}px, ${pan[1]}px) scale(${zoom})`}
+          style:transform-origin="0 0"
+          onload={(ev) => {
+            syncStageMetrics(ev.currentTarget as HTMLImageElement);
+            // The dropped-drag crop is held until the new pixels actually paint;
+            // this is that moment. (A drag already restarted keeps its ghost.)
+            if (drag === null) dragVisual = null;
+          }}
         />
         {#if !presenting}
+          <!-- The layout grid overlay (§ canvas.grid): faint guides the author
+               places against, drawn from the file's own grid — a view aid, not
+               geometry. -->
+          {#if gridOverlay !== null}
+            <div class="grid-overlay" aria-hidden="true">
+              {#each gridOverlay.xs as gx, gi (`x${gi}`)}
+                <div
+                  class="grid-line v"
+                  style:left={`${gx}px`}
+                  style:top={`${gridOverlay.top}px`}
+                  style:height={`${gridOverlay.height}px`}
+                ></div>
+              {/each}
+              {#each gridOverlay.ys as gy, gi (`y${gi}`)}
+                <div
+                  class="grid-line h"
+                  style:left={`${gridOverlay.left}px`}
+                  style:top={`${gy}px`}
+                  style:width={`${gridOverlay.width}px`}
+                ></div>
+              {/each}
+            </div>
+          {/if}
+          <!-- The live drag crop: the dragged object's own pixels, translated
+               under the cursor at 60fps with no server round-trip. Held frozen
+               at the drop until the fresh render swaps the real pixels in. -->
+          {#if dragVisual !== null && ghostBox !== null}
+            <canvas
+              bind:this={ghostCanvas}
+              class="drag-ghost"
+              class:frozen={drag === null}
+              style:left={`${ghostBox.left}px`}
+              style:top={`${ghostBox.top}px`}
+              style:width={`${ghostBox.width}px`}
+              style:height={`${ghostBox.height}px`}
+              style:transform={ghostTransform}
+            ></canvas>
+            {#if drag !== null}
+              <div
+                class="drag-origin"
+                style:left={`${ghostBox.left}px`}
+                style:top={`${ghostBox.top}px`}
+                style:width={`${ghostBox.width}px`}
+                style:height={`${ghostBox.height}px`}
+              ></div>
+            {/if}
+          {/if}
           {#if selectionBox !== null}
             <!-- With a child drilled into, the parent demotes to a dashed
                  containment hint and the child wears the selection. -->
@@ -1500,6 +2119,39 @@
                 style:height={`${childBox.height}px`}
               ></div>
             {/if}
+          {/if}
+          <!-- Arrange multi-selection: the non-anchor members wear a lighter
+               outline (the anchor keeps the solid selection above). -->
+          {#each extraBoxes as b (b.id)}
+            <div
+              class="selection multi"
+              style:left={`${b.left}px`}
+              style:top={`${b.top}px`}
+              style:width={`${b.width}px`}
+              style:height={`${b.height}px`}
+            ></div>
+          {/each}
+          <!-- Snap + alignment guides while dragging: a grid line spans the
+               canvas, an object-edge alignment spans the aligned objects. -->
+          {#each guideLines as g (g.key)}
+            <div
+              class="guide"
+              class:grid={g.grid}
+              class:vertical={g.vertical}
+              style:left={`${g.left}px`}
+              style:top={`${g.top}px`}
+              style:width={g.vertical ? "0px" : `${g.length}px`}
+              style:height={g.vertical ? `${g.length}px` : "0px"}
+            ></div>
+          {/each}
+          {#if resizeBadge !== null}
+            <div
+              class="size-badge"
+              style:left={`${resizeBadge.left}px`}
+              style:top={`${resizeBadge.top}px`}
+            >
+              {resizeBadge.text}
+            </div>
           {/if}
           {#each flashes as f (f.key)}
             <div
@@ -1604,6 +2256,34 @@
       {#if rendering && imgUrl !== null}
         <div class="rendering-dot" title="rendering"></div>
       {/if}
+      {#if !presenting && imgUrl !== null}
+        <!-- Zoom controls: ⌘/Ctrl+wheel or pinch zooms about the cursor;
+             two-finger scroll or space-drag pans. The percent doubles as
+             reset-to-fit. -->
+        <div class="zoom-controls">
+          <button
+            class="zoom-btn"
+            onclick={() => zoomStep(1 / 1.25)}
+            disabled={zoom <= MIN_ZOOM + 1e-6}
+            aria-label="zoom out"
+            title="zoom out">−</button
+          >
+          <button
+            class="zoom-pct"
+            class:dim={atFit}
+            onclick={resetView}
+            aria-label="reset to fit"
+            title="reset to fit (100%)">{Math.round(zoom * 100)}%</button
+          >
+          <button
+            class="zoom-btn"
+            onclick={() => zoomStep(1.25)}
+            disabled={zoom >= MAX_ZOOM - 1e-6}
+            aria-label="zoom in"
+            title="zoom in">+</button
+          >
+        </div>
+      {/if}
     </div>
 
     {#if presenting}
@@ -1644,6 +2324,30 @@
         {:else if saveError !== null}
           <span class="save-state err" title={saveError}>{midTruncate(saveError, 60)}</span>
         {/if}
+        <button
+          class="nav wide"
+          class:armed={showGrid}
+          disabled={board?.grid == null}
+          onclick={() => (showGrid = !showGrid)}
+          aria-pressed={showGrid}
+          aria-label="toggle layout grid overlay"
+          title={board?.grid != null
+            ? "toggle the layout grid overlay (canvas.grid)"
+            : "this board has no canvas.grid"}
+          >grid</button
+        >
+        <button
+          bind:this={arrangeChipEl}
+          class="nav wide"
+          class:armed={arrangeOpen}
+          disabled={selected === null}
+          onclick={() => (arrangeOpen = !arrangeOpen)}
+          aria-expanded={arrangeOpen}
+          aria-haspopup="dialog"
+          aria-label="align and distribute"
+          title="align, distribute, or snap the selection to the grid — shift/⌘-click objects on the stage to select more"
+          >align{arrangeSel.length > 1 ? ` (${arrangeSel.length})` : ""}</button
+        >
         <button
           class="nav wide"
           class:armed={pinMode}
@@ -1746,15 +2450,34 @@
             </div>
           </div>
         {/if}
+        {#if arrangeOpen}
+          <div
+            class="arrange-pop"
+            bind:this={arrangePopEl}
+            role="dialog"
+            aria-label="align and distribute"
+          >
+            <div class="arrange-hint">
+              {arrangeSel.length > 1
+                ? `${arrangeSel.length} selected · first is the anchor`
+                : "shift/⌘-click objects on the stage to align them"}
+            </div>
+            <div class="arrange-grid">
+              {#each ARRANGE_OPS as a (a.op)}
+                <button
+                  class="arr"
+                  disabled={arrangeBusy ||
+                    arrangeSel.length < a.min ||
+                    (a.grid === true && board?.grid == null)}
+                  title={a.title}
+                  onclick={() => void runArrange(a.op)}>{a.label}</button
+                >
+              {/each}
+            </div>
+          </div>
+        {/if}
       </div>
 
-      {#if warnings.length > 0}
-        <div class="diags">
-          {#each warnings as w (w.rendered)}
-            <div class="diag" class:err={w.severity === "error"}>{w.rendered}</div>
-          {/each}
-        </div>
-      {/if}
     {/if}
   </div>
 
@@ -1768,7 +2491,11 @@
       catSwatches={render?.catSwatches ?? []}
       bgSwatches={render?.bgSwatches ?? []}
       canvasBackground={board?.canvasBackground ?? null}
+      schemes={render?.schemes ?? []}
+      themeSelection={render?.themeSelection ?? "auto"}
+      diagnostics={render?.diagnostics ?? []}
       oncommitcanvas={commitCanvasBackground}
+      oncommittheme={commitTheme}
       onselect={(id) => {
         selected = id;
         selectedChild = null;
@@ -1811,8 +2538,16 @@
     align-items: center;
     justify-content: center;
     padding: 16px;
+    /* Zoomed-in pixels overflow the fit box; clip them to the stage. */
+    overflow: hidden;
     touch-action: none;
     user-select: none;
+  }
+  .stage.pan-ready {
+    cursor: grab;
+  }
+  .stage.panning {
+    cursor: grabbing;
   }
   .stage img {
     max-width: 100%;
@@ -1821,6 +2556,65 @@
     box-shadow: 0 2px 16px var(--scrim);
     border: 1px solid var(--edge);
     border-radius: 4px;
+  }
+  /* The layout grid overlay. */
+  .grid-line {
+    position: absolute;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  .grid-line.v {
+    width: 1px;
+  }
+  .grid-line.h {
+    height: 1px;
+  }
+  /* The live drag crop — the object's own pixels lifted under the cursor. */
+  .drag-ghost {
+    position: absolute;
+    pointer-events: none;
+    transform-origin: 0 0;
+    border-radius: 2px;
+    box-shadow: 0 6px 20px var(--scrim);
+    will-change: transform;
+  }
+  .drag-ghost.frozen {
+    /* Held at the drop until the fresh render lands — no shadow flicker. */
+    box-shadow: none;
+  }
+  /* A faint marker of where the drag started. */
+  .drag-origin {
+    position: absolute;
+    pointer-events: none;
+    border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+    border-radius: 2px;
+  }
+  /* Snap + alignment guides. */
+  .guide {
+    position: absolute;
+    pointer-events: none;
+    background: var(--accent);
+  }
+  .guide.vertical {
+    width: 1px;
+  }
+  .guide:not(.vertical) {
+    height: 1px;
+  }
+  .guide.grid {
+    background: color-mix(in srgb, var(--accent) 60%, transparent);
+  }
+  .size-badge {
+    position: absolute;
+    transform: translate(0, calc(-100% - 6px));
+    padding: 1px 6px;
+    background: var(--accent);
+    color: var(--term-bg);
+    font-family: var(--mono);
+    font-size: 10px;
+    border-radius: 3px;
+    pointer-events: none;
+    white-space: nowrap;
   }
   .presenting .stage {
     padding: 0;
@@ -1843,6 +2637,11 @@
   .selection.parent {
     border-style: dashed;
     border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    box-shadow: none;
+  }
+  .selection.multi {
+    border-width: 1px;
+    border-color: color-mix(in srgb, var(--accent) 70%, transparent);
     box-shadow: none;
   }
   .handle {
@@ -2022,6 +2821,94 @@
     font-size: var(--text-xs);
     color: var(--muted);
   }
+  /* Floating zoom controls, bottom-left of the stage. */
+  .zoom-controls {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 2px 10px var(--scrim);
+    overflow: hidden;
+    z-index: 2;
+  }
+  .zoom-btn,
+  .zoom-pct {
+    background: none;
+    border: none;
+    color: var(--fg);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    height: 24px;
+  }
+  .zoom-btn {
+    width: 26px;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .zoom-pct {
+    min-width: 48px;
+    border-left: 1px solid var(--edge);
+    border-right: 1px solid var(--edge);
+    font-family: var(--mono);
+  }
+  .zoom-pct.dim {
+    color: var(--muted);
+  }
+  .zoom-btn:not(:disabled):hover,
+  .zoom-pct:hover {
+    background: var(--row-hover);
+  }
+  .zoom-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  /* The align/distribute popover, anchored above its chip. */
+  .arrange-pop {
+    position: absolute;
+    z-index: 4;
+    right: 8px;
+    bottom: calc(100% + 6px);
+    width: 210px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--term-bg);
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px var(--scrim);
+    color: var(--fg);
+  }
+  .arrange-hint {
+    color: var(--muted);
+    font-size: var(--text-xs);
+  }
+  .arrange-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+  }
+  .arr {
+    background: none;
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    color: var(--fg);
+    padding: 4px 0;
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .arr:not(:disabled):hover {
+    background: var(--row-hover);
+  }
+  .arr:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
   .export-pop {
     position: absolute;
     z-index: 4;
@@ -2161,21 +3048,6 @@
     font-family: var(--mono);
   }
   .save-state.err {
-    color: var(--err);
-  }
-  .diags {
-    max-height: 96px;
-    overflow-y: auto;
-    border-top: 1px solid var(--edge);
-    padding: 4px 12px;
-  }
-  .diag {
-    font-size: var(--text-xs);
-    font-family: var(--mono);
-    color: var(--warn);
-    padding: 1px 0;
-  }
-  .diag.err {
     color: var(--err);
   }
 </style>

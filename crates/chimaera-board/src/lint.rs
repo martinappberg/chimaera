@@ -463,6 +463,30 @@ pub fn lint_target(
     let mut diags = lint(board, theme);
     let floors = &preset.floors;
 
+    // The talk floor: a deck reads as unfinished without a cover title.
+    // Scoped to talk-family presets (`require_title`) — a figure, poster or
+    // README image legitimately carries none, so this never fires there. A
+    // Warning, not a floor Error: a titleless deck is a smell, not illegal.
+    if preset.rules.require_title
+        && board
+            .title
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        diags.push(
+            Diagnostic::new(
+                Severity::Warning,
+                format!(
+                    "no board title; {} decks read as unfinished without one — set `title`",
+                    preset.id
+                ),
+            )
+            .field("title"),
+        );
+    }
+
     // Role names actually drawn on this board, for the font-resolution check.
     let mut used_roles: BTreeSet<&str> = BTreeSet::new();
     // The theme ramp's CVD-safe series cap, computed lazily: the Machado
@@ -2039,9 +2063,12 @@ mod tests {
 
     // --- lint --target -----------------------------------------------------
 
+    // A titled board on purpose: the talk-family title floor is exercised by
+    // its own test, so the shared helper stays title-clean and every other
+    // target assertion measures only the object under test.
     fn target_linted(objects: &str, theme_id: &str, target: &str) -> Vec<Diagnostic> {
         let mut b = crate::parse(&format!(
-            r#"{{"format":"chimaera.board","formatVersion":1,
+            r#"{{"format":"chimaera.board","formatVersion":1,"title":"T",
                 "canvas":{{"size":[960,540]}},
                 "pages":[{{"id":"p1","objects":[{objects}]}}]}}"#
         ))
@@ -2050,6 +2077,63 @@ mod tests {
         let theme = crate::theme::bundled(theme_id).unwrap();
         let preset = crate::presets::get(target).unwrap();
         lint_target(&b, &theme, preset, &FontStack::new(&[]))
+    }
+
+    /// A titleless board lints clean under a figure/pub target — a figure
+    /// needs no title — but warns under a talk target, where a deck reads as
+    /// unfinished without one. A titled board warns nowhere.
+    #[test]
+    fn a_titleless_board_warns_only_under_a_talk_target() {
+        let title_warning = |d: &Diagnostic| {
+            d.severity == Severity::Warning && d.message.contains("no board title")
+        };
+        let lint_with = |title: &str, theme_id: &str, target: &str| {
+            let json = if title.is_empty() {
+                r#"{"format":"chimaera.board","formatVersion":1,
+                    "canvas":{"size":[960,540]},"pages":[{"id":"p1","objects":[]}]}"#
+                    .to_string()
+            } else {
+                format!(
+                    r#"{{"format":"chimaera.board","formatVersion":1,"title":"{title}",
+                        "canvas":{{"size":[960,540]}},"pages":[{{"id":"p1","objects":[]}}]}}"#
+                )
+            };
+            let mut b = crate::parse(&json).unwrap();
+            crate::normalize(&mut b);
+            let theme = crate::theme::bundled(theme_id).unwrap();
+            let preset = crate::presets::get(target).unwrap();
+            lint_target(&b, &theme, preset, &FontStack::new(&[]))
+        };
+
+        // Titleless: clean under a figure/pub venue.
+        assert!(
+            !lint_with("", "figure-light", "pub-nature-single")
+                .iter()
+                .any(title_warning),
+            "a figure needs no title"
+        );
+        assert!(
+            !lint_with("", "figure-light", "readme-image")
+                .iter()
+                .any(title_warning),
+            "a README image needs no title"
+        );
+        // Titleless: warns under a talk deck.
+        let talk = lint_with("", "talk-light", "talk-16x9");
+        let w = talk
+            .iter()
+            .find(|d| title_warning(d))
+            .expect("a title warning");
+        assert_eq!(w.field.as_deref(), Some("title"));
+        assert!(w.message.contains("talk-16x9"), "{}", w.message);
+        // A whitespace-only title is still no title.
+        assert!(lint_with("   ", "talk-light", "talk-16x9")
+            .iter()
+            .any(title_warning));
+        // A real title clears it, deck or figure.
+        assert!(!lint_with("Kickoff", "talk-light", "talk-16x9")
+            .iter()
+            .any(title_warning));
     }
 
     #[test]

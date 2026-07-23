@@ -13,18 +13,22 @@ import {
   editorTextToNodeLabel,
   editorTextToParagraphs,
   fateCensus,
+  gridLines,
   hitChild,
   MARK_SWAP_KINDS,
   nextPinId,
   paragraphsToEditorText,
+  parseBoard,
   pinAnchor,
   sameParagraphs,
+  snapDrag,
   snapshotRegion,
   SORT_OPTIONS,
   unresolvedPins,
   SNAPSHOT_PAD_PT,
   type ChildFrame,
   type ExpectedChange,
+  type Frame,
   type ObjInfo,
   type ObjSnap,
   type PinInfo,
@@ -500,5 +504,114 @@ describe("attributeDiff with config fingerprints", () => {
     );
     expect(changed).toEqual([]);
     expect(expected.size).toBe(0);
+  });
+});
+
+describe("parseBoard grid", () => {
+  const bytes = (v: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(v));
+
+  it("parses a column-only grid", () => {
+    const b = parseBoard(bytes({ canvas: { size: [960, 540], grid: { cols: 12 } }, pages: [] }));
+    expect(b?.grid).toEqual({ cols: 12, rows: null, margin: 0, gutter: 0 });
+  });
+
+  it("carries rows, margin and gutter", () => {
+    const b = parseBoard(
+      bytes({ canvas: { size: [960, 540], grid: { cols: 6, rows: 4, margin: 24, gutter: 8 } } }),
+    );
+    expect(b?.grid).toEqual({ cols: 6, rows: 4, margin: 24, gutter: 8 });
+  });
+
+  it("drops a structurally broken grid to null (leniency, like the daemon)", () => {
+    expect(parseBoard(bytes({ canvas: { size: [960, 540], grid: { cols: "x" } } }))?.grid).toBeNull();
+    expect(parseBoard(bytes({ canvas: { size: [960, 540], grid: 7 } }))?.grid).toBeNull();
+    // cols < 1 reads as absent (an overlay of one column is noise).
+    expect(parseBoard(bytes({ canvas: { size: [960, 540], grid: { cols: 0 } } }))?.grid).toBeNull();
+  });
+
+  it("is null when the board has no grid", () => {
+    expect(parseBoard(bytes({ canvas: { size: [960, 540] } }))?.grid).toBeNull();
+  });
+});
+
+describe("gridLines", () => {
+  it("mirrors the engine's 12-column design grid (80pt columns, x only)", () => {
+    const { xs, ys } = gridLines([960, 540], { cols: 12, rows: null, margin: 0, gutter: 0 });
+    expect(xs).toEqual([0, 80, 160, 240, 320, 400, 480, 560, 640, 720, 800, 880]);
+    // A column-only grid snaps x only — no row lines, exactly like snap-grid.
+    expect(ys).toEqual([]);
+  });
+
+  it("emits row-start lines when the grid has rows", () => {
+    const { xs, ys } = gridLines([960, 540], { cols: 12, rows: 6, margin: 0, gutter: 0 });
+    expect(xs).toHaveLength(12);
+    expect(ys).toHaveLength(6);
+    expect(ys[0]).toBe(0);
+  });
+
+  it("insets by margin and separates by gutter, 8pt-quantized", () => {
+    const { xs } = gridLines([960, 540], { cols: 2, rows: null, margin: 16, gutter: 16 });
+    // content 928, cell (928-16)/2=456; starts 16 and 16+456+16=488, both 8pt.
+    expect(xs).toEqual([16, 488]);
+  });
+});
+
+describe("snapDrag", () => {
+  const grid = { xs: [0, 80, 160, 240], ys: [] as number[] };
+  const canvas: [number, number] = [960, 540];
+
+  it("does nothing with no neighbours and no grid", () => {
+    const r = snapDrag({ at: [123, 45], size: [40, 40] }, [], null, canvas, 8);
+    expect(r).toEqual({ dx: 0, dy: 0, guides: [] });
+  });
+
+  it("snaps a near-aligned left edge and draws a vertical guide", () => {
+    const other: Frame = { at: [100, 200], size: [40, 40] };
+    const r = snapDrag({ at: [103, 52], size: [40, 40] }, [other], null, canvas, 8);
+    // left 103→100 (dx -3), top 52→200-edge is far; but the other's top 200 is
+    // 148 away, so no y snap here.
+    expect(r.dx).toBe(-3);
+    expect(r.dy).toBe(0);
+    const vx = r.guides.find((g) => g.axis === "x");
+    expect(vx?.pos).toBe(100);
+    expect(vx?.grid).toBe(false);
+  });
+
+  it("snaps both axes to one neighbour's top-left", () => {
+    const other: Frame = { at: [100, 50], size: [40, 40] };
+    const r = snapDrag({ at: [103, 52], size: [40, 40] }, [other], null, canvas, 8);
+    expect(r.dx).toBe(-3);
+    expect(r.dy).toBe(-2);
+    expect(r.guides.some((g) => g.axis === "x" && g.pos === 100)).toBe(true);
+    expect(r.guides.some((g) => g.axis === "y" && g.pos === 50)).toBe(true);
+  });
+
+  it("snaps to a grid line when nothing else aligns", () => {
+    const r = snapDrag({ at: [82, 300], size: [40, 40] }, [], grid, canvas, 8);
+    expect(r.dx).toBe(-2);
+    const vx = r.guides.find((g) => g.axis === "x");
+    expect(vx?.grid).toBe(true);
+    expect(vx?.pos).toBe(80);
+    // A grid guide spans the whole canvas cross-axis.
+    expect(vx?.from).toBe(0);
+    expect(vx?.to).toBe(canvas[1]);
+  });
+
+  it("prefers an object edge over a grid line at equal distance", () => {
+    // other's left at 84 (2 away) ties the grid line at 80... make the object
+    // strictly closer to prove the tie-break toward object edges.
+    const other: Frame = { at: [83, 300], size: [40, 40] };
+    const r = snapDrag({ at: [82, 300], size: [40, 40] }, [other], grid, canvas, 8);
+    const vx = r.guides.find((g) => g.axis === "x");
+    expect(vx?.grid).toBe(false);
+    expect(vx?.pos).toBe(83);
+  });
+
+  it("stays free past the threshold", () => {
+    // Every anchor (left/center/right = 123/143/163) sits >8pt from the other's
+    // edges and from any grid line (0/80/160/240), so nothing snaps.
+    const other: Frame = { at: [400, 400], size: [40, 40] };
+    const r = snapDrag({ at: [123, 55], size: [40, 40] }, [other], grid, canvas, 8);
+    expect(r).toEqual({ dx: 0, dy: 0, guides: [] });
   });
 });

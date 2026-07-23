@@ -65,6 +65,21 @@ describe("collectShownBoards", () => {
       "/ws/b.board.json",
     ]);
   });
+
+  it("matches the canonical .board extension the CLI now emits", () => {
+    const tools = [done(`${SHOWN}.chimaera/board/shown/a3f1.board`)];
+    expect(collectShownBoards(tools, "/ws")).toEqual([
+      { path: "/ws/.chimaera/board/shown/a3f1.board", revision: 1 },
+    ]);
+  });
+
+  it("matches .board and legacy .board.json side by side", () => {
+    const tools = [done(`${SHOWN}new.board\n${SHOWN}old.board.json`)];
+    expect(collectShownBoards(tools, "/ws").map((s) => s.path)).toEqual([
+      "/ws/new.board",
+      "/ws/old.board.json",
+    ]);
+  });
 });
 
 describe("collectShownByGroup (update-in-place across turns)", () => {
@@ -133,6 +148,11 @@ describe("uniqueBoardName", () => {
 
   it("survives a name with no extension", () => {
     expect(uniqueBoardName("plain", new Set(["plain"]))).toBe("plain-2");
+  });
+
+  it("keeps the canonical .board extension whole on collision", () => {
+    const existing = new Set(["a.board"]);
+    expect(uniqueBoardName("a.board", existing)).toBe("a-2.board");
   });
 });
 

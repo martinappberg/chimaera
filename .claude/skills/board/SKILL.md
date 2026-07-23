@@ -1,11 +1,12 @@
 ---
 name: board
-description: Compose and edit .board.json visual surfaces (decks, cards, quick result charts) with the chimaera board CLI — show a result mid-work, author a deck, read back positions after the human moves things, and keep the loop honest. Use when the user asks for a slide, a figure, a chart of results, or when a picture beats a paragraph.
+description: Compose and edit .board visual surfaces (decks, cards, quick result charts) with the chimaera board CLI — show a result mid-work, author a deck, read back positions after the human moves things, and keep the loop honest. Use when the user asks for a slide, a figure, a chart of results, or when a picture beats a paragraph.
 ---
 
 # Board — compose, render, read back
 
-A board is an ordinary `*.board.json` file anywhere in the workspace. You write
+A board is an ordinary `*.board` file anywhere in the workspace (JSON content;
+the legacy `*.board.json` still opens). You write
 it, `chimaera board render` draws it, the human nudges objects in the BoardView
 pane, and `chimaera board describe` tells you what they did. The file is the
 single source of truth — there is no hidden state.
@@ -44,7 +45,7 @@ It prints `shown chart · N rows · theme · WxH → path`; tell the user the pa
 
 ## Author a board
 
-`chimaera board new talks/lab-meeting.board.json --title "..."` then edit the
+`chimaera board new talks/lab-meeting.board --title "..."` then edit the
 JSON. The format:
 
 - **Points only.** A 16:9 slide is 960×540 pt, origin top-left. Positions and
@@ -75,7 +76,7 @@ look at your own work — you cannot judge a layout you have not seen).
 ## Read back what the human did
 
 ```sh
-chimaera board describe talks/lab-meeting.board.json
+chimaera board describe talks/lab-meeting.board
 ```
 
 prints every object with its position in the same points you write:
@@ -113,7 +114,8 @@ import it.
 
 ## Footguns observed live
 
-- A board path must end in `.board.json` — `board.json` alone is refused.
+- A board path must end in `.board` (the legacy `.board.json` still opens) —
+  `board.json` alone is refused.
 - The renderer refuses sub-floor text (per-role `minPt`) — it clamps up and
   reports; fix the role, don't fight the floor.
 - Unknown `geo` names draw a dashed placeholder box and say so. v0 geometries:

@@ -22,7 +22,7 @@
   },
   "type": {
     "title": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 14,
       "weight": 700,
       "color": "@fg",
@@ -31,7 +31,7 @@
       "tracking": -0.1
     },
     "heading": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 11,
       "weight": 700,
       "color": "@fg",
@@ -39,7 +39,7 @@
       "lineHeight": 1.2
     },
     "subtitle": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 10,
       "weight": 400,
       "color": "@muted",
@@ -47,7 +47,7 @@
       "lineHeight": 1.25
     },
     "body": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 9,
       "weight": 400,
       "color": "@body",
@@ -55,7 +55,7 @@
       "lineHeight": 1.35
     },
     "caption": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 7,
       "weight": 400,
       "color": "@muted",
@@ -63,7 +63,7 @@
       "lineHeight": 1.3
     },
     "label": {
-      "family": ["Geist", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
+      "family": ["Arimo", "Arial", "Helvetica Neue", "Helvetica", "Liberation Sans", "DejaVu Sans", "Inter", "sans-serif"],
       "size": 7,
       "weight": 400,
       "color": "@muted",

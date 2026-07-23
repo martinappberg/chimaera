@@ -1,7 +1,8 @@
 /**
  * Pure logic for `chimaera board show` cards in the chat transcript
- * (board plan §10.1): detecting the `shown … → <path>.board.json`
- * signature in completed tool output, the transcript-level update-in-place
+ * (board plan §10.1): detecting the `shown … → <path>.board` signature
+ * (a legacy `.board.json` path still matches) in completed tool output, the
+ * transcript-level update-in-place
  * reduction (one card per board path, riding the latest re-show), the
  * boards/ promotion naming, and the chart-provenance parse the card's
  * "data" disclosure renders. No network here — ShownCard.svelte owns the
@@ -31,9 +32,10 @@ export interface ShownGroupInput<T extends ShownToolLike = ShownToolLike> {
   tools: readonly T[];
 }
 
-/** The stdout signature `chimaera board show` prints (plan §10.1). matchAll
- *  clones the regex, so the shared global literal is safe. */
-const SHOWN_RE = /^shown .+ → (.+\.board\.json)$/gm;
+/** The stdout signature `chimaera board show` prints (plan §10.1). The CLI now
+ *  emits the canonical `.board`; the optional `.json` still matches a legacy
+ *  card. matchAll clones the regex, so the shared global literal is safe. */
+const SHOWN_RE = /^shown .+ → (.+\.board(?:\.json)?)$/gm;
 
 /** `board show` prints ABSOLUTE paths (so a board mounts regardless of where
  *  the agent's cwd sits versus the board's own workspace root — the two are
@@ -113,10 +115,11 @@ export function boardsDirFor(shownPath: string, cwd?: string): string | null {
 }
 
 /**
- * A collision-free basename for boards/: `name.board.json`,
- * `name-2.board.json`, `name-3.board.json`, … The compound `.board.json`
- * extension stays whole (the server's generic "name copy" uniquifier would
- * split it at the last dot and the result would stop opening as a board).
+ * A collision-free basename for boards/: `name.board`, `name-2.board`, … (or
+ * a legacy `name.board.json`). The suffix is split at the FIRST dot, so a
+ * compound `.board.json` extension stays whole (the server's generic "name
+ * copy" uniquifier would split at the last dot and the result would stop
+ * opening as a board).
  */
 export function uniqueBoardName(desired: string, existing: ReadonlySet<string>): string {
   if (!existing.has(desired)) return desired;
@@ -156,7 +159,7 @@ const MAX_WALK_DEPTH = 6;
 
 /**
  * Parse the first chart's `data` provenance out of a board file's JSON text
- * (the same .board.json the card already renders). Defensive throughout —
+ * (the same board file the card already renders). Defensive throughout —
  * the file is agent-written; anything malformed is simply "no provenance".
  */
 export function chartProvenance(boardJson: string): ChartProvenance | null {

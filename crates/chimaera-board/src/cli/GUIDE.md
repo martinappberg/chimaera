@@ -1,6 +1,7 @@
 # chimaera board — the complete manual
 
-Boards are plain `*.board.json` files; `chimaera board` renders them to pixels.
+Boards are plain `*.board` files (JSON content under a branded extension; the
+legacy `*.board.json` still opens); `chimaera board` renders them to pixels.
 This page is self-contained: run the examples as-is, and never explore
 `--help`, the source, or the repo to learn the tool. One law up front:
 **Board computes scales and layout, never statistics** — no binning, no
@@ -93,14 +94,14 @@ drawn on the card. Rules:
 
 ## Card an existing board
 
-`chimaera board show --file path/to/deck.board.json` — no spec, no copy:
+`chimaera board show --file path/to/deck.board` — no spec, no copy:
 validates the file, renders its first page to a PNG beside it, and prints the
 shown line for THAT path so the chat card mounts. Use it after hand-writing
 or editing a board; plain `render` does not surface a card.
 
 ## Hand-written boards (decks, figures)
 
-`chimaera board new boards/name.board.json --title "…"`, then edit the JSON:
+`chimaera board new boards/name.board --title "…"`, then edit the JSON:
 `pages[].objects[]`, each with a unique slug `id` (the Edit/diff/journal
 anchor — never rename casually). Positions in points (16:9 = 960×540,
 origin top-left, 8 pt grid snap on save). Object types: `text` `shape`
@@ -123,12 +124,15 @@ another ground — any `@token` or `#hex`, plain white `#ffffff` or plain black
 `show --file`), and LOOK at the PNG.
 
 **Fonts** are bundled into the binary (no install, deterministic on a fontless
-compute node): themes lead with **Geist** (the brand sans), with **IBM Plex
-Sans** (a neutral alternate) and **JetBrains Mono** (the `code` role) also
-baked in. You don't set a font on an object — font lives on the *theme*. To
-change it: `theme-export <id> --format json > .chimaera/board/themes/mine.theme.json`,
-edit each role's `family` array (first name that resolves wins — put your face
-first, keep the rest as fallbacks), and set the board's `theme` to `mine`. Any
+compute node): themes lead with **Arimo**, a standard Helvetica/Arial-class sans
+that is metric-compatible with Arial (the figure standard for PLOS/Cell), so a
+figure is submission-safe by default on any host. Also baked in as selectable
+alternates: **Geist** (a brand/slides sans), **IBM Plex Sans** (a neutral
+alternate) and **JetBrains Mono** (the `code` role). You don't set a font on an
+object — font lives on the *theme*. To change it: `theme-export <id> --format
+json > .chimaera/board/themes/mine.theme.json`, edit each role's `family` array
+(first name that resolves wins — put your face first, e.g. `Geist` for a slides
+look, keep the rest as fallbacks), and set the board's `theme` to `mine`. Any
 other face works too: drop it in `.chimaera/board/fonts/` (vendored fonts win
 over the bundled ones) and name it first in the stack.
 
@@ -173,7 +177,7 @@ Which tool for the picture in front of you:
 
 Complete example — a two-lane architecture figure. Copy it, rename the ids,
 change the text/positions; `chimaera board show --file
-boards/chrombpnet.board.json` cards it (write it under `boards/` only for a
+boards/chrombpnet.board` cards it (write it under `boards/` only for a
 deliverable the user asked to keep — otherwise any path works):
 
 ```json
@@ -346,5 +350,5 @@ Everything `show` writes lands under `.chimaera/board/shown/`
 (self-gitignored) — exploratory results never dirty the repo, and re-shows
 overwrite by id. Create a persistent board ONLY when the user explicitly asks
 for a deliverable (a deck, a figure to keep): put it at
-`./boards/<name>.board.json` (create the directory; it is an ordinary tracked
+`./boards/<name>.board` (create the directory; it is an ordinary tracked
 file) and keep editing that file in place.

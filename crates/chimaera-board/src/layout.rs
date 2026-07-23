@@ -251,23 +251,38 @@ pub fn css_font_family(families: &[String]) -> String {
         .join(", ")
 }
 
-/// The brand faces baked into the binary and registered into every render's
+/// The text faces baked into the binary and registered into every render's
 /// `fontdb`, so a board renders in the same face on a laptop and on a fontless
 /// compute node — the fix for the HPC fallback, and how the app carries a
-/// typographic identity instead of a system default.
+/// deterministic typographic identity instead of a system default.
+///
+/// The default is a **standard Arial-class sans** ([`DEFAULT_SANS`], Arimo):
+/// figures are the use case, scientific venues expect Helvetica/Arial-class
+/// metrics (a strict PLOS figure needs *Arial*), and since exports keep editable
+/// text a user can restyle downstream — so the safe default is the expected one,
+/// not a tech-brand face. The brand sans ([`BRAND_SANS`], Geist) stays bundled as
+/// a selectable slides/brand alternate, alongside a neutral alternate
+/// ([`NEUTRAL_SANS`]) and the [`MONO`] code face.
 ///
 /// Only static weight instances are committed (never variable fonts), so weight
-/// selection is exact and reproducible; the weights are exactly those the
-/// bundled themes reference (400 body, 600 talk headings, 700 figure headings).
-/// Provenance, versions, sha256 and licenses: `fonts/text/README.md`. Every
-/// family is SIL OFL 1.1, which permits this bundling. This mirrors how the
-/// `equation` feature commits STIX Two Math under `fonts/`.
+/// selection is exact and reproducible. Arimo ships Arial's own weight set —
+/// Regular 400 and Bold 700; a talk heading asks for 600, which fontdb resolves
+/// to the 700 Bold face *within the Arimo family*, so a heading is never a
+/// foreign fallback. Geist keeps its 400/600/700 for the slides look. Provenance,
+/// versions, sha256 and licenses: `fonts/text/README.md`. Every family is SIL OFL
+/// 1.1, which permits this bundling. This mirrors how the `equation` feature
+/// commits STIX Two Math under `fonts/`.
 pub mod bundled {
     use usvg::fontdb;
 
-    /// The default text face across every bundled theme — the app's brand sans.
+    /// The default text face across every bundled theme — a standard,
+    /// Arial-metric-compatible sans (Arimo), so figures render in the metrics
+    /// scientific venues expect on any host, submission-safe by default.
+    pub const DEFAULT_SANS: &str = "Arimo";
+    /// The brand sans a user can select in place of the default — Geist, a
+    /// tech-brand geometric sans that suits slides/decks over strict figures.
     pub const BRAND_SANS: &str = "Geist";
-    /// A clean, neutral alternate a user can select in place of the brand face.
+    /// A clean, neutral alternate a user can select in place of the default.
     pub const NEUTRAL_SANS: &str = "IBM Plex Sans";
     /// The monospace the `code` role uses — the same face the app's terminal
     /// and web UI use, so code on a board and code in a terminal share DNA.
@@ -275,12 +290,14 @@ pub mod bundled {
 
     /// Every family name a bare [`super::FontStack`] resolves without a system
     /// or vendored font present. Tests assert the render `fontdb` carries these.
-    pub const FAMILIES: &[&str] = &[BRAND_SANS, NEUTRAL_SANS, MONO];
+    pub const FAMILIES: &[&str] = &[DEFAULT_SANS, BRAND_SANS, NEUTRAL_SANS, MONO];
 
-    // Geist 1.800 · IBM Plex Sans 3.005 · JetBrains Mono 2.305 — see the
-    // asset README for sources and hashes. `../../fonts` is crate-relative
-    // from `src/layout.rs`.
+    // Arimo 1.33 (Arial-metric) · Geist 1.800 · IBM Plex Sans 3.005 ·
+    // JetBrains Mono 2.305 — see the asset README for sources and hashes.
+    // `../fonts` is crate-relative from `src/layout.rs`.
     const FACES: &[&[u8]] = &[
+        include_bytes!("../fonts/text/Arimo-Regular.otf"),
+        include_bytes!("../fonts/text/Arimo-Bold.otf"),
         include_bytes!("../fonts/text/Geist-Regular.otf"),
         include_bytes!("../fonts/text/Geist-SemiBold.otf"),
         include_bytes!("../fonts/text/Geist-Bold.otf"),
@@ -388,32 +405,55 @@ mod tests {
     }
 
     #[test]
-    fn the_brand_sans_resolves_at_every_theme_weight() {
+    fn the_default_sans_resolves_at_every_theme_weight() {
         // The bundled themes ask for 400 (body), 600 (talk headings) and 700
-        // (figure headings). All three static weights are present, so a heading
-        // never silently borrows a wrong-weight face on a bare host.
+        // (figure headings). Arimo is a standard Arial-class family, which — like
+        // Arial itself — ships only Regular and Bold; the 600 query resolves to
+        // the 700 Bold face *within Arimo*, so a talk heading is a real Arimo
+        // face, never a foreign fallback, on a bare host.
+        let s = stack();
+        for w in [400u16, 600, 700] {
+            let r = s.resolve(&[bundled::DEFAULT_SANS.to_string()], w, false);
+            let r = r.unwrap_or_else(|| panic!("{} at {w} did not resolve", bundled::DEFAULT_SANS));
+            assert!(
+                r.family.eq_ignore_ascii_case(bundled::DEFAULT_SANS),
+                "{w} resolved to {:?}, not the default family",
+                r.family
+            );
+        }
+        assert!(
+            s.missing_families().is_empty(),
+            "default weights went missing"
+        );
+    }
+
+    #[test]
+    fn geist_still_resolves_as_a_selectable_alternate() {
+        // Geist is no longer the default but stays bundled as the slides/brand
+        // alternate. It keeps its full 400/600/700 static set, so a user who
+        // switches a theme to it gets exact weights, not the Arial-class 400/700.
         let s = stack();
         for w in [400u16, 600, 700] {
             let r = s.resolve(&[bundled::BRAND_SANS.to_string()], w, false);
             let r = r.unwrap_or_else(|| panic!("{} at {w} did not resolve", bundled::BRAND_SANS));
             assert!(
                 r.family.eq_ignore_ascii_case(bundled::BRAND_SANS),
-                "{w} resolved to {:?}, not the brand family",
+                "{w} resolved to {:?}, not Geist",
                 r.family
             );
         }
         assert!(
             s.missing_families().is_empty(),
-            "brand weights went missing"
+            "Geist weights went missing"
         );
     }
 
     #[test]
-    fn the_brand_sans_measures_wider_when_bolder() {
+    fn the_default_sans_measures_wider_when_bolder() {
         // A weak proxy that the distinct weight faces are really registered and
         // shaping against them, not one face reused for every weight.
         let s = stack();
-        let fam = vec![bundled::BRAND_SANS.to_string()];
+        let fam = vec![bundled::DEFAULT_SANS.to_string()];
         let regular = s.measure("Chimaera", &fam, 40.0, 400);
         let bold = s.measure("Chimaera", &fam, 40.0, 700);
         assert!(regular > 0.0 && bold > 0.0);

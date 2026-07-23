@@ -55,8 +55,15 @@
 
   /** The app's current appearance: an `auto`-themed shown board renders on
    *  the ground the transcript around it uses, and re-renders (in place, no
-   *  flash — the previous image holds) when the app's mode flips. */
+   *  flash — the previous image holds) when the app's mode flips. Because the
+   *  board defaults to `theme:"auto"`, the image itself carries the light/dark
+   *  ground — so the card wears no tint of its own and blends into the chat. */
   const appMode = $derived(activeTheme().kind);
+
+  /** The rendered board's aspect ratio decides its measure: a wide slide fills
+   *  the transcript column, a squarer figure/chart sits at reading width so it
+   *  reads as a figure, not a banner. Unknown (pre-render) reads as wide. */
+  const reading = $derived(size !== null && size[1] > 0 && size[0] / size[1] < 1.4);
 
   $effect(() => {
     const p = path;
@@ -146,7 +153,7 @@
   }
 </script>
 
-<div class="shown" class:compact class:visible>
+<div class="shown" class:compact class:visible class:reading={!compact && reading}>
   <div class="head">
     <button class="name-btn" title="open {basename(path)} in a pane" onclick={() => onOpen?.(path)}>
       <span class="chip">board</span>
@@ -264,15 +271,21 @@
 
 <style>
   /* Full mode is a first-class figure in the transcript column — the agent
-     presenting, not CLI residue — so it wears the ToolGroup container idiom
-     (edge border, rise entrance) at reading width. */
+     presenting, not CLI residue. It carries NO tint of its own: the auto-themed
+     image already holds the light/dark ground, so a hairline frame and a flush
+     image are all the chrome it needs to sit in the chat, not float over it.
+     A wide slide fills the measure; `.reading` caps a figure/chart at reading
+     width so it doesn't read as a banner. */
   .shown {
     margin: 4px 0;
-    border: 1px solid var(--edge);
+    border: 1px solid color-mix(in srgb, var(--edge) 70%, transparent);
     border-radius: 8px;
     overflow: hidden;
-    background: color-mix(in srgb, var(--fg) 2%, transparent);
+    background: transparent;
     animation: rise 0.15s ease; /* @keyframes rise lives in app.css */
+  }
+  .shown.reading {
+    max-width: 520px;
   }
   .shown:not(.visible) {
     animation: none;
@@ -369,24 +382,24 @@
   .act.text.on {
     color: var(--accent);
   }
+  /* The image sits flush to the frame — no inner padding or separator line —
+     so the board's own ground reaches the card edge and the figure reads as
+     one clean unit rather than an image boxed inside a panel. */
   .stage {
     display: block;
     width: 100%;
-    padding: 10px;
+    padding: 0;
     background: none;
     border: none;
-    border-top: 1px solid color-mix(in srgb, var(--edge) 55%, transparent);
     cursor: zoom-in;
     text-align: center;
   }
-  /* Sized like a real figure: the shown preset is 720×450 @2×, so it fills
-     the ~600–700px transcript measure edge to edge. */
   .stage img {
+    display: block;
     width: 100%;
     height: auto;
     max-height: 460px;
     object-fit: contain;
-    border-radius: 4px;
   }
   .loading {
     position: relative;

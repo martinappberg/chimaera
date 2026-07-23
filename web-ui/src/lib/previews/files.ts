@@ -291,6 +291,18 @@ export interface BoardRender {
    *  canvas-background swatch row. Same contract as catSwatches: commit the
    *  token, show the hex. Absent on an older daemon → no control. */
   bgSwatches?: { token: string; hex: string }[];
+  /** The theme picker's override choices: each scheme family's id, human
+   *  label, and the concrete variant it resolves to under THIS render's mode.
+   *  Schemes still follow the app's light/dark — they override *which* family,
+   *  not the match-the-app behavior. Absent on an older daemon → no scheme
+   *  overrides offered. */
+  schemes?: { id: string; label: string; variant: string }[];
+  /** What the board's theme reference selects, for the picker's current state:
+   *  `"auto"` (match the app — the zero-config default, shown as "Match app"),
+   *  a scheme id (`talk`/`figure`), or `"pinned"` (a fixed variant / workspace
+   *  theme the app's mode no longer moves). Absent on an older daemon → treat
+   *  as `"auto"`. */
+  themeSelection?: string;
   /** Every composite's derived children (`<id>/<part>`) and their laid-out
    *  `[x, y, w, h]` frames in page points, z-ordered within a composite —
    *  the hit-test map that makes a diagram's nodes selectable instead of the
@@ -367,6 +379,25 @@ export async function fsBoardCanvasBackground(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, canvasBackground: background }),
+    }),
+  );
+  return body.mtime;
+}
+
+/**
+ * The board-level theme override: set (a scheme id like `figure`, or a pinned
+ * variant / workspace theme name) or clear (null — back to `auto`, matching the
+ * viewing app's light/dark) the board's `theme`. Same server-side canonical
+ * writer + journal as `canvas.background`. A scheme still follows the app's
+ * mode; this overrides *which* family, not the match-the-app default. Resolves
+ * to the new X-Mtime token for own-write adoption.
+ */
+export async function fsBoardTheme(path: string, theme: string | null): Promise<string | null> {
+  const body = await json<{ mtime: string | null }>(
+    await api("/board/edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, theme }),
     }),
   );
   return body.mtime;
@@ -753,6 +784,18 @@ const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg"]);
 export function isImagePath(path: string): boolean {
   return IMAGE_EXTS.has(extension(path));
 }
+
+/**
+ * Whether a path names a board: the canonical `.board`, or the legacy
+ * compound `.board.json` that still opens (JSON content, either extension).
+ * Matched on the whole suffix — `extension()` only sees the last dot segment,
+ * so a plain `.json` is never a board and `.board.json` matches whole. Mirrors
+ * `chimaera_board::is_board_path` in the engine.
+ */
+export function isBoardPath(path: string): boolean {
+  const name = basename(path).toLowerCase();
+  return name.endsWith(".board") || name.endsWith(".board.json");
+}
 const MARKDOWN_EXTS = new Set(["md", "markdown"]);
 const HTML_EXTS = new Set(["html", "htm"]);
 const TABLE_EXTS = new Set(["csv", "tsv"]);
@@ -790,10 +833,10 @@ export function viewKindFor(path: string): FileViewKind {
   // every other gzip goes down the text path (fs/file decompresses, then the
   // NUL sniff falls back to the binary card for gzipped binaries).
   if (isGzipped(path)) return TABLE_EXTS.has(ext) ? "table" : "text";
-  // Boards match on the full compound suffix — `extension()` only ever sees
-  // the last dot segment, so a plain `.json` never lands here, and an older
-  // build (or a failed parse) falls back to the ordinary text view.
-  if (basename(path).toLowerCase().endsWith(".board.json")) return "board";
+  // Boards match on the whole suffix, not `extension()` (which only ever sees
+  // the last dot segment) — so a plain `.json` never lands here. A failed
+  // parse falls back to the ordinary text view.
+  if (isBoardPath(path)) return "board";
   if (IMAGE_EXTS.has(ext)) return "image";
   if (MARKDOWN_EXTS.has(ext)) return "markdown";
   if (HTML_EXTS.has(ext)) return "html";

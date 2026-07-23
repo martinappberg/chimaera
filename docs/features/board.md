@@ -1,7 +1,8 @@
 # Board
 
-Chimaera's visual composition surface: agents write ordinary `*.board.json`
-files (decks, cards, figures, quick result charts), the daemon renders them
+Chimaera's visual composition surface: agents write ordinary `*.board`
+files (decks, cards, figures, quick result charts) — JSON content under a
+branded extension; the legacy `*.board.json` still opens — the daemon renders them
 server-side, the BoardView pane shows the pixels and lets the human move
 things, and the agent reads the gestures back through `describe` and the
 semantic journal. The design source of truth is
@@ -22,7 +23,7 @@ journal, imginfo, export/{pptx,svg,pdf}). CLI verbs:
 `crates/chimaera-server/src/board.rs`. Pane:
 `web-ui/src/lib/previews/BoardView.svelte` (+ `boardInteract.ts`,
 `BoardRail`, `BoardPresentChrome`), registered as the `board` `FileViewKind`
-on the full `.board.json` suffix. Chat card:
+on the full `.board` (or legacy `.board.json`) suffix. Chat card:
 `web-ui/src/lib/chat/ShownCard.svelte`. Skill:
 `.claude/skills/board/SKILL.md` (+ `.agents/skills/board/` bridge).
 
@@ -129,21 +130,30 @@ on the full `.board.json` suffix. Chat card:
   ground-token swatch row (+ "match theme" reset) writing it through the
   board-level `canvasBackground` edit op, journaled as `canvas-changed`; a
   page's own `background.fill` still wins.
-- **Fonts are bundled and brand-owned.** Three SIL OFL 1.1 families are baked
-  into the binary (`include_bytes!`, registered into the render `fontdb` on
-  every stack) so a board draws the same face on a laptop and on a fontless HPC
-  login node — deterministic, and on-brand rather than a generic fallback:
-  **Geist** (the default sans every bundled theme leads with), **IBM Plex Sans**
-  (a clean neutral alternate), and **JetBrains Mono** (the `code` role, matching
-  the app's terminal). Font is a *theme* property, not a per-board field: to
-  change it, `theme-export <id> --format json`, edit the roles' `family` stacks
-  (first that resolves wins), save under `.chimaera/board/themes/`, and
+- **Fonts are bundled, with a submission-safe default.** Four SIL OFL 1.1
+  families are baked into the binary (`include_bytes!`, registered into the
+  render `fontdb` on every stack) so a board draws the same face on a laptop and
+  on a fontless HPC login node — deterministic, not a generic fallback. The
+  default is **Arimo**, a standard **Helvetica/Arial-class** sans that is
+  metric-compatible with Arial (the PLOS/Cell figure standard), so a figure
+  renders submission-safe by default — this is what resolves the PLOS-Arial trap
+  (PLOS requires *Arial, not Helvetica*). The rest are selectable alternates:
+  **Geist** (a brand/slides sans), **IBM Plex Sans** (a clean neutral alternate),
+  and **JetBrains Mono** (the `code` role, matching the app's terminal). Font is
+  a *theme* property, not a per-board field: to switch (e.g. to Geist for a
+  slides look), `theme-export <id> --format json`, edit the roles' `family`
+  stacks (first that resolves wins), save under `.chimaera/board/themes/`, and
   reference it — or vendor any face into `.chimaera/board/fonts/`, which wins
   over the bundled set. Provenance/licenses: `crates/chimaera-board/fonts/text/`.
 - **Presets carry four axes** (geometry / floors / page furniture / rules):
   `talk-16x9`, `design-review`, `exec-update`, `teaching`, `readme-image`,
   `poster-a0`, `pub-nature-single`, `pub-cell`, `pub-plos`. Furniture (page
-  number/footer/logo) renders from the preset, suppressed on covers.
+  number/footer/logo) renders from the preset, suppressed on covers. Rules are
+  venue data, not universal predicates: the talk family (`talk-16x9`,
+  `design-review`, `exec-update`, `teaching`) warns on a missing board title —
+  a deck reads as unfinished without one — while a figure/pub/poster/README
+  target does not (a titleless figure is legal; its caption lives in the
+  manuscript).
 
 ## CLI
 
@@ -234,8 +244,11 @@ on slug ids (engine: `crates/chimaera-board/src/merge.rs`), shaped as a git
 merge driver. Wire it up per repo:
 
 ```gitattributes
-# .gitattributes
-*.board.json merge=board
+# .gitattributes — `.board` is JSON, so highlight/diff it as JSON; route both
+# the canonical `.board` and the legacy `.board.json` through the merge driver.
+*.board          linguist-language=JSON
+*.board          merge=board
+*.board.json     merge=board
 ```
 
 ```sh
