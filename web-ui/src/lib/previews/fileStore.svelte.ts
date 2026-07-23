@@ -82,7 +82,9 @@ export class FileEntry {
   /** Last global unknown-change generation this entry has checked against. */
   seenAllStaleEpoch = 0;
   /** In-flight guards so concurrent readers don't double-fetch. */
-  private loading = { mtime: false, chunk: false, md: false, table: false, raw: false };
+  private loading = { mtime: false, chunk: false, md: false, table: false };
+  /** Raw consumers must await the same ticket mint, not merely suppress duplicates. */
+  private rawLoad: Promise<void> | null = null;
 
   constructor(path: string) {
     this.path = path;
@@ -156,16 +158,26 @@ export class FileEntry {
   /** Mint (or reuse a still-fresh) `/raw` URL for image/pdf/html surfaces. */
   async ensureRawUrl(): Promise<void> {
     const fresh = this.rawUrl !== null && Date.now() - this.rawMintedAt < TICKET_TTL_MS;
-    if (fresh || this.loading.raw) return;
-    this.loading.raw = true;
-    this.rawError = null;
+    if (fresh) return;
+    if (this.rawLoad !== null) {
+      await this.rawLoad;
+      return;
+    }
+
+    const load = (async (): Promise<void> => {
+      this.rawError = null;
+      try {
+        this.rawUrl = await fsRawUrl(this.path);
+        this.rawMintedAt = Date.now();
+      } catch (e) {
+        this.rawError = e instanceof Error ? e.message : "failed to load file";
+      }
+    })();
+    this.rawLoad = load;
     try {
-      this.rawUrl = await fsRawUrl(this.path);
-      this.rawMintedAt = Date.now();
-    } catch (e) {
-      this.rawError = e instanceof Error ? e.message : "failed to load file";
+      await load;
     } finally {
-      this.loading.raw = false;
+      if (this.rawLoad === load) this.rawLoad = null;
     }
   }
 
