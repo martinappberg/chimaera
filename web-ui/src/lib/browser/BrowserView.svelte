@@ -250,28 +250,57 @@
 
   let titleObserver: MutationObserver | null = null;
 
-  function readIframeState(): void {
+  /**
+   * Pull the iframe's in-app location into `livePath` + the address bar. Cheap
+   * (a synchronous same-origin location read) and idempotent, so it is safe to
+   * poll: same-document navigations — a hash-router route, JupyterLab's
+   * History-API notebook switch — never fire `onload`, and the poll below is
+   * the only thing that keeps the address + persisted path honest for them.
+   * Returns the same-origin window when readable, so `readIframeState` can also
+   * do its heavier onload-only work (the title observer).
+   */
+  function syncLocation(): Window | null {
     const el = iframeEl;
     const b = base;
-    if (el === null || b === null) return;
+    if (el === null || b === null) return null;
     try {
       const win = el.contentWindow;
-      const doc = el.contentDocument;
-      if (win === null || doc === null) return; // cross-origin: leave as-is
+      if (win === null) return null; // cross-origin: leave the address as-is
       // Include the hash so livePath matches a target path that carried one
-      // (a hash-router route) — otherwise the external-navigation effect below
+      // (a hash-router route) — otherwise the external-navigation effect above
       // would see a spurious mismatch and re-load on every settle.
       const raw = `${win.location.pathname}${win.location.search}${win.location.hash}`;
       // Prefixed navigations carry /proxy/{id}; rescued (absolute-path) ones
       // land on root-form paths. Both name the same app location. A /proxy/
       // path under a DIFFERENT id is the previous target's iframe still on
       // screen mid-retarget — never record it as this target's location.
-      if (raw.startsWith("/proxy/") && !raw.startsWith(b)) return;
+      if (raw.startsWith("/proxy/") && !raw.startsWith(b)) return null;
       const inApp = raw.startsWith(b) ? raw.slice(b.length) || "/" : raw;
-      livePath = inApp;
-      if (inApp !== path) onNavigate(inApp);
-      const title = doc.title.trim();
+      if (inApp !== livePath) {
+        livePath = inApp;
+        if (inApp !== path) onNavigate(inApp);
+      }
+      // Keep the tab label honest too: a same-document route change can swap
+      // the title, and re-reading it here (idempotent — setBrowserTitle
+      // short-circuits an unchanged value) also heals any transient clear.
+      const title = win.document.title.trim();
       setBrowserTitle(tabId, title.length > 0 ? title : null);
+      return win;
+    } catch {
+      // The app navigated somewhere cross-origin; the address keeps the last
+      // known in-app location.
+      return null;
+    }
+  }
+
+  function readIframeState(): void {
+    const win = syncLocation();
+    if (win === null) return;
+    try {
+      // Live title updates BETWEEN polls (an app that renames its own tab
+      // without navigating) — the poll re-reads titles too, this just makes it
+      // instant.
+      const doc = win.document;
       titleObserver?.disconnect();
       const titleEl = doc.querySelector("title");
       if (titleEl !== null) {
@@ -282,10 +311,19 @@
         titleObserver.observe(titleEl, { childList: true, characterData: true, subtree: true });
       }
     } catch {
-      // The app navigated somewhere cross-origin; the address keeps the last
-      // known in-app location.
+      // went cross-origin between the location read and here — nothing to do
     }
   }
+
+  // Same-document navigations don't reload the iframe, so `onload` never fires
+  // for them; a slow poll is what keeps the address bar and persisted path in
+  // step for hash-router / History-API apps. 1/s is imperceptible latency for a
+  // user-driven route change and the read is a bare property access — no I/O.
+  $effect(() => {
+    if (!visible || phase.kind !== "ready") return;
+    const t = setInterval(syncLocation, 1000);
+    return () => clearInterval(t);
+  });
 
   // Clicking into an iframe never bubbles to the pane: notice the focus move
   // via the window losing focus TO our iframe, and hand the pane focus over.

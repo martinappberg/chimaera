@@ -9,6 +9,7 @@
 
 import { writable } from "svelte/store";
 import { api } from "../net/api";
+import { proxyableUrl } from "../shared/urlOpen";
 
 export interface ProxySession {
   id: string;
@@ -145,39 +146,30 @@ export async function probeNodes(hosts: string[], port: number): Promise<string[
 }
 
 /**
- * Parse an address-bar entry (or a detected URL) into a proxy target. Accepts
- * `host:port`, `host:port/path`, and full http(s) URLs; a bare `:8888` or
- * `8888` means localhost. Returns null when it isn't an address.
+ * Parse an address-bar entry into a proxy target. Accepts `host:port`,
+ * `host:port/path`, and full http URLs; a bare `:8888` or `8888` means
+ * localhost. Returns null when it isn't a target the pane can serve — the
+ * caller then hands a web URL to the real browser instead.
+ *
+ * The URL forms run through the shared `proxyableUrl` policy so the address
+ * bar and every detected link agree on ONE definition of "proxyable": http
+ * only, and a non-loopback host qualifies only with an EXPLICIT port. That
+ * last rule keeps an ordinary web URL typed here (`http://github.com/x`, which
+ * would otherwise default to `:80`) out of a daemon relay and in the browser.
  */
 export function parseAddress(
   input: string,
 ): { host: string; port: number; path: string } | null {
   const raw = input.trim();
   if (raw === "") return null;
+  // Bare port — `:8888` or `8888` — is shorthand for this machine.
   const bare = /^:?(\d{2,5})$/.exec(raw);
   if (bare !== null) {
     const port = Number.parseInt(bare[1], 10);
     return port > 0 && port <= 65535 ? { host: "localhost", port, path: "/" } : null;
   }
-  const withScheme = /^https?:\/\//.test(raw) ? raw : `http://${raw}`;
-  let url: URL;
-  try {
-    url = new URL(withScheme);
-  } catch {
-    return null;
-  }
-  if (url.hostname === "") return null;
-  // http only: the daemon dials plain TCP and speaks clear-text HTTP/1.1
-  // upstream, so a TLS app can't be served through the pane. Returning null
-  // lets the caller hand it to the real browser instead of showing a pane
-  // that could only ever fail (see shared/urlOpen.ts).
-  if (url.protocol !== "http:") return null;
-  const port = url.port !== "" ? Number.parseInt(url.port, 10) : 80;
-  if (!(port > 0 && port <= 65535)) return null;
-  return {
-    host: url.hostname,
-    port,
-    // Keep the fragment — a hash-router SPA's route lives there (see urlOpen).
-    path: `${url.pathname}${url.search}${url.hash}` || "/",
-  };
+  // A scheme-less `host:port` / `host/path` is assumed http so the bar stays
+  // terse; the shared policy judges the rest (and drops the fragment in, since
+  // a hash-router SPA carries its route there).
+  return proxyableUrl(/^https?:\/\//.test(raw) ? raw : `http://${raw}`);
 }
