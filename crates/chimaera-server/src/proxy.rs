@@ -49,6 +49,11 @@ const MAX_PROXIES: usize = 32;
 /// A session unused this long is swept (mounted panes ping /health, so this
 /// only reaps targets no window shows anymore).
 const IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How stale a compute-node session's ownership check may get before a dial
+/// re-verifies the node is still in one of the user's RUNNING jobs. Bounds how
+/// long a mounted pane's health pings can keep an id alive on a node whose
+/// allocation ended (matches the compute snapshot's own cache window).
+const REVALIDATE_TTL: Duration = Duration::from_secs(30);
 /// Global cap on concurrently upgraded (WebSocket) tunnels.
 const MAX_TUNNELS: usize = 256;
 /// Dialing the target (per request, loopback or cached route).
@@ -83,6 +88,12 @@ struct ProxyEntry {
     host: String,
     port: u16,
     last_used: Instant,
+    /// Where the target sits relative to the daemon, snapshotted at mint. Drives
+    /// both the relay gate (only compute nodes ssh-hop) and revalidation.
+    class: HostClass,
+    /// When a compute-node entry's ownership was last confirmed (see
+    /// `REVALIDATE_TTL`). Ignored for other classes.
+    revalidated_at: Instant,
     /// The proven route, cached after the first successful dial.
     route: Option<Route>,
     /// Single-flight guard for (re)probing the route.
@@ -162,12 +173,21 @@ pub(crate) async fn sweeper(state: Arc<AppState>) {
 // --- mint-time policy ----------------------------------------------------------
 
 /// Where a requested target host sits relative to this daemon.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum HostClass {
     Loopback,
     SelfHost,
     ComputeNode,
     Other,
+}
+
+/// The ssh `-N -L` relay second hop exists for ONE case: a service bound to an
+/// allocated compute node's loopback. It must never fire for anything else —
+/// a confirmed ordinary remote whose direct probe fails is simply unreachable,
+/// not a reason to `ssh <that host>` with the user's agent and disabled
+/// host-key checking (codex round 5 P2).
+fn relay_allowed(class: HostClass) -> bool {
+    matches!(class, HostClass::ComputeNode)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -352,6 +372,11 @@ pub(crate) async fn create_proxy(
             .find(|(_, e)| e.host == host && e.port == req.port)
         {
             entry.last_used = Instant::now();
+            // A re-mint is a fresh classification: refresh the stored class and
+            // reset the revalidation clock (the confirm gate above already
+            // re-ran classify_host).
+            entry.class = class;
+            entry.revalidated_at = Instant::now();
             (id.clone(), evicted)
         } else {
             if store.entries.len() >= MAX_PROXIES {
@@ -377,6 +402,8 @@ pub(crate) async fn create_proxy(
                     host: host.clone(),
                     port: req.port,
                     last_used: Instant::now(),
+                    class,
+                    revalidated_at: Instant::now(),
                     route: None,
                     probe: Arc::new(tokio::sync::Mutex::new(())),
                     relay: None,
@@ -465,6 +492,8 @@ enum DialError {
 struct DialPlan {
     host: String,
     port: u16,
+    class: HostClass,
+    revalidated_at: Instant,
     route: Option<Route>,
     probe: Arc<tokio::sync::Mutex<()>>,
 }
@@ -476,9 +505,32 @@ fn plan(state: &AppState, id: &str) -> Option<DialPlan> {
     Some(DialPlan {
         host: e.host.clone(),
         port: e.port,
+        class: e.class,
+        revalidated_at: e.revalidated_at,
         route: e.route,
         probe: e.probe.clone(),
     })
+}
+
+/// Refresh a compute-node entry's ownership clock after a successful re-check.
+fn mark_revalidated(state: &AppState, id: &str) {
+    if let Some(e) = crate::lock(&state.proxies).entries.get_mut(id) {
+        e.revalidated_at = Instant::now();
+    }
+}
+
+/// Drop an entry whose compute-node ownership lapsed (the allocation ended),
+/// killing any relay child off the lock. The pane sees `expired` and re-mints —
+/// which now re-classifies the host and demands confirmation if it's foreign.
+fn expire(state: &AppState, id: &str) {
+    let child = {
+        let mut store = crate::lock(&state.proxies);
+        store.entries.remove(id).and_then(|mut e| e.relay.take())
+    };
+    if let Some(child) = child {
+        kill_relay(child);
+    }
+    tracing::info!(%id, "compute-node proxy expired: node no longer in a running job");
 }
 
 async fn connect_route(host: &str, port: u16, route: Route) -> std::io::Result<TcpStream> {
@@ -502,6 +554,20 @@ async fn connect_route(host: &str, port: u16, route: Route) -> std::io::Result<T
 /// services on compute nodes). Returns the stream and the route used.
 async fn dial(state: &AppState, id: &str) -> Result<(TcpStream, Route), DialError> {
     let p = plan(state, id).ok_or(DialError::Expired)?;
+
+    // A compute-node session is the user's only for as long as the allocation
+    // is. Re-verify ownership when the stored check has gone stale (cheap — the
+    // compute snapshot is itself cached), so a mounted pane's health pings
+    // cannot keep an id alive dialing a node whose job ended and was handed to
+    // another user (codex round 5 P1).
+    if p.class == HostClass::ComputeNode && p.revalidated_at.elapsed() > REVALIDATE_TTL {
+        if classify_host(state, &p.host).await == HostClass::ComputeNode {
+            mark_revalidated(state, id);
+        } else {
+            expire(state, id);
+            return Err(DialError::Expired);
+        }
+    }
 
     // Fast path: a proven route, no locks held.
     if let Some(route) = p.route {
@@ -533,12 +599,16 @@ async fn dial(state: &AppState, id: &str) -> Result<(TcpStream, Route), DialErro
 
     let host = fresh.host;
     let port = fresh.port;
-    // Loopback (and the daemon's own host) can only ever be direct.
-    let direct_only = is_loopback_host(&host) || host.eq_ignore_ascii_case(&state.hostname);
-    let direct_timeout = if direct_only {
-        CONNECT_TIMEOUT
-    } else {
+    // The ssh relay second hop is for compute nodes only (see `relay_allowed`).
+    // A direct-only target — loopback, the daemon's own host, or a confirmed
+    // ordinary remote — gets the full connect timeout and, if the direct dial
+    // fails, is simply unreachable: we never ssh to it. A compute node fails
+    // fast on the direct probe so the relay attempt can follow.
+    let relay_ok = relay_allowed(fresh.class);
+    let direct_timeout = if relay_ok {
         DIRECT_PROBE_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
     };
     let direct =
         tokio::time::timeout(direct_timeout, TcpStream::connect((host.as_str(), port))).await;
@@ -547,7 +617,7 @@ async fn dial(state: &AppState, id: &str) -> Result<(TcpStream, Route), DialErro
             set_route(state, id, Route::Direct, None);
             return Ok((stream, Route::Direct));
         }
-        _ if direct_only => {
+        _ if !relay_ok => {
             return Err(DialError::Unreachable(format!(
                 "nothing is listening on {host}:{port}"
             )));
@@ -555,7 +625,7 @@ async fn dial(state: &AppState, id: &str) -> Result<(TcpStream, Route), DialErro
         _ => {}
     }
 
-    // Second hop: the target is a remote node whose service may be bound to
+    // Second hop: the target is a compute node whose service may be bound to
     // its loopback — stand up ssh -N -L and connect through it.
     let (child, local) = start_relay(&host, port)
         .await
@@ -1303,6 +1373,16 @@ mod tests {
         assert!(!host_matches("sh03-09n14.attacker.example", "sh03-09n14"));
         // A different bare name is never a match.
         assert!(!host_matches("login02", "login01"));
+    }
+
+    #[test]
+    fn only_compute_nodes_get_the_ssh_relay() {
+        assert!(relay_allowed(HostClass::ComputeNode));
+        assert!(!relay_allowed(HostClass::Loopback));
+        assert!(!relay_allowed(HostClass::SelfHost));
+        // The security crux: a confirmed ordinary remote is dialed directly or
+        // reported unreachable — the daemon never ssh-relays to it.
+        assert!(!relay_allowed(HostClass::Other));
     }
 
     #[test]
